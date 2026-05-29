@@ -102,6 +102,7 @@ cargo build --release
 ./target/release/zipp run examples/fib.ts            # => 6765
 ./target/release/zipp run --jit examples/sum.ts      # loop + u64 + array
 ./target/release/zipp run --llvm examples/point.ts   # interface -> struct
+./target/release/zipp run --jit examples/account.ts  # class: methods + new + this
 
 # run the language test suite
 cargo test
@@ -336,12 +337,14 @@ app.ts ─[oxc]→ TS AST ─[lower the subset]→ ZIPP AST ─→ check → IR 
 the rest with a line-numbered error. **Supported (v0):** typed functions +
 recursion, `let`/`const`, `if`/`while`/`for`, `break`/`continue`, the operator
 set, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing, `.length`),
-**`interface`s → structs** (construct with `let p: T = {…}` or `{…} as T`, field
-read/write, struct params/returns), `console.log`, math builtins. **Type
-mapping:** `number`→f64, `bigint`→i64, `boolean`→bool, `string`→str, and
-`i64`/`i32`/`u32`/`u64`/`f64` and your `interface` names usable directly.
-`examples/fib.ts` runs identically on all four backends; `sum.ts` shows a `u64`
-loop + arrays; `point.ts` shows interfaces/structs.
+**`interface`s and `class`es → structs** (interfaces construct with
+`let p: T = {…}` / `{…} as T`; classes give you fields, a constructor, methods,
+`this`, and `new C(…)` — a class lowers to a factory plus methods taking `this`),
+field read/write, `console.log`, math builtins. **Type mapping:** `number`→f64,
+`bigint`→i64, `boolean`→bool, `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64`
+and your `interface`/`class` names usable directly. `examples/fib.ts` runs
+identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
+`point.ts` interfaces; `account.ts` a class with methods.
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,
