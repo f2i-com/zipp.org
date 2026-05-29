@@ -17,6 +17,9 @@
 //! structs, generics, closures — and never the dynamic core (`any`, prototypes,
 //! `eval`, exceptions, async), which is off-mission for an AOT/provable language.
 
+use std::cell::Cell;
+use std::collections::HashMap;
+
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_parser::Parser;
@@ -33,11 +36,16 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
     if !ret.errors.is_empty() {
         return Err(format!("typescript parse error: {}", ret.errors[0]));
     }
-    Lower { src }.module(&ret.program)
+    let mut lower = Lower { src, structs: HashMap::new(), ret_struct: Cell::new(None) };
+    lower.module(&ret.program)
 }
 
 struct Lower<'s> {
     src: &'s str,
+    /// Interface name → struct index (in `Module::structs`).
+    structs: HashMap<String, u32>,
+    /// Struct id of the current function's return type (for `return {...}`).
+    ret_struct: Cell<Option<u32>>,
 }
 
 type LResult<T> = Result<T, String>;
@@ -55,23 +63,91 @@ impl Lower<'_> {
         format!("typescript error [line {}]: {msg}", self.line(span))
     }
 
-    fn module(&self, program: &Program) -> LResult<z::Module> {
+    fn module(&mut self, program: &Program) -> LResult<z::Module> {
+        // Pass 1: interfaces -> structs (so types/constructions can resolve them).
+        let mut structs = Vec::new();
+        for stmt in &program.body {
+            if let Statement::TSInterfaceDeclaration(decl) = stmt {
+                let name = decl.id.name.as_str().to_string();
+                if self.structs.contains_key(&name) {
+                    return Err(self.err(decl.span, format!("interface '{name}' redefined")));
+                }
+                self.structs.insert(name, structs.len() as u32);
+                structs.push(decl); // lower bodies below (after the name map is built)
+            }
+        }
+        let structs: Vec<z::StructDecl> =
+            structs.iter().map(|d| self.interface(d)).collect::<LResult<_>>()?;
+
+        // Pass 2: functions.
         let mut funcs = Vec::new();
         for stmt in &program.body {
             match stmt {
                 Statement::FunctionDeclaration(f) => funcs.push(self.func(f)?),
-                // Type-only declarations carry no runtime meaning — skip them.
-                Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => {}
-                Statement::EmptyStatement(_) => {}
+                Statement::TSInterfaceDeclaration(_)
+                | Statement::TSTypeAliasDeclaration(_)
+                | Statement::EmptyStatement(_) => {}
                 other => {
                     return Err(self.err(
                         span_of_stmt(other),
-                        "only top-level function declarations are supported (v0)",
+                        "only top-level functions and interfaces are supported (v0)",
                     ))
                 }
             }
         }
-        Ok(z::Module { funcs, structs: Vec::new() })
+        Ok(z::Module { funcs, structs })
+    }
+
+    fn interface(&self, decl: &TSInterfaceDeclaration) -> LResult<z::StructDecl> {
+        let name = decl.id.name.as_str().to_string();
+        let mut fields = Vec::new();
+        for sig in &decl.body.body {
+            match sig {
+                TSSignature::TSPropertySignature(p) => {
+                    let fname = match &p.key {
+                        PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
+                        _ => return Err(self.err(p.span, "interface field keys must be plain names")),
+                    };
+                    if p.optional {
+                        return Err(self.err(p.span, "optional fields aren't supported yet"));
+                    }
+                    let ann = p
+                        .type_annotation
+                        .as_ref()
+                        .ok_or_else(|| self.err(p.span, format!("field '{fname}' needs a type")))?;
+                    fields.push((fname, self.ty(&ann.type_annotation)?));
+                }
+                _ => return Err(self.err(decl.span, "interface methods/index signatures aren't supported")),
+            }
+        }
+        Ok(z::StructDecl { name, fields })
+    }
+
+    /// Lower an object literal `{ x: 1, y: 2 }` to a nominal `StructLit` for the
+    /// struct identified by `id` (the ZIPP checker reorders/validates fields).
+    fn obj_struct_lit(&self, obj: &ObjectExpression, id: u32) -> LResult<z::Expr> {
+        let name = self
+            .structs
+            .iter()
+            .find(|(_, &v)| v == id)
+            .map(|(k, _)| k.clone())
+            .ok_or_else(|| self.err(obj.span, "internal: unknown struct id"))?;
+        let mut fields = Vec::new();
+        for p in &obj.properties {
+            match p {
+                ObjectPropertyKind::ObjectProperty(op) => {
+                    let fname = match &op.key {
+                        PropertyKey::StaticIdentifier(k) => k.name.as_str().to_string(),
+                        _ => return Err(self.err(op.span, "object keys must be plain names")),
+                    };
+                    fields.push((fname, self.expr(&op.value)?));
+                }
+                ObjectPropertyKind::SpreadProperty(_) => {
+                    return Err(self.err(obj.span, "object spread isn't supported"))
+                }
+            }
+        }
+        Ok(z::Expr::StructLit { name, fields })
     }
 
     fn func(&self, f: &Function) -> LResult<z::Func> {
@@ -98,6 +174,10 @@ impl Lower<'_> {
             Some(ann) => self.ty(&ann.type_annotation)?,
             None => return Err(self.err(f.span, "functions need an explicit return type")),
         };
+        self.ret_struct.set(match ret {
+            z::Type::Struct(id) => Some(id),
+            _ => None,
+        });
         let body = match &f.body {
             Some(b) => self.block(&b.statements)?,
             None => return Err(self.err(f.span, "function has no body")),
@@ -131,7 +211,10 @@ impl Lower<'_> {
                     "f64" => z::Type::F64,
                     "bool" => z::Type::Bool,
                     "string" | "str" => z::Type::Str,
-                    other => return Err(self.err(r.span, format!("unsupported type '{other}'"))),
+                    other => match self.structs.get(other) {
+                        Some(&id) => z::Type::Struct(id),
+                        None => return Err(self.err(r.span, format!("unknown type '{other}'"))),
+                    },
                 }
             }
             TSType::TSParenthesizedType(p) => self.ty(&p.type_annotation)?,
@@ -155,9 +238,13 @@ impl Lower<'_> {
         match s {
             Statement::VariableDeclaration(v) => self.var_decl(v, out)?,
             Statement::ReturnStatement(r) => {
-                let val = match &r.argument {
-                    Some(e) => Some(self.expr(e)?),
-                    None => None,
+                let val = match (&r.argument, self.ret_struct.get()) {
+                    // `return { ... }` from a struct-typed function.
+                    (Some(Expression::ObjectExpression(obj)), Some(id)) => {
+                        Some(self.obj_struct_lit(obj, id)?)
+                    }
+                    (Some(e), _) => Some(self.expr(e)?),
+                    (None, _) => None,
                 };
                 push(out, z::StmtKind::Return(val), r.span);
             }
@@ -234,8 +321,15 @@ impl Lower<'_> {
                 Some(a) => Some(self.ty(&a.type_annotation)?),
                 None => None,
             };
+            // `let p: Point = { ... }` — the annotation names the struct.
+            let value = match (&ty, value) {
+                (Some(z::Type::Struct(id)), Expression::ObjectExpression(obj)) => {
+                    self.obj_struct_lit(obj, *id)?
+                }
+                _ => self.expr(value)?,
+            };
             out.push(z::Stmt {
-                kind: z::StmtKind::Let { name, ty, value: self.expr(value)? },
+                kind: z::StmtKind::Let { name, ty, value },
                 line: self.line(d.span),
             });
         }
@@ -305,6 +399,11 @@ impl Lower<'_> {
                 arr: Box::new(self.expr(&m.object)?),
                 index: Box::new(self.expr(&m.expression)?),
             }),
+            // `obj.field = v`
+            AssignmentTarget::StaticMemberExpression(m) => Ok(z::Expr::Field {
+                base: Box::new(self.expr(&m.object)?),
+                field: m.property.name.as_str().to_string(),
+            }),
             _ => Err(self.err(span_of_assign_target(t), "unsupported assignment target")),
         }
     }
@@ -368,14 +467,34 @@ impl Lower<'_> {
                     // `arr.length` → len(arr)
                     z::Expr::Call { name: "len".into(), args: vec![self.expr(&m.object)?] }
                 } else {
-                    return Err(self.err(m.span, "field access (structs) isn't supported yet"));
+                    // `obj.field` → struct field access
+                    z::Expr::Field {
+                        base: Box::new(self.expr(&m.object)?),
+                        field: m.property.name.as_str().to_string(),
+                    }
                 }
             }
-            // `x as T` — treat a numeric cast as a runtime conversion.
-            Expression::TSAsExpression(a) => z::Expr::Cast {
-                to: self.ty(&a.type_annotation)?,
-                e: Box::new(self.expr(&a.expression)?),
-            },
+            // `x as T`: numeric → runtime conversion; `{...} as Struct` → struct
+            // literal; otherwise a no-op type assertion.
+            Expression::TSAsExpression(a) => {
+                let to = self.ty(&a.type_annotation)?;
+                if to.is_numeric() {
+                    z::Expr::Cast { to, e: Box::new(self.expr(&a.expression)?) }
+                } else if let (z::Type::Struct(id), Expression::ObjectExpression(obj)) =
+                    (to, &a.expression)
+                {
+                    self.obj_struct_lit(obj, id)?
+                } else {
+                    self.expr(&a.expression)?
+                }
+            }
+            Expression::ObjectExpression(o) => {
+                return Err(self.err(
+                    o.span,
+                    "object literal needs a known type — annotate the `let`, write `{...} as T`, \
+                     or return it from a struct-typed function",
+                ))
+            }
             other => return Err(self.err(span_of_expr(other), "unsupported expression")),
         })
     }
@@ -485,6 +604,32 @@ fn span_of_assign_target(t: &AssignmentTarget) -> Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_i64(ts: &str) -> i64 {
+        let module = compile_ts(ts).expect("lower");
+        let prog = zippc::compile_module(&module).expect("compile");
+        match zippc::vm::run(&prog, false).expect("run").result {
+            zippc::Value::I64(x) => x,
+            other => panic!("expected i64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interfaces_and_structs() {
+        // interface -> struct; typed-let construction; field read/write; struct param
+        let ts = "interface Point { x: i64; y: i64; } \
+                  function dist2(p: Point): i64 { return p.x * p.x + p.y * p.y; } \
+                  function main(): i64 { \
+                    let p: Point = { x: 3, y: 4 }; \
+                    p.x = p.x + 1; \
+                    return dist2(p); }";
+        assert_eq!(run_i64(ts), 32);
+        // `{...} as T` construction + a struct-returning function
+        let ts2 = "interface V { a: i64; b: i64; } \
+                   function mk(): V { return { a: 5, b: 6 }; } \
+                   function main(): i64 { let v = mk(); return v.a + v.b; }";
+        assert_eq!(run_i64(ts2), 11);
+    }
 
     #[test]
     fn lowers_and_runs_fib() {

@@ -101,6 +101,7 @@ cargo build --release
 # real TypeScript, run on any backend (oxc frontend → ZIPP AST)
 ./target/release/zipp run examples/fib.ts            # => 6765
 ./target/release/zipp run --jit examples/sum.ts      # loop + u64 + array
+./target/release/zipp run --llvm examples/point.ts   # interface -> struct
 
 # run the language test suite
 cargo test
@@ -335,10 +336,13 @@ app.ts ─[oxc]→ TS AST ─[lower the subset]→ ZIPP AST ─→ check → IR 
 the rest with a line-numbered error. **Supported (v0):** typed functions +
 recursion, `let`/`const`, `if`/`while`/`for`, `break`/`continue`, the operator
 set, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing, `.length`),
-`console.log`, math builtins. **Type mapping:** `number`→f64, `bigint`→i64,
-`boolean`→bool, `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` usable directly
-(a `zipp.d.ts` makes `tsc`/editors accept those names). `examples/fib.ts` runs
-identically on all four backends; `examples/sum.ts` shows a `u64` loop + arrays.
+**`interface`s → structs** (construct with `let p: T = {…}` or `{…} as T`, field
+read/write, struct params/returns), `console.log`, math builtins. **Type
+mapping:** `number`→f64, `bigint`→i64, `boolean`→bool, `string`→str, and
+`i64`/`i32`/`u32`/`u64`/`f64` and your `interface` names usable directly (a
+`zipp.d.ts` makes `tsc`/editors accept the scalar names). `examples/fib.ts` runs
+identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
+`point.ts` shows interfaces/structs.
 
 This is the **AssemblyScript model** — a typed subset compiled to fast/provable
 code — *not* a JavaScript engine. Running *arbitrary* dynamic JS (`any`,
