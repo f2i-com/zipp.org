@@ -27,27 +27,36 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("run") => {
             let mut prove = false;
             let mut jit = false;
+            let mut llvm = false;
             let mut fast_math = false;
             let mut path: Option<String> = None;
             for a in it {
                 match a.as_str() {
                     "--prove" => prove = true,
                     "--jit" => jit = true,
+                    "--llvm" => llvm = true,
                     "--ffast-math" => fast_math = true,
                     s if s.starts_with("--") => return Err(format!("unknown flag '{s}'")),
                     s => path = Some(s.to_string()),
                 }
             }
-            let path = path.ok_or("usage: zipp run [--prove] [--jit [--ffast-math]] <file.zipp>")?;
-            if fast_math && !jit {
-                return Err("--ffast-math only applies with --jit".into());
+            let path =
+                path.ok_or("usage: zipp run [--prove] [--jit|--llvm [--ffast-math]] <file.zipp>")?;
+            if jit && llvm {
+                return Err("--jit (Cranelift) and --llvm (clang -O3) are different backends; pick one".into());
             }
-            run_file(&path, prove, jit, fast_math)
+            if fast_math && !(jit || llvm) {
+                return Err("--ffast-math only applies with --jit or --llvm".into());
+            }
+            run_file(&path, prove, jit, llvm, fast_math)
         }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
             println!("usage:");
-            println!("  zipp run <file.zipp>            compile + run");
+            println!("  zipp run <file.zipp>            compile + run (interpreter)");
+            println!("  zipp run --jit <file.zipp>      Cranelift JIT, scalar subset (tier-0)");
+            println!("  zipp run --llvm <file.zipp>     clang -O3 release tier, scalar subset");
+            println!("  zipp run --jit|--llvm --ffast-math <file.zipp>   + FMA/reassoc (changes float rounding)");
             println!("  zipp run --prove <file.zipp>    run, then zk-STARK prove + verify the execution");
             Ok(())
         }
@@ -55,12 +64,12 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn run_file(path: &str, prove: bool, jit: bool, fast_math: bool) -> Result<(), String> {
+fn run_file(path: &str, prove: bool, jit: bool, llvm: bool, fast_math: bool) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
     let program = zippc::compile(&src)?;
 
-    if jit && prove {
-        return Err("--jit and --prove can't be combined (the prover needs the interpreter trace)".into());
+    if (jit || llvm) && prove {
+        return Err("--prove needs the interpreter trace; it can't be combined with a native backend".into());
     }
     if jit {
         if let Some((r, compile, execute)) = jit_run(&program, fast_math)? {
@@ -71,6 +80,17 @@ fn run_file(path: &str, prove: bool, jit: bool, fast_math: bool) -> Result<(), S
             return Ok(());
         }
         // ineligible — jit_run explained why; fall through to the interpreter.
+    }
+    if llvm {
+        if let Some((r, out, compile, execute)) = llvm_run(&program, fast_math)? {
+            print!("{out}"); // the program's own print() output (captured from the exe)
+            let fm = if fast_math { " · ffast-math" } else { "" };
+            println!(
+                "=> {r} (llvm · clang -O3 -march=native{fm} · compiled in {compile:.2?}, ran in {execute:.2?})"
+            );
+            return Ok(());
+        }
+        // ineligible — llvm_run explained why; fall through to the interpreter.
     }
 
     let t0 = Instant::now();
@@ -125,6 +145,28 @@ fn jit_run(
     _fast_math: bool,
 ) -> Result<Option<(String, std::time::Duration, std::time::Duration)>, String> {
     Err("this build has no jit profile — rebuild with the `jit` feature".into())
+}
+
+// (formatted result, captured program output, compile time, execute time)
+#[cfg(feature = "llvm")]
+type LlvmTimed = (String, String, std::time::Duration, std::time::Duration);
+
+#[cfg(feature = "llvm")]
+fn llvm_run(program: &zippc::Program, fast_math: bool) -> Result<Option<LlvmTimed>, String> {
+    if let Some(bad) = zipp_llvm::ineligible_reason(program) {
+        eprintln!("zipp: --llvm covers the scalar subset only (program uses {bad}); using the interpreter");
+        return Ok(None);
+    }
+    let r = zipp_llvm::build_and_run(program, fast_math)?;
+    Ok(Some((r.result, r.program_output, r.compile, r.execute)))
+}
+
+#[cfg(not(feature = "llvm"))]
+fn llvm_run(
+    _program: &zippc::Program,
+    _fast_math: bool,
+) -> Result<Option<(String, String, std::time::Duration, std::time::Duration)>, String> {
+    Err("this build has no llvm tier — rebuild with the `llvm` feature".into())
 }
 
 #[cfg(feature = "zk")]

@@ -9,14 +9,18 @@ description = "ZIPP command-line interface: `zipp run [--prove] file.zipp`"
 name = "zipp"
 path = "src/main.rs"
 
-# The zk-STARK proving profile and the native JIT are OPTIONAL (on by default).
-# `--no-default-features` drops both heavy dependencies (Winterfell, Cranelift).
+# The zk-STARK proving profile, the Cranelift JIT, and the LLVM release tier are
+# all OPTIONAL (on by default). `--no-default-features` drops the heavy deps
+# (Winterfell, Cranelift); the LLVM tier itself has no build-time dependency
+# (it shells out to clang), so it's cheap to keep.
 [features]
-default = ["zk", "jit"]
+default = ["zk", "jit", "llvm"]
 zk = ["dep:zipp-zk"]
 jit = ["dep:zipp-jit"]
+llvm = ["dep:zipp-llvm"]
 
 [dependencies]
 zippc = { path = "../zippc" }
 zipp-zk = { path = "../zipp-zk", optional = true }
 zipp-jit = { path = "../zipp-jit", optional = true }
+zipp-llvm = { path = "../zipp-llvm", optional = true }

@@ -1,0 +1,13 @@
+[package]
+name = "zipp-llvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP optional release tier — emit LLVM IR text, compile with clang -O3 (PLAN.md Phases 8-9)"
+
+# No llvm-sys/inkwell dependency: we emit textual LLVM IR and drive the LLVM
+# toolchain (clang) as a subprocess. That sidesteps the llvm-sys build entirely
+# and is exactly how an AOT release tier should work (rustc-style: emit IR, let
+# LLVM -O3 optimize + codegen).
+[dependencies]
+zippc = { path = "../zippc" }

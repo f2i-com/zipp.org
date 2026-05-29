@@ -740,6 +740,7 @@ name = "zipp-cli"
 version = "0.0.1"
 dependencies = [
  "zipp-jit",
+ "zipp-llvm",
  "zipp-zk",
  "zippc",
 ]
@@ -753,6 +754,13 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "zippc",
+]
+
+[[package]]
+name = "zipp-llvm"
+version = "0.0.1"
+dependencies = [
  "zippc",
 ]
 
