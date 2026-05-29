@@ -32,6 +32,9 @@ pub enum Tok {
     TyF64,
     TyBool,
     TyStr,
+    TyI32,
+    TyU32,
+    TyU64,
     // punctuation
     LParen,
     RParen,
@@ -366,6 +369,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                     "f64" => Tok::TyF64,
                     "bool" => Tok::TyBool,
                     "str" => Tok::TyStr,
+                    "i32" => Tok::TyI32,
+                    "u32" => Tok::TyU32,
+                    "u64" => Tok::TyU64,
                     _ => Tok::Ident(s.to_string()),
                 });
             }

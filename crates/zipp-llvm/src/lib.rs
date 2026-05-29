@@ -22,11 +22,15 @@ use std::time::{Duration, Instant};
 use zippc::ast::{BinOp, Elem, Type, UnOp};
 use zippc::ir::{BuiltinOp, FuncMeta, Instr, Program};
 
-/// LLVM type of a register. Arrays are `ptr` to a length-prefixed i64 block; the
-/// bool carried by `Arr` records whether the *elements* are f64.
+/// LLVM type of a register. `I32`/`U32` are LLVM `i32`; everything else (i64/u64,
+/// bool, array/string/struct pointers) is i64-width. Signedness picks sdiv/udiv,
+/// slt/ult, sext/zext, sitofp/uitofp, etc.
 #[derive(Clone, Copy, PartialEq)]
 enum LTy {
     I64,
+    I32,
+    U32,
+    U64,
     F64,
     Arr(bool),
     Str,
@@ -35,9 +39,10 @@ enum LTy {
 
 fn llname(t: LTy) -> &'static str {
     match t {
-        LTy::I64 => "i64",
         LTy::F64 => "double",
+        LTy::I32 | LTy::U32 => "i32",
         LTy::Arr(_) | LTy::Str | LTy::Struct(_) => "ptr",
+        _ => "i64", // i64, u64, bool
     }
 }
 
@@ -52,12 +57,23 @@ fn struct_id(t: LTy) -> Option<u32> {
     }
 }
 
+fn is_int(t: LTy) -> bool {
+    matches!(t, LTy::I64 | LTy::I32 | LTy::U32 | LTy::U64)
+}
+
+fn signed(t: LTy) -> bool {
+    matches!(t, LTy::I64 | LTy::I32)
+}
+
 fn lty_of(t: Type) -> LTy {
     match t {
         Type::F64 => LTy::F64,
         Type::Array(e) => LTy::Arr(matches!(e, Elem::F64)),
         Type::Str => LTy::Str,
         Type::Struct(id) => LTy::Struct(id),
+        Type::I32 => LTy::I32,
+        Type::U32 => LTy::U32,
+        Type::U64 => LTy::U64,
         _ => LTy::I64, // i64, bool (bool is an i64 0/1)
     }
 }
@@ -123,9 +139,10 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
             Instr::Cast { dst, to, .. } => t[*dst as usize] = lty_of(*to),
             Instr::Mov { dst, src } => t[*dst as usize] = t[*src as usize],
             Instr::Bin { op, dst, a, .. } => {
+                use BinOp::*;
                 t[*dst as usize] = match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => t[*a as usize],
-                    _ => LTy::I64,
+                    Eq | Ne | Lt | Le | Gt | Ge | And | Or => LTy::I64, // bool
+                    _ => t[*a as usize], // arithmetic / bitwise / shift keep operand type
                 };
             }
             Instr::Unary { op, dst, a } => {
@@ -243,6 +260,35 @@ fn cmp(body: &mut String, tmp: &mut usize, kind: &str, cc: &str, ty: &str, a: &s
     r
 }
 
+/// Numeric cast with Rust `as` semantics (truncate / sign- or zero-extend /
+/// saturating float↔int), mirroring the interpreter.
+fn emit_cast(body: &mut String, tmp: &mut usize, from: LTy, to: LTy, v: &str) -> String {
+    let (fw, tw) = (llname(from), llname(to));
+    if from == LTy::F64 && is_int(to) {
+        let intr = if signed(to) { "fptosi" } else { "fptoui" };
+        let r = fresh(tmp);
+        body.push_str(&format!("  {r} = call {tw} @llvm.{intr}.sat.{tw}.f64(double {v})\n"));
+        return r;
+    }
+    if is_int(from) && to == LTy::F64 {
+        let op = if signed(from) { "sitofp" } else { "uitofp" };
+        let r = fresh(tmp);
+        body.push_str(&format!("  {r} = {op} {fw} {v} to double\n"));
+        return r;
+    }
+    if fw == tw {
+        return v.to_string(); // same width: signed↔unsigned reinterpret, or f64↔f64
+    }
+    let r = fresh(tmp);
+    if fw == "i32" && tw == "i64" {
+        let op = if signed(from) { "sext" } else { "zext" };
+        body.push_str(&format!("  {r} = {op} i32 {v} to i64\n"));
+    } else {
+        body.push_str(&format!("  {r} = trunc i64 {v} to i32\n")); // i64 → i32
+    }
+    r
+}
+
 fn emit_bin(body: &mut String, tmp: &mut usize, op: BinOp, ty: LTy, a: &str, b: &str) -> String {
     use BinOp::*;
     if ty == LTy::F64 {
@@ -269,9 +315,23 @@ fn emit_bin(body: &mut String, tmp: &mut usize, op: BinOp, ty: LTy, a: &str, b: 
             }
         };
     }
+    // Integer path. `w` is the operand width (i32 or i64); signedness picks
+    // sdiv/udiv, ashr/lshr, and slt/ult comparison codes.
+    let w = llname(ty);
+    let sgned = signed(ty);
+    let mask = if w == "i32" { 31 } else { 63 };
     let bin = |body: &mut String, tmp: &mut usize, mn: &str| {
         let r = fresh(tmp);
-        body.push_str(&format!("  {r} = {mn} i64 {a}, {b}\n"));
+        body.push_str(&format!("  {r} = {mn} {w} {a}, {b}\n"));
+        r
+    };
+    // Shift amount must be masked to the width (LLVM shl/shr are poison if the
+    // amount is >= the bit width; the VM and Cranelift mask it the same way).
+    let shift = |body: &mut String, tmp: &mut usize, mn: &str| {
+        let bm = fresh(tmp);
+        body.push_str(&format!("  {bm} = and {w} {b}, {mask}\n"));
+        let r = fresh(tmp);
+        body.push_str(&format!("  {r} = {mn} {w} {a}, {bm}\n"));
         r
     };
     let logical = |body: &mut String, tmp: &mut usize, mn: &str| {
@@ -289,19 +349,19 @@ fn emit_bin(body: &mut String, tmp: &mut usize, op: BinOp, ty: LTy, a: &str, b: 
         Add => bin(body, tmp, "add"),
         Sub => bin(body, tmp, "sub"),
         Mul => bin(body, tmp, "mul"),
-        Div => bin(body, tmp, "sdiv"),
-        Mod => bin(body, tmp, "srem"),
+        Div => bin(body, tmp, if sgned { "sdiv" } else { "udiv" }),
+        Mod => bin(body, tmp, if sgned { "srem" } else { "urem" }),
         BitAnd => bin(body, tmp, "and"),
         BitOr => bin(body, tmp, "or"),
         BitXor => bin(body, tmp, "xor"),
-        Shl => bin(body, tmp, "shl"),
-        Shr => bin(body, tmp, "ashr"),
-        Eq => cmp(body, tmp, "icmp", "eq", "i64", a, b),
-        Ne => cmp(body, tmp, "icmp", "ne", "i64", a, b),
-        Lt => cmp(body, tmp, "icmp", "slt", "i64", a, b),
-        Le => cmp(body, tmp, "icmp", "sle", "i64", a, b),
-        Gt => cmp(body, tmp, "icmp", "sgt", "i64", a, b),
-        Ge => cmp(body, tmp, "icmp", "sge", "i64", a, b),
+        Shl => shift(body, tmp, "shl"),
+        Shr => shift(body, tmp, if sgned { "ashr" } else { "lshr" }),
+        Eq => cmp(body, tmp, "icmp", "eq", w, a, b),
+        Ne => cmp(body, tmp, "icmp", "ne", w, a, b),
+        Lt => cmp(body, tmp, "icmp", if sgned { "slt" } else { "ult" }, w, a, b),
+        Le => cmp(body, tmp, "icmp", if sgned { "sle" } else { "ule" }, w, a, b),
+        Gt => cmp(body, tmp, "icmp", if sgned { "sgt" } else { "ugt" }, w, a, b),
+        Ge => cmp(body, tmp, "icmp", if sgned { "sge" } else { "uge" }, w, a, b),
         And => logical(body, tmp, "and"),
         Or => logical(body, tmp, "or"),
     }
@@ -348,19 +408,7 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
             }
             Instr::Cast { dst, src, to } => {
                 let sv = load(&mut s, &mut tmp, &rty, *src);
-                let from = rty[*src as usize];
-                let tol = lty_of(*to);
-                let r = if from == LTy::I64 && tol == LTy::F64 {
-                    let t = fresh(&mut tmp);
-                    s.push_str(&format!("  {t} = sitofp i64 {sv} to double\n"));
-                    t
-                } else if from == LTy::F64 && tol == LTy::I64 {
-                    let t = fresh(&mut tmp);
-                    s.push_str(&format!("  {t} = call i64 @llvm.fptosi.sat.i64.f64(double {sv})\n"));
-                    t
-                } else {
-                    sv
-                };
+                let r = emit_cast(&mut s, &mut tmp, rty[*src as usize], lty_of(*to), &sv);
                 store(&mut s, &rty, *dst, &r);
             }
             Instr::Mov { dst, src } => {
@@ -461,10 +509,17 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 term = true;
             }
             Instr::Print { a } => {
+                let aty = rty[*a as usize];
                 let v = load(&mut s, &mut tmp, &rty, *a);
-                match rty[*a as usize] {
+                match aty {
                     LTy::Str => s.push_str(&format!("  call void @zipp_print_str(ptr {v})\n")),
                     LTy::F64 => s.push_str(&format!("  call void @zipp_print_f64(double {v})\n")),
+                    LTy::U64 => s.push_str(&format!("  call void @zipp_print_u64(i64 {v})\n")),
+                    LTy::I32 | LTy::U32 => {
+                        // widen to i64 (sext signed / zext unsigned) for the printer
+                        let w = emit_cast(&mut s, &mut tmp, aty, LTy::I64, &v);
+                        s.push_str(&format!("  call void @zipp_print_i64(i64 {w})\n"));
+                    }
                     _ => s.push_str(&format!("  call void @zipp_print_i64(i64 {v})\n")),
                 }
             }
@@ -663,6 +718,9 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     out.push_str("; ZIPP → LLVM IR (release tier; runtime linked from zipp-rt)\n");
     out.push_str("declare i32 @clock()\n"); // Windows: clock_t = long = i32, CLOCKS_PER_SEC = 1000
     out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n");
+    out.push_str("declare i32 @llvm.fptosi.sat.i32.f64(double)\n");
+    out.push_str("declare i64 @llvm.fptoui.sat.i64.f64(double)\n");
+    out.push_str("declare i32 @llvm.fptoui.sat.i32.f64(double)\n");
     // Math-builtin intrinsics (LLVM lowers these to the right instruction or a
     // libm call; minnum/maxnum match Rust's f64::min/max NaN handling).
     out.push_str("declare i64 @llvm.abs.i64(i64, i1)\n");
@@ -684,9 +742,11 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     out.push_str("declare i64 @zipp_str_eq(ptr, ptr)\n");
     out.push_str("declare i64 @zipp_ipow(i64, i64)\n");
     out.push_str("declare void @zipp_print_i64(i64)\n");
+    out.push_str("declare void @zipp_print_u64(i64)\n");
     out.push_str("declare void @zipp_print_f64(double)\n");
     out.push_str("declare void @zipp_print_str(ptr)\n");
     out.push_str("declare void @zipp_emit_result_i64(i64)\n");
+    out.push_str("declare void @zipp_emit_result_u64(i64)\n");
     out.push_str("declare void @zipp_emit_result_f64(double)\n");
     out.push_str("declare void @zipp_emit_time_ms(i64)\n\n");
 
@@ -730,6 +790,15 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     match ret {
         LTy::F64 => out.push_str("  call void @zipp_emit_result_f64(double %r)\n"),
         LTy::I64 => out.push_str("  call void @zipp_emit_result_i64(i64 %r)\n"),
+        LTy::U64 => out.push_str("  call void @zipp_emit_result_u64(i64 %r)\n"),
+        LTy::I32 => {
+            out.push_str("  %rw = sext i32 %r to i64\n");
+            out.push_str("  call void @zipp_emit_result_i64(i64 %rw)\n");
+        }
+        LTy::U32 => {
+            out.push_str("  %rw = zext i32 %r to i64\n");
+            out.push_str("  call void @zipp_emit_result_i64(i64 %rw)\n");
+        }
         _ => {
             // array/string/struct return: report the handle as an integer
             out.push_str("  %ri = ptrtoint ptr %r to i64\n");

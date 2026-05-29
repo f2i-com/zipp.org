@@ -18,17 +18,26 @@ pub enum Value {
     Arr(usize),
     Str(usize),
     Struct { id: u32, ptr: usize },
+    // Sized integers (reached via casts).
+    I32(i32),
+    U32(u32),
+    U64(u64),
 }
 
 impl Value {
     fn is_zero(self) -> bool {
         match self {
             Value::I64(x) => x == 0,
+            Value::I32(x) => x == 0,
+            Value::U32(x) => x == 0,
+            Value::U64(x) => x == 0,
             Value::F64(f) => f == 0.0,
             Value::Arr(_) | Value::Str(_) | Value::Struct { .. } => false,
         }
     }
-    /// The i64 payload, or `None` for non-integers.
+    /// The i64 payload, or `None` for non-`i64` values. (Array index / repeat
+    /// count are checked to be `i64`, and `--prove` rejects sized ints, so this
+    /// is only ever asked of genuine `i64` values.)
     pub fn as_i64(self) -> Option<i64> {
         match self {
             Value::I64(x) => Some(x),
@@ -36,11 +45,14 @@ impl Value {
         }
     }
     /// i64 view for trace columns. Only reached for `I64` under trace recording
-    /// (f64/arrays/strings are gated out), so this is exact there.
+    /// (everything else is gated out), so this is exact there.
     fn trace_i64(self) -> i64 {
         match self {
             Value::I64(x) => x,
             Value::F64(f) => f as i64,
+            Value::I32(x) => x as i64,
+            Value::U32(x) => x as i64,
+            Value::U64(x) => x as i64,
             Value::Arr(_) | Value::Str(_) | Value::Struct { .. } => 0,
         }
     }
@@ -50,6 +62,9 @@ impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::I64(x) => write!(f, "{x}"),
+            Value::I32(x) => write!(f, "{x}"),
+            Value::U32(x) => write!(f, "{x}"),
+            Value::U64(x) => write!(f, "{x}"),
             Value::F64(v) => write!(f, "{v}"),
             Value::Arr(_) => write!(f, "[array]"),
             Value::Str(_) => write!(f, "[str]"),
@@ -155,7 +170,8 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 reg[base + *dst as usize] = Value::Str(i);
             }
             Instr::Cast { dst, src, to } => {
-                if record_trace && *to == Type::F64 {
+                // The zk profile is i64-only: f64 and sized ints are gated out.
+                if record_trace && matches!(to, Type::F64 | Type::I32 | Type::U32 | Type::U64) {
                     return Err(ZK_INT_ONLY.into());
                 }
                 let v = reg[base + *src as usize];
@@ -363,12 +379,52 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
     }
 }
 
+/// Numeric cast, with Rust `as` semantics (truncate on narrowing, sign/zero
+/// extend per source signedness on widening, saturating float→int). The native
+/// backends mirror this exactly.
 fn cast(v: Value, to: Type) -> Value {
-    match (v, to) {
-        (Value::I64(x), Type::F64) => Value::F64(x as f64),
-        (Value::F64(f), Type::I64) => Value::I64(f as i64),
-        // identity (same-type cast); cast-to-bool is rejected by the checker.
-        (other, _) => other,
+    use Type as T;
+    use Value as V;
+    // A common i64 view (sign- or zero-extended per source signedness) and an
+    // f64 view make the target conversions uniform.
+    let as_i64 = match v {
+        V::I64(x) => x,
+        V::I32(x) => x as i64,
+        V::U32(x) => x as i64,
+        V::U64(x) => x as i64,
+        V::F64(_) => 0, // handled per-target below
+        _ => return v,  // non-numeric (checker prevents)
+    };
+    match to {
+        T::F64 => V::F64(match v {
+            V::F64(f) => f,
+            V::I64(x) => x as f64,
+            V::I32(x) => x as f64,
+            V::U32(x) => x as f64,
+            V::U64(x) => x as f64,
+            _ => return v,
+        }),
+        T::I64 => V::I64(match v {
+            V::F64(f) => f as i64,
+            _ => as_i64,
+        }),
+        T::I32 => V::I32(match v {
+            V::F64(f) => f as i32,
+            _ => as_i64 as i32,
+        }),
+        T::U32 => V::U32(match v {
+            V::F64(f) => f as u32,
+            V::U64(x) => x as u32,
+            _ => as_i64 as u32,
+        }),
+        T::U64 => V::U64(match v {
+            V::F64(f) => f as u64,
+            V::U64(x) => x,
+            V::U32(x) => x as u64,
+            // signed sources reinterpret their two's-complement bits as u64
+            _ => as_i64 as u64,
+        }),
+        _ => v, // non-numeric target (checker prevents)
     }
 }
 
@@ -383,6 +439,9 @@ fn array_ref(v: Value) -> Result<usize, String> {
 fn render(v: Value, strs: &[String]) -> String {
     match v {
         Value::I64(x) => x.to_string(),
+        Value::I32(x) => x.to_string(),
+        Value::U32(x) => x.to_string(),
+        Value::U64(x) => x.to_string(),
         Value::F64(f) => f.to_string(),
         Value::Str(i) => strs[i].clone(),
         Value::Arr(_) => "[array]".to_string(),
@@ -435,9 +494,15 @@ fn eval_builtin(op: BuiltinOp, args: &[Value]) -> Result<Value, String> {
 fn eval_un(op: UnOp, a: Value) -> Result<Value, String> {
     Ok(match (op, a) {
         (UnOp::Neg, Value::I64(x)) => Value::I64(x.wrapping_neg()),
+        (UnOp::Neg, Value::I32(x)) => Value::I32(x.wrapping_neg()),
+        (UnOp::Neg, Value::U32(x)) => Value::U32(x.wrapping_neg()),
+        (UnOp::Neg, Value::U64(x)) => Value::U64(x.wrapping_neg()),
         (UnOp::Neg, Value::F64(f)) => Value::F64(-f),
         (UnOp::Not, Value::I64(x)) => Value::I64((x == 0) as i64),
         (UnOp::BitNot, Value::I64(x)) => Value::I64(!x),
+        (UnOp::BitNot, Value::I32(x)) => Value::I32(!x),
+        (UnOp::BitNot, Value::U32(x)) => Value::U32(!x),
+        (UnOp::BitNot, Value::U64(x)) => Value::U64(!x),
         _ => return Err(format!("runtime error: unary {op:?} on {a:?}")),
     })
 }
@@ -445,8 +510,11 @@ fn eval_un(op: UnOp, a: Value) -> Result<Value, String> {
 fn eval_bin(op: BinOp, a: Value, b: Value) -> Result<Value, String> {
     match (a, b) {
         (Value::I64(x), Value::I64(y)) => eval_i64(op, x, y),
+        (Value::I32(x), Value::I32(y)) => eval_i32(op, x, y),
+        (Value::U32(x), Value::U32(y)) => eval_u32(op, x, y),
+        (Value::U64(x), Value::U64(y)) => eval_u64(op, x, y),
         (Value::F64(x), Value::F64(y)) => eval_f64(op, x, y),
-        _ => Err("runtime error: mixed i64/f64 operands (use a cast)".into()),
+        _ => Err("runtime error: mismatched numeric operands (use a cast)".into()),
     }
 }
 
@@ -482,6 +550,105 @@ fn eval_i64(op: BinOp, a: i64, b: i64) -> Result<Value, String> {
         Shl => a.wrapping_shl(b as u32),
         Shr => a.wrapping_shr(b as u32),
     }))
+}
+
+fn eval_i32(op: BinOp, a: i32, b: i32) -> Result<Value, String> {
+    use BinOp::*;
+    Ok(match op {
+        Add => Value::I32(a.wrapping_add(b)),
+        Sub => Value::I32(a.wrapping_sub(b)),
+        Mul => Value::I32(a.wrapping_mul(b)),
+        Div => {
+            if b == 0 {
+                return Err("runtime error: division by zero".into());
+            }
+            Value::I32(a.wrapping_div(b))
+        }
+        Mod => {
+            if b == 0 {
+                return Err("runtime error: modulo by zero".into());
+            }
+            Value::I32(a.wrapping_rem(b))
+        }
+        BitAnd => Value::I32(a & b),
+        BitOr => Value::I32(a | b),
+        BitXor => Value::I32(a ^ b),
+        Shl => Value::I32(a.wrapping_shl(b as u32)),
+        Shr => Value::I32(a.wrapping_shr(b as u32)),
+        Eq => Value::I64((a == b) as i64),
+        Ne => Value::I64((a != b) as i64),
+        Lt => Value::I64((a < b) as i64),
+        Le => Value::I64((a <= b) as i64),
+        Gt => Value::I64((a > b) as i64),
+        Ge => Value::I64((a >= b) as i64),
+        And | Or => return Err(format!("runtime error: operator {op:?} is not valid on i32")),
+    })
+}
+
+fn eval_u32(op: BinOp, a: u32, b: u32) -> Result<Value, String> {
+    use BinOp::*;
+    Ok(match op {
+        Add => Value::U32(a.wrapping_add(b)),
+        Sub => Value::U32(a.wrapping_sub(b)),
+        Mul => Value::U32(a.wrapping_mul(b)),
+        Div => {
+            if b == 0 {
+                return Err("runtime error: division by zero".into());
+            }
+            Value::U32(a / b)
+        }
+        Mod => {
+            if b == 0 {
+                return Err("runtime error: modulo by zero".into());
+            }
+            Value::U32(a % b)
+        }
+        BitAnd => Value::U32(a & b),
+        BitOr => Value::U32(a | b),
+        BitXor => Value::U32(a ^ b),
+        Shl => Value::U32(a.wrapping_shl(b)),
+        Shr => Value::U32(a.wrapping_shr(b)),
+        Eq => Value::I64((a == b) as i64),
+        Ne => Value::I64((a != b) as i64),
+        Lt => Value::I64((a < b) as i64),
+        Le => Value::I64((a <= b) as i64),
+        Gt => Value::I64((a > b) as i64),
+        Ge => Value::I64((a >= b) as i64),
+        And | Or => return Err(format!("runtime error: operator {op:?} is not valid on u32")),
+    })
+}
+
+fn eval_u64(op: BinOp, a: u64, b: u64) -> Result<Value, String> {
+    use BinOp::*;
+    Ok(match op {
+        Add => Value::U64(a.wrapping_add(b)),
+        Sub => Value::U64(a.wrapping_sub(b)),
+        Mul => Value::U64(a.wrapping_mul(b)),
+        Div => {
+            if b == 0 {
+                return Err("runtime error: division by zero".into());
+            }
+            Value::U64(a / b)
+        }
+        Mod => {
+            if b == 0 {
+                return Err("runtime error: modulo by zero".into());
+            }
+            Value::U64(a % b)
+        }
+        BitAnd => Value::U64(a & b),
+        BitOr => Value::U64(a | b),
+        BitXor => Value::U64(a ^ b),
+        Shl => Value::U64(a.wrapping_shl(b as u32)),
+        Shr => Value::U64(a.wrapping_shr(b as u32)),
+        Eq => Value::I64((a == b) as i64),
+        Ne => Value::I64((a != b) as i64),
+        Lt => Value::I64((a < b) as i64),
+        Le => Value::I64((a <= b) as i64),
+        Gt => Value::I64((a > b) as i64),
+        Ge => Value::I64((a >= b) as i64),
+        And | Or => return Err(format!("runtime error: operator {op:?} is not valid on u64")),
+    })
 }
 
 fn eval_f64(op: BinOp, a: f64, b: f64) -> Result<Value, String> {

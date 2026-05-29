@@ -117,6 +117,9 @@ impl<'a> Parser<'a> {
             Tok::TyF64 => Ok(Type::F64),
             Tok::TyBool => Ok(Type::Bool),
             Tok::TyStr => Ok(Type::Str),
+            Tok::TyI32 => Ok(Type::I32),
+            Tok::TyU32 => Ok(Type::U32),
+            Tok::TyU64 => Ok(Type::U64),
             Tok::LBracket => {
                 let inner = self.ty()?;
                 self.expect(&Tok::RBracket)?;
@@ -512,6 +515,14 @@ impl<'a> Parser<'a> {
         Ok(e)
     }
 
+    /// Parse `(expr)` after a type keyword and build a cast to `to`.
+    fn cast_to(&mut self, to: Type) -> Result<Expr, String> {
+        self.expect(&Tok::LParen)?;
+        let e = self.expr()?;
+        self.expect(&Tok::RParen)?;
+        Ok(Expr::Cast { to, e: Box::new(e) })
+    }
+
     fn primary(&mut self) -> Result<Expr, String> {
         let pos = self.at();
         match self.bump()? {
@@ -520,19 +531,12 @@ impl<'a> Parser<'a> {
             Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
-            // Casts: `i64(expr)` / `f64(expr)`.
-            Tok::TyI64 => {
-                self.expect(&Tok::LParen)?;
-                let e = self.expr()?;
-                self.expect(&Tok::RParen)?;
-                Ok(Expr::Cast { to: Type::I64, e: Box::new(e) })
-            }
-            Tok::TyF64 => {
-                self.expect(&Tok::LParen)?;
-                let e = self.expr()?;
-                self.expect(&Tok::RParen)?;
-                Ok(Expr::Cast { to: Type::F64, e: Box::new(e) })
-            }
+            // Casts: `i64(expr)` / `f64(expr)` / `i32(expr)` / `u32(expr)` / `u64(expr)`.
+            Tok::TyI64 => self.cast_to(Type::I64),
+            Tok::TyF64 => self.cast_to(Type::F64),
+            Tok::TyI32 => self.cast_to(Type::I32),
+            Tok::TyU32 => self.cast_to(Type::U32),
+            Tok::TyU64 => self.cast_to(Type::U64),
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(&Tok::RParen)?;

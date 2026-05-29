@@ -56,11 +56,20 @@ pub fn check(m: &Module) -> Result<(), String> {
             return Err(format!("type error: struct '{}' redefined", sd.name));
         }
         let mut seen_fields = std::collections::HashSet::new();
-        for (fname, _) in &sd.fields {
+        for (fname, fty) in &sd.fields {
             if !seen_fields.insert(fname.as_str()) {
                 return Err(format!(
                     "type error: struct '{}' has a duplicate field '{}'",
                     sd.name, fname
+                ));
+            }
+            // v0: sized integers aren't yet supported as struct fields (the
+            // native backends would need width-aware field slots). Use i64.
+            if matches!(fty, Type::I32 | Type::U32 | Type::U64) {
+                return Err(format!(
+                    "type error: struct '{}' field '{fname}': sized integers \
+                     aren't supported as struct fields yet (use i64)",
+                    sd.name
                 ));
             }
         }
@@ -203,7 +212,7 @@ fn check_stmt_kind(
         }
         StmtKind::Print(e) => {
             let t = type_of(e, scope, cx)?;
-            if t != Type::I64 && t != Type::F64 && t != Type::Str {
+            if !t.is_numeric() && t != Type::Str {
                 return Err(format!("type error: print expects a number or string, found {t:?}"));
             }
             Ok(())
@@ -259,7 +268,7 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
             .ok_or_else(|| format!("type error: use of undeclared variable '{name}'")),
         Expr::Cast { to, e } => {
             let t = type_of(e, scope, cx)?;
-            if t == Type::I64 || t == Type::F64 {
+            if t.is_numeric() && to.is_numeric() {
                 Ok(*to)
             } else {
                 Err(format!("type error: cannot cast {t:?} to {to:?} (numbers only)"))
@@ -350,8 +359,8 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
         Expr::Unary { op, e } => {
             let t = type_of(e, scope, cx)?;
             match op {
-                UnOp::Neg if t == Type::I64 || t == Type::F64 => Ok(t),
-                UnOp::BitNot if t == Type::I64 => Ok(Type::I64),
+                UnOp::Neg if t.is_numeric() => Ok(t),
+                UnOp::BitNot if t.is_int() => Ok(t),
                 UnOp::Not if t == Type::Bool => Ok(Type::Bool),
                 _ => Err(format!("type error: unary {op:?} on {t:?}")),
             }
@@ -368,7 +377,7 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                     _ => Err(format!("type error: operator {op:?} is not valid on strings")),
                 };
             }
-            let numeric = |t: Type| t == Type::I64 || t == Type::F64;
+            let numeric = |t: Type| t.is_numeric();
             match op {
                 // +, -, *, / work on i64 OR f64 (operands must match — no implicit mixing).
                 Add | Sub | Mul | Div => {
@@ -378,10 +387,10 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                         Err(format!("type error: arithmetic {op:?} on {lt:?} and {rt:?}"))
                     }
                 }
-                // %, bitwise and shifts are integer-only.
+                // %, bitwise and shifts are integer-only (operands same int type).
                 Mod | BitAnd | BitOr | BitXor | Shl | Shr => {
-                    if lt == Type::I64 && rt == Type::I64 {
-                        Ok(Type::I64)
+                    if lt == rt && lt.is_int() {
+                        Ok(lt)
                     } else {
                         Err(format!("type error: integer op {op:?} on {lt:?} and {rt:?}"))
                     }

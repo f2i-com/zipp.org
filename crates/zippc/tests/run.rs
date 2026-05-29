@@ -49,6 +49,40 @@ fn bitwise_and_shift() {
 }
 
 #[test]
+fn sized_integers() {
+    // u32 wrapping add (5e9 mod 2^32), unsigned compare, unsigned div
+    assert_eq!(
+        result("fn main(): i64 { let a = u32(4000000000); let b = u32(1000000000); return i64(a + b); }"),
+        705032704
+    );
+    assert_eq!(
+        result("fn main(): i64 { let a = u32(3000000000); if (a > u32(1)) { return 1; } return 0; }"),
+        1
+    );
+    assert_eq!(
+        result("fn main(): i64 { return i64(u32(4000000000) / u32(2)); }"),
+        2000000000
+    );
+    // i32 signed overflow wraps to MIN; narrowing keeps low 32 bits
+    assert_eq!(
+        result("fn main(): i64 { return i64(i32(2147483647) + i32(1)); }"),
+        -2147483648
+    );
+    assert_eq!(result("fn main(): i64 { return i64(u32(4294967297)); }"), 1);
+    // u64 arithmetic; u32 logical shift
+    assert_eq!(
+        result("fn main(): i64 { return i64(u64(10000000000) * u64(2)); }"),
+        20000000000
+    );
+    assert_eq!(result("fn main(): i64 { return i64(u32(1) << u32(31)); }"), 2147483648);
+    // print uses unsigned formatting for u32/u64 (u64::MAX via 0 - 1 wrapping)
+    assert_eq!(
+        output("fn main(): i64 { print(u32(3000000000)); print(u64(0) - u64(1)); return 0; }"),
+        vec!["3000000000".to_string(), "18446744073709551615".to_string()]
+    );
+}
+
+#[test]
 fn short_circuit_and_avoids_div_by_zero() {
     // If `&&` were eager, `10 / x` would divide by zero and error.
     let src = "fn main(): i64 { let x = 0; let r = 5; if (x != 0 && 10 / x > 0) { r = 1; } return r; }";

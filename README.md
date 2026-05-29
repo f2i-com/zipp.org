@@ -26,6 +26,9 @@ with `--no-default-features` and the language still runs.
   no implicit coercions, arity/return checking)
 - **`f64` floating-point** with `i64()` / `f64()` casts (the zk profile stays
   integer-only — `--prove` rejects f64, per PLAN.md §7)
+- **Sized integers** `i32` / `u32` / `u64` (default is `i64`), reached via casts
+  (`u32(e)` …) with Rust `as` semantics — wrapping arithmetic, signed/unsigned
+  div/compare/shift, exact across interpreter/`--jit`/`--llvm` (see `examples/fnv.zipp`)
 - **Lexical block scoping with shadowing**; `while` / **`for`** loops,
   `break` / `continue`; **short-circuit** `&&` / `||`
 - Full operator set incl. **bitwise/shift** `& | ^ << >> ~`
@@ -53,14 +56,13 @@ with `--no-default-features` and the language still runs.
   statement line (e.g. `type error: arithmetic Add on I64 and Bool [line 2]`)
 
 🚧 Roadmap (see `../ZIPP.md` for the full plan):
-- Types: sized integers (`i32`/`u32`/`u64`)
 - Runtime-error positions (bytecode → source mapping; compile errors are done)
 - Frontend: swap the hand-written parser for **oxc/SWC** (real TS/JSX)
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
 - Backends: **Cranelift** tier-0 JIT and an **LLVM** release tier (`clang -O3`)
   — the **whole language** compiles natively (matches V8 on dense f64; beats
   V8/Bun on matmul), and **both share one runtime with a conservative mark-sweep
-  GC** (`zipp-rt`). Next: LTO/PGO, sized integers, and a **WASM-contract** target
+  GC** (`zipp-rt`). Next: LTO/PGO and a **WASM-contract** target
 - Parallel work-stealing scheduler (the §5.8 flagship), GC/arenas, fast stdlib
 - zk hardening: PC-integrity + memory-permutation arguments, 64-bit range checks
 
@@ -79,6 +81,7 @@ cargo build --release
 ./target/release/zipp run examples/fizzbuzz.zipp    # for + % + else-if + strings
 ./target/release/zipp run examples/math.zipp        # abs/min/max/pow/sqrt/floor/ceil
 ./target/release/zipp run examples/structs.zipp     # records + field access
+./target/release/zipp run examples/fnv.zipp          # 32-bit FNV-1a hash (u32 wrapping)
 
 # run the language test suite
 cargo test
@@ -130,7 +133,7 @@ zipp-lang/
 │   ├── zipp-jit/     # OPTIONAL native backend (Cranelift JIT, tier-0)
 │   ├── zipp-llvm/    # OPTIONAL release tier (emit LLVM IR, compile with clang -O3)
 │   └── zipp-cli/     # the `zipp` binary
-└── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz, math, structs
+└── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz, math, structs, fnv
 ```
 
 The modules inside `zippc` map onto the separate crates in `../ZIPP.md §15`

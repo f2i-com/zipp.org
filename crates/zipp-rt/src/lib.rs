@@ -33,6 +33,12 @@ pub extern "C" fn zipp_print_i64(x: i64) {
 pub extern "C" fn zipp_print_f64(x: f64) {
     println!("{x}");
 }
+/// Unsigned 64-bit print (i32/u32/i64 widen to i64 and use `zipp_print_i64`;
+/// only u64 needs an unsigned channel — its bits would print negative as i64).
+#[no_mangle]
+pub extern "C" fn zipp_print_u64(x: u64) {
+    println!("{x}");
+}
 #[no_mangle]
 pub extern "C" fn zipp_print_str(s: i64) {
     // SAFETY: s is a valid string block (make_str / leak_str_blob / a literal).
@@ -44,6 +50,10 @@ pub extern "C" fn zipp_print_str(s: i64) {
 // as `print` so program output and markers stay correctly ordered.
 #[no_mangle]
 pub extern "C" fn zipp_emit_result_i64(x: i64) {
+    println!("__ZRESULT__:{x}");
+}
+#[no_mangle]
+pub extern "C" fn zipp_emit_result_u64(x: u64) {
     println!("__ZRESULT__:{x}");
 }
 #[no_mangle]

@@ -38,6 +38,7 @@ use zippc::ir::{BuiltinOp, FuncMeta, Instr, Program};
 #[derive(Clone, Copy)]
 struct RuntimeIds {
     print_i64: FuncId,
+    print_u64: FuncId,
     print_f64: FuncId,
     print_str: FuncId,
     alloc: FuncId,
@@ -48,10 +49,12 @@ struct RuntimeIds {
     ipow: FuncId,
 }
 
-/// Result of a JIT'd `main`.
+/// Result of a JIT'd `main`. `U64` is separate so a u64 result prints unsigned
+/// (i32/u32 main returns widen into `I64` with the correct value).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JitValue {
     I64(i64),
+    U64(u64),
     F64(f64),
 }
 
@@ -59,6 +62,7 @@ impl std::fmt::Display for JitValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JitValue::I64(x) => write!(f, "{x}"),
+            JitValue::U64(x) => write!(f, "{x}"),
             JitValue::F64(v) => write!(f, "{v}"),
         }
     }
@@ -74,12 +78,15 @@ pub struct JitOutcome {
     pub execute: Duration,
 }
 
-/// The JIT type of a register. Arrays are pointers (Cranelift type `i64`); the
-/// bool carried by `Arr` records whether the *elements* are f64 (so loads/stores
-/// know whether to bit-reinterpret).
+/// The JIT type of a register. `I32`/`U32` are Cranelift `i32`; everything else
+/// (incl. `i64`/`u64`, bool, and array/string/struct pointers) is `i64`. The
+/// signedness distinguishes `sdiv`/`udiv`, `slt`/`ult`, `sext`/`uext`, etc.
 #[derive(Clone, Copy, PartialEq)]
 enum JTy {
     I64,
+    I32,
+    U32,
+    U64,
     F64,
     Arr(bool),
     Str,
@@ -88,11 +95,18 @@ enum JTy {
 
 impl JTy {
     fn clif(self) -> ClifType {
-        if matches!(self, JTy::F64) {
-            types::F64
-        } else {
-            types::I64 // i64, bool, and array/string/struct pointers
+        match self {
+            JTy::F64 => types::F64,
+            JTy::I32 | JTy::U32 => types::I32,
+            _ => types::I64, // i64, u64, bool, array/string/struct pointers
         }
+    }
+    fn is_int(self) -> bool {
+        matches!(self, JTy::I64 | JTy::I32 | JTy::U32 | JTy::U64)
+    }
+    /// Among integers, whether the type is signed (i32/i64).
+    fn signed(self) -> bool {
+        matches!(self, JTy::I64 | JTy::I32)
     }
     fn arr_f64(self) -> bool {
         matches!(self, JTy::Arr(true))
@@ -111,7 +125,10 @@ fn jty_of(t: Type) -> JTy {
         Type::Array(e) => JTy::Arr(matches!(e, Elem::F64)),
         Type::Str => JTy::Str,
         Type::Struct(id) => JTy::Struct(id),
-        _ => JTy::I64,
+        Type::I32 => JTy::I32,
+        Type::U32 => JTy::U32,
+        Type::U64 => JTy::U64,
+        _ => JTy::I64, // i64, bool
     }
 }
 
@@ -179,6 +196,7 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
         .map_err(|e| format!("isa finish: {e}"))?;
     let mut jit = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     jit.symbol("zipp_print_i64", zipp_rt::zipp_print_i64 as *const u8);
+    jit.symbol("zipp_print_u64", zipp_rt::zipp_print_u64 as *const u8);
     jit.symbol("zipp_print_f64", zipp_rt::zipp_print_f64 as *const u8);
     jit.symbol("zipp_print_str", zipp_rt::zipp_print_str as *const u8);
     jit.symbol("zipp_alloc", zipp_rt::zipp_alloc as *const u8);
@@ -211,6 +229,7 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     };
     let rt = RuntimeIds {
         print_i64: import(&mut module, "zipp_print_i64", &[types::I64], None)?,
+        print_u64: import(&mut module, "zipp_print_u64", &[types::I64], None)?,
         print_f64: import(&mut module, "zipp_print_f64", &[types::F64], None)?,
         print_str: import(&mut module, "zipp_print_str", &[types::I64], None)?,
         alloc: import(&mut module, "zipp_alloc", &[types::I64], Some(types::I64))?,
@@ -252,14 +271,29 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     std::hint::black_box(&anchor);
 
     let e0 = Instant::now();
-    // SAFETY: main takes no params; the signature was just finalized.
+    // SAFETY: main takes no params; read the result at its native width.
     let value = unsafe {
-        if main.ret == Type::F64 {
-            let f: extern "C" fn() -> f64 = std::mem::transmute(ptr);
-            JitValue::F64(f())
-        } else {
-            let f: extern "C" fn() -> i64 = std::mem::transmute(ptr);
-            JitValue::I64(f())
+        match jty_of(main.ret) {
+            JTy::F64 => {
+                let f: extern "C" fn() -> f64 = std::mem::transmute(ptr);
+                JitValue::F64(f())
+            }
+            JTy::I32 => {
+                let f: extern "C" fn() -> i32 = std::mem::transmute(ptr);
+                JitValue::I64(f() as i64) // sign-extend
+            }
+            JTy::U32 => {
+                let f: extern "C" fn() -> u32 = std::mem::transmute(ptr);
+                JitValue::I64(f() as i64) // zero-extend (value)
+            }
+            JTy::U64 => {
+                let f: extern "C" fn() -> u64 = std::mem::transmute(ptr);
+                JitValue::U64(f())
+            }
+            _ => {
+                let f: extern "C" fn() -> i64 = std::mem::transmute(ptr);
+                JitValue::I64(f())
+            }
         }
     };
     let execute = e0.elapsed();
@@ -281,9 +315,12 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
             Instr::Cast { dst, to, .. } => t[*dst as usize] = jty_of(*to),
             Instr::Mov { dst, src } => t[*dst as usize] = t[*src as usize],
             Instr::Bin { op, dst, a, .. } => {
+                use BinOp::*;
                 t[*dst as usize] = match op {
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => t[*a as usize],
-                    _ => JTy::I64, // comparisons (bool), mod/bitwise/shift
+                    // comparisons / logical → bool (i64 0/1)
+                    Eq | Ne | Lt | Le | Gt | Ge | And | Or => JTy::I64,
+                    // arithmetic / bitwise / shift → the operand type
+                    _ => t[*a as usize],
                 };
             }
             Instr::Unary { op, dst, a } => {
@@ -504,7 +541,7 @@ fn compile_function(
         let z = if rty[r as usize].clif() == types::F64 {
             builder.ins().f64const(0.0)
         } else {
-            builder.ins().iconst(types::I64, 0)
+            builder.ins().iconst(rty[r as usize].clif(), 0) // i32 or i64 zero
         };
         builder.def_var(var(r), z);
     }
@@ -542,15 +579,7 @@ fn compile_function(
             }
             Instr::Cast { dst, src, to } => {
                 let sval = builder.use_var(var(*src));
-                let src_ty = rty[*src as usize].clif();
-                let to_ty = clif_ty(*to);
-                let res = if src_ty == types::I64 && to_ty == types::F64 {
-                    builder.ins().fcvt_from_sint(types::F64, sval)
-                } else if src_ty == types::F64 && to_ty == types::I64 {
-                    builder.ins().fcvt_to_sint_sat(types::I64, sval)
-                } else {
-                    sval
-                };
+                let res = emit_cast(&mut builder, rty[*src as usize], jty_of(*to), sval);
                 builder.def_var(var(*dst), res);
             }
             Instr::Mov { dst, src } => {
@@ -585,7 +614,7 @@ fn compile_function(
                 } else {
                     let av = builder.use_var(var(*a));
                     let bv = builder.use_var(var(*b));
-                    emit_bin(&mut builder, *op, av, bv, rty[*a as usize].clif())
+                    emit_bin(&mut builder, *op, av, bv, rty[*a as usize])
                 };
                 builder.def_var(var(*dst), res);
             }
@@ -630,13 +659,24 @@ fn compile_function(
                 terminated = true;
             }
             Instr::Print { a } => {
-                let id = match rty[*a as usize] {
+                let aj = rty[*a as usize];
+                let mut av = builder.use_var(var(*a));
+                // Widen i32/u32 to i64 (sign/zero extend) so the i64 printer is
+                // correct; u64 needs the unsigned printer.
+                if aj.clif() == types::I32 {
+                    av = if aj.signed() {
+                        builder.ins().sextend(types::I64, av)
+                    } else {
+                        builder.ins().uextend(types::I64, av)
+                    };
+                }
+                let id = match aj {
                     JTy::Str => rt.print_str,
                     JTy::F64 => rt.print_f64,
+                    JTy::U64 => rt.print_u64,
                     _ => rt.print_i64,
                 };
                 let p = module.declare_func_in_func(id, builder.func);
-                let av = builder.use_var(var(*a));
                 builder.ins().call(p, &[av]);
             }
             Instr::ArrayLit { dst, elems } => {
@@ -794,14 +834,46 @@ fn compile_function(
     Ok(())
 }
 
-fn emit_bin(bld: &mut FunctionBuilder, op: BinOp, x: Value, y: Value, ty: ClifType) -> Value {
+/// Numeric cast with Rust `as` semantics (truncate / sign- or zero-extend per
+/// source signedness / saturating float↔int), mirroring the interpreter.
+fn emit_cast(b: &mut FunctionBuilder, from: JTy, to: JTy, v: Value) -> Value {
+    let (fc, tc) = (from.clif(), to.clif());
+    if fc == types::F64 && to.is_int() {
+        return if to.signed() {
+            b.ins().fcvt_to_sint_sat(tc, v)
+        } else {
+            b.ins().fcvt_to_uint_sat(tc, v)
+        };
+    }
+    if from.is_int() && tc == types::F64 {
+        return if from.signed() {
+            b.ins().fcvt_from_sint(types::F64, v)
+        } else {
+            b.ins().fcvt_from_uint(types::F64, v)
+        };
+    }
+    if fc == tc {
+        return v; // same clif width: signed↔unsigned reinterpret, or f64↔f64
+    }
+    if fc == types::I32 && tc == types::I64 {
+        if from.signed() {
+            b.ins().sextend(types::I64, v)
+        } else {
+            b.ins().uextend(types::I64, v)
+        }
+    } else {
+        b.ins().ireduce(types::I32, v) // i64 → i32 (truncate low 32)
+    }
+}
+
+fn emit_bin(bld: &mut FunctionBuilder, op: BinOp, x: Value, y: Value, ty: JTy) -> Value {
     use BinOp::*;
-    if ty == types::F64 {
+    if ty == JTy::F64 {
         let fc = |bld: &mut FunctionBuilder, cc: FloatCC| {
             let c = bld.ins().fcmp(cc, x, y);
             bld.ins().uextend(types::I64, c)
         };
-        match op {
+        return match op {
             Add => bld.ins().fadd(x, y),
             Sub => bld.ins().fsub(x, y),
             Mul => bld.ins().fmul(x, y),
@@ -813,43 +885,51 @@ fn emit_bin(bld: &mut FunctionBuilder, op: BinOp, x: Value, y: Value, ty: ClifTy
             Gt => fc(bld, FloatCC::GreaterThan),
             Ge => fc(bld, FloatCC::GreaterThanOrEqual),
             _ => bld.ins().iconst(types::I64, 0), // mod/bitwise/shift/&&/|| invalid on f64
-        }
-    } else {
-        let ic = |bld: &mut FunctionBuilder, cc: IntCC| {
-            let c = bld.ins().icmp(cc, x, y);
-            bld.ins().uextend(types::I64, c)
         };
-        match op {
-            Add => bld.ins().iadd(x, y),
-            Sub => bld.ins().isub(x, y),
-            Mul => bld.ins().imul(x, y),
-            Div => bld.ins().sdiv(x, y),
-            Mod => bld.ins().srem(x, y),
-            BitAnd => bld.ins().band(x, y),
-            BitOr => bld.ins().bor(x, y),
-            BitXor => bld.ins().bxor(x, y),
-            Shl => bld.ins().ishl(x, y),
-            Shr => bld.ins().sshr(x, y),
-            Eq => ic(bld, IntCC::Equal),
-            Ne => ic(bld, IntCC::NotEqual),
-            Lt => ic(bld, IntCC::SignedLessThan),
-            Le => ic(bld, IntCC::SignedLessThanOrEqual),
-            Gt => ic(bld, IntCC::SignedGreaterThan),
-            Ge => ic(bld, IntCC::SignedGreaterThanOrEqual),
-            And => {
-                let xn = bld.ins().icmp_imm(IntCC::NotEqual, x, 0);
-                let yn = bld.ins().icmp_imm(IntCC::NotEqual, y, 0);
-                let xe = bld.ins().uextend(types::I64, xn);
-                let ye = bld.ins().uextend(types::I64, yn);
-                bld.ins().band(xe, ye)
-            }
-            Or => {
-                let xn = bld.ins().icmp_imm(IntCC::NotEqual, x, 0);
-                let yn = bld.ins().icmp_imm(IntCC::NotEqual, y, 0);
-                let xe = bld.ins().uextend(types::I64, xn);
-                let ye = bld.ins().uextend(types::I64, yn);
-                bld.ins().bor(xe, ye)
-            }
+    }
+    let signed = ty.signed();
+    let ic = |bld: &mut FunctionBuilder, s: IntCC, u: IntCC| {
+        let c = bld.ins().icmp(if signed { s } else { u }, x, y);
+        bld.ins().uextend(types::I64, c)
+    };
+    use IntCC::*;
+    match op {
+        Add => bld.ins().iadd(x, y),
+        Sub => bld.ins().isub(x, y),
+        Mul => bld.ins().imul(x, y),
+        Div => {
+            if signed { bld.ins().sdiv(x, y) } else { bld.ins().udiv(x, y) }
+        }
+        Mod => {
+            if signed { bld.ins().srem(x, y) } else { bld.ins().urem(x, y) }
+        }
+        BitAnd => bld.ins().band(x, y),
+        BitOr => bld.ins().bor(x, y),
+        BitXor => bld.ins().bxor(x, y),
+        Shl => bld.ins().ishl(x, y), // Cranelift masks the shift mod width
+        Shr => {
+            if signed { bld.ins().sshr(x, y) } else { bld.ins().ushr(x, y) }
+        }
+        Eq => ic(bld, Equal, Equal),
+        Ne => ic(bld, NotEqual, NotEqual),
+        Lt => ic(bld, SignedLessThan, UnsignedLessThan),
+        Le => ic(bld, SignedLessThanOrEqual, UnsignedLessThanOrEqual),
+        Gt => ic(bld, SignedGreaterThan, UnsignedGreaterThan),
+        Ge => ic(bld, SignedGreaterThanOrEqual, UnsignedGreaterThanOrEqual),
+        // And/Or only ever see bool (i64 0/1) operands.
+        And => {
+            let xn = bld.ins().icmp_imm(NotEqual, x, 0);
+            let yn = bld.ins().icmp_imm(NotEqual, y, 0);
+            let xe = bld.ins().uextend(types::I64, xn);
+            let ye = bld.ins().uextend(types::I64, yn);
+            bld.ins().band(xe, ye)
+        }
+        Or => {
+            let xn = bld.ins().icmp_imm(NotEqual, x, 0);
+            let yn = bld.ins().icmp_imm(NotEqual, y, 0);
+            let xe = bld.ins().uextend(types::I64, xn);
+            let ye = bld.ins().uextend(types::I64, yn);
+            bld.ins().bor(xe, ye)
         }
     }
 }
@@ -987,6 +1067,42 @@ mod tests {
         assert_eq!(jit_i64(src), 19999900000 + 200000);
         let (collections, _live) = zipp_rt::gc_stats();
         assert!(collections > 0, "a 64KB threshold should have forced collections");
+    }
+
+    #[test]
+    fn sized_ints() {
+        // u32 wrapping add (5e9 mod 2^32)
+        assert_eq!(
+            jit_i64("fn main(): i64 { let a = u32(4000000000); let b = u32(1000000000); return i64(a + b); }"),
+            705032704
+        );
+        // UNSIGNED compare: as i32, 3e9 would be negative; as u32 it's > 1
+        assert_eq!(
+            jit_i64("fn main(): i64 { let a = u32(3000000000); if (a > u32(1)) { return 1; } return 0; }"),
+            1
+        );
+        // unsigned division
+        assert_eq!(
+            jit_i64("fn main(): i64 { let a = u32(4000000000); return i64(a / u32(2)); }"),
+            2000000000
+        );
+        // i32 signed overflow wraps to MIN
+        assert_eq!(
+            jit_i64("fn main(): i64 { let a = i32(2147483647); return i64(a + i32(1)); }"),
+            -2147483648
+        );
+        // narrowing cast keeps the low 32 bits: (2^32 + 1) as u32 = 1
+        assert_eq!(jit_i64("fn main(): i64 { return i64(u32(4294967297)); }"), 1);
+        // u64 arithmetic
+        assert_eq!(
+            jit_i64("fn main(): i64 { let a = u64(10000000000); return i64(a * u64(2)); }"),
+            20000000000
+        );
+        // u32 logical shift
+        assert_eq!(
+            jit_i64("fn main(): i64 { let a = u32(1); return i64(a << u32(31)); }"),
+            2147483648
+        );
     }
 
     #[test]
