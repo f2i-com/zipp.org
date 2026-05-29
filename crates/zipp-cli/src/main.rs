@@ -66,13 +66,23 @@ fn run_file(path: &str, prove: bool) -> Result<(), String> {
             .result
             .as_i64()
             .ok_or("internal: prove produced a non-integer result")?;
-        prove_and_verify(&result.trace, r)?;
+        prove_and_verify(&result.trace, r, hash_source(&src))?;
     }
     Ok(())
 }
 
+/// Deterministic FNV-1a hash of the source — binds a proof to a program.
+fn hash_source(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
 #[cfg(feature = "zk")]
-fn prove_and_verify(trace: &[zippc::TraceStep], result: i64) -> Result<(), String> {
+fn prove_and_verify(trace: &[zippc::TraceStep], result: i64, program_hash: u64) -> Result<(), String> {
     if trace.is_empty() {
         return Err("nothing to prove (empty trace)".into());
     }
@@ -93,7 +103,7 @@ fn prove_and_verify(trace: &[zippc::TraceStep], result: i64) -> Result<(), Strin
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let proved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        zipp_zk::prove(trace, result)
+        zipp_zk::prove(trace, result, program_hash)
     }));
     std::panic::set_hook(prev_hook);
     let (proof, pub_inputs) = match proved {
@@ -111,11 +121,16 @@ fn prove_and_verify(trace: &[zippc::TraceStep], result: i64) -> Result<(), Strin
 
     let t1 = Instant::now();
     zipp_zk::verify(&bytes, &pub_inputs)?;
-    println!("verified in {:.2?}  ✓ execution result {} is STARK-proven", t1.elapsed(), pub_inputs.result);
+    println!(
+        "verified in {:.2?}  ✓ result {} is STARK-proven, bound to program {:#018x}",
+        t1.elapsed(),
+        pub_inputs.result,
+        pub_inputs.program_hash
+    );
     Ok(())
 }
 
 #[cfg(not(feature = "zk"))]
-fn prove_and_verify(_trace: &[zippc::TraceStep], _result: i64) -> Result<(), String> {
+fn prove_and_verify(_trace: &[zippc::TraceStep], _result: i64, _program_hash: u64) -> Result<(), String> {
     Err("this build has no zk profile — rebuild with the `zk` feature".into())
 }

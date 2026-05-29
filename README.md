@@ -112,10 +112,11 @@ kept together for v0 and can be split as each gains weight.
 ## zk soundness boundary (v0 — honest)
 
 The v0 AIR constrains the **arithmetic** of the trace (`Const`/`Add`/`Sub`/`Mul`),
-selector booleanity/exclusivity, a monotonic clock, and a boundary assertion
-binding the final value to the public result. Control-flow / memory steps are
-recorded but **not yet** constrained (no PC-integrity or memory-permutation
-argument; no 64-bit range checks). Proven arithmetic must be non-negative and
+selector booleanity/exclusivity, a monotonic clock, a boundary assertion binding
+the final value to the public result, and a **program-hash binding** (a constant
+column tied to the public inputs, so a proof for one program won't verify as
+another). Control-flow / memory steps are recorded but **not yet** constrained
+(no PC-integrity or memory-permutation argument; no 64-bit range checks). Proven arithmetic must be non-negative and
 non-overflowing (true for the bundled examples). Hardening this is the roadmap —
 the same path `zk-formlogic` took to its 78-column trace.
 

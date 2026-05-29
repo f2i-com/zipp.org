@@ -20,11 +20,11 @@ and the Winterfell dependency entirely; the language still compiles and runs.
 3. `zipp run --prove <file>` runs, proves, and **verifies** the proof, reporting
    proof size and timings.
 
-### Trace columns (v0, width 10)
+### Trace columns (v0, width 11)
 
 ```
 0 clk | 1 sel_const | 2 sel_add | 3 sel_sub | 4 sel_mul | 5 sel_other
-6 a   | 7 b         | 8 dst     | 9 imm
+6 a   | 7 b         | 8 dst     | 9 imm      | 10 prog_hash
 ```
 
 ### AIR constraints (v0)
@@ -36,7 +36,9 @@ and the Winterfell dependency entirely; the language still compiles and runs.
 - **sel_add·(dst − a − b) = 0**
 - **sel_sub·(dst − a + b) = 0**
 - **sel_mul·(dst − a·b) = 0**
-- Boundary: `clk[0] = 0` and `dst[last] = result` (binds the proof to the public output).
+- **prog_hash' − prog_hash = 0** — the program hash is constant on every row.
+- Boundary: `clk[0] = 0`, `dst[last] = result` (binds the public output), and
+  `prog_hash[0] = public program hash` (binds the proof to a specific program).
 
 ## v0 soundness boundary (deliberately honest)
 
@@ -61,8 +63,10 @@ This is the same staged path `zk-formlogic` took to its 78-column trace.
 2. **Memory-permutation argument** (auxiliary segment + randomized bus) so reads
    return the last written value — mirror `zk-formlogic`'s aux trace.
 3. **Range checks** to bind field values to 64-bit (or fixed-point) integers.
-4. **Program binding**: commit a hash of the bytecode in public inputs (so a proof
-   is tied to a specific program), like `zk-formlogic`'s program-hash columns.
+4. **Program binding** — *done (v0)*: a constant `prog_hash` column bound to the
+   public inputs, so a proof for one program won't verify as another. v0 uses a
+   64-bit FNV hash of the source; production would use a 256-bit hash across 4
+   columns, like `zk-formlogic`.
 5. **State roots**: boundary-assert before/after state roots to bind a proof to a
    chain state transition — the hook for on-chain use.
 6. **GPU**: reuse the chain's `zk-formlogic-cuda` NTT kernels for the prover NTT.

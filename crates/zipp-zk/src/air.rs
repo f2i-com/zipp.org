@@ -13,17 +13,23 @@ use crate::*;
 pub struct PublicInputs {
     /// Field-encoded result of `main` (bound to the final trace row).
     pub result: u64,
+    /// Hash of the program (bound to all rows via a constant column).
+    pub program_hash: u64,
 }
 
 impl ToElements<BaseElement> for PublicInputs {
     fn to_elements(&self) -> Vec<BaseElement> {
-        vec![BaseElement::from(self.result)]
+        vec![
+            BaseElement::from(self.result),
+            BaseElement::from(self.program_hash),
+        ]
     }
 }
 
 pub struct ZippAir {
     context: AirContext<BaseElement>,
     result: BaseElement,
+    prog_hash: BaseElement,
     trace_len: usize,
 }
 
@@ -47,11 +53,13 @@ impl Air for ZippAir {
             d2.clone(), // 8  add:   sa*(dst - a - b)
             d2,         // 9  sub:   ss*(dst - a + b)
             d3,         // 10 mul:   sm*(dst - a*b)
+            TransitionConstraintDegree::new(1), // 11 program hash constancy
         ];
         let trace_len = trace_info.length();
         ZippAir {
-            context: AirContext::new(trace_info, degrees, 2, options),
+            context: AirContext::new(trace_info, degrees, 3, options),
             result: BaseElement::from(pub_inputs.result),
+            prog_hash: BaseElement::from(pub_inputs.program_hash),
             trace_len,
         }
     }
@@ -97,6 +105,8 @@ impl Air for ZippAir {
         result[8] = sa * (dst - a - b);
         result[9] = ss * (dst - a + b);
         result[10] = sm * (dst - a * b);
+        // Program hash is constant across rows.
+        result[11] = nxt[COL_PROG_HASH] - cur[COL_PROG_HASH];
     }
 
     fn get_assertions(&self) -> Vec<Assertion<Self::BaseField>> {
@@ -106,6 +116,8 @@ impl Air for ZippAir {
             Assertion::single(COL_CLK, 0, BaseElement::ZERO),
             // Final destination equals the public result.
             Assertion::single(COL_DST, last, self.result),
+            // Program hash (row 0) equals the public program hash.
+            Assertion::single(COL_PROG_HASH, 0, self.prog_hash),
         ]
     }
 }

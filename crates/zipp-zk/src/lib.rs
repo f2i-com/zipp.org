@@ -39,7 +39,7 @@ use zippc::{OpKind, TraceStep};
 type Blake3 = Blake3_256<BaseElement>;
 
 /// Trace width (columns).
-pub const WIDTH: usize = 10;
+pub const WIDTH: usize = 11;
 
 // Column indices.
 pub(crate) const COL_CLK: usize = 0;
@@ -52,6 +52,9 @@ pub(crate) const COL_A: usize = 6;
 pub(crate) const COL_B: usize = 7;
 pub(crate) const COL_DST: usize = 8;
 pub(crate) const COL_IMM: usize = 9;
+/// Program hash — constant across all rows, boundary-asserted at row 0. Binds
+/// the proof to a specific program (a proof for program A won't verify as B).
+pub(crate) const COL_PROG_HASH: usize = 10;
 
 /// STARK parameters — shared by prover and verifier (must match exactly).
 pub(crate) fn proof_options() -> ProofOptions {
@@ -73,7 +76,7 @@ fn felt(x: i64) -> BaseElement {
 }
 
 /// Build the padded, power-of-two trace columns from a VM trace.
-pub(crate) fn build_columns(steps: &[TraceStep]) -> Vec<Vec<BaseElement>> {
+pub(crate) fn build_columns(steps: &[TraceStep], program_hash: u64) -> Vec<Vec<BaseElement>> {
     let n = steps.len().next_power_of_two().max(8);
     let last_dst = steps.last().map(|s| s.dst).unwrap_or(0);
     let mut cols = vec![vec![BaseElement::ZERO; n]; WIDTH];
@@ -81,6 +84,8 @@ pub(crate) fn build_columns(steps: &[TraceStep]) -> Vec<Vec<BaseElement>> {
     for i in 0..n {
         // Re-clock to the row index so clk' = clk + 1 holds across padding.
         cols[COL_CLK][i] = BaseElement::from(i as u64);
+        // Program hash is constant across every row.
+        cols[COL_PROG_HASH][i] = BaseElement::from(program_hash);
 
         let (op, a, b, dst, imm) = if i < steps.len() {
             let s = steps[i];
@@ -106,13 +111,17 @@ pub(crate) fn build_columns(steps: &[TraceStep]) -> Vec<Vec<BaseElement>> {
     cols
 }
 
-/// Generate a STARK proof of a ZIPP execution trace.
-pub fn prove(trace: &[TraceStep], result: i64) -> Result<(Proof, PublicInputs), String> {
+/// Generate a STARK proof of a ZIPP execution trace, bound to `program_hash`.
+pub fn prove(
+    trace: &[TraceStep],
+    result: i64,
+    program_hash: u64,
+) -> Result<(Proof, PublicInputs), String> {
     if trace.is_empty() {
         return Err("cannot prove an empty trace".into());
     }
-    let pub_inputs = PublicInputs { result: result as u64 };
-    let columns = build_columns(trace);
+    let pub_inputs = PublicInputs { result: result as u64, program_hash };
+    let columns = build_columns(trace, program_hash);
     let proof = prover::prove(columns, pub_inputs.clone())?;
     Ok((proof, pub_inputs))
 }
@@ -142,11 +151,13 @@ mod tests {
     // NOTE: run with `cargo test -p zipp-zk --release` — the AIR degree check is
     // a debug_assert that selector-gated constraints trip in debug builds.
 
+    const PH: u64 = 0x1234_5678_9abc_def0;
+
     #[test]
     fn proves_and_verifies_real_execution() {
         let (trace, result) = trace_of("fn main(): i64 { let a = 7; let b = 6; return a * b + 3; }");
         assert_eq!(result, 45);
-        let (proof, pi) = prove(&trace, result).expect("prove");
+        let (proof, pi) = prove(&trace, result, PH).expect("prove");
         verify(&proof.to_bytes(), &pi).expect("valid proof must verify");
     }
 
@@ -155,11 +166,23 @@ mod tests {
         // The proof must NOT verify against a result the execution didn't produce
         // — i.e. the STARK is meaningful, not a rubber stamp.
         let (trace, result) = trace_of("fn main(): i64 { let a = 7; let b = 6; return a * b + 3; }");
-        let (proof, _pi) = prove(&trace, result).expect("prove");
-        let lie = PublicInputs { result: (result + 1) as u64 };
+        let (proof, _pi) = prove(&trace, result, PH).expect("prove");
+        let lie = PublicInputs { result: (result + 1) as u64, program_hash: PH };
         assert!(
             verify(&proof.to_bytes(), &lie).is_err(),
             "verification accepted a false result — soundness broken"
+        );
+    }
+
+    #[test]
+    fn rejects_a_wrong_program_hash() {
+        // A proof for one program must not verify as another (program binding).
+        let (trace, result) = trace_of("fn main(): i64 { let a = 7; let b = 6; return a * b + 3; }");
+        let (proof, _pi) = prove(&trace, result, PH).expect("prove");
+        let other = PublicInputs { result: result as u64, program_hash: PH ^ 1 };
+        assert!(
+            verify(&proof.to_bytes(), &other).is_err(),
+            "verification accepted a mismatched program hash — binding broken"
         );
     }
 }
