@@ -153,8 +153,12 @@ fn var(r: u32) -> Variable {
 /// Reason a program can't be JIT-compiled, or `None`. The native backend now
 /// covers the whole language, so this is always `None` (kept for the CLI's
 /// fallback path and forward compatibility).
-pub fn ineligible_reason(_prog: &Program) -> Option<&'static str> {
-    None // the JIT compiles the whole language, including nullable structs
+pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
+    // Nullable structs run natively; nullable *scalars* (no null sentinel) don't.
+    if prog.uses_opt_scalar {
+        return Some("nullable scalars (i64 | null)");
+    }
+    None
 }
 
 fn make_sig(module: &JITModule, params: &[Type], ret: Type) -> cranelift_codegen::ir::Signature {

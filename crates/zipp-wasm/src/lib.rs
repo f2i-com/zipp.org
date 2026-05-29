@@ -65,6 +65,9 @@ fn wty_of(t: Type) -> WTy {
 
 /// Reason a program can't use the contract profile (scalar subset only), or `None`.
 pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
+    if prog.uses_opt_scalar {
+        return Some("nullable scalars (i64 | null)");
+    }
     for ins in &prog.code {
         let bad = match ins {
             Instr::SConst { .. } => "strings",

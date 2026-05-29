@@ -94,6 +94,41 @@ pub struct Program {
     pub funcs: Vec<FuncMeta>,
     pub main: u32,
     pub structs: Vec<StructLayout>,
+    /// The program uses a nullable *scalar* (`i64|null`/`f64|null`/`bool|null`),
+    /// which only the interpreter handles (scalars have no null sentinel; native
+    /// tiers fall back).
+    pub uses_opt_scalar: bool,
+}
+
+fn is_opt_scalar(t: Type) -> bool {
+    matches!(t, Type::OptI64 | Type::OptF64 | Type::OptBool)
+}
+
+/// Does a statement (recursively) declare a nullable-scalar local?
+fn stmt_uses_opt_scalar(s: &Stmt) -> bool {
+    match &s.kind {
+        StmtKind::Let { ty: Some(t), .. } => is_opt_scalar(*t),
+        StmtKind::If { then_b, else_b, .. } => {
+            then_b.iter().any(stmt_uses_opt_scalar) || else_b.iter().any(stmt_uses_opt_scalar)
+        }
+        StmtKind::While { body, .. } => body.iter().any(stmt_uses_opt_scalar),
+        StmtKind::For { init, step, body, .. } => {
+            init.as_deref().is_some_and(stmt_uses_opt_scalar)
+                || step.as_deref().is_some_and(stmt_uses_opt_scalar)
+                || body.iter().any(stmt_uses_opt_scalar)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the module uses a nullable scalar anywhere (signature, field, local).
+fn module_uses_opt_scalar(m: &Module) -> bool {
+    m.structs.iter().any(|s| s.fields.iter().any(|(_, t)| is_opt_scalar(*t)))
+        || m.funcs.iter().any(|f| {
+            is_opt_scalar(f.ret)
+                || f.params.iter().any(|p| is_opt_scalar(p.ty))
+                || f.body.iter().any(stmt_uses_opt_scalar)
+        })
 }
 
 pub fn lower(m: &Module) -> Result<Program, String> {
@@ -150,7 +185,7 @@ pub fn lower(m: &Module) -> Result<Program, String> {
             types: sd.fields.iter().map(|(_, t)| *t).collect(),
         })
         .collect();
-    Ok(Program { code, funcs, main, structs })
+    Ok(Program { code, funcs, main, structs, uses_opt_scalar: module_uses_opt_scalar(m) })
 }
 
 struct LoopCtx {

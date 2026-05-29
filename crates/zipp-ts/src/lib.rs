@@ -881,7 +881,9 @@ impl Lower<'_> {
                 z::Expr::Repeat { value: Box::new(elem), count: Box::new(z::Expr::Int(0)) }
             }
             // a nullable field defaults to `null`
-            z::Type::OptStruct(_) => z::Expr::Null,
+            z::Type::OptStruct(_) | z::Type::OptI64 | z::Type::OptF64 | z::Type::OptBool => {
+                z::Expr::Null
+            }
             z::Type::Struct(_) | z::Type::Null => return None,
         })
     }
@@ -1108,20 +1110,19 @@ impl Lower<'_> {
                 }
             }
             TSType::TSParenthesizedType(p) => self.ty(&p.type_annotation)?,
-            // `T | null` / `T | undefined` → a nullable struct reference.
+            // `T | null` / `T | undefined` → a nullable type (struct, or a
+            // nullable scalar i64/f64/bool).
             TSType::TSUnionType(u) => {
                 let non_null: Vec<&TSType> =
                     u.types.iter().filter(|t| !is_null_ts_type(t)).collect();
                 if u.types.iter().any(is_null_ts_type) && non_null.len() == 1 {
-                    match self.ty(non_null[0])? {
-                        z::Type::Struct(id) => z::Type::OptStruct(id),
-                        other => {
-                            return Err(self.err(
-                                u.span,
-                                format!("only a struct type can be `… | null` in v0, not {other:?}"),
-                            ))
-                        }
-                    }
+                    let inner = self.ty(non_null[0])?;
+                    inner.into_opt().ok_or_else(|| {
+                        self.err(
+                            u.span,
+                            format!("`{inner:?} | null` isn't supported (only struct/i64/f64/bool)"),
+                        )
+                    })?
                 } else {
                     return Err(self.err(u.span, "only `T | null` unions are supported"));
                 }
@@ -2037,6 +2038,9 @@ fn mangle_type(t: z::Type) -> String {
         ),
         z::Type::Struct(id) => format!("s{id}"),
         z::Type::OptStruct(id) => format!("opts{id}"),
+        z::Type::OptI64 => "opti64".into(),
+        z::Type::OptF64 => "optf64".into(),
+        z::Type::OptBool => "optbool".into(),
         z::Type::Null => "null".into(),
     }
 }
@@ -2205,6 +2209,31 @@ mod tests {
                      if (n !== null) { return head.val + n.val; } \
                      return head.val; }";
         assert_eq!(run_i64(ts3), 3); // 1 + 2
+    }
+
+    #[test]
+    fn nullable_scalars() {
+        // nullable i64 param + narrowing + `?? default`
+        let ts = "function orZero(n: i64 | null): i64 { \
+                    if (n !== null) { return n; } \
+                    return 0; \
+                  } \
+                  function main(): i64 { \
+                    let some: i64 | null = 42; \
+                    let none: i64 | null = null; \
+                    return orZero(some) + orZero(none) + (none ?? 7); }";
+        assert_eq!(run_i64(ts), 49); // 42 + 0 + 7
+        // a nullable scalar struct field, read with `?? default`
+        let ts2 = "interface Cfg { timeout: i64 | null; } \
+                   function main(): i64 { \
+                     let a: Cfg = { timeout: 30 }; \
+                     let b: Cfg = { timeout: null }; \
+                     return (a.timeout ?? 10) + (b.timeout ?? 10); }";
+        assert_eq!(run_i64(ts2), 40); // 30 + 10
+        // bool | null
+        let ts3 = "function pick(flag: bool | null): i64 { return (flag ?? false) ? 1 : 0; } \
+                   function main(): i64 { return pick(true) + pick(null); }";
+        assert_eq!(run_i64(ts3), 1); // 1 + 0
     }
 
     #[test]

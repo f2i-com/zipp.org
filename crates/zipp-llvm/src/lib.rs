@@ -141,8 +141,12 @@ fn from_slot(body: &mut String, tmp: &mut usize, lty: LTy, raw: &str) -> String 
 
 /// Reason a program can't use the LLVM tier, or `None`. The tier now covers the
 /// whole language, so this is always `None` (kept for the CLI's fallback path).
-pub fn ineligible_reason(_prog: &Program) -> Option<&'static str> {
-    None // the LLVM tier compiles the whole language, including nullable structs
+pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
+    // Nullable structs run natively; nullable *scalars* (no null sentinel) don't.
+    if prog.uses_opt_scalar {
+        return Some("nullable scalars (i64 | null)");
+    }
+    None
 }
 
 /// Per-register LLVM type (registers are monotonic ⇒ one static type each).

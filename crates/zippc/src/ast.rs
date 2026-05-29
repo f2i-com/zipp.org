@@ -33,9 +33,15 @@ pub enum Type {
     U32,
     U64,
     /// A nullable struct reference, `T | null`. Runtime value is a struct pointer
-    /// that may be null. Only the interpreter handles it (native tiers fall back).
+    /// that may be null. Native tiers represent it as a pointer (0 = null).
     OptStruct(u32),
-    /// The type of the `null` literal — assignable to any `OptStruct`.
+    /// Nullable scalars `i64 | null` / `f64 | null` / `bool | null`. Scalars have
+    /// no spare null sentinel, so these run on the interpreter (dynamically
+    /// tagged); the native tiers fall back.
+    OptI64,
+    OptF64,
+    OptBool,
+    /// The type of the `null` literal — assignable to any nullable type.
     Null,
 }
 
@@ -47,6 +53,33 @@ impl Type {
             Type::I64 => Some(Elem::I64),
             Type::F64 => Some(Elem::F64),
             Type::Bool => Some(Elem::Bool),
+            _ => None,
+        }
+    }
+
+    /// The non-null inner type of a nullable type (`T | null` → `T`), else None.
+    pub fn opt_inner(self) -> Option<Type> {
+        match self {
+            Type::OptStruct(id) => Some(Type::Struct(id)),
+            Type::OptI64 => Some(Type::I64),
+            Type::OptF64 => Some(Type::F64),
+            Type::OptBool => Some(Type::Bool),
+            _ => None,
+        }
+    }
+
+    /// True for a nullable type (`T | null`).
+    pub fn is_opt(self) -> bool {
+        self.opt_inner().is_some()
+    }
+
+    /// The nullable wrapper of a scalar/struct type (`T` → `T | null`), if any.
+    pub fn into_opt(self) -> Option<Type> {
+        match self {
+            Type::Struct(id) => Some(Type::OptStruct(id)),
+            Type::I64 => Some(Type::OptI64),
+            Type::F64 => Some(Type::OptF64),
+            Type::Bool => Some(Type::OptBool),
             _ => None,
         }
     }

@@ -186,8 +186,8 @@ fn check_stmt_kind(
             let narrow = |scope: &mut Scope, want_then: bool| {
                 if let Some((x, in_then)) = guard {
                     if in_then == want_then {
-                        if let Some(Type::OptStruct(id)) = scope.lookup(x) {
-                            let _ = scope.declare(x, Type::Struct(id)); // fresh frame: can't fail
+                        if let Some(inner) = scope.lookup(x).and_then(Type::opt_inner) {
+                            let _ = scope.declare(x, inner); // fresh frame: can't fail
                         }
                     }
                 }
@@ -285,14 +285,7 @@ fn expect_type(
 /// Is a value of type `from` assignable to a slot of type `to`? Identity, plus
 /// widening `T` / `null` into `T | null`.
 fn assignable(from: Type, to: Type) -> bool {
-    if from == to {
-        return true;
-    }
-    match (from, to) {
-        (Type::Null, Type::OptStruct(_)) => true,
-        (Type::Struct(a), Type::OptStruct(b)) => a == b,
-        _ => false,
-    }
+    from == to || (from == Type::Null && to.is_opt()) || to.opt_inner() == Some(from)
 }
 
 /// A struct field's declared type, by struct id and field name.
@@ -343,18 +336,14 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
         Expr::Coalesce { lhs, rhs } => {
             let lt = type_of(lhs, scope, cx)?;
             let rt = type_of(rhs, scope, cx)?;
-            match lt {
-                Type::Null => Ok(rt), // `null ?? rhs`
-                Type::OptStruct(id) => {
-                    if rt == Type::Struct(id) || rt == Type::OptStruct(id) {
-                        Ok(rt) // a non-null rhs makes the whole `??` non-null
-                    } else {
-                        Err(format!(
-                            "type error: `??` right side must be the struct or its nullable, found {rt:?}"
-                        ))
-                    }
-                }
-                _ => Err(format!("type error: `??` left side must be nullable, found {lt:?}")),
+            if lt == Type::Null {
+                return Ok(rt); // `null ?? rhs`
+            }
+            match lt.opt_inner() {
+                // `x ?? rhs`: a non-null rhs makes the whole thing non-null.
+                Some(inner) if rt == inner || rt == lt => Ok(rt),
+                Some(_) => Err(format!("type error: `??` right side {rt:?} doesn't match {lt:?}")),
+                None => Err(format!("type error: `??` left side must be nullable, found {lt:?}")),
             }
         }
         Expr::OptField { base, field } => {
@@ -380,11 +369,9 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                 }
             };
             // the field's value, defaulting to `default` when base is null → the
-            // field's *non-null* type.
-            let result = match struct_field_ty(cx, xid, field)? {
-                Type::OptStruct(f) => Type::Struct(f),
-                other => other,
-            };
+            // field's *non-null* type (so a nullable field coalesces away too).
+            let ft = struct_field_ty(cx, xid, field)?;
+            let result = ft.opt_inner().unwrap_or(ft);
             let dt = type_of(default, scope, cx)?;
             if !assignable(dt, result) {
                 return Err(format!("type error: `?? default` has type {dt:?}, expected {result:?}"));
@@ -503,7 +490,7 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
             use BinOp::*;
             // Null comparison: `x === null` / `x !== null`.
             if lt == Type::Null || rt == Type::Null {
-                let ok = |t: Type| matches!(t, Type::Null | Type::OptStruct(_));
+                let ok = |t: Type| t == Type::Null || t.is_opt();
                 return match op {
                     Eq | Ne if ok(lt) && ok(rt) => Ok(Type::Bool),
                     _ => Err(format!(
