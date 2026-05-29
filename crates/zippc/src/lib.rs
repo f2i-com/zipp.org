@@ -22,8 +22,15 @@ pub use vm::{OpKind, RunResult, TraceStep, Value};
 pub fn compile(src: &str) -> Result<Program, String> {
     let tokens = lexer::lex(src)?;
     let ast = parser::parse(&tokens)?;
-    check::check(&ast)?;
-    ir::lower(&ast)
+    compile_module(&ast)
+}
+
+/// Check + lower an already-parsed [`ast::Module`] to bytecode. Front-ends other
+/// than the built-in parser (e.g. the TypeScript frontend `zipp-ts`) produce a
+/// `Module` and feed it here — reusing the whole sound checker + IR + backends.
+pub fn compile_module(ast: &ast::Module) -> Result<Program, String> {
+    check::check(ast)?;
+    ir::lower(ast)
 }
 
 /// Compile and run ZIPP source, returning the result of `main`, any printed

@@ -1,7 +1,9 @@
 # ZIPP language
 
-A sound-TypeScript-subset language, AOT-compiled, in Rust. The full design lives
-in [`../ZIPP.md`](../ZIPP.md); this repo is the standalone implementation.
+A sound-TypeScript-subset language, AOT-compiled, in Rust — you can write it in
+**real TypeScript** (`.ts`, parsed by `oxc`) or ZIPP's own syntax. The full
+design lives in [`../ZIPP.md`](../ZIPP.md); this repo is the standalone
+implementation.
 
 ZIPP has **three execution profiles** from one frontend + IR:
 
@@ -28,8 +30,11 @@ heavy deps (Winterfell/Cranelift) and the language still runs on the interpreter
 ## Status (v0 — a working vertical slice, not the finished language)
 
 ✅ Working end-to-end today:
-- Lexer → recursive-descent parser → **sound-subset type checker** (`i64`/`f64`/`bool`/`str`,
-  no implicit coercions, arity/return checking)
+- Two front-ends: the built-in lexer/recursive-descent parser (`.zipp`) **and a
+  real TypeScript frontend** (`.ts`, via `oxc`) that lowers the sound subset to
+  the same AST — `zipp run app.ts` runs on every backend below
+- **Sound-subset type checker** (`i64`/`f64`/`bool`/`str`, no implicit coercions,
+  arity/return checking)
 - **`f64` floating-point** with `i64()` / `f64()` casts (the zk profile stays
   integer-only — `--prove` rejects f64, per PLAN.md §7)
 - **Sized integers** `i32` / `u32` / `u64` (default is `i64`), reached via casts
@@ -93,6 +98,10 @@ cargo build --release
 ./target/release/zipp run examples/structs.zipp     # records + field access
 ./target/release/zipp run examples/fnv.zipp          # 32-bit FNV-1a hash (u32 wrapping)
 
+# real TypeScript, run on any backend (oxc frontend → ZIPP AST)
+./target/release/zipp run examples/fib.ts            # => 6765
+./target/release/zipp run --jit examples/sum.ts      # loop + u64 + array
+
 # run the language test suite
 cargo test
 
@@ -147,6 +156,7 @@ zipp-lang/
 │   ├── zipp-jit/     # OPTIONAL native backend (Cranelift JIT, tier-0)
 │   ├── zipp-llvm/    # OPTIONAL release tier (emit LLVM IR, compile with clang -O3)
 │   ├── zipp-wasm/    # OPTIONAL contract profile (emit gas-metered WebAssembly)
+│   ├── zipp-ts/      # OPTIONAL TypeScript frontend (oxc → ZIPP AST, sound subset)
 │   └── zipp-cli/     # the `zipp` binary
 └── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz, math, structs, fnv
 ```
@@ -310,6 +320,34 @@ like an on-chain VM. Arbitrary control flow is lowered with the standard
 `zipp run --wasm --gas 1000 bench/loop.zipp`). Results match the interpreter
 exactly. The pure-Rust `wat` crate assembles the text to a `.wasm`; no external
 toolchain. *(Future: a gas-priced heap/runtime to lift the scalar-only limit.)*
+
+## TypeScript frontend
+
+`zipp run app.ts` parses **real TypeScript** with `oxc` and lowers the *sound
+subset* to ZIPP's AST — then the existing checker, IR, GC and all four targets
+run unchanged. Only the front-end is new:
+
+```
+app.ts ─[oxc]→ TS AST ─[lower the subset]→ ZIPP AST ─→ check → IR → { interp · jit · llvm · wasm · prove }
+```
+
+`oxc` parses *all* TS syntax; we lower what maps to ZIPP's sound core and reject
+the rest with a line-numbered error. **Supported (v0):** typed functions +
+recursion, `let`/`const`, `if`/`while`/`for`, `break`/`continue`, the operator
+set, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing, `.length`),
+`console.log`, math builtins. **Type mapping:** `number`→f64, `bigint`→i64,
+`boolean`→bool, `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` usable directly
+(a `zipp.d.ts` makes `tsc`/editors accept those names). `examples/fib.ts` runs
+identically on all four backends; `examples/sum.ts` shows a `u64` loop + arrays.
+
+This is the **AssemblyScript model** — a typed subset compiled to fast/provable
+code — *not* a JavaScript engine. Running *arbitrary* dynamic JS (`any`,
+prototypes, `eval`, exceptions, async) is an explicit non-goal: it would be
+slower than V8 (you can't out-V8 V8 by reimplementing it) and would forfeit
+ZIPP's AOT speed, gas-metered determinism, and zk-provability — all of which
+depend on static types and no dynamic dispatch. Coverage grows toward more
+idiomatic typed TS (classes, generics via monomorphization); the dynamic core
+stays out by design.
 
 ## License
 

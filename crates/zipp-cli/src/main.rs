@@ -61,7 +61,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
             println!("usage:");
-            println!("  zipp run <file.zipp>            compile + run (interpreter)");
+            println!("  zipp run <file.zipp|.ts>        compile + run (.ts uses the oxc TypeScript frontend)");
             println!("  zipp run --jit <file.zipp>      Cranelift JIT (fast-compile tier-0)");
             println!("  zipp run --llvm <file.zipp>     clang -O3 release tier");
             println!("  zipp run --wasm <file.zipp>     gas-metered WebAssembly (contract profile; --gas N)");
@@ -84,7 +84,14 @@ fn run_file(
     fast_math: bool,
 ) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
-    let program = zippc::compile(&src)?;
+    // `.ts` files go through the TypeScript frontend (oxc → ZIPP AST); `.zipp`
+    // files use the built-in parser. Both produce the same bytecode.
+    let program = if path.ends_with(".ts") {
+        let module = ts_compile(&src)?;
+        zippc::compile_module(&module)?
+    } else {
+        zippc::compile(&src)?
+    };
 
     if (jit || llvm || wasm) && prove {
         return Err("--prove needs the interpreter trace; it can't be combined with a native backend".into());
@@ -211,6 +218,17 @@ fn wasm_run(program: &zippc::Program, gas: u64) -> Result<Option<(String, String
 #[cfg(not(feature = "wasm"))]
 fn wasm_run(_program: &zippc::Program, _gas: u64) -> Result<Option<(String, String, u64, usize)>, String> {
     Err("this build has no wasm profile — rebuild with the `wasm` feature".into())
+}
+
+// TypeScript frontend: parse a `.ts` file (oxc) and lower the sound subset.
+#[cfg(feature = "ts")]
+fn ts_compile(src: &str) -> Result<zippc::ast::Module, String> {
+    zipp_ts::compile_ts(src)
+}
+
+#[cfg(not(feature = "ts"))]
+fn ts_compile(_src: &str) -> Result<zippc::ast::Module, String> {
+    Err("this build has no TypeScript frontend — rebuild with the `ts` feature".into())
 }
 
 #[cfg(feature = "zk")]
