@@ -262,6 +262,63 @@ fn builtin_names_are_reserved() {
     assert!(run("fn abs(x: i64): i64 { return x; } fn main(): i64 { return 0; }").is_err());
 }
 
+// ── structs ──
+
+#[test]
+fn structs_construct_and_read() {
+    let src = "struct Point { x: i64, y: i64 } \
+               fn main(): i64 { let p = Point { x: 3, y: 4 }; return p.x + p.y; }";
+    assert_eq!(result(src), 7);
+}
+
+#[test]
+fn struct_fields_order_independent() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn main(): i64 { let p = P { y: 10, x: 1 }; return p.x * 100 + p.y; }";
+    assert_eq!(result(src), 110);
+}
+
+#[test]
+fn struct_field_write() {
+    let src = "struct P { x: i64, y: i64 } \
+               fn main(): i64 { let p = P { x: 1, y: 2 }; p.x = 9; return p.x + p.y; }";
+    assert_eq!(result(src), 11);
+}
+
+#[test]
+fn structs_are_reference_types() {
+    let src = "struct P { x: i64 } fn bump(p: P): i64 { p.x = p.x + 1; return 0; } \
+               fn main(): i64 { let p = P { x: 5 }; let _ = bump(p); return p.x; }";
+    assert_eq!(result(src), 6);
+}
+
+#[test]
+fn struct_mixed_field_types_and_nesting() {
+    assert_eq!(
+        fresult("struct Mix { n: i64, f: f64 } fn main(): f64 { let m = Mix { n: 2, f: 1.5 }; return f64(m.n) + m.f; }"),
+        3.5
+    );
+    let nested = "struct Inner { v: i64 } struct Outer { a: Inner, b: i64 } \
+                  fn main(): i64 { let o = Outer { a: Inner { v: 7 }, b: 3 }; return o.a.v + o.b; }";
+    assert_eq!(result(nested), 10);
+}
+
+#[test]
+fn rejects_bad_struct_use() {
+    assert!(run("struct P { x: i64 } fn main(): i64 { let p = P { x: 1, y: 2 }; return p.x; }").is_err()); // wrong fields
+    assert!(run("struct P { x: i64 } fn main(): i64 { let p = P { x: 1 }; return p.z; }").is_err()); // no such field
+    assert!(run("struct P { x: i64 } fn main(): i64 { let p = P { x: true }; return 0; }").is_err()); // field type
+    assert!(run("fn main(): i64 { let p = Nope { x: 1 }; return 0; }").is_err()); // unknown struct
+    assert!(run("struct P { x: i64, x: i64 } fn main(): i64 { return 0; }").is_err()); // duplicate field
+}
+
+#[test]
+fn prove_profile_rejects_structs() {
+    let prog = zippc::compile("struct P { x: i64 } fn main(): i64 { let p = P { x: 1 }; return p.x; }").unwrap();
+    assert!(zippc::vm::run(&prog, false).is_ok());
+    assert!(zippc::vm::run(&prog, true).is_err());
+}
+
 // ── for loops ──
 
 #[test]

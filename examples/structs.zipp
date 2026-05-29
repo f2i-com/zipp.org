@@ -1,0 +1,16 @@
+// Structs: named records, field access, and reference semantics.
+struct Point { x: i64, y: i64 }
+
+fn manhattan(a: Point, b: Point): i64 {
+    return abs(a.x - b.x) + abs(a.y - b.y);
+}
+
+fn main(): i64 {
+    let p = Point { x: 1, y: 2 };
+    let q = Point { x: 4, y: 6 };
+    print(p.x);
+    print(q.y);
+    let d = manhattan(p, q); // |1-4| + |2-6| = 7
+    print(d);
+    return d;
+}

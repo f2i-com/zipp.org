@@ -6,7 +6,7 @@
 //! registers). `&&`/`||` are short-circuited; `break`/`continue` patch to the
 //! enclosing loop. Jumps use absolute code offsets and are backpatched.
 
-use crate::ast::{BinOp, Expr, Module, Stmt, StmtKind, Type, UnOp};
+use crate::ast::{BinOp, Expr, Module, Stmt, StmtKind, StructDecl, Type, UnOp};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -31,6 +31,17 @@ pub enum Instr {
     SetIndex { arr: u32, idx: u32, value: u32 },
     Len { dst: u32, arr: u32 },
     Builtin { op: BuiltinOp, dst: u32, args: Vec<u32> },
+    // Structs (heap-backed, like arrays; rejected by the integer-only zk profile).
+    NewStruct { id: u32, dst: u32, fields: Vec<u32> },
+    GetField { dst: u32, base: u32, field: String },
+    SetField { base: u32, field: String, value: u32 },
+}
+
+/// Field names of a struct, in declaration order (indexed by struct id). The VM
+/// uses this to resolve a field name to its slot.
+#[derive(Debug, Clone)]
+pub struct StructLayout {
+    pub fields: Vec<String>,
 }
 
 /// Builtin math functions (recognized call names, not user functions).
@@ -72,6 +83,7 @@ pub struct Program {
     pub code: Vec<Instr>,
     pub funcs: Vec<FuncMeta>,
     pub main: u32,
+    pub structs: Vec<StructLayout>,
 }
 
 pub fn lower(m: &Module) -> Result<Program, String> {
@@ -88,6 +100,7 @@ pub fn lower(m: &Module) -> Result<Program, String> {
         let mut g = Gen {
             code: &mut code,
             func_index: &func_index,
+            structs: &m.structs,
             scopes: vec![(HashMap::new(), 0)],
             next_reg: 0,
             max_reg: 0,
@@ -117,7 +130,14 @@ pub fn lower(m: &Module) -> Result<Program, String> {
     }
 
     let main = *func_index.get("main").expect("checker guarantees main exists");
-    Ok(Program { code, funcs, main })
+    let structs = m
+        .structs
+        .iter()
+        .map(|sd| StructLayout {
+            fields: sd.fields.iter().map(|(n, _)| n.clone()).collect(),
+        })
+        .collect();
+    Ok(Program { code, funcs, main, structs })
 }
 
 struct LoopCtx {
@@ -128,6 +148,7 @@ struct LoopCtx {
 struct Gen<'a> {
     code: &'a mut Vec<Instr>,
     func_index: &'a HashMap<String, u32>,
+    structs: &'a [StructDecl],
     /// Scope stack: (name -> register, saved next_reg watermark on entry).
     scopes: Vec<(HashMap<String, u32>, u32)>,
     next_reg: u32,
@@ -206,6 +227,12 @@ impl<'a> Gen<'a> {
                     let i = self.gen_expr(index)?;
                     let v = self.gen_expr(value)?;
                     self.code.push(Instr::SetIndex { arr: a, idx: i, value: v });
+                    Ok(())
+                }
+                Expr::Field { base, field } => {
+                    let b = self.gen_expr(base)?;
+                    let v = self.gen_expr(value)?;
+                    self.code.push(Instr::SetField { base: b, field: field.clone(), value: v });
                     Ok(())
                 }
                 _ => Err("ir error: invalid assignment target".into()),
@@ -368,6 +395,39 @@ impl<'a> Gen<'a> {
                 let i = self.gen_expr(index)?;
                 let dst = self.alloc();
                 self.code.push(Instr::Index { dst, arr: a, idx: i });
+                Ok(dst)
+            }
+            Expr::StructLit { name, fields } => {
+                // Evaluate provided fields, then arrange them in declaration order.
+                let mut named: Vec<(String, u32)> = Vec::with_capacity(fields.len());
+                for (fname, fexpr) in fields {
+                    let r = self.gen_expr(fexpr)?;
+                    named.push((fname.clone(), r));
+                }
+                let id = self
+                    .structs
+                    .iter()
+                    .position(|s| &s.name == name)
+                    .ok_or_else(|| format!("ir error: unknown struct '{name}'"))? as u32;
+                let order: Vec<String> =
+                    self.structs[id as usize].fields.iter().map(|(n, _)| n.clone()).collect();
+                let mut ordered = Vec::with_capacity(order.len());
+                for dn in &order {
+                    let r = named
+                        .iter()
+                        .find(|(n, _)| n == dn)
+                        .map(|(_, r)| *r)
+                        .ok_or_else(|| format!("ir error: missing field '{dn}'"))?;
+                    ordered.push(r);
+                }
+                let dst = self.alloc();
+                self.code.push(Instr::NewStruct { id, dst, fields: ordered });
+                Ok(dst)
+            }
+            Expr::Field { base, field } => {
+                let b = self.gen_expr(base)?;
+                let dst = self.alloc();
+                self.code.push(Instr::GetField { dst, base: b, field: field.clone() });
                 Ok(dst)
             }
             Expr::Unary { op, e } => {

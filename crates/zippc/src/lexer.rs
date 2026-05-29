@@ -16,6 +16,7 @@ pub enum Tok {
     Ident(String),
     // keywords
     Fn,
+    Struct,
     Let,
     Return,
     If,
@@ -41,6 +42,7 @@ pub enum Tok {
     Comma,
     Colon,
     Semi,
+    Dot,
     Assign, // =
     // operators
     Plus,
@@ -153,6 +155,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             ';' => {
                 emit!(Tok::Semi);
+                i += 1;
+            }
+            '.' => {
+                emit!(Tok::Dot);
                 i += 1;
             }
             '+' => {
@@ -314,6 +320,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 let s = &src[start..i];
                 emit!(match s {
                     "fn" => Tok::Fn,
+                    "struct" => Tok::Struct,
                     "let" => Tok::Let,
                     "return" => Tok::Return,
                     "if" => Tok::If,

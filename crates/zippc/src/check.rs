@@ -42,7 +42,30 @@ impl Scope {
     }
 }
 
+/// Checker context: function signatures + struct declarations.
+struct Cx<'a> {
+    sigs: HashMap<String, Sig>,
+    structs: &'a [StructDecl],
+}
+
 pub fn check(m: &Module) -> Result<(), String> {
+    // Struct declarations: unique names, unique fields per struct.
+    let mut seen_structs = std::collections::HashSet::new();
+    for sd in &m.structs {
+        if !seen_structs.insert(sd.name.as_str()) {
+            return Err(format!("type error: struct '{}' redefined", sd.name));
+        }
+        let mut seen_fields = std::collections::HashSet::new();
+        for (fname, _) in &sd.fields {
+            if !seen_fields.insert(fname.as_str()) {
+                return Err(format!(
+                    "type error: struct '{}' has a duplicate field '{}'",
+                    sd.name, fname
+                ));
+            }
+        }
+    }
+
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for f in &m.funcs {
         if f.name == "len" || crate::ir::math_builtin(&f.name).is_some() {
@@ -59,13 +82,14 @@ pub fn check(m: &Module) -> Result<(), String> {
     if !sigs.contains_key("main") {
         return Err("type error: program has no `main` function".into());
     }
+    let cx = Cx { sigs, structs: &m.structs };
     for f in &m.funcs {
-        check_func(f, &sigs)?;
+        check_func(f, &cx)?;
     }
     Ok(())
 }
 
-fn check_func(f: &Func, sigs: &HashMap<String, Sig>) -> Result<(), String> {
+fn check_func(f: &Func, cx: &Cx) -> Result<(), String> {
     let mut scope = Scope::new();
     for p in &f.params {
         scope.declare(&p.name, p.ty).map_err(|_| {
@@ -73,7 +97,7 @@ fn check_func(f: &Func, sigs: &HashMap<String, Sig>) -> Result<(), String> {
         })?;
     }
     for s in &f.body {
-        check_stmt(s, &mut scope, sigs, f.ret, &f.name, 0)?;
+        check_stmt(s, &mut scope, cx, f.ret, &f.name, 0)?;
     }
     Ok(())
 }
@@ -81,12 +105,12 @@ fn check_func(f: &Func, sigs: &HashMap<String, Sig>) -> Result<(), String> {
 fn check_stmt(
     s: &Stmt,
     scope: &mut Scope,
-    sigs: &HashMap<String, Sig>,
+    cx: &Cx,
     ret: Type,
     fname: &str,
     loop_depth: u32,
 ) -> Result<(), String> {
-    check_stmt_kind(&s.kind, scope, sigs, ret, fname, loop_depth)
+    check_stmt_kind(&s.kind, scope, cx, ret, fname, loop_depth)
         .map_err(|e| with_line(e, s.line))
 }
 
@@ -103,14 +127,14 @@ fn with_line(e: String, line: u32) -> String {
 fn check_stmt_kind(
     s: &StmtKind,
     scope: &mut Scope,
-    sigs: &HashMap<String, Sig>,
+    cx: &Cx,
     ret: Type,
     fname: &str,
     loop_depth: u32,
 ) -> Result<(), String> {
     match s {
         StmtKind::Let { name, ty, value } => {
-            let vt = type_of(value, scope, sigs)?;
+            let vt = type_of(value, scope, cx)?;
             if let Some(ann) = ty {
                 if *ann != vt {
                     return Err(format!(
@@ -123,15 +147,15 @@ fn check_stmt_kind(
         StmtKind::Assign { target, value } => {
             // `type_of` on the target validates it (an undeclared var or a
             // non-array index is an error) and gives the slot's type.
-            let tt = type_of(target, scope, sigs)?;
-            let vt = type_of(value, scope, sigs)?;
+            let tt = type_of(target, scope, cx)?;
+            let vt = type_of(value, scope, cx)?;
             if tt != vt {
                 return Err(format!("type error: cannot assign {vt:?} to a target of type {tt:?}"));
             }
             Ok(())
         }
         StmtKind::Return(Some(e)) => {
-            let t = type_of(e, scope, sigs)?;
+            let t = type_of(e, scope, cx)?;
             if t != ret {
                 return Err(format!("type error: '{fname}' returns {ret:?} but found {t:?}"));
             }
@@ -141,26 +165,26 @@ fn check_stmt_kind(
             "type error: '{fname}' must return a {ret:?} value (bare `return` unsupported in v0)"
         )),
         StmtKind::If { cond, then_b, else_b } => {
-            expect_type(cond, Type::Bool, scope, sigs, "if condition")?;
-            check_block(then_b, scope, sigs, ret, fname, loop_depth)?;
-            check_block(else_b, scope, sigs, ret, fname, loop_depth)
+            expect_type(cond, Type::Bool, scope, cx, "if condition")?;
+            check_block(then_b, scope, cx, ret, fname, loop_depth)?;
+            check_block(else_b, scope, cx, ret, fname, loop_depth)
         }
         StmtKind::While { cond, body } => {
-            expect_type(cond, Type::Bool, scope, sigs, "while condition")?;
-            check_block(body, scope, sigs, ret, fname, loop_depth + 1)
+            expect_type(cond, Type::Bool, scope, cx, "while condition")?;
+            check_block(body, scope, cx, ret, fname, loop_depth + 1)
         }
         StmtKind::For { init, cond, step, body } => {
             // The init binding is scoped to the loop.
             scope.enter();
             let r = (|| {
                 if let Some(i) = init {
-                    check_stmt(i, scope, sigs, ret, fname, loop_depth)?;
+                    check_stmt(i, scope, cx, ret, fname, loop_depth)?;
                 }
-                expect_type(cond, Type::Bool, scope, sigs, "for condition")?;
+                expect_type(cond, Type::Bool, scope, cx, "for condition")?;
                 if let Some(s) = step {
-                    check_stmt(s, scope, sigs, ret, fname, loop_depth)?;
+                    check_stmt(s, scope, cx, ret, fname, loop_depth)?;
                 }
-                check_block(body, scope, sigs, ret, fname, loop_depth + 1)
+                check_block(body, scope, cx, ret, fname, loop_depth + 1)
             })();
             scope.exit();
             r
@@ -178,14 +202,14 @@ fn check_stmt_kind(
             Ok(())
         }
         StmtKind::Print(e) => {
-            let t = type_of(e, scope, sigs)?;
+            let t = type_of(e, scope, cx)?;
             if t != Type::I64 && t != Type::F64 && t != Type::Str {
                 return Err(format!("type error: print expects a number or string, found {t:?}"));
             }
             Ok(())
         }
         StmtKind::ExprStmt(e) => {
-            type_of(e, scope, sigs)?;
+            type_of(e, scope, cx)?;
             Ok(())
         }
     }
@@ -194,7 +218,7 @@ fn check_stmt_kind(
 fn check_block(
     stmts: &[Stmt],
     scope: &mut Scope,
-    sigs: &HashMap<String, Sig>,
+    cx: &Cx,
     ret: Type,
     fname: &str,
     loop_depth: u32,
@@ -202,7 +226,7 @@ fn check_block(
     scope.enter();
     let r = (|| {
         for s in stmts {
-            check_stmt(s, scope, sigs, ret, fname, loop_depth)?;
+            check_stmt(s, scope, cx, ret, fname, loop_depth)?;
         }
         Ok(())
     })();
@@ -214,17 +238,17 @@ fn expect_type(
     e: &Expr,
     want: Type,
     scope: &Scope,
-    sigs: &HashMap<String, Sig>,
+    cx: &Cx,
     what: &str,
 ) -> Result<(), String> {
-    let got = type_of(e, scope, sigs)?;
+    let got = type_of(e, scope, cx)?;
     if got != want {
         return Err(format!("type error: {what} expects {want:?}, found {got:?}"));
     }
     Ok(())
 }
 
-fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type, String> {
+fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
     match e {
         Expr::Int(_) => Ok(Type::I64),
         Expr::Float(_) => Ok(Type::F64),
@@ -234,7 +258,7 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
             .lookup(name)
             .ok_or_else(|| format!("type error: use of undeclared variable '{name}'")),
         Expr::Cast { to, e } => {
-            let t = type_of(e, scope, sigs)?;
+            let t = type_of(e, scope, cx)?;
             if t == Type::I64 || t == Type::F64 {
                 Ok(*to)
             } else {
@@ -243,12 +267,12 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
         }
         Expr::Array(elems) => {
             // Parser guarantees at least one element.
-            let first = type_of(&elems[0], scope, sigs)?;
+            let first = type_of(&elems[0], scope, cx)?;
             let elem = first
                 .as_elem()
                 .ok_or("type error: array elements must be scalar (no nested arrays in v0)")?;
             for e in &elems[1..] {
-                let t = type_of(e, scope, sigs)?;
+                let t = type_of(e, scope, cx)?;
                 if t != first {
                     return Err(format!(
                         "type error: array literal mixes {first:?} and {t:?}"
@@ -258,18 +282,18 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
             Ok(Type::Array(elem))
         }
         Expr::Repeat { value, count } => {
-            let vt = type_of(value, scope, sigs)?;
+            let vt = type_of(value, scope, cx)?;
             let elem = vt
                 .as_elem()
                 .ok_or("type error: array elements must be scalar (no nested arrays in v0)")?;
-            if type_of(count, scope, sigs)? != Type::I64 {
+            if type_of(count, scope, cx)? != Type::I64 {
                 return Err("type error: repeat count must be i64".into());
             }
             Ok(Type::Array(elem))
         }
         Expr::Index { arr, index } => {
-            let at = type_of(arr, scope, sigs)?;
-            if type_of(index, scope, sigs)? != Type::I64 {
+            let at = type_of(arr, scope, cx)?;
+            if type_of(index, scope, cx)? != Type::I64 {
                 return Err("type error: array index must be i64".into());
             }
             match at {
@@ -277,8 +301,54 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
                 _ => Err(format!("type error: cannot index a {at:?}")),
             }
         }
+        Expr::StructLit { name, fields } => {
+            let id = cx
+                .structs
+                .iter()
+                .position(|s| &s.name == name)
+                .ok_or_else(|| format!("type error: unknown struct '{name}'"))?;
+            let decl = &cx.structs[id];
+            if fields.len() != decl.fields.len() {
+                return Err(format!(
+                    "type error: struct '{name}' expects {} fields, got {}",
+                    decl.fields.len(),
+                    fields.len()
+                ));
+            }
+            for (fname, fexpr) in fields {
+                let expected = decl
+                    .fields
+                    .iter()
+                    .find(|(n, _)| n == fname)
+                    .map(|(_, t)| *t)
+                    .ok_or_else(|| format!("type error: struct '{name}' has no field '{fname}'"))?;
+                let actual = type_of(fexpr, scope, cx)?;
+                if actual != expected {
+                    return Err(format!(
+                        "type error: field '{name}.{fname}' expects {expected:?}, found {actual:?}"
+                    ));
+                }
+            }
+            Ok(Type::Struct(id as u32))
+        }
+        Expr::Field { base, field } => {
+            let bt = type_of(base, scope, cx)?;
+            match bt {
+                Type::Struct(id) => {
+                    let decl = &cx.structs[id as usize];
+                    decl.fields
+                        .iter()
+                        .find(|(n, _)| n == field)
+                        .map(|(_, t)| *t)
+                        .ok_or_else(|| {
+                            format!("type error: no field '{field}' on struct '{}'", decl.name)
+                        })
+                }
+                _ => Err(format!("type error: cannot access field '{field}' on {bt:?}")),
+            }
+        }
         Expr::Unary { op, e } => {
-            let t = type_of(e, scope, sigs)?;
+            let t = type_of(e, scope, cx)?;
             match op {
                 UnOp::Neg if t == Type::I64 || t == Type::F64 => Ok(t),
                 UnOp::BitNot if t == Type::I64 => Ok(Type::I64),
@@ -287,8 +357,8 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
             }
         }
         Expr::Bin { op, l, r } => {
-            let lt = type_of(l, scope, sigs)?;
-            let rt = type_of(r, scope, sigs)?;
+            let lt = type_of(l, scope, cx)?;
+            let rt = type_of(r, scope, cx)?;
             use BinOp::*;
             // String operations: `+` concatenates, `==`/`!=` compare.
             if lt == Type::Str || rt == Type::Str {
@@ -345,7 +415,7 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
                 if args.len() != 1 {
                     return Err("type error: len expects 1 array argument".into());
                 }
-                return match type_of(&args[0], scope, sigs)? {
+                return match type_of(&args[0], scope, cx)? {
                     Type::Array(_) | Type::Str => Ok(Type::I64),
                     other => Err(format!(
                         "type error: len expects an array or string, found {other:?}"
@@ -356,7 +426,7 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
             if crate::ir::math_builtin(name).is_some() {
                 let argt: Vec<Type> = args
                     .iter()
-                    .map(|a| type_of(a, scope, sigs))
+                    .map(|a| type_of(a, scope, cx))
                     .collect::<Result<_, _>>()?;
                 use Type::*;
                 return match (name.as_str(), argt.as_slice()) {
@@ -367,7 +437,8 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
                     _ => Err(format!("type error: invalid arguments to builtin '{name}'")),
                 };
             }
-            let sig = sigs
+            let sig = cx
+                .sigs
                 .get(name)
                 .ok_or_else(|| format!("type error: call to unknown function '{name}'"))?;
             if args.len() != sig.params.len() {
@@ -378,7 +449,7 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
                 ));
             }
             for (i, (a, pty)) in args.iter().zip(&sig.params).enumerate() {
-                let at = type_of(a, scope, sigs)?;
+                let at = type_of(a, scope, cx)?;
                 if at != *pty {
                     return Err(format!(
                         "type error: '{name}' arg {i} expects {pty:?}, found {at:?}"

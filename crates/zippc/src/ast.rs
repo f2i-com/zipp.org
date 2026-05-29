@@ -25,17 +25,19 @@ pub enum Type {
     Bool,
     Str,
     Array(Elem),
+    /// A struct, identified by its index in `Module::structs`.
+    Struct(u32),
 }
 
 impl Type {
     /// As a scalar element type (for use as an array element), if scalar.
-    /// v0 arrays hold i64/f64/bool (not strings or nested arrays).
+    /// v0 arrays hold i64/f64/bool (not strings, structs or nested arrays).
     pub fn as_elem(self) -> Option<Elem> {
         match self {
             Type::I64 => Some(Elem::I64),
             Type::F64 => Some(Elem::F64),
             Type::Bool => Some(Elem::Bool),
-            Type::Str | Type::Array(_) => None,
+            Type::Str | Type::Array(_) | Type::Struct(_) => None,
         }
     }
 }
@@ -87,6 +89,10 @@ pub enum Expr {
     Repeat { value: Box<Expr>, count: Box<Expr> },
     /// Indexing `arr[index]`.
     Index { arr: Box<Expr>, index: Box<Expr> },
+    /// Struct literal `Name { field: value, ... }`.
+    StructLit { name: String, fields: Vec<(String, Expr)> },
+    /// Field access `base.field`.
+    Field { base: Box<Expr>, field: String },
 }
 
 /// A statement plus the source line it starts on (for error messages).
@@ -144,6 +150,13 @@ pub struct Func {
 }
 
 #[derive(Debug, Clone)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Module {
     pub funcs: Vec<Func>,
+    pub structs: Vec<StructDecl>,
 }

@@ -2,19 +2,38 @@
 
 use crate::ast::*;
 use crate::lexer::{Tok, Token};
+use std::collections::HashMap;
 
 pub fn parse(tokens: &[Token]) -> Result<Module, String> {
-    let mut p = Parser { toks: tokens, pos: 0 };
-    let mut funcs = Vec::new();
-    while !p.at_end() {
-        funcs.push(p.func()?);
+    // Pre-scan struct names → ids so a type can reference any struct (incl.
+    // forward references and self/mutual references in field types).
+    let mut struct_ids: HashMap<String, u32> = HashMap::new();
+    for w in tokens.windows(2) {
+        if w[0].tok == Tok::Struct {
+            if let Tok::Ident(name) = &w[1].tok {
+                let next = struct_ids.len() as u32;
+                struct_ids.entry(name.clone()).or_insert(next);
+            }
+        }
     }
-    Ok(Module { funcs })
+
+    let mut p = Parser { toks: tokens, pos: 0, struct_ids };
+    let mut funcs = Vec::new();
+    let mut structs = Vec::new();
+    while !p.at_end() {
+        match p.peek() {
+            Some(Tok::Struct) => structs.push(p.struct_decl()?),
+            Some(Tok::Fn) => funcs.push(p.func()?),
+            _ => return Err(format!("parse error: expected `fn` or `struct`{}", p.at())),
+        }
+    }
+    Ok(Module { funcs, structs })
 }
 
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
+    struct_ids: HashMap<String, u32>,
 }
 
 impl<'a> Parser<'a> {
@@ -94,8 +113,30 @@ impl<'a> Parser<'a> {
                     .ok_or("parse error: nested arrays are not supported in v0")?;
                 Ok(Type::Array(elem))
             }
+            Tok::Ident(name) => match self.struct_ids.get(&name) {
+                Some(id) => Ok(Type::Struct(*id)),
+                None => Err(format!("parse error: unknown type '{name}'")),
+            },
             other => Err(format!("parse error: expected type, found {other:?}")),
         }
+    }
+
+    fn struct_decl(&mut self) -> Result<StructDecl, String> {
+        self.expect(&Tok::Struct)?;
+        let name = self.ident()?;
+        self.expect(&Tok::LBrace)?;
+        let mut fields = Vec::new();
+        while self.peek() != Some(&Tok::RBrace) {
+            let fname = self.ident()?;
+            self.expect(&Tok::Colon)?;
+            let fty = self.ty()?;
+            fields.push((fname, fty));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(StructDecl { name, fields })
     }
 
     fn func(&mut self) -> Result<Func, String> {
@@ -237,7 +278,7 @@ impl<'a> Parser<'a> {
                     let value = self.expr()?;
                     self.expect(&Tok::Semi)?;
                     match e {
-                        Expr::Var(_) | Expr::Index { .. } => Ok(StmtKind::Assign { target: e, value }),
+                        Expr::Var(_) | Expr::Index { .. } | Expr::Field { .. } =>Ok(StmtKind::Assign { target: e, value }),
                         _ => Err(format!("parse error: invalid assignment target{}", self.at())),
                     }
                 } else {
@@ -255,7 +296,7 @@ impl<'a> Parser<'a> {
         let kind = if self.eat(&Tok::Assign) {
             let value = self.expr()?;
             match e {
-                Expr::Var(_) | Expr::Index { .. } => StmtKind::Assign { target: e, value },
+                Expr::Var(_) | Expr::Index { .. } | Expr::Field { .. } =>StmtKind::Assign { target: e, value },
                 _ => return Err(format!("parse error: invalid assignment target{}", self.at())),
             }
         } else {
@@ -416,11 +457,21 @@ impl<'a> Parser<'a> {
     /// Primary followed by zero or more `[index]` suffixes.
     fn postfix(&mut self) -> Result<Expr, String> {
         let mut e = self.primary()?;
-        while self.peek() == Some(&Tok::LBracket) {
-            self.bump()?;
-            let index = self.expr()?;
-            self.expect(&Tok::RBracket)?;
-            e = Expr::Index { arr: Box::new(e), index: Box::new(index) };
+        loop {
+            match self.peek() {
+                Some(Tok::LBracket) => {
+                    self.bump()?;
+                    let index = self.expr()?;
+                    self.expect(&Tok::RBracket)?;
+                    e = Expr::Index { arr: Box::new(e), index: Box::new(index) };
+                }
+                Some(Tok::Dot) => {
+                    self.bump()?;
+                    let field = self.ident()?;
+                    e = Expr::Field { base: Box::new(e), field };
+                }
+                _ => break,
+            }
         }
         Ok(e)
     }
@@ -486,6 +537,21 @@ impl<'a> Parser<'a> {
                     }
                     self.expect(&Tok::RParen)?;
                     Ok(Expr::Call { name, args })
+                } else if self.peek() == Some(&Tok::LBrace) && self.struct_ids.contains_key(&name) {
+                    // struct literal: Name { field: value, ... }
+                    self.bump()?; // {
+                    let mut fields = Vec::new();
+                    while self.peek() != Some(&Tok::RBrace) {
+                        let fname = self.ident()?;
+                        self.expect(&Tok::Colon)?;
+                        let fe = self.expr()?;
+                        fields.push((fname, fe));
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RBrace)?;
+                    Ok(Expr::StructLit { name, fields })
                 } else {
                     Ok(Expr::Var(name))
                 }

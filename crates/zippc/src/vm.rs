@@ -17,6 +17,7 @@ pub enum Value {
     F64(f64),
     Arr(usize),
     Str(usize),
+    Struct { id: u32, ptr: usize },
 }
 
 impl Value {
@@ -24,7 +25,7 @@ impl Value {
         match self {
             Value::I64(x) => x == 0,
             Value::F64(f) => f == 0.0,
-            Value::Arr(_) | Value::Str(_) => false,
+            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } => false,
         }
     }
     /// The i64 payload, or `None` for non-integers.
@@ -40,7 +41,7 @@ impl Value {
         match self {
             Value::I64(x) => x,
             Value::F64(f) => f as i64,
-            Value::Arr(_) | Value::Str(_) => 0,
+            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } => 0,
         }
     }
 }
@@ -52,6 +53,7 @@ impl std::fmt::Display for Value {
             Value::F64(v) => write!(f, "{v}"),
             Value::Arr(_) => write!(f, "[array]"),
             Value::Str(_) => write!(f, "[str]"),
+            Value::Struct { .. } => write!(f, "[struct]"),
         }
     }
 }
@@ -96,6 +98,7 @@ pub const MAX_TRACE_STEPS: usize = 1 << 19;
 const ZK_INT_ONLY: &str = "--prove is integer-only: this program uses f64 (the zk profile is integer-only by design)";
 const ZK_NO_ARRAY: &str = "--prove does not support arrays yet (the zk profile is integer-only)";
 const ZK_NO_STR: &str = "--prove does not support strings (the zk profile is integer-only)";
+const ZK_NO_STRUCT: &str = "--prove does not support structs (the zk profile is integer-only)";
 
 pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
     let main = &prog.funcs[prog.main as usize];
@@ -315,6 +318,46 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 let a1 = vals.get(1).map(|v| v.trace_i64()).unwrap_or(0);
                 rec!(OpKind::Other, a0, a1, res.trace_i64(), 0);
             }
+            Instr::NewStruct { id, dst, fields } => {
+                if record_trace {
+                    return Err(ZK_NO_STRUCT.into());
+                }
+                let vals: Vec<Value> = fields.iter().map(|r| reg[base + *r as usize]).collect();
+                let ptr = heap.len();
+                heap.push(vals);
+                reg[base + *dst as usize] = Value::Struct { id: *id, ptr };
+            }
+            Instr::GetField { dst, base: obj, field } => {
+                if record_trace {
+                    return Err(ZK_NO_STRUCT.into());
+                }
+                let (id, ptr) = match reg[base + *obj as usize] {
+                    Value::Struct { id, ptr } => (id, ptr),
+                    _ => return Err("runtime error: field access on a non-struct".into()),
+                };
+                let slot = prog.structs[id as usize]
+                    .fields
+                    .iter()
+                    .position(|f| f == field)
+                    .ok_or_else(|| format!("runtime error: no field '{field}'"))?;
+                reg[base + *dst as usize] = heap[ptr][slot];
+            }
+            Instr::SetField { base: obj, field, value } => {
+                if record_trace {
+                    return Err(ZK_NO_STRUCT.into());
+                }
+                let (id, ptr) = match reg[base + *obj as usize] {
+                    Value::Struct { id, ptr } => (id, ptr),
+                    _ => return Err("runtime error: field assignment to a non-struct".into()),
+                };
+                let slot = prog.structs[id as usize]
+                    .fields
+                    .iter()
+                    .position(|f| f == field)
+                    .ok_or_else(|| format!("runtime error: no field '{field}'"))?;
+                let v = reg[base + *value as usize];
+                heap[ptr][slot] = v;
+            }
         }
         clk += 1;
     }
@@ -343,6 +386,7 @@ fn render(v: Value, strs: &[String]) -> String {
         Value::F64(f) => f.to_string(),
         Value::Str(i) => strs[i].clone(),
         Value::Arr(_) => "[array]".to_string(),
+        Value::Struct { .. } => "[struct]".to_string(),
     }
 }
 
