@@ -23,8 +23,9 @@ function main() {
   }
   return total;
 }
+const eng = typeof Bun !== "undefined" ? "bun/JSC" : "node/V8";
 const t0 = process.hrtime.bigint();
 const r = main();
 const t1 = process.hrtime.bigint();
 console.log(r);
-console.log(`=> ${r} (node/V8, ran in ${Number(t1 - t0) / 1e6} ms)`);
+console.log(`=> ${r} (${eng}, ran in ${Number(t1 - t0) / 1e6} ms)`);

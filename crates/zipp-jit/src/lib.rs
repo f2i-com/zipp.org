@@ -1,11 +1,17 @@
-//! ZIPP native backend — a Cranelift JIT for the **scalar subset** (`i64` and
-//! `f64`, incl. casts). Programs using arrays/strings/structs/builtins fall
-//! back to the interpreter.
+//! ZIPP native backend — a Cranelift JIT for the **scalar subset plus 1-D
+//! arrays** (`i64`/`f64`, casts, and `[T]` of scalars). Programs using
+//! strings/structs/builtins fall back to the interpreter.
 //!
 //! Registers are statically typed (the IR allocates them monotonically, so each
-//! has one type); a forward pass infers each register's Cranelift type, then
-//! every ZIPP function is lowered to a Cranelift function — registers → SSA
-//! variables, jump targets → blocks, calls → direct calls.
+//! has one type); a forward pass infers each register's type, then every ZIPP
+//! function is lowered to a Cranelift function — registers → SSA variables,
+//! jump targets → blocks, calls → direct calls.
+//!
+//! Arrays are heap blocks `[ len:i64 | e0 | e1 | … ]` of 8-byte slots (f64
+//! elements stored bit-reinterpreted), allocated by a tiny leak-on-alloc
+//! runtime (`zipp_alloc`); no GC yet, matching the interpreter's heap. Indexing
+//! is bounds-checked (one unsigned compare catches negative and ≥len), aborting
+//! via `zipp_oob` — same semantics as the interpreter.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -13,12 +19,14 @@ use std::time::{Duration, Instant};
 use cranelift_codegen::settings::Configurable;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, Type as ClifType, Value};
+use cranelift_codegen::ir::{
+    types, AbiParam, Block, InstBuilder, MemFlags, TrapCode, Type as ClifType, Value,
+};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
-use zippc::ast::{BinOp, Type, UnOp};
+use zippc::ast::{BinOp, Elem, Type, UnOp};
 use zippc::ir::{FuncMeta, Instr, Program};
 
 extern "C" fn zipp_print_i64(x: i64) {
@@ -26,6 +34,50 @@ extern "C" fn zipp_print_i64(x: i64) {
 }
 extern "C" fn zipp_print_f64(x: f64) {
     println!("{x}");
+}
+
+/// Allocate an array of `n` 8-byte slots, length-prefixed, zero-initialized.
+/// Leaks (no GC in v0 — the interpreter's heap doesn't free either). Returns the
+/// base pointer as an i64. Aborts on a negative/absurd length.
+extern "C" fn zipp_alloc(n: i64) -> i64 {
+    if n < 0 {
+        eprintln!("zipp: array length cannot be negative ({n})");
+        std::process::abort();
+    }
+    let total = (n as usize) + 1;
+    let mut v: Vec<i64> = vec![0; total];
+    v[0] = n;
+    let ptr = v.as_mut_ptr();
+    std::mem::forget(v); // leaked until process exit
+    ptr as i64
+}
+
+/// `[value; n]` — allocate then fill. `val` is the raw 8-byte payload (f64
+/// elements are passed bit-reinterpreted by the caller).
+extern "C" fn zipp_array_repeat(n: i64, val: i64) -> i64 {
+    let base = zipp_alloc(n) as *mut i64;
+    // SAFETY: zipp_alloc gave us n+1 valid slots; we fill the n element slots.
+    unsafe {
+        for i in 0..n {
+            *base.add(1 + i as usize) = val;
+        }
+    }
+    base as i64
+}
+
+extern "C" fn zipp_oob(idx: i64, len: i64) {
+    eprintln!("zipp: array index {idx} out of bounds (len {len})");
+    std::process::abort();
+}
+
+/// Runtime symbols the JIT calls into.
+#[derive(Clone, Copy)]
+struct RuntimeIds {
+    print_i64: FuncId,
+    print_f64: FuncId,
+    alloc: FuncId,
+    array_repeat: FuncId,
+    oob: FuncId,
 }
 
 /// Result of a JIT'd `main`.
@@ -54,32 +106,56 @@ pub struct JitOutcome {
     pub execute: Duration,
 }
 
-fn is_scalar(t: Type) -> bool {
-    matches!(t, Type::I64 | Type::F64 | Type::Bool)
+/// The JIT type of a register. Arrays are pointers (Cranelift type `i64`); the
+/// bool carried by `Arr` records whether the *elements* are f64 (so loads/stores
+/// know whether to bit-reinterpret).
+#[derive(Clone, Copy, PartialEq)]
+enum JTy {
+    I64,
+    F64,
+    Arr(bool),
 }
 
-/// Cranelift type for a ZIPP type (bool is an i64 0/1).
-fn clif_ty(t: Type) -> ClifType {
-    match t {
-        Type::F64 => types::F64,
-        _ => types::I64,
+impl JTy {
+    fn clif(self) -> ClifType {
+        if matches!(self, JTy::F64) {
+            types::F64
+        } else {
+            types::I64 // i64, bool, and array pointers
+        }
     }
+    fn arr_f64(self) -> bool {
+        matches!(self, JTy::Arr(true))
+    }
+}
+
+fn jty_of(t: Type) -> JTy {
+    match t {
+        Type::F64 => JTy::F64,
+        Type::Array(e) => JTy::Arr(matches!(e, Elem::F64)),
+        _ => JTy::I64,
+    }
+}
+
+/// A type usable across the JIT ABI: a scalar or a 1-D array of scalars.
+fn jit_ty_ok(t: Type) -> bool {
+    matches!(t, Type::I64 | Type::F64 | Type::Bool | Type::Array(_))
+}
+
+/// Cranelift type for a ZIPP type (bool / array pointers are i64).
+fn clif_ty(t: Type) -> ClifType {
+    jty_of(t).clif()
 }
 
 fn var(r: u32) -> Variable {
     Variable::from_u32(r)
 }
 
-/// Reason a program can't be JIT-compiled (scalar subset only), or `None`.
+/// Reason a program can't be JIT-compiled (scalar subset + arrays), or `None`.
 pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     for ins in &prog.code {
         let bad = match ins {
             Instr::SConst { .. } => "strings",
-            Instr::ArrayLit { .. }
-            | Instr::ArrayRepeat { .. }
-            | Instr::Index { .. }
-            | Instr::SetIndex { .. }
-            | Instr::Len { .. } => "arrays",
             Instr::Builtin { .. } => "builtins",
             Instr::NewStruct { .. } | Instr::GetField { .. } | Instr::SetField { .. } => "structs",
             _ => continue,
@@ -87,8 +163,8 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
         return Some(bad);
     }
     for f in &prog.funcs {
-        if !is_scalar(f.ret) || f.params.iter().any(|t| !is_scalar(*t)) {
-            return Some("non-scalar function signatures");
+        if !jit_ty_ok(f.ret) || f.params.iter().any(|t| !jit_ty_ok(*t)) {
+            return Some("non-scalar/array function signatures");
         }
     }
     None
@@ -136,6 +212,9 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     let mut jit = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     jit.symbol("zipp_print_i64", zipp_print_i64 as *const u8);
     jit.symbol("zipp_print_f64", zipp_print_f64 as *const u8);
+    jit.symbol("zipp_alloc", zipp_alloc as *const u8);
+    jit.symbol("zipp_array_repeat", zipp_array_repeat as *const u8);
+    jit.symbol("zipp_oob", zipp_oob as *const u8);
     let mut module = JITModule::new(jit);
 
     let mut func_ids = Vec::with_capacity(prog.funcs.len());
@@ -146,15 +225,25 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
             .map_err(|e| format!("declare {}: {e}", f.name))?;
         func_ids.push(id);
     }
-    let import = |module: &mut JITModule, name: &str, ty: ClifType| {
+    let import = |module: &mut JITModule, name: &str, params: &[ClifType], ret: Option<ClifType>| {
         let mut sig = module.make_signature();
-        sig.params.push(AbiParam::new(ty));
+        for p in params {
+            sig.params.push(AbiParam::new(*p));
+        }
+        if let Some(r) = ret {
+            sig.returns.push(AbiParam::new(r));
+        }
         module
             .declare_function(name, Linkage::Import, &sig)
             .map_err(|e| format!("declare {name}: {e}"))
     };
-    let print_i64_id = import(&mut module, "zipp_print_i64", types::I64)?;
-    let print_f64_id = import(&mut module, "zipp_print_f64", types::F64)?;
+    let rt = RuntimeIds {
+        print_i64: import(&mut module, "zipp_print_i64", &[types::I64], None)?,
+        print_f64: import(&mut module, "zipp_print_f64", &[types::F64], None)?,
+        alloc: import(&mut module, "zipp_alloc", &[types::I64], Some(types::I64))?,
+        array_repeat: import(&mut module, "zipp_array_repeat", &[types::I64, types::I64], Some(types::I64))?,
+        oob: import(&mut module, "zipp_oob", &[types::I64, types::I64], None)?,
+    };
 
     let mut ctx = module.make_context();
     let mut fctx = FunctionBuilderContext::new();
@@ -165,10 +254,7 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
             prog.code.len() as u32
         };
         ctx.func.signature = make_sig(&module, &f.params, f.ret);
-        compile_function(
-            &mut module, &mut ctx, &mut fctx, prog, i, end, &func_ids, print_i64_id,
-            print_f64_id, fast_math,
-        )?;
+        compile_function(&mut module, &mut ctx, &mut fctx, prog, i, end, &func_ids, &rt, fast_math)?;
         module
             .define_function(func_ids[i], &mut ctx)
             .map_err(|e| format!("jit codegen failed for {}: {e:?}", f.name))?;
@@ -197,33 +283,48 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     Ok(JitOutcome { value, compile, execute })
 }
 
-/// Forward pass: the Cranelift type of every register in a function.
-fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<ClifType> {
-    let mut t = vec![types::I64; f.nregs as usize];
+/// Forward pass: the [`JTy`] of every register in a function.
+fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
+    let mut t = vec![JTy::I64; f.nregs as usize];
     for (i, pt) in f.params.iter().enumerate() {
-        t[i] = clif_ty(*pt);
+        t[i] = jty_of(*pt);
     }
+    let is_f64 = |t: &[JTy], r: u32| matches!(t[r as usize], JTy::F64);
     for pc in f.entry..end {
         match &prog.code[pc as usize] {
-            Instr::Const { dst, .. } => t[*dst as usize] = types::I64,
-            Instr::FConst { dst, .. } => t[*dst as usize] = types::F64,
-            Instr::Cast { dst, to, .. } => t[*dst as usize] = clif_ty(*to),
+            Instr::Const { dst, .. } => t[*dst as usize] = JTy::I64,
+            Instr::FConst { dst, .. } => t[*dst as usize] = JTy::F64,
+            Instr::Cast { dst, to, .. } => t[*dst as usize] = jty_of(*to),
             Instr::Mov { dst, src } => t[*dst as usize] = t[*src as usize],
             Instr::Bin { op, dst, a, .. } => {
                 t[*dst as usize] = match op {
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => t[*a as usize],
-                    _ => types::I64, // comparisons (bool), mod/bitwise/shift
+                    _ => JTy::I64, // comparisons (bool), mod/bitwise/shift
                 };
             }
             Instr::Unary { op, dst, a } => {
                 t[*dst as usize] = match op {
                     UnOp::Neg => t[*a as usize],
-                    _ => types::I64,
+                    _ => JTy::I64,
                 };
             }
             Instr::Call { func, dst, .. } => {
-                t[*dst as usize] = clif_ty(prog.funcs[*func as usize].ret);
+                t[*dst as usize] = jty_of(prog.funcs[*func as usize].ret);
             }
+            Instr::ArrayLit { dst, elems } => {
+                t[*dst as usize] = JTy::Arr(elems.first().is_some_and(|e| is_f64(&t, *e)));
+            }
+            Instr::ArrayRepeat { dst, value, .. } => {
+                t[*dst as usize] = JTy::Arr(is_f64(&t, *value));
+            }
+            Instr::Index { dst, arr, .. } => {
+                t[*dst as usize] = if t[*arr as usize].arr_f64() {
+                    JTy::F64
+                } else {
+                    JTy::I64
+                };
+            }
+            Instr::Len { dst, .. } => t[*dst as usize] = JTy::I64,
             _ => {}
         }
     }
@@ -276,7 +377,7 @@ fn plan_fma(
     prog: &Program,
     f: &FuncMeta,
     end: u32,
-    rty: &[ClifType],
+    rty: &[JTy],
     leaders: &BTreeSet<u32>,
 ) -> (std::collections::HashSet<u32>, HashMap<u32, FmaPlan>) {
     let uses = use_counts(prog, f, end);
@@ -286,7 +387,7 @@ fn plan_fma(
         let Instr::Bin { op: BinOp::Mul, dst: m, a: p, b: q } = &prog.code[pc as usize] else {
             continue;
         };
-        if rty[*m as usize] != types::F64 || uses[*m as usize] != 1 {
+        if rty[*m as usize].clif() != types::F64 || uses[*m as usize] != 1 {
             continue;
         }
         let next = pc + 1;
@@ -312,6 +413,33 @@ fn plan_fma(
     (skip, plan)
 }
 
+/// Compute a bounds-checked element address `base + 8*(idx+1)`, aborting via
+/// `zipp_oob` if `idx` is out of range (the unsigned compare also catches
+/// negatives). Splits the current block into an out-of-bounds path and the
+/// in-bounds continuation, and leaves the builder positioned in the latter.
+fn checked_addr(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    oob: FuncId,
+    base: Value,
+    idx: Value,
+) -> Value {
+    let flags = MemFlags::trusted();
+    let len = builder.ins().load(types::I64, flags, base, 0);
+    let inb = builder.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+    let ok = builder.create_block();
+    let bad = builder.create_block();
+    builder.ins().brif(inb, ok, &[], bad, &[]);
+    builder.switch_to_block(bad);
+    let f = module.declare_func_in_func(oob, builder.func);
+    builder.ins().call(f, &[idx, len]);
+    builder.ins().trap(TrapCode::HEAP_OUT_OF_BOUNDS); // zipp_oob aborts; unreachable
+    builder.switch_to_block(ok);
+    let i1 = builder.ins().iadd_imm(idx, 1);
+    let off = builder.ins().imul_imm(i1, 8);
+    builder.ins().iadd(base, off)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_function(
     module: &mut JITModule,
@@ -321,8 +449,7 @@ fn compile_function(
     fi: usize,
     end: u32,
     func_ids: &[FuncId],
-    print_i64_id: FuncId,
-    print_f64_id: FuncId,
+    rt: &RuntimeIds,
     fast_math: bool,
 ) -> Result<(), String> {
     let f = &prog.funcs[fi];
@@ -364,7 +491,7 @@ fn compile_function(
     }
 
     for r in 0..f.nregs {
-        builder.declare_var(var(r), rty[r as usize]);
+        builder.declare_var(var(r), rty[r as usize].clif());
     }
 
     let entry_blk = blocks[&entry_pc];
@@ -375,7 +502,7 @@ fn compile_function(
         builder.def_var(var(idx as u32), *pv);
     }
     for r in f.nparams..f.nregs {
-        let z = if rty[r as usize] == types::F64 {
+        let z = if rty[r as usize].clif() == types::F64 {
             builder.ins().f64const(0.0)
         } else {
             builder.ins().iconst(types::I64, 0)
@@ -410,7 +537,7 @@ fn compile_function(
             }
             Instr::Cast { dst, src, to } => {
                 let sval = builder.use_var(var(*src));
-                let src_ty = rty[*src as usize];
+                let src_ty = rty[*src as usize].clif();
                 let to_ty = clif_ty(*to);
                 let res = if src_ty == types::I64 && to_ty == types::F64 {
                     builder.ins().fcvt_from_sint(types::F64, sval)
@@ -440,14 +567,14 @@ fn compile_function(
                 } else {
                     let av = builder.use_var(var(*a));
                     let bv = builder.use_var(var(*b));
-                    emit_bin(&mut builder, *op, av, bv, rty[*a as usize])
+                    emit_bin(&mut builder, *op, av, bv, rty[*a as usize].clif())
                 };
                 builder.def_var(var(*dst), res);
             }
             Instr::Unary { op, dst, a } => {
                 let av = builder.use_var(var(*a));
                 let res = match op {
-                    UnOp::Neg if rty[*a as usize] == types::F64 => builder.ins().fneg(av),
+                    UnOp::Neg if rty[*a as usize].clif() == types::F64 => builder.ins().fneg(av),
                     UnOp::Neg => builder.ins().ineg(av),
                     UnOp::BitNot => builder.ins().bnot(av),
                     UnOp::Not => {
@@ -485,14 +612,74 @@ fn compile_function(
                 terminated = true;
             }
             Instr::Print { a } => {
-                let id = if rty[*a as usize] == types::F64 {
-                    print_f64_id
+                let id = if rty[*a as usize].clif() == types::F64 {
+                    rt.print_f64
                 } else {
-                    print_i64_id
+                    rt.print_i64
                 };
                 let p = module.declare_func_in_func(id, builder.func);
                 let av = builder.use_var(var(*a));
                 builder.ins().call(p, &[av]);
+            }
+            Instr::ArrayLit { dst, elems } => {
+                let n = builder.ins().iconst(types::I64, elems.len() as i64);
+                let alloc = module.declare_func_in_func(rt.alloc, builder.func);
+                let call = builder.ins().call(alloc, &[n]);
+                let ptr = builder.inst_results(call)[0];
+                let elem_f64 = rty[*dst as usize].arr_f64();
+                let flags = MemFlags::trusted();
+                for (i, e) in elems.iter().enumerate() {
+                    let ev = builder.use_var(var(*e));
+                    let raw = if elem_f64 {
+                        builder.ins().bitcast(types::I64, MemFlags::new(), ev)
+                    } else {
+                        ev
+                    };
+                    builder.ins().store(flags, raw, ptr, 8 * (i as i32 + 1));
+                }
+                builder.def_var(var(*dst), ptr);
+            }
+            Instr::ArrayRepeat { dst, value, count } => {
+                let cv = builder.use_var(var(*count));
+                let vv = builder.use_var(var(*value));
+                let raw = if rty[*dst as usize].arr_f64() {
+                    builder.ins().bitcast(types::I64, MemFlags::new(), vv)
+                } else {
+                    vv
+                };
+                let rep = module.declare_func_in_func(rt.array_repeat, builder.func);
+                let call = builder.ins().call(rep, &[cv, raw]);
+                let ptr = builder.inst_results(call)[0];
+                builder.def_var(var(*dst), ptr);
+            }
+            Instr::Index { dst, arr, idx } => {
+                let base = builder.use_var(var(*arr));
+                let i = builder.use_var(var(*idx));
+                let addr = checked_addr(module, &mut builder, rt.oob, base, i);
+                let raw = builder.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+                let val = if rty[*arr as usize].arr_f64() {
+                    builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+                } else {
+                    raw
+                };
+                builder.def_var(var(*dst), val);
+            }
+            Instr::SetIndex { arr, idx, value } => {
+                let base = builder.use_var(var(*arr));
+                let i = builder.use_var(var(*idx));
+                let vv = builder.use_var(var(*value));
+                let raw = if rty[*arr as usize].arr_f64() {
+                    builder.ins().bitcast(types::I64, MemFlags::new(), vv)
+                } else {
+                    vv
+                };
+                let addr = checked_addr(module, &mut builder, rt.oob, base, i);
+                builder.ins().store(MemFlags::trusted(), raw, addr, 0);
+            }
+            Instr::Len { dst, arr } => {
+                let base = builder.use_var(var(*arr));
+                let len = builder.ins().load(types::I64, MemFlags::trusted(), base, 0);
+                builder.def_var(var(*dst), len);
             }
             other => return Err(format!("internal: ineligible instr reached JIT: {other:?}")),
         }
@@ -617,9 +804,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_heap_programs() {
-        let a = zippc::compile("fn main(): i64 { let x = [1, 2]; return x[0]; }").unwrap();
-        assert!(run(&a).is_err());
+    fn arrays_i64() {
+        // literal, index read/write, len, a loop summing an array
+        let sum = "fn main(): i64 { \
+                     let a = [10, 20, 30, 40]; \
+                     a[1] = a[1] + 5; \
+                     let s = 0; let i = 0; \
+                     while (i < len(a)) { s = s + a[i]; i = i + 1; } \
+                     return s; }"; // 10 + 25 + 30 + 40 = 105
+        assert_eq!(jit_i64(sum), 105);
+    }
+
+    #[test]
+    fn arrays_f64_and_repeat() {
+        // repeat-init f64 array, write, read back, average
+        let avg = "fn main(): f64 { \
+                     let a = [0.0; 4]; let i = 0; \
+                     while (i < 4) { a[i] = f64(i) + 1.0; i = i + 1; } \
+                     let s = 0.0; i = 0; \
+                     while (i < len(a)) { s = s + a[i]; i = i + 1; } \
+                     return s / f64(len(a)); }"; // (1+2+3+4)/4 = 2.5
+        assert_eq!(jit_f64(avg), 2.5);
+    }
+
+    #[test]
+    fn arrays_across_calls() {
+        // array passed to and returned from a function (pointer ABI)
+        let src = "fn fill(a: [i64], v: i64): [i64] { \
+                       let i = 0; while (i < len(a)) { a[i] = v; i = i + 1; } return a; } \
+                   fn main(): i64 { \
+                       let a = [0, 0, 0]; a = fill(a, 7); return a[0] + a[2]; }"; // 14
+        assert_eq!(jit_i64(src), 14);
+    }
+
+    #[test]
+    fn rejects_strings_and_structs() {
+        // arrays now JIT; strings/structs still fall back.
         let s = zippc::compile("fn main(): i64 { let x = \"hi\"; return len(x); }").unwrap();
         assert!(run(&s).is_err());
     }

@@ -9,50 +9,55 @@
 //! reassociation, vectorization and scheduling for free — the things Cranelift
 //! (the tier-0 JIT) does not.
 //!
-//! Scope: the scalar subset (`i64` + `f64`, casts) — same as the JIT. Arrays /
-//! strings / structs fall back to the interpreter.
+//! Scope: the scalar subset (`i64` + `f64`, casts) plus 1-D arrays of scalars
+//! (a small emitted runtime: calloc-backed, length-prefixed, bounds-checked) —
+//! same coverage as the JIT. Strings / structs fall back to the interpreter.
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use zippc::ast::{BinOp, Type, UnOp};
+use zippc::ast::{BinOp, Elem, Type, UnOp};
 use zippc::ir::{FuncMeta, Instr, Program};
 
+/// LLVM type of a register. Arrays are `ptr` to a length-prefixed i64 block; the
+/// bool carried by `Arr` records whether the *elements* are f64.
 #[derive(Clone, Copy, PartialEq)]
 enum LTy {
     I64,
     F64,
+    Arr(bool),
 }
 
 fn llname(t: LTy) -> &'static str {
     match t {
         LTy::I64 => "i64",
         LTy::F64 => "double",
+        LTy::Arr(_) => "ptr",
     }
+}
+
+fn arr_f64(t: LTy) -> bool {
+    matches!(t, LTy::Arr(true))
 }
 
 fn lty_of(t: Type) -> LTy {
     match t {
         Type::F64 => LTy::F64,
+        Type::Array(e) => LTy::Arr(matches!(e, Elem::F64)),
         _ => LTy::I64, // i64, bool (bool is an i64 0/1)
     }
 }
 
-fn is_scalar(t: Type) -> bool {
-    matches!(t, Type::I64 | Type::F64 | Type::Bool)
+fn llvm_ty_ok(t: Type) -> bool {
+    matches!(t, Type::I64 | Type::F64 | Type::Bool | Type::Array(_))
 }
 
-/// Reason a program can't use the LLVM tier (scalar subset only), or `None`.
+/// Reason a program can't use the LLVM tier (scalar subset + arrays), or `None`.
 pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     for ins in &prog.code {
         let bad = match ins {
             Instr::SConst { .. } => "strings",
-            Instr::ArrayLit { .. }
-            | Instr::ArrayRepeat { .. }
-            | Instr::Index { .. }
-            | Instr::SetIndex { .. }
-            | Instr::Len { .. } => "arrays",
             Instr::Builtin { .. } => "builtins",
             Instr::NewStruct { .. } | Instr::GetField { .. } | Instr::SetField { .. } => "structs",
             _ => continue,
@@ -60,8 +65,8 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
         return Some(bad);
     }
     for f in &prog.funcs {
-        if !is_scalar(f.ret) || f.params.iter().any(|t| !is_scalar(*t)) {
-            return Some("non-scalar function signatures");
+        if !llvm_ty_ok(f.ret) || f.params.iter().any(|t| !llvm_ty_ok(*t)) {
+            return Some("non-scalar/array function signatures");
         }
     }
     None
@@ -94,10 +99,48 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
             Instr::Call { func, dst, .. } => {
                 t[*dst as usize] = lty_of(prog.funcs[*func as usize].ret);
             }
+            Instr::ArrayLit { dst, elems } => {
+                t[*dst as usize] =
+                    LTy::Arr(elems.first().is_some_and(|e| t[*e as usize] == LTy::F64));
+            }
+            Instr::ArrayRepeat { dst, value, .. } => {
+                t[*dst as usize] = LTy::Arr(t[*value as usize] == LTy::F64);
+            }
+            Instr::Index { dst, arr, .. } => {
+                t[*dst as usize] = if arr_f64(t[*arr as usize]) {
+                    LTy::F64
+                } else {
+                    LTy::I64
+                };
+            }
+            Instr::Len { dst, .. } => t[*dst as usize] = LTy::I64,
             _ => {}
         }
     }
     t
+}
+
+/// Emit a bounds-checked element-address GEP (`base[idx+1]`), aborting via
+/// `@zipp_oob` if out of range. Leaves emission in the in-bounds block; returns
+/// the element-slot `ptr` SSA name.
+fn checked_slot(body: &mut String, tmp: &mut usize, base: &str, idx: &str) -> String {
+    let n = *tmp;
+    *tmp += 1;
+    let len = fresh(tmp);
+    body.push_str(&format!("  {len} = load i64, ptr {base}\n"));
+    let inb = fresh(tmp);
+    body.push_str(&format!("  {inb} = icmp ult i64 {idx}, {len}\n"));
+    let (ok, bad) = (format!("chk{n}.ok"), format!("chk{n}.bad"));
+    body.push_str(&format!("  br i1 {inb}, label %{ok}, label %{bad}\n"));
+    body.push_str(&format!("{bad}:\n"));
+    body.push_str(&format!("  call void @zipp_oob(i64 {idx}, i64 {len})\n"));
+    body.push_str("  unreachable\n");
+    body.push_str(&format!("{ok}:\n"));
+    let i1 = fresh(tmp);
+    body.push_str(&format!("  {i1} = add i64 {idx}, 1\n"));
+    let slot = fresh(tmp);
+    body.push_str(&format!("  {slot} = getelementptr inbounds i64, ptr {base}, i64 {i1}\n"));
+    slot
 }
 
 fn leaders_of(prog: &Program, entry: u32, end: u32) -> std::collections::BTreeSet<u32> {
@@ -340,9 +383,80 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> String {
                 let v = load(&mut s, &mut tmp, &rty, *a);
                 let (fmt, ty) = match rty[*a as usize] {
                     LTy::F64 => ("@.fmt_f64", "double"),
-                    LTy::I64 => ("@.fmt_i64", "i64"),
+                    _ => ("@.fmt_i64", "i64"),
                 };
                 s.push_str(&format!("  call i32 (ptr, ...) @printf(ptr {fmt}, {ty} {v})\n"));
+            }
+            Instr::ArrayLit { dst, elems } => {
+                let p = fresh(&mut tmp);
+                s.push_str(&format!("  {p} = call ptr @zipp_alloc(i64 {})\n", elems.len()));
+                let elem_f64 = arr_f64(rty[*dst as usize]);
+                for (i, e) in elems.iter().enumerate() {
+                    let ev = load(&mut s, &mut tmp, &rty, *e);
+                    let raw = if elem_f64 {
+                        let b = fresh(&mut tmp);
+                        s.push_str(&format!("  {b} = bitcast double {ev} to i64\n"));
+                        b
+                    } else {
+                        ev
+                    };
+                    let slot = fresh(&mut tmp);
+                    s.push_str(&format!(
+                        "  {slot} = getelementptr inbounds i64, ptr {p}, i64 {}\n",
+                        i + 1
+                    ));
+                    s.push_str(&format!("  store i64 {raw}, ptr {slot}\n"));
+                }
+                store(&mut s, &rty, *dst, &p);
+            }
+            Instr::ArrayRepeat { dst, value, count } => {
+                let cv = load(&mut s, &mut tmp, &rty, *count);
+                let vv = load(&mut s, &mut tmp, &rty, *value);
+                let raw = if arr_f64(rty[*dst as usize]) {
+                    let b = fresh(&mut tmp);
+                    s.push_str(&format!("  {b} = bitcast double {vv} to i64\n"));
+                    b
+                } else {
+                    vv
+                };
+                let p = fresh(&mut tmp);
+                s.push_str(&format!("  {p} = call ptr @zipp_array_repeat(i64 {cv}, i64 {raw})\n"));
+                store(&mut s, &rty, *dst, &p);
+            }
+            Instr::Index { dst, arr, idx } => {
+                let base = load(&mut s, &mut tmp, &rty, *arr);
+                let i = load(&mut s, &mut tmp, &rty, *idx);
+                let slot = checked_slot(&mut s, &mut tmp, &base, &i);
+                let raw = fresh(&mut tmp);
+                s.push_str(&format!("  {raw} = load i64, ptr {slot}\n"));
+                let val = if arr_f64(rty[*arr as usize]) {
+                    let d = fresh(&mut tmp);
+                    s.push_str(&format!("  {d} = bitcast i64 {raw} to double\n"));
+                    d
+                } else {
+                    raw
+                };
+                store(&mut s, &rty, *dst, &val);
+            }
+            Instr::SetIndex { arr, idx, value } => {
+                let base = load(&mut s, &mut tmp, &rty, *arr);
+                let i = load(&mut s, &mut tmp, &rty, *idx);
+                let vv = load(&mut s, &mut tmp, &rty, *value);
+                let raw = if arr_f64(rty[*arr as usize]) {
+                    let b = fresh(&mut tmp);
+                    s.push_str(&format!("  {b} = bitcast double {vv} to i64\n"));
+                    b
+                } else {
+                    vv
+                };
+                let slot = checked_slot(&mut s, &mut tmp, &base, &i);
+                s.push_str(&format!("  store i64 {raw}, ptr {slot}\n"));
+            }
+            Instr::Len { dst, arr } => {
+                let base = load(&mut s, &mut tmp, &rty, *arr);
+                let v = fresh(&mut tmp);
+                s.push_str(&format!("  {v} = load i64, ptr {base}\n"));
+                store(&mut s, &rty, *dst, &v);
             }
             other => {
                 s.push_str(&format!("  ; unsupported instr reached llvm emit: {other:?}\n"));
@@ -372,23 +486,79 @@ fn cstr_global(name: &str, s: &str) -> String {
     format!("@{name} = private unnamed_addr constant [{n} x i8] c\"{esc}\"\n")
 }
 
+/// Array runtime, emitted into every module (stripped by -O3 if unused). An
+/// array is a `ptr` to `[ len:i64 | e0 | e1 | … ]`; f64 elements are stored
+/// bit-reinterpreted as i64. Allocation leaks (no GC v0). Indexing is bounds-
+/// checked by the caller via `@zipp_oob` (one unsigned compare; aborts).
+const ARRAY_RUNTIME: &str = r#"define internal ptr @zipp_alloc(i64 %n) {
+entry:
+  %neg = icmp slt i64 %n, 0
+  br i1 %neg, label %bad, label %ok
+bad:
+  call i32 (ptr, ...) @printf(ptr @.fmt_neg, i64 %n)
+  call void @abort()
+  unreachable
+ok:
+  %tot = add i64 %n, 1
+  %p = call ptr @calloc(i64 %tot, i64 8)
+  store i64 %n, ptr %p
+  ret ptr %p
+}
+
+define internal void @zipp_oob(i64 %idx, i64 %len) {
+entry:
+  call i32 (ptr, ...) @printf(ptr @.fmt_oob, i64 %idx, i64 %len)
+  call void @abort()
+  unreachable
+}
+
+define internal ptr @zipp_array_repeat(i64 %n, i64 %val) {
+entry:
+  %p = call ptr @zipp_alloc(i64 %n)
+  %ip = alloca i64
+  store i64 0, ptr %ip
+  br label %cond
+cond:
+  %i = load i64, ptr %ip
+  %done = icmp sge i64 %i, %n
+  br i1 %done, label %end, label %body
+body:
+  %i1 = add i64 %i, 1
+  %slot = getelementptr inbounds i64, ptr %p, i64 %i1
+  store i64 %val, ptr %slot
+  store i64 %i1, ptr %ip
+  br label %cond
+end:
+  ret ptr %p
+}
+
+"#;
+
 /// Lower a whole program to textual LLVM IR (a self-contained module with a C
 /// `main` that times the entry call with `clock()` and prints the result).
 pub fn emit_ir(prog: &Program) -> Result<String, String> {
     if let Some(bad) = ineligible_reason(prog) {
-        return Err(format!("--llvm supports the scalar subset only (program uses {bad})"));
+        return Err(format!("--llvm supports the scalar subset + arrays only (program uses {bad})"));
     }
     let mut out = String::new();
     out.push_str("; ZIPP → LLVM IR (release tier)\n");
     out.push_str("declare i32 @printf(ptr, ...)\n");
     out.push_str("declare i32 @clock()\n"); // Windows: clock_t = long = i32, CLOCKS_PER_SEC = 1000
-    out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n\n");
+    out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n");
+    out.push_str("declare ptr @calloc(i64, i64)\n");
+    out.push_str("declare void @abort()\n\n");
     out.push_str(&cstr_global(".fmt_i64", "%lld\n"));
     out.push_str(&cstr_global(".fmt_f64", "%.17g\n"));
     out.push_str(&cstr_global(".fmt_ri", "__ZRESULT__:%lld\n"));
     out.push_str(&cstr_global(".fmt_rf", "__ZRESULT__:%.17g\n"));
     out.push_str(&cstr_global(".fmt_time", "__ZTIME_MS__:%d\n"));
+    out.push_str(&cstr_global(".fmt_neg", "zipp: array length cannot be negative (%lld)\n"));
+    out.push_str(&cstr_global(".fmt_oob", "zipp: array index %lld out of bounds (len %lld)\n"));
     out.push('\n');
+
+    // Array runtime: a length-prefixed i64 block via calloc (zero-init, leaked —
+    // no GC in v0). `internal` so -O3 strips these when a program has no arrays.
+    out.push_str(ARRAY_RUNTIME);
 
     for i in 0..prog.funcs.len() {
         let end = if i + 1 < prog.funcs.len() {
@@ -405,7 +575,7 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     let ret = lty_of(prog.funcs[mi].ret);
     let (rt, fmt) = match ret {
         LTy::F64 => ("double", "@.fmt_rf"),
-        LTy::I64 => ("i64", "@.fmt_ri"),
+        _ => ("i64", "@.fmt_ri"), // i64 (or an array pointer, printed as i64)
     };
     out.push_str("define i32 @main() {\nentry:\n");
     out.push_str("  %t0 = call i32 @clock()\n");
@@ -473,7 +643,14 @@ pub fn build_and_run(prog: &Program, fast_math: bool) -> Result<LlvmRun, String>
         .output()
         .map_err(|e| format!("could not run compiled exe: {e}"))?;
     if !run.status.success() {
-        return Err(format!("compiled program exited with {}", run.status));
+        // A runtime abort (e.g. an out-of-bounds index via @zipp_oob) printed its
+        // message to stdout before aborting — surface it.
+        let msg = String::from_utf8_lossy(&run.stdout);
+        let msg = msg.trim();
+        if msg.is_empty() {
+            return Err(format!("compiled program exited with {}", run.status));
+        }
+        return Err(format!("{msg}"));
     }
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
     let mut result = String::new();
@@ -508,8 +685,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_heap_programs() {
-        let prog = zippc::compile("fn main(): i64 { let x = [1, 2, 3]; return x[0]; }").unwrap();
+    fn emits_ir_for_array_programs() {
+        // arrays now emit (literal, index, len, repeat)
+        let prog = zippc::compile(
+            "fn main(): i64 { let a = [1, 2, 3]; a[0] = 9; let b = [0; 4]; return a[0] + len(b); }",
+        )
+        .unwrap();
+        let ir = emit_ir(&prog).unwrap();
+        assert!(ir.contains("@zipp_alloc"));
+        assert!(ir.contains("@zipp_oob"));
+        assert!(ir.contains("getelementptr"));
+    }
+
+    #[test]
+    fn rejects_strings() {
+        // arrays now emit; strings still fall back.
+        let prog = zippc::compile("fn main(): i64 { let x = \"hi\"; return len(x); }").unwrap();
         assert!(emit_ir(&prog).is_err());
     }
 }
