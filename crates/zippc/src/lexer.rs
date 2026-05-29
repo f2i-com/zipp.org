@@ -30,6 +30,8 @@ pub enum Tok {
     RParen,
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     Comma,
     Colon,
     Semi,
@@ -88,6 +90,14 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
             }
             '}' => {
                 out.push(Tok::RBrace);
+                i += 1;
+            }
+            '[' => {
+                out.push(Tok::LBracket);
+                i += 1;
+            }
+            ']' => {
+                out.push(Tok::RBracket);
                 i += 1;
             }
             ',' => {

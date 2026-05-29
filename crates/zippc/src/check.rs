@@ -95,15 +95,13 @@ fn check_stmt(
             }
             scope.declare(name, vt)
         }
-        Stmt::Assign { name, value } => {
-            let target = scope
-                .lookup(name)
-                .ok_or_else(|| format!("type error: assignment to undeclared '{name}'"))?;
+        Stmt::Assign { target, value } => {
+            // `type_of` on the target validates it (an undeclared var or a
+            // non-array index is an error) and gives the slot's type.
+            let tt = type_of(target, scope, sigs)?;
             let vt = type_of(value, scope, sigs)?;
-            if target != vt {
-                return Err(format!(
-                    "type error: cannot assign {vt:?} to '{name}' of type {target:?}"
-                ));
+            if tt != vt {
+                return Err(format!("type error: cannot assign {vt:?} to a target of type {tt:?}"));
             }
             Ok(())
         }
@@ -201,6 +199,42 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
                 Err(format!("type error: cannot cast {t:?} to {to:?} (numbers only)"))
             }
         }
+        Expr::Array(elems) => {
+            // Parser guarantees at least one element.
+            let first = type_of(&elems[0], scope, sigs)?;
+            let elem = first
+                .as_elem()
+                .ok_or("type error: array elements must be scalar (no nested arrays in v0)")?;
+            for e in &elems[1..] {
+                let t = type_of(e, scope, sigs)?;
+                if t != first {
+                    return Err(format!(
+                        "type error: array literal mixes {first:?} and {t:?}"
+                    ));
+                }
+            }
+            Ok(Type::Array(elem))
+        }
+        Expr::Repeat { value, count } => {
+            let vt = type_of(value, scope, sigs)?;
+            let elem = vt
+                .as_elem()
+                .ok_or("type error: array elements must be scalar (no nested arrays in v0)")?;
+            if type_of(count, scope, sigs)? != Type::I64 {
+                return Err("type error: repeat count must be i64".into());
+            }
+            Ok(Type::Array(elem))
+        }
+        Expr::Index { arr, index } => {
+            let at = type_of(arr, scope, sigs)?;
+            if type_of(index, scope, sigs)? != Type::I64 {
+                return Err("type error: array index must be i64".into());
+            }
+            match at {
+                Type::Array(elem) => Ok(elem.to_type()),
+                _ => Err(format!("type error: cannot index a {at:?}")),
+            }
+        }
         Expr::Unary { op, e } => {
             let t = type_of(e, scope, sigs)?;
             match op {
@@ -256,6 +290,16 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
             }
         }
         Expr::Call { name, args } => {
+            // Builtin: len(array) -> i64.
+            if name == "len" {
+                if args.len() != 1 {
+                    return Err("type error: len expects 1 array argument".into());
+                }
+                return match type_of(&args[0], scope, sigs)? {
+                    Type::Array(_) => Ok(Type::I64),
+                    other => Err(format!("type error: len expects an array, found {other:?}")),
+                };
+            }
             let sig = sigs
                 .get(name)
                 .ok_or_else(|| format!("type error: call to unknown function '{name}'"))?;

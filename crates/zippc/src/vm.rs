@@ -9,11 +9,13 @@
 use crate::ast::{BinOp, Type, UnOp};
 use crate::ir::{Instr, Program};
 
-/// A runtime value.
+/// A runtime value. `Arr` is an index into the VM heap (arrays are reference
+/// types — passing or assigning an array shares it).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
     I64(i64),
     F64(f64),
+    Arr(usize),
 }
 
 impl Value {
@@ -21,21 +23,23 @@ impl Value {
         match self {
             Value::I64(x) => x == 0,
             Value::F64(f) => f == 0.0,
+            Value::Arr(_) => false,
         }
     }
-    /// The i64 payload, or `None` for an `f64`.
+    /// The i64 payload, or `None` for non-integers.
     pub fn as_i64(self) -> Option<i64> {
         match self {
             Value::I64(x) => Some(x),
-            Value::F64(_) => None,
+            _ => None,
         }
     }
     /// i64 view for trace columns. Only reached for `I64` under trace recording
-    /// (f64 is gated out), so this is exact there.
+    /// (f64 and arrays are gated out), so this is exact there.
     fn trace_i64(self) -> i64 {
         match self {
             Value::I64(x) => x,
             Value::F64(f) => f as i64,
+            Value::Arr(_) => 0,
         }
     }
 }
@@ -45,6 +49,7 @@ impl std::fmt::Display for Value {
         match self {
             Value::I64(x) => write!(f, "{x}"),
             Value::F64(v) => write!(f, "{v}"),
+            Value::Arr(_) => write!(f, "[array]"),
         }
     }
 }
@@ -86,6 +91,7 @@ const MAX_STEPS: u64 = 500_000_000;
 pub const MAX_TRACE_STEPS: usize = 1 << 19;
 
 const ZK_INT_ONLY: &str = "--prove is integer-only: this program uses f64 (the zk profile is integer-only by design)";
+const ZK_NO_ARRAY: &str = "--prove does not support arrays yet (the zk profile is integer-only)";
 
 pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
     let main = &prog.funcs[prog.main as usize];
@@ -94,6 +100,7 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
     let mut pc: u32 = main.entry;
     let mut call_stack: Vec<Frame> = Vec::new();
     let mut output: Vec<Value> = Vec::new();
+    let mut heap: Vec<Vec<Value>> = Vec::new();
     let mut trace: Vec<TraceStep> = Vec::new();
     let mut clk: u64 = 0;
 
@@ -212,6 +219,66 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 output.push(v);
                 rec!(OpKind::Other, v.trace_i64(), 0, v.trace_i64(), 0);
             }
+            Instr::ArrayLit { dst, elems } => {
+                if record_trace {
+                    return Err(ZK_NO_ARRAY.into());
+                }
+                let vals: Vec<Value> = elems.iter().map(|r| reg[base + *r as usize]).collect();
+                let h = heap.len();
+                heap.push(vals);
+                reg[base + *dst as usize] = Value::Arr(h);
+            }
+            Instr::ArrayRepeat { dst, value, count } => {
+                if record_trace {
+                    return Err(ZK_NO_ARRAY.into());
+                }
+                let v = reg[base + *value as usize];
+                let n = reg[base + *count as usize]
+                    .as_i64()
+                    .ok_or("runtime error: array length must be i64")?;
+                if n < 0 {
+                    return Err("runtime error: array length cannot be negative".into());
+                }
+                let h = heap.len();
+                heap.push(vec![v; n as usize]);
+                reg[base + *dst as usize] = Value::Arr(h);
+            }
+            Instr::Index { dst, arr, idx } => {
+                if record_trace {
+                    return Err(ZK_NO_ARRAY.into());
+                }
+                let h = array_ref(reg[base + *arr as usize])?;
+                let i = reg[base + *idx as usize]
+                    .as_i64()
+                    .ok_or("runtime error: index must be i64")?;
+                let a = &heap[h];
+                if i < 0 || i as usize >= a.len() {
+                    return Err(format!("runtime error: index {i} out of bounds (len {})", a.len()));
+                }
+                reg[base + *dst as usize] = a[i as usize];
+            }
+            Instr::SetIndex { arr, idx, value } => {
+                if record_trace {
+                    return Err(ZK_NO_ARRAY.into());
+                }
+                let h = array_ref(reg[base + *arr as usize])?;
+                let i = reg[base + *idx as usize]
+                    .as_i64()
+                    .ok_or("runtime error: index must be i64")?;
+                let v = reg[base + *value as usize];
+                let len = heap[h].len();
+                if i < 0 || i as usize >= len {
+                    return Err(format!("runtime error: index {i} out of bounds (len {len})"));
+                }
+                heap[h][i as usize] = v;
+            }
+            Instr::Len { dst, arr } => {
+                if record_trace {
+                    return Err(ZK_NO_ARRAY.into());
+                }
+                let h = array_ref(reg[base + *arr as usize])?;
+                reg[base + *dst as usize] = Value::I64(heap[h].len() as i64);
+            }
         }
         clk += 1;
     }
@@ -223,6 +290,13 @@ fn cast(v: Value, to: Type) -> Value {
         (Value::F64(f), Type::I64) => Value::I64(f as i64),
         // identity (same-type cast); cast-to-bool is rejected by the checker.
         (other, _) => other,
+    }
+}
+
+fn array_ref(v: Value) -> Result<usize, String> {
+    match v {
+        Value::Arr(h) => Ok(h),
+        _ => Err("runtime error: expected an array".into()),
     }
 }
 

@@ -1,10 +1,41 @@
 //! ZIPP abstract syntax tree (v0 sound subset).
 
+/// Scalar element type for arrays (keeps `Type` `Copy` — v0 arrays are 1-D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elem {
+    I64,
+    F64,
+    Bool,
+}
+
+impl Elem {
+    pub fn to_type(self) -> Type {
+        match self {
+            Elem::I64 => Type::I64,
+            Elem::F64 => Type::F64,
+            Elem::Bool => Type::Bool,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     I64,
     F64,
     Bool,
+    Array(Elem),
+}
+
+impl Type {
+    /// As a scalar element type (for use as an array element), if scalar.
+    pub fn as_elem(self) -> Option<Elem> {
+        match self {
+            Type::I64 => Some(Elem::I64),
+            Type::F64 => Some(Elem::F64),
+            Type::Bool => Some(Elem::Bool),
+            Type::Array(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +78,12 @@ pub enum Expr {
     Unary { op: UnOp, e: Box<Expr> },
     Bin { op: BinOp, l: Box<Expr>, r: Box<Expr> },
     Call { name: String, args: Vec<Expr> },
+    /// Array literal `[a, b, c]`.
+    Array(Vec<Expr>),
+    /// Repeat literal `[value; count]`.
+    Repeat { value: Box<Expr>, count: Box<Expr> },
+    /// Indexing `arr[index]`.
+    Index { arr: Box<Expr>, index: Box<Expr> },
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +94,7 @@ pub enum Stmt {
         value: Expr,
     },
     Assign {
-        name: String,
+        target: Expr, // lvalue: Var or Index
         value: Expr,
     },
     Return(Option<Expr>),

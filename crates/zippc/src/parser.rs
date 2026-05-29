@@ -66,6 +66,14 @@ impl<'a> Parser<'a> {
             Tok::TyI64 => Ok(Type::I64),
             Tok::TyF64 => Ok(Type::F64),
             Tok::TyBool => Ok(Type::Bool),
+            Tok::LBracket => {
+                let inner = self.ty()?;
+                self.expect(&Tok::RBracket)?;
+                let elem = inner
+                    .as_elem()
+                    .ok_or("parse error: nested arrays are not supported in v0")?;
+                Ok(Type::Array(elem))
+            }
             other => Err(format!("parse error: expected type, found {other:?}")),
         }
     }
@@ -175,18 +183,20 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::Semi)?;
                 Ok(Stmt::Print(e))
             }
-            // assignment `name = expr;` or a bare expression statement
-            Some(Tok::Ident(_)) if self.toks.get(self.pos + 1) == Some(&Tok::Assign) => {
-                let name = self.ident()?;
-                self.expect(&Tok::Assign)?;
-                let value = self.expr()?;
-                self.expect(&Tok::Semi)?;
-                Ok(Stmt::Assign { name, value })
-            }
+            // assignment to an lvalue (`x = e;` / `a[i] = e;`) or a bare expression
             _ => {
                 let e = self.expr()?;
-                self.expect(&Tok::Semi)?;
-                Ok(Stmt::ExprStmt(e))
+                if self.eat(&Tok::Assign) {
+                    let value = self.expr()?;
+                    self.expect(&Tok::Semi)?;
+                    match e {
+                        Expr::Var(_) | Expr::Index { .. } => Ok(Stmt::Assign { target: e, value }),
+                        _ => Err("parse error: invalid assignment target".into()),
+                    }
+                } else {
+                    self.expect(&Tok::Semi)?;
+                    Ok(Stmt::ExprStmt(e))
+                }
             }
         }
     }
@@ -336,8 +346,20 @@ impl<'a> Parser<'a> {
                 let e = self.unary_expr()?;
                 Ok(Expr::Unary { op: UnOp::BitNot, e: Box::new(e) })
             }
-            _ => self.primary(),
+            _ => self.postfix(),
         }
+    }
+
+    /// Primary followed by zero or more `[index]` suffixes.
+    fn postfix(&mut self) -> Result<Expr, String> {
+        let mut e = self.primary()?;
+        while self.peek() == Some(&Tok::LBracket) {
+            self.bump()?;
+            let index = self.expr()?;
+            self.expect(&Tok::RBracket)?;
+            e = Expr::Index { arr: Box::new(e), index: Box::new(index) };
+        }
+        Ok(e)
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
@@ -363,6 +385,28 @@ impl<'a> Parser<'a> {
                 let e = self.expr()?;
                 self.expect(&Tok::RParen)?;
                 Ok(e)
+            }
+            Tok::LBracket => {
+                if self.peek() == Some(&Tok::RBracket) {
+                    return Err("parse error: empty array literal needs a type — use `[value; 0]`".into());
+                }
+                let first = self.expr()?;
+                if self.eat(&Tok::Semi) {
+                    // repeat literal [value; count]
+                    let count = self.expr()?;
+                    self.expect(&Tok::RBracket)?;
+                    Ok(Expr::Repeat { value: Box::new(first), count: Box::new(count) })
+                } else {
+                    let mut elems = vec![first];
+                    while self.eat(&Tok::Comma) {
+                        if self.peek() == Some(&Tok::RBracket) {
+                            break; // tolerate trailing comma
+                        }
+                        elems.push(self.expr()?);
+                    }
+                    self.expect(&Tok::RBracket)?;
+                    Ok(Expr::Array(elems))
+                }
             }
             Tok::Ident(name) => {
                 if self.eat(&Tok::LParen) {

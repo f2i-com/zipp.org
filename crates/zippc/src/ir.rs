@@ -23,6 +23,12 @@ pub enum Instr {
     Call { func: u32, arg_base: u32, argc: u32, dst: u32 },
     Ret { src: u32 },
     Print { a: u32 },
+    // Arrays (heap-backed; rejected by the integer-only zk profile).
+    ArrayLit { dst: u32, elems: Vec<u32> },
+    ArrayRepeat { dst: u32, value: u32, count: u32 },
+    Index { dst: u32, arr: u32, idx: u32 },
+    SetIndex { arr: u32, idx: u32, value: u32 },
+    Len { dst: u32, arr: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -160,12 +166,22 @@ impl<'a> Gen<'a> {
                 self.code.push(Instr::Mov { dst: r, src: v });
                 Ok(())
             }
-            Stmt::Assign { name, value } => {
-                let v = self.gen_expr(value)?;
-                let r = self.resolve(name)?;
-                self.code.push(Instr::Mov { dst: r, src: v });
-                Ok(())
-            }
+            Stmt::Assign { target, value } => match target {
+                Expr::Var(name) => {
+                    let v = self.gen_expr(value)?;
+                    let r = self.resolve(name)?;
+                    self.code.push(Instr::Mov { dst: r, src: v });
+                    Ok(())
+                }
+                Expr::Index { arr, index } => {
+                    let a = self.gen_expr(arr)?;
+                    let i = self.gen_expr(index)?;
+                    let v = self.gen_expr(value)?;
+                    self.code.push(Instr::SetIndex { arr: a, idx: i, value: v });
+                    Ok(())
+                }
+                _ => Err("ir error: invalid assignment target".into()),
+            },
             Stmt::Return(Some(e)) => {
                 let v = self.gen_expr(e)?;
                 self.code.push(Instr::Ret { src: v });
@@ -266,6 +282,29 @@ impl<'a> Gen<'a> {
                 self.code.push(Instr::Cast { dst: r, src, to: *to });
                 Ok(r)
             }
+            Expr::Array(elems) => {
+                let regs = elems
+                    .iter()
+                    .map(|e| self.gen_expr(e))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dst = self.alloc();
+                self.code.push(Instr::ArrayLit { dst, elems: regs });
+                Ok(dst)
+            }
+            Expr::Repeat { value, count } => {
+                let v = self.gen_expr(value)?;
+                let c = self.gen_expr(count)?;
+                let dst = self.alloc();
+                self.code.push(Instr::ArrayRepeat { dst, value: v, count: c });
+                Ok(dst)
+            }
+            Expr::Index { arr, index } => {
+                let a = self.gen_expr(arr)?;
+                let i = self.gen_expr(index)?;
+                let dst = self.alloc();
+                self.code.push(Instr::Index { dst, arr: a, idx: i });
+                Ok(dst)
+            }
             Expr::Unary { op, e } => {
                 let a = self.gen_expr(e)?;
                 let r = self.alloc();
@@ -302,6 +341,12 @@ impl<'a> Gen<'a> {
                 let b = self.gen_expr(r)?;
                 let dst = self.alloc();
                 self.code.push(Instr::Bin { op: *op, dst, a, b });
+                Ok(dst)
+            }
+            Expr::Call { name, args } if name == "len" => {
+                let a = self.gen_expr(&args[0])?;
+                let dst = self.alloc();
+                self.code.push(Instr::Len { dst, arr: a });
                 Ok(dst)
             }
             Expr::Call { name, args } => {

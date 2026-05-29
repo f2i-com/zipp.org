@@ -153,3 +153,46 @@ fn prove_profile_is_integer_only() {
     // ...but recording a trace for it (what --prove does) is rejected.
     assert!(zippc::vm::run(&prog, true).is_err());
 }
+
+// ── arrays ──
+
+#[test]
+fn array_literal_index_len() {
+    assert_eq!(result("fn main(): i64 { let a = [10, 20, 30]; return a[0] + a[2] + len(a); }"), 43);
+}
+
+#[test]
+fn array_repeat_fill_and_sum() {
+    let src = "fn main(): i64 { let a = [0; 5]; let i = 0; \
+               while (i < 5) { a[i] = i * i; i = i + 1; } \
+               let s = 0; let j = 0; while (j < len(a)) { s = s + a[j]; j = j + 1; } return s; }";
+    assert_eq!(result(src), 30); // 0+1+4+9+16
+}
+
+#[test]
+fn arrays_are_reference_types() {
+    // Mutating an array argument is visible to the caller.
+    let src = "fn fill(a: [i64]): i64 { a[0] = 99; return 0; } \
+               fn main(): i64 { let a = [1, 2, 3]; let _ = fill(a); return a[0]; }";
+    assert_eq!(result(src), 99);
+}
+
+#[test]
+fn float_arrays() {
+    assert_eq!(fresult("fn main(): f64 { let a = [1.5, 2.5, 3.0]; return a[0] + a[1] + a[2]; }"), 7.0);
+}
+
+#[test]
+fn rejects_bad_array_use() {
+    assert!(run("fn main(): i64 { let a = [1, 2]; return a[5]; }").is_err()); // out of bounds (runtime)
+    assert!(run("fn main(): i64 { let x = 5; return x[0]; }").is_err()); // index a non-array
+    assert!(run("fn main(): i64 { let a = [1]; return a[true]; }").is_err()); // non-i64 index
+    assert!(run("fn main(): i64 { let a = [1, 2.0]; return a[0]; }").is_err()); // mixed element types
+}
+
+#[test]
+fn prove_profile_rejects_arrays() {
+    let prog = zippc::compile("fn main(): i64 { let a = [1, 2, 3]; return a[1]; }").unwrap();
+    assert!(zippc::vm::run(&prog, false).is_ok());
+    assert!(zippc::vm::run(&prog, true).is_err());
+}
