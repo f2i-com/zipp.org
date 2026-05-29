@@ -424,6 +424,90 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 };
                 reg[base + *dst as usize] = Value::I64(n as i64);
             }
+            Instr::StrOp { op, dst, args } => {
+                use crate::ast::StrOpKind as K;
+                if record_trace {
+                    return Err(ZK_NO_STR.into());
+                }
+                let recv = match reg[base + args[0] as usize] {
+                    Value::Str(i) => i,
+                    _ => return Err("runtime error: string method on a non-string".into()),
+                };
+                let res = {
+                    let int_arg = |k: usize| reg[base + args[k] as usize].as_i64().unwrap_or(0);
+                    let str_arg = |k: usize| -> Result<usize, String> {
+                        match reg[base + args[k] as usize] {
+                            Value::Str(i) => Ok(i),
+                            _ => Err("runtime error: string method expects a string argument".into()),
+                        }
+                    };
+                    match op {
+                    K::ByteAt => {
+                        let i = int_arg(1);
+                        let b = str_heap[recv].as_bytes();
+                        Value::I64(if i < 0 || i as usize >= b.len() {
+                            -1
+                        } else {
+                            b[i as usize] as i64
+                        })
+                    }
+                    K::IndexOf => {
+                        let n = str_arg(1)?;
+                        Value::I64(str_index_of(&str_heap[recv], &str_heap[n], int_arg(2)))
+                    }
+                    K::LastIndexOf => {
+                        let n = str_arg(1)?;
+                        Value::I64(str_last_index_of(&str_heap[recv], &str_heap[n]))
+                    }
+                    K::EndsWith => {
+                        let n = str_arg(1)?;
+                        let (b, sn) = (str_heap[recv].as_bytes(), str_heap[n].as_bytes());
+                        Value::I64((sn.len() <= b.len() && b[b.len() - sn.len()..] == *sn) as i64)
+                    }
+                    K::Slice | K::SliceFrom | K::Repeat | K::CharAt => {
+                        let s: String = match op {
+                            K::Slice => {
+                                let b = str_heap[recv].as_bytes();
+                                let a = str_norm(int_arg(1), b.len());
+                                let e = str_norm(int_arg(2), b.len());
+                                if e <= a {
+                                    String::new()
+                                } else {
+                                    String::from_utf8_lossy(&b[a..e]).into_owned()
+                                }
+                            }
+                            K::SliceFrom => {
+                                let b = str_heap[recv].as_bytes();
+                                let a = str_norm(int_arg(1), b.len());
+                                String::from_utf8_lossy(&b[a..]).into_owned()
+                            }
+                            K::Repeat => {
+                                let c = int_arg(1);
+                                if c < 0 {
+                                    return Err("runtime error: repeat count must be >= 0".into());
+                                }
+                                str_heap[recv].repeat(c as usize)
+                            }
+                            K::CharAt => {
+                                let b = str_heap[recv].as_bytes();
+                                let i = int_arg(1);
+                                if i < 0 || i as usize >= b.len() {
+                                    String::new()
+                                } else {
+                                    String::from_utf8_lossy(&b[i as usize..i as usize + 1])
+                                        .into_owned()
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        let idx = str_heap.len();
+                        str_heap.push(s);
+                        Value::Str(idx)
+                    }
+                    }
+                };
+                reg[base + *dst as usize] = res;
+            }
             Instr::Builtin { op, dst, args } => {
                 let vals: Vec<Value> = args.iter().map(|r| reg[base + *r as usize]).collect();
                 let res = eval_builtin(*op, &vals)?;
@@ -555,6 +639,44 @@ fn render(v: Value, strs: &[String]) -> String {
         Value::Null => "null".to_string(),
         Value::Func(_) | Value::Closure { .. } => "[function]".to_string(),
     }
+}
+
+// String-method helpers (byte-level; mirror the zipp-rt runtime functions so the
+// interpreter and native tiers agree).
+fn str_norm(idx: i64, len: usize) -> usize {
+    let l = len as i64;
+    (if idx < 0 { (l + idx).max(0) } else { idx.min(l) }) as usize
+}
+fn str_index_of(s: &str, n: &str, from: i64) -> i64 {
+    let (b, nb) = (s.as_bytes(), n.as_bytes());
+    let start = (from.max(0) as usize).min(b.len());
+    if nb.is_empty() {
+        return start as i64;
+    }
+    if nb.len() > b.len() {
+        return -1;
+    }
+    for i in start..=(b.len() - nb.len()) {
+        if b[i..i + nb.len()] == *nb {
+            return i as i64;
+        }
+    }
+    -1
+}
+fn str_last_index_of(s: &str, n: &str) -> i64 {
+    let (b, nb) = (s.as_bytes(), n.as_bytes());
+    if nb.is_empty() {
+        return b.len() as i64;
+    }
+    if nb.len() > b.len() {
+        return -1;
+    }
+    for i in (0..=(b.len() - nb.len())).rev() {
+        if b[i..i + nb.len()] == *nb {
+            return i as i64;
+        }
+    }
+    -1
 }
 
 fn eval_builtin(op: BuiltinOp, args: &[Value]) -> Result<Value, String> {

@@ -48,6 +48,9 @@ pub enum Instr {
     // Growable arrays (interpreter-only in v0): append / remove-last.
     Push { dst: u32, arr: u32, value: u32 },
     Pop { dst: u32, arr: u32 },
+    // Native string method (a `zipp_str_*` runtime call); `args[0]` is the
+    // receiver string.
+    StrOp { op: crate::ast::StrOpKind, dst: u32, args: Vec<u32> },
 }
 
 /// Field names of a struct, in declaration order (indexed by struct id). The VM
@@ -772,6 +775,17 @@ impl<'a> Gen<'a> {
                 let a = self.gen_expr(arr)?;
                 let dst = self.alloc();
                 self.code.push(Instr::Pop { dst, arr: a });
+                Ok(dst)
+            }
+            // Native string method: evaluate the receiver + args once, into a
+            // contiguous-free reg list, and emit one StrOp.
+            Expr::StrOp { op, args } => {
+                let regs = args
+                    .iter()
+                    .map(|a| self.gen_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dst = self.alloc();
+                self.code.push(Instr::StrOp { op: *op, dst, args: regs });
                 Ok(dst)
             }
             // An indirect call through a function value.

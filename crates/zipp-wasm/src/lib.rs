@@ -70,7 +70,7 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     }
     for ins in &prog.code {
         let bad = match ins {
-            Instr::SConst { .. } => "strings",
+            Instr::SConst { .. } | Instr::StrOp { .. } => "strings",
             Instr::ArrayLit { .. }
             | Instr::ArrayRepeat { .. }
             | Instr::Index { .. }

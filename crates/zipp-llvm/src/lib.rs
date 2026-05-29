@@ -230,6 +230,13 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
                     Sqrt | Floor | Ceil => LTy::F64,
                 };
             }
+            Instr::StrOp { op, dst, .. } => {
+                use zippc::ast::StrOpKind::*;
+                t[*dst as usize] = match op {
+                    Slice | SliceFrom | Repeat | CharAt => LTy::Str,
+                    ByteAt | IndexOf | LastIndexOf | EndsWith => LTy::I64,
+                };
+            }
             _ => {}
         }
     }
@@ -732,6 +739,30 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
             Instr::Push { .. } | Instr::Pop { .. } => {
                 return Err("internal: growable arrays reached the LLVM backend".into())
             }
+            // Native string method: call the matching runtime function. Each arg
+            // is loaded with its register type (ptr for a string, i64 for an
+            // index); the result is a string pointer or an i64.
+            Instr::StrOp { op, dst, args } => {
+                use zippc::ast::StrOpKind::*;
+                let (fname, ret) = match op {
+                    ByteAt => ("zipp_str_byte_at", "i64"),
+                    Slice => ("zipp_str_slice", "ptr"),
+                    SliceFrom => ("zipp_str_slice_from", "ptr"),
+                    IndexOf => ("zipp_str_index_of", "i64"),
+                    LastIndexOf => ("zipp_str_last_index_of", "i64"),
+                    Repeat => ("zipp_str_repeat", "ptr"),
+                    EndsWith => ("zipp_str_ends_with", "i64"),
+                    CharAt => ("zipp_str_char_at", "ptr"),
+                };
+                let mut argstr = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = load(&mut s, &mut tmp, &rty, *a);
+                    argstr.push(format!("{} {v}", llname(rty[*a as usize])));
+                }
+                let r = fresh(&mut tmp);
+                s.push_str(&format!("  {r} = call {ret} @{fname}({})\n", argstr.join(", ")));
+                store(&mut s, &rty, *dst, &r);
+            }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;
                 let f64a = rty[args[0] as usize] == LTy::F64;
@@ -831,6 +862,14 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     out.push_str("declare ptr @zipp_str_concat(ptr, ptr)\n");
     out.push_str("declare i64 @zipp_str_eq(ptr, ptr)\n");
     out.push_str("declare i64 @zipp_ipow(i64, i64)\n");
+    out.push_str("declare i64 @zipp_str_byte_at(ptr, i64)\n");
+    out.push_str("declare ptr @zipp_str_slice(ptr, i64, i64)\n");
+    out.push_str("declare ptr @zipp_str_slice_from(ptr, i64)\n");
+    out.push_str("declare i64 @zipp_str_index_of(ptr, ptr, i64)\n");
+    out.push_str("declare i64 @zipp_str_last_index_of(ptr, ptr)\n");
+    out.push_str("declare ptr @zipp_str_repeat(ptr, i64)\n");
+    out.push_str("declare i64 @zipp_str_ends_with(ptr, ptr)\n");
+    out.push_str("declare ptr @zipp_str_char_at(ptr, i64)\n");
     out.push_str("declare void @zipp_print_i64(i64)\n");
     out.push_str("declare void @zipp_print_u64(i64)\n");
     out.push_str("declare void @zipp_print_f64(double)\n");

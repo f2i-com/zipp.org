@@ -47,6 +47,15 @@ struct RuntimeIds {
     str_concat: FuncId,
     str_eq: FuncId,
     ipow: FuncId,
+    // string methods
+    str_byte_at: FuncId,
+    str_slice: FuncId,
+    str_slice_from: FuncId,
+    str_index_of: FuncId,
+    str_last_index_of: FuncId,
+    str_repeat: FuncId,
+    str_ends_with: FuncId,
+    str_char_at: FuncId,
 }
 
 /// Result of a JIT'd `main`. `U64` is separate so a u64 result prints unsigned
@@ -221,6 +230,14 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     jit.symbol("zipp_str_concat", zipp_rt::zipp_str_concat as *const u8);
     jit.symbol("zipp_str_eq", zipp_rt::zipp_str_eq as *const u8);
     jit.symbol("zipp_ipow", zipp_rt::zipp_ipow as *const u8);
+    jit.symbol("zipp_str_byte_at", zipp_rt::zipp_str_byte_at as *const u8);
+    jit.symbol("zipp_str_slice", zipp_rt::zipp_str_slice as *const u8);
+    jit.symbol("zipp_str_slice_from", zipp_rt::zipp_str_slice_from as *const u8);
+    jit.symbol("zipp_str_index_of", zipp_rt::zipp_str_index_of as *const u8);
+    jit.symbol("zipp_str_last_index_of", zipp_rt::zipp_str_last_index_of as *const u8);
+    jit.symbol("zipp_str_repeat", zipp_rt::zipp_str_repeat as *const u8);
+    jit.symbol("zipp_str_ends_with", zipp_rt::zipp_str_ends_with as *const u8);
+    jit.symbol("zipp_str_char_at", zipp_rt::zipp_str_char_at as *const u8);
     let mut module = JITModule::new(jit);
 
     let mut func_ids = Vec::with_capacity(prog.funcs.len());
@@ -254,6 +271,14 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
         str_concat: import(&mut module, "zipp_str_concat", &[types::I64, types::I64], Some(types::I64))?,
         str_eq: import(&mut module, "zipp_str_eq", &[types::I64, types::I64], Some(types::I64))?,
         ipow: import(&mut module, "zipp_ipow", &[types::I64, types::I64], Some(types::I64))?,
+        str_byte_at: import(&mut module, "zipp_str_byte_at", &[types::I64, types::I64], Some(types::I64))?,
+        str_slice: import(&mut module, "zipp_str_slice", &[types::I64, types::I64, types::I64], Some(types::I64))?,
+        str_slice_from: import(&mut module, "zipp_str_slice_from", &[types::I64, types::I64], Some(types::I64))?,
+        str_index_of: import(&mut module, "zipp_str_index_of", &[types::I64, types::I64, types::I64], Some(types::I64))?,
+        str_last_index_of: import(&mut module, "zipp_str_last_index_of", &[types::I64, types::I64], Some(types::I64))?,
+        str_repeat: import(&mut module, "zipp_str_repeat", &[types::I64, types::I64], Some(types::I64))?,
+        str_ends_with: import(&mut module, "zipp_str_ends_with", &[types::I64, types::I64], Some(types::I64))?,
+        str_char_at: import(&mut module, "zipp_str_char_at", &[types::I64, types::I64], Some(types::I64))?,
     };
 
     let mut ctx = module.make_context();
@@ -389,6 +414,13 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
                     Abs | Min | Max => t[args[0] as usize], // polymorphic in the operand
                     Pow => JTy::I64,
                     Sqrt | Floor | Ceil => JTy::F64,
+                };
+            }
+            Instr::StrOp { op, dst, .. } => {
+                use zippc::ast::StrOpKind::*;
+                t[*dst as usize] = match op {
+                    Slice | SliceFrom | Repeat | CharAt => JTy::Str,
+                    ByteAt | IndexOf | LastIndexOf | EndsWith => JTy::I64,
                 };
             }
             _ => {}
@@ -837,6 +869,27 @@ fn compile_function(
             Instr::Push { .. } | Instr::Pop { .. } => {
                 return Err("internal: growable arrays reached the JIT".into())
             }
+            // Native string method: call the matching runtime function. All args
+            // are i64 (string pointers are i64 in Cranelift); the result is i64
+            // (a string pointer for slice/repeat/charAt, else a value).
+            Instr::StrOp { op, dst, args } => {
+                use zippc::ast::StrOpKind::*;
+                let id = match op {
+                    ByteAt => rt.str_byte_at,
+                    Slice => rt.str_slice,
+                    SliceFrom => rt.str_slice_from,
+                    IndexOf => rt.str_index_of,
+                    LastIndexOf => rt.str_last_index_of,
+                    Repeat => rt.str_repeat,
+                    EndsWith => rt.str_ends_with,
+                    CharAt => rt.str_char_at,
+                };
+                let argv: Vec<_> = args.iter().map(|a| builder.use_var(var(*a))).collect();
+                let f = module.declare_func_in_func(id, builder.func);
+                let call = builder.ins().call(f, &argv);
+                let r = builder.inst_results(call)[0];
+                builder.def_var(var(*dst), r);
+            }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;
                 let f64a = rty[args[0] as usize].clif() == types::F64;
@@ -1041,6 +1094,25 @@ mod tests {
                    function main(): i64 { let a: str | null = \"abcd\"; return g(a) + g(null); }";
         assert_eq!(jit_ts_i64(ts5), 5); // 4 + 1
     }
+
+    #[test]
+    fn string_methods_run_native() {
+        // native zipp_str_* runtime calls on the JIT, matching the interpreter
+        assert_eq!(jit_ts_i64("function main(): i64 { return \"hello\".indexOf(\"lo\"); }"), 3);
+        assert_eq!(jit_ts_i64("function main(): i64 { return \"hello\".slice(1, 3) === \"el\" ? 1 : 0; }"), 1);
+        assert_eq!(jit_ts_i64("function main(): i64 { return \"hello\".slice(-2) === \"lo\" ? 1 : 0; }"), 1);
+        assert_eq!(jit_ts_i64("function main(): i64 { return \"ABC\".charCodeAt(3); }"), -1);
+        assert_eq!(jit_ts_i64("function main(): i64 { return \"ab\".repeat(3) === \"ababab\" ? 1 : 0; }"), 1);
+        assert_eq!(jit_ts_i64("function main(): i64 { return \"abc\".endsWith(\"bc\") ? 1 : 0; }"), 1);
+        assert_eq!(
+            jit_ts_i64("function main(): i64 { return (\"abc\".includes(\"b\") && !\"abc\".startsWith(\"b\")) ? 1 : 0; }"),
+            1
+        );
+        // non-ASCII slice at a non-char boundary is lossy (U+FFFD, 0xEF=239) on the
+        // JIT exactly as on the interpreter — the make_str_lossy parity fix.
+        assert_eq!(jit_ts_i64("function main(): i64 { return \"é\".slice(0, 1).charCodeAt(0); }"), 239);
+    }
+
     fn jit_f64(src: &str) -> f64 {
         let prog = zippc::compile(src).expect("compile");
         match run(&prog).expect("jit run").value {

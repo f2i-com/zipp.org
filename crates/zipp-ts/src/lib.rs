@@ -988,6 +988,8 @@ impl Lower<'_> {
                 let z::Type::Array(e) = self.ztype_of(arr)? else { return None };
                 e.to_type()
             }
+            // A string method's result type (so chaining like `s.slice(1).indexOf(...)` resolves).
+            z::Expr::StrOp { op, .. } => op.result(),
             // Comparisons/logicals are bool; arithmetic/bitwise share the operand
             // type. Lets arrow return types infer from simple bodies.
             z::Expr::Bin { op, l, .. } => match op {
@@ -2299,6 +2301,87 @@ impl Lower<'_> {
         name
     }
 
+    /// Dispatch a builtin string method on a string receiver. Most are runtime
+    /// primitives (`StrOp`); `includes`/`startsWith` desugar to `indexOf`. The
+    /// receiver is used exactly once (no double-evaluation).
+    fn str_method(&self, recv: z::Expr, method: &str, c: &CallExpression) -> LResult<z::Expr> {
+        use z::StrOpKind as K;
+        let mut args = self.lower_args(c)?;
+        let n = args.len();
+        let span = c.span;
+        // `recv.indexOf(needle) <cmp> 0` — the shared shape of includes/startsWith.
+        let index_cmp = |recv: z::Expr, needle: z::Expr, op: z::BinOp| z::Expr::Bin {
+            op,
+            l: Box::new(z::Expr::StrOp { op: K::IndexOf, args: vec![recv, needle, z::Expr::Int(0)] }),
+            r: Box::new(z::Expr::Int(0)),
+        };
+        match method {
+            "charCodeAt" | "charAt" => {
+                if n > 1 {
+                    return Err(self.err(span, format!("{method}(index?) takes 0 or 1 arguments")));
+                }
+                let i = if n == 1 { args.remove(0) } else { z::Expr::Int(0) };
+                let op = if method == "charCodeAt" { K::ByteAt } else { K::CharAt };
+                Ok(z::Expr::StrOp { op, args: vec![recv, i] })
+            }
+            "slice" => match n {
+                0 => Ok(z::Expr::StrOp { op: K::SliceFrom, args: vec![recv, z::Expr::Int(0)] }),
+                1 => Ok(z::Expr::StrOp { op: K::SliceFrom, args: vec![recv, args.remove(0)] }),
+                2 => {
+                    let start = args.remove(0);
+                    let end = args.remove(0);
+                    Ok(z::Expr::StrOp { op: K::Slice, args: vec![recv, start, end] })
+                }
+                _ => Err(self.err(span, "slice(start?, end?) takes 0 to 2 arguments")),
+            },
+            "indexOf" => {
+                if n == 0 || n > 2 {
+                    return Err(self.err(span, "indexOf(needle, from?) takes 1 or 2 arguments"));
+                }
+                let needle = args.remove(0);
+                let from = if n == 2 { args.remove(0) } else { z::Expr::Int(0) };
+                Ok(z::Expr::StrOp { op: K::IndexOf, args: vec![recv, needle, from] })
+            }
+            "lastIndexOf" => {
+                if n != 1 {
+                    return Err(self.err(span, "lastIndexOf(needle) takes one argument"));
+                }
+                Ok(z::Expr::StrOp { op: K::LastIndexOf, args: vec![recv, args.remove(0)] })
+            }
+            "repeat" => {
+                if n != 1 {
+                    return Err(self.err(span, "repeat(count) takes one argument"));
+                }
+                Ok(z::Expr::StrOp { op: K::Repeat, args: vec![recv, args.remove(0)] })
+            }
+            "endsWith" => {
+                if n != 1 {
+                    return Err(self.err(span, "endsWith(suffix) takes one argument"));
+                }
+                Ok(z::Expr::StrOp { op: K::EndsWith, args: vec![recv, args.remove(0)] })
+            }
+            "includes" => {
+                if n != 1 {
+                    return Err(self.err(span, "includes(needle) takes one argument"));
+                }
+                Ok(index_cmp(recv, args.remove(0), z::BinOp::Ge))
+            }
+            "startsWith" => {
+                if n != 1 {
+                    return Err(self.err(span, "startsWith(prefix) takes one argument"));
+                }
+                Ok(index_cmp(recv, args.remove(0), z::BinOp::Eq))
+            }
+            other => Err(self.err(
+                span,
+                format!(
+                    "unknown string method '.{other}()' — supported: charCodeAt, charAt, slice, \
+                     indexOf, lastIndexOf, includes, startsWith, endsWith, repeat"
+                ),
+            )),
+        }
+    }
+
     /// Lower a call's positional arguments (rejecting spreads).
     fn lower_args(&self, c: &CallExpression) -> LResult<Vec<z::Expr>> {
         let mut args = Vec::with_capacity(c.arguments.len());
@@ -2323,6 +2406,10 @@ impl Lower<'_> {
             // Builtin array methods (push/pop/map/filter/reduce) on an array receiver.
             if let Some(z::Type::Array(elem)) = self.ztype_of(&recv) {
                 return self.array_method(recv, elem, method, c);
+            }
+            // Builtin string methods on a string receiver.
+            if self.ztype_of(&recv) == Some(z::Type::Str) {
+                return self.str_method(recv, method, c);
             }
             let cid = match self.ztype_of(&recv) {
                 Some(z::Type::Struct(id)) => id,
@@ -2605,6 +2692,7 @@ fn collect_vars(e: &z::Expr, out: &mut Vec<String>) {
             collect_vars(value, out);
         }
         Pop { arr } => collect_vars(arr, out),
+        StrOp { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
         FuncRef(_) | Int(_) | Float(_) | Bool(_) | Str(_) | Null => {}
     }
 }
@@ -2645,6 +2733,7 @@ fn expr_has_var(e: &z::Expr) -> bool {
         z::Expr::MakeClosure { captures, .. } => captures.iter().any(expr_has_var),
         z::Expr::Push { arr, value } => expr_has_var(arr) || expr_has_var(value),
         z::Expr::Pop { arr } => expr_has_var(arr),
+        z::Expr::StrOp { args, .. } => args.iter().any(expr_has_var),
         z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) | z::Expr::Null => {
             false
         }
@@ -3381,6 +3470,54 @@ mod tests {
         let m = compile_ts(ts).expect("lower");
         let prog = zippc::compile_module(&m).expect("compile");
         assert!(prog.uses_growable);
+    }
+
+    #[test]
+    fn string_methods() {
+        // charCodeAt + out-of-range sentinel (-1, TS-divergent from NaN)
+        assert_eq!(run_i64("function main(): i64 { return \"ABC\".charCodeAt(2); }"), 67);
+        assert_eq!(run_i64("function main(): i64 { return \"ABC\".charCodeAt(3); }"), -1);
+        assert_eq!(run_i64("function main(): i64 { return \"ABC\".charCodeAt(-1); }"), -1);
+
+        // slice: positive / negative / clamp-empty / omitted-end length
+        assert_eq!(run_i64("function main(): i64 { return \"hello\".slice(1, 3) === \"el\" ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return \"hello\".slice(-1) === \"o\" ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return \"hello\".slice(1, -1) === \"ell\" ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return \"hello\".slice(3, 1) === \"\" ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return len(\"hello\".slice(1)); }"), 4);
+
+        // indexOf / lastIndexOf (empty-needle identities)
+        assert_eq!(run_i64("function main(): i64 { return \"abab\".indexOf(\"ab\"); }"), 0);
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".indexOf(\"d\"); }"), -1);
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".indexOf(\"\"); }"), 0);
+        assert_eq!(run_i64("function main(): i64 { return \"abab\".lastIndexOf(\"ab\"); }"), 2);
+
+        // includes / startsWith / endsWith
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".includes(\"b\") ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".includes(\"d\") ? 1 : 0; }"), 0);
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".startsWith(\"ab\") ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".startsWith(\"b\") ? 1 : 0; }"), 0);
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".endsWith(\"bc\") ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".endsWith(\"b\") ? 1 : 0; }"), 0);
+        // HEADLINE: includes("b") is true but startsWith("b") is false
+        assert_eq!(run_i64("function main(): i64 { return (\"abc\".includes(\"b\") && !\"abc\".startsWith(\"b\")) ? 1 : 0; }"), 1);
+
+        // charAt: in-range char / out-of-range empty (contrast charCodeAt's -1)
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".charAt(0) === \"a\" ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return \"abc\".charAt(3) === \"\" ? 1 : 0; }"), 1);
+
+        // repeat
+        assert_eq!(run_i64("function main(): i64 { return \"ab\".repeat(3) === \"ababab\" ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { return \"x\".repeat(0) === \"\" ? 1 : 0; }"), 1);
+
+        // chaining + derivation cross-check (includes === indexOf >= 0)
+        assert_eq!(run_i64("function main(): i64 { return \"hello\".slice(1).indexOf(\"l\"); }"), 1);
+
+        // string methods stay NATIVE (no closure, no push, no nullable scalar)
+        let m = compile_ts("function main(): i64 { return \"hello\".slice(1, 3).charCodeAt(0); }")
+            .expect("lower");
+        let prog = zippc::compile_module(&m).expect("compile");
+        assert!(!prog.uses_growable && !prog.uses_func_value && !prog.uses_opt_scalar);
     }
 
     #[test]

@@ -154,6 +154,41 @@ pub enum UnOp {
     BitNot,
 }
 
+/// Native string-method primitives (byte-level / UTF-8). Each maps to a
+/// `zipp_str_*` runtime function; `args[0]` is always the receiver string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrOpKind {
+    /// `charCodeAt(i)` → i64 (byte 0-255, or -1 if out of range).
+    ByteAt,
+    /// `slice(start, end)` → str.
+    Slice,
+    /// `slice(start)` → str (end defaults to len).
+    SliceFrom,
+    /// `indexOf(needle, from)` → i64 (byte offset, or -1).
+    IndexOf,
+    /// `lastIndexOf(needle)` → i64.
+    LastIndexOf,
+    /// `repeat(count)` → str (count < 0 aborts).
+    Repeat,
+    /// `endsWith(suffix)` → bool.
+    EndsWith,
+    /// `charAt(i)` → str (1-byte, or "" if out of range).
+    CharAt,
+}
+
+impl StrOpKind {
+    /// The result type of this string op.
+    pub fn result(self) -> Type {
+        match self {
+            StrOpKind::Slice | StrOpKind::SliceFrom | StrOpKind::Repeat | StrOpKind::CharAt => {
+                Type::Str
+            }
+            StrOpKind::EndsWith => Type::Bool,
+            StrOpKind::ByteAt | StrOpKind::IndexOf | StrOpKind::LastIndexOf => Type::I64,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
@@ -210,6 +245,9 @@ pub enum Expr {
     /// `arr.pop()` — remove and return the last element (a runtime error if the
     /// array is empty). Result is the element type.
     Pop { arr: Box<Expr> },
+    /// A native string-method primitive; `args[0]` is the receiver string. Result
+    /// type is `op.result()`. Runs natively (a `zipp_str_*` runtime call).
+    StrOp { op: StrOpKind, args: Vec<Expr> },
 }
 
 /// A statement plus the source line it starts on (for error messages).

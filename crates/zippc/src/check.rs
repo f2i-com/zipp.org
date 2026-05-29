@@ -780,5 +780,33 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
             };
             Ok(e.to_type())
         }
+        // A native string method — `args[0]` is the receiver string.
+        Expr::StrOp { op, args } => {
+            use StrOpKind::*;
+            if type_of(&args[0], scope, cx)? != Type::Str {
+                return Err("type error: string method on a non-string".into());
+            }
+            let want: &[Type] = match op {
+                ByteAt | SliceFrom | CharAt | Repeat => &[Type::I64],
+                Slice => &[Type::I64, Type::I64],
+                IndexOf => &[Type::Str, Type::I64],
+                LastIndexOf | EndsWith => &[Type::Str],
+            };
+            let rest = &args[1..];
+            if rest.len() != want.len() {
+                return Err(format!(
+                    "type error: string method {op:?} expects {} argument(s), got {}",
+                    want.len(),
+                    rest.len()
+                ));
+            }
+            for (a, w) in rest.iter().zip(want) {
+                let at = type_of(a, scope, cx)?;
+                if !assignable(at, *w) {
+                    return Err(format!("type error: string method arg expects {w:?}, found {at:?}"));
+                }
+            }
+            Ok(op.result())
+        }
     }
 }

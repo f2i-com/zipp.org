@@ -45,8 +45,10 @@ heavy deps (Winterfell/Cranelift) and the language still runs on the interpreter
 - Full operator set incl. **bitwise/shift** `& | ^ << >> ~`
 - **Arrays**: literals `[a, b, c]`, repeat `[v; n]`, indexing read/write, `len()`,
   runtime bounds checks (reference types; also `--prove`-gated for now)
-- **Strings**: literals with escapes, `+` concat, `==`/`!=`, `len()`, `print`
-  (heap-backed, immutable; `--prove`-gated)
+- **Strings**: literals with escapes, `+` concat, `==`/`!=`, `len()`, `print`, and
+  a native **method stdlib** —
+  `charCodeAt`/`charAt`/`slice`/`indexOf`/`lastIndexOf`/`includes`/`startsWith`/`endsWith`/`repeat`
+  (byte-level / ASCII-exact vs TS; heap-backed, immutable; `--prove`-gated)
 - **Structs**: `struct Point { x: i64, y: i64 }`, construction, field read/write,
   nesting (heap-backed reference types; `--prove`-gated)
 - **Builtins**: `len`; `abs`/`min`/`max`/`pow` (integers); `sqrt`/`floor`/`ceil` (floats)
@@ -122,6 +124,7 @@ cargo build --release
 ./target/release/zipp run examples/arraymethods.ts   # growable arrays + map/filter/reduce/push/pop
 ./target/release/zipp run examples/arraymethods2.ts  # some/every/findIndex/slice/concat/reverse/fill
 ./target/release/zipp run --jit examples/arraysearch.ts # indexOf/includes/reverse/fill run NATIVE
+./target/release/zipp run --jit examples/strings.ts  # string methods (slice/indexOf/… run NATIVE)
 
 # run the language test suite
 cargo test
@@ -360,6 +363,9 @@ recursion (with **default parameters**), `let`/`const` (incl. array/object
 ternary `?:`, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing,
 `.length`, **growable** with `push`/`pop`, and a **method stdlib**:
 `map`/`filter`/`reduce`/`some`/`every`/`findIndex`/`indexOf`/`includes`/`slice`/`concat`/`reverse`/`fill`),
+**strings** (`+`, `==`, `len`, and a native method stdlib
+`charCodeAt`/`charAt`/`slice`/`indexOf`/`lastIndexOf`/`includes`/`startsWith`/`endsWith`/`repeat`
+— byte-level/ASCII-exact vs TS),
 **tuples** (`[i64, str]` — positional indexing + destructuring),
 numeric **and string `enum`s**, **`interface`s and `class`es → structs**
 (interfaces construct with `let p: T = {…}` / `{…} as T`; classes give you
@@ -391,7 +397,7 @@ optional chaining; `nullable_heap.ts` `str | null` + `T[] | null`;
 `nullable_scalar.ts` `i64 | null`; `lambda.ts` first-class functions + arrow
 lambdas; `closure.ts` closures (capture); `arraymethods.ts` + `arraymethods2.ts`
 the array method stdlib; `arraysearch.ts` the search/in-place methods running
-native. Most run on all four backends;
+native; `strings.ts` the native string-method stdlib. Most run on all four backends;
 **nullable
 *heap* types — structs, `str`, arrays — run natively on `--jit` and `--llvm`**
 (a null is a 0/null pointer; `=== null` is a pointer compare). **Nullable
@@ -403,8 +409,14 @@ interpreter** in v0 (`--jit`/`--llvm`/`--wasm` fall back) — a closure captures
 doesn't change the closure), and the higher-order array methods lower to
 synthesized per-element-type loop helpers. The **pure array methods**
 (`indexOf`/`includes`/`reverse`/`fill` — no closure, no `push`) stay **native** on
-`--jit`/`--llvm`. `--wasm` falls back for all nullable (its contract profile stays
-scalar-only).
+`--jit`/`--llvm`. **String methods run natively too** — each is a `zipp_str_*`
+runtime call shared by the interpreter and both native backends. They are
+**byte-level (UTF-8)**: `len`, indices, and `charCodeAt` are byte offsets,
+ASCII-exact vs TypeScript; on non-ASCII, indices are byte (not UTF-16-code-unit)
+positions and `charCodeAt` returns a byte. Index accessors are total —
+`charCodeAt(out-of-range)` is `-1` (TS `NaN`), `charAt(out-of-range)` is `""`,
+`slice` clamps — while `repeat(negative)` is a runtime error. `--wasm` falls back
+for all nullable and for strings (its contract profile stays scalar-only).
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,
