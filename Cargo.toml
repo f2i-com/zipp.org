@@ -1,0 +1,25 @@
+# ZIPP language — standalone workspace.
+# v0 brings up a working vertical slice: source -> lex -> parse -> typecheck ->
+# bytecode -> VM, plus an OPTIONAL zk-STARK proving profile over the VM trace.
+#
+# Heavier backends from PLAN.md (LLVM/PGO native, WASM-contract, full oxc/swc
+# frontend, parallel scheduler, fast stdlib) are roadmap — see PLAN.md.
+[workspace]
+resolver = "2"
+members = [
+    "crates/zippc",     # compiler core + register VM (lexer, ast, parser, check, ir, vm)
+    "crates/zipp-zk",   # OPTIONAL zk-STARK profile: Winterfell prover/verifier over the VM trace
+    "crates/zipp-cli",  # `zipp run [--prove] file.zipp`
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+
+[profile.release]
+opt-level = 3
+# `--prove` runs in release: Winterfell's per-constraint degree check is a
+# debug_assert, and selector-gated AIR constraints look like degree-0 polys on
+# traces that don't exercise every opcode. Release also makes proving fast.
+lto = false

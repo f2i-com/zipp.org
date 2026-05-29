@@ -1,0 +1,10 @@
+[package]
+name = "zipp-zk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP optional zk-STARK profile — Winterfell prover/verifier over the VM execution trace"
+
+[dependencies]
+winterfell = "0.13"
+zippc = { path = "../zippc" }

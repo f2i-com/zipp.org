@@ -1,0 +1,20 @@
+[package]
+name = "zipp-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP command-line interface: `zipp run [--prove] file.zipp`"
+
+[[bin]]
+name = "zipp"
+path = "src/main.rs"
+
+[features]
+# The zk-STARK proving profile is OPTIONAL (on by default). Build with
+# `--no-default-features` to drop the Winterfell dependency entirely.
+default = ["zk"]
+zk = ["dep:zipp-zk"]
+
+[dependencies]
+zippc = { path = "../zippc" }
+zipp-zk = { path = "../zipp-zk", optional = true }
