@@ -6,7 +6,7 @@
 //! registers). `&&`/`||` are short-circuited; `break`/`continue` patch to the
 //! enclosing loop. Jumps use absolute code offsets and are backpatched.
 
-use crate::ast::{BinOp, Expr, Module, Stmt, Type, UnOp};
+use crate::ast::{BinOp, Expr, Module, Stmt, StmtKind, Type, UnOp};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -160,14 +160,14 @@ impl<'a> Gen<'a> {
     }
 
     fn gen_stmt(&mut self, s: &Stmt) -> Result<(), String> {
-        match s {
-            Stmt::Let { name, value, .. } => {
+        match &s.kind {
+            StmtKind::Let { name, value, .. } => {
                 let v = self.gen_expr(value)?;
                 let r = self.declare(name);
                 self.code.push(Instr::Mov { dst: r, src: v });
                 Ok(())
             }
-            Stmt::Assign { target, value } => match target {
+            StmtKind::Assign { target, value } => match target {
                 Expr::Var(name) => {
                     let v = self.gen_expr(value)?;
                     let r = self.resolve(name)?;
@@ -183,13 +183,13 @@ impl<'a> Gen<'a> {
                 }
                 _ => Err("ir error: invalid assignment target".into()),
             },
-            Stmt::Return(Some(e)) => {
+            StmtKind::Return(Some(e)) => {
                 let v = self.gen_expr(e)?;
                 self.code.push(Instr::Ret { src: v });
                 Ok(())
             }
-            Stmt::Return(None) => Err("ir error: bare return unsupported".into()),
-            Stmt::If { cond, then_b, else_b } => {
+            StmtKind::Return(None) => Err("ir error: bare return unsupported".into()),
+            StmtKind::If { cond, then_b, else_b } => {
                 let c = self.gen_expr(cond)?;
                 let jz = self.here();
                 self.code.push(Instr::JmpIfZero { cond: c, target: 0 });
@@ -203,7 +203,7 @@ impl<'a> Gen<'a> {
                 self.patch(jend, end);
                 Ok(())
             }
-            Stmt::While { cond, body } => {
+            StmtKind::While { cond, body } => {
                 let lstart = self.here();
                 let c = self.gen_expr(cond)?;
                 let jexit = self.here();
@@ -222,7 +222,7 @@ impl<'a> Gen<'a> {
                 }
                 Ok(())
             }
-            Stmt::For { init, cond, step, body } => {
+            StmtKind::For { init, cond, step, body } => {
                 self.enter();
                 if let Some(i) = init {
                     self.gen_stmt(i)?;
@@ -250,7 +250,7 @@ impl<'a> Gen<'a> {
                 self.exit();
                 Ok(())
             }
-            Stmt::Break => {
+            StmtKind::Break => {
                 let idx = self.here();
                 self.code.push(Instr::Jmp { target: 0 });
                 self.loops
@@ -260,7 +260,7 @@ impl<'a> Gen<'a> {
                     .push(idx);
                 Ok(())
             }
-            Stmt::Continue => {
+            StmtKind::Continue => {
                 let idx = self.here();
                 self.code.push(Instr::Jmp { target: 0 });
                 self.loops
@@ -270,12 +270,12 @@ impl<'a> Gen<'a> {
                     .push(idx);
                 Ok(())
             }
-            Stmt::Print(e) => {
+            StmtKind::Print(e) => {
                 let v = self.gen_expr(e)?;
                 self.code.push(Instr::Print { a: v });
                 Ok(())
             }
-            Stmt::ExprStmt(e) => {
+            StmtKind::ExprStmt(e) => {
                 self.gen_expr(e)?;
                 Ok(())
             }

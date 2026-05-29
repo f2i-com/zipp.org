@@ -83,8 +83,30 @@ fn check_stmt(
     fname: &str,
     loop_depth: u32,
 ) -> Result<(), String> {
+    check_stmt_kind(&s.kind, scope, sigs, ret, fname, loop_depth)
+        .map_err(|e| with_line(e, s.line))
+}
+
+/// Append `[line N]` to a type error unless an inner statement already did
+/// (so the most specific line wins).
+fn with_line(e: String, line: u32) -> String {
+    if e.contains("[line ") {
+        e
+    } else {
+        format!("{e} [line {line}]")
+    }
+}
+
+fn check_stmt_kind(
+    s: &StmtKind,
+    scope: &mut Scope,
+    sigs: &HashMap<String, Sig>,
+    ret: Type,
+    fname: &str,
+    loop_depth: u32,
+) -> Result<(), String> {
     match s {
-        Stmt::Let { name, ty, value } => {
+        StmtKind::Let { name, ty, value } => {
             let vt = type_of(value, scope, sigs)?;
             if let Some(ann) = ty {
                 if *ann != vt {
@@ -95,7 +117,7 @@ fn check_stmt(
             }
             scope.declare(name, vt)
         }
-        Stmt::Assign { target, value } => {
+        StmtKind::Assign { target, value } => {
             // `type_of` on the target validates it (an undeclared var or a
             // non-array index is an error) and gives the slot's type.
             let tt = type_of(target, scope, sigs)?;
@@ -105,26 +127,26 @@ fn check_stmt(
             }
             Ok(())
         }
-        Stmt::Return(Some(e)) => {
+        StmtKind::Return(Some(e)) => {
             let t = type_of(e, scope, sigs)?;
             if t != ret {
                 return Err(format!("type error: '{fname}' returns {ret:?} but found {t:?}"));
             }
             Ok(())
         }
-        Stmt::Return(None) => Err(format!(
+        StmtKind::Return(None) => Err(format!(
             "type error: '{fname}' must return a {ret:?} value (bare `return` unsupported in v0)"
         )),
-        Stmt::If { cond, then_b, else_b } => {
+        StmtKind::If { cond, then_b, else_b } => {
             expect_type(cond, Type::Bool, scope, sigs, "if condition")?;
             check_block(then_b, scope, sigs, ret, fname, loop_depth)?;
             check_block(else_b, scope, sigs, ret, fname, loop_depth)
         }
-        Stmt::While { cond, body } => {
+        StmtKind::While { cond, body } => {
             expect_type(cond, Type::Bool, scope, sigs, "while condition")?;
             check_block(body, scope, sigs, ret, fname, loop_depth + 1)
         }
-        Stmt::For { init, cond, step, body } => {
+        StmtKind::For { init, cond, step, body } => {
             // The init binding is scoped to the loop.
             scope.enter();
             let r = (|| {
@@ -140,26 +162,26 @@ fn check_stmt(
             scope.exit();
             r
         }
-        Stmt::Break => {
+        StmtKind::Break => {
             if loop_depth == 0 {
                 return Err("type error: `break` outside of a loop".into());
             }
             Ok(())
         }
-        Stmt::Continue => {
+        StmtKind::Continue => {
             if loop_depth == 0 {
                 return Err("type error: `continue` outside of a loop".into());
             }
             Ok(())
         }
-        Stmt::Print(e) => {
+        StmtKind::Print(e) => {
             let t = type_of(e, scope, sigs)?;
             if t != Type::I64 && t != Type::F64 && t != Type::Str {
                 return Err(format!("type error: print expects a number or string, found {t:?}"));
             }
             Ok(())
         }
-        Stmt::ExprStmt(e) => {
+        StmtKind::ExprStmt(e) => {
             type_of(e, scope, sigs)?;
             Ok(())
         }

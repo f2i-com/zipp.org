@@ -1,9 +1,9 @@
 //! Recursive-descent parser for the ZIPP v0 subset.
 
 use crate::ast::*;
-use crate::lexer::Tok;
+use crate::lexer::{Tok, Token};
 
-pub fn parse(tokens: &[Tok]) -> Result<Module, String> {
+pub fn parse(tokens: &[Token]) -> Result<Module, String> {
     let mut p = Parser { toks: tokens, pos: 0 };
     let mut funcs = Vec::new();
     while !p.at_end() {
@@ -13,7 +13,7 @@ pub fn parse(tokens: &[Tok]) -> Result<Module, String> {
 }
 
 struct Parser<'a> {
-    toks: &'a [Tok],
+    toks: &'a [Token],
     pos: usize,
 }
 
@@ -23,25 +23,43 @@ impl<'a> Parser<'a> {
     }
 
     fn peek(&self) -> Option<&Tok> {
-        self.toks.get(self.pos)
+        self.toks.get(self.pos).map(|t| &t.tok)
+    }
+
+    /// " (line L:C)" for the current token (or the last token at EOF).
+    fn at(&self) -> String {
+        match self.toks.get(self.pos).or_else(|| self.toks.last()) {
+            Some(t) => format!(" (line {}:{})", t.line, t.col),
+            None => String::new(),
+        }
+    }
+
+    /// Line the current token starts on (used to tag statements).
+    fn cur_line(&self) -> u32 {
+        self.toks
+            .get(self.pos)
+            .or_else(|| self.toks.last())
+            .map(|t| t.line)
+            .unwrap_or(0)
     }
 
     fn bump(&mut self) -> Result<Tok, String> {
         let t = self
             .toks
             .get(self.pos)
-            .cloned()
+            .map(|t| t.tok.clone())
             .ok_or_else(|| "parse error: unexpected end of input".to_string())?;
         self.pos += 1;
         Ok(t)
     }
 
     fn expect(&mut self, want: &Tok) -> Result<(), String> {
+        let pos = self.at();
         let got = self.bump()?;
         if &got == want {
             Ok(())
         } else {
-            Err(format!("parse error: expected {want:?}, found {got:?}"))
+            Err(format!("parse error: expected {want:?}, found {got:?}{pos}"))
         }
     }
 
@@ -55,9 +73,10 @@ impl<'a> Parser<'a> {
     }
 
     fn ident(&mut self) -> Result<String, String> {
+        let pos = self.at();
         match self.bump()? {
             Tok::Ident(s) => Ok(s),
-            other => Err(format!("parse error: expected identifier, found {other:?}")),
+            other => Err(format!("parse error: expected identifier, found {other:?}{pos}")),
         }
     }
 
@@ -116,6 +135,12 @@ impl<'a> Parser<'a> {
     }
 
     fn stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.cur_line();
+        let kind = self.stmt_kind()?;
+        Ok(Stmt { kind, line })
+    }
+
+    fn stmt_kind(&mut self) -> Result<StmtKind, String> {
         match self.peek() {
             Some(Tok::Let) => {
                 self.bump()?;
@@ -128,16 +153,16 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::Assign)?;
                 let value = self.expr()?;
                 self.expect(&Tok::Semi)?;
-                Ok(Stmt::Let { name, ty, value })
+                Ok(StmtKind::Let { name, ty, value })
             }
             Some(Tok::Return) => {
                 self.bump()?;
                 if self.eat(&Tok::Semi) {
-                    Ok(Stmt::Return(None))
+                    Ok(StmtKind::Return(None))
                 } else {
                     let e = self.expr()?;
                     self.expect(&Tok::Semi)?;
-                    Ok(Stmt::Return(Some(e)))
+                    Ok(StmtKind::Return(Some(e)))
                 }
             }
             Some(Tok::If) => {
@@ -156,7 +181,7 @@ impl<'a> Parser<'a> {
                 } else {
                     Vec::new()
                 };
-                Ok(Stmt::If { cond, then_b, else_b })
+                Ok(StmtKind::If { cond, then_b, else_b })
             }
             Some(Tok::While) => {
                 self.bump()?;
@@ -164,7 +189,7 @@ impl<'a> Parser<'a> {
                 let cond = self.expr()?;
                 self.expect(&Tok::RParen)?;
                 let body = self.block()?;
-                Ok(Stmt::While { cond, body })
+                Ok(StmtKind::While { cond, body })
             }
             Some(Tok::For) => {
                 self.bump()?;
@@ -185,17 +210,17 @@ impl<'a> Parser<'a> {
                 };
                 self.expect(&Tok::RParen)?;
                 let body = self.block()?;
-                Ok(Stmt::For { init, cond, step, body })
+                Ok(StmtKind::For { init, cond, step, body })
             }
             Some(Tok::Break) => {
                 self.bump()?;
                 self.expect(&Tok::Semi)?;
-                Ok(Stmt::Break)
+                Ok(StmtKind::Break)
             }
             Some(Tok::Continue) => {
                 self.bump()?;
                 self.expect(&Tok::Semi)?;
-                Ok(Stmt::Continue)
+                Ok(StmtKind::Continue)
             }
             Some(Tok::Print) => {
                 self.bump()?;
@@ -203,7 +228,7 @@ impl<'a> Parser<'a> {
                 let e = self.expr()?;
                 self.expect(&Tok::RParen)?;
                 self.expect(&Tok::Semi)?;
-                Ok(Stmt::Print(e))
+                Ok(StmtKind::Print(e))
             }
             // assignment to an lvalue (`x = e;` / `a[i] = e;`) or a bare expression
             _ => {
@@ -212,12 +237,12 @@ impl<'a> Parser<'a> {
                     let value = self.expr()?;
                     self.expect(&Tok::Semi)?;
                     match e {
-                        Expr::Var(_) | Expr::Index { .. } => Ok(Stmt::Assign { target: e, value }),
-                        _ => Err("parse error: invalid assignment target".into()),
+                        Expr::Var(_) | Expr::Index { .. } => Ok(StmtKind::Assign { target: e, value }),
+                        _ => Err(format!("parse error: invalid assignment target{}", self.at())),
                     }
                 } else {
                     self.expect(&Tok::Semi)?;
-                    Ok(Stmt::ExprStmt(e))
+                    Ok(StmtKind::ExprStmt(e))
                 }
             }
         }
@@ -225,16 +250,18 @@ impl<'a> Parser<'a> {
 
     /// A statement without a trailing semicolon — used for a `for` loop's step.
     fn simple_stmt(&mut self) -> Result<Stmt, String> {
+        let line = self.cur_line();
         let e = self.expr()?;
-        if self.eat(&Tok::Assign) {
+        let kind = if self.eat(&Tok::Assign) {
             let value = self.expr()?;
             match e {
-                Expr::Var(_) | Expr::Index { .. } => Ok(Stmt::Assign { target: e, value }),
-                _ => Err("parse error: invalid assignment target".into()),
+                Expr::Var(_) | Expr::Index { .. } => StmtKind::Assign { target: e, value },
+                _ => return Err(format!("parse error: invalid assignment target{}", self.at())),
             }
         } else {
-            Ok(Stmt::ExprStmt(e))
-        }
+            StmtKind::ExprStmt(e)
+        };
+        Ok(Stmt { kind, line })
     }
 
     // ── expression precedence (low -> high) ──
@@ -399,6 +426,7 @@ impl<'a> Parser<'a> {
     }
 
     fn primary(&mut self) -> Result<Expr, String> {
+        let pos = self.at();
         match self.bump()? {
             Tok::Int(n) => Ok(Expr::Int(n)),
             Tok::Float(f) => Ok(Expr::Float(f)),
@@ -462,7 +490,7 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Var(name))
                 }
             }
-            other => Err(format!("parse error: unexpected token {other:?}")),
+            other => Err(format!("parse error: unexpected token {other:?}{pos}")),
         }
     }
 }

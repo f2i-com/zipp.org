@@ -89,8 +89,15 @@ pub enum Expr {
     Index { arr: Box<Expr>, index: Box<Expr> },
 }
 
+/// A statement plus the source line it starts on (for error messages).
 #[derive(Debug, Clone)]
-pub enum Stmt {
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone)]
+pub enum StmtKind {
     Let {
         name: String,
         ty: Option<Type>,

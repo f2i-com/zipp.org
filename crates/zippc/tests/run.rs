@@ -263,6 +263,27 @@ fn for_var_is_scoped_to_the_loop() {
     assert!(run("fn main(): i64 { for (let i = 0; i < 3; i = i + 1) { } return i; }").is_err());
 }
 
+// ── error positions ──
+
+#[test]
+fn parse_errors_have_line_col() {
+    // missing `;` after `5`; the next token (`return`) is on line 3
+    let src = "fn main(): i64 {\n    let x = 5\n    return x;\n}";
+    let e = run(src).unwrap_err();
+    assert!(e.contains("line 3"), "expected 'line 3' in: {e}");
+}
+
+#[test]
+fn type_errors_have_statement_line() {
+    let src = "fn main(): i64 {\n    return 1 + true;\n}";
+    let e = run(src).unwrap_err();
+    assert!(e.contains("[line 2]"), "expected '[line 2]' in: {e}");
+    // a deeper statement reports its own (innermost) line
+    let src2 = "fn main(): i64 {\n    let x = 0;\n    if (x == 0) {\n        let y = x + true;\n    }\n    return 0;\n}";
+    let e2 = run(src2).unwrap_err();
+    assert!(e2.contains("[line 4]"), "expected '[line 4]' in: {e2}");
+}
+
 #[test]
 fn for_over_array() {
     let src = "fn main(): i64 { let a = [3, 1, 4, 1, 5]; let s = 0; \

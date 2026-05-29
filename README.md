@@ -38,10 +38,12 @@ with `--no-default-features` and the language still runs.
 - The **optional zk-STARK profile** (`zipp run --prove`): Winterfell proof +
   verification over the VM execution trace
 - An integration **test suite** (`cargo test`)
+- **Positioned errors** — parse errors report `line:col`, type errors report the
+  statement line (e.g. `type error: arithmetic Add on I64 and Bool [line 2]`)
 
 🚧 Roadmap (see `../ZIPP.md` for the full plan):
-- Types: sized integers (`i32`/`u32`/`u64`), then strings
-- Better errors with source line/column
+- Types: sized integers (`i32`/`u32`/`u64`)
+- Runtime-error positions (bytecode → source mapping; compile errors are done)
 - Frontend: swap the hand-written parser for **oxc/SWC** (real TS/JSX)
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
 - Backends: **Cranelift** tier-0 JIT, **LLVM** release (+LTO/PGO/SIMD), **WASM-contract**
