@@ -1,12 +1,12 @@
 //! Bytecode IR + lowering from the checked AST.
 //!
-//! v0 lowers straight to a flat register-machine bytecode (a stand-in for the
-//! ZHIR/ZMIR pipeline in PLAN.md). Registers are frame-relative; each call
-//! pushes a fresh register window. Jumps use absolute code offsets and are
-//! backpatched.
+//! v0 lowers to a flat register-machine bytecode (a stand-in for ZHIR/ZMIR).
+//! Registers are frame-relative and lexically scoped: entering a block snapshots
+//! the register watermark, exiting restores it (so sibling blocks reuse
+//! registers). `&&`/`||` are short-circuited; `break`/`continue` patch to the
+//! enclosing loop. Jumps use absolute code offsets and are backpatched.
 
-use crate::ast::{BinOp, Func, Module, Stmt, UnOp};
-use crate::ast::Expr;
+use crate::ast::{BinOp, Expr, Module, Stmt, UnOp};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -17,6 +17,7 @@ pub enum Instr {
     Unary { op: UnOp, dst: u32, a: u32 },
     Jmp { target: u32 },
     JmpIfZero { cond: u32, target: u32 },
+    JmpIfNonZero { cond: u32, target: u32 },
     Call { func: u32, arg_base: u32, argc: u32, dst: u32 },
     Ret { src: u32 },
     Print { a: u32 },
@@ -38,7 +39,6 @@ pub struct Program {
 }
 
 pub fn lower(m: &Module) -> Result<Program, String> {
-    // Pass 1: assign function indices.
     let mut func_index: HashMap<String, u32> = HashMap::new();
     for (i, f) in m.funcs.iter().enumerate() {
         func_index.insert(f.name.clone(), i as u32);
@@ -47,29 +47,30 @@ pub fn lower(m: &Module) -> Result<Program, String> {
     let mut code: Vec<Instr> = Vec::new();
     let mut funcs: Vec<FuncMeta> = Vec::with_capacity(m.funcs.len());
 
-    // Pass 2: lower each function body into the shared code buffer.
     for f in &m.funcs {
         let entry = code.len() as u32;
         let mut g = Gen {
             code: &mut code,
             func_index: &func_index,
-            regs: HashMap::new(),
+            scopes: vec![(HashMap::new(), 0)],
             next_reg: 0,
+            max_reg: 0,
+            loops: Vec::new(),
         };
         for (i, p) in f.params.iter().enumerate() {
-            g.regs.insert(p.name.clone(), i as u32);
+            g.scopes[0].0.insert(p.name.clone(), i as u32);
         }
         g.next_reg = f.params.len() as u32;
+        g.max_reg = g.next_reg;
         g.gen_block(&f.body)?;
-        // Fallthrough return 0 so execution never runs off the end.
+        // Fallthrough `return 0` so execution never runs off the end.
         let z = g.alloc();
         g.code.push(Instr::Const { dst: z, imm: 0 });
         g.code.push(Instr::Ret { src: z });
-        let nregs = g.next_reg;
         funcs.push(FuncMeta {
             name: f.name.clone(),
             entry,
-            nregs,
+            nregs: g.max_reg,
             nparams: f.params.len() as u32,
         });
     }
@@ -78,22 +79,63 @@ pub fn lower(m: &Module) -> Result<Program, String> {
     Ok(Program { code, funcs, main })
 }
 
+struct LoopCtx {
+    continue_target: u32,
+    breaks: Vec<u32>,
+}
+
 struct Gen<'a> {
     code: &'a mut Vec<Instr>,
     func_index: &'a HashMap<String, u32>,
-    regs: HashMap<String, u32>,
+    /// Scope stack: (name -> register, saved next_reg watermark on entry).
+    scopes: Vec<(HashMap<String, u32>, u32)>,
     next_reg: u32,
+    max_reg: u32,
+    loops: Vec<LoopCtx>,
 }
 
 impl<'a> Gen<'a> {
     fn alloc(&mut self) -> u32 {
         let r = self.next_reg;
         self.next_reg += 1;
+        if self.next_reg > self.max_reg {
+            self.max_reg = self.next_reg;
+        }
         r
     }
 
     fn here(&self) -> u32 {
         self.code.len() as u32
+    }
+
+    fn enter(&mut self) {
+        self.scopes.push((HashMap::new(), self.next_reg));
+    }
+
+    fn exit(&mut self) {
+        let (_, saved) = self.scopes.pop().expect("scope underflow");
+        self.next_reg = saved; // reclaim registers used inside the block
+    }
+
+    fn declare(&mut self, name: &str) -> u32 {
+        let r = self.alloc();
+        self.scopes.last_mut().unwrap().0.insert(name.to_string(), r);
+        r
+    }
+
+    fn resolve(&self, name: &str) -> Result<u32, String> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|(m, _)| m.get(name).copied())
+            .ok_or_else(|| format!("ir error: unbound variable '{name}'"))
+    }
+
+    fn scoped_block(&mut self, stmts: &[Stmt]) -> Result<(), String> {
+        self.enter();
+        let r = self.gen_block(stmts);
+        self.exit();
+        r
     }
 
     fn gen_block(&mut self, stmts: &[Stmt]) -> Result<(), String> {
@@ -107,17 +149,13 @@ impl<'a> Gen<'a> {
         match s {
             Stmt::Let { name, value, .. } => {
                 let v = self.gen_expr(value)?;
-                let r = self.alloc();
+                let r = self.declare(name);
                 self.code.push(Instr::Mov { dst: r, src: v });
-                self.regs.insert(name.clone(), r);
                 Ok(())
             }
             Stmt::Assign { name, value } => {
                 let v = self.gen_expr(value)?;
-                let r = *self
-                    .regs
-                    .get(name)
-                    .ok_or_else(|| format!("ir error: assign to unbound '{name}'"))?;
+                let r = self.resolve(name)?;
                 self.code.push(Instr::Mov { dst: r, src: v });
                 Ok(())
             }
@@ -131,14 +169,14 @@ impl<'a> Gen<'a> {
                 let c = self.gen_expr(cond)?;
                 let jz = self.here();
                 self.code.push(Instr::JmpIfZero { cond: c, target: 0 });
-                self.gen_block(then_b)?;
+                self.scoped_block(then_b)?;
                 let jend = self.here();
                 self.code.push(Instr::Jmp { target: 0 });
                 let else_start = self.here();
-                self.patch_target(jz, else_start);
-                self.gen_block(else_b)?;
+                self.patch(jz, else_start);
+                self.scoped_block(else_b)?;
                 let end = self.here();
-                self.patch_target(jend, end);
+                self.patch(jend, end);
                 Ok(())
             }
             Stmt::While { cond, body } => {
@@ -146,10 +184,34 @@ impl<'a> Gen<'a> {
                 let c = self.gen_expr(cond)?;
                 let jexit = self.here();
                 self.code.push(Instr::JmpIfZero { cond: c, target: 0 });
-                self.gen_block(body)?;
+                self.loops.push(LoopCtx { continue_target: lstart, breaks: Vec::new() });
+                self.scoped_block(body)?;
                 self.code.push(Instr::Jmp { target: lstart });
                 let end = self.here();
-                self.patch_target(jexit, end);
+                self.patch(jexit, end);
+                let ctx = self.loops.pop().expect("loop ctx");
+                for b in ctx.breaks {
+                    self.patch(b, end);
+                }
+                Ok(())
+            }
+            Stmt::Break => {
+                let idx = self.here();
+                self.code.push(Instr::Jmp { target: 0 });
+                self.loops
+                    .last_mut()
+                    .ok_or("ir error: break outside loop")?
+                    .breaks
+                    .push(idx);
+                Ok(())
+            }
+            Stmt::Continue => {
+                let target = self
+                    .loops
+                    .last()
+                    .ok_or("ir error: continue outside loop")?
+                    .continue_target;
+                self.code.push(Instr::Jmp { target });
                 Ok(())
             }
             Stmt::Print(e) => {
@@ -164,10 +226,12 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn patch_target(&mut self, at: u32, target: u32) {
+    fn patch(&mut self, at: u32, target: u32) {
         match &mut self.code[at as usize] {
-            Instr::Jmp { target: t } | Instr::JmpIfZero { target: t, .. } => *t = target,
-            _ => unreachable!("patch_target on non-jump instruction"),
+            Instr::Jmp { target: t }
+            | Instr::JmpIfZero { target: t, .. }
+            | Instr::JmpIfNonZero { target: t, .. } => *t = target,
+            _ => unreachable!("patch on non-jump instruction"),
         }
     }
 
@@ -183,16 +247,37 @@ impl<'a> Gen<'a> {
                 self.code.push(Instr::Const { dst: r, imm: if *b { 1 } else { 0 } });
                 Ok(r)
             }
-            Expr::Var(name) => self
-                .regs
-                .get(name)
-                .copied()
-                .ok_or_else(|| format!("ir error: unbound variable '{name}'")),
+            Expr::Var(name) => self.resolve(name),
             Expr::Unary { op, e } => {
                 let a = self.gen_expr(e)?;
                 let r = self.alloc();
                 self.code.push(Instr::Unary { op: *op, dst: r, a });
                 Ok(r)
+            }
+            // Short-circuit logical operators lower to branches.
+            Expr::Bin { op: BinOp::And, l, r } => {
+                let dst = self.alloc();
+                let la = self.gen_expr(l)?;
+                self.code.push(Instr::Mov { dst, src: la });
+                let jz = self.here();
+                self.code.push(Instr::JmpIfZero { cond: dst, target: 0 });
+                let rb = self.gen_expr(r)?;
+                self.code.push(Instr::Mov { dst, src: rb });
+                let end = self.here();
+                self.patch(jz, end);
+                Ok(dst)
+            }
+            Expr::Bin { op: BinOp::Or, l, r } => {
+                let dst = self.alloc();
+                let la = self.gen_expr(l)?;
+                self.code.push(Instr::Mov { dst, src: la });
+                let jnz = self.here();
+                self.code.push(Instr::JmpIfNonZero { cond: dst, target: 0 });
+                let rb = self.gen_expr(r)?;
+                self.code.push(Instr::Mov { dst, src: rb });
+                let end = self.here();
+                self.patch(jnz, end);
+                Ok(dst)
             }
             Expr::Bin { op, l, r } => {
                 let a = self.gen_expr(l)?;
@@ -207,10 +292,11 @@ impl<'a> Gen<'a> {
                     .get(name)
                     .ok_or_else(|| format!("ir error: call to unknown function '{name}'"))?;
                 let argc = args.len() as u32;
-                // Reserve a contiguous argument block, then evaluate each arg
-                // and move it into place (arg exprs may allocate temps above).
                 let arg_base = self.next_reg;
-                self.next_reg += argc;
+                // Reserve the contiguous argument window.
+                for _ in 0..argc {
+                    self.alloc();
+                }
                 for (i, a) in args.iter().enumerate() {
                     let v = self.gen_expr(a)?;
                     self.code.push(Instr::Mov { dst: arg_base + i as u32, src: v });

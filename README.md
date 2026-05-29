@@ -24,12 +24,18 @@ with `--no-default-features` and the language still runs.
 ✅ Working end-to-end today:
 - Lexer → recursive-descent parser → **sound-subset type checker** (`i64`/`bool`,
   no implicit coercions, arity/return checking)
-- Lowering to **register-machine bytecode**; functions, recursion, `if`/`while`
+- **Lexical block scoping with shadowing**; `break` / `continue`; **short-circuit**
+  `&&` / `||`
+- Full operator set incl. **bitwise/shift** `& | ^ << >> ~`
+- Lowering to **register-machine bytecode**; functions, recursion, `if` / `while`
 - A **VM** that runs it (`zipp run`)
 - The **optional zk-STARK profile** (`zipp run --prove`): Winterfell proof +
   verification over the VM execution trace
+- An integration **test suite** (`cargo test`)
 
 🚧 Roadmap (see `../ZIPP.md` for the full plan):
+- Types: `f64`, sized integers (`i32`/`u32`/`u64`), then strings
+- Better errors with source line/column
 - Frontend: swap the hand-written parser for **oxc/SWC** (real TS/JSX)
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
 - Backends: **Cranelift** tier-0 JIT, **LLVM** release (+LTO/PGO/SIMD), **WASM-contract**
@@ -44,6 +50,10 @@ cargo build --release
 # run
 ./target/release/zipp run examples/fib.zipp        # => 55
 ./target/release/zipp run examples/sum.zipp         # => 385
+./target/release/zipp run examples/bits.zipp        # => 247  (bitwise/shift)
+
+# run the language test suite
+cargo test
 
 # run + zk-STARK prove + verify the execution
 ./target/release/zipp run --prove examples/add.zipp
@@ -75,7 +85,7 @@ zipp-lang/
 │   ├── zippc/        # compiler core + register VM: lexer, ast, parser, check, ir, vm
 │   ├── zipp-zk/      # OPTIONAL zk-STARK profile (Winterfell prover/verifier over the trace)
 │   └── zipp-cli/     # the `zipp` binary
-└── examples/         # add.zipp, sum.zipp, fib.zipp
+└── examples/         # add.zipp, sum.zipp, fib.zipp, bits.zipp
 ```
 
 The modules inside `zippc` map onto the separate crates in `../ZIPP.md §15`

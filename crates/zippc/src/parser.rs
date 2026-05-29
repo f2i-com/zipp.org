@@ -156,6 +156,16 @@ impl<'a> Parser<'a> {
                 let body = self.block()?;
                 Ok(Stmt::While { cond, body })
             }
+            Some(Tok::Break) => {
+                self.bump()?;
+                self.expect(&Tok::Semi)?;
+                Ok(Stmt::Break)
+            }
+            Some(Tok::Continue) => {
+                self.bump()?;
+                self.expect(&Tok::Semi)?;
+                Ok(Stmt::Continue)
+            }
             Some(Tok::Print) => {
                 self.bump()?;
                 self.expect(&Tok::LParen)?;
@@ -195,10 +205,37 @@ impl<'a> Parser<'a> {
     }
 
     fn and_expr(&mut self) -> Result<Expr, String> {
-        let mut l = self.eq_expr()?;
+        let mut l = self.bitor_expr()?;
         while self.eat(&Tok::AndAnd) {
-            let r = self.eq_expr()?;
+            let r = self.bitor_expr()?;
             l = Expr::Bin { op: BinOp::And, l: Box::new(l), r: Box::new(r) };
+        }
+        Ok(l)
+    }
+
+    fn bitor_expr(&mut self) -> Result<Expr, String> {
+        let mut l = self.bitxor_expr()?;
+        while self.eat(&Tok::BitOr) {
+            let r = self.bitxor_expr()?;
+            l = Expr::Bin { op: BinOp::BitOr, l: Box::new(l), r: Box::new(r) };
+        }
+        Ok(l)
+    }
+
+    fn bitxor_expr(&mut self) -> Result<Expr, String> {
+        let mut l = self.bitand_expr()?;
+        while self.eat(&Tok::BitXor) {
+            let r = self.bitand_expr()?;
+            l = Expr::Bin { op: BinOp::BitXor, l: Box::new(l), r: Box::new(r) };
+        }
+        Ok(l)
+    }
+
+    fn bitand_expr(&mut self) -> Result<Expr, String> {
+        let mut l = self.eq_expr()?;
+        while self.eat(&Tok::BitAnd) {
+            let r = self.eq_expr()?;
+            l = Expr::Bin { op: BinOp::BitAnd, l: Box::new(l), r: Box::new(r) };
         }
         Ok(l)
     }
@@ -219,13 +256,28 @@ impl<'a> Parser<'a> {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr, String> {
-        let mut l = self.add_expr()?;
+        let mut l = self.shift_expr()?;
         loop {
             let op = match self.peek() {
                 Some(Tok::Lt) => BinOp::Lt,
                 Some(Tok::Le) => BinOp::Le,
                 Some(Tok::Gt) => BinOp::Gt,
                 Some(Tok::Ge) => BinOp::Ge,
+                _ => break,
+            };
+            self.bump()?;
+            let r = self.shift_expr()?;
+            l = Expr::Bin { op, l: Box::new(l), r: Box::new(r) };
+        }
+        Ok(l)
+    }
+
+    fn shift_expr(&mut self) -> Result<Expr, String> {
+        let mut l = self.add_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Shl) => BinOp::Shl,
+                Some(Tok::Shr) => BinOp::Shr,
                 _ => break,
             };
             self.bump()?;
@@ -277,6 +329,11 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 let e = self.unary_expr()?;
                 Ok(Expr::Unary { op: UnOp::Not, e: Box::new(e) })
+            }
+            Some(Tok::BitNot) => {
+                self.bump()?;
+                let e = self.unary_expr()?;
+                Ok(Expr::Unary { op: UnOp::BitNot, e: Box::new(e) })
             }
             _ => self.primary(),
         }

@@ -16,6 +16,8 @@ pub enum Tok {
     If,
     Else,
     While,
+    Break,
+    Continue,
     True,
     False,
     Print,
@@ -45,6 +47,12 @@ pub enum Tok {
     Ge,
     AndAnd,
     OrOr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitNot,
+    Shl,
+    Shr,
 }
 
 pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
@@ -131,7 +139,10 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 }
             }
             '<' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'<' {
+                    out.push(Tok::Shl);
+                    i += 2;
+                } else if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     out.push(Tok::Le);
                     i += 2;
                 } else {
@@ -140,7 +151,10 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 }
             }
             '>' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+                    out.push(Tok::Shr);
+                    i += 2;
+                } else if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     out.push(Tok::Ge);
                     i += 2;
                 } else {
@@ -153,7 +167,8 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     out.push(Tok::AndAnd);
                     i += 2;
                 } else {
-                    return Err("lex error: '&' (did you mean '&&'?)".into());
+                    out.push(Tok::BitAnd);
+                    i += 1;
                 }
             }
             '|' => {
@@ -161,8 +176,17 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     out.push(Tok::OrOr);
                     i += 2;
                 } else {
-                    return Err("lex error: '|' (did you mean '||'?)".into());
+                    out.push(Tok::BitOr);
+                    i += 1;
                 }
+            }
+            '^' => {
+                out.push(Tok::BitXor);
+                i += 1;
+            }
+            '~' => {
+                out.push(Tok::BitNot);
+                i += 1;
             }
             c if c.is_ascii_digit() => {
                 let start = i;
@@ -190,6 +214,8 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     "if" => Tok::If,
                     "else" => Tok::Else,
                     "while" => Tok::While,
+                    "break" => Tok::Break,
+                    "continue" => Tok::Continue,
                     "true" => Tok::True,
                     "false" => Tok::False,
                     "print" => Tok::Print,

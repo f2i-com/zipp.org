@@ -118,6 +118,7 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 let res = match op {
                     UnOp::Neg => av.wrapping_neg(),
                     UnOp::Not => (av == 0) as i64,
+                    UnOp::BitNot => !av,
                 };
                 reg[base + *dst as usize] = res;
                 rec!(OpKind::Other, av, 0, res, 0);
@@ -130,6 +131,13 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 let c = reg[base + *cond as usize];
                 rec!(OpKind::Other, c, 0, 0, 0);
                 if c == 0 {
+                    pc = *target;
+                }
+            }
+            Instr::JmpIfNonZero { cond, target } => {
+                let c = reg[base + *cond as usize];
+                rec!(OpKind::Other, c, 0, 0, 0);
+                if c != 0 {
                     pc = *target;
                 }
             }
@@ -196,5 +204,10 @@ fn eval_bin(op: BinOp, a: i64, b: i64) -> Result<i64, String> {
         Ge => (a >= b) as i64,
         And => ((a != 0) && (b != 0)) as i64,
         Or => ((a != 0) || (b != 0)) as i64,
+        BitAnd => a & b,
+        BitOr => a | b,
+        BitXor => a ^ b,
+        Shl => a.wrapping_shl(b as u32),
+        Shr => a.wrapping_shr(b as u32),
     })
 }

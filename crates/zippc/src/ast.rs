@@ -21,12 +21,19 @@ pub enum BinOp {
     Ge,
     And,
     Or,
+    // Bitwise / shift (integer-only — PLAN.md §5.4 native integers).
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Neg,
     Not,
+    BitNot,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +67,8 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    Break,
+    Continue,
     Print(Expr),
     ExprStmt(Expr),
 }

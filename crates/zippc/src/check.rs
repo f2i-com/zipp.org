@@ -1,8 +1,9 @@
 //! Sound-subset type checker.
 //!
-//! This is intentionally strict (no implicit coercions, no `any`, unique names
-//! per function) — the same discipline that PLAN.md §2 relies on for both
-//! speed and on-chain determinism. v0 supports `i64` and `bool`.
+//! Strict by design (no implicit coercions, `i64`/`bool` only) — the discipline
+//! PLAN.md §2 relies on for speed and on-chain determinism. Variables are
+//! lexically block-scoped with shadowing across scopes; `break`/`continue` are
+//! only valid inside a loop.
 
 use crate::ast::*;
 use std::collections::HashMap;
@@ -10,6 +11,35 @@ use std::collections::HashMap;
 struct Sig {
     params: Vec<Type>,
     ret: Type,
+}
+
+/// Lexical scope stack. Innermost scope is last.
+struct Scope {
+    frames: Vec<HashMap<String, Type>>,
+}
+
+impl Scope {
+    fn new() -> Self {
+        Self { frames: vec![HashMap::new()] }
+    }
+    fn enter(&mut self) {
+        self.frames.push(HashMap::new());
+    }
+    fn exit(&mut self) {
+        self.frames.pop();
+    }
+    /// Declare in the innermost scope; error on redeclaration *within the same scope*.
+    fn declare(&mut self, name: &str, ty: Type) -> Result<(), String> {
+        let top = self.frames.last_mut().expect("at least one scope");
+        if top.contains_key(name) {
+            return Err(format!("type error: '{name}' already declared in this scope"));
+        }
+        top.insert(name.to_string(), ty);
+        Ok(())
+    }
+    fn lookup(&self, name: &str) -> Option<Type> {
+        self.frames.iter().rev().find_map(|f| f.get(name).copied())
+    }
 }
 
 pub fn check(m: &Module) -> Result<(), String> {
@@ -20,10 +50,7 @@ pub fn check(m: &Module) -> Result<(), String> {
         }
         sigs.insert(
             f.name.clone(),
-            Sig {
-                params: f.params.iter().map(|p| p.ty).collect(),
-                ret: f.ret,
-            },
+            Sig { params: f.params.iter().map(|p| p.ty).collect(), ret: f.ret },
         );
     }
     if !sigs.contains_key("main") {
@@ -36,37 +63,25 @@ pub fn check(m: &Module) -> Result<(), String> {
 }
 
 fn check_func(f: &Func, sigs: &HashMap<String, Sig>) -> Result<(), String> {
-    let mut scope: HashMap<String, Type> = HashMap::new();
+    let mut scope = Scope::new();
     for p in &f.params {
-        if scope.insert(p.name.clone(), p.ty).is_some() {
-            return Err(format!(
-                "type error: parameter '{}' declared twice in '{}'",
-                p.name, f.name
-            ));
-        }
+        scope.declare(&p.name, p.ty).map_err(|_| {
+            format!("type error: parameter '{}' declared twice in '{}'", p.name, f.name)
+        })?;
     }
-    check_block(&f.body, &mut scope, sigs, f.ret, &f.name)
-}
-
-fn check_block(
-    stmts: &[Stmt],
-    scope: &mut HashMap<String, Type>,
-    sigs: &HashMap<String, Sig>,
-    ret: Type,
-    fname: &str,
-) -> Result<(), String> {
-    for s in stmts {
-        check_stmt(s, scope, sigs, ret, fname)?;
+    for s in &f.body {
+        check_stmt(s, &mut scope, sigs, f.ret, &f.name, 0)?;
     }
     Ok(())
 }
 
 fn check_stmt(
     s: &Stmt,
-    scope: &mut HashMap<String, Type>,
+    scope: &mut Scope,
     sigs: &HashMap<String, Sig>,
     ret: Type,
     fname: &str,
+    loop_depth: u32,
 ) -> Result<(), String> {
     match s {
         Stmt::Let { name, ty, value } => {
@@ -78,17 +93,11 @@ fn check_stmt(
                     ));
                 }
             }
-            if scope.contains_key(name) {
-                return Err(format!(
-                    "type error: '{name}' already declared in '{fname}' (shadowing is not allowed in v0)"
-                ));
-            }
-            scope.insert(name.clone(), vt);
-            Ok(())
+            scope.declare(name, vt)
         }
         Stmt::Assign { name, value } => {
-            let target = *scope
-                .get(name)
+            let target = scope
+                .lookup(name)
                 .ok_or_else(|| format!("type error: assignment to undeclared '{name}'"))?;
             let vt = type_of(value, scope, sigs)?;
             if target != vt {
@@ -101,9 +110,7 @@ fn check_stmt(
         Stmt::Return(Some(e)) => {
             let t = type_of(e, scope, sigs)?;
             if t != ret {
-                return Err(format!(
-                    "type error: '{fname}' returns {ret:?} but found {t:?}"
-                ));
+                return Err(format!("type error: '{fname}' returns {ret:?} but found {t:?}"));
             }
             Ok(())
         }
@@ -112,12 +119,24 @@ fn check_stmt(
         )),
         Stmt::If { cond, then_b, else_b } => {
             expect_type(cond, Type::Bool, scope, sigs, "if condition")?;
-            check_block(then_b, scope, sigs, ret, fname)?;
-            check_block(else_b, scope, sigs, ret, fname)
+            check_block(then_b, scope, sigs, ret, fname, loop_depth)?;
+            check_block(else_b, scope, sigs, ret, fname, loop_depth)
         }
         Stmt::While { cond, body } => {
             expect_type(cond, Type::Bool, scope, sigs, "while condition")?;
-            check_block(body, scope, sigs, ret, fname)
+            check_block(body, scope, sigs, ret, fname, loop_depth + 1)
+        }
+        Stmt::Break => {
+            if loop_depth == 0 {
+                return Err("type error: `break` outside of a loop".into());
+            }
+            Ok(())
+        }
+        Stmt::Continue => {
+            if loop_depth == 0 {
+                return Err("type error: `continue` outside of a loop".into());
+            }
+            Ok(())
         }
         Stmt::Print(e) => {
             expect_type(e, Type::I64, scope, sigs, "print")?;
@@ -130,10 +149,29 @@ fn check_stmt(
     }
 }
 
+fn check_block(
+    stmts: &[Stmt],
+    scope: &mut Scope,
+    sigs: &HashMap<String, Sig>,
+    ret: Type,
+    fname: &str,
+    loop_depth: u32,
+) -> Result<(), String> {
+    scope.enter();
+    let r = (|| {
+        for s in stmts {
+            check_stmt(s, scope, sigs, ret, fname, loop_depth)?;
+        }
+        Ok(())
+    })();
+    scope.exit();
+    r
+}
+
 fn expect_type(
     e: &Expr,
     want: Type,
-    scope: &HashMap<String, Type>,
+    scope: &Scope,
     sigs: &HashMap<String, Sig>,
     what: &str,
 ) -> Result<(), String> {
@@ -144,22 +182,18 @@ fn expect_type(
     Ok(())
 }
 
-fn type_of(
-    e: &Expr,
-    scope: &HashMap<String, Type>,
-    sigs: &HashMap<String, Sig>,
-) -> Result<Type, String> {
+fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type, String> {
     match e {
         Expr::Int(_) => Ok(Type::I64),
         Expr::Bool(_) => Ok(Type::Bool),
         Expr::Var(name) => scope
-            .get(name)
-            .copied()
+            .lookup(name)
             .ok_or_else(|| format!("type error: use of undeclared variable '{name}'")),
         Expr::Unary { op, e } => {
             let t = type_of(e, scope, sigs)?;
             match op {
                 UnOp::Neg if t == Type::I64 => Ok(Type::I64),
+                UnOp::BitNot if t == Type::I64 => Ok(Type::I64),
                 UnOp::Not if t == Type::Bool => Ok(Type::Bool),
                 _ => Err(format!("type error: unary {op:?} on {t:?}")),
             }
@@ -169,11 +203,11 @@ fn type_of(
             let rt = type_of(r, scope, sigs)?;
             use BinOp::*;
             match op {
-                Add | Sub | Mul | Div | Mod => {
+                Add | Sub | Mul | Div | Mod | BitAnd | BitOr | BitXor | Shl | Shr => {
                     if lt == Type::I64 && rt == Type::I64 {
                         Ok(Type::I64)
                     } else {
-                        Err(format!("type error: arithmetic {op:?} on {lt:?} and {rt:?}"))
+                        Err(format!("type error: integer op {op:?} on {lt:?} and {rt:?}"))
                     }
                 }
                 Lt | Le | Gt | Ge => {
