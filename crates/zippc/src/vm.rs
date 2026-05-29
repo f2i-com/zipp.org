@@ -22,6 +22,8 @@ pub enum Value {
     I32(i32),
     U32(u32),
     U64(u64),
+    /// A null struct reference (`T | null` whose value is absent).
+    Null,
 }
 
 impl Value {
@@ -32,7 +34,7 @@ impl Value {
             Value::U32(x) => x == 0,
             Value::U64(x) => x == 0,
             Value::F64(f) => f == 0.0,
-            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } => false,
+            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } | Value::Null => false,
         }
     }
     /// The i64 payload, or `None` for non-`i64` values. (Array index / repeat
@@ -53,7 +55,7 @@ impl Value {
             Value::I32(x) => x as i64,
             Value::U32(x) => x as i64,
             Value::U64(x) => x as i64,
-            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } => 0,
+            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } | Value::Null => 0,
         }
     }
 }
@@ -69,6 +71,7 @@ impl std::fmt::Display for Value {
             Value::Arr(_) => write!(f, "[array]"),
             Value::Str(_) => write!(f, "[str]"),
             Value::Struct { .. } => write!(f, "[struct]"),
+            Value::Null => write!(f, "null"),
         }
     }
 }
@@ -200,6 +203,14 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                         BinOp::Ne => Value::I64((str_heap[x] != str_heap[y]) as i64),
                         _ => return Err(format!("runtime error: operator {op:?} not valid on strings")),
                     },
+                    // Null comparisons: `x === null` / `x !== null` (a non-null
+                    // struct is never equal to null; null equals only null).
+                    (Value::Null, _) | (_, Value::Null)
+                        if matches!(*op, BinOp::Eq | BinOp::Ne) =>
+                    {
+                        let eq = matches!((av, bv), (Value::Null, Value::Null));
+                        Value::I64((if *op == BinOp::Eq { eq } else { !eq }) as i64)
+                    }
                     _ => eval_bin(*op, av, bv)?,
                 };
                 reg[base + *dst as usize] = res;
@@ -349,6 +360,7 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 }
                 let (id, ptr) = match reg[base + *obj as usize] {
                     Value::Struct { id, ptr } => (id, ptr),
+                    Value::Null => return Err("runtime error: null reference (read of '.{field}')".replace("{field}", field)),
                     _ => return Err("runtime error: field access on a non-struct".into()),
                 };
                 let slot = prog.structs[id as usize]
@@ -358,12 +370,19 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                     .ok_or_else(|| format!("runtime error: no field '{field}'"))?;
                 reg[base + *dst as usize] = heap[ptr][slot];
             }
+            Instr::ConstNull { dst } => {
+                if record_trace {
+                    return Err(ZK_NO_STRUCT.into());
+                }
+                reg[base + *dst as usize] = Value::Null;
+            }
             Instr::SetField { base: obj, field, value } => {
                 if record_trace {
                     return Err(ZK_NO_STRUCT.into());
                 }
                 let (id, ptr) = match reg[base + *obj as usize] {
                     Value::Struct { id, ptr } => (id, ptr),
+                    Value::Null => return Err("runtime error: null reference (write to a field)".into()),
                     _ => return Err("runtime error: field assignment to a non-struct".into()),
                 };
                 let slot = prog.structs[id as usize]
@@ -446,6 +465,7 @@ fn render(v: Value, strs: &[String]) -> String {
         Value::Str(i) => strs[i].clone(),
         Value::Arr(_) => "[array]".to_string(),
         Value::Struct { .. } => "[struct]".to_string(),
+        Value::Null => "null".to_string(),
     }
 }
 

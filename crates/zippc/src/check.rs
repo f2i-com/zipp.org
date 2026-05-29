@@ -144,28 +144,34 @@ fn check_stmt_kind(
     match s {
         StmtKind::Let { name, ty, value } => {
             let vt = type_of(value, scope, cx)?;
-            if let Some(ann) = ty {
-                if *ann != vt {
-                    return Err(format!(
-                        "type error: `let {name}: {ann:?}` initialized with {vt:?}"
-                    ));
+            // With an annotation, declare the annotated type (so `let x: T | null
+            // = someT` keeps `x` nullable) and allow widening into it.
+            let declared = match ty {
+                Some(ann) => {
+                    if !assignable(vt, *ann) {
+                        return Err(format!(
+                            "type error: `let {name}: {ann:?}` initialized with {vt:?}"
+                        ));
+                    }
+                    *ann
                 }
-            }
-            scope.declare(name, vt)
+                None => vt,
+            };
+            scope.declare(name, declared)
         }
         StmtKind::Assign { target, value } => {
             // `type_of` on the target validates it (an undeclared var or a
             // non-array index is an error) and gives the slot's type.
             let tt = type_of(target, scope, cx)?;
             let vt = type_of(value, scope, cx)?;
-            if tt != vt {
+            if !assignable(vt, tt) {
                 return Err(format!("type error: cannot assign {vt:?} to a target of type {tt:?}"));
             }
             Ok(())
         }
         StmtKind::Return(Some(e)) => {
             let t = type_of(e, scope, cx)?;
-            if t != ret {
+            if !assignable(t, ret) {
                 return Err(format!("type error: '{fname}' returns {ret:?} but found {t:?}"));
             }
             Ok(())
@@ -175,8 +181,27 @@ fn check_stmt_kind(
         )),
         StmtKind::If { cond, then_b, else_b } => {
             expect_type(cond, Type::Bool, scope, cx, "if condition")?;
-            check_block(then_b, scope, cx, ret, fname, loop_depth)?;
-            check_block(else_b, scope, cx, ret, fname, loop_depth)
+            // Flow-narrow a `T | null` variable that the condition null-checks.
+            let guard = null_guard(cond);
+            let narrow = |scope: &mut Scope, want_then: bool| {
+                if let Some((x, in_then)) = guard {
+                    if in_then == want_then {
+                        if let Some(Type::OptStruct(id)) = scope.lookup(x) {
+                            let _ = scope.declare(x, Type::Struct(id)); // fresh frame: can't fail
+                        }
+                    }
+                }
+            };
+            scope.enter();
+            narrow(scope, true);
+            let r1 = check_block(then_b, scope, cx, ret, fname, loop_depth);
+            scope.exit();
+            r1?;
+            scope.enter();
+            narrow(scope, false);
+            let r2 = check_block(else_b, scope, cx, ret, fname, loop_depth);
+            scope.exit();
+            r2
         }
         StmtKind::While { cond, body } => {
             expect_type(cond, Type::Bool, scope, cx, "while condition")?;
@@ -251,10 +276,38 @@ fn expect_type(
     what: &str,
 ) -> Result<(), String> {
     let got = type_of(e, scope, cx)?;
-    if got != want {
+    if !assignable(got, want) {
         return Err(format!("type error: {what} expects {want:?}, found {got:?}"));
     }
     Ok(())
+}
+
+/// Is a value of type `from` assignable to a slot of type `to`? Identity, plus
+/// widening `T` / `null` into `T | null`.
+fn assignable(from: Type, to: Type) -> bool {
+    if from == to {
+        return true;
+    }
+    match (from, to) {
+        (Type::Null, Type::OptStruct(_)) => true,
+        (Type::Struct(a), Type::OptStruct(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// If `cond` is a null guard on a variable (`x === null` / `x !== null`), return
+/// the variable name and whether it is non-null in the `then` branch.
+fn null_guard(cond: &Expr) -> Option<(&str, bool)> {
+    let Expr::Bin { op, l, r } = cond else { return None };
+    let var = match (&**l, &**r) {
+        (Expr::Var(x), Expr::Null) | (Expr::Null, Expr::Var(x)) => x.as_str(),
+        _ => return None,
+    };
+    match op {
+        BinOp::Ne => Some((var, true)),  // `x !== null` → x is non-null in `then`
+        BinOp::Eq => Some((var, false)), // `x === null` → x is non-null in `else`
+        _ => None,
+    }
 }
 
 fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
@@ -273,6 +326,24 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                 ));
             }
             Ok(tt)
+        }
+        Expr::Null => Ok(Type::Null),
+        Expr::Coalesce { lhs, rhs } => {
+            let lt = type_of(lhs, scope, cx)?;
+            let rt = type_of(rhs, scope, cx)?;
+            match lt {
+                Type::Null => Ok(rt), // `null ?? rhs`
+                Type::OptStruct(id) => {
+                    if rt == Type::Struct(id) || rt == Type::OptStruct(id) {
+                        Ok(rt) // a non-null rhs makes the whole `??` non-null
+                    } else {
+                        Err(format!(
+                            "type error: `??` right side must be the struct or its nullable, found {rt:?}"
+                        ))
+                    }
+                }
+                _ => Err(format!("type error: `??` left side must be nullable, found {lt:?}")),
+            }
         }
         Expr::Var(name) => scope
             .lookup(name)
@@ -343,7 +414,7 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                     .map(|(_, t)| *t)
                     .ok_or_else(|| format!("type error: struct '{name}' has no field '{fname}'"))?;
                 let actual = type_of(fexpr, scope, cx)?;
-                if actual != expected {
+                if !assignable(actual, expected) {
                     return Err(format!(
                         "type error: field '{name}.{fname}' expects {expected:?}, found {actual:?}"
                     ));
@@ -364,6 +435,10 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                             format!("type error: no field '{field}' on struct '{}'", decl.name)
                         })
                 }
+                Type::OptStruct(_) => Err(format!(
+                    "type error: '{field}' accessed on a possibly-null value; narrow it with \
+                     `if (x !== null) {{ … }}` or use `x ?? …`"
+                )),
                 _ => Err(format!("type error: cannot access field '{field}' on {bt:?}")),
             }
         }
@@ -380,6 +455,16 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
             let lt = type_of(l, scope, cx)?;
             let rt = type_of(r, scope, cx)?;
             use BinOp::*;
+            // Null comparison: `x === null` / `x !== null`.
+            if lt == Type::Null || rt == Type::Null {
+                let ok = |t: Type| matches!(t, Type::Null | Type::OptStruct(_));
+                return match op {
+                    Eq | Ne if ok(lt) && ok(rt) => Ok(Type::Bool),
+                    _ => Err(format!(
+                        "type error: only `==`/`!=` with `null` is allowed ({op:?} on {lt:?}, {rt:?})"
+                    )),
+                };
+            }
             // String operations: `+` concatenates, `==`/`!=` compare.
             if lt == Type::Str || rt == Type::Str {
                 return match op {
@@ -470,7 +555,7 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
             }
             for (i, (a, pty)) in args.iter().zip(&sig.params).enumerate() {
                 let at = type_of(a, scope, cx)?;
-                if at != *pty {
+                if !assignable(at, *pty) {
                     return Err(format!(
                         "type error: '{name}' arg {i} expects {pty:?}, found {at:?}"
                     ));

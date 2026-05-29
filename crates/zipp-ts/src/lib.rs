@@ -850,7 +850,7 @@ impl Lower<'_> {
         }
         let ret = self.fn_ret_type(f)?;
         let prev = self.ret_struct.replace(match ret {
-            z::Type::Struct(id) => Some(id),
+            z::Type::Struct(id) | z::Type::OptStruct(id) => Some(id),
             _ => None,
         });
         let body = match &f.body {
@@ -880,7 +880,9 @@ impl Lower<'_> {
                 };
                 z::Expr::Repeat { value: Box::new(elem), count: Box::new(z::Expr::Int(0)) }
             }
-            z::Type::Struct(_) => return None,
+            // a nullable field defaults to `null`
+            z::Type::OptStruct(_) => z::Expr::Null,
+            z::Type::Struct(_) | z::Type::Null => return None,
         })
     }
 
@@ -932,6 +934,7 @@ impl Lower<'_> {
                 self.struct_field_type(id, field)?
             }
             z::Expr::Cond { then, .. } => self.ztype_of(then)?,
+            z::Expr::Coalesce { rhs, .. } => self.ztype_of(rhs)?,
             _ => return None,
         })
     }
@@ -974,7 +977,7 @@ impl Lower<'_> {
         }
         let ret = self.fn_ret_type(f)?;
         self.ret_struct.set(match ret {
-            z::Type::Struct(id) => Some(id),
+            z::Type::Struct(id) | z::Type::OptStruct(id) => Some(id),
             _ => None,
         });
         let body = match &f.body {
@@ -1105,6 +1108,24 @@ impl Lower<'_> {
                 }
             }
             TSType::TSParenthesizedType(p) => self.ty(&p.type_annotation)?,
+            // `T | null` / `T | undefined` → a nullable struct reference.
+            TSType::TSUnionType(u) => {
+                let non_null: Vec<&TSType> =
+                    u.types.iter().filter(|t| !is_null_ts_type(t)).collect();
+                if u.types.iter().any(is_null_ts_type) && non_null.len() == 1 {
+                    match self.ty(non_null[0])? {
+                        z::Type::Struct(id) => z::Type::OptStruct(id),
+                        other => {
+                            return Err(self.err(
+                                u.span,
+                                format!("only a struct type can be `… | null` in v0, not {other:?}"),
+                            ))
+                        }
+                    }
+                } else {
+                    return Err(self.err(u.span, "only `T | null` unions are supported"));
+                }
+            }
             other => return Err(self.err(span_of_type(other), "unsupported type")),
         })
     }
@@ -1335,9 +1356,10 @@ impl Lower<'_> {
                     };
                     // `let p: Point = { ... }` — the annotation names the struct.
                     let value = match (&ty, init) {
-                        (Some(z::Type::Struct(id)), Expression::ObjectExpression(obj)) => {
-                            self.obj_struct_lit(obj, *id)?
-                        }
+                        (
+                            Some(z::Type::Struct(id) | z::Type::OptStruct(id)),
+                            Expression::ObjectExpression(obj),
+                        ) => self.obj_struct_lit(obj, *id)?,
                         _ => self.expr(init)?,
                     };
                     // Track the variable's type (annotation, else inferred).
@@ -1540,24 +1562,31 @@ impl Lower<'_> {
             }
             Expression::StringLiteral(s) => z::Expr::Str(s.value.as_str().to_string()),
             Expression::BooleanLiteral(b) => z::Expr::Bool(b.value),
-            Expression::Identifier(id) => z::Expr::Var(id.name.as_str().to_string()),
+            Expression::NullLiteral(_) => z::Expr::Null,
+            Expression::Identifier(id) => {
+                // `undefined` is conflated with `null` in this subset.
+                if id.name.as_str() == "undefined" {
+                    z::Expr::Null
+                } else {
+                    z::Expr::Var(id.name.as_str().to_string())
+                }
+            }
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression)?,
             Expression::BinaryExpression(b) => z::Expr::Bin {
                 op: self.bin_op(b.operator, b.span)?,
                 l: Box::new(self.expr(&b.left)?),
                 r: Box::new(self.expr(&b.right)?),
             },
-            Expression::LogicalExpression(l) => z::Expr::Bin {
-                op: match l.operator {
-                    LogicalOperator::And => z::BinOp::And,
-                    LogicalOperator::Or => z::BinOp::Or,
-                    LogicalOperator::Coalesce => {
-                        return Err(self.err(l.span, "`??` is not supported"))
-                    }
-                },
-                l: Box::new(self.expr(&l.left)?),
-                r: Box::new(self.expr(&l.right)?),
-            },
+            Expression::LogicalExpression(l) => {
+                let lhs = Box::new(self.expr(&l.left)?);
+                let rhs = Box::new(self.expr(&l.right)?);
+                match l.operator {
+                    LogicalOperator::And => z::Expr::Bin { op: z::BinOp::And, l: lhs, r: rhs },
+                    LogicalOperator::Or => z::Expr::Bin { op: z::BinOp::Or, l: lhs, r: rhs },
+                    // `a ?? b` — nullish coalescing.
+                    LogicalOperator::Coalesce => z::Expr::Coalesce { lhs, rhs },
+                }
+            }
             // `cond ? then : els`
             Expression::ConditionalExpression(c) => z::Expr::Cond {
                 cond: Box::new(self.expr(&c.test)?),
@@ -1623,8 +1652,10 @@ impl Lower<'_> {
                 let to = self.ty(&a.type_annotation)?;
                 if to.is_numeric() {
                     z::Expr::Cast { to, e: Box::new(self.expr(&a.expression)?) }
-                } else if let (z::Type::Struct(id), Expression::ObjectExpression(obj)) =
-                    (to, &a.expression)
+                } else if let (
+                    z::Type::Struct(id) | z::Type::OptStruct(id),
+                    Expression::ObjectExpression(obj),
+                ) = (to, &a.expression)
                 {
                     self.obj_struct_lit(obj, id)?
                 } else {
@@ -1909,8 +1940,16 @@ fn expr_has_var(e: &z::Expr) -> bool {
         z::Expr::Index { arr, index } => expr_has_var(arr) || expr_has_var(index),
         z::Expr::Field { base, .. } => expr_has_var(base),
         z::Expr::StructLit { fields, .. } => fields.iter().any(|(_, e)| expr_has_var(e)),
-        z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) => false,
+        z::Expr::Coalesce { lhs, rhs } => expr_has_var(lhs) || expr_has_var(rhs),
+        z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) | z::Expr::Null => {
+            false
+        }
     }
+}
+
+/// Is this TS type the `null` or `undefined` keyword (a nullable union member)?
+fn is_null_ts_type(t: &TSType) -> bool {
+    matches!(t, TSType::TSNullKeyword(_) | TSType::TSUndefinedKeyword(_))
 }
 
 /// The name of a bare type reference (`T`), used to spot type parameters.
@@ -1951,6 +1990,8 @@ fn mangle_type(t: z::Type) -> String {
             }
         ),
         z::Type::Struct(id) => format!("s{id}"),
+        z::Type::OptStruct(id) => format!("opts{id}"),
+        z::Type::Null => "null".into(),
     }
 }
 
@@ -2088,6 +2129,36 @@ mod tests {
                    function unwrap(b: Box<i64>): i64 { return b.get(); } \
                    function main(): i64 { return unwrap(new Box(99)); }";
         assert_eq!(run_i64(ts3), 99);
+    }
+
+    #[test]
+    fn optionals() {
+        // nullable param + `if (x !== null)` flow narrowing + null widening
+        let ts = "interface User { age: i64; } \
+                  function ageOr(u: User | null, fallback: i64): i64 { \
+                    if (u !== null) { return u.age; } \
+                    return fallback; \
+                  } \
+                  function main(): i64 { \
+                    let a: User = { age: 30 }; \
+                    let some: User | null = a; \
+                    let none: User | null = null; \
+                    return ageOr(some, -1) + ageOr(none, -1); }";
+        assert_eq!(run_i64(ts), 29); // 30 + (-1)
+        // `??` coalesces to a non-null default, then a field read
+        let ts2 = "interface Box { v: i64; } \
+                   function pick(b: Box | null): i64 { let def: Box = { v: 7 }; return (b ?? def).v; } \
+                   function main(): i64 { let x: Box = { v: 100 }; return pick(x) + pick(null); }";
+        assert_eq!(run_i64(ts2), 107); // 100 + 7
+        // a self-referential nullable field (`next: Node | null`)
+        let ts3 = "interface Node { val: i64; next: Node | null; } \
+                   function main(): i64 { \
+                     let tail: Node = { val: 2, next: null }; \
+                     let head: Node = { val: 1, next: tail }; \
+                     let n: Node | null = head.next; \
+                     if (n !== null) { return head.val + n.val; } \
+                     return head.val; }";
+        assert_eq!(run_i64(ts3), 3); // 1 + 2
     }
 
     #[test]

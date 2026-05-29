@@ -32,6 +32,11 @@ pub enum Type {
     I32,
     U32,
     U64,
+    /// A nullable struct reference, `T | null`. Runtime value is a struct pointer
+    /// that may be null. Only the interpreter handles it (native tiers fall back).
+    OptStruct(u32),
+    /// The type of the `null` literal — assignable to any `OptStruct`.
+    Null,
 }
 
 impl Type {
@@ -121,6 +126,10 @@ pub enum Expr {
     Field { base: Box<Expr>, field: String },
     /// Conditional (ternary) `cond ? then : els`; both arms share a type.
     Cond { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
+    /// The `null` literal.
+    Null,
+    /// Nullish coalescing `lhs ?? rhs` — `lhs` if non-null, else `rhs`.
+    Coalesce { lhs: Box<Expr>, rhs: Box<Expr> },
 }
 
 /// A statement plus the source line it starts on (for error messages).

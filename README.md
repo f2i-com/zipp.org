@@ -110,6 +110,7 @@ cargo build --release
 ./target/release/zipp run --jit examples/ternary.ts  # ternary ?: (a lazy recursive fib)
 ./target/release/zipp run examples/destructure.ts    # string enum + destructuring
 ./target/release/zipp run examples/defaults.ts       # default parameter values
+./target/release/zipp run examples/optional.ts       # T | null, ??, narrowing
 
 # run the language test suite
 cargo test
@@ -353,15 +354,20 @@ fields, a constructor, methods, `this`, and `new C(…)` — a class lowers to a
 factory plus methods taking `this`), field read/write, **generics** — both
 functions (`f<T>(…)`) and classes (`class Box<T>`) — monomorphized per use to
 concrete types (inferred or explicit), so the backends only ever see concrete
-code (a `Box<i64>` and a `Box<bool>` are two distinct structs), `console.log`,
-math builtins. **Type mapping:** `number`→f64, `bigint`→i64, `boolean`→bool,
+code (a `Box<i64>` and a `Box<bool>` are two distinct structs), **optionals**
+(`T | null`, `null`, `x ?? y`, `=== null`, and `if (x !== null)` flow
+narrowing), `console.log`, math builtins. **Type mapping:** `number`→f64,
+`bigint`→i64, `boolean`→bool,
 `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` and your
 `interface`/`class`/`enum` names usable directly. `examples/fib.ts` runs
 identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
 `point.ts` interfaces; `account.ts` a class with methods; `generic.ts`
 monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
 `for…of`; `calc.ts` a `switch`; `ternary.ts` the `?:` operator; `destructure.ts`
-a string enum + array/object destructuring; `defaults.ts` default parameters.
+a string enum + array/object destructuring; `defaults.ts` default parameters;
+`optional.ts` nullable references (`T | null`, `??`, narrowing). Most run on all
+four backends; **nullable (`T | null`) runs on the interpreter** — the native
+tiers cleanly fall back, since they don't yet carry a null representation.
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,

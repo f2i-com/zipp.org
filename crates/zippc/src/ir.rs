@@ -35,6 +35,8 @@ pub enum Instr {
     NewStruct { id: u32, dst: u32, fields: Vec<u32> },
     GetField { dst: u32, base: u32, field: String },
     SetField { base: u32, field: String, value: u32 },
+    // Nullable struct references (interpreter-only; native tiers fall back).
+    ConstNull { dst: u32 },
 }
 
 /// Field names of a struct, in declaration order (indexed by struct id). The VM
@@ -91,6 +93,17 @@ pub struct Program {
     pub funcs: Vec<FuncMeta>,
     pub main: u32,
     pub structs: Vec<StructLayout>,
+}
+
+impl Program {
+    /// True if the program uses nullable struct references (`T | null`). The
+    /// native tiers (jit/llvm/wasm) fall back to the interpreter for these (v0).
+    pub fn uses_nullable(&self) -> bool {
+        let opt = |t: &Type| matches!(t, Type::OptStruct(_) | Type::Null);
+        self.code.iter().any(|i| matches!(i, Instr::ConstNull { .. }))
+            || self.funcs.iter().any(|f| opt(&f.ret) || f.params.iter().any(opt))
+            || self.structs.iter().any(|s| s.types.iter().any(opt))
+    }
 }
 
 pub fn lower(m: &Module) -> Result<Program, String> {
@@ -439,6 +452,28 @@ impl<'a> Gen<'a> {
                 let b = self.gen_expr(base)?;
                 let dst = self.alloc();
                 self.code.push(Instr::GetField { dst, base: b, field: field.clone() });
+                Ok(dst)
+            }
+            Expr::Null => {
+                let dst = self.alloc();
+                self.code.push(Instr::ConstNull { dst });
+                Ok(dst)
+            }
+            // `lhs ?? rhs` — evaluate lhs once; if it's null, take rhs.
+            Expr::Coalesce { lhs, rhs } => {
+                let dst = self.alloc();
+                let l = self.gen_expr(lhs)?;
+                self.code.push(Instr::Mov { dst, src: l });
+                let nullr = self.alloc();
+                self.code.push(Instr::ConstNull { dst: nullr });
+                let isnull = self.alloc();
+                self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: dst, b: nullr });
+                let jz = self.here();
+                self.code.push(Instr::JmpIfZero { cond: isnull, target: 0 }); // not null → keep lhs
+                let rb = self.gen_expr(rhs)?;
+                self.code.push(Instr::Mov { dst, src: rb });
+                let end = self.here();
+                self.patch(jz, end);
                 Ok(dst)
             }
             // Ternary `cond ? then : els` — branch, with both arms writing `dst`

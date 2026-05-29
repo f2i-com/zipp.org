@@ -151,7 +151,10 @@ fn var(r: u32) -> Variable {
 /// Reason a program can't be JIT-compiled, or `None`. The native backend now
 /// covers the whole language, so this is always `None` (kept for the CLI's
 /// fallback path and forward compatibility).
-pub fn ineligible_reason(_prog: &Program) -> Option<&'static str> {
+pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
+    if prog.uses_nullable() {
+        return Some("nullable types (T | null)");
+    }
     None
 }
 
@@ -347,6 +350,7 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
             }
             Instr::Len { dst, .. } => t[*dst as usize] = JTy::I64,
             Instr::NewStruct { id, dst, .. } => t[*dst as usize] = JTy::Struct(*id),
+            Instr::ConstNull { dst } => t[*dst as usize] = JTy::I64, // unreachable (filtered)
             Instr::GetField { dst, base, field } => {
                 t[*dst as usize] = t[*base as usize]
                     .struct_id()
@@ -788,6 +792,9 @@ fn compile_function(
                     vv
                 };
                 builder.ins().store(MemFlags::trusted(), raw, base_v, 8 * (slot as i32 + 1));
+            }
+            Instr::ConstNull { .. } => {
+                return Err("internal: nullable types run on the interpreter".into());
             }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;

@@ -121,7 +121,10 @@ fn from_slot(body: &mut String, tmp: &mut usize, lty: LTy, raw: &str) -> String 
 
 /// Reason a program can't use the LLVM tier, or `None`. The tier now covers the
 /// whole language, so this is always `None` (kept for the CLI's fallback path).
-pub fn ineligible_reason(_prog: &Program) -> Option<&'static str> {
+pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
+    if prog.uses_nullable() {
+        return Some("nullable types (T | null)");
+    }
     None
 }
 
@@ -641,6 +644,9 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                     slot + 1
                 ));
                 s.push_str(&format!("  store i64 {raw}, ptr {sp}\n"));
+            }
+            Instr::ConstNull { .. } => {
+                return Err("internal: nullable types run on the interpreter".into());
             }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;

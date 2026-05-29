@@ -75,6 +75,7 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
             | Instr::Len { .. } => "arrays",
             Instr::Builtin { .. } => "builtins",
             Instr::NewStruct { .. } | Instr::GetField { .. } | Instr::SetField { .. } => "structs",
+            Instr::ConstNull { .. } => "nullable types (T | null)",
             _ => continue,
         };
         return Some(bad);
