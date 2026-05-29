@@ -33,6 +33,7 @@ with `--no-default-features` and the language still runs.
   runtime bounds checks (reference types; also `--prove`-gated for now)
 - **Strings**: literals with escapes, `+` concat, `==`/`!=`, `len()`, `print`
   (heap-backed, immutable; `--prove`-gated)
+- **Builtins**: `len`; `abs`/`min`/`max`/`pow` (integers); `sqrt`/`floor`/`ceil` (floats)
 - Lowering to **register-machine bytecode**; functions, recursion, `if` / `while`
 - A **VM** that runs it (`zipp run`)
 - The **optional zk-STARK profile** (`zipp run --prove`): Winterfell proof +
@@ -63,6 +64,7 @@ cargo build --release
 ./target/release/zipp run examples/arrays.zipp      # bubble sort (arrays + len)
 ./target/release/zipp run examples/hello.zipp       # strings: concat, len
 ./target/release/zipp run examples/fizzbuzz.zipp    # for + % + else-if + strings
+./target/release/zipp run examples/math.zipp        # abs/min/max/pow/sqrt/floor/ceil
 
 # run the language test suite
 cargo test
@@ -97,7 +99,7 @@ zipp-lang/
 │   ├── zippc/        # compiler core + register VM: lexer, ast, parser, check, ir, vm
 │   ├── zipp-zk/      # OPTIONAL zk-STARK profile (Winterfell prover/verifier over the trace)
 │   └── zipp-cli/     # the `zipp` binary
-└── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz
+└── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz, math
 ```
 
 The modules inside `zippc` map onto the separate crates in `../ZIPP.md §15`

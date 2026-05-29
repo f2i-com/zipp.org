@@ -30,6 +30,33 @@ pub enum Instr {
     Index { dst: u32, arr: u32, idx: u32 },
     SetIndex { arr: u32, idx: u32, value: u32 },
     Len { dst: u32, arr: u32 },
+    Builtin { op: BuiltinOp, dst: u32, args: Vec<u32> },
+}
+
+/// Builtin math functions (recognized call names, not user functions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinOp {
+    Abs,
+    Min,
+    Max,
+    Pow,
+    Sqrt,
+    Floor,
+    Ceil,
+}
+
+/// Map a call name to a math builtin, if it is one.
+pub fn math_builtin(name: &str) -> Option<BuiltinOp> {
+    Some(match name {
+        "abs" => BuiltinOp::Abs,
+        "min" => BuiltinOp::Min,
+        "max" => BuiltinOp::Max,
+        "pow" => BuiltinOp::Pow,
+        "sqrt" => BuiltinOp::Sqrt,
+        "floor" => BuiltinOp::Floor,
+        "ceil" => BuiltinOp::Ceil,
+        _ => return None,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -385,6 +412,16 @@ impl<'a> Gen<'a> {
                 let a = self.gen_expr(&args[0])?;
                 let dst = self.alloc();
                 self.code.push(Instr::Len { dst, arr: a });
+                Ok(dst)
+            }
+            Expr::Call { name, args } if math_builtin(name).is_some() => {
+                let op = math_builtin(name).unwrap();
+                let regs = args
+                    .iter()
+                    .map(|a| self.gen_expr(a))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dst = self.alloc();
+                self.code.push(Instr::Builtin { op, dst, args: regs });
                 Ok(dst)
             }
             Expr::Call { name, args } => {

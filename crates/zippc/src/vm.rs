@@ -7,7 +7,7 @@
 //! rather than producing an unprovable trace.
 
 use crate::ast::{BinOp, Type, UnOp};
-use crate::ir::{Instr, Program};
+use crate::ir::{BuiltinOp, Instr, Program};
 
 /// A runtime value. `Arr`/`Str` are indices into VM heaps (arrays are reference
 /// types — passing or assigning shares them; strings are immutable).
@@ -307,6 +307,14 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 };
                 reg[base + *dst as usize] = Value::I64(n as i64);
             }
+            Instr::Builtin { op, dst, args } => {
+                let vals: Vec<Value> = args.iter().map(|r| reg[base + *r as usize]).collect();
+                let res = eval_builtin(*op, &vals)?;
+                reg[base + *dst as usize] = res;
+                let a0 = vals.first().map(|v| v.trace_i64()).unwrap_or(0);
+                let a1 = vals.get(1).map(|v| v.trace_i64()).unwrap_or(0);
+                rec!(OpKind::Other, a0, a1, res.trace_i64(), 0);
+            }
         }
         clk += 1;
     }
@@ -336,6 +344,48 @@ fn render(v: Value, strs: &[String]) -> String {
         Value::Str(i) => strs[i].clone(),
         Value::Arr(_) => "[array]".to_string(),
     }
+}
+
+fn eval_builtin(op: BuiltinOp, args: &[Value]) -> Result<Value, String> {
+    use BuiltinOp::*;
+    Ok(match op {
+        Abs => match args[0] {
+            Value::I64(x) => Value::I64(x.wrapping_abs()),
+            Value::F64(f) => Value::F64(f.abs()),
+            _ => return Err("runtime error: abs expects a number".into()),
+        },
+        Min => match (args[0], args[1]) {
+            (Value::I64(a), Value::I64(b)) => Value::I64(a.min(b)),
+            (Value::F64(a), Value::F64(b)) => Value::F64(a.min(b)),
+            _ => return Err("runtime error: min expects two numbers of the same type".into()),
+        },
+        Max => match (args[0], args[1]) {
+            (Value::I64(a), Value::I64(b)) => Value::I64(a.max(b)),
+            (Value::F64(a), Value::F64(b)) => Value::F64(a.max(b)),
+            _ => return Err("runtime error: max expects two numbers of the same type".into()),
+        },
+        Pow => match (args[0], args[1]) {
+            (Value::I64(base), Value::I64(exp)) => {
+                if exp < 0 {
+                    return Err("runtime error: pow exponent must be >= 0".into());
+                }
+                Value::I64(base.wrapping_pow(exp as u32))
+            }
+            _ => return Err("runtime error: pow expects two integers".into()),
+        },
+        Sqrt => match args[0] {
+            Value::F64(f) => Value::F64(f.sqrt()),
+            _ => return Err("runtime error: sqrt expects an f64".into()),
+        },
+        Floor => match args[0] {
+            Value::F64(f) => Value::F64(f.floor()),
+            _ => return Err("runtime error: floor expects an f64".into()),
+        },
+        Ceil => match args[0] {
+            Value::F64(f) => Value::F64(f.ceil()),
+            _ => return Err("runtime error: ceil expects an f64".into()),
+        },
+    })
 }
 
 fn eval_un(op: UnOp, a: Value) -> Result<Value, String> {

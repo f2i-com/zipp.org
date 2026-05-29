@@ -232,6 +232,36 @@ fn prove_profile_rejects_strings() {
     assert!(zippc::vm::run(&prog, true).is_err());
 }
 
+// ── builtin math ──
+
+#[test]
+fn builtin_int_math() {
+    assert_eq!(result("fn main(): i64 { return abs(-7); }"), 7);
+    assert_eq!(result("fn main(): i64 { return min(3, 9) + max(3, 9); }"), 12);
+    assert_eq!(result("fn main(): i64 { return pow(2, 10); }"), 1024);
+}
+
+#[test]
+fn builtin_float_math() {
+    assert_eq!(fresult("fn main(): f64 { return sqrt(f64(3 * 3 + 4 * 4)); }"), 5.0);
+    assert_eq!(fresult("fn main(): f64 { return abs(-2.5); }"), 2.5);
+    assert_eq!(fresult("fn main(): f64 { return floor(2.7) + ceil(2.1); }"), 5.0);
+    assert_eq!(fresult("fn main(): f64 { return max(1.5, 2.5); }"), 2.5);
+}
+
+#[test]
+fn builtin_arg_checking() {
+    assert!(run("fn main(): i64 { return sqrt(4); }").is_err()); // sqrt needs f64
+    assert!(run("fn main(): f64 { return pow(2.0, 3.0); }").is_err()); // pow needs ints
+    assert!(run("fn main(): i64 { return min(1, 2.0); }").is_err()); // mixed types
+    assert!(run("fn main(): i64 { return abs(true); }").is_err()); // non-numeric
+}
+
+#[test]
+fn builtin_names_are_reserved() {
+    assert!(run("fn abs(x: i64): i64 { return x; } fn main(): i64 { return 0; }").is_err());
+}
+
 // ── for loops ──
 
 #[test]

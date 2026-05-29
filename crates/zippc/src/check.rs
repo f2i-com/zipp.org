@@ -45,6 +45,9 @@ impl Scope {
 pub fn check(m: &Module) -> Result<(), String> {
     let mut sigs: HashMap<String, Sig> = HashMap::new();
     for f in &m.funcs {
+        if f.name == "len" || crate::ir::math_builtin(&f.name).is_some() {
+            return Err(format!("type error: '{}' is a reserved builtin name", f.name));
+        }
         if sigs.contains_key(&f.name) {
             return Err(format!("type error: function '{}' redefined", f.name));
         }
@@ -347,6 +350,21 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
                     other => Err(format!(
                         "type error: len expects an array or string, found {other:?}"
                     )),
+                };
+            }
+            // Builtin math: abs/min/max/pow (ints), sqrt/floor/ceil (floats).
+            if crate::ir::math_builtin(name).is_some() {
+                let argt: Vec<Type> = args
+                    .iter()
+                    .map(|a| type_of(a, scope, sigs))
+                    .collect::<Result<_, _>>()?;
+                use Type::*;
+                return match (name.as_str(), argt.as_slice()) {
+                    ("abs", [t]) if *t == I64 || *t == F64 => Ok(*t),
+                    ("min" | "max", [a, b]) if a == b && (*a == I64 || *a == F64) => Ok(*a),
+                    ("pow", [I64, I64]) => Ok(I64),
+                    ("sqrt" | "floor" | "ceil", [F64]) => Ok(F64),
+                    _ => Err(format!("type error: invalid arguments to builtin '{name}'")),
                 };
             }
             let sig = sigs
