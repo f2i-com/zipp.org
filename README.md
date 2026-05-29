@@ -366,8 +366,9 @@ monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
 `for…of`; `calc.ts` a `switch`; `ternary.ts` the `?:` operator; `destructure.ts`
 a string enum + array/object destructuring; `defaults.ts` default parameters;
 `optional.ts` nullable references (`T | null`, `??`, narrowing). Most run on all
-four backends; **nullable (`T | null`) runs on the interpreter** — the native
-tiers cleanly fall back, since they don't yet carry a null representation.
+four backends; **nullable (`T | null`) also runs natively on `--jit`** (a null is
+a 0 pointer — struct handles are `i64` in Cranelift), with `--llvm`/`--wasm`
+falling back to the interpreter for it (no null representation there yet).
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,

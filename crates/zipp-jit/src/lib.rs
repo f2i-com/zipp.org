@@ -125,10 +125,12 @@ fn jty_of(t: Type) -> JTy {
         Type::Array(e) => JTy::Arr(matches!(e, Elem::F64)),
         Type::Str => JTy::Str,
         Type::Struct(id) => JTy::Struct(id),
+        // a nullable struct is a struct pointer that may be 0 (null)
+        Type::OptStruct(id) => JTy::Struct(id),
         Type::I32 => JTy::I32,
         Type::U32 => JTy::U32,
         Type::U64 => JTy::U64,
-        _ => JTy::I64, // i64, bool
+        _ => JTy::I64, // i64, bool, null
     }
 }
 
@@ -151,11 +153,8 @@ fn var(r: u32) -> Variable {
 /// Reason a program can't be JIT-compiled, or `None`. The native backend now
 /// covers the whole language, so this is always `None` (kept for the CLI's
 /// fallback path and forward compatibility).
-pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
-    if prog.uses_nullable() {
-        return Some("nullable types (T | null)");
-    }
-    None
+pub fn ineligible_reason(_prog: &Program) -> Option<&'static str> {
+    None // the JIT compiles the whole language, including nullable structs
 }
 
 fn make_sig(module: &JITModule, params: &[Type], ret: Type) -> cranelift_codegen::ir::Signature {
@@ -316,7 +315,15 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
             Instr::FConst { dst, .. } => t[*dst as usize] = JTy::F64,
             Instr::SConst { dst, .. } => t[*dst as usize] = JTy::Str,
             Instr::Cast { dst, to, .. } => t[*dst as usize] = jty_of(*to),
-            Instr::Mov { dst, src } => t[*dst as usize] = t[*src as usize],
+            Instr::Mov { dst, src } => {
+                // A null (`i64 0`) Mov'd into a heap/struct register keeps that
+                // register's type — so `let x: T|null = …; x = null` stays a struct.
+                let s = t[*src as usize];
+                let heap = matches!(t[*dst as usize], JTy::Struct(_) | JTy::Arr(_) | JTy::Str);
+                if !(s == JTy::I64 && heap) {
+                    t[*dst as usize] = s;
+                }
+            }
             Instr::Bin { op, dst, a, .. } => {
                 use BinOp::*;
                 t[*dst as usize] = match op {
@@ -350,7 +357,12 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
             }
             Instr::Len { dst, .. } => t[*dst as usize] = JTy::I64,
             Instr::NewStruct { id, dst, .. } => t[*dst as usize] = JTy::Struct(*id),
-            Instr::ConstNull { dst } => t[*dst as usize] = JTy::I64, // unreachable (filtered)
+            Instr::ConstNull { dst, id } => {
+                t[*dst as usize] = match id {
+                    Some(s) => JTy::Struct(*s), // a typed null (e.g. a nullable local)
+                    None => JTy::I64,           // an untyped null (compared, not dereferenced)
+                };
+            }
             Instr::GetField { dst, base, field } => {
                 t[*dst as usize] = t[*base as usize]
                     .struct_id()
@@ -793,8 +805,10 @@ fn compile_function(
                 };
                 builder.ins().store(MemFlags::trusted(), raw, base_v, 8 * (slot as i32 + 1));
             }
-            Instr::ConstNull { .. } => {
-                return Err("internal: nullable types run on the interpreter".into());
+            Instr::ConstNull { dst, .. } => {
+                // null is a 0 pointer (struct handles are i64 in Cranelift).
+                let z = builder.ins().iconst(types::I64, 0);
+                builder.def_var(var(*dst), z);
             }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;
@@ -951,6 +965,45 @@ mod tests {
             JitValue::I64(x) => x,
             other => panic!("expected i64, got {other:?}"),
         }
+    }
+
+    /// Compile a TypeScript program (via the oxc frontend) and run it on the JIT.
+    fn jit_ts_i64(ts: &str) -> i64 {
+        let module = zipp_ts::compile_ts(ts).expect("lower ts");
+        let prog = zippc::compile_module(&module).expect("compile");
+        match run(&prog).expect("jit run").value {
+            JitValue::I64(x) => x,
+            other => panic!("expected i64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nullable_structs_run_native() {
+        // a nullable param + `if (x !== null)` narrowing + null widening
+        let ts = "interface User { age: i64; } \
+                  function ageOr(u: User | null, fb: i64): i64 { \
+                    if (u !== null) { return u.age; } return fb; \
+                  } \
+                  function main(): i64 { \
+                    let a: User = { age: 30 }; \
+                    let some: User | null = a; \
+                    let none: User | null = null; \
+                    return ageOr(some, -1) + ageOr(none, -1); }";
+        assert_eq!(jit_ts_i64(ts), 29); // 30 + (-1)
+        // `??` coalesce to a non-null default, then a field read
+        let ts2 = "interface Box { v: i64; } \
+                   function pick(b: Box | null): i64 { let d: Box = { v: 7 }; return (b ?? d).v; } \
+                   function main(): i64 { let x: Box = { v: 100 }; return pick(x) + pick(null); }";
+        assert_eq!(jit_ts_i64(ts2), 107); // 100 + 7
+        // a null-initialized local, reassigned then narrowed (exercises the id +
+        // non-downgrading Mov so the register stays a struct pointer)
+        let ts3 = "interface N { v: i64; } \
+                   function main(): i64 { \
+                     let x: N | null = null; \
+                     x = { v: 42 } as N; \
+                     if (x !== null) { return x.v; } \
+                     return -1; }";
+        assert_eq!(jit_ts_i64(ts3), 42);
     }
     fn jit_f64(src: &str) -> f64 {
         let prog = zippc::compile(src).expect("compile");

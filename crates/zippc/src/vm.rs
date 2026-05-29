@@ -370,7 +370,7 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                     .ok_or_else(|| format!("runtime error: no field '{field}'"))?;
                 reg[base + *dst as usize] = heap[ptr][slot];
             }
-            Instr::ConstNull { dst } => {
+            Instr::ConstNull { dst, .. } => {
                 if record_trace {
                     return Err(ZK_NO_STRUCT.into());
                 }

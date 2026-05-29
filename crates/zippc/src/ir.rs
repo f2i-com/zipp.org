@@ -35,8 +35,9 @@ pub enum Instr {
     NewStruct { id: u32, dst: u32, fields: Vec<u32> },
     GetField { dst: u32, base: u32, field: String },
     SetField { base: u32, field: String, value: u32 },
-    // Nullable struct references (interpreter-only; native tiers fall back).
-    ConstNull { dst: u32 },
+    // Nullable struct references. `id` is the struct the null belongs to when
+    // known from context (so the JIT can type a null-initialized local).
+    ConstNull { dst: u32, id: Option<u32> },
 }
 
 /// Field names of a struct, in declaration order (indexed by struct id). The VM
@@ -233,8 +234,17 @@ impl<'a> Gen<'a> {
 
     fn gen_stmt(&mut self, s: &Stmt) -> Result<(), String> {
         match &s.kind {
-            StmtKind::Let { name, value, .. } => {
-                let v = self.gen_expr(value)?;
+            StmtKind::Let { name, ty, value } => {
+                // A null-initialized nullable local carries its struct id, so the
+                // JIT can type the register (and dereference it after narrowing).
+                let v = match (value, ty) {
+                    (Expr::Null, Some(Type::OptStruct(id))) => {
+                        let r = self.alloc();
+                        self.code.push(Instr::ConstNull { dst: r, id: Some(*id) });
+                        r
+                    }
+                    _ => self.gen_expr(value)?,
+                };
                 let r = self.declare(name);
                 self.code.push(Instr::Mov { dst: r, src: v });
                 Ok(())
@@ -456,7 +466,7 @@ impl<'a> Gen<'a> {
             }
             Expr::Null => {
                 let dst = self.alloc();
-                self.code.push(Instr::ConstNull { dst });
+                self.code.push(Instr::ConstNull { dst, id: None });
                 Ok(dst)
             }
             // `lhs ?? rhs` — evaluate lhs once; if it's null, take rhs.
@@ -465,7 +475,7 @@ impl<'a> Gen<'a> {
                 let l = self.gen_expr(lhs)?;
                 self.code.push(Instr::Mov { dst, src: l });
                 let nullr = self.alloc();
-                self.code.push(Instr::ConstNull { dst: nullr });
+                self.code.push(Instr::ConstNull { dst: nullr, id: None });
                 let isnull = self.alloc();
                 self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: dst, b: nullr });
                 let jz = self.here();

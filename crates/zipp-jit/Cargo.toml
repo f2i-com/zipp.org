@@ -13,3 +13,7 @@ cranelift-module = "0.116"
 cranelift-native = "0.116"
 zippc = { path = "../zippc" }
 zipp-rt = { path = "../zipp-rt" }
+
+[dev-dependencies]
+# Used only by tests to exercise nullable structs (no `.zipp` syntax for `null`).
+zipp-ts = { path = "../zipp-ts" }
