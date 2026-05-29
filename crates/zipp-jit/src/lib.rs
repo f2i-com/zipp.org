@@ -1004,6 +1004,11 @@ mod tests {
                      if (x !== null) { return x.v; } \
                      return -1; }";
         assert_eq!(jit_ts_i64(ts3), 42);
+        // optional chaining `a?.b?.c ?? default`, native on the JIT
+        let ts4 = "interface A { zip: i64; } interface U { a: A | null; } \
+                   function z(u: U | null): i64 { return u?.a?.zip ?? -1; } \
+                   function main(): i64 { let aa: A = { zip: 5 }; let u: U = { a: aa }; return z(u) + z(null); }";
+        assert_eq!(jit_ts_i64(ts4), 4); // 5 + (-1)
     }
     fn jit_f64(src: &str) -> f64 {
         let prog = zippc::compile(src).expect("compile");

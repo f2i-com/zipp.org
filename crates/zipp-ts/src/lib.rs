@@ -1551,6 +1551,35 @@ impl Lower<'_> {
         }
     }
 
+    /// Lower a `.`/`?.` member access: optional `base?.field`, an enum member,
+    /// `arr.length`, or a struct field read.
+    fn member(&self, m: &StaticMemberExpression) -> LResult<z::Expr> {
+        let field = m.property.name.as_str();
+        if m.optional {
+            return Ok(z::Expr::OptField {
+                base: Box::new(self.expr(&m.object)?),
+                field: field.to_string(),
+            });
+        }
+        // `Color.Red` → the enum member's value.
+        if let Expression::Identifier(obj) = &m.object {
+            if let Some(kind) = self.enums.get(obj.name.as_str()) {
+                let val = match kind {
+                    EnumKind::Int(mem) => mem.get(field).map(|&v| z::Expr::Int(v)),
+                    EnumKind::Str(mem) => mem.get(field).map(|s| z::Expr::Str(s.clone())),
+                };
+                return val.ok_or_else(|| {
+                    self.err(m.span, format!("enum '{}' has no member '{field}'", obj.name.as_str()))
+                });
+            }
+        }
+        if field == "length" {
+            Ok(z::Expr::Call { name: "len".into(), args: vec![self.expr(&m.object)?] })
+        } else {
+            Ok(z::Expr::Field { base: Box::new(self.expr(&m.object)?), field: field.to_string() })
+        }
+    }
+
     fn expr(&self, e: &Expression) -> LResult<z::Expr> {
         Ok(match e {
             Expression::NumericLiteral(n) => {
@@ -1577,16 +1606,34 @@ impl Lower<'_> {
                 l: Box::new(self.expr(&b.left)?),
                 r: Box::new(self.expr(&b.right)?),
             },
-            Expression::LogicalExpression(l) => {
-                let lhs = Box::new(self.expr(&l.left)?);
-                let rhs = Box::new(self.expr(&l.right)?);
-                match l.operator {
-                    LogicalOperator::And => z::Expr::Bin { op: z::BinOp::And, l: lhs, r: rhs },
-                    LogicalOperator::Or => z::Expr::Bin { op: z::BinOp::Or, l: lhs, r: rhs },
-                    // `a ?? b` — nullish coalescing.
-                    LogicalOperator::Coalesce => z::Expr::Coalesce { lhs, rhs },
+            Expression::LogicalExpression(l) => match l.operator {
+                LogicalOperator::And => z::Expr::Bin {
+                    op: z::BinOp::And,
+                    l: Box::new(self.expr(&l.left)?),
+                    r: Box::new(self.expr(&l.right)?),
+                },
+                LogicalOperator::Or => z::Expr::Bin {
+                    op: z::BinOp::Or,
+                    l: Box::new(self.expr(&l.left)?),
+                    r: Box::new(self.expr(&l.right)?),
+                },
+                LogicalOperator::Coalesce => {
+                    // `base?.field ?? default` fuses to a type-safe default (works
+                    // even when the field is a scalar — no nullable-scalar needed).
+                    if let Some(m) = optional_member(&l.left) {
+                        z::Expr::OptFieldOr {
+                            base: Box::new(self.expr(&m.object)?),
+                            field: m.property.name.as_str().to_string(),
+                            default: Box::new(self.expr(&l.right)?),
+                        }
+                    } else {
+                        z::Expr::Coalesce {
+                            lhs: Box::new(self.expr(&l.left)?),
+                            rhs: Box::new(self.expr(&l.right)?),
+                        }
+                    }
                 }
-            }
+            },
             // `cond ? then : els`
             Expression::ConditionalExpression(c) => z::Expr::Cond {
                 cond: Box::new(self.expr(&c.test)?),
@@ -1618,34 +1665,17 @@ impl Lower<'_> {
                 arr: Box::new(self.expr(&m.object)?),
                 index: Box::new(self.expr(&m.expression)?),
             },
-            Expression::StaticMemberExpression(m) => {
-                // `Color.Red` → the enum member's integer value.
-                if let Expression::Identifier(obj) = &m.object {
-                    if let Some(kind) = self.enums.get(obj.name.as_str()) {
-                        let member = m.property.name.as_str();
-                        let val = match kind {
-                            EnumKind::Int(mem) => mem.get(member).map(|&v| z::Expr::Int(v)),
-                            EnumKind::Str(mem) => mem.get(member).map(|s| z::Expr::Str(s.clone())),
-                        };
-                        return val.ok_or_else(|| {
-                            self.err(
-                                m.span,
-                                format!("enum '{}' has no member '{member}'", obj.name.as_str()),
-                            )
-                        });
-                    }
+            Expression::StaticMemberExpression(m) => self.member(m)?,
+            // `a?.b` — optional chaining (the chain is wrapped here).
+            Expression::ChainExpression(c) => match &c.expression {
+                ChainElement::StaticMemberExpression(m) => self.member(m)?,
+                _ => {
+                    return Err(self.err(
+                        c.span,
+                        "only `a?.b` optional chaining is supported (not `?.()` or `?.[…]`)",
+                    ))
                 }
-                if m.property.name.as_str() == "length" {
-                    // `arr.length` → len(arr)
-                    z::Expr::Call { name: "len".into(), args: vec![self.expr(&m.object)?] }
-                } else {
-                    // `obj.field` → struct field access
-                    z::Expr::Field {
-                        base: Box::new(self.expr(&m.object)?),
-                        field: m.property.name.as_str().to_string(),
-                    }
-                }
-            }
+            },
             // `x as T`: numeric → runtime conversion; `{...} as Struct` → struct
             // literal; otherwise a no-op type assertion.
             Expression::TSAsExpression(a) => {
@@ -1941,10 +1971,26 @@ fn expr_has_var(e: &z::Expr) -> bool {
         z::Expr::Field { base, .. } => expr_has_var(base),
         z::Expr::StructLit { fields, .. } => fields.iter().any(|(_, e)| expr_has_var(e)),
         z::Expr::Coalesce { lhs, rhs } => expr_has_var(lhs) || expr_has_var(rhs),
+        z::Expr::OptField { base, .. } => expr_has_var(base),
+        z::Expr::OptFieldOr { base, default, .. } => {
+            expr_has_var(base) || expr_has_var(default)
+        }
         z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) | z::Expr::Null => {
             false
         }
     }
+}
+
+/// If `e` is an optional member access `base?.field`, return that member.
+fn optional_member<'e, 'a>(e: &'e Expression<'a>) -> Option<&'e StaticMemberExpression<'a>> {
+    if let Expression::ChainExpression(c) = e {
+        if let ChainElement::StaticMemberExpression(m) = &c.expression {
+            if m.optional {
+                return Some(m);
+            }
+        }
+    }
+    None
 }
 
 /// Is this TS type the `null` or `undefined` keyword (a nullable union member)?
@@ -2159,6 +2205,41 @@ mod tests {
                      if (n !== null) { return head.val + n.val; } \
                      return head.val; }";
         assert_eq!(run_i64(ts3), 3); // 1 + 2
+    }
+
+    #[test]
+    fn optional_chaining() {
+        // `a?.b ?? default` on a scalar field (the fused form)
+        let ts = "interface User { age: i64; } \
+                  function ageOf(u: User | null): i64 { return u?.age ?? -1; } \
+                  function main(): i64 { \
+                    let a: User = { age: 30 }; \
+                    let some: User | null = a; \
+                    let none: User | null = null; \
+                    return ageOf(some) + ageOf(none); }";
+        assert_eq!(run_i64(ts), 29); // 30 + (-1)
+        // chained `?.` through a nullable struct field, ending in `?? default`
+        let ts2 = "interface Addr { zip: i64; } \
+                   interface User { addr: Addr | null; } \
+                   function zipOf(u: User | null): i64 { return u?.addr?.zip ?? 0; } \
+                   function main(): i64 { \
+                     let home: Addr = { zip: 90210 }; \
+                     let withAddr: User = { addr: home }; \
+                     let noAddr: User = { addr: null }; \
+                     let w: User | null = withAddr; \
+                     return zipOf(w) + zipOf(noAddr) + zipOf(null); }";
+        assert_eq!(run_i64(ts2), 90210); // 90210 + 0 + 0
+        // bare `a?.b` on a struct field yields a nullable, then narrowed
+        let ts3 = "interface Inner { v: i64; } \
+                   interface Outer { inner: Inner | null; } \
+                   function main(): i64 { \
+                     let i: Inner = { v: 7 }; \
+                     let o: Outer = { inner: i }; \
+                     let oo: Outer | null = o; \
+                     let r: Inner | null = oo?.inner; \
+                     if (r !== null) { return r.v; } \
+                     return -1; }";
+        assert_eq!(run_i64(ts3), 7);
     }
 
     #[test]

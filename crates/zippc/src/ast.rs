@@ -130,6 +130,12 @@ pub enum Expr {
     Null,
     /// Nullish coalescing `lhs ?? rhs` — `lhs` if non-null, else `rhs`.
     Coalesce { lhs: Box<Expr>, rhs: Box<Expr> },
+    /// Optional field access `base?.field` — `null` if `base` is null, else
+    /// `base.field`. Result is nullable (the field must be a struct in v0).
+    OptField { base: Box<Expr>, field: String },
+    /// Fused `base?.field ?? default` — the field's value, or `default` when
+    /// `base` is null. Result is the (non-null) field type; works for any field.
+    OptFieldOr { base: Box<Expr>, field: String, default: Box<Expr> },
 }
 
 /// A statement plus the source line it starts on (for error messages).

@@ -486,6 +486,47 @@ impl<'a> Gen<'a> {
                 self.patch(jz, end);
                 Ok(dst)
             }
+            // `base?.field` — null if base is null, else base.field.
+            Expr::OptField { base, field } => {
+                let dst = self.alloc();
+                let b = self.gen_expr(base)?;
+                self.code.push(Instr::ConstNull { dst, id: None }); // default: null
+                let nullr = self.alloc();
+                self.code.push(Instr::ConstNull { dst: nullr, id: None });
+                let isnull = self.alloc();
+                self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: b, b: nullr });
+                let jnz = self.here();
+                self.code.push(Instr::JmpIfNonZero { cond: isnull, target: 0 }); // null → keep null
+                let fv = self.alloc();
+                self.code.push(Instr::GetField { dst: fv, base: b, field: field.clone() });
+                self.code.push(Instr::Mov { dst, src: fv });
+                let end = self.here();
+                self.patch(jnz, end);
+                Ok(dst)
+            }
+            // `base?.field ?? default` — base.field, or default when base is null.
+            Expr::OptFieldOr { base, field, default } => {
+                let dst = self.alloc();
+                let b = self.gen_expr(base)?;
+                let nullr = self.alloc();
+                self.code.push(Instr::ConstNull { dst: nullr, id: None });
+                let isnull = self.alloc();
+                self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: b, b: nullr });
+                let jz = self.here();
+                self.code.push(Instr::JmpIfZero { cond: isnull, target: 0 }); // non-null → load field
+                let d = self.gen_expr(default)?;
+                self.code.push(Instr::Mov { dst, src: d });
+                let jmp = self.here();
+                self.code.push(Instr::Jmp { target: 0 });
+                let fld = self.here();
+                self.patch(jz, fld);
+                let fv = self.alloc();
+                self.code.push(Instr::GetField { dst: fv, base: b, field: field.clone() });
+                self.code.push(Instr::Mov { dst, src: fv });
+                let end = self.here();
+                self.patch(jmp, end);
+                Ok(dst)
+            }
             // Ternary `cond ? then : els` — branch, with both arms writing `dst`
             // (mirrors the short-circuit `&&`/`||` lowering above).
             Expr::Cond { cond, then, els } => {

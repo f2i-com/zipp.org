@@ -111,6 +111,7 @@ cargo build --release
 ./target/release/zipp run examples/destructure.ts    # string enum + destructuring
 ./target/release/zipp run examples/defaults.ts       # default parameter values
 ./target/release/zipp run examples/optional.ts       # T | null, ??, narrowing
+./target/release/zipp run --jit examples/chain.ts    # optional chaining a?.b?.c ?? d
 
 # run the language test suite
 cargo test
@@ -355,9 +356,9 @@ factory plus methods taking `this`), field read/write, **generics** — both
 functions (`f<T>(…)`) and classes (`class Box<T>`) — monomorphized per use to
 concrete types (inferred or explicit), so the backends only ever see concrete
 code (a `Box<i64>` and a `Box<bool>` are two distinct structs), **optionals**
-(`T | null`, `null`, `x ?? y`, `=== null`, and `if (x !== null)` flow
-narrowing), `console.log`, math builtins. **Type mapping:** `number`→f64,
-`bigint`→i64, `boolean`→bool,
+(`T | null`, `null`, `x ?? y`, `=== null`, `if (x !== null)` flow narrowing, and
+optional chaining `a?.b` / `a?.b ?? default`), `console.log`, math builtins.
+**Type mapping:** `number`→f64, `bigint`→i64, `boolean`→bool,
 `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` and your
 `interface`/`class`/`enum` names usable directly. `examples/fib.ts` runs
 identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
@@ -365,7 +366,8 @@ identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
 monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
 `for…of`; `calc.ts` a `switch`; `ternary.ts` the `?:` operator; `destructure.ts`
 a string enum + array/object destructuring; `defaults.ts` default parameters;
-`optional.ts` nullable references (`T | null`, `??`, narrowing). Most run on all
+`optional.ts` nullable references (`T | null`, `??`, narrowing); `chain.ts`
+optional chaining. Most run on all
 four backends; **nullable (`T | null`) also runs natively on `--jit`** (a null is
 a 0 pointer — struct handles are `i64` in Cranelift), with `--llvm`/`--wasm`
 falling back to the interpreter for it (no null representation there yet).

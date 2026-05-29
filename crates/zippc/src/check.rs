@@ -295,6 +295,18 @@ fn assignable(from: Type, to: Type) -> bool {
     }
 }
 
+/// A struct field's declared type, by struct id and field name.
+fn struct_field_ty(cx: &Cx, id: u32, field: &str) -> Result<Type, String> {
+    cx.structs[id as usize]
+        .fields
+        .iter()
+        .find(|(n, _)| n == field)
+        .map(|(_, t)| *t)
+        .ok_or_else(|| {
+            format!("type error: no field '{field}' on struct '{}'", cx.structs[id as usize].name)
+        })
+}
+
 /// If `cond` is a null guard on a variable (`x === null` / `x !== null`), return
 /// the variable name and whether it is non-null in the `then` branch.
 fn null_guard(cond: &Expr) -> Option<(&str, bool)> {
@@ -344,6 +356,40 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                 }
                 _ => Err(format!("type error: `??` left side must be nullable, found {lt:?}")),
             }
+        }
+        Expr::OptField { base, field } => {
+            let xid = match type_of(base, scope, cx)? {
+                Type::OptStruct(id) | Type::Struct(id) => id,
+                bt => {
+                    return Err(format!("type error: optional access `?.{field}` on a {bt:?}"))
+                }
+            };
+            match struct_field_ty(cx, xid, field)? {
+                Type::Struct(f) | Type::OptStruct(f) => Ok(Type::OptStruct(f)),
+                _ => Err(format!(
+                    "type error: optional access of the non-struct field '{field}' must be \
+                     coalesced — write `…?.{field} ?? default`"
+                )),
+            }
+        }
+        Expr::OptFieldOr { base, field, default } => {
+            let xid = match type_of(base, scope, cx)? {
+                Type::OptStruct(id) | Type::Struct(id) => id,
+                bt => {
+                    return Err(format!("type error: optional access `?.{field}` on a {bt:?}"))
+                }
+            };
+            // the field's value, defaulting to `default` when base is null → the
+            // field's *non-null* type.
+            let result = match struct_field_ty(cx, xid, field)? {
+                Type::OptStruct(f) => Type::Struct(f),
+                other => other,
+            };
+            let dt = type_of(default, scope, cx)?;
+            if !assignable(dt, result) {
+                return Err(format!("type error: `?? default` has type {dt:?}, expected {result:?}"));
+            }
+            Ok(result)
         }
         Expr::Var(name) => scope
             .lookup(name)
