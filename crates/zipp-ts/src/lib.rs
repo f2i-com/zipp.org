@@ -52,6 +52,8 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
         type_env: RefCell::new(Vec::new()),
         pending: RefCell::new(Vec::new()),
         done_insts: RefCell::new(HashSet::new()),
+        enums: HashMap::new(),
+        tmp: Cell::new(0),
     };
     lower.module(&ret.program)
 }
@@ -80,6 +82,10 @@ struct Lower<'s> {
     pending: RefCell<Vec<(String, Vec<z::Type>)>>,
     /// Mangled instantiation names already emitted or queued (dedup).
     done_insts: RefCell<HashSet<String>>,
+    /// Numeric enum: name → (member name → integer value).
+    enums: HashMap<String, HashMap<String, i64>>,
+    /// Counter for fresh temporary names (e.g. `for…of` desugaring).
+    tmp: Cell<u32>,
 }
 
 /// Owned metadata to monomorphize a generic function without re-touching the AST.
@@ -114,6 +120,35 @@ impl Lower<'_> {
     }
 
     fn module(&mut self, program: &Program) -> LResult<z::Module> {
+        // Pass 0: numeric enums — compute each member's integer value, so both a
+        // type reference (`Color`→i64) and `Color.Member` resolve everywhere.
+        for stmt in &program.body {
+            if let Statement::TSEnumDeclaration(decl) = stmt {
+                let name = decl.id.name.as_str().to_string();
+                if self.enums.contains_key(&name) {
+                    return Err(self.err(decl.span, format!("enum '{name}' redefined")));
+                }
+                let mut members = HashMap::new();
+                let mut next = 0i64;
+                for m in &decl.body.members {
+                    let mname = match &m.id {
+                        TSEnumMemberName::Identifier(id) => id.name.as_str().to_string(),
+                        TSEnumMemberName::String(s) => s.value.as_str().to_string(),
+                        _ => {
+                            return Err(self.err(m.span, "computed enum member names aren't supported"))
+                        }
+                    };
+                    let val = match &m.initializer {
+                        Some(e) => self.enum_value(e)?,
+                        None => next,
+                    };
+                    members.insert(mname, val);
+                    next = val + 1;
+                }
+                self.enums.insert(name, members);
+            }
+        }
+
         // Pass 1a: register every interface/class name → struct id (source order),
         // so type references and constructions resolve regardless of order.
         let mut next_id = 0u32;
@@ -216,11 +251,12 @@ impl Lower<'_> {
                 Statement::ClassDeclaration(c) => self.lower_class(c, &mut funcs)?,
                 Statement::TSInterfaceDeclaration(_)
                 | Statement::TSTypeAliasDeclaration(_)
+                | Statement::TSEnumDeclaration(_)
                 | Statement::EmptyStatement(_) => {}
                 other => {
                     return Err(self.err(
                         span_of_stmt(other),
-                        "only top-level functions, classes, and interfaces are supported (v0)",
+                        "only top-level functions, classes, interfaces, and enums are supported (v0)",
                     ))
                 }
             }
@@ -287,6 +323,35 @@ impl Lower<'_> {
             }
         }
         self.ty(t).ok().map(TypeTpl::Concrete)
+    }
+
+    /// Evaluate a constant integer enum initializer (`= 5`, `= -1`).
+    fn enum_value(&self, e: &Expression) -> LResult<i64> {
+        match e {
+            Expression::NumericLiteral(n) => {
+                if n.value.fract() != 0.0 {
+                    return Err(self.err(n.span, "enum value must be an integer"));
+                }
+                Ok(n.value as i64)
+            }
+            Expression::UnaryExpression(u)
+                if matches!(u.operator, UnaryOperator::UnaryNegation) =>
+            {
+                Ok(-self.enum_value(&u.argument)?)
+            }
+            Expression::ParenthesizedExpression(p) => self.enum_value(&p.expression),
+            other => Err(self.err(
+                span_of_expr(other),
+                "enum initializer must be an integer literal (string/computed enums aren't supported)",
+            )),
+        }
+    }
+
+    /// A fresh, collision-free temporary name (for desugaring).
+    fn fresh(&self, tag: &str) -> String {
+        let n = self.tmp.get();
+        self.tmp.set(n + 1);
+        format!("__z{tag}{n}")
     }
 
     fn interface(&self, decl: &TSInterfaceDeclaration) -> LResult<z::StructDecl> {
@@ -668,6 +733,8 @@ impl Lower<'_> {
                             self.type_env.borrow().iter().rev().find_map(|m| m.get(other).copied())
                         {
                             t
+                        } else if self.enums.contains_key(other) {
+                            z::Type::I64 // a numeric enum is represented as i64
                         } else if let Some(&id) = self.structs.get(other) {
                             z::Type::Struct(id)
                         } else {
@@ -746,6 +813,79 @@ impl Lower<'_> {
                 };
                 let body = self.stmt_as_block(&f.body)?;
                 push(out, z::StmtKind::For { init, cond, step, body }, f.span);
+            }
+            // `for (const x of arr) { … }` → an index loop over a hoisted array.
+            Statement::ForOfStatement(fo) => {
+                if fo.r#await {
+                    return Err(self.err(fo.span, "`for await` isn't supported"));
+                }
+                let var = match &fo.left {
+                    ForStatementLeft::VariableDeclaration(vd) => {
+                        if vd.declarations.len() != 1 {
+                            return Err(self.err(fo.span, "for…of needs exactly one binding"));
+                        }
+                        match &vd.declarations[0].id {
+                            BindingPattern::BindingIdentifier(bi) => bi.name.as_str().to_string(),
+                            _ => return Err(self.err(fo.span, "for…of binding must be a plain name")),
+                        }
+                    }
+                    _ => return Err(self.err(fo.span, "for…of must bind with `let`/`const`")),
+                };
+                let arr = self.expr(&fo.right)?;
+                let arr_tmp = self.fresh("arr");
+                let idx_tmp = self.fresh("i");
+                let line = self.line(fo.span);
+                let var_eq = |t: &str| z::Expr::Var(t.to_string());
+                // hoist the iterable once: `let __arr = <iterable>;`
+                push(out, z::StmtKind::Let { name: arr_tmp.clone(), ty: None, value: arr }, fo.span);
+                // loop body: `let x = __arr[__i]; <user body>`
+                let mut body = vec![z::Stmt {
+                    kind: z::StmtKind::Let {
+                        name: var,
+                        ty: None,
+                        value: z::Expr::Index {
+                            arr: Box::new(var_eq(&arr_tmp)),
+                            index: Box::new(var_eq(&idx_tmp)),
+                        },
+                    },
+                    line,
+                }];
+                body.extend(self.stmt_as_block(&fo.body)?);
+                // `for (let __i = 0; __i < len(__arr); __i = __i + 1) { … }`
+                let init = z::Stmt {
+                    kind: z::StmtKind::Let {
+                        name: idx_tmp.clone(),
+                        ty: Some(z::Type::I64),
+                        value: z::Expr::Int(0),
+                    },
+                    line,
+                };
+                let cond = z::Expr::Bin {
+                    op: z::BinOp::Lt,
+                    l: Box::new(var_eq(&idx_tmp)),
+                    r: Box::new(z::Expr::Call { name: "len".into(), args: vec![var_eq(&arr_tmp)] }),
+                };
+                let step = z::Stmt {
+                    kind: z::StmtKind::Assign {
+                        target: var_eq(&idx_tmp),
+                        value: z::Expr::Bin {
+                            op: z::BinOp::Add,
+                            l: Box::new(var_eq(&idx_tmp)),
+                            r: Box::new(z::Expr::Int(1)),
+                        },
+                    },
+                    line,
+                };
+                push(
+                    out,
+                    z::StmtKind::For {
+                        init: Some(Box::new(init)),
+                        cond,
+                        step: Some(Box::new(step)),
+                        body,
+                    },
+                    fo.span,
+                );
             }
             Statement::BreakStatement(b) => push(out, z::StmtKind::Break, b.span),
             Statement::ContinueStatement(c) => push(out, z::StmtKind::Continue, c.span),
@@ -926,6 +1066,19 @@ impl Lower<'_> {
                 index: Box::new(self.expr(&m.expression)?),
             },
             Expression::StaticMemberExpression(m) => {
+                // `Color.Red` → the enum member's integer value.
+                if let Expression::Identifier(obj) = &m.object {
+                    if let Some(members) = self.enums.get(obj.name.as_str()) {
+                        let member = m.property.name.as_str();
+                        return match members.get(member) {
+                            Some(&v) => Ok(z::Expr::Int(v)),
+                            None => Err(self.err(
+                                m.span,
+                                format!("enum '{}' has no member '{member}'", obj.name.as_str()),
+                            )),
+                        };
+                    }
+                }
                 if m.property.name.as_str() == "length" {
                     // `arr.length` → len(arr)
                     z::Expr::Call { name: "len".into(), args: vec![self.expr(&m.object)?] }
@@ -1311,6 +1464,30 @@ mod tests {
         let ts3 = "function rec<T>(x: T, n: i64): i64 { if (n <= 0) { return 0; } return 1 + rec<T>(x, n - 1); } \
                    function main(): i64 { return rec<bool>(true, 5); }";
         assert_eq!(run_i64(ts3), 5);
+    }
+
+    #[test]
+    fn for_of_and_enums() {
+        // for…of over an array, with `continue` and `break`
+        let ts = "function main(): i64 { \
+                    let xs: i64[] = [10, 20, 30, 40, 50]; \
+                    let total: i64 = 0; \
+                    for (const x of xs) { \
+                      if (x == 30) { continue; } \
+                      if (x == 50) { break; } \
+                      total = total + x; \
+                    } \
+                    return total; }"; // 10 + 20 + 40 = 70
+        assert_eq!(run_i64(ts), 70);
+        // numeric enum: auto-increment + explicit value that auto-continues
+        let ts2 = "enum Dir { North, East, South = 10, West } \
+                   function main(): i64 { return Dir.North + Dir.East + Dir.South + Dir.West; }";
+        assert_eq!(run_i64(ts2), 22); // 0 + 1 + 10 + 11
+        // an enum as an i64-backed parameter type
+        let ts3 = "enum Color { Red, Green, Blue } \
+                   function val(c: Color): i64 { if (c == Color.Green) { return 99; } return 0; } \
+                   function main(): i64 { return val(Color.Green); }";
+        assert_eq!(run_i64(ts3), 99);
     }
 
     #[test]
