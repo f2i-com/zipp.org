@@ -45,9 +45,9 @@ with `--no-default-features` and the language still runs.
   builtins — to machine code with a **conservative mark-sweep GC**; nothing
   falls back. A fast-compile tier-0 that beats V8 on integer loops (see below)
 - An **LLVM release tier** (`zipp run --llvm`): emits LLVM IR and compiles it
-  with `clang -O3 -march=native` — same coverage, **matches V8 on dense f64**
-  and **beats V8 and Bun on dense-f64 arrays** (matmul). No `llvm-sys` linkage;
-  it shells out to `clang`.
+  with `clang -O3 -march=native` — same coverage (incl. the GC), **matches V8 on
+  dense f64** and **beats V8 and Bun on dense-f64 arrays** (matmul). No
+  `llvm-sys` linkage; it shells out to `clang` and links the shared runtime.
 - An integration **test suite** (`cargo test`)
 - **Positioned errors** — parse errors report `line:col`, type errors report the
   statement line (e.g. `type error: arithmetic Add on I64 and Bool [line 2]`)
@@ -58,10 +58,9 @@ with `--no-default-features` and the language still runs.
 - Frontend: swap the hand-written parser for **oxc/SWC** (real TS/JSX)
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
 - Backends: **Cranelift** tier-0 JIT and an **LLVM** release tier (`clang -O3`)
-  — *scalars + arrays + strings + structs done* (matches V8 on dense f64; beats
-  V8/Bun on matmul); the **whole language** compiles natively now, and the JIT
-  has a **conservative mark-sweep GC**. Next: a GC for the LLVM AOT tier (shared
-  runtime), LTO/PGO, and a **WASM-contract** target
+  — the **whole language** compiles natively (matches V8 on dense f64; beats
+  V8/Bun on matmul), and **both share one runtime with a conservative mark-sweep
+  GC** (`zipp-rt`). Next: LTO/PGO, sized integers, and a **WASM-contract** target
 - Parallel work-stealing scheduler (the §5.8 flagship), GC/arenas, fast stdlib
 - zk hardening: PC-integrity + memory-permutation arguments, 64-bit range checks
 
@@ -127,7 +126,8 @@ zipp-lang/
 ├── crates/
 │   ├── zippc/        # compiler core + register VM: lexer, ast, parser, check, ir, vm
 │   ├── zipp-zk/      # OPTIONAL zk-STARK profile (Winterfell prover/verifier over the trace)
-│   ├── zipp-jit/     # OPTIONAL native backend (Cranelift JIT, scalar subset, tier-0)
+│   ├── zipp-rt/      # shared native runtime: allocator + conservative GC (rlib + staticlib)
+│   ├── zipp-jit/     # OPTIONAL native backend (Cranelift JIT, tier-0)
 │   ├── zipp-llvm/    # OPTIONAL release tier (emit LLVM IR, compile with clang -O3)
 │   └── zipp-cli/     # the `zipp` binary
 └── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz, math, structs
@@ -246,29 +246,31 @@ One kernel isn't the whole story (PLAN.md §6/§11 — workloads differ, and V8'
 hand-tuned stdlib is a separate battle), but this is real, reproducible evidence
 the thesis holds where the design predicts.
 
-### Garbage collection (JIT)
+### Garbage collection (both backends)
 
-The JIT runtime has a **conservative mark-sweep GC**. ZIPP heap handles
-(arrays/strings/structs) are always `i64`, so they only ever live in GPRs or on
-the stack — never in float registers — which bounds the root set: the collector
-captures the callee-saved GPRs and conservatively scans the machine stack, marks
-through reachable objects (so a struct field holding an array keeps it alive),
-and sweeps the rest. It's sound for this value model with no codegen changes or
-stack maps; it's per-thread (matching ZIPP's single-threaded execution); and it
-never moves objects, so handles stay valid.
+Both native backends share one runtime crate, **`zipp-rt`** (linked as an rlib
+into the JIT and as a static lib into the LLVM exe), which provides the allocator
+and a **conservative mark-sweep GC**. ZIPP heap handles (arrays/strings/structs)
+are always `i64`, so they only ever live in GPRs or on the stack — never in float
+registers — which bounds the root set: the collector captures the callee-saved
+GPRs and conservatively scans the machine stack, marks through reachable objects
+(so a struct field holding an array keeps it alive), and sweeps the rest. It's
+sound for this value model with no codegen changes or stack maps; it's per-thread
+(matching ZIPP's single-threaded execution); and it never moves objects, so
+handles stay valid. The same collector runs in-process under `--jit` and inside
+the compiled exe under `--llvm`.
 
 On `bench/churn.zipp` (a fresh 64-element array every iteration, 2M iterations,
-only the current one live):
+only the current one live), peak RSS — GC on vs off (`ZIPP_GC=0`):
 
-| | peak RSS | result |
-|---|---|---|
-| **GC on** (default) | **~11 MB** | ✓ |
-| GC off (`ZIPP_GC=0`) | ~1.1 GB | ✓ |
+| backend | GC on | GC off | result |
+|---|---|---|---|
+| `--jit` | ~11 MB | ~1.1 GB | ✓ |
+| `--llvm` | ~8 MB | ~1.1 GB | ✓ |
 
-~100× less memory, same answer. String *literals* are allocated outside the GC
-(immortal — they're baked into the code as constants). The `--llvm` AOT tier is
-a separate process and still leaks; giving it this same collector via a shared
-runtime static lib is the next step. (Set `ZIPP_GC=0` to disable collection.)
+~100–140× less memory, same answer. String *literals* are allocated outside the
+GC (immortal — the JIT bakes them into the code, the LLVM tier puts them in the
+exe's read-only data). Set `ZIPP_GC=0` to disable collection.
 
 ## License
 

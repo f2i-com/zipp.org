@@ -10,9 +10,10 @@
 //! (the tier-0 JIT) does not.
 //!
 //! Scope: the **whole language** — scalars (`i64`/`f64`, casts), 1-D arrays,
-//! strings, structs, and math builtins. Heap types use a small emitted runtime
-//! (calloc/malloc-backed, length-prefixed, bounds-checked; leaks, no GC v0).
-//! Same coverage as the JIT.
+//! strings, structs, and math builtins (same coverage as the JIT). The runtime
+//! (allocator + conservative GC, strings, pow, print) is the shared `zipp-rt`
+//! crate, linked into the exe as a static library — so the LLVM tier is GC'd
+//! too. This module just `declare`s those entry points and calls them.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -461,14 +462,10 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
             }
             Instr::Print { a } => {
                 let v = load(&mut s, &mut tmp, &rty, *a);
-                if rty[*a as usize] == LTy::Str {
-                    s.push_str(&format!("  call void @zipp_print_str(ptr {v})\n"));
-                } else {
-                    let (fmt, ty) = match rty[*a as usize] {
-                        LTy::F64 => ("@.fmt_f64", "double"),
-                        _ => ("@.fmt_i64", "i64"),
-                    };
-                    s.push_str(&format!("  call i32 (ptr, ...) @printf(ptr {fmt}, {ty} {v})\n"));
+                match rty[*a as usize] {
+                    LTy::Str => s.push_str(&format!("  call void @zipp_print_str(ptr {v})\n")),
+                    LTy::F64 => s.push_str(&format!("  call void @zipp_print_f64(double {v})\n")),
+                    _ => s.push_str(&format!("  call void @zipp_print_i64(i64 {v})\n")),
                 }
             }
             Instr::ArrayLit { dst, elems } => {
@@ -642,121 +639,6 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
     Ok(s)
 }
 
-fn cstr_global(name: &str, s: &str) -> String {
-    let mut bytes = s.as_bytes().to_vec();
-    bytes.push(0);
-    let n = bytes.len();
-    let mut esc = String::new();
-    for &b in &bytes {
-        if (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\' {
-            esc.push(b as char);
-        } else {
-            esc.push_str(&format!("\\{b:02X}"));
-        }
-    }
-    format!("@{name} = private unnamed_addr constant [{n} x i8] c\"{esc}\"\n")
-}
-
-/// Array runtime, emitted into every module (stripped by -O3 if unused). An
-/// array is a `ptr` to `[ len:i64 | e0 | e1 | … ]`; f64 elements are stored
-/// bit-reinterpreted as i64. Allocation leaks (no GC v0). Indexing is bounds-
-/// checked by the caller via `@zipp_oob` (one unsigned compare; aborts).
-const ARRAY_RUNTIME: &str = r#"define internal ptr @zipp_alloc(i64 %n) {
-entry:
-  %neg = icmp slt i64 %n, 0
-  br i1 %neg, label %bad, label %ok
-bad:
-  call i32 (ptr, ...) @printf(ptr @.fmt_neg, i64 %n)
-  call void @abort()
-  unreachable
-ok:
-  %tot = add i64 %n, 1
-  %p = call ptr @calloc(i64 %tot, i64 8)
-  store i64 %n, ptr %p
-  ret ptr %p
-}
-
-define internal void @zipp_oob(i64 %idx, i64 %len) {
-entry:
-  call i32 (ptr, ...) @printf(ptr @.fmt_oob, i64 %idx, i64 %len)
-  call void @abort()
-  unreachable
-}
-
-define internal ptr @zipp_array_repeat(i64 %n, i64 %val) {
-entry:
-  %p = call ptr @zipp_alloc(i64 %n)
-  %ip = alloca i64
-  store i64 0, ptr %ip
-  br label %cond
-cond:
-  %i = load i64, ptr %ip
-  %done = icmp sge i64 %i, %n
-  br i1 %done, label %end, label %body
-body:
-  %i1 = add i64 %i, 1
-  %slot = getelementptr inbounds i64, ptr %p, i64 %i1
-  store i64 %val, ptr %slot
-  store i64 %i1, ptr %ip
-  br label %cond
-end:
-  ret ptr %p
-}
-
-"#;
-
-/// String runtime, emitted into every module (stripped by -O3 if unused). A
-/// string is a `ptr` to `[ len:i64 | utf8 bytes… ]`. Literals are module-level
-/// constants (`@.sconst_N`); concat mallocs a fresh block. Leaks (no GC v0).
-const STRING_RUNTIME: &str = r#"declare ptr @malloc(i64)
-declare i32 @memcmp(ptr, ptr, i64)
-declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
-
-define internal ptr @zipp_str_concat(ptr %a, ptr %b) {
-entry:
-  %la = load i64, ptr %a
-  %lb = load i64, ptr %b
-  %tot = add i64 %la, %lb
-  %sz = add i64 %tot, 8
-  %p = call ptr @malloc(i64 %sz)
-  store i64 %tot, ptr %p
-  %pd = getelementptr inbounds i8, ptr %p, i64 8
-  %pa = getelementptr inbounds i8, ptr %a, i64 8
-  %pb = getelementptr inbounds i8, ptr %b, i64 8
-  call void @llvm.memcpy.p0.p0.i64(ptr %pd, ptr %pa, i64 %la, i1 false)
-  %pd2 = getelementptr inbounds i8, ptr %pd, i64 %la
-  call void @llvm.memcpy.p0.p0.i64(ptr %pd2, ptr %pb, i64 %lb, i1 false)
-  ret ptr %p
-}
-
-define internal i64 @zipp_str_eq(ptr %a, ptr %b) {
-entry:
-  %la = load i64, ptr %a
-  %lb = load i64, ptr %b
-  %lne = icmp ne i64 %la, %lb
-  br i1 %lne, label %neq, label %cmp
-neq:
-  ret i64 0
-cmp:
-  %pa = getelementptr inbounds i8, ptr %a, i64 8
-  %pb = getelementptr inbounds i8, ptr %b, i64 8
-  %c = call i32 @memcmp(ptr %pa, ptr %pb, i64 %la)
-  %eq = icmp eq i32 %c, 0
-  %r = zext i1 %eq to i64
-  ret i64 %r
-}
-
-define internal void @zipp_print_str(ptr %s) {
-entry:
-  %l = load i64, ptr %s
-  %li = trunc i64 %l to i32
-  %p = getelementptr inbounds i8, ptr %s, i64 8
-  call i32 (ptr, ...) @printf(ptr @.fmt_str, i32 %li, ptr %p)
-  ret void
-}
-
-"#;
-
 /// LLVM byte-escape (no trailing nul — strings are length-prefixed, not C
 /// strings). Printable ASCII except `"` and `\` stays literal; else `\XX`.
 fn escape_bytes(s: &str) -> String {
@@ -771,40 +653,6 @@ fn escape_bytes(s: &str) -> String {
     esc
 }
 
-/// Integer pow by repeated wrapping multiply (matches the interpreter; LLVM `mul`
-/// wraps). Exponent must be ≥ 0 — aborts otherwise. `internal`, stripped if unused.
-const IPOW_RUNTIME: &str = r#"define internal i64 @zipp_ipow(i64 %base, i64 %exp) {
-entry:
-  %neg = icmp slt i64 %exp, 0
-  br i1 %neg, label %bad, label %init
-bad:
-  call i32 (ptr, ...) @printf(ptr @.fmt_powneg, i64 %exp)
-  call void @abort()
-  unreachable
-init:
-  %rp = alloca i64
-  %ip = alloca i64
-  store i64 1, ptr %rp
-  store i64 0, ptr %ip
-  br label %cond
-cond:
-  %i = load i64, ptr %ip
-  %done = icmp sge i64 %i, %exp
-  br i1 %done, label %end, label %body
-body:
-  %r = load i64, ptr %rp
-  %r2 = mul i64 %r, %base
-  store i64 %r2, ptr %rp
-  %i1 = add i64 %i, 1
-  store i64 %i1, ptr %ip
-  br label %cond
-end:
-  %res = load i64, ptr %rp
-  ret i64 %res
-}
-
-"#;
-
 /// Lower a whole program to textual LLVM IR (a self-contained module with a C
 /// `main` that times the entry call with `clock()` and prints the result).
 pub fn emit_ir(prog: &Program) -> Result<String, String> {
@@ -812,12 +660,9 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
         return Err(format!("--llvm supports scalars + arrays + strings + structs only (program uses {bad})"));
     }
     let mut out = String::new();
-    out.push_str("; ZIPP → LLVM IR (release tier)\n");
-    out.push_str("declare i32 @printf(ptr, ...)\n");
+    out.push_str("; ZIPP → LLVM IR (release tier; runtime linked from zipp-rt)\n");
     out.push_str("declare i32 @clock()\n"); // Windows: clock_t = long = i32, CLOCKS_PER_SEC = 1000
     out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n");
-    out.push_str("declare ptr @calloc(i64, i64)\n");
-    out.push_str("declare void @abort()\n");
     // Math-builtin intrinsics (LLVM lowers these to the right instruction or a
     // libm call; minnum/maxnum match Rust's f64::min/max NaN handling).
     out.push_str("declare i64 @llvm.abs.i64(i64, i1)\n");
@@ -828,17 +673,22 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     out.push_str("declare double @llvm.maxnum.f64(double, double)\n");
     out.push_str("declare double @llvm.sqrt.f64(double)\n");
     out.push_str("declare double @llvm.floor.f64(double)\n");
-    out.push_str("declare double @llvm.ceil.f64(double)\n\n");
-    out.push_str(&cstr_global(".fmt_i64", "%lld\n"));
-    out.push_str(&cstr_global(".fmt_f64", "%.17g\n"));
-    out.push_str(&cstr_global(".fmt_ri", "__ZRESULT__:%lld\n"));
-    out.push_str(&cstr_global(".fmt_rf", "__ZRESULT__:%.17g\n"));
-    out.push_str(&cstr_global(".fmt_time", "__ZTIME_MS__:%d\n"));
-    out.push_str(&cstr_global(".fmt_neg", "zipp: array length cannot be negative (%lld)\n"));
-    out.push_str(&cstr_global(".fmt_oob", "zipp: array index %lld out of bounds (len %lld)\n"));
-    out.push_str(&cstr_global(".fmt_str", "%.*s\n"));
-    out.push_str(&cstr_global(".fmt_powneg", "zipp: pow exponent must be >= 0 (got %lld)\n"));
-    out.push('\n');
+    out.push_str("declare double @llvm.ceil.f64(double)\n");
+    // The ZIPP runtime — allocator (GC-backed), strings, pow, print, and the
+    // CLI result/time markers — is provided by the zipp-rt static library.
+    out.push_str("declare void @zipp_set_stack_bottom(i64)\n");
+    out.push_str("declare ptr @zipp_alloc(i64)\n");
+    out.push_str("declare ptr @zipp_array_repeat(i64, i64)\n");
+    out.push_str("declare void @zipp_oob(i64, i64)\n");
+    out.push_str("declare ptr @zipp_str_concat(ptr, ptr)\n");
+    out.push_str("declare i64 @zipp_str_eq(ptr, ptr)\n");
+    out.push_str("declare i64 @zipp_ipow(i64, i64)\n");
+    out.push_str("declare void @zipp_print_i64(i64)\n");
+    out.push_str("declare void @zipp_print_f64(double)\n");
+    out.push_str("declare void @zipp_print_str(ptr)\n");
+    out.push_str("declare void @zipp_emit_result_i64(i64)\n");
+    out.push_str("declare void @zipp_emit_result_f64(double)\n");
+    out.push_str("declare void @zipp_emit_time_ms(i64)\n\n");
 
     // String literals: one module-level constant each, laid out as the runtime
     // expects — a packed `{ i64 len, [len x i8] bytes }`.
@@ -853,12 +703,6 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     }
     out.push('\n');
 
-    // Array + string runtimes (calloc/malloc-backed, leaked — no GC in v0) and
-    // integer pow. `internal` so -O3 strips whichever a program doesn't use.
-    out.push_str(ARRAY_RUNTIME);
-    out.push_str(STRING_RUNTIME);
-    out.push_str(IPOW_RUNTIME);
-
     for i in 0..prog.funcs.len() {
         let end = if i + 1 < prog.funcs.len() {
             prog.funcs[i + 1].entry
@@ -868,21 +712,30 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
         out.push_str(&emit_fn(prog, i, end)?);
     }
 
-    // C entry: time the kernel with clock() (excludes process startup), then
-    // print the result on a parseable marker line.
+    // C entry: anchor the GC stack scan, time the kernel with clock() (excludes
+    // process startup), then emit the time + result markers via the runtime.
     let mi = prog.main as usize;
     let ret = lty_of(prog.funcs[mi].ret);
-    let (rt, fmt) = match ret {
-        LTy::F64 => ("double", "@.fmt_rf"),
-        _ => ("i64", "@.fmt_ri"), // i64 (or an array pointer, printed as i64)
-    };
+    let rt_ty = llname(ret);
     out.push_str("define i32 @main() {\nentry:\n");
+    out.push_str("  %anchor = alloca i64\n");
+    out.push_str("  %ab = ptrtoint ptr %anchor to i64\n");
+    out.push_str("  call void @zipp_set_stack_bottom(i64 %ab)\n");
     out.push_str("  %t0 = call i32 @clock()\n");
-    out.push_str(&format!("  %r = call {rt} @zfn{mi}()\n"));
+    out.push_str(&format!("  %r = call {rt_ty} @zfn{mi}()\n"));
     out.push_str("  %t1 = call i32 @clock()\n");
     out.push_str("  %dt = sub i32 %t1, %t0\n");
-    out.push_str("  call i32 (ptr, ...) @printf(ptr @.fmt_time, i32 %dt)\n");
-    out.push_str(&format!("  call i32 (ptr, ...) @printf(ptr {fmt}, {rt} %r)\n"));
+    out.push_str("  %dt64 = sext i32 %dt to i64\n");
+    out.push_str("  call void @zipp_emit_time_ms(i64 %dt64)\n");
+    match ret {
+        LTy::F64 => out.push_str("  call void @zipp_emit_result_f64(double %r)\n"),
+        LTy::I64 => out.push_str("  call void @zipp_emit_result_i64(i64 %r)\n"),
+        _ => {
+            // array/string/struct return: report the handle as an integer
+            out.push_str("  %ri = ptrtoint ptr %r to i64\n");
+            out.push_str("  call void @zipp_emit_result_i64(i64 %ri)\n");
+        }
+    }
     out.push_str("  ret i32 0\n}\n");
     Ok(out)
 }
@@ -906,24 +759,56 @@ fn find_clang() -> String {
     "clang".to_string() // hope it's on PATH; spawn error guides if not
 }
 
+/// Locate the `zipp_rt` static library (the shared runtime to link into the
+/// exe). It's built next to the `zipp` binary by `cargo build`.
+fn find_zipp_rt() -> Result<String, String> {
+    if let Ok(p) = std::env::var("ZIPP_RT_LIB") {
+        return Ok(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("zipp_rt.lib");
+            if cand.exists() {
+                return Ok(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    Err("zipp_rt.lib not found — build the workspace (`cargo build --release`), \
+         or set ZIPP_RT_LIB to its path"
+        .into())
+}
+
+/// System libraries the Rust std static lib needs on Windows (from
+/// `rustc --print native-static-libs`). The CRT is pulled in by clang/the lib's
+/// own linker directives.
+const RT_SYS_LIBS: &[&str] = &["kernel32", "ntdll", "userenv", "ws2_32", "dbghelp"];
+
 /// Emit IR, compile it with `clang -O3 -march=native [-ffast-math]`, run the
 /// exe, and return the parsed result + timings.
 pub fn build_and_run(prog: &Program, fast_math: bool) -> Result<LlvmRun, String> {
     let ir = emit_ir(prog)?;
     let clang = find_clang();
+    let rt_lib = find_zipp_rt()?;
     let dir = std::env::temp_dir().join(format!("zipp_llvm_{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| format!("temp dir: {e}"))?;
     let ll = dir.join("zmod.ll");
     let exe = dir.join("zmod.exe");
     std::fs::write(&ll, &ir).map_err(|e| format!("write {}: {e}", ll.display()))?;
 
-    let mut args: Vec<String> = vec!["-O3".into(), "-march=native".into()];
+    // clang compiles the .ll and links the shared runtime (zipp_rt.lib) + the
+    // system libs std needs. -Wno-override-module silences the no-triple note.
+    let mut args: Vec<String> =
+        vec!["-O3".into(), "-march=native".into(), "-Wno-override-module".into()];
     if fast_math {
         args.push("-ffast-math".into());
     }
     args.push("-o".into());
     args.push(exe.to_string_lossy().into_owned());
     args.push(ll.to_string_lossy().into_owned());
+    args.push(rt_lib);
+    for l in RT_SYS_LIBS {
+        args.push(format!("-l{l}"));
+    }
 
     let c0 = Instant::now();
     let out = Command::new(&clang)
@@ -942,14 +827,15 @@ pub fn build_and_run(prog: &Program, fast_math: bool) -> Result<LlvmRun, String>
         .output()
         .map_err(|e| format!("could not run compiled exe: {e}"))?;
     if !run.status.success() {
-        // A runtime abort (e.g. an out-of-bounds index via @zipp_oob) printed its
-        // message to stdout before aborting — surface it.
-        let msg = String::from_utf8_lossy(&run.stdout);
+        // A runtime abort (e.g. an out-of-bounds index via zipp_oob) printed its
+        // message to stderr before aborting — surface it.
+        let msg = String::from_utf8_lossy(&run.stderr);
         let msg = msg.trim();
         if msg.is_empty() {
             return Err(format!("compiled program exited with {}", run.status));
         }
-        return Err(format!("{msg}"));
+        // The CLI re-prefixes errors with "zipp: "; the runtime already did.
+        return Err(msg.strip_prefix("zipp: ").unwrap_or(msg).to_string());
     }
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
     let mut result = String::new();

@@ -1,4 +1,4 @@
-//! A conservative mark-sweep garbage collector for the JIT runtime.
+//! A conservative mark-sweep garbage collector for the ZIPP native runtime.
 //!
 //! ZIPP heap objects — arrays, strings, structs — are reached through `i64`
 //! handles (pointers to the start of a heap block). In the generated machine
@@ -23,11 +23,14 @@
 //! must only ever scan its own thread's stack. Thread-local state also keeps it
 //! correct under parallel `cargo test`.
 //!
-//! Scope: this is the JIT (in-process) runtime. The `--llvm` AOT tier is a
-//! separate process and still leaks (sharing this as a static lib is a follow-on).
+//! This runtime is shared by both native backends: the Cranelift JIT links it
+//! in-process (rlib) and the LLVM tier links it into the clang exe (staticlib);
+//! the collector works identically in either process.
 //!
-//! String *literals* are deliberately allocated outside this heap (they're baked
-//! into the code as constants and must be immortal) — see `leak_str_blob`.
+//! String *literals* are deliberately allocated outside this heap (the JIT bakes
+//! them as code constants via `leak_str_blob`; the LLVM tier puts them in the
+//! exe's read-only data) — they're immortal and never appear in the alloc table,
+//! so the collector simply never frees them.
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cell::RefCell;
@@ -66,8 +69,8 @@ thread_local! {
     static HEAP: RefCell<GcHeap> = const { RefCell::new(GcHeap::new()) };
 }
 
-/// Record the high end of the stack (a local in the frame that calls the JIT'd
-/// `main`). Until this is set, the GC only allocates — it never collects.
+/// Record the high end of the stack (a local in the frame that calls the
+/// generated `main`). Until this is set, the GC only allocates — never collects.
 pub fn set_stack_bottom(addr: usize) {
     HEAP.with(|h| {
         let mut h = h.borrow_mut();
@@ -89,7 +92,8 @@ pub fn gc_alloc(size: usize) -> *mut u8 {
                 // If the live set is genuinely large, grow the threshold so we
                 // don't thrash (collect on every allocation).
                 if hb.bytes.saturating_add(size) > hb.threshold {
-                    hb.threshold = hb.bytes.saturating_add(size).saturating_mul(2).max(MIN_THRESHOLD);
+                    hb.threshold =
+                        hb.bytes.saturating_add(size).saturating_mul(2).max(MIN_THRESHOLD);
                 }
             }
         }
@@ -210,8 +214,6 @@ unsafe fn collect(_h: &mut GcHeap) {
 mod tests {
     use super::*;
 
-    // Standalone sanity check of the allocator/collector data structures
-    // (independent of the JIT): allocate, root some via the stack, collect.
     #[test]
     fn interior_pointer_lookup_marks_object() {
         let mut h = GcHeap::new();
@@ -220,8 +222,7 @@ mod tests {
         scan_word(&mut h, 0x1020, &mut wl); // interior pointer into [0x1000,0x1040)
         assert_eq!(wl, vec![0x1000]);
         assert!(h.allocs[&0x1000].mark);
-        // a word outside any allocation marks nothing
-        scan_word(&mut h, 0x9999, &mut wl);
+        scan_word(&mut h, 0x9999, &mut wl); // outside any allocation
         assert_eq!(wl.len(), 1);
     }
 }

@@ -29,116 +29,10 @@ use cranelift_module::{FuncId, Linkage, Module};
 use zippc::ast::{BinOp, Elem, Type, UnOp};
 use zippc::ir::{BuiltinOp, FuncMeta, Instr, Program};
 
-mod gc;
-
-extern "C" fn zipp_print_i64(x: i64) {
-    println!("{x}");
-}
-extern "C" fn zipp_print_f64(x: f64) {
-    println!("{x}");
-}
-
-/// Allocate an array (or struct) block of `n` 8-byte slots, length-prefixed,
-/// zero-initialized, from the GC heap. Returns the base pointer as an i64.
-/// Aborts on a negative/absurd length.
-extern "C" fn zipp_alloc(n: i64) -> i64 {
-    if n < 0 {
-        eprintln!("zipp: array length cannot be negative ({n})");
-        std::process::abort();
-    }
-    let total = (n as usize) + 1; // 1 length slot + n element slots
-    let p = gc::gc_alloc(total * 8) as *mut i64; // gc_alloc returns zeroed memory
-    // SAFETY: p has `total` i64 slots; slot 0 holds the length.
-    unsafe { *p = n };
-    p as i64
-}
-
-/// `[value; n]` — allocate then fill. `val` is the raw 8-byte payload (f64
-/// elements are passed bit-reinterpreted by the caller).
-extern "C" fn zipp_array_repeat(n: i64, val: i64) -> i64 {
-    let base = zipp_alloc(n) as *mut i64;
-    // SAFETY: zipp_alloc gave us n+1 valid slots; we fill the n element slots.
-    unsafe {
-        for i in 0..n {
-            *base.add(1 + i as usize) = val;
-        }
-    }
-    base as i64
-}
-
-extern "C" fn zipp_oob(idx: i64, len: i64) {
-    eprintln!("zipp: array index {idx} out of bounds (len {len})");
-    std::process::abort();
-}
-
-// Strings: a pointer to an 8-aligned block `[ len:i64 | utf8 bytes… ]`, like an
-// array but with packed bytes. Immutable. Literals are baked at compile time
-// (`leak_str_blob`); concat allocates a fresh block. All leak (no GC v0).
-
-/// Allocate an 8-aligned `[len|bytes]` string block from the GC heap, return its
-/// address. (Concat results; literals use `leak_str_blob` and are immortal.)
-fn make_str(bytes: &[u8]) -> i64 {
-    let p = gc::gc_alloc(8 + bytes.len());
-    // SAFETY: p is 8-aligned with room for the length slot + bytes.
-    unsafe {
-        *(p as *mut i64) = bytes.len() as i64;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(8), bytes.len());
-    }
-    p as i64
-}
-
-/// Bytes slice of a string block (used by concat/eq/print).
-unsafe fn str_bytes<'a>(s: i64) -> &'a [u8] {
-    let len = *(s as *const i64) as usize;
-    std::slice::from_raw_parts((s as *const u8).add(8), len)
-}
-
-/// Bake a literal into a *leaked* `[len|bytes]` block at JIT-compile time; the
-/// address is embedded as a constant in the generated code. This must live for
-/// the whole process — the constant reproduces the address on every use — so it
-/// is allocated OUTSIDE the GC heap (never collected).
-fn leak_str_blob(s: &str) -> i64 {
-    let bytes = s.as_bytes();
-    let nslots = 1 + bytes.len().div_ceil(8);
-    let mut v: Vec<i64> = vec![0; nslots];
-    v[0] = bytes.len() as i64;
-    // SAFETY: v has room for 8 + bytes.len() bytes after the length slot.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), (v.as_mut_ptr() as *mut u8).add(8), bytes.len());
-    }
-    let p = v.as_ptr() as i64;
-    std::mem::forget(v); // immortal — outside the GC by design
-    p
-}
-
-extern "C" fn zipp_str_concat(a: i64, b: i64) -> i64 {
-    // SAFETY: a, b are valid string blocks produced by make_str/leak_str_blob.
-    let (sa, sb) = unsafe { (str_bytes(a), str_bytes(b)) };
-    let mut bytes = Vec::with_capacity(sa.len() + sb.len());
-    bytes.extend_from_slice(sa);
-    bytes.extend_from_slice(sb);
-    make_str(&bytes)
-}
-
-extern "C" fn zipp_str_eq(a: i64, b: i64) -> i64 {
-    // SAFETY: as above.
-    (unsafe { str_bytes(a) == str_bytes(b) }) as i64
-}
-
-extern "C" fn zipp_print_str(s: i64) {
-    // SAFETY: as above.
-    println!("{}", String::from_utf8_lossy(unsafe { str_bytes(s) }));
-}
-
-/// Integer `pow` (the one builtin with no single instruction). Matches the
-/// interpreter: exponent must be ≥ 0; wrapping multiply.
-extern "C" fn zipp_ipow(base: i64, exp: i64) -> i64 {
-    if exp < 0 {
-        eprintln!("zipp: pow exponent must be >= 0 (got {exp})");
-        std::process::abort();
-    }
-    base.wrapping_pow(exp as u32)
-}
+// The runtime itself (allocator + conservative GC + string/print/pow helpers)
+// lives in the shared `zipp-rt` crate, so the JIT and the LLVM tier share one
+// implementation. Here we just register `zipp-rt`'s `extern "C"` entry points as
+// JIT symbols and call them.
 
 /// Runtime symbols the JIT calls into.
 #[derive(Clone, Copy)]
@@ -284,15 +178,15 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
         .finish(cranelift_codegen::settings::Flags::new(flags))
         .map_err(|e| format!("isa finish: {e}"))?;
     let mut jit = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
-    jit.symbol("zipp_print_i64", zipp_print_i64 as *const u8);
-    jit.symbol("zipp_print_f64", zipp_print_f64 as *const u8);
-    jit.symbol("zipp_print_str", zipp_print_str as *const u8);
-    jit.symbol("zipp_alloc", zipp_alloc as *const u8);
-    jit.symbol("zipp_array_repeat", zipp_array_repeat as *const u8);
-    jit.symbol("zipp_oob", zipp_oob as *const u8);
-    jit.symbol("zipp_str_concat", zipp_str_concat as *const u8);
-    jit.symbol("zipp_str_eq", zipp_str_eq as *const u8);
-    jit.symbol("zipp_ipow", zipp_ipow as *const u8);
+    jit.symbol("zipp_print_i64", zipp_rt::zipp_print_i64 as *const u8);
+    jit.symbol("zipp_print_f64", zipp_rt::zipp_print_f64 as *const u8);
+    jit.symbol("zipp_print_str", zipp_rt::zipp_print_str as *const u8);
+    jit.symbol("zipp_alloc", zipp_rt::zipp_alloc as *const u8);
+    jit.symbol("zipp_array_repeat", zipp_rt::zipp_array_repeat as *const u8);
+    jit.symbol("zipp_oob", zipp_rt::zipp_oob as *const u8);
+    jit.symbol("zipp_str_concat", zipp_rt::zipp_str_concat as *const u8);
+    jit.symbol("zipp_str_eq", zipp_rt::zipp_str_eq as *const u8);
+    jit.symbol("zipp_ipow", zipp_rt::zipp_ipow as *const u8);
     let mut module = JITModule::new(jit);
 
     let mut func_ids = Vec::with_capacity(prog.funcs.len());
@@ -354,7 +248,7 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     // `main`'s, so scanning [sp-at-collection, &anchor) covers every frame that
     // can hold a live heap handle while the program runs.
     let anchor: u8 = 0;
-    gc::set_stack_bottom(&anchor as *const u8 as usize);
+    zipp_rt::gc_set_stack_bottom(&anchor as *const u8 as usize);
     std::hint::black_box(&anchor);
 
     let e0 = Instant::now();
@@ -643,7 +537,7 @@ fn compile_function(
             Instr::SConst { dst, imm } => {
                 // Bake the literal into a leaked [len|bytes] block now; embed its
                 // address as a constant (valid for this JIT process's lifetime).
-                let addr = builder.ins().iconst(types::I64, leak_str_blob(imm));
+                let addr = builder.ins().iconst(types::I64, zipp_rt::leak_str_blob(imm));
                 builder.def_var(var(*dst), addr);
             }
             Instr::Cast { dst, src, to } => {
@@ -1078,7 +972,7 @@ mod tests {
         // Force frequent collections, then allocate ~200k short-lived arrays
         // while a live accumulator array must survive every collection. If the
         // GC freed a live object the result would be wrong (or it'd crash).
-        gc::set_threshold(64 * 1024);
+        zipp_rt::gc_set_threshold(64 * 1024);
         let src = "fn main(): i64 { \
                      let acc = [0, 0]; \
                      let i = 0; \
@@ -1091,7 +985,7 @@ mod tests {
                      return acc[0] + acc[1]; }";
         // sum_{i=0}^{199999} i = 19999900000, plus acc[1] = 200000
         assert_eq!(jit_i64(src), 19999900000 + 200000);
-        let (collections, _live) = gc::stats();
+        let (collections, _live) = zipp_rt::gc_stats();
         assert!(collections > 0, "a 64KB threshold should have forced collections");
     }
 

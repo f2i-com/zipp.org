@@ -12,3 +12,4 @@ cranelift-jit = "0.116"
 cranelift-module = "0.116"
 cranelift-native = "0.116"
 zippc = { path = "../zippc" }
+zipp-rt = { path = "../zipp-rt" }

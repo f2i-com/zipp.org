@@ -754,6 +754,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "zipp-rt",
  "zippc",
 ]
 
@@ -763,6 +764,10 @@ version = "0.0.1"
 dependencies = [
  "zippc",
 ]
+
+[[package]]
+name = "zipp-rt"
+version = "0.0.1"
 
 [[package]]
 name = "zipp-zk"
