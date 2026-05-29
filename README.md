@@ -117,6 +117,7 @@ cargo build --release
 ./target/release/zipp run --jit examples/optcall.ts  # optional method calls a?.m() ?? d
 ./target/release/zipp run --jit examples/nullable_heap.ts # str | null, T[] | null (native)
 ./target/release/zipp run examples/nullable_scalar.ts # i64 | null (interpreter tier)
+./target/release/zipp run examples/lambda.ts         # first-class functions + arrow lambdas
 
 # run the language test suite
 cargo test
@@ -364,8 +365,11 @@ code (a `Box<i64>` and a `Box<bool>` are two distinct structs), **optionals** �
 `T | null` for heap types (structs, `str`, arrays) and nullable scalars
 `i64 | null` / `f64 | null` / `bool | null`, plus `null`, `x ?? y`, `=== null`,
 flow narrowing (`if (x !== null) {…}` and early-return `if (x === null) return;`),
-and optional chaining `a?.b` / `a?.m()` / `… ?? default`, `console.log`, math
-builtins. (`switch` works on numbers, strings, and enums.) **Type mapping:** `number`→f64, `bigint`→i64,
+and optional chaining `a?.b` / `a?.m()` / `… ?? default`, **first-class
+functions** — pass functions as values, function-typed parameters
+(`f: (n: i64) => i64`), arrow lambdas (`(x: i64) => x * 2`), and indirect calls —
+`console.log`, math builtins. (`switch` works on numbers, strings, and enums.)
+**Type mapping:** `number`→f64, `bigint`→i64,
 `boolean`→bool,
 `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` and your
 `interface`/`class`/`enum` names usable directly. `examples/fib.ts` runs
@@ -376,12 +380,16 @@ monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
 a string enum + array/object destructuring; `defaults.ts` default parameters;
 `optional.ts` nullable references (`T | null`, `??`, narrowing); `chain.ts`
 optional chaining; `nullable_heap.ts` `str | null` + `T[] | null`;
-`nullable_scalar.ts` `i64 | null`. Most run on all four backends; **nullable
+`nullable_scalar.ts` `i64 | null`; `lambda.ts` first-class functions + arrow
+lambdas. Most run on all four backends; **nullable
 *heap* types — structs, `str`, arrays — run natively on `--jit` and `--llvm`**
 (a null is a 0/null pointer; `=== null` is a pointer compare). **Nullable
 *scalars* (`i64 | null`) run on the interpreter** — scalars have no spare null
-value, so the native tiers fall back (they'd need boxing). `--wasm` falls back
-for all nullable (its contract profile stays scalar-only).
+value, so the native tiers fall back (they'd need boxing). **First-class
+functions also run on the interpreter** in v0 (`--jit`/`--llvm`/`--wasm` fall
+back); arrow lambdas can't yet capture enclosing locals (pass them as
+parameters). `--wasm` falls back for all nullable (its contract profile stays
+scalar-only).
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,

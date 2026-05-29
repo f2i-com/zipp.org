@@ -160,6 +160,10 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     if prog.uses_opt_scalar {
         return Some("nullable scalars (i64 | null)");
     }
+    // First-class functions are interpreter-only in v0.
+    if prog.uses_func_value {
+        return Some("first-class functions");
+    }
     None
 }
 
@@ -819,6 +823,11 @@ fn compile_function(
                 // null is a 0 pointer (struct handles are i64 in Cranelift).
                 let z = builder.ins().iconst(types::I64, 0);
                 builder.def_var(var(*dst), z);
+            }
+            // First-class functions are interpreter-only; `ineligible_reason`
+            // gates them out before codegen, so this is never reached.
+            Instr::FuncRef { .. } | Instr::CallValue { .. } => {
+                return Err("internal: first-class functions reached the JIT".into())
             }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;

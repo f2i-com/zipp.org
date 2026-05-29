@@ -24,6 +24,8 @@ pub enum Value {
     U64(u64),
     /// A null struct reference (`T | null` whose value is absent).
     Null,
+    /// A first-class function value: an index into the program's `funcs`.
+    Func(u32),
 }
 
 impl Value {
@@ -34,7 +36,9 @@ impl Value {
             Value::U32(x) => x == 0,
             Value::U64(x) => x == 0,
             Value::F64(f) => f == 0.0,
-            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } | Value::Null => false,
+            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } | Value::Null | Value::Func(_) => {
+                false
+            }
         }
     }
     /// The i64 payload, or `None` for non-`i64` values. (Array index / repeat
@@ -55,7 +59,7 @@ impl Value {
             Value::I32(x) => x as i64,
             Value::U32(x) => x as i64,
             Value::U64(x) => x as i64,
-            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } | Value::Null => 0,
+            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } | Value::Null | Value::Func(_) => 0,
         }
     }
 }
@@ -72,6 +76,7 @@ impl std::fmt::Display for Value {
             Value::Str(_) => write!(f, "[str]"),
             Value::Struct { .. } => write!(f, "[struct]"),
             Value::Null => write!(f, "null"),
+            Value::Func(_) => write!(f, "[function]"),
         }
     }
 }
@@ -257,6 +262,26 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 call_stack.push(Frame { ret_pc: pc, base, dst: *dst });
                 base = new_base;
                 pc = callee.entry;
+            }
+            Instr::FuncRef { dst, func } => {
+                reg[base + *dst as usize] = Value::Func(*func);
+                rec!(OpKind::Other, 0, 0, 0, 0);
+            }
+            Instr::CallValue { dst, callee, arg_base, argc } => {
+                let f = match reg[base + *callee as usize] {
+                    Value::Func(i) => i,
+                    _ => return Err("runtime error: called a non-function value".into()),
+                };
+                let callee_fn = &prog.funcs[f as usize];
+                let new_base = reg.len();
+                reg.resize(new_base + callee_fn.nregs as usize, Value::I64(0));
+                for i in 0..*argc as usize {
+                    reg[new_base + i] = reg[base + *arg_base as usize + i];
+                }
+                rec!(OpKind::Other, 0, 0, 0, 0);
+                call_stack.push(Frame { ret_pc: pc, base, dst: *dst });
+                base = new_base;
+                pc = callee_fn.entry;
             }
             Instr::Ret { src } => {
                 let v = reg[base + *src as usize];
@@ -466,6 +491,7 @@ fn render(v: Value, strs: &[String]) -> String {
         Value::Arr(_) => "[array]".to_string(),
         Value::Struct { .. } => "[struct]".to_string(),
         Value::Null => "null".to_string(),
+        Value::Func(_) => "[function]".to_string(),
     }
 }
 

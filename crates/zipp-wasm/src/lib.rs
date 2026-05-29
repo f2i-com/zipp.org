@@ -79,6 +79,7 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
             Instr::Builtin { .. } => "builtins",
             Instr::NewStruct { .. } | Instr::GetField { .. } | Instr::SetField { .. } => "structs",
             Instr::ConstNull { .. } => "nullable types (T | null)",
+            Instr::FuncRef { .. } | Instr::CallValue { .. } => "first-class functions",
             _ => continue,
         };
         return Some(bad);

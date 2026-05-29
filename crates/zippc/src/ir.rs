@@ -39,6 +39,10 @@ pub enum Instr {
     // known from context (so native tiers can type a null-initialized local);
     // `None` for a bare comparison operand.
     ConstNull { dst: u32, ty: Option<Type> },
+    // First-class functions (interpreter-only in v0). `FuncRef` loads a function
+    // index as a value; `CallValue` calls through such a value.
+    FuncRef { dst: u32, func: u32 },
+    CallValue { dst: u32, callee: u32, arg_base: u32, argc: u32 },
 }
 
 /// Field names of a struct, in declaration order (indexed by struct id). The VM
@@ -99,6 +103,9 @@ pub struct Program {
     /// which only the interpreter handles (scalars have no null sentinel; native
     /// tiers fall back).
     pub uses_opt_scalar: bool,
+    /// The program uses first-class function values (`FuncRef`/`CallValue`), which
+    /// only the interpreter handles in v0; native tiers fall back.
+    pub uses_func_value: bool,
 }
 
 fn is_opt_scalar(t: Type) -> bool {
@@ -186,7 +193,16 @@ pub fn lower(m: &Module) -> Result<Program, String> {
             types: sd.fields.iter().map(|(_, t)| *t).collect(),
         })
         .collect();
-    Ok(Program { code, funcs, main, structs, uses_opt_scalar: module_uses_opt_scalar(m) })
+    let uses_func_value =
+        code.iter().any(|i| matches!(i, Instr::FuncRef { .. } | Instr::CallValue { .. }));
+    Ok(Program {
+        code,
+        funcs,
+        main,
+        structs,
+        uses_opt_scalar: module_uses_opt_scalar(m),
+        uses_func_value,
+    })
 }
 
 struct LoopCtx {
@@ -703,6 +719,32 @@ impl<'a> Gen<'a> {
                 }
                 let dst = self.alloc();
                 self.code.push(Instr::Call { func, arg_base, argc, dst });
+                Ok(dst)
+            }
+            // A function used as a value: load its index.
+            Expr::FuncRef(name) => {
+                let func = *self
+                    .func_index
+                    .get(name)
+                    .ok_or_else(|| format!("ir error: reference to unknown function '{name}'"))?;
+                let dst = self.alloc();
+                self.code.push(Instr::FuncRef { dst, func });
+                Ok(dst)
+            }
+            // An indirect call through a function value.
+            Expr::CallValue { callee, args } => {
+                let callee_reg = self.gen_expr(callee)?;
+                let argc = args.len() as u32;
+                let arg_base = self.next_reg;
+                for _ in 0..argc {
+                    self.alloc();
+                }
+                for (i, a) in args.iter().enumerate() {
+                    let v = self.gen_expr(a)?;
+                    self.code.push(Instr::Mov { dst: arg_base + i as u32, src: v });
+                }
+                let dst = self.alloc();
+                self.code.push(Instr::CallValue { dst, callee: callee_reg, arg_base, argc });
                 Ok(dst)
             }
         }

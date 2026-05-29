@@ -65,6 +65,7 @@ fn block_diverges(stmts: &[Stmt]) -> bool {
 struct Cx<'a> {
     sigs: HashMap<String, Sig>,
     structs: &'a [StructDecl],
+    func_types: &'a [FuncType],
 }
 
 pub fn check(m: &Module) -> Result<(), String> {
@@ -110,7 +111,7 @@ pub fn check(m: &Module) -> Result<(), String> {
     if !sigs.contains_key("main") {
         return Err("type error: program has no `main` function".into());
     }
-    let cx = Cx { sigs, structs: &m.structs };
+    let cx = Cx { sigs, structs: &m.structs, func_types: &m.func_types };
     for f in &m.funcs {
         check_func(f, &cx)?;
     }
@@ -688,6 +689,43 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                 }
             }
             Ok(sig.ret)
+        }
+        // A function used as a value — its type is the matching `Func` type.
+        Expr::FuncRef(name) => {
+            let sig = cx
+                .sigs
+                .get(name)
+                .ok_or_else(|| format!("type error: '{name}' is not a function"))?;
+            let id = cx
+                .func_types
+                .iter()
+                .position(|ft| ft.params == sig.params && ft.ret == sig.ret)
+                .ok_or_else(|| format!("type error: no function type interned for '{name}'"))?;
+            Ok(Type::Func(id as u32))
+        }
+        // Indirect call: the callee must be a function value.
+        Expr::CallValue { callee, args } => {
+            let ct = type_of(callee, scope, cx)?;
+            let Type::Func(id) = ct else {
+                return Err(format!("type error: called a non-function value of type {ct:?}"));
+            };
+            let ft = &cx.func_types[id as usize];
+            if args.len() != ft.params.len() {
+                return Err(format!(
+                    "type error: function value expects {} arg(s), got {}",
+                    ft.params.len(),
+                    args.len()
+                ));
+            }
+            for (i, (a, pty)) in args.iter().zip(&ft.params).enumerate() {
+                let at = type_of(a, scope, cx)?;
+                if !assignable(at, *pty) {
+                    return Err(format!(
+                        "type error: call arg {i} expects {pty:?}, found {at:?}"
+                    ));
+                }
+            }
+            Ok(ft.ret)
         }
     }
 }

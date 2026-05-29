@@ -27,7 +27,8 @@ pub fn parse(tokens: &[Token]) -> Result<Module, String> {
             _ => return Err(format!("parse error: expected `fn` or `struct`{}", p.at())),
         }
     }
-    Ok(Module { funcs, structs })
+    // The native-syntax parser doesn't yet support first-class functions.
+    Ok(Module { funcs, structs, func_types: Vec::new() })
 }
 
 /// Map a compound-assignment token (`+=` etc.) to its binary operator.

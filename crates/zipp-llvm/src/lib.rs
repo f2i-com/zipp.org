@@ -148,6 +148,10 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     if prog.uses_opt_scalar {
         return Some("nullable scalars (i64 | null)");
     }
+    // First-class functions are interpreter-only in v0.
+    if prog.uses_func_value {
+        return Some("first-class functions");
+    }
     None
 }
 
@@ -714,6 +718,11 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 // null is `i64 0` (both round-trip to 0).
                 let v = if llname(rty[*dst as usize]) == "ptr" { "null" } else { "0" };
                 store(&mut s, &rty, *dst, v);
+            }
+            // First-class functions are interpreter-only; `ineligible_reason`
+            // gates them out before codegen, so this is never reached.
+            Instr::FuncRef { .. } | Instr::CallValue { .. } => {
+                return Err("internal: first-class functions reached the LLVM backend".into())
             }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;

@@ -59,6 +59,10 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
         enums: HashMap::new(),
         tuple_ids: RefCell::new(HashSet::new()),
         tmp: Cell::new(0),
+        func_types: RefCell::new(Vec::new()),
+        lambdas: RefCell::new(Vec::new()),
+        next_lambda: Cell::new(0),
+        fn_value_types: RefCell::new(HashMap::new()),
     };
     lower.module(&ret.program)
 }
@@ -104,6 +108,17 @@ struct Lower<'s> {
     tuple_ids: RefCell<HashSet<u32>>,
     /// Counter for fresh temporary names (e.g. `for…of` desugaring).
     tmp: Cell<u32>,
+    /// Interned first-class function types (→ `Module::func_types`), find-or-create
+    /// by structural signature so equal types share a `Type::Func` id.
+    func_types: RefCell<Vec<z::FuncType>>,
+    /// Arrow lambdas lifted to top-level functions, drained into the module's
+    /// `funcs` after lowering.
+    lambdas: RefCell<Vec<z::Func>>,
+    /// Counter for fresh lambda names (`__lambda0`, …).
+    next_lambda: Cell<u32>,
+    /// Callable name → its first-class function type (`Type::Func`). Lets a bare
+    /// function reference and `ztype_of` resolve a function used as a value.
+    fn_value_types: RefCell<HashMap<String, z::Type>>,
 }
 
 /// Owned metadata to monomorphize a generic function without re-touching the AST.
@@ -270,6 +285,16 @@ impl Lower<'_> {
                         self.fn_rets.borrow_mut().insert(id.name.as_str().to_string(), r);
                         let defs = self.lower_defaults(&f.params)?;
                         self.fn_defaults.insert(id.name.as_str().to_string(), defs);
+                        // Intern its first-class function type so the function can
+                        // be used as a value (`let f = thatFn` / passing it along).
+                        let ptys: Vec<z::Type> = f
+                            .params
+                            .items
+                            .iter()
+                            .map(|p| self.param(p).map(|(_, t)| t))
+                            .collect::<LResult<_>>()?;
+                        let fty = self.intern_func_type(ptys, r);
+                        self.fn_value_types.borrow_mut().insert(id.name.as_str().to_string(), fty);
                     }
                 }
                 Statement::ClassDeclaration(c) => {
@@ -385,7 +410,13 @@ impl Lower<'_> {
             }
             break;
         }
-        Ok(z::Module { funcs, structs: self.struct_decls.take() })
+        // Append lifted arrow lambdas (created on demand while lowering bodies).
+        funcs.extend(self.lambdas.take());
+        Ok(z::Module {
+            funcs,
+            structs: self.struct_decls.take(),
+            func_types: self.func_types.take(),
+        })
     }
 
     /// Precompute the owned monomorphization metadata for a generic function.
@@ -891,7 +922,8 @@ impl Lower<'_> {
             | z::Type::OptI64
             | z::Type::OptF64
             | z::Type::OptBool => z::Expr::Null,
-            z::Type::Struct(_) | z::Type::Null => return None,
+            // structs and function values have no zero default (need an initializer)
+            z::Type::Struct(_) | z::Type::Null | z::Type::Func(_) => return None,
         })
     }
 
@@ -944,6 +976,24 @@ impl Lower<'_> {
             }
             z::Expr::Cond { then, .. } => self.ztype_of(then)?,
             z::Expr::Coalesce { rhs, .. } => self.ztype_of(rhs)?,
+            // Comparisons/logicals are bool; arithmetic/bitwise share the operand
+            // type. Lets arrow return types infer from simple bodies.
+            z::Expr::Bin { op, l, .. } => match op {
+                z::BinOp::Eq | z::BinOp::Ne | z::BinOp::Lt | z::BinOp::Le | z::BinOp::Gt
+                | z::BinOp::Ge | z::BinOp::And | z::BinOp::Or => z::Type::Bool,
+                _ => self.ztype_of(l)?,
+            },
+            z::Expr::Unary { op, e } => match op {
+                z::UnOp::Not => z::Type::Bool,
+                _ => self.ztype_of(e)?,
+            },
+            // A function value's type is the interned `Func` type recorded for it.
+            z::Expr::FuncRef(name) => self.fn_value_types.borrow().get(name).copied()?,
+            // An indirect call yields the function type's return type.
+            z::Expr::CallValue { callee, .. } => {
+                let z::Type::Func(id) = self.ztype_of(callee)? else { return None };
+                self.func_types.borrow().get(id as usize)?.ret
+            }
             _ => return None,
         })
     }
@@ -961,6 +1011,18 @@ impl Lower<'_> {
     }
     fn lookup(&self, name: &str) -> Option<z::Type> {
         self.scope.borrow().iter().rev().find_map(|m| m.get(name).copied())
+    }
+
+    /// Find-or-create a first-class function type, returning `Type::Func(id)`.
+    /// Structural dedup keeps one id per unique signature.
+    fn intern_func_type(&self, params: Vec<z::Type>, ret: z::Type) -> z::Type {
+        let ft = z::FuncType { params, ret };
+        let mut tbl = self.func_types.borrow_mut();
+        let id = tbl.iter().position(|t| *t == ft).unwrap_or_else(|| {
+            tbl.push(ft);
+            tbl.len() - 1
+        });
+        z::Type::Func(id as u32)
     }
 
     fn func(&self, f: &Function) -> LResult<z::Func> {
@@ -995,6 +1057,76 @@ impl Lower<'_> {
         };
         self.pop_scope();
         Ok(z::Func { name, params, ret, body })
+    }
+
+    /// Lower an arrow lambda `(p: T, …) => expr` to a lifted top-level function,
+    /// returning a `FuncRef` to it. v0: expression body, explicitly-typed params,
+    /// and no capture of enclosing locals (pass them as parameters instead).
+    fn lower_arrow(&self, a: &ArrowFunctionExpression) -> LResult<z::Expr> {
+        if a.type_parameters.is_some() {
+            return Err(self.err(a.span, "generic arrow functions aren't supported (v0)"));
+        }
+        if !a.expression {
+            return Err(self.err(
+                a.span,
+                "only expression-bodied arrows `(x: T) => expr` are supported (v0)",
+            ));
+        }
+        let body_ast = match a.body.statements.first() {
+            Some(Statement::ExpressionStatement(es)) => &es.expression,
+            _ => return Err(self.err(a.span, "expected an expression-bodied arrow")),
+        };
+        self.push_scope();
+        let mut params = Vec::with_capacity(a.params.items.len());
+        let mut param_names = HashSet::new();
+        for p in &a.params.items {
+            let (pname, pty) = self.param(p)?;
+            self.bind(&pname, pty);
+            param_names.insert(pname.clone());
+            params.push(z::Param { name: pname, ty: pty });
+        }
+        let body = self.expr(body_ast)?;
+        // v0: no closures — reject any reference to an enclosing local.
+        if let Some(name) = self.captured_local(&body, &param_names) {
+            self.pop_scope();
+            return Err(self.err(
+                a.span,
+                format!("arrow can't capture local '{name}' yet (v0) — pass it as a parameter"),
+            ));
+        }
+        let ret = match &a.return_type {
+            Some(ann) => self.ty(&ann.type_annotation)?,
+            None => self.ztype_of(&body).ok_or_else(|| {
+                self.err(a.span, "can't infer the arrow's return type — annotate it `(x: T): R => …`")
+            })?,
+        };
+        self.pop_scope();
+        let id = self.next_lambda.get();
+        self.next_lambda.set(id + 1);
+        let name = format!("__lambda{id}");
+        let line = self.line(a.span);
+        let fty = self.intern_func_type(params.iter().map(|p| p.ty).collect(), ret);
+        self.lambdas.borrow_mut().push(z::Func {
+            name: name.clone(),
+            params,
+            ret,
+            body: vec![z::Stmt { kind: z::StmtKind::Return(Some(body)), line }],
+        });
+        self.fn_rets.borrow_mut().insert(name.clone(), ret);
+        self.fn_value_types.borrow_mut().insert(name.clone(), fty);
+        Ok(z::Expr::FuncRef(name))
+    }
+
+    /// The first variable in `body` that names an enclosing local (a capture) and
+    /// isn't one of the arrow's own `params`, if any.
+    fn captured_local(&self, body: &z::Expr, params: &HashSet<String>) -> Option<String> {
+        let mut vars = Vec::new();
+        collect_vars(body, &mut vars);
+        let scope = self.scope.borrow();
+        // Every frame except the top one (the arrow's own params) is enclosing.
+        let enclosing = if scope.len() >= 2 { &scope[..scope.len() - 1] } else { &[][..] };
+        vars.into_iter()
+            .find(|n| !params.contains(n) && enclosing.iter().any(|m| m.contains_key(n)))
     }
 
     /// Lower one formal parameter to `(name, type)`. Rejects destructuring and
@@ -1072,6 +1204,15 @@ impl Lower<'_> {
             TSType::TSParenthesizedType(p) => self.ty(&p.type_annotation)?,
             // `[T0, T1, …]` → a synthetic struct with positional fields "0","1",…
             TSType::TSTupleType(tt) => z::Type::Struct(self.tuple_type_id(tt)?),
+            // `(p: P, …) => R` → a first-class function type.
+            TSType::TSFunctionType(ft) => {
+                let mut params = Vec::with_capacity(ft.params.items.len());
+                for p in &ft.params.items {
+                    params.push(self.param(p)?.1);
+                }
+                let ret = self.ty(&ft.return_type.type_annotation)?;
+                self.intern_func_type(params, ret)
+            }
             // `T | null` / `T | undefined` → a nullable type (struct, or a
             // nullable scalar i64/f64/bool).
             TSType::TSUnionType(u) => {
@@ -1718,13 +1859,18 @@ impl Lower<'_> {
             Expression::BooleanLiteral(b) => z::Expr::Bool(b.value),
             Expression::NullLiteral(_) => z::Expr::Null,
             Expression::Identifier(id) => {
+                let n = id.name.as_str();
                 // `undefined` is conflated with `null` in this subset.
-                if id.name.as_str() == "undefined" {
+                if n == "undefined" {
                     z::Expr::Null
+                } else if self.lookup(n).is_none() && self.fn_value_types.borrow().contains_key(n) {
+                    // A top-level function used as a value (not shadowed by a local).
+                    z::Expr::FuncRef(n.to_string())
                 } else {
-                    z::Expr::Var(id.name.as_str().to_string())
+                    z::Expr::Var(n.to_string())
                 }
             }
+            Expression::ArrowFunctionExpression(a) => self.lower_arrow(a)?,
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression)?,
             Expression::BinaryExpression(b) => z::Expr::Bin {
                 op: self.bin_op(b.operator, b.span)?,
@@ -1937,6 +2083,11 @@ impl Lower<'_> {
                 .ok_or_else(|| self.err(c.span, "spread arguments aren't supported"))?;
             args.push(self.expr(ex)?);
         }
+        // Indirect call through a function-valued local (a parameter or `let`
+        // holding a function). Direct calls to named functions fall through.
+        if matches!(self.lookup(&name), Some(z::Type::Func(_))) {
+            return Ok(z::Expr::CallValue { callee: Box::new(z::Expr::Var(name)), args });
+        }
         // Numeric cast keywords used as calls.
         let cast = match name.as_str() {
             "i64" => Some(z::Type::I64),
@@ -2111,6 +2262,59 @@ fn stmt_has_switch_break(s: &Statement) -> bool {
     }
 }
 
+/// Collect every variable name referenced in a lowered expression (used by the
+/// arrow-capture check).
+fn collect_vars(e: &z::Expr, out: &mut Vec<String>) {
+    use z::Expr::*;
+    match e {
+        Var(n) => out.push(n.clone()),
+        Cast { e, .. } | Unary { e, .. } => collect_vars(e, out),
+        Bin { l, r, .. } => {
+            collect_vars(l, out);
+            collect_vars(r, out);
+        }
+        Cond { cond, then, els } => {
+            collect_vars(cond, out);
+            collect_vars(then, out);
+            collect_vars(els, out);
+        }
+        Call { args, .. } => args.iter().for_each(|a| collect_vars(a, out)),
+        Array(es) => es.iter().for_each(|a| collect_vars(a, out)),
+        Repeat { value, count } => {
+            collect_vars(value, out);
+            collect_vars(count, out);
+        }
+        Index { arr, index } => {
+            collect_vars(arr, out);
+            collect_vars(index, out);
+        }
+        Field { base, .. } | OptField { base, .. } => collect_vars(base, out),
+        StructLit { fields, .. } => fields.iter().for_each(|(_, e)| collect_vars(e, out)),
+        Coalesce { lhs, rhs } => {
+            collect_vars(lhs, out);
+            collect_vars(rhs, out);
+        }
+        OptFieldOr { base, default, .. } => {
+            collect_vars(base, out);
+            collect_vars(default, out);
+        }
+        OptCall { recv, args, .. } => {
+            collect_vars(recv, out);
+            args.iter().for_each(|a| collect_vars(a, out));
+        }
+        OptCallOr { recv, args, default, .. } => {
+            collect_vars(recv, out);
+            args.iter().for_each(|a| collect_vars(a, out));
+            collect_vars(default, out);
+        }
+        CallValue { callee, args } => {
+            collect_vars(callee, out);
+            args.iter().for_each(|a| collect_vars(a, out));
+        }
+        FuncRef(_) | Int(_) | Float(_) | Bool(_) | Str(_) | Null => {}
+    }
+}
+
 /// Does a lowered expression reference any variable? Used to keep default
 /// parameter values constant (they're cloned into call sites).
 fn expr_has_var(e: &z::Expr) -> bool {
@@ -2137,6 +2341,12 @@ fn expr_has_var(e: &z::Expr) -> bool {
         }
         z::Expr::OptCallOr { recv, args, default, .. } => {
             expr_has_var(recv) || args.iter().any(expr_has_var) || expr_has_var(default)
+        }
+        // A function value names a function, not a variable; an indirect call's
+        // callee/args may.
+        z::Expr::FuncRef(_) => false,
+        z::Expr::CallValue { callee, args } => {
+            expr_has_var(callee) || args.iter().any(expr_has_var)
         }
         z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) | z::Expr::Null => {
             false
@@ -2227,6 +2437,7 @@ fn mangle_type(t: z::Type) -> String {
         z::Type::OptF64 => "optf64".into(),
         z::Type::OptBool => "optbool".into(),
         z::Type::Null => "null".into(),
+        z::Type::Func(id) => format!("fn{id}"),
     }
 }
 
@@ -2394,6 +2605,30 @@ mod tests {
                      if (n !== null) { return head.val + n.val; } \
                      return head.val; }";
         assert_eq!(run_i64(ts3), 3); // 1 + 2
+    }
+
+    #[test]
+    fn first_class_functions() {
+        // named function as a value, arrow lambda, function-typed parameter,
+        // and indirect calls — all on the interpreter tier.
+        let ts = "function applyTwice(f: (n: i64) => i64, x: i64): i64 { return f(f(x)); } \
+                  function inc(n: i64): i64 { return n + 1; } \
+                  function main(): i64 { \
+                    const g = inc; \
+                    const double = (n: i64) => n * 2; \
+                    return applyTwice(double, 5) + applyTwice(g, 10) + applyTwice(inc, 100); }";
+        // double(double(5))=20 ; inc(inc(10))=12 ; inc(inc(100))=102 -> 134
+        assert_eq!(run_i64(ts), 134);
+
+        // the program is flagged interpreter-only (native tiers fall back)
+        let m = compile_ts(ts).expect("lower");
+        let prog = zippc::compile_module(&m).expect("compile");
+        assert!(prog.uses_func_value);
+
+        // arrows can't capture enclosing locals yet — a clear error, not a silently
+        // wrong (capture-by-value) result.
+        let cap = "function main(): i64 { let k = 3; const f = (n: i64) => n + k; return f(1); }";
+        assert!(compile_ts(cap).is_err());
     }
 
     #[test]

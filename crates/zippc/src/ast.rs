@@ -47,6 +47,10 @@ pub enum Type {
     OptBool,
     /// The type of the `null` literal — assignable to any nullable type.
     Null,
+    /// A first-class function value `(P0, …) => R`, identified by its index in
+    /// `Module::func_types`. The runtime value is a function index; the native
+    /// tiers fall back (interpreter-only in v0).
+    Func(u32),
 }
 
 impl Type {
@@ -189,6 +193,12 @@ pub enum Expr {
     /// Fused `recv?.m(args) ?? default` — the method result, or `default` when
     /// `recv` is null. Result is the (non-null) return type; works for any return.
     OptCallOr { recv: Box<Expr>, name: String, args: Vec<Expr>, default: Box<Expr> },
+    /// A named function (or lifted lambda) used as a first-class value. Its type
+    /// is the corresponding `Type::Func`.
+    FuncRef(String),
+    /// An indirect call through a function value `f(args)` (where `f` has a
+    /// `Type::Func`). Distinguished from `Call` (a direct, statically-named call).
+    CallValue { callee: Box<Expr>, args: Vec<Expr> },
 }
 
 /// A statement plus the source line it starts on (for error messages).
@@ -251,8 +261,19 @@ pub struct StructDecl {
     pub fields: Vec<(String, Type)>,
 }
 
+/// A first-class function type `(params) => ret`, interned in `Module::func_types`
+/// and referenced by index from `Type::Func`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncType {
+    pub params: Vec<Type>,
+    pub ret: Type,
+}
+
 #[derive(Debug, Clone)]
 pub struct Module {
     pub funcs: Vec<Func>,
     pub structs: Vec<StructDecl>,
+    /// Interned function types (indexed by `Type::Func`). Empty unless the
+    /// program uses first-class functions.
+    pub func_types: Vec<FuncType>,
 }
