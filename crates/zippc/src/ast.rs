@@ -119,6 +119,8 @@ pub enum Expr {
     StructLit { name: String, fields: Vec<(String, Expr)> },
     /// Field access `base.field`.
     Field { base: Box<Expr>, field: String },
+    /// Conditional (ternary) `cond ? then : els`; both arms share a type.
+    Cond { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
 }
 
 /// A statement plus the source line it starts on (for error messages).

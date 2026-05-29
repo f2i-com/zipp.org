@@ -441,6 +441,25 @@ impl<'a> Gen<'a> {
                 self.code.push(Instr::GetField { dst, base: b, field: field.clone() });
                 Ok(dst)
             }
+            // Ternary `cond ? then : els` — branch, with both arms writing `dst`
+            // (mirrors the short-circuit `&&`/`||` lowering above).
+            Expr::Cond { cond, then, els } => {
+                let dst = self.alloc();
+                let c = self.gen_expr(cond)?;
+                let jz = self.here();
+                self.code.push(Instr::JmpIfZero { cond: c, target: 0 });
+                let ta = self.gen_expr(then)?;
+                self.code.push(Instr::Mov { dst, src: ta });
+                let jend = self.here();
+                self.code.push(Instr::Jmp { target: 0 });
+                let else_start = self.here();
+                self.patch(jz, else_start);
+                let eb = self.gen_expr(els)?;
+                self.code.push(Instr::Mov { dst, src: eb });
+                let end = self.here();
+                self.patch(jend, end);
+                Ok(dst)
+            }
             Expr::Unary { op, e } => {
                 let a = self.gen_expr(e)?;
                 let r = self.alloc();

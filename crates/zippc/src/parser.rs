@@ -346,7 +346,16 @@ impl<'a> Parser<'a> {
 
     // ── expression precedence (low -> high) ──
     fn expr(&mut self) -> Result<Expr, String> {
-        self.or_expr()
+        // Ternary `cond ? then : els` sits just below `||` and is right-associative.
+        let cond = self.or_expr()?;
+        if self.eat(&Tok::Question) {
+            let then = self.expr()?;
+            self.expect(&Tok::Colon)?;
+            let els = self.expr()?;
+            Ok(Expr::Cond { cond: Box::new(cond), then: Box::new(then), els: Box::new(els) })
+        } else {
+            Ok(cond)
+        }
     }
 
     fn or_expr(&mut self) -> Result<Expr, String> {

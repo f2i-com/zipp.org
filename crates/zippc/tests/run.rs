@@ -32,6 +32,28 @@ fn recursion() {
 }
 
 #[test]
+fn ternary_expr() {
+    // basic
+    assert_eq!(result("fn main(): i64 { let n = 0 - 5; return n < 0 ? 0 - n : n; }"), 5);
+    // nested, right-associative
+    assert_eq!(
+        result(
+            "fn g(s: i64): i64 { return s >= 90 ? 1 : s >= 80 ? 2 : 3; } \
+             fn main(): i64 { return g(95) + g(85) + g(10); }"
+        ),
+        6
+    );
+    // laziness: the untaken (recursive) branch isn't evaluated at the base case
+    assert_eq!(
+        result(
+            "fn fib(n: i64): i64 { return n < 2 ? n : fib(n-1) + fib(n-2); } \
+             fn main(): i64 { return fib(15); }"
+        ),
+        610
+    );
+}
+
+#[test]
 fn while_loop_sum_of_squares() {
     let src = "fn main(): i64 { let t = 0; let i = 1; while (i <= 10) { t = t + i*i; i = i + 1; } return t; }";
     assert_eq!(result(src), 385);

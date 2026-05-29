@@ -874,6 +874,7 @@ impl Lower<'_> {
                 let z::Type::Struct(id) = self.ztype_of(base)? else { return None };
                 self.struct_field_type(id, field)?
             }
+            z::Expr::Cond { then, .. } => self.ztype_of(then)?,
             _ => return None,
         })
     }
@@ -1386,6 +1387,12 @@ impl Lower<'_> {
                 l: Box::new(self.expr(&l.left)?),
                 r: Box::new(self.expr(&l.right)?),
             },
+            // `cond ? then : els`
+            Expression::ConditionalExpression(c) => z::Expr::Cond {
+                cond: Box::new(self.expr(&c.test)?),
+                then: Box::new(self.expr(&c.consequent)?),
+                els: Box::new(self.expr(&c.alternate)?),
+            },
             Expression::UnaryExpression(u) => {
                 let inner = self.expr(&u.argument)?;
                 match u.operator {
@@ -1883,6 +1890,25 @@ mod tests {
                    function unwrap(b: Box<i64>): i64 { return b.get(); } \
                    function main(): i64 { return unwrap(new Box(99)); }";
         assert_eq!(run_i64(ts3), 99);
+    }
+
+    #[test]
+    fn ternary() {
+        // nested ternary (right-associative) + use in arithmetic
+        let ts = "function f(n: i64): i64 { return n < 0 ? 0 - n : n; } \
+                  function grade(s: i64): i64 { return s >= 90 ? 1 : s >= 80 ? 2 : 3; } \
+                  function main(): i64 { return f(-7) + grade(95) + grade(85) + grade(50); }";
+        assert_eq!(run_i64(ts), 13); // 7 + 1 + 2 + 3
+        // laziness: a fib written with `?:` only terminates if the untaken branch
+        // (the recursive one) is NOT evaluated at the base case
+        let ts2 = "function fib(n: i64): i64 { return n < 2 ? n : fib(n - 1) + fib(n - 2); } \
+                   function main(): i64 { return fib(10); }";
+        assert_eq!(run_i64(ts2), 55);
+        // a ternary yielding a struct, then a field read (result type is tracked)
+        let ts3 = "interface P { x: i64; } \
+                   function pick(b: bool): P { let a: P = { x: 1 }; let c: P = { x: 9 }; return b ? a : c; } \
+                   function main(): i64 { return pick(false).x; }";
+        assert_eq!(run_i64(ts3), 9);
     }
 
     #[test]

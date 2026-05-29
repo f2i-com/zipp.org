@@ -263,6 +263,17 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
         Expr::Float(_) => Ok(Type::F64),
         Expr::Bool(_) => Ok(Type::Bool),
         Expr::Str(_) => Ok(Type::Str),
+        Expr::Cond { cond, then, els } => {
+            expect_type(cond, Type::Bool, scope, cx, "ternary condition")?;
+            let tt = type_of(then, scope, cx)?;
+            let et = type_of(els, scope, cx)?;
+            if tt != et {
+                return Err(format!(
+                    "type error: ternary branches have different types ({tt:?} vs {et:?})"
+                ));
+            }
+            Ok(tt)
+        }
         Expr::Var(name) => scope
             .lookup(name)
             .ok_or_else(|| format!("type error: use of undeclared variable '{name}'")),

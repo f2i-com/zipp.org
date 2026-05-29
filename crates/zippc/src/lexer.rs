@@ -44,6 +44,7 @@ pub enum Tok {
     RBracket,
     Comma,
     Colon,
+    Question,
     Semi,
     Dot,
     Assign, // =
@@ -159,6 +160,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             }
             ':' => {
                 emit!(Tok::Colon);
+                i += 1;
+            }
+            '?' => {
+                emit!(Tok::Question);
                 i += 1;
             }
             ';' => {
