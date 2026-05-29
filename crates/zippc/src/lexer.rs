@@ -65,6 +65,11 @@ pub enum Tok {
     BitNot,
     Shl,
     Shr,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
 }
 
 /// A token plus its 1-based source position.
@@ -162,24 +167,49 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 i += 1;
             }
             '+' => {
-                emit!(Tok::Plus);
-                i += 1;
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    emit!(Tok::PlusEq);
+                    i += 2;
+                } else {
+                    emit!(Tok::Plus);
+                    i += 1;
+                }
             }
             '-' => {
-                emit!(Tok::Minus);
-                i += 1;
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    emit!(Tok::MinusEq);
+                    i += 2;
+                } else {
+                    emit!(Tok::Minus);
+                    i += 1;
+                }
             }
             '*' => {
-                emit!(Tok::Star);
-                i += 1;
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    emit!(Tok::StarEq);
+                    i += 2;
+                } else {
+                    emit!(Tok::Star);
+                    i += 1;
+                }
             }
             '/' => {
-                emit!(Tok::Slash);
-                i += 1;
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    emit!(Tok::SlashEq);
+                    i += 2;
+                } else {
+                    emit!(Tok::Slash);
+                    i += 1;
+                }
             }
             '%' => {
-                emit!(Tok::Percent);
-                i += 1;
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    emit!(Tok::PercentEq);
+                    i += 2;
+                } else {
+                    emit!(Tok::Percent);
+                    i += 1;
+                }
             }
             '=' => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {

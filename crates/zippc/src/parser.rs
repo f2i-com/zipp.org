@@ -30,6 +30,18 @@ pub fn parse(tokens: &[Token]) -> Result<Module, String> {
     Ok(Module { funcs, structs })
 }
 
+/// Map a compound-assignment token (`+=` etc.) to its binary operator.
+fn compound_op(t: &Tok) -> Option<BinOp> {
+    Some(match t {
+        Tok::PlusEq => BinOp::Add,
+        Tok::MinusEq => BinOp::Sub,
+        Tok::StarEq => BinOp::Mul,
+        Tok::SlashEq => BinOp::Div,
+        Tok::PercentEq => BinOp::Mod,
+        _ => return None,
+    })
+}
+
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
@@ -271,21 +283,44 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::Semi)?;
                 Ok(StmtKind::Print(e))
             }
-            // assignment to an lvalue (`x = e;` / `a[i] = e;`) or a bare expression
+            // assignment / compound assignment to an lvalue, or a bare expression
             _ => {
                 let e = self.expr()?;
                 if self.eat(&Tok::Assign) {
                     let value = self.expr()?;
                     self.expect(&Tok::Semi)?;
-                    match e {
-                        Expr::Var(_) | Expr::Index { .. } | Expr::Field { .. } =>Ok(StmtKind::Assign { target: e, value }),
-                        _ => Err(format!("parse error: invalid assignment target{}", self.at())),
-                    }
+                    self.make_assign(e, value)
+                } else if let Some(op) = self.peek().and_then(compound_op) {
+                    self.bump()?;
+                    let rhs = self.expr()?;
+                    self.expect(&Tok::Semi)?;
+                    self.make_compound(e, op, rhs)
                 } else {
                     self.expect(&Tok::Semi)?;
                     Ok(StmtKind::ExprStmt(e))
                 }
             }
+        }
+    }
+
+    /// Build a plain assignment, validating the lvalue.
+    fn make_assign(&self, target: Expr, value: Expr) -> Result<StmtKind, String> {
+        match target {
+            Expr::Var(_) | Expr::Index { .. } | Expr::Field { .. } => {
+                Ok(StmtKind::Assign { target, value })
+            }
+            _ => Err(format!("parse error: invalid assignment target{}", self.at())),
+        }
+    }
+
+    /// Desugar `target op= rhs` into `target = target op rhs`.
+    fn make_compound(&self, target: Expr, op: BinOp, rhs: Expr) -> Result<StmtKind, String> {
+        match &target {
+            Expr::Var(_) | Expr::Index { .. } | Expr::Field { .. } => {
+                let value = Expr::Bin { op, l: Box::new(target.clone()), r: Box::new(rhs) };
+                Ok(StmtKind::Assign { target, value })
+            }
+            _ => Err(format!("parse error: invalid assignment target{}", self.at())),
         }
     }
 
@@ -295,10 +330,11 @@ impl<'a> Parser<'a> {
         let e = self.expr()?;
         let kind = if self.eat(&Tok::Assign) {
             let value = self.expr()?;
-            match e {
-                Expr::Var(_) | Expr::Index { .. } | Expr::Field { .. } =>StmtKind::Assign { target: e, value },
-                _ => return Err(format!("parse error: invalid assignment target{}", self.at())),
-            }
+            self.make_assign(e, value)?
+        } else if let Some(op) = self.peek().and_then(compound_op) {
+            self.bump()?;
+            let rhs = self.expr()?;
+            self.make_compound(e, op, rhs)?
         } else {
             StmtKind::ExprStmt(e)
         };

@@ -120,6 +120,24 @@ another). Control-flow / memory steps are recorded but **not yet** constrained
 non-overflowing (true for the bundled examples). Hardening this is the roadmap —
 the same path `zk-formlogic` took to its 78-column trace.
 
+## Performance (honest, measured)
+
+ZIPP v0 runs on a **bytecode interpreter**, so it is **not yet** competitive
+with V8 on raw compute. A 50M-iteration sum loop (`bench/loop.zipp`):
+
+| | execution |
+|---|---|
+| ZIPP (release interpreter) | ~0.59 s |
+| Node 24 (V8 JIT) | ~0.028 s |
+
+≈20× slower on a hot loop — expected: V8 JIT-compiles to native machine code,
+ZIPP interprets bytecode. ZIPP wins on **startup** (instant native binary, no
+JIT warmup), so very small scripts finish quicker in wall-clock.
+
+Closing the compute gap is the `ZIPP.md` thesis and requires the **AOT native
+backend** (Cranelift tier-0, then LLVM + LTO + PGO) — Phases 7–9. That backend,
+not the interpreter, is where "beat V8" lives; it's the current focus.
+
 ## License
 
 Apache-2.0

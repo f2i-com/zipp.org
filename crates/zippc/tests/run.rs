@@ -319,6 +319,16 @@ fn prove_profile_rejects_structs() {
     assert!(zippc::vm::run(&prog, true).is_err());
 }
 
+// ── compound assignment ──
+
+#[test]
+fn compound_assignment() {
+    assert_eq!(result("fn main(): i64 { let x = 10; x += 5; x -= 2; x *= 3; return x; }"), 39);
+    assert_eq!(result("fn main(): i64 { let x = 17; x /= 5; x %= 2; return x; }"), 1);
+    assert_eq!(result("fn main(): i64 { let a = [1, 2, 3]; a[1] += 10; return a[1]; }"), 12);
+    assert_eq!(result("fn main(): i64 { let s = 0; for (let i = 1; i <= 5; i += 1) { s += i; } return s; }"), 15);
+}
+
 // ── for loops ──
 
 #[test]
