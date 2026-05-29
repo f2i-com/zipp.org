@@ -105,6 +105,7 @@ cargo build --release
 ./target/release/zipp run --jit examples/account.ts  # class: methods + new + this
 ./target/release/zipp run --llvm examples/generic.ts # generic functions
 ./target/release/zipp run --jit examples/box.ts      # generic classes Box<T>/Pair<A,B>
+./target/release/zipp run --llvm examples/tuple.ts   # tuples [i64,str] + destructuring
 ./target/release/zipp run examples/cards.ts          # numeric enum + for...of
 ./target/release/zipp run --wasm examples/calc.ts    # switch (runs in the contract profile)
 ./target/release/zipp run --jit examples/ternary.ts  # ternary ?: (a lazy recursive fib)
@@ -350,8 +351,8 @@ recursion (with **default parameters**), `let`/`const` (incl. array/object
 **destructuring**),
 `if`/`while`/`for`/`for…of`/`switch`, `break`/`continue`, the operator set +
 ternary `?:`, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing,
-`.length`), numeric **and string `enum`s**, **`interface`s and `class`es →
-structs**
+`.length`), **tuples** (`[i64, str]` — positional indexing + destructuring),
+numeric **and string `enum`s**, **`interface`s and `class`es → structs**
 (interfaces construct with `let p: T = {…}` / `{…} as T`; classes give you
 fields, a constructor, methods, `this`, and `new C(…)` — a class lowers to a
 factory plus methods taking `this`), field read/write, **generics** — both
@@ -366,7 +367,7 @@ code (a `Box<i64>` and a `Box<bool>` are two distinct structs), **optionals** �
 `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` and your
 `interface`/`class`/`enum` names usable directly. `examples/fib.ts` runs
 identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
-`point.ts` interfaces; `account.ts` a class with methods; `generic.ts`
+`tuple.ts` tuples + destructuring; `point.ts` interfaces; `account.ts` a class with methods; `generic.ts`
 monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
 `for…of`; `calc.ts` a `switch`; `ternary.ts` the `?:` operator; `destructure.ts`
 a string enum + array/object destructuring; `defaults.ts` default parameters;

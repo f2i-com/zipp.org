@@ -57,6 +57,7 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
         pending_classes: RefCell::new(Vec::new()),
         done_insts: RefCell::new(HashSet::new()),
         enums: HashMap::new(),
+        tuple_ids: RefCell::new(HashSet::new()),
         tmp: Cell::new(0),
     };
     lower.module(&ret.program)
@@ -98,6 +99,9 @@ struct Lower<'s> {
     done_insts: RefCell<HashSet<String>>,
     /// Enum: name → its members (numeric → i64, or string → str).
     enums: HashMap<String, EnumKind>,
+    /// Struct ids that are tuples (`[T0, T1, …]` lowers to a struct with fields
+    /// "0","1",…). Distinguishes positional indexing/construction from structs.
+    tuple_ids: RefCell<HashSet<u32>>,
     /// Counter for fresh temporary names (e.g. `for…of` desugaring).
     tmp: Cell<u32>,
 }
@@ -1064,55 +1068,10 @@ impl Lower<'_> {
                 })?;
                 z::Type::Array(e)
             }
-            TSType::TSTypeReference(r) => {
-                let name = match &r.type_name {
-                    TSTypeName::IdentifierReference(id) => id.name.as_str(),
-                    _ => return Err(self.err(r.span, "qualified type names aren't supported")),
-                };
-                match name {
-                    "i64" => z::Type::I64,
-                    "i32" => z::Type::I32,
-                    "u32" => z::Type::U32,
-                    "u64" => z::Type::U64,
-                    "f64" => z::Type::F64,
-                    "bool" => z::Type::Bool,
-                    "string" | "str" => z::Type::Str,
-                    other => {
-                        // A generic type parameter currently in scope?
-                        if let Some(t) =
-                            self.type_env.borrow().iter().rev().find_map(|m| m.get(other).copied())
-                        {
-                            t
-                        } else if let Some(k) = self.enums.get(other) {
-                            match k {
-                                EnumKind::Int(_) => z::Type::I64,
-                                EnumKind::Str(_) => z::Type::Str,
-                            }
-                        } else if self.generic_class_info.contains_key(other) {
-                            // `Box<i64>` → instantiate the generic class
-                            let args = match &r.type_arguments {
-                                Some(ta) => ta
-                                    .params
-                                    .iter()
-                                    .map(|p| self.ty(p))
-                                    .collect::<LResult<Vec<_>>>()?,
-                                None => {
-                                    return Err(self.err(
-                                        r.span,
-                                        format!("'{other}' is generic — write `{other}<…>`"),
-                                    ))
-                                }
-                            };
-                            z::Type::Struct(self.instantiate_generic_class(other, args, r.span)?)
-                        } else if let Some(id) = self.struct_id(other) {
-                            z::Type::Struct(id)
-                        } else {
-                            return Err(self.err(r.span, format!("unknown type '{other}'")));
-                        }
-                    }
-                }
-            }
+            TSType::TSTypeReference(r) => self.resolve_ref(r)?,
             TSType::TSParenthesizedType(p) => self.ty(&p.type_annotation)?,
+            // `[T0, T1, …]` → a synthetic struct with positional fields "0","1",…
+            TSType::TSTupleType(tt) => z::Type::Struct(self.tuple_type_id(tt)?),
             // `T | null` / `T | undefined` → a nullable type (struct, or a
             // nullable scalar i64/f64/bool).
             TSType::TSUnionType(u) => {
@@ -1132,6 +1091,116 @@ impl Lower<'_> {
             }
             other => return Err(self.err(span_of_type(other), "unsupported type")),
         })
+    }
+
+    /// Resolve a named type reference (`i64`, a struct/enum/type-param, a generic
+    /// class instantiation `Box<i64>`).
+    fn resolve_ref(&self, r: &TSTypeReference) -> LResult<z::Type> {
+        let name = match &r.type_name {
+            TSTypeName::IdentifierReference(id) => id.name.as_str(),
+            _ => return Err(self.err(r.span, "qualified type names aren't supported")),
+        };
+        Ok(match name {
+            "i64" => z::Type::I64,
+            "i32" => z::Type::I32,
+            "u32" => z::Type::U32,
+            "u64" => z::Type::U64,
+            "f64" => z::Type::F64,
+            "bool" => z::Type::Bool,
+            "string" | "str" => z::Type::Str,
+            other => {
+                if let Some(t) =
+                    self.type_env.borrow().iter().rev().find_map(|m| m.get(other).copied())
+                {
+                    t
+                } else if let Some(k) = self.enums.get(other) {
+                    match k {
+                        EnumKind::Int(_) => z::Type::I64,
+                        EnumKind::Str(_) => z::Type::Str,
+                    }
+                } else if self.generic_class_info.contains_key(other) {
+                    let args = match &r.type_arguments {
+                        Some(ta) => ta.params.iter().map(|p| self.ty(p)).collect::<LResult<_>>()?,
+                        None => {
+                            return Err(
+                                self.err(r.span, format!("'{other}' is generic — write `{other}<…>`")),
+                            )
+                        }
+                    };
+                    z::Type::Struct(self.instantiate_generic_class(other, args, r.span)?)
+                } else if let Some(id) = self.struct_id(other) {
+                    z::Type::Struct(id)
+                } else {
+                    return Err(self.err(r.span, format!("unknown type '{other}'")));
+                }
+            }
+        })
+    }
+
+    /// Resolve a tuple type to its synthetic struct id (interned per shape).
+    fn tuple_type_id(&self, tt: &TSTupleType) -> LResult<u32> {
+        let mut elems = Vec::with_capacity(tt.element_types.len());
+        for el in &tt.element_types {
+            elems.push(self.tuple_elem_ty(el)?);
+        }
+        // find-or-create a struct named for the element-type sequence
+        let name = format!(
+            "__tup{}",
+            elems.iter().map(|t| format!("_{}", mangle_type(*t))).collect::<String>()
+        );
+        if let Some(id) = self.struct_id(&name) {
+            return Ok(id);
+        }
+        let fields = elems.iter().enumerate().map(|(i, t)| (i.to_string(), *t)).collect();
+        let id = self.add_struct(z::StructDecl { name, fields });
+        self.tuple_ids.borrow_mut().insert(id);
+        Ok(id)
+    }
+
+    /// The type of one tuple element.
+    fn tuple_elem_ty(&self, el: &TSTupleElement) -> LResult<z::Type> {
+        match el {
+            TSTupleElement::TSNumberKeyword(_) => Ok(z::Type::F64),
+            TSTupleElement::TSBigIntKeyword(_) => Ok(z::Type::I64),
+            TSTupleElement::TSBooleanKeyword(_) => Ok(z::Type::Bool),
+            TSTupleElement::TSStringKeyword(_) => Ok(z::Type::Str),
+            TSTupleElement::TSTypeReference(r) => self.resolve_ref(r),
+            TSTupleElement::TSArrayType(a) => {
+                let elem = self.ty(&a.element_type)?;
+                let e = elem
+                    .as_elem()
+                    .ok_or_else(|| self.err(a.span, "array element type isn't a scalar"))?;
+                Ok(z::Type::Array(e))
+            }
+            TSTupleElement::TSTupleType(t) => Ok(z::Type::Struct(self.tuple_type_id(t)?)),
+            TSTupleElement::TSParenthesizedType(p) => self.ty(&p.type_annotation),
+            _ => Err(self.err(oxc_span::GetSpan::span(el), "unsupported tuple element type")),
+        }
+    }
+
+    /// Lower an array literal `[a, b]` to a nominal tuple `StructLit`.
+    fn arr_tuple_lit(&self, arr: &ArrayExpression, id: u32) -> LResult<z::Expr> {
+        let name = self.struct_name(id).unwrap();
+        let nfields = self.struct_decls.borrow()[id as usize].fields.len();
+        if arr.elements.len() != nfields {
+            return Err(self.err(
+                arr.span,
+                format!("tuple expects {nfields} elements, got {}", arr.elements.len()),
+            ));
+        }
+        let mut fields = Vec::with_capacity(nfields);
+        for (i, el) in arr.elements.iter().enumerate() {
+            let ex = el
+                .as_expression()
+                .ok_or_else(|| self.err(arr.span, "tuple holes/spreads aren't supported"))?;
+            fields.push((i.to_string(), self.expr(ex)?));
+        }
+        Ok(z::Expr::StructLit { name, fields })
+    }
+
+    /// True if `t` is a tuple type (a synthetic positional struct).
+    fn is_tuple(&self, t: z::Type) -> bool {
+        matches!(t, z::Type::Struct(id) if self.tuple_ids.borrow().contains(&id))
     }
 
     fn block(&self, stmts: &[Statement]) -> LResult<Vec<z::Stmt>> {
@@ -1154,6 +1223,12 @@ impl Lower<'_> {
                     // `return { ... }` from a struct-typed function.
                     (Some(Expression::ObjectExpression(obj)), Some(id)) => {
                         Some(self.obj_struct_lit(obj, id)?)
+                    }
+                    // `return [ ... ]` from a tuple-typed function.
+                    (Some(Expression::ArrayExpression(arr)), Some(id))
+                        if self.is_tuple(z::Type::Struct(id)) =>
+                    {
+                        Some(self.arr_tuple_lit(arr, id)?)
                     }
                     (Some(e), _) => Some(self.expr(e)?),
                     (None, _) => None,
@@ -1364,6 +1439,12 @@ impl Lower<'_> {
                             Some(z::Type::Struct(id) | z::Type::OptStruct(id)),
                             Expression::ObjectExpression(obj),
                         ) => self.obj_struct_lit(obj, *id)?,
+                        // `let t: [i64, str] = [a, b]` — array literal in tuple context
+                        (Some(z::Type::Struct(id)), Expression::ArrayExpression(arr))
+                            if self.is_tuple(z::Type::Struct(*id)) =>
+                        {
+                            self.arr_tuple_lit(arr, *id)?
+                        }
                         _ => self.expr(init)?,
                     };
                     // Track the variable's type (annotation, else inferred).
@@ -1394,26 +1475,33 @@ impl Lower<'_> {
             return Err(self.err(arr.span, "a rest element `...` in array destructuring isn't supported"));
         }
         let value = self.expr(init)?;
+        // a tuple destructures by positional field, an array by index
+        let tuple = self.ztype_of(&value).is_some_and(|t| self.is_tuple(t));
+        let tmp_ty = self.ztype_of(&value);
         let tmp = self.fresh("d");
         let line = self.line(arr.span);
         out.push(z::Stmt { kind: z::StmtKind::Let { name: tmp.clone(), ty: None, value }, line });
+        if let Some(t) = tmp_ty {
+            self.bind(&tmp, t);
+        }
         for (i, el) in arr.elements.iter().enumerate() {
             let Some(pat) = el else { continue }; // hole, e.g. `[, b]`
             let name = match pat {
                 BindingPattern::BindingIdentifier(bi) => bi.name.as_str().to_string(),
                 _ => return Err(self.err(arr.span, "nested destructuring isn't supported")),
             };
-            out.push(z::Stmt {
-                kind: z::StmtKind::Let {
-                    name,
-                    ty: None,
-                    value: z::Expr::Index {
-                        arr: Box::new(z::Expr::Var(tmp.clone())),
-                        index: Box::new(z::Expr::Int(i as i64)),
-                    },
-                },
-                line,
-            });
+            let access = if tuple {
+                z::Expr::Field { base: Box::new(z::Expr::Var(tmp.clone())), field: i.to_string() }
+            } else {
+                z::Expr::Index {
+                    arr: Box::new(z::Expr::Var(tmp.clone())),
+                    index: Box::new(z::Expr::Int(i as i64)),
+                }
+            };
+            if let Some(t) = self.ztype_of(&access) {
+                self.bind(&name, t);
+            }
+            out.push(z::Stmt { kind: z::StmtKind::Let { name, ty: None, value: access }, line });
         }
         Ok(())
     }
@@ -1665,10 +1753,22 @@ impl Lower<'_> {
                 }
                 z::Expr::Array(elems)
             }
-            Expression::ComputedMemberExpression(m) => z::Expr::Index {
-                arr: Box::new(self.expr(&m.object)?),
-                index: Box::new(self.expr(&m.expression)?),
-            },
+            Expression::ComputedMemberExpression(m) => {
+                let obj = self.expr(&m.object)?;
+                // a tuple `t[0]` is a positional field access (constant index);
+                // an array `a[i]` is a runtime index.
+                if self.ztype_of(&obj).is_some_and(|t| self.is_tuple(t)) {
+                    let idx = const_int_lit(&m.expression).ok_or_else(|| {
+                        self.err(m.span, "a tuple index must be a constant integer")
+                    })?;
+                    z::Expr::Field { base: Box::new(obj), field: idx.to_string() }
+                } else {
+                    z::Expr::Index {
+                        arr: Box::new(obj),
+                        index: Box::new(self.expr(&m.expression)?),
+                    }
+                }
+            }
             Expression::StaticMemberExpression(m) => self.member(m)?,
             // `a?.b` — optional chaining (the chain is wrapped here).
             Expression::ChainExpression(c) => match &c.expression {
@@ -1692,6 +1792,14 @@ impl Lower<'_> {
                 ) = (to, &a.expression)
                 {
                     self.obj_struct_lit(obj, id)?
+                } else if let (z::Type::Struct(id), Expression::ArrayExpression(arr)) =
+                    (to, &a.expression)
+                {
+                    if self.is_tuple(to) {
+                        self.arr_tuple_lit(arr, id)? // `[a, b] as [i64, str]`
+                    } else {
+                        self.expr(&a.expression)?
+                    }
                 } else {
                     self.expr(&a.expression)?
                 }
@@ -1997,6 +2105,15 @@ fn optional_member<'e, 'a>(e: &'e Expression<'a>) -> Option<&'e StaticMemberExpr
     None
 }
 
+/// A constant integer literal (for a tuple index), if `e` is one.
+fn const_int_lit(e: &Expression) -> Option<i64> {
+    match e {
+        Expression::NumericLiteral(n) if n.value.fract() == 0.0 => Some(n.value as i64),
+        Expression::ParenthesizedExpression(p) => const_int_lit(&p.expression),
+        _ => None,
+    }
+}
+
 /// Is this TS type the `null` or `undefined` keyword (a nullable union member)?
 fn is_null_ts_type(t: &TSType) -> bool {
     matches!(t, TSType::TSNullKeyword(_) | TSType::TSUndefinedKeyword(_))
@@ -2214,6 +2331,23 @@ mod tests {
                      if (n !== null) { return head.val + n.val; } \
                      return head.val; }";
         assert_eq!(run_i64(ts3), 3); // 1 + 2
+    }
+
+    #[test]
+    fn tuples() {
+        // tuple return + destructuring (the multiple-return-values pattern)
+        let ts = "function divmod(a: i64, b: i64): [i64, i64] { return [a / b, a % b]; } \
+                  function main(): i64 { let [q, r] = divmod(17, 5); return q * 100 + r; }";
+        assert_eq!(run_i64(ts), 302); // 3*100 + 2
+        // heterogeneous tuple local + positional indexing
+        let ts2 = "function main(): i64 { \
+                     let t: [i64, str] = [42, \"hi\"]; \
+                     return t[0] + len(t[1]); }";
+        assert_eq!(run_i64(ts2), 44); // 42 + len("hi")
+        // tuple as a parameter
+        let ts3 = "function fst(p: [i64, bool]): i64 { return p[0]; } \
+                   function main(): i64 { let p: [i64, bool] = [7, true]; return fst(p); }";
+        assert_eq!(run_i64(ts3), 7);
     }
 
     #[test]
