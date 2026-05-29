@@ -71,8 +71,10 @@ fn lty_of(t: Type) -> LTy {
         Type::Array(e) => LTy::Arr(matches!(e, Elem::F64)),
         Type::Str => LTy::Str,
         Type::Struct(id) => LTy::Struct(id),
-        // a nullable struct is a struct pointer that may be null
+        // nullable heap references are just the pointer (may be null)
         Type::OptStruct(id) => LTy::Struct(id),
+        Type::OptStr => LTy::Str,
+        Type::OptArr(e) => LTy::Arr(matches!(e, Elem::F64)),
         Type::I32 => LTy::I32,
         Type::U32 => LTy::U32,
         Type::U64 => LTy::U64,
@@ -169,9 +171,9 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
                     t[*dst as usize] = s;
                 }
             }
-            Instr::ConstNull { dst, id } => {
-                t[*dst as usize] = match id {
-                    Some(s) => LTy::Struct(*s),
+            Instr::ConstNull { dst, ty } => {
+                t[*dst as usize] = match ty {
+                    Some(t2) => lty_of(*t2),
                     None => LTy::I64,
                 };
             }
@@ -457,7 +459,11 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 // the string handle is just its address.
                 store(&mut s, &rty, *dst, &format!("@.sconst_{pc}"));
             }
-            Instr::Bin { op, dst, a, b } if rty[*a as usize] == LTy::Str => {
+            // Both operands strings → runtime concat/eq; `str === null` (other
+            // side an i64 null) falls through to the pointer compare below.
+            Instr::Bin { op, dst, a, b }
+                if rty[*a as usize] == LTy::Str && rty[*b as usize] == LTy::Str =>
+            {
                 // String concat (+) / equality (==, !=) via the runtime.
                 let av = load(&mut s, &mut tmp, &rty, *a);
                 let bv = load(&mut s, &mut tmp, &rty, *b);

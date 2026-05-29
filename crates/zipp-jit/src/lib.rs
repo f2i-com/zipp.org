@@ -125,8 +125,10 @@ fn jty_of(t: Type) -> JTy {
         Type::Array(e) => JTy::Arr(matches!(e, Elem::F64)),
         Type::Str => JTy::Str,
         Type::Struct(id) => JTy::Struct(id),
-        // a nullable struct is a struct pointer that may be 0 (null)
+        // nullable heap references are just the pointer (may be 0 = null)
         Type::OptStruct(id) => JTy::Struct(id),
+        Type::OptStr => JTy::Str,
+        Type::OptArr(e) => JTy::Arr(matches!(e, Elem::F64)),
         Type::I32 => JTy::I32,
         Type::U32 => JTy::U32,
         Type::U64 => JTy::U64,
@@ -361,10 +363,10 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
             }
             Instr::Len { dst, .. } => t[*dst as usize] = JTy::I64,
             Instr::NewStruct { id, dst, .. } => t[*dst as usize] = JTy::Struct(*id),
-            Instr::ConstNull { dst, id } => {
-                t[*dst as usize] = match id {
-                    Some(s) => JTy::Struct(*s), // a typed null (e.g. a nullable local)
-                    None => JTy::I64,           // an untyped null (compared, not dereferenced)
+            Instr::ConstNull { dst, ty } => {
+                t[*dst as usize] = match ty {
+                    Some(t2) => jty_of(*t2), // a typed null (e.g. a nullable local)
+                    None => JTy::I64,        // an untyped null (compared, not dereferenced)
                 };
             }
             Instr::GetField { dst, base, field } => {
@@ -607,7 +609,11 @@ fn compile_function(
                 builder.def_var(var(*dst), s);
             }
             Instr::Bin { op, dst, a, b } => {
-                let res = if matches!(rty[*a as usize], JTy::Str) {
+                // Both operands must be strings for the runtime concat/eq path;
+                // `str === null` (the other side an i64 null) is a pointer compare.
+                let res = if matches!(rty[*a as usize], JTy::Str)
+                    && matches!(rty[*b as usize], JTy::Str)
+                {
                     // String concat (+) / equality (==, !=) via the runtime.
                     let av = builder.use_var(var(*a));
                     let bv = builder.use_var(var(*b));
@@ -1013,6 +1019,10 @@ mod tests {
                    function z(u: U | null): i64 { return u?.a?.zip ?? -1; } \
                    function main(): i64 { let aa: A = { zip: 5 }; let u: U = { a: aa }; return z(u) + z(null); }";
         assert_eq!(jit_ts_i64(ts4), 4); // 5 + (-1)
+        // `str | null` is a heap pointer (like OptStruct) → also native
+        let ts5 = "function g(s: str | null): i64 { return len(s ?? \"x\"); } \
+                   function main(): i64 { let a: str | null = \"abcd\"; return g(a) + g(null); }";
+        assert_eq!(jit_ts_i64(ts5), 5); // 4 + 1
     }
     fn jit_f64(src: &str) -> f64 {
         let prog = zippc::compile(src).expect("compile");

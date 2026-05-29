@@ -112,6 +112,7 @@ cargo build --release
 ./target/release/zipp run examples/defaults.ts       # default parameter values
 ./target/release/zipp run examples/optional.ts       # T | null, ??, narrowing
 ./target/release/zipp run --llvm examples/chain.ts   # optional chaining a?.b?.c ?? d
+./target/release/zipp run --jit examples/nullable_heap.ts # str | null, T[] | null (native)
 ./target/release/zipp run examples/nullable_scalar.ts # i64 | null (interpreter tier)
 
 # run the language test suite
@@ -357,10 +358,11 @@ factory plus methods taking `this`), field read/write, **generics** — both
 functions (`f<T>(…)`) and classes (`class Box<T>`) — monomorphized per use to
 concrete types (inferred or explicit), so the backends only ever see concrete
 code (a `Box<i64>` and a `Box<bool>` are two distinct structs), **optionals** —
-`T | null` (structs) and nullable scalars `i64 | null` / `f64 | null` /
-`bool | null`, plus `null`, `x ?? y`, `=== null`, `if (x !== null)` flow
-narrowing, and optional chaining `a?.b` / `a?.b ?? default`, `console.log`, math
-builtins. **Type mapping:** `number`→f64, `bigint`→i64, `boolean`→bool,
+`T | null` for heap types (structs, `str`, arrays) and nullable scalars
+`i64 | null` / `f64 | null` / `bool | null`, plus `null`, `x ?? y`, `=== null`,
+`if (x !== null)` flow narrowing, and optional chaining `a?.b` / `a?.b ?? default`,
+`console.log`, math builtins. **Type mapping:** `number`→f64, `bigint`→i64,
+`boolean`→bool,
 `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` and your
 `interface`/`class`/`enum` names usable directly. `examples/fib.ts` runs
 identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
@@ -369,8 +371,9 @@ monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
 `for…of`; `calc.ts` a `switch`; `ternary.ts` the `?:` operator; `destructure.ts`
 a string enum + array/object destructuring; `defaults.ts` default parameters;
 `optional.ts` nullable references (`T | null`, `??`, narrowing); `chain.ts`
-optional chaining; `nullable_scalar.ts` `i64 | null` etc. Most run on all four
-backends; **nullable structs (`T | null`) run natively on `--jit` and `--llvm`**
+optional chaining; `nullable_heap.ts` `str | null` + `T[] | null`;
+`nullable_scalar.ts` `i64 | null`. Most run on all four backends; **nullable
+*heap* types — structs, `str`, arrays — run natively on `--jit` and `--llvm`**
 (a null is a 0/null pointer; `=== null` is a pointer compare). **Nullable
 *scalars* (`i64 | null`) run on the interpreter** — scalars have no spare null
 value, so the native tiers fall back (they'd need boxing). `--wasm` falls back

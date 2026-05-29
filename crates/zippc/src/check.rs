@@ -353,10 +353,14 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                     return Err(format!("type error: optional access `?.{field}` on a {bt:?}"))
                 }
             };
-            match struct_field_ty(cx, xid, field)? {
-                Type::Struct(f) | Type::OptStruct(f) => Ok(Type::OptStruct(f)),
+            // result is `field | null`; a heap field (struct/str/array) becomes
+            // the matching nullable, a scalar field must be coalesced.
+            let ft = struct_field_ty(cx, xid, field)?;
+            let inner = ft.opt_inner().unwrap_or(ft);
+            match inner {
+                Type::Struct(_) | Type::Str | Type::Array(_) => Ok(inner.into_opt().unwrap()),
                 _ => Err(format!(
-                    "type error: optional access of the non-struct field '{field}' must be \
+                    "type error: optional access of the non-heap field '{field}' must be \
                      coalesced — write `…?.{field} ?? default`"
                 )),
             }

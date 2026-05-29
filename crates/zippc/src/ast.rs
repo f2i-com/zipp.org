@@ -35,6 +35,10 @@ pub enum Type {
     /// A nullable struct reference, `T | null`. Runtime value is a struct pointer
     /// that may be null. Native tiers represent it as a pointer (0 = null).
     OptStruct(u32),
+    /// Nullable heap references `str | null` / `T[] | null` — a pointer that may
+    /// be null (0), like `OptStruct`; native tiers handle them directly.
+    OptStr,
+    OptArr(Elem),
     /// Nullable scalars `i64 | null` / `f64 | null` / `bool | null`. Scalars have
     /// no spare null sentinel, so these run on the interpreter (dynamically
     /// tagged); the native tiers fall back.
@@ -61,6 +65,8 @@ impl Type {
     pub fn opt_inner(self) -> Option<Type> {
         match self {
             Type::OptStruct(id) => Some(Type::Struct(id)),
+            Type::OptStr => Some(Type::Str),
+            Type::OptArr(e) => Some(Type::Array(e)),
             Type::OptI64 => Some(Type::I64),
             Type::OptF64 => Some(Type::F64),
             Type::OptBool => Some(Type::Bool),
@@ -73,10 +79,18 @@ impl Type {
         self.opt_inner().is_some()
     }
 
-    /// The nullable wrapper of a scalar/struct type (`T` → `T | null`), if any.
+    /// True for a nullable *heap* type (struct/str/array) — native tiers handle
+    /// these as a possibly-null pointer (nullable scalars need boxing instead).
+    pub fn is_opt_heap(self) -> bool {
+        matches!(self, Type::OptStruct(_) | Type::OptStr | Type::OptArr(_))
+    }
+
+    /// The nullable wrapper of a scalar/heap type (`T` → `T | null`), if any.
     pub fn into_opt(self) -> Option<Type> {
         match self {
             Type::Struct(id) => Some(Type::OptStruct(id)),
+            Type::Str => Some(Type::OptStr),
+            Type::Array(e) => Some(Type::OptArr(e)),
             Type::I64 => Some(Type::OptI64),
             Type::F64 => Some(Type::OptF64),
             Type::Bool => Some(Type::OptBool),

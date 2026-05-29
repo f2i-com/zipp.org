@@ -35,9 +35,10 @@ pub enum Instr {
     NewStruct { id: u32, dst: u32, fields: Vec<u32> },
     GetField { dst: u32, base: u32, field: String },
     SetField { base: u32, field: String, value: u32 },
-    // Nullable struct references. `id` is the struct the null belongs to when
-    // known from context (so the JIT can type a null-initialized local).
-    ConstNull { dst: u32, id: Option<u32> },
+    // A null value. `ty` is the non-null inner type the null belongs to when
+    // known from context (so native tiers can type a null-initialized local);
+    // `None` for a bare comparison operand.
+    ConstNull { dst: u32, ty: Option<Type> },
 }
 
 /// Field names of a struct, in declaration order (indexed by struct id). The VM
@@ -262,9 +263,9 @@ impl<'a> Gen<'a> {
                 // A null-initialized nullable local carries its struct id, so the
                 // JIT can type the register (and dereference it after narrowing).
                 let v = match (value, ty) {
-                    (Expr::Null, Some(Type::OptStruct(id))) => {
+                    (Expr::Null, Some(opt)) if opt.is_opt() => {
                         let r = self.alloc();
-                        self.code.push(Instr::ConstNull { dst: r, id: Some(*id) });
+                        self.code.push(Instr::ConstNull { dst: r, ty: opt.opt_inner() });
                         r
                     }
                     _ => self.gen_expr(value)?,
@@ -490,7 +491,7 @@ impl<'a> Gen<'a> {
             }
             Expr::Null => {
                 let dst = self.alloc();
-                self.code.push(Instr::ConstNull { dst, id: None });
+                self.code.push(Instr::ConstNull { dst, ty: None });
                 Ok(dst)
             }
             // `lhs ?? rhs` — evaluate lhs once; if it's null, take rhs.
@@ -499,7 +500,7 @@ impl<'a> Gen<'a> {
                 let l = self.gen_expr(lhs)?;
                 self.code.push(Instr::Mov { dst, src: l });
                 let nullr = self.alloc();
-                self.code.push(Instr::ConstNull { dst: nullr, id: None });
+                self.code.push(Instr::ConstNull { dst: nullr, ty: None });
                 let isnull = self.alloc();
                 self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: dst, b: nullr });
                 let jz = self.here();
@@ -514,9 +515,9 @@ impl<'a> Gen<'a> {
             Expr::OptField { base, field } => {
                 let dst = self.alloc();
                 let b = self.gen_expr(base)?;
-                self.code.push(Instr::ConstNull { dst, id: None }); // default: null
+                self.code.push(Instr::ConstNull { dst, ty: None }); // default: null
                 let nullr = self.alloc();
-                self.code.push(Instr::ConstNull { dst: nullr, id: None });
+                self.code.push(Instr::ConstNull { dst: nullr, ty: None });
                 let isnull = self.alloc();
                 self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: b, b: nullr });
                 let jnz = self.here();
@@ -533,7 +534,7 @@ impl<'a> Gen<'a> {
                 let dst = self.alloc();
                 let b = self.gen_expr(base)?;
                 let nullr = self.alloc();
-                self.code.push(Instr::ConstNull { dst: nullr, id: None });
+                self.code.push(Instr::ConstNull { dst: nullr, ty: None });
                 let isnull = self.alloc();
                 self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: b, b: nullr });
                 let jz = self.here();

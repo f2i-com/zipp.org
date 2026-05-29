@@ -881,9 +881,12 @@ impl Lower<'_> {
                 z::Expr::Repeat { value: Box::new(elem), count: Box::new(z::Expr::Int(0)) }
             }
             // a nullable field defaults to `null`
-            z::Type::OptStruct(_) | z::Type::OptI64 | z::Type::OptF64 | z::Type::OptBool => {
-                z::Expr::Null
-            }
+            z::Type::OptStruct(_)
+            | z::Type::OptStr
+            | z::Type::OptArr(_)
+            | z::Type::OptI64
+            | z::Type::OptF64
+            | z::Type::OptBool => z::Expr::Null,
             z::Type::Struct(_) | z::Type::Null => return None,
         })
     }
@@ -2038,6 +2041,8 @@ fn mangle_type(t: z::Type) -> String {
         ),
         z::Type::Struct(id) => format!("s{id}"),
         z::Type::OptStruct(id) => format!("opts{id}"),
+        z::Type::OptStr => "optstr".into(),
+        z::Type::OptArr(_) => "optarr".into(),
         z::Type::OptI64 => "opti64".into(),
         z::Type::OptF64 => "optf64".into(),
         z::Type::OptBool => "optbool".into(),
@@ -2209,6 +2214,31 @@ mod tests {
                      if (n !== null) { return head.val + n.val; } \
                      return head.val; }";
         assert_eq!(run_i64(ts3), 3); // 1 + 2
+    }
+
+    #[test]
+    fn nullable_str_and_array() {
+        // str | null: `?? default`
+        let ts = "function greet(name: str | null): str { return \"hi \" + (name ?? \"guest\"); } \
+                  function main(): i64 { \
+                    let a: str | null = \"Ada\"; \
+                    let n: str | null = null; \
+                    return len(greet(a)) + len(greet(n)); }";
+        assert_eq!(run_i64(ts), 14); // "hi Ada"(6) + "hi guest"(8)
+        // T[] | null: narrow then index
+        let ts2 = "function sumOr(xs: i64[] | null): i64 { \
+                     if (xs !== null) { return xs[0] + xs[1]; } \
+                     return -1; \
+                   } \
+                   function main(): i64 { \
+                     let some: i64[] | null = [10, 20]; \
+                     let none: i64[] | null = null; \
+                     return sumOr(some) + sumOr(none); }";
+        assert_eq!(run_i64(ts2), 29); // 30 + (-1)
+        // a nullable str struct field, read with `?? default`
+        let ts3 = "interface User { nick: str | null; } \
+                   function main(): i64 { let u: User = { nick: null }; return len(u.nick ?? \"anon\"); }";
+        assert_eq!(run_i64(ts3), 4); // "anon"
     }
 
     #[test]
