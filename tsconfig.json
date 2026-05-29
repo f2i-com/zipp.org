@@ -1,0 +1,14 @@
+{
+  "//": "Type-check ZIPP TypeScript with `tsc --noEmit`. `zipp.d.ts` supplies the",
+  "//2": "i64/u32/... types, the cast functions, builtins, print and console.",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2020",
+    "lib": ["ES2020"],
+    "types": [],
+    "moduleDetection": "force",
+    "isolatedModules": false
+  },
+  "include": ["zipp.d.ts", "examples/**/*.ts"]
+}

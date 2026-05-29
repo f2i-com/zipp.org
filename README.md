@@ -339,10 +339,18 @@ set, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing, `.length`),
 **`interface`s → structs** (construct with `let p: T = {…}` or `{…} as T`, field
 read/write, struct params/returns), `console.log`, math builtins. **Type
 mapping:** `number`→f64, `bigint`→i64, `boolean`→bool, `string`→str, and
-`i64`/`i32`/`u32`/`u64`/`f64` and your `interface` names usable directly (a
-`zipp.d.ts` makes `tsc`/editors accept the scalar names). `examples/fib.ts` runs
-identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
-`point.ts` shows interfaces/structs.
+`i64`/`i32`/`u32`/`u64`/`f64` and your `interface` names usable directly.
+`examples/fib.ts` runs identically on all four backends; `sum.ts` shows a `u64`
+loop + arrays; `point.ts` shows interfaces/structs.
+
+**Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
+`i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,
+and `len`. Point a `tsconfig.json` at it (`"include": ["zipp.d.ts", "**/*.ts"]`,
+`"lib": ["ES2020"]`, `"types": []`) and `tsc --noEmit` checks your ZIPP programs
+— autocomplete, arity, return types, undefined names, interface fields. (The
+numeric types alias to `number` so arithmetic still checks; ZIPP's own checker
+enforces width/signedness.) The bundled `tsconfig.json` type-checks `examples/`
+clean: `npx -y -p typescript tsc --noEmit -p tsconfig.json`.
 
 This is the **AssemblyScript model** — a typed subset compiled to fast/provable
 code — *not* a JavaScript engine. Running *arbitrary* dynamic JS (`any`,
