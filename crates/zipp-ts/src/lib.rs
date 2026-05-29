@@ -3473,6 +3473,37 @@ mod tests {
     }
 
     #[test]
+    fn calculator_demo() {
+        // A compact recursive-descent calculator (the examples/calculator.ts shape)
+        // — exercises classes/this, recursion, charCodeAt, and precedence/parens
+        // end to end.
+        let prelude = "class P { s: str; pos: i64; \
+            constructor(s: str) { this.s = s; this.pos = 0; } \
+            peek(): i64 { return this.pos < len(this.s) ? this.s.charCodeAt(this.pos) : -1; } \
+            sp(): i64 { while (this.peek() === 32) { this.pos = this.pos + 1; } return this.pos; } \
+            num(): i64 { let n = 0; while (true) { const c = this.peek(); \
+              if (c < 48 || c > 57) { break; } n = n * 10 + (c - 48); this.pos = this.pos + 1; } return n; } \
+            fac(): i64 { this.sp(); const c = this.peek(); \
+              if (c === 40) { this.pos = this.pos + 1; const v = this.exp(); this.sp(); this.pos = this.pos + 1; return v; } \
+              if (c === 45) { this.pos = this.pos + 1; return -this.fac(); } return this.num(); } \
+            term(): i64 { let v = this.fac(); while (true) { this.sp(); const c = this.peek(); \
+              if (c === 42) { this.pos = this.pos + 1; v = v * this.fac(); } \
+              else if (c === 47) { this.pos = this.pos + 1; v = v / this.fac(); } else { break; } } return v; } \
+            exp(): i64 { let v = this.term(); while (true) { this.sp(); const c = this.peek(); \
+              if (c === 43) { this.pos = this.pos + 1; v = v + this.term(); } \
+              else if (c === 45) { this.pos = this.pos + 1; v = v - this.term(); } else { break; } } return v; } } \
+            function ev(s: str): i64 { const p = new P(s); return p.exp(); } ";
+        let prog = |e: &str| format!("{prelude} function main(): i64 {{ return ev(\"{e}\"); }}");
+        assert_eq!(run_i64(&prog("1 + 2 * 3")), 7); // precedence
+        assert_eq!(run_i64(&prog("(1 + 2) * 3")), 9); // parens
+        assert_eq!(run_i64(&prog("10 - 2 - 3")), 5); // left assoc
+        assert_eq!(run_i64(&prog("100 / 7")), 14); // integer division
+        assert_eq!(run_i64(&prog("-(3 + 4) + 10")), 3); // unary minus
+        assert_eq!(run_i64(&prog("2 * -3 + 8")), 2);
+        assert_eq!(run_i64(&prog("(2 + 3) * (4 + 5)")), 45);
+    }
+
+    #[test]
     fn string_methods() {
         // charCodeAt + out-of-range sentinel (-1, TS-divergent from NaN)
         assert_eq!(run_i64("function main(): i64 { return \"ABC\".charCodeAt(2); }"), 67);

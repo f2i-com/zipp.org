@@ -291,6 +291,9 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
         };
         ctx.func.signature = make_sig(&module, &f.params, f.ret);
         compile_function(&mut module, &mut ctx, &mut fctx, prog, i, end, &func_ids, &rt, fast_math)?;
+        if std::env::var("ZIPP_JIT_CLIF").is_ok() {
+            eprintln!("=== clif {} ===\n{}", f.name, ctx.func.display());
+        }
         module
             .define_function(func_ids[i], &mut ctx)
             .map_err(|e| format!("jit codegen failed for {}: {e:?}", f.name))?;
@@ -592,7 +595,14 @@ fn compile_function(
         builder.declare_var(var(r), rty[r as usize].clif());
     }
 
-    let entry_blk = blocks[&entry_pc];
+    // A DEDICATED entry block carries the function parameters, then jumps into
+    // the first instruction's block. This matters when the function opens with a
+    // loop: the loop's back-edge targets `blocks[entry_pc]`, and a back-edge into
+    // a block that has the function params as block-params is malformed (it would
+    // re-enter the prologue → infinite recursion). Keeping the param block
+    // separate makes `blocks[entry_pc]` a plain block whose loop-carried values
+    // are reconstructed as SSA Variables.
+    let entry_blk = builder.create_block();
     builder.append_block_params_for_function_params(entry_blk);
     builder.switch_to_block(entry_blk);
     let params: Vec<Value> = builder.block_params(entry_blk).to_vec();
@@ -607,6 +617,8 @@ fn compile_function(
         };
         builder.def_var(var(r), z);
     }
+    builder.ins().jump(blocks[&entry_pc], &[]);
+    builder.switch_to_block(blocks[&entry_pc]);
 
     let mut terminated = false;
     for pc in entry_pc..end {
@@ -1111,6 +1123,38 @@ mod tests {
         // non-ASCII slice at a non-char boundary is lossy (U+FFFD, 0xEF=239) on the
         // JIT exactly as on the interpreter — the make_str_lossy parity fix.
         assert_eq!(jit_ts_i64("function main(): i64 { return \"é\".slice(0, 1).charCodeAt(0); }"), 239);
+    }
+
+    #[test]
+    fn function_body_opening_with_a_loop() {
+        // Regression: a function whose body OPENS with a loop made the loop's
+        // back-edge target the parameter-carrying entry block → re-entering the
+        // prologue → infinite recursion / stack overflow on the JIT. Triggered
+        // when the loop condition calls a method that itself makes a call.
+        let ts = "function helper(p: i64): i64 { return p; } \
+                  class P { pos: i64; \
+                    constructor(n: i64) { this.pos = n; } \
+                    peek(): i64 { return helper(this.pos) < 3 ? 32 : 88; } \
+                    skip(): i64 { while (this.peek() === 32) { this.pos = this.pos + 1; } \
+                      return this.pos; } } \
+                  function main(): i64 { const p = new P(0); return p.skip(); }";
+        assert_eq!(jit_ts_i64(ts), 3);
+
+        // simplest forms: a free function whose body is a bare loop
+        assert_eq!(
+            jit_ts_i64("function f(n: i64): i64 { while (n < 10) { n = n + 1; } return n; } \
+                        function main(): i64 { return f(0); }"),
+            10
+        );
+        // mutual recursion where each opens with a loop (the calculator shape)
+        assert_eq!(
+            jit_ts_i64("class P { s: str; pos: i64; \
+                          constructor(s: str) { this.s = s; this.pos = 0; } \
+                          peek(): i64 { return this.pos < len(this.s) ? this.s.charCodeAt(this.pos) : -1; } \
+                          skip(): i64 { while (this.peek() === 32) { this.pos = this.pos + 1; } return this.pos; } } \
+                        function main(): i64 { const p = new P(\"   x\"); return p.skip(); }"),
+            3
+        );
     }
 
     fn jit_f64(src: &str) -> f64 {

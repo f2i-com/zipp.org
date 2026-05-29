@@ -125,6 +125,7 @@ cargo build --release
 ./target/release/zipp run examples/arraymethods2.ts  # some/every/findIndex/slice/concat/reverse/fill
 ./target/release/zipp run --jit examples/arraysearch.ts # indexOf/includes/reverse/fill run NATIVE
 ./target/release/zipp run --jit examples/strings.ts  # string methods (slice/indexOf/… run NATIVE)
+./target/release/zipp run --jit examples/calculator.ts # recursive-descent calculator (runs NATIVE)
 
 # run the language test suite
 cargo test
@@ -397,7 +398,9 @@ optional chaining; `nullable_heap.ts` `str | null` + `T[] | null`;
 `nullable_scalar.ts` `i64 | null`; `lambda.ts` first-class functions + arrow
 lambdas; `closure.ts` closures (capture); `arraymethods.ts` + `arraymethods2.ts`
 the array method stdlib; `arraysearch.ts` the search/in-place methods running
-native; `strings.ts` the native string-method stdlib. Most run on all four backends;
+native; `strings.ts` the native string-method stdlib; `calculator.ts` a
+recursive-descent arithmetic evaluator (classes + recursion + `charCodeAt`,
+running natively). Most run on all four backends;
 **nullable
 *heap* types — structs, `str`, arrays — run natively on `--jit` and `--llvm`**
 (a null is a 0/null pointer; `=== null` is a pointer compare). **Nullable
