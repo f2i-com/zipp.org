@@ -9,16 +9,17 @@
 //! reassociation, vectorization and scheduling for free — the things Cranelift
 //! (the tier-0 JIT) does not.
 //!
-//! Scope: the scalar subset (`i64` + `f64`, casts) plus 1-D arrays of scalars
-//! (a small emitted runtime: calloc-backed, length-prefixed, bounds-checked) —
-//! same coverage as the JIT. Strings / structs fall back to the interpreter.
+//! Scope: the **whole language** — scalars (`i64`/`f64`, casts), 1-D arrays,
+//! strings, structs, and math builtins. Heap types use a small emitted runtime
+//! (calloc/malloc-backed, length-prefixed, bounds-checked; leaks, no GC v0).
+//! Same coverage as the JIT.
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use zippc::ast::{BinOp, Elem, Type, UnOp};
-use zippc::ir::{FuncMeta, Instr, Program};
+use zippc::ir::{BuiltinOp, FuncMeta, Instr, Program};
 
 /// LLVM type of a register. Arrays are `ptr` to a length-prefixed i64 block; the
 /// bool carried by `Arr` records whether the *elements* are f64.
@@ -101,14 +102,9 @@ fn from_slot(body: &mut String, tmp: &mut usize, lty: LTy, raw: &str) -> String 
     }
 }
 
-/// Reason a program can't use the LLVM tier, or `None`. Only math builtins are
-/// left unsupported (scalars, arrays, strings, structs all compile).
-pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
-    for ins in &prog.code {
-        if let Instr::Builtin { .. } = ins {
-            return Some("builtins");
-        }
-    }
+/// Reason a program can't use the LLVM tier, or `None`. The tier now covers the
+/// whole language, so this is always `None` (kept for the CLI's fallback path).
+pub fn ineligible_reason(_prog: &Program) -> Option<&'static str> {
     None
 }
 
@@ -160,6 +156,14 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
                 t[*dst as usize] = struct_id(t[*base as usize])
                     .and_then(|id| struct_field(prog, id, field))
                     .map_or(LTy::I64, |(_, fty)| fty);
+            }
+            Instr::Builtin { op, dst, args } => {
+                use BuiltinOp::*;
+                t[*dst as usize] = match op {
+                    Abs | Min | Max => t[args[0] as usize],
+                    Pow => LTy::I64,
+                    Sqrt | Floor | Ceil => LTy::F64,
+                };
             }
             _ => {}
         }
@@ -586,8 +590,47 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 ));
                 s.push_str(&format!("  store i64 {raw}, ptr {sp}\n"));
             }
-            other => {
-                s.push_str(&format!("  ; unsupported instr reached llvm emit: {other:?}\n"));
+            Instr::Builtin { op, dst, args } => {
+                use BuiltinOp::*;
+                let f64a = rty[args[0] as usize] == LTy::F64;
+                let r = fresh(&mut tmp);
+                match op {
+                    Abs => {
+                        let x = load(&mut s, &mut tmp, &rty, args[0]);
+                        if f64a {
+                            s.push_str(&format!("  {r} = call double @llvm.fabs.f64(double {x})\n"));
+                        } else {
+                            s.push_str(&format!("  {r} = call i64 @llvm.abs.i64(i64 {x}, i1 false)\n"));
+                        }
+                    }
+                    Min | Max => {
+                        let a = load(&mut s, &mut tmp, &rty, args[0]);
+                        let b = load(&mut s, &mut tmp, &rty, args[1]);
+                        let intr = match (op, f64a) {
+                            (Min, true) => "call double @llvm.minnum.f64(double",
+                            (Max, true) => "call double @llvm.maxnum.f64(double",
+                            (Min, _) => "call i64 @llvm.smin.i64(i64",
+                            (_, _) => "call i64 @llvm.smax.i64(i64",
+                        };
+                        let ty = if f64a { "double" } else { "i64" };
+                        s.push_str(&format!("  {r} = {intr} {a}, {ty} {b})\n"));
+                    }
+                    Pow => {
+                        let a = load(&mut s, &mut tmp, &rty, args[0]);
+                        let b = load(&mut s, &mut tmp, &rty, args[1]);
+                        s.push_str(&format!("  {r} = call i64 @zipp_ipow(i64 {a}, i64 {b})\n"));
+                    }
+                    Sqrt | Floor | Ceil => {
+                        let x = load(&mut s, &mut tmp, &rty, args[0]);
+                        let intr = match op {
+                            Sqrt => "llvm.sqrt.f64",
+                            Floor => "llvm.floor.f64",
+                            _ => "llvm.ceil.f64",
+                        };
+                        s.push_str(&format!("  {r} = call double @{intr}(double {x})\n"));
+                    }
+                }
+                store(&mut s, &rty, *dst, &r);
             }
         }
     }
@@ -728,6 +771,40 @@ fn escape_bytes(s: &str) -> String {
     esc
 }
 
+/// Integer pow by repeated wrapping multiply (matches the interpreter; LLVM `mul`
+/// wraps). Exponent must be ≥ 0 — aborts otherwise. `internal`, stripped if unused.
+const IPOW_RUNTIME: &str = r#"define internal i64 @zipp_ipow(i64 %base, i64 %exp) {
+entry:
+  %neg = icmp slt i64 %exp, 0
+  br i1 %neg, label %bad, label %init
+bad:
+  call i32 (ptr, ...) @printf(ptr @.fmt_powneg, i64 %exp)
+  call void @abort()
+  unreachable
+init:
+  %rp = alloca i64
+  %ip = alloca i64
+  store i64 1, ptr %rp
+  store i64 0, ptr %ip
+  br label %cond
+cond:
+  %i = load i64, ptr %ip
+  %done = icmp sge i64 %i, %exp
+  br i1 %done, label %end, label %body
+body:
+  %r = load i64, ptr %rp
+  %r2 = mul i64 %r, %base
+  store i64 %r2, ptr %rp
+  %i1 = add i64 %i, 1
+  store i64 %i1, ptr %ip
+  br label %cond
+end:
+  %res = load i64, ptr %rp
+  ret i64 %res
+}
+
+"#;
+
 /// Lower a whole program to textual LLVM IR (a self-contained module with a C
 /// `main` that times the entry call with `clock()` and prints the result).
 pub fn emit_ir(prog: &Program) -> Result<String, String> {
@@ -740,7 +817,18 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     out.push_str("declare i32 @clock()\n"); // Windows: clock_t = long = i32, CLOCKS_PER_SEC = 1000
     out.push_str("declare i64 @llvm.fptosi.sat.i64.f64(double)\n");
     out.push_str("declare ptr @calloc(i64, i64)\n");
-    out.push_str("declare void @abort()\n\n");
+    out.push_str("declare void @abort()\n");
+    // Math-builtin intrinsics (LLVM lowers these to the right instruction or a
+    // libm call; minnum/maxnum match Rust's f64::min/max NaN handling).
+    out.push_str("declare i64 @llvm.abs.i64(i64, i1)\n");
+    out.push_str("declare double @llvm.fabs.f64(double)\n");
+    out.push_str("declare i64 @llvm.smin.i64(i64, i64)\n");
+    out.push_str("declare i64 @llvm.smax.i64(i64, i64)\n");
+    out.push_str("declare double @llvm.minnum.f64(double, double)\n");
+    out.push_str("declare double @llvm.maxnum.f64(double, double)\n");
+    out.push_str("declare double @llvm.sqrt.f64(double)\n");
+    out.push_str("declare double @llvm.floor.f64(double)\n");
+    out.push_str("declare double @llvm.ceil.f64(double)\n\n");
     out.push_str(&cstr_global(".fmt_i64", "%lld\n"));
     out.push_str(&cstr_global(".fmt_f64", "%.17g\n"));
     out.push_str(&cstr_global(".fmt_ri", "__ZRESULT__:%lld\n"));
@@ -749,6 +837,7 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     out.push_str(&cstr_global(".fmt_neg", "zipp: array length cannot be negative (%lld)\n"));
     out.push_str(&cstr_global(".fmt_oob", "zipp: array index %lld out of bounds (len %lld)\n"));
     out.push_str(&cstr_global(".fmt_str", "%.*s\n"));
+    out.push_str(&cstr_global(".fmt_powneg", "zipp: pow exponent must be >= 0 (got %lld)\n"));
     out.push('\n');
 
     // String literals: one module-level constant each, laid out as the runtime
@@ -764,10 +853,11 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     }
     out.push('\n');
 
-    // Array + string runtimes (calloc/malloc-backed, leaked — no GC in v0).
-    // `internal` so -O3 strips whichever a given program doesn't use.
+    // Array + string runtimes (calloc/malloc-backed, leaked — no GC in v0) and
+    // integer pow. `internal` so -O3 strips whichever a program doesn't use.
     out.push_str(ARRAY_RUNTIME);
     out.push_str(STRING_RUNTIME);
+    out.push_str(IPOW_RUNTIME);
 
     for i in 0..prog.funcs.len() {
         let end = if i + 1 < prog.funcs.len() {
@@ -931,9 +1021,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_builtins() {
-        // everything but math builtins now emits.
-        let prog = zippc::compile("fn main(): i64 { return abs(0 - 5); }").unwrap();
-        assert!(emit_ir(&prog).is_err());
+    fn emits_ir_for_builtins() {
+        // the whole language emits now — math builtins included
+        let prog = zippc::compile("fn main(): i64 { return abs(0 - 5) + pow(2, 3); }").unwrap();
+        let ir = emit_ir(&prog).unwrap();
+        assert!(ir.contains("@llvm.abs.i64"));
+        assert!(ir.contains("@zipp_ipow"));
     }
 }

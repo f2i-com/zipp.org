@@ -1,6 +1,6 @@
-//! ZIPP native backend — a Cranelift JIT for the **scalar subset plus 1-D
-//! arrays** (`i64`/`f64`, casts, and `[T]` of scalars). Programs using
-//! strings/structs/builtins fall back to the interpreter.
+//! ZIPP native backend — a Cranelift JIT covering the **whole language**:
+//! scalars (`i64`/`f64`, casts), 1-D arrays, strings, structs, and math
+//! builtins. Nothing falls back to the interpreter anymore.
 //!
 //! Registers are statically typed (the IR allocates them monotonically, so each
 //! has one type); a forward pass infers each register's type, then every ZIPP
@@ -27,7 +27,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module};
 
 use zippc::ast::{BinOp, Elem, Type, UnOp};
-use zippc::ir::{FuncMeta, Instr, Program};
+use zippc::ir::{BuiltinOp, FuncMeta, Instr, Program};
 
 extern "C" fn zipp_print_i64(x: i64) {
     println!("{x}");
@@ -119,6 +119,16 @@ extern "C" fn zipp_print_str(s: i64) {
     println!("{}", String::from_utf8_lossy(unsafe { str_bytes(s) }));
 }
 
+/// Integer `pow` (the one builtin with no single instruction). Matches the
+/// interpreter: exponent must be ≥ 0; wrapping multiply.
+extern "C" fn zipp_ipow(base: i64, exp: i64) -> i64 {
+    if exp < 0 {
+        eprintln!("zipp: pow exponent must be >= 0 (got {exp})");
+        std::process::abort();
+    }
+    base.wrapping_pow(exp as u32)
+}
+
 /// Runtime symbols the JIT calls into.
 #[derive(Clone, Copy)]
 struct RuntimeIds {
@@ -130,6 +140,7 @@ struct RuntimeIds {
     oob: FuncId,
     str_concat: FuncId,
     str_eq: FuncId,
+    ipow: FuncId,
 }
 
 /// Result of a JIT'd `main`.
@@ -215,14 +226,10 @@ fn var(r: u32) -> Variable {
     Variable::from_u32(r)
 }
 
-/// Reason a program can't be JIT-compiled, or `None`. Only math builtins are
-/// left unsupported (scalars, arrays, strings, structs all compile).
-pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
-    for ins in &prog.code {
-        if let Instr::Builtin { .. } = ins {
-            return Some("builtins");
-        }
-    }
+/// Reason a program can't be JIT-compiled, or `None`. The native backend now
+/// covers the whole language, so this is always `None` (kept for the CLI's
+/// fallback path and forward compatibility).
+pub fn ineligible_reason(_prog: &Program) -> Option<&'static str> {
     None
 }
 
@@ -274,6 +281,7 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     jit.symbol("zipp_oob", zipp_oob as *const u8);
     jit.symbol("zipp_str_concat", zipp_str_concat as *const u8);
     jit.symbol("zipp_str_eq", zipp_str_eq as *const u8);
+    jit.symbol("zipp_ipow", zipp_ipow as *const u8);
     let mut module = JITModule::new(jit);
 
     let mut func_ids = Vec::with_capacity(prog.funcs.len());
@@ -305,6 +313,7 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
         oob: import(&mut module, "zipp_oob", &[types::I64, types::I64], None)?,
         str_concat: import(&mut module, "zipp_str_concat", &[types::I64, types::I64], Some(types::I64))?,
         str_eq: import(&mut module, "zipp_str_eq", &[types::I64, types::I64], Some(types::I64))?,
+        ipow: import(&mut module, "zipp_ipow", &[types::I64, types::I64], Some(types::I64))?,
     };
 
     let mut ctx = module.make_context();
@@ -394,6 +403,14 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
                     .struct_id()
                     .and_then(|id| struct_field(prog, id, field))
                     .map_or(JTy::I64, |(_, fty)| fty);
+            }
+            Instr::Builtin { op, dst, args } => {
+                use BuiltinOp::*;
+                t[*dst as usize] = match op {
+                    Abs | Min | Max => t[args[0] as usize], // polymorphic in the operand
+                    Pow => JTy::I64,
+                    Sqrt | Floor | Ceil => JTy::F64,
+                };
             }
             _ => {}
         }
@@ -820,7 +837,43 @@ fn compile_function(
                 };
                 builder.ins().store(MemFlags::trusted(), raw, base_v, 8 * (slot as i32 + 1));
             }
-            other => return Err(format!("internal: ineligible instr reached JIT: {other:?}")),
+            Instr::Builtin { op, dst, args } => {
+                use BuiltinOp::*;
+                let f64a = rty[args[0] as usize].clif() == types::F64;
+                let res = match op {
+                    Abs => {
+                        let x = builder.use_var(var(args[0]));
+                        if f64a { builder.ins().fabs(x) } else { builder.ins().iabs(x) }
+                    }
+                    Min => {
+                        let (a, b) = (builder.use_var(var(args[0])), builder.use_var(var(args[1])));
+                        if f64a { builder.ins().fmin(a, b) } else { builder.ins().smin(a, b) }
+                    }
+                    Max => {
+                        let (a, b) = (builder.use_var(var(args[0])), builder.use_var(var(args[1])));
+                        if f64a { builder.ins().fmax(a, b) } else { builder.ins().smax(a, b) }
+                    }
+                    Pow => {
+                        let (a, b) = (builder.use_var(var(args[0])), builder.use_var(var(args[1])));
+                        let f = module.declare_func_in_func(rt.ipow, builder.func);
+                        let call = builder.ins().call(f, &[a, b]);
+                        builder.inst_results(call)[0]
+                    }
+                    Sqrt => {
+                        let x = builder.use_var(var(args[0]));
+                        builder.ins().sqrt(x)
+                    }
+                    Floor => {
+                        let x = builder.use_var(var(args[0]));
+                        builder.ins().floor(x)
+                    }
+                    Ceil => {
+                        let x = builder.use_var(var(args[0]));
+                        builder.ins().ceil(x)
+                    }
+                };
+                builder.def_var(var(*dst), res);
+            }
         }
     }
 
@@ -1003,9 +1056,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_builtins() {
-        // everything but math builtins now compiles natively.
-        let b = zippc::compile("fn main(): i64 { return abs(0 - 5); }").unwrap();
-        assert!(run(&b).is_err());
+    fn builtins() {
+        // the whole language compiles now — math builtins included
+        assert_eq!(jit_i64("fn main(): i64 { return abs(0 - 5); }"), 5);
+        assert_eq!(jit_i64("fn main(): i64 { return min(3, 7) + max(3, 7); }"), 10);
+        assert_eq!(jit_i64("fn main(): i64 { return pow(2, 10); }"), 1024);
+        assert_eq!(jit_f64("fn main(): f64 { return sqrt(16.0); }"), 4.0);
+        assert_eq!(jit_f64("fn main(): f64 { return floor(3.7) + ceil(3.2); }"), 7.0);
+        assert_eq!(jit_f64("fn main(): f64 { return abs(0.0 - 2.5); }"), 2.5);
     }
 }

@@ -40,10 +40,10 @@ with `--no-default-features` and the language still runs.
 - A **VM** that runs it (`zipp run`)
 - The **optional zk-STARK profile** (`zipp run --prove`): Winterfell proof +
   verification over the VM execution trace
-- A **native JIT** (`zipp run --jit`, Cranelift): compiles **nearly the whole
-  language** — scalars (`i64`/`f64`, casts), arrays, strings, structs — to
-  machine code; only math builtins fall back. A fast-compile tier-0 that beats
-  V8 on integer loops (see Performance below)
+- A **native JIT** (`zipp run --jit`, Cranelift): compiles the **entire
+  language** — scalars (`i64`/`f64`, casts), arrays, strings, structs, math
+  builtins — to machine code; nothing falls back. A fast-compile tier-0 that
+  beats V8 on integer loops (see Performance below)
 - An **LLVM release tier** (`zipp run --llvm`): emits LLVM IR and compiles it
   with `clang -O3 -march=native` — same coverage, **matches V8 on dense f64**
   and **beats V8 and Bun on dense-f64 arrays** (matmul). No `llvm-sys` linkage;
@@ -59,8 +59,8 @@ with `--no-default-features` and the language still runs.
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
 - Backends: **Cranelift** tier-0 JIT and an **LLVM** release tier (`clang -O3`)
   — *scalars + arrays + strings + structs done* (matches V8 on dense f64; beats
-  V8/Bun on matmul); next: math builtins, a GC (heap currently leaks), LTO/PGO,
-  and a **WASM-contract** target
+  V8/Bun on matmul); the **whole language** compiles natively now — next: a GC
+  (heap currently leaks), LTO/PGO, and a **WASM-contract** target
 - Parallel work-stealing scheduler (the §5.8 flagship), GC/arenas, fast stdlib
 - zk hardening: PC-integrity + memory-permutation arguments, 64-bit range checks
 
@@ -193,9 +193,9 @@ fastest. (Interpreter: ~455 ms, so the JIT/LLVM are ~28–32× over it.)
 
 ZIPP has **three native paths**: the Cranelift **`--jit`** (PLAN.md tier-0 — a
 fast-*compile* baseline) and the **`--llvm`** release tier (`clang -O3`),
-plus the interpreter fallback. Both native backends cover **nearly the whole
-language** — scalars (`i64` + `f64`, casts), 1-D arrays, strings, and structs;
-only math builtins still fall back to the interpreter.
+plus the interpreter fallback (now only used when you don't pass `--jit`/`--llvm`).
+Both native backends cover the **entire language** — scalars (`i64` + `f64`,
+casts), 1-D arrays, strings, structs, and math builtins.
 
 - **`--llvm` matches V8 on dense f64** (~99 ms vs ~101 ms) and **beats V8/Bun on
   dense-f64 arrays** (matmul). `-O3` auto-FMAs, schedules, reassociates and
@@ -241,11 +241,10 @@ host AVX/FMA, verifier off, opt-in FMA; LLVM: `-O3 -march=native`).
 rounding (last-bit), so the strict default keeps native output bit-identical to
 the interpreter — which matters for the deterministic contract/provable profiles.
 
-Next: math builtins in the native backends (the last fallback), then a GC (the
-array/string/struct heap currently leaks). One kernel isn't the whole story
-(PLAN.md §6/§11 — workloads differ, and V8's hand-tuned stdlib is a separate
-battle), but this is real, reproducible evidence the thesis holds where the
-design predicts.
+The whole language now compiles natively; next is a GC (the array/string/struct
+heap currently leaks). One kernel isn't the whole story (PLAN.md §6/§11 —
+workloads differ, and V8's hand-tuned stdlib is a separate battle), but this is
+real, reproducible evidence the thesis holds where the design predicts.
 
 ## License
 
