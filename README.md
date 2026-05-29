@@ -26,8 +26,8 @@ with `--no-default-features` and the language still runs.
   no implicit coercions, arity/return checking)
 - **`f64` floating-point** with `i64()` / `f64()` casts (the zk profile stays
   integer-only — `--prove` rejects f64, per PLAN.md §7)
-- **Lexical block scoping with shadowing**; `break` / `continue`; **short-circuit**
-  `&&` / `||`
+- **Lexical block scoping with shadowing**; `while` / **`for`** loops,
+  `break` / `continue`; **short-circuit** `&&` / `||`
 - Full operator set incl. **bitwise/shift** `& | ^ << >> ~`
 - **Arrays**: literals `[a, b, c]`, repeat `[v; n]`, indexing read/write, `len()`,
   runtime bounds checks (reference types; also `--prove`-gated for now)
@@ -60,6 +60,7 @@ cargo build --release
 ./target/release/zipp run examples/pi.zipp          # => 3.14159...  (f64 + casts)
 ./target/release/zipp run examples/arrays.zipp      # bubble sort (arrays + len)
 ./target/release/zipp run examples/hello.zipp       # strings: concat, len
+./target/release/zipp run examples/fizzbuzz.zipp    # for + % + else-if + strings
 
 # run the language test suite
 cargo test
@@ -94,7 +95,7 @@ zipp-lang/
 │   ├── zippc/        # compiler core + register VM: lexer, ast, parser, check, ir, vm
 │   ├── zipp-zk/      # OPTIONAL zk-STARK profile (Winterfell prover/verifier over the trace)
 │   └── zipp-cli/     # the `zipp` binary
-└── examples/         # add, sum, fib, bits, pi, arrays, hello
+└── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz
 ```
 
 The modules inside `zippc` map onto the separate crates in `../ZIPP.md §15`

@@ -166,6 +166,27 @@ impl<'a> Parser<'a> {
                 let body = self.block()?;
                 Ok(Stmt::While { cond, body })
             }
+            Some(Tok::For) => {
+                self.bump()?;
+                self.expect(&Tok::LParen)?;
+                // init: a full statement (consumes its own `;`) or empty.
+                let init = if self.eat(&Tok::Semi) {
+                    None
+                } else {
+                    Some(Box::new(self.stmt()?))
+                };
+                let cond = self.expr()?;
+                self.expect(&Tok::Semi)?;
+                // step: assignment or expression, no trailing `;`.
+                let step = if self.peek() == Some(&Tok::RParen) {
+                    None
+                } else {
+                    Some(Box::new(self.simple_stmt()?))
+                };
+                self.expect(&Tok::RParen)?;
+                let body = self.block()?;
+                Ok(Stmt::For { init, cond, step, body })
+            }
             Some(Tok::Break) => {
                 self.bump()?;
                 self.expect(&Tok::Semi)?;
@@ -199,6 +220,20 @@ impl<'a> Parser<'a> {
                     Ok(Stmt::ExprStmt(e))
                 }
             }
+        }
+    }
+
+    /// A statement without a trailing semicolon — used for a `for` loop's step.
+    fn simple_stmt(&mut self) -> Result<Stmt, String> {
+        let e = self.expr()?;
+        if self.eat(&Tok::Assign) {
+            let value = self.expr()?;
+            match e {
+                Expr::Var(_) | Expr::Index { .. } => Ok(Stmt::Assign { target: e, value }),
+                _ => Err("parse error: invalid assignment target".into()),
+            }
+        } else {
+            Ok(Stmt::ExprStmt(e))
         }
     }
 

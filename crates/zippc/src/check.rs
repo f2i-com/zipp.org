@@ -124,6 +124,22 @@ fn check_stmt(
             expect_type(cond, Type::Bool, scope, sigs, "while condition")?;
             check_block(body, scope, sigs, ret, fname, loop_depth + 1)
         }
+        Stmt::For { init, cond, step, body } => {
+            // The init binding is scoped to the loop.
+            scope.enter();
+            let r = (|| {
+                if let Some(i) = init {
+                    check_stmt(i, scope, sigs, ret, fname, loop_depth)?;
+                }
+                expect_type(cond, Type::Bool, scope, sigs, "for condition")?;
+                if let Some(s) = step {
+                    check_stmt(s, scope, sigs, ret, fname, loop_depth)?;
+                }
+                check_block(body, scope, sigs, ret, fname, loop_depth + 1)
+            })();
+            scope.exit();
+            r
+        }
         Stmt::Break => {
             if loop_depth == 0 {
                 return Err("type error: `break` outside of a loop".into());

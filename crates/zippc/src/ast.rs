@@ -110,6 +110,12 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    For {
+        init: Option<Box<Stmt>>,
+        cond: Expr,
+        step: Option<Box<Stmt>>,
+        body: Vec<Stmt>,
+    },
     Break,
     Continue,
     Print(Expr),

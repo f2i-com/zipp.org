@@ -231,3 +231,41 @@ fn prove_profile_rejects_strings() {
     assert!(zippc::vm::run(&prog, false).is_ok());
     assert!(zippc::vm::run(&prog, true).is_err());
 }
+
+// ── for loops ──
+
+#[test]
+fn for_loop_sum() {
+    assert_eq!(
+        result("fn main(): i64 { let s = 0; for (let i = 1; i <= 10; i = i + 1) { s = s + i; } return s; }"),
+        55
+    );
+}
+
+#[test]
+fn for_continue_runs_the_step() {
+    // continue must run the step (i++), else this would loop forever / mis-sum.
+    let src = "fn main(): i64 { let s = 0; \
+               for (let i = 1; i <= 10; i = i + 1) { if (i % 2 == 0) { continue; } s = s + i; } \
+               return s; }";
+    assert_eq!(result(src), 25); // 1+3+5+7+9
+}
+
+#[test]
+fn for_break() {
+    let src = "fn main(): i64 { let s = 0; \
+               for (let i = 0; i < 100; i = i + 1) { if (i == 5) { break; } s = s + i; } return s; }";
+    assert_eq!(result(src), 10); // 0+1+2+3+4
+}
+
+#[test]
+fn for_var_is_scoped_to_the_loop() {
+    assert!(run("fn main(): i64 { for (let i = 0; i < 3; i = i + 1) { } return i; }").is_err());
+}
+
+#[test]
+fn for_over_array() {
+    let src = "fn main(): i64 { let a = [3, 1, 4, 1, 5]; let s = 0; \
+               for (let i = 0; i < len(a); i = i + 1) { s = s + a[i]; } return s; }";
+    assert_eq!(result(src), 14);
+}

@@ -94,8 +94,8 @@ pub fn lower(m: &Module) -> Result<Program, String> {
 }
 
 struct LoopCtx {
-    continue_target: u32,
     breaks: Vec<u32>,
+    continues: Vec<u32>,
 }
 
 struct Gen<'a> {
@@ -208,7 +208,7 @@ impl<'a> Gen<'a> {
                 let c = self.gen_expr(cond)?;
                 let jexit = self.here();
                 self.code.push(Instr::JmpIfZero { cond: c, target: 0 });
-                self.loops.push(LoopCtx { continue_target: lstart, breaks: Vec::new() });
+                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new() });
                 self.scoped_block(body)?;
                 self.code.push(Instr::Jmp { target: lstart });
                 let end = self.here();
@@ -217,6 +217,37 @@ impl<'a> Gen<'a> {
                 for b in ctx.breaks {
                     self.patch(b, end);
                 }
+                for c in ctx.continues {
+                    self.patch(c, lstart); // continue re-checks the condition
+                }
+                Ok(())
+            }
+            Stmt::For { init, cond, step, body } => {
+                self.enter();
+                if let Some(i) = init {
+                    self.gen_stmt(i)?;
+                }
+                let lcond = self.here();
+                let c = self.gen_expr(cond)?;
+                let jexit = self.here();
+                self.code.push(Instr::JmpIfZero { cond: c, target: 0 });
+                self.loops.push(LoopCtx { breaks: Vec::new(), continues: Vec::new() });
+                self.scoped_block(body)?;
+                let lstep = self.here();
+                if let Some(s) = step {
+                    self.gen_stmt(s)?;
+                }
+                self.code.push(Instr::Jmp { target: lcond });
+                let end = self.here();
+                self.patch(jexit, end);
+                let ctx = self.loops.pop().expect("loop ctx");
+                for b in ctx.breaks {
+                    self.patch(b, end);
+                }
+                for c in ctx.continues {
+                    self.patch(c, lstep); // continue runs the step, then re-checks
+                }
+                self.exit();
                 Ok(())
             }
             Stmt::Break => {
@@ -230,12 +261,13 @@ impl<'a> Gen<'a> {
                 Ok(())
             }
             Stmt::Continue => {
-                let target = self
-                    .loops
-                    .last()
+                let idx = self.here();
+                self.code.push(Instr::Jmp { target: 0 });
+                self.loops
+                    .last_mut()
                     .ok_or("ir error: continue outside loop")?
-                    .continue_target;
-                self.code.push(Instr::Jmp { target });
+                    .continues
+                    .push(idx);
                 Ok(())
             }
             Stmt::Print(e) => {
