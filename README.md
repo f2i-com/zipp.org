@@ -106,6 +106,7 @@ cargo build --release
 ./target/release/zipp run --llvm examples/generic.ts # generic functions
 ./target/release/zipp run --jit examples/box.ts      # generic classes Box<T>/Pair<A,B>
 ./target/release/zipp run examples/cards.ts          # numeric enum + for...of
+./target/release/zipp run --wasm examples/calc.ts    # switch (runs in the contract profile)
 
 # run the language test suite
 cargo test
@@ -338,9 +339,10 @@ app.ts ─[oxc]→ TS AST ─[lower the subset]→ ZIPP AST ─→ check → IR 
 
 `oxc` parses *all* TS syntax; we lower what maps to ZIPP's sound core and reject
 the rest with a line-numbered error. **Supported (v0):** typed functions +
-recursion, `let`/`const`, `if`/`while`/`for`/`for…of`, `break`/`continue`, the
-operator set, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing,
-`.length`), numeric **`enum`s**, **`interface`s and `class`es → structs**
+recursion, `let`/`const`, `if`/`while`/`for`/`for…of`/`switch`,
+`break`/`continue`, the operator set, numeric casts (`i64(x)`/`u32(x)`/…),
+arrays (`T[]`, indexing, `.length`), numeric **`enum`s**, **`interface`s and
+`class`es → structs**
 (interfaces construct with `let p: T = {…}` / `{…} as T`; classes give you
 fields, a constructor, methods, `this`, and `new C(…)` — a class lowers to a
 factory plus methods taking `this`), field read/write, **generics** — both
@@ -353,7 +355,7 @@ math builtins. **Type mapping:** `number`→f64, `bigint`→i64, `boolean`→boo
 identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
 `point.ts` interfaces; `account.ts` a class with methods; `generic.ts`
 monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
-`for…of`.
+`for…of`; `calc.ts` a `switch`.
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,

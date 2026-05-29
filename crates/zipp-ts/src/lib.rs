@@ -1151,6 +1151,59 @@ impl Lower<'_> {
                     fo.span,
                 );
             }
+            // `switch (d) { case v: …; default: … }` → an if/else-if chain on a
+            // hoisted discriminant. Sound subset: no fall-through (each non-empty
+            // case ends with break/return/continue); empty cases stack onto the
+            // next; a `break` only as the case terminator.
+            Statement::SwitchStatement(sw) => {
+                let disc = self.expr(&sw.discriminant)?;
+                let sw_tmp = self.fresh("sw");
+                push(out, z::StmtKind::Let { name: sw_tmp.clone(), ty: None, value: disc }, sw.span);
+                let mut groups: Vec<(Vec<z::Expr>, Vec<z::Stmt>)> = Vec::new();
+                let mut default_body: Vec<z::Stmt> = Vec::new();
+                let mut pending: Vec<z::Expr> = Vec::new();
+                for case in &sw.cases {
+                    match &case.test {
+                        None => {
+                            default_body = self.switch_case_body(&case.consequent)?;
+                            pending.clear(); // empty cases before default fall to it
+                        }
+                        Some(test) => {
+                            let t = self.expr(test)?;
+                            if case.consequent.is_empty() {
+                                pending.push(t); // stacks onto the next non-empty case
+                            } else {
+                                let mut grp = std::mem::take(&mut pending);
+                                grp.push(t);
+                                groups.push((grp, self.switch_case_body(&case.consequent)?));
+                            }
+                        }
+                    }
+                }
+                // fold into a right-nested chain (default = the innermost else)
+                let line = self.line(sw.span);
+                let mut else_b = default_body;
+                for (grp, body) in groups.into_iter().rev() {
+                    let cond = grp
+                        .into_iter()
+                        .map(|t| z::Expr::Bin {
+                            op: z::BinOp::Eq,
+                            l: Box::new(z::Expr::Var(sw_tmp.clone())),
+                            r: Box::new(t),
+                        })
+                        .reduce(|a, b| z::Expr::Bin {
+                            op: z::BinOp::Or,
+                            l: Box::new(a),
+                            r: Box::new(b),
+                        })
+                        .unwrap();
+                    else_b = vec![z::Stmt {
+                        kind: z::StmtKind::If { cond, then_b: body, else_b },
+                        line,
+                    }];
+                }
+                out.extend(else_b);
+            }
             Statement::BreakStatement(b) => push(out, z::StmtKind::Break, b.span),
             Statement::ContinueStatement(c) => push(out, z::StmtKind::Continue, c.span),
             Statement::BlockStatement(b) => {
@@ -1212,6 +1265,35 @@ impl Lower<'_> {
             self.stmt(s, &mut out)?;
             Ok(out)
         }
+    }
+
+    /// Lower one switch case's body: strip a trailing `break` (the terminator),
+    /// reject fall-through and a `break` used anywhere but as the terminator.
+    fn switch_case_body(&self, stmts: &[Statement]) -> LResult<Vec<z::Stmt>> {
+        let trailing_break =
+            matches!(stmts.last(), Some(Statement::BreakStatement(b)) if b.label.is_none());
+        let body = if trailing_break { &stmts[..stmts.len() - 1] } else { stmts };
+        if !trailing_break && !stmts.is_empty() && !stmt_diverges(stmts.last().unwrap()) {
+            // otherwise the case would fall through to the next
+            return Err(self.err(
+                span_of_stmt(stmts.last().unwrap()),
+                "switch case must end with `break`, `return`, or `continue` \
+                 (fall-through isn't supported)",
+            ));
+        }
+        for s in body {
+            if stmt_has_switch_break(s) {
+                return Err(self.err(
+                    span_of_stmt(s),
+                    "a `break` inside a switch case (other than the final one) isn't supported",
+                ));
+            }
+        }
+        let mut out = Vec::new();
+        for s in body {
+            self.stmt(s, &mut out)?;
+        }
+        Ok(out)
     }
 
     /// An expression used in statement position: assignment, `print`, or a bare
@@ -1595,6 +1677,37 @@ fn assign_bin_op(op: AssignmentOperator) -> Option<z::BinOp> {
     }
 }
 
+/// Does this statement always leave the case (return/continue/break, or a block
+/// or full if/else whose branches all do)? Used to reject fall-through.
+fn stmt_diverges(s: &Statement) -> bool {
+    match s {
+        Statement::ReturnStatement(_)
+        | Statement::ContinueStatement(_)
+        | Statement::BreakStatement(_) => true,
+        Statement::BlockStatement(b) => b.body.last().is_some_and(stmt_diverges),
+        Statement::IfStatement(i) => {
+            stmt_diverges(&i.consequent)
+                && i.alternate.as_ref().is_some_and(|a| stmt_diverges(a))
+        }
+        _ => false,
+    }
+}
+
+/// Does this statement contain a `break` that would target the enclosing switch?
+/// (Descends into `if`/blocks but stops at loops/nested switches, which capture
+/// their own `break`.)
+fn stmt_has_switch_break(s: &Statement) -> bool {
+    match s {
+        Statement::BreakStatement(_) => true,
+        Statement::IfStatement(i) => {
+            stmt_has_switch_break(&i.consequent)
+                || i.alternate.as_ref().is_some_and(|a| stmt_has_switch_break(a))
+        }
+        Statement::BlockStatement(b) => b.body.iter().any(stmt_has_switch_break),
+        _ => false,
+    }
+}
+
 /// The name of a bare type reference (`T`), used to spot type parameters.
 fn bare_type_ref_name<'a>(t: &'a TSType<'a>) -> Option<&'a str> {
     if let TSType::TSTypeReference(r) = t {
@@ -1770,6 +1883,37 @@ mod tests {
                    function unwrap(b: Box<i64>): i64 { return b.get(); } \
                    function main(): i64 { return unwrap(new Box(99)); }";
         assert_eq!(run_i64(ts3), 99);
+    }
+
+    #[test]
+    fn switch_statements() {
+        // value cases + default + empty-case stacking + a returning case
+        let ts = "function classify(n: i64): i64 { \
+                    switch (n) { \
+                      case 0: return 100; \
+                      case 1: \
+                      case 2: return 200; \
+                      case 3: { let x: i64 = 5; return 300 + x; } \
+                      default: return 999; \
+                    } \
+                  } \
+                  function main(): i64 { \
+                    return classify(0) + classify(1) + classify(2) + classify(3) + classify(7); }";
+        // 100 + 200 + 200 + 305 + 999 = 1804
+        assert_eq!(run_i64(ts), 1804);
+        // break-terminated cases that mutate, plus a switch on an enum
+        let ts2 = "enum Op { Add, Sub, Mul } \
+                   function apply(op: Op, a: i64, b: i64): i64 { \
+                     let r: i64 = 0; \
+                     switch (op) { \
+                       case Op.Add: r = a + b; break; \
+                       case Op.Sub: r = a - b; break; \
+                       case Op.Mul: r = a * b; break; \
+                     } \
+                     return r; \
+                   } \
+                   function main(): i64 { return apply(Op.Add, 3, 4) + apply(Op.Mul, 5, 6); }";
+        assert_eq!(run_i64(ts2), 37); // 7 + 30
     }
 
     #[test]
