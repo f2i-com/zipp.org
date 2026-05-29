@@ -114,6 +114,7 @@ cargo build --release
 ./target/release/zipp run examples/defaults.ts       # default parameter values
 ./target/release/zipp run examples/optional.ts       # T | null, ??, narrowing
 ./target/release/zipp run --llvm examples/chain.ts   # optional chaining a?.b?.c ?? d
+./target/release/zipp run --jit examples/optcall.ts  # optional method calls a?.m() ?? d
 ./target/release/zipp run --jit examples/nullable_heap.ts # str | null, T[] | null (native)
 ./target/release/zipp run examples/nullable_scalar.ts # i64 | null (interpreter tier)
 
@@ -363,8 +364,8 @@ code (a `Box<i64>` and a `Box<bool>` are two distinct structs), **optionals** �
 `T | null` for heap types (structs, `str`, arrays) and nullable scalars
 `i64 | null` / `f64 | null` / `bool | null`, plus `null`, `x ?? y`, `=== null`,
 flow narrowing (`if (x !== null) {…}` and early-return `if (x === null) return;`),
-and optional chaining `a?.b` / `a?.b ?? default`, `console.log`, math builtins.
-(`switch` works on numbers, strings, and enums.) **Type mapping:** `number`→f64, `bigint`→i64,
+and optional chaining `a?.b` / `a?.m()` / `… ?? default`, `console.log`, math
+builtins. (`switch` works on numbers, strings, and enums.) **Type mapping:** `number`→f64, `bigint`→i64,
 `boolean`→bool,
 `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` and your
 `interface`/`class`/`enum` names usable directly. `examples/fib.ts` runs

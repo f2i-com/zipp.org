@@ -324,6 +324,37 @@ fn assignable(from: Type, to: Type) -> bool {
     from == to || (from == Type::Null && to.is_opt()) || to.opt_inner() == Some(from)
 }
 
+/// Validate `recv?.m(args)` (the receiver's non-null type is the method's `this`)
+/// and return the method's (non-null) return type.
+fn opt_call_ret(
+    recv: &Expr,
+    name: &str,
+    args: &[Expr],
+    scope: &Scope,
+    cx: &Cx,
+) -> Result<Type, String> {
+    let sig = cx.sigs.get(name).ok_or_else(|| format!("type error: unknown method '{name}'"))?;
+    let rt = type_of(recv, scope, cx)?;
+    let recv_c = rt.opt_inner().unwrap_or(rt); // the non-null receiver type
+    if sig.params.first() != Some(&recv_c) {
+        return Err(format!("type error: optional method call on {rt:?}"));
+    }
+    if args.len() != sig.params.len() - 1 {
+        return Err(format!(
+            "type error: '{name}' expects {} argument(s), got {}",
+            sig.params.len() - 1,
+            args.len()
+        ));
+    }
+    for (a, p) in args.iter().zip(&sig.params[1..]) {
+        let at = type_of(a, scope, cx)?;
+        if !assignable(at, *p) {
+            return Err(format!("type error: method arg expects {p:?}, found {at:?}"));
+        }
+    }
+    Ok(sig.ret)
+}
+
 /// A struct field's declared type, by struct id and field name.
 fn struct_field_ty(cx: &Cx, id: u32, field: &str) -> Result<Type, String> {
     cx.structs[id as usize]
@@ -412,6 +443,28 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
             // field's *non-null* type (so a nullable field coalesces away too).
             let ft = struct_field_ty(cx, xid, field)?;
             let result = ft.opt_inner().unwrap_or(ft);
+            let dt = type_of(default, scope, cx)?;
+            if !assignable(dt, result) {
+                return Err(format!("type error: `?? default` has type {dt:?}, expected {result:?}"));
+            }
+            Ok(result)
+        }
+        Expr::OptCall { recv, name, args } => {
+            // result is `ret | null`; a heap return becomes nullable (an already
+            // nullable return doesn't double-wrap), a scalar return must be coalesced.
+            let ret = opt_call_ret(recv, name, args, scope, cx)?;
+            let inner = ret.opt_inner().unwrap_or(ret);
+            match inner {
+                Type::Struct(_) | Type::Str | Type::Array(_) => Ok(inner.into_opt().unwrap()),
+                _ => Err(format!(
+                    "type error: optional call returns a non-heap {ret:?} — coalesce it \
+                     (`recv?.m(…) ?? default`)"
+                )),
+            }
+        }
+        Expr::OptCallOr { recv, name, args, default } => {
+            let ret = opt_call_ret(recv, name, args, scope, cx)?;
+            let result = ret.opt_inner().unwrap_or(ret); // the method's non-null result
             let dt = type_of(default, scope, cx)?;
             if !assignable(dt, result) {
                 return Err(format!("type error: `?? default` has type {dt:?}, expected {result:?}"));

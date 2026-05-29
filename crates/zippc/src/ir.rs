@@ -404,6 +404,28 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Emit a call `name(recv, args…)` (recv already in `recv`), returning the
+    /// result register. Used by optional method calls.
+    fn emit_call(&mut self, name: &str, recv: u32, args: &[Expr]) -> Result<u32, String> {
+        let func = *self
+            .func_index
+            .get(name)
+            .ok_or_else(|| format!("ir error: call to unknown method '{name}'"))?;
+        let argc = args.len() as u32 + 1;
+        let arg_base = self.next_reg;
+        for _ in 0..argc {
+            self.alloc();
+        }
+        self.code.push(Instr::Mov { dst: arg_base, src: recv });
+        for (i, a) in args.iter().enumerate() {
+            let v = self.gen_expr(a)?;
+            self.code.push(Instr::Mov { dst: arg_base + 1 + i as u32, src: v });
+        }
+        let dst = self.alloc();
+        self.code.push(Instr::Call { func, arg_base, argc, dst });
+        Ok(dst)
+    }
+
     fn gen_expr(&mut self, e: &Expr) -> Result<u32, String> {
         match e {
             Expr::Int(n) => {
@@ -548,6 +570,45 @@ impl<'a> Gen<'a> {
                 let fv = self.alloc();
                 self.code.push(Instr::GetField { dst: fv, base: b, field: field.clone() });
                 self.code.push(Instr::Mov { dst, src: fv });
+                let end = self.here();
+                self.patch(jmp, end);
+                Ok(dst)
+            }
+            // `recv?.m(args)` — null if recv is null, else name(recv, args).
+            Expr::OptCall { recv, name, args } => {
+                let dst = self.alloc();
+                let r = self.gen_expr(recv)?;
+                self.code.push(Instr::ConstNull { dst, ty: None }); // default: null
+                let nullr = self.alloc();
+                self.code.push(Instr::ConstNull { dst: nullr, ty: None });
+                let isnull = self.alloc();
+                self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: r, b: nullr });
+                let jnz = self.here();
+                self.code.push(Instr::JmpIfNonZero { cond: isnull, target: 0 }); // null → keep null
+                let cr = self.emit_call(name, r, args)?;
+                self.code.push(Instr::Mov { dst, src: cr });
+                let end = self.here();
+                self.patch(jnz, end);
+                Ok(dst)
+            }
+            // `recv?.m(args) ?? default`.
+            Expr::OptCallOr { recv, name, args, default } => {
+                let dst = self.alloc();
+                let r = self.gen_expr(recv)?;
+                let nullr = self.alloc();
+                self.code.push(Instr::ConstNull { dst: nullr, ty: None });
+                let isnull = self.alloc();
+                self.code.push(Instr::Bin { op: BinOp::Eq, dst: isnull, a: r, b: nullr });
+                let jz = self.here();
+                self.code.push(Instr::JmpIfZero { cond: isnull, target: 0 }); // non-null → call
+                let d = self.gen_expr(default)?;
+                self.code.push(Instr::Mov { dst, src: d });
+                let jmp = self.here();
+                self.code.push(Instr::Jmp { target: 0 });
+                let callblk = self.here();
+                self.patch(jz, callblk);
+                let cr = self.emit_call(name, r, args)?;
+                self.code.push(Instr::Mov { dst, src: cr });
                 let end = self.here();
                 self.patch(jmp, end);
                 Ok(dst)

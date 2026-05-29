@@ -183,6 +183,12 @@ pub enum Expr {
     /// Fused `base?.field ?? default` — the field's value, or `default` when
     /// `base` is null. Result is the (non-null) field type; works for any field.
     OptFieldOr { base: Box<Expr>, field: String, default: Box<Expr> },
+    /// Optional method call `recv?.m(args)` — `null` if `recv` is null, else
+    /// `name(recv, args)`. Result is nullable (the method must return a heap type).
+    OptCall { recv: Box<Expr>, name: String, args: Vec<Expr> },
+    /// Fused `recv?.m(args) ?? default` — the method result, or `default` when
+    /// `recv` is null. Result is the (non-null) return type; works for any return.
+    OptCallOr { recv: Box<Expr>, name: String, args: Vec<Expr>, default: Box<Expr> },
 }
 
 /// A statement plus the source line it starts on (for error messages).

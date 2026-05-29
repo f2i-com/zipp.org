@@ -1643,6 +1643,39 @@ impl Lower<'_> {
         }
     }
 
+    /// Resolve `recv?.method(args)` to `(recv, mangled-method-name, args)` by
+    /// dispatching on the receiver's (non-null) class.
+    fn resolve_opt_call(
+        &self,
+        c: &CallExpression,
+    ) -> LResult<(z::Expr, String, Vec<z::Expr>)> {
+        let m = match &c.callee {
+            Expression::StaticMemberExpression(m) if m.optional => m,
+            _ => return Err(self.err(c.span, "only `recv?.method(…)` optional calls are supported")),
+        };
+        let method = m.property.name.as_str();
+        let recv = self.expr(&m.object)?;
+        let cid = match self.ztype_of(&recv).map(|t| t.opt_inner().unwrap_or(t)) {
+            Some(z::Type::Struct(id)) => id,
+            _ => {
+                return Err(self.err(
+                    c.span,
+                    "can't resolve the receiver's class for `?.m()` — annotate it",
+                ))
+            }
+        };
+        let cname = self.struct_name(cid).ok_or_else(|| self.err(c.span, "internal: unknown struct"))?;
+        let name = format!("{cname}__{method}");
+        let mut args = Vec::new();
+        for a in &c.arguments {
+            let ex = a
+                .as_expression()
+                .ok_or_else(|| self.err(c.span, "spread arguments aren't supported"))?;
+            args.push(self.expr(ex)?);
+        }
+        Ok((recv, name, args))
+    }
+
     /// Lower a `.`/`?.` member access: optional `base?.field`, an enum member,
     /// `arr.length`, or a struct field read.
     fn member(&self, m: &StaticMemberExpression) -> LResult<z::Expr> {
@@ -1710,12 +1743,20 @@ impl Lower<'_> {
                     r: Box::new(self.expr(&l.right)?),
                 },
                 LogicalOperator::Coalesce => {
-                    // `base?.field ?? default` fuses to a type-safe default (works
-                    // even when the field is a scalar — no nullable-scalar needed).
+                    // `base?.field ?? default` / `recv?.m() ?? default` fuse to a
+                    // type-safe default (works even for a scalar field/return).
                     if let Some(m) = optional_member(&l.left) {
                         z::Expr::OptFieldOr {
                             base: Box::new(self.expr(&m.object)?),
                             field: m.property.name.as_str().to_string(),
+                            default: Box::new(self.expr(&l.right)?),
+                        }
+                    } else if let Some(call) = optional_call(&l.left) {
+                        let (recv, name, args) = self.resolve_opt_call(call)?;
+                        z::Expr::OptCallOr {
+                            recv: Box::new(recv),
+                            name,
+                            args,
                             default: Box::new(self.expr(&l.right)?),
                         }
                     } else {
@@ -1770,13 +1811,17 @@ impl Lower<'_> {
                 }
             }
             Expression::StaticMemberExpression(m) => self.member(m)?,
-            // `a?.b` — optional chaining (the chain is wrapped here).
+            // `a?.b` / `a?.m()` — optional chaining (the chain is wrapped here).
             Expression::ChainExpression(c) => match &c.expression {
                 ChainElement::StaticMemberExpression(m) => self.member(m)?,
+                ChainElement::CallExpression(call) => {
+                    let (recv, name, args) = self.resolve_opt_call(call)?;
+                    z::Expr::OptCall { recv: Box::new(recv), name, args }
+                }
                 _ => {
                     return Err(self.err(
                         c.span,
-                        "only `a?.b` optional chaining is supported (not `?.()` or `?.[…]`)",
+                        "only `a?.b` / `a?.m()` optional chaining is supported (not `?.[…]`)",
                     ))
                 }
             },
@@ -2087,6 +2132,12 @@ fn expr_has_var(e: &z::Expr) -> bool {
         z::Expr::OptFieldOr { base, default, .. } => {
             expr_has_var(base) || expr_has_var(default)
         }
+        z::Expr::OptCall { recv, args, .. } => {
+            expr_has_var(recv) || args.iter().any(expr_has_var)
+        }
+        z::Expr::OptCallOr { recv, args, default, .. } => {
+            expr_has_var(recv) || args.iter().any(expr_has_var) || expr_has_var(default)
+        }
         z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) | z::Expr::Null => {
             false
         }
@@ -2099,6 +2150,18 @@ fn optional_member<'e, 'a>(e: &'e Expression<'a>) -> Option<&'e StaticMemberExpr
         if let ChainElement::StaticMemberExpression(m) = &c.expression {
             if m.optional {
                 return Some(m);
+            }
+        }
+    }
+    None
+}
+
+/// If `e` is an optional method call `recv?.method(args)`, return that call.
+fn optional_call<'e, 'a>(e: &'e Expression<'a>) -> Option<&'e CallExpression<'a>> {
+    if let Expression::ChainExpression(c) = e {
+        if let ChainElement::CallExpression(call) = &c.expression {
+            if matches!(&call.callee, Expression::StaticMemberExpression(m) if m.optional) {
+                return Some(call);
             }
         }
     }
@@ -2331,6 +2394,32 @@ mod tests {
                      if (n !== null) { return head.val + n.val; } \
                      return head.val; }";
         assert_eq!(run_i64(ts3), 3); // 1 + 2
+    }
+
+    #[test]
+    fn optional_method_calls() {
+        // `a?.m() ?? default` — a scalar-returning method, fused
+        let ts = "class Account { \
+                    balance: i64; \
+                    constructor(b: i64) { this.balance = b; } \
+                    get(): i64 { return this.balance; } \
+                  } \
+                  function bal(a: Account | null): i64 { return a?.get() ?? -1; } \
+                  function main(): i64 { let x = new Account(100); return bal(x) + bal(null); }";
+        assert_eq!(run_i64(ts), 99); // 100 + (-1)
+        // `a?.m()` returning a nullable struct → chain/narrow the result
+        let ts2 = "class Node { \
+                     v: i64; nxt: Node | null; \
+                     constructor(v: i64, nxt: Node | null) { this.v = v; this.nxt = nxt; } \
+                     next(): Node | null { return this.nxt; } \
+                   } \
+                   function main(): i64 { \
+                     let tail = new Node(2, null); \
+                     let head = new Node(1, tail); \
+                     let h: Node | null = head; \
+                     let n = h?.next(); \
+                     return n?.v ?? -1; }";
+        assert_eq!(run_i64(ts2), 2); // head.next() = tail, tail.v = 2
     }
 
     #[test]
