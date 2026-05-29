@@ -167,6 +167,7 @@ enum JTy {
     F64,
     Arr(bool),
     Str,
+    Struct(u32),
 }
 
 impl JTy {
@@ -174,11 +175,17 @@ impl JTy {
         if matches!(self, JTy::F64) {
             types::F64
         } else {
-            types::I64 // i64, bool, and array/string pointers
+            types::I64 // i64, bool, and array/string/struct pointers
         }
     }
     fn arr_f64(self) -> bool {
         matches!(self, JTy::Arr(true))
+    }
+    fn struct_id(self) -> Option<u32> {
+        match self {
+            JTy::Struct(id) => Some(id),
+            _ => None,
+        }
     }
 }
 
@@ -187,8 +194,16 @@ fn jty_of(t: Type) -> JTy {
         Type::F64 => JTy::F64,
         Type::Array(e) => JTy::Arr(matches!(e, Elem::F64)),
         Type::Str => JTy::Str,
+        Type::Struct(id) => JTy::Struct(id),
         _ => JTy::I64,
     }
+}
+
+/// (slot index, field type) of a struct field by name.
+fn struct_field(prog: &Program, id: u32, field: &str) -> Option<(usize, JTy)> {
+    let layout = &prog.structs[id as usize];
+    let slot = layout.fields.iter().position(|f| f == field)?;
+    Some((slot, jty_of(layout.types[slot])))
 }
 
 /// Cranelift type for a ZIPP type (bool / array / string pointers are i64).
@@ -201,15 +216,12 @@ fn var(r: u32) -> Variable {
 }
 
 /// Reason a program can't be JIT-compiled, or `None`. Only math builtins are
-/// left unsupported (everything else — scalars, arrays, strings — compiles).
+/// left unsupported (scalars, arrays, strings, structs all compile).
 pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     for ins in &prog.code {
-        let bad = match ins {
-            Instr::Builtin { .. } => "builtins",
-            Instr::NewStruct { .. } | Instr::GetField { .. } | Instr::SetField { .. } => "structs",
-            _ => continue,
-        };
-        return Some(bad);
+        if let Instr::Builtin { .. } = ins {
+            return Some("builtins");
+        }
     }
     None
 }
@@ -376,6 +388,13 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
                 };
             }
             Instr::Len { dst, .. } => t[*dst as usize] = JTy::I64,
+            Instr::NewStruct { id, dst, .. } => t[*dst as usize] = JTy::Struct(*id),
+            Instr::GetField { dst, base, field } => {
+                t[*dst as usize] = t[*base as usize]
+                    .struct_id()
+                    .and_then(|id| struct_field(prog, id, field))
+                    .map_or(JTy::I64, |(_, fty)| fty);
+            }
             _ => {}
         }
     }
@@ -751,6 +770,56 @@ fn compile_function(
                 let len = builder.ins().load(types::I64, MemFlags::trusted(), base, 0);
                 builder.def_var(var(*dst), len);
             }
+            Instr::NewStruct { id, dst, fields } => {
+                // Reuse the array allocator: zipp_alloc(nfields) gives [n | slots];
+                // fields go in the element slots (slot 0's len is unused here).
+                let nfields = prog.structs[*id as usize].fields.len();
+                let n = builder.ins().iconst(types::I64, nfields as i64);
+                let alloc = module.declare_func_in_func(rt.alloc, builder.func);
+                let call = builder.ins().call(alloc, &[n]);
+                let ptr = builder.inst_results(call)[0];
+                let flags = MemFlags::trusted();
+                for (i, fr) in fields.iter().enumerate() {
+                    let fv = builder.use_var(var(*fr));
+                    let raw = if matches!(jty_of(prog.structs[*id as usize].types[i]), JTy::F64) {
+                        builder.ins().bitcast(types::I64, MemFlags::new(), fv)
+                    } else {
+                        fv
+                    };
+                    builder.ins().store(flags, raw, ptr, 8 * (i as i32 + 1));
+                }
+                builder.def_var(var(*dst), ptr);
+            }
+            Instr::GetField { dst, base, field } => {
+                let id = rty[*base as usize]
+                    .struct_id()
+                    .ok_or("internal: GetField on a non-struct register")?;
+                let (slot, fty) =
+                    struct_field(prog, id, field).ok_or("internal: unknown struct field")?;
+                let base_v = builder.use_var(var(*base));
+                let raw = builder.ins().load(types::I64, MemFlags::trusted(), base_v, 8 * (slot as i32 + 1));
+                let val = if matches!(fty, JTy::F64) {
+                    builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+                } else {
+                    raw
+                };
+                builder.def_var(var(*dst), val);
+            }
+            Instr::SetField { base, field, value } => {
+                let id = rty[*base as usize]
+                    .struct_id()
+                    .ok_or("internal: SetField on a non-struct register")?;
+                let (slot, fty) =
+                    struct_field(prog, id, field).ok_or("internal: unknown struct field")?;
+                let base_v = builder.use_var(var(*base));
+                let vv = builder.use_var(var(*value));
+                let raw = if matches!(fty, JTy::F64) {
+                    builder.ins().bitcast(types::I64, MemFlags::new(), vv)
+                } else {
+                    vv
+                };
+                builder.ins().store(MemFlags::trusted(), raw, base_v, 8 * (slot as i32 + 1));
+            }
             other => return Err(format!("internal: ineligible instr reached JIT: {other:?}")),
         }
     }
@@ -919,12 +988,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_structs() {
-        // arrays + strings now JIT; structs still fall back (next).
-        let st = zippc::compile(
-            "struct P { x: i64 } fn main(): i64 { let p = P { x: 7 }; return p.x; }",
-        )
-        .unwrap();
-        assert!(run(&st).is_err());
+    fn structs() {
+        // construct, field read/write, mixed i64/f64 fields, struct param
+        let p = "struct P { x: i64, y: i64 } \
+                 fn main(): i64 { let p = P { x: 3, y: 4 }; p.y = p.y + 10; return p.x + p.y; }";
+        assert_eq!(jit_i64(p), 17);
+        let m = "struct V { a: f64, n: i64 } \
+                 fn main(): f64 { let v = V { a: 1.5, n: 2 }; v.a = v.a * f64(v.n); return v.a; }";
+        assert_eq!(jit_f64(m), 3.0);
+        let call = "struct P { x: i64, y: i64 } \
+                    fn sm(p: P): i64 { return p.x + p.y; } \
+                    fn main(): i64 { let p = P { x: 5, y: 6 }; return sm(p); }";
+        assert_eq!(jit_i64(call), 11);
+    }
+
+    #[test]
+    fn rejects_builtins() {
+        // everything but math builtins now compiles natively.
+        let b = zippc::compile("fn main(): i64 { return abs(0 - 5); }").unwrap();
+        assert!(run(&b).is_err());
     }
 }

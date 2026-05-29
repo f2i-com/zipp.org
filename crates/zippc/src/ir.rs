@@ -42,6 +42,9 @@ pub enum Instr {
 #[derive(Debug, Clone)]
 pub struct StructLayout {
     pub fields: Vec<String>,
+    /// Field types, parallel to `fields` (the VM ignores these — it's
+    /// dynamically tagged — but the native backends need them to type each slot).
+    pub types: Vec<Type>,
 }
 
 /// Builtin math functions (recognized call names, not user functions).
@@ -141,6 +144,7 @@ pub fn lower(m: &Module) -> Result<Program, String> {
         .iter()
         .map(|sd| StructLayout {
             fields: sd.fields.iter().map(|(n, _)| n.clone()).collect(),
+            types: sd.fields.iter().map(|(_, t)| *t).collect(),
         })
         .collect();
     Ok(Program { code, funcs, main, structs })

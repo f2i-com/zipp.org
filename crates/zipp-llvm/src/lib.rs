@@ -28,13 +28,14 @@ enum LTy {
     F64,
     Arr(bool),
     Str,
+    Struct(u32),
 }
 
 fn llname(t: LTy) -> &'static str {
     match t {
         LTy::I64 => "i64",
         LTy::F64 => "double",
-        LTy::Arr(_) | LTy::Str => "ptr",
+        LTy::Arr(_) | LTy::Str | LTy::Struct(_) => "ptr",
     }
 }
 
@@ -42,25 +43,71 @@ fn arr_f64(t: LTy) -> bool {
     matches!(t, LTy::Arr(true))
 }
 
+fn struct_id(t: LTy) -> Option<u32> {
+    match t {
+        LTy::Struct(id) => Some(id),
+        _ => None,
+    }
+}
+
 fn lty_of(t: Type) -> LTy {
     match t {
         Type::F64 => LTy::F64,
         Type::Array(e) => LTy::Arr(matches!(e, Elem::F64)),
         Type::Str => LTy::Str,
+        Type::Struct(id) => LTy::Struct(id),
         _ => LTy::I64, // i64, bool (bool is an i64 0/1)
     }
 }
 
+/// (slot index, field type) of a struct field by name.
+fn struct_field(prog: &Program, id: u32, field: &str) -> Option<(usize, LTy)> {
+    let layout = &prog.structs[id as usize];
+    let slot = layout.fields.iter().position(|f| f == field)?;
+    Some((slot, lty_of(layout.types[slot])))
+}
+
+/// Convert a typed value to the raw i64 stored in a struct slot.
+fn to_slot(body: &mut String, tmp: &mut usize, lty: LTy, val: &str) -> String {
+    match lty {
+        LTy::I64 => val.to_string(),
+        LTy::F64 => {
+            let t = fresh(tmp);
+            body.push_str(&format!("  {t} = bitcast double {val} to i64\n"));
+            t
+        }
+        _ => {
+            let t = fresh(tmp); // array/string/struct pointer
+            body.push_str(&format!("  {t} = ptrtoint ptr {val} to i64\n"));
+            t
+        }
+    }
+}
+
+/// Convert a raw i64 slot back to its typed value.
+fn from_slot(body: &mut String, tmp: &mut usize, lty: LTy, raw: &str) -> String {
+    match lty {
+        LTy::I64 => raw.to_string(),
+        LTy::F64 => {
+            let t = fresh(tmp);
+            body.push_str(&format!("  {t} = bitcast i64 {raw} to double\n"));
+            t
+        }
+        _ => {
+            let t = fresh(tmp);
+            body.push_str(&format!("  {t} = inttoptr i64 {raw} to ptr\n"));
+            t
+        }
+    }
+}
+
 /// Reason a program can't use the LLVM tier, or `None`. Only math builtins are
-/// left unsupported (scalars, arrays, strings all compile).
+/// left unsupported (scalars, arrays, strings, structs all compile).
 pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     for ins in &prog.code {
-        let bad = match ins {
-            Instr::Builtin { .. } => "builtins",
-            Instr::NewStruct { .. } | Instr::GetField { .. } | Instr::SetField { .. } => "structs",
-            _ => continue,
-        };
-        return Some(bad);
+        if let Instr::Builtin { .. } = ins {
+            return Some("builtins");
+        }
     }
     None
 }
@@ -108,6 +155,12 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
                 };
             }
             Instr::Len { dst, .. } => t[*dst as usize] = LTy::I64,
+            Instr::NewStruct { id, dst, .. } => t[*dst as usize] = LTy::Struct(*id),
+            Instr::GetField { dst, base, field } => {
+                t[*dst as usize] = struct_id(t[*base as usize])
+                    .and_then(|id| struct_field(prog, id, field))
+                    .map_or(LTy::I64, |(_, fty)| fty);
+            }
             _ => {}
         }
     }
@@ -249,7 +302,7 @@ fn emit_bin(body: &mut String, tmp: &mut usize, op: BinOp, ty: LTy, a: &str, b: 
     }
 }
 
-fn emit_fn(prog: &Program, fi: usize, end: u32) -> String {
+fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
     let f = &prog.funcs[fi];
     let rty = infer(prog, f, end);
     let ret = lty_of(f.ret);
@@ -485,6 +538,54 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> String {
                 s.push_str(&format!("  {v} = load i64, ptr {base}\n"));
                 store(&mut s, &rty, *dst, &v);
             }
+            Instr::NewStruct { id, dst, fields } => {
+                // Reuse zipp_alloc(nfields): fields go in the element slots.
+                let nfields = prog.structs[*id as usize].fields.len();
+                let p = fresh(&mut tmp);
+                s.push_str(&format!("  {p} = call ptr @zipp_alloc(i64 {nfields})\n"));
+                for (i, fr) in fields.iter().enumerate() {
+                    let fv = load(&mut s, &mut tmp, &rty, *fr);
+                    let raw = to_slot(&mut s, &mut tmp, rty[*fr as usize], &fv);
+                    let slot = fresh(&mut tmp);
+                    s.push_str(&format!(
+                        "  {slot} = getelementptr inbounds i64, ptr {p}, i64 {}\n",
+                        i + 1
+                    ));
+                    s.push_str(&format!("  store i64 {raw}, ptr {slot}\n"));
+                }
+                store(&mut s, &rty, *dst, &p);
+            }
+            Instr::GetField { dst, base, field } => {
+                let id = struct_id(rty[*base as usize])
+                    .ok_or("internal: GetField on a non-struct register")?;
+                let (slot, fty) =
+                    struct_field(prog, id, field).ok_or("internal: unknown struct field")?;
+                let basev = load(&mut s, &mut tmp, &rty, *base);
+                let sp = fresh(&mut tmp);
+                s.push_str(&format!(
+                    "  {sp} = getelementptr inbounds i64, ptr {basev}, i64 {}\n",
+                    slot + 1
+                ));
+                let raw = fresh(&mut tmp);
+                s.push_str(&format!("  {raw} = load i64, ptr {sp}\n"));
+                let val = from_slot(&mut s, &mut tmp, fty, &raw);
+                store(&mut s, &rty, *dst, &val);
+            }
+            Instr::SetField { base, field, value } => {
+                let id = struct_id(rty[*base as usize])
+                    .ok_or("internal: SetField on a non-struct register")?;
+                let (slot, fty) =
+                    struct_field(prog, id, field).ok_or("internal: unknown struct field")?;
+                let basev = load(&mut s, &mut tmp, &rty, *base);
+                let vv = load(&mut s, &mut tmp, &rty, *value);
+                let raw = to_slot(&mut s, &mut tmp, fty, &vv);
+                let sp = fresh(&mut tmp);
+                s.push_str(&format!(
+                    "  {sp} = getelementptr inbounds i64, ptr {basev}, i64 {}\n",
+                    slot + 1
+                ));
+                s.push_str(&format!("  store i64 {raw}, ptr {sp}\n"));
+            }
             other => {
                 s.push_str(&format!("  ; unsupported instr reached llvm emit: {other:?}\n"));
             }
@@ -495,7 +596,7 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> String {
         s.push_str(&format!("  ret {} {z}\n", llname(ret)));
     }
     s.push_str("}\n\n");
-    s
+    Ok(s)
 }
 
 fn cstr_global(name: &str, s: &str) -> String {
@@ -631,7 +732,7 @@ fn escape_bytes(s: &str) -> String {
 /// `main` that times the entry call with `clock()` and prints the result).
 pub fn emit_ir(prog: &Program) -> Result<String, String> {
     if let Some(bad) = ineligible_reason(prog) {
-        return Err(format!("--llvm supports scalars + arrays + strings only (program uses {bad})"));
+        return Err(format!("--llvm supports scalars + arrays + strings + structs only (program uses {bad})"));
     }
     let mut out = String::new();
     out.push_str("; ZIPP → LLVM IR (release tier)\n");
@@ -674,7 +775,7 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
         } else {
             prog.code.len() as u32
         };
-        out.push_str(&emit_fn(prog, i, end));
+        out.push_str(&emit_fn(prog, i, end)?);
     }
 
     // C entry: time the kernel with clock() (excludes process startup), then
@@ -818,12 +919,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_structs() {
-        // arrays + strings now emit; structs still fall back (next).
+    fn emits_ir_for_struct_programs() {
         let prog = zippc::compile(
-            "struct P { x: i64 } fn main(): i64 { let p = P { x: 7 }; return p.x; }",
+            "struct P { x: i64, y: f64 } \
+             fn main(): f64 { let p = P { x: 3, y: 1.5 }; p.x = p.x + 1; return p.y; }",
         )
         .unwrap();
+        let ir = emit_ir(&prog).unwrap();
+        assert!(ir.contains("@zipp_alloc")); // structs reuse the array allocator
+        assert!(ir.contains("getelementptr"));
+    }
+
+    #[test]
+    fn rejects_builtins() {
+        // everything but math builtins now emits.
+        let prog = zippc::compile("fn main(): i64 { return abs(0 - 5); }").unwrap();
         assert!(emit_ir(&prog).is_err());
     }
 }

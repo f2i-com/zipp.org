@@ -40,13 +40,14 @@ with `--no-default-features` and the language still runs.
 - A **VM** that runs it (`zipp run`)
 - The **optional zk-STARK profile** (`zipp run --prove`): Winterfell proof +
   verification over the VM execution trace
-- A **native JIT** (`zipp run --jit`, Cranelift): compiles the scalar subset
-  (`i64` + `f64`, casts) **plus 1-D arrays** to machine code — a fast-compile
-  tier-0 that beats V8 on integer loops (see Performance below)
+- A **native JIT** (`zipp run --jit`, Cranelift): compiles **nearly the whole
+  language** — scalars (`i64`/`f64`, casts), arrays, strings, structs — to
+  machine code; only math builtins fall back. A fast-compile tier-0 that beats
+  V8 on integer loops (see Performance below)
 - An **LLVM release tier** (`zipp run --llvm`): emits LLVM IR and compiles it
-  with `clang -O3 -march=native` — same coverage (scalars + arrays), **matches
-  V8 on dense f64** and **beats V8 and Bun on dense-f64 arrays** (matmul). No
-  `llvm-sys` linkage; it shells out to `clang`.
+  with `clang -O3 -march=native` — same coverage, **matches V8 on dense f64**
+  and **beats V8 and Bun on dense-f64 arrays** (matmul). No `llvm-sys` linkage;
+  it shells out to `clang`.
 - An integration **test suite** (`cargo test`)
 - **Positioned errors** — parse errors report `line:col`, type errors report the
   statement line (e.g. `type error: arithmetic Add on I64 and Bool [line 2]`)
@@ -57,9 +58,9 @@ with `--no-default-features` and the language still runs.
 - Frontend: swap the hand-written parser for **oxc/SWC** (real TS/JSX)
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
 - Backends: **Cranelift** tier-0 JIT and an **LLVM** release tier (`clang -O3`)
-  — *scalars + 1-D arrays done* (matches V8 on dense f64; beats V8/Bun on matmul);
-  next, extend both to strings/structs, add a GC, LTO/PGO, and a **WASM-contract**
-  target
+  — *scalars + arrays + strings + structs done* (matches V8 on dense f64; beats
+  V8/Bun on matmul); next: math builtins, a GC (heap currently leaks), LTO/PGO,
+  and a **WASM-contract** target
 - Parallel work-stealing scheduler (the §5.8 flagship), GC/arenas, fast stdlib
 - zk hardening: PC-integrity + memory-permutation arguments, 64-bit range checks
 
@@ -192,9 +193,9 @@ fastest. (Interpreter: ~455 ms, so the JIT/LLVM are ~28–32× over it.)
 
 ZIPP has **three native paths**: the Cranelift **`--jit`** (PLAN.md tier-0 — a
 fast-*compile* baseline) and the **`--llvm`** release tier (`clang -O3`),
-plus the interpreter fallback. All cover the scalar subset (`i64` + `f64`,
-casts) **and 1-D arrays of scalars**; strings / structs still fall back to the
-interpreter.
+plus the interpreter fallback. Both native backends cover **nearly the whole
+language** — scalars (`i64` + `f64`, casts), 1-D arrays, strings, and structs;
+only math builtins still fall back to the interpreter.
 
 - **`--llvm` matches V8 on dense f64** (~99 ms vs ~101 ms) and **beats V8/Bun on
   dense-f64 arrays** (matmul). `-O3` auto-FMAs, schedules, reassociates and
@@ -240,11 +241,11 @@ host AVX/FMA, verifier off, opt-in FMA; LLVM: `-O3 -march=native`).
 rounding (last-bit), so the strict default keeps native output bit-identical to
 the interpreter — which matters for the deterministic contract/provable profiles.
 
-Next: strings and structs in the native backends (arrays now JIT/LLVM via a
-length-prefixed, bounds-checked, calloc/leak runtime — no GC yet). One kernel
-isn't the whole story (PLAN.md §6/§11 — workloads differ, and V8's hand-tuned
-stdlib is a separate battle), but this is real, reproducible evidence the thesis
-holds where the design predicts.
+Next: math builtins in the native backends (the last fallback), then a GC (the
+array/string/struct heap currently leaks). One kernel isn't the whole story
+(PLAN.md §6/§11 — workloads differ, and V8's hand-tuned stdlib is a separate
+battle), but this is real, reproducible evidence the thesis holds where the
+design predicts.
 
 ## License
 
