@@ -133,7 +133,11 @@ the same path `zk-formlogic` took to its 78-column trace.
 
 ## Performance (honest, measured)
 
-50M-iteration sum loop (`bench/loop.zipp`), execution time:
+Two kernels, vs Node 24 (V8). ZIPP `--jit` times include compilation; all
+engines compute the identical result on each kernel (so the comparison is
+apples-to-apples). Both kernels are in `bench/` with byte-identical `.js` twins.
+
+**Integer** — 50M-iteration sum loop (`bench/loop.zipp`):
 
 | engine | time | vs V8 |
 |---|---|---|
@@ -141,15 +145,32 @@ the same path `zk-formlogic` took to its 78-column trace.
 | Node 24 (V8 JIT) | ~30 ms | 1× |
 | **ZIPP `--jit` (Cranelift, native)** | **~10 ms** | **~3× faster** |
 
-The bytecode interpreter is ~20× slower than V8 (expected — it interprets; V8
-JITs). The new **native JIT** (`--jit`, PLAN.md tier-0) compiles the scalar
-subset to machine code and on this kernel **beats V8** — the §6 sweet spot
-(native scalars, no deopt guards, AOT). It now covers the scalar subset (`i64`
-and `f64`, casts, arithmetic, control flow, functions, `print`); arrays /
-strings / structs still fall back to the interpreter. **f64 JITs too**: the
-Leibniz-π loop (`examples/pi.zipp`) runs in ~1.7 ms native vs ~29 ms interpreted
-(~17×). Next: heap types via a runtime, then an LLVM release tier (+LTO/PGO),
-per Phases 7–9.
+**Dense f64** — 1000×1000 Mandelbrot, 256-iter cap (`bench/mandelbrot.zipp`):
+
+| engine | time | vs V8 |
+|---|---|---|
+| Node 24 (V8 JIT) | ~100 ms | 1× |
+| **ZIPP `--jit` (Cranelift, native)** | **~127 ms** | **~1.27× slower** |
+
+The story these two tell is the honest one. The **native JIT** (`--jit`,
+PLAN.md tier-0) compiles the scalar subset (`i64` + `f64`, casts, arithmetic,
+control flow, functions, `print`) to machine code; arrays / strings / structs
+still fall back to the interpreter.
+
+- On the **integer** loop there's nothing for an optimizing compiler to do, so
+  ZIPP's AOT-no-deopt-guards code **beats V8 ~3×** — the §6 sweet spot.
+- On **dense f64**, V8's optimizing tier (TurboFan — better register
+  allocation, and almost certainly FMA contraction of the `a*b + c` terms)
+  pulls **~30% ahead**. Cranelift is a *baseline* compiler (even at
+  `opt_level="speed"`, which is enabled here); it does no FMA contraction
+  (float semantics) and lighter scheduling. So ZIPP is "on par" — same
+  ballpark, within ~1.3× — but not yet ahead on this class.
+
+Closing the dense-f64 gap is the planned **LLVM release tier** (Phases 8–9:
+`-O3` + LTO/PGO/SIMD), which is the engine meant to win this race. Per-kernel
+f64 also already crushes the interpreter — the Leibniz-π loop (`examples/pi.zipp`)
+is ~1.7 ms native vs ~29 ms interpreted (~17×). Next on the JIT itself: heap
+types via a runtime (unlocks the array benchmarks — n-body, spectral-norm).
 
 One kernel isn't the whole story (PLAN.md §6/§11 — different workloads favour
 different engines, and V8's hand-tuned stdlib is a separate battle), but it's

@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use cranelift_codegen::settings::Configurable;
+
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, Type as ClifType, Value};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -96,8 +98,19 @@ pub fn run(prog: &Program) -> Result<JitValue, String> {
         return Err(format!("--jit supports the scalar subset only (program uses {bad})"));
     }
 
-    let mut jit = JITBuilder::new(cranelift_module::default_libcall_names())
-        .map_err(|e| format!("jit init failed: {e}"))?;
+    // Tier-0 but with the optimizer on: opt_level=none (the default) leaves
+    // obvious redundancy (e.g. recomputed `x*x`) in the code; "speed" turns on
+    // Cranelift's egraph mid-end (GVN/LICM-style rewrites) — material on dense
+    // arithmetic kernels like Mandelbrot.
+    let mut flags = cranelift_codegen::settings::builder();
+    flags
+        .set("opt_level", "speed")
+        .map_err(|e| format!("opt flag: {e}"))?;
+    let isa = cranelift_native::builder()
+        .map_err(|e| format!("host isa unavailable: {e}"))?
+        .finish(cranelift_codegen::settings::Flags::new(flags))
+        .map_err(|e| format!("isa finish: {e}"))?;
+    let mut jit = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     jit.symbol("zipp_print_i64", zipp_print_i64 as *const u8);
     jit.symbol("zipp_print_f64", zipp_print_f64 as *const u8);
     let mut module = JITModule::new(jit);
