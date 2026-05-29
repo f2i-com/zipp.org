@@ -16,12 +16,14 @@
 //! `i64`/`i32`/`u32`/`u64`/`f64` usable directly. `interface`s and `class`es
 //! become ZIPP structs (a class lowers to a `C__new` factory plus methods that
 //! take `this` as their first parameter; `new`/`this`/`obj.method()` are
-//! rewritten accordingly). Not yet: generics, closures, inheritance — and never
-//! the dynamic core (`any`, prototypes, `eval`, exceptions, async), which is
-//! off-mission for an AOT/provable language.
+//! rewritten accordingly). Generic functions are **monomorphized**: every call
+//! is specialized to concrete types (inferred or explicit `f<T>(…)`), so the
+//! backends only ever see concrete code. Not yet: generic classes, closures,
+//! inheritance — and never the dynamic core (`any`, prototypes, `eval`,
+//! exceptions, async), which is off-mission for an AOT/provable language.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
@@ -43,9 +45,13 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
         src,
         structs: HashMap::new(),
         struct_fields: Vec::new(),
-        fn_rets: HashMap::new(),
+        fn_rets: RefCell::new(HashMap::new()),
         scope: RefCell::new(Vec::new()),
         ret_struct: Cell::new(None),
+        generic_info: HashMap::new(),
+        type_env: RefCell::new(Vec::new()),
+        pending: RefCell::new(Vec::new()),
+        done_insts: RefCell::new(HashSet::new()),
     };
     lower.module(&ret.program)
 }
@@ -58,13 +64,38 @@ struct Lower<'s> {
     /// `obj.field` types (and so resolve method-call receivers).
     struct_fields: Vec<Vec<(String, z::Type)>>,
     /// Every callable's return type — top-level functions, class factories
-    /// (`C__new`), and methods (`C__m`). Lets a method call resolve a receiver
-    /// expression whose type comes from a call result.
-    fn_rets: HashMap<String, z::Type>,
+    /// (`C__new`), methods (`C__m`), and generic instantiations. Lets a call
+    /// (or method) resolve a receiver whose type comes from a call result.
+    /// `RefCell` so generic instantiations can register their type at the call.
+    fn_rets: RefCell<HashMap<String, z::Type>>,
     /// Per-function variable → type environment (drives `obj.method()` dispatch).
     scope: RefCell<Vec<HashMap<String, z::Type>>>,
     /// Struct id of the current function's return type (for `return {...}`).
     ret_struct: Cell<Option<u32>>,
+    /// Generic function name → owned monomorphization metadata.
+    generic_info: HashMap<String, GenericInfo>,
+    /// Active type-parameter bindings (a stack, for nested instantiation).
+    type_env: RefCell<Vec<HashMap<String, z::Type>>>,
+    /// Queue of generic instantiations still to emit: (generic name, type args).
+    pending: RefCell<Vec<(String, Vec<z::Type>)>>,
+    /// Mangled instantiation names already emitted or queued (dedup).
+    done_insts: RefCell<HashSet<String>>,
+}
+
+/// Owned metadata to monomorphize a generic function without re-touching the AST.
+struct GenericInfo {
+    type_params: Vec<String>,
+    /// Per type param: an argument index to infer it from (a parameter whose type
+    /// is exactly `T`), or `None` if it must be supplied explicitly (`f<i64>(…)`).
+    infer_from: Vec<Option<usize>>,
+    /// The return type as a template, for the instantiation's `fn_rets` entry.
+    ret: Option<TypeTpl>,
+}
+
+/// A generic function's return type expressed against its type parameters.
+enum TypeTpl {
+    Concrete(z::Type),
+    Param(usize),
 }
 
 type LResult<T> = Result<T, String>;
@@ -116,26 +147,30 @@ impl Lower<'_> {
         }
         self.struct_fields = structs.iter().map(|s| s.fields.clone()).collect();
 
-        // Pass 1c: collect the return type of every callable up front, so method
-        // bodies can resolve the type of a call result (for dispatch).
+        // Pass 1c: collect the return type of every NON-generic callable up front
+        // (generic instantiations register theirs at the call site). Methods can
+        // then resolve the type of a call result for dispatch.
         for stmt in &program.body {
             match stmt {
                 Statement::FunctionDeclaration(f) => {
+                    if f.type_parameters.is_some() {
+                        continue; // generic template — registered in pass 1d
+                    }
                     if let Some(id) = &f.id {
                         let r = self.fn_ret_type(f)?;
-                        self.fn_rets.insert(id.name.as_str().to_string(), r);
+                        self.fn_rets.borrow_mut().insert(id.name.as_str().to_string(), r);
                     }
                 }
                 Statement::ClassDeclaration(c) => {
                     let cname = c.id.as_ref().unwrap().name.as_str().to_string();
                     let cid = self.structs[cname.as_str()];
-                    self.fn_rets.insert(format!("{cname}__new"), z::Type::Struct(cid));
+                    self.fn_rets.borrow_mut().insert(format!("{cname}__new"), z::Type::Struct(cid));
                     for el in &c.body.body {
                         if let ClassElement::MethodDefinition(m) = el {
                             if matches!(m.kind, MethodDefinitionKind::Method) {
                                 let mname = self.prop_name(&m.key, m.span)?;
                                 let r = self.fn_ret_type(&m.value)?;
-                                self.fn_rets.insert(format!("{cname}__{mname}"), r);
+                                self.fn_rets.borrow_mut().insert(format!("{cname}__{mname}"), r);
                             }
                         }
                     }
@@ -144,12 +179,40 @@ impl Lower<'_> {
             }
         }
 
-        // Pass 2: lower all bodies — top-level functions, then class factories
-        // and methods (emitted as ordinary ZIPP functions).
+        // Pass 1d: register generic function templates — owned metadata for
+        // monomorphization, plus a borrow of the AST to instantiate from.
+        let mut generics: HashMap<String, &Function> = HashMap::new();
+        for stmt in &program.body {
+            if let Statement::FunctionDeclaration(f) = stmt {
+                let Some(decl) = &f.type_parameters else { continue };
+                let name = f
+                    .id
+                    .as_ref()
+                    .ok_or_else(|| self.err(f.span, "functions must be named"))?
+                    .name
+                    .as_str()
+                    .to_string();
+                if self.generic_info.contains_key(&name)
+                    || self.fn_rets.borrow().contains_key(&name)
+                {
+                    return Err(self.err(f.span, format!("function '{name}' redefined")));
+                }
+                let info = self.generic_info_of(f, decl)?;
+                self.generic_info.insert(name.clone(), info);
+                generics.insert(name, f);
+            }
+        }
+
+        // Pass 2: lower all bodies — non-generic functions, then class factories
+        // and methods. Generic templates are lowered on demand (pass 3).
         let mut funcs = Vec::new();
         for stmt in &program.body {
             match stmt {
-                Statement::FunctionDeclaration(f) => funcs.push(self.func(f)?),
+                Statement::FunctionDeclaration(f) => {
+                    if f.type_parameters.is_none() {
+                        funcs.push(self.func(f)?);
+                    }
+                }
                 Statement::ClassDeclaration(c) => self.lower_class(c, &mut funcs)?,
                 Statement::TSInterfaceDeclaration(_)
                 | Statement::TSTypeAliasDeclaration(_)
@@ -162,7 +225,68 @@ impl Lower<'_> {
                 }
             }
         }
+
+        // Pass 3: monomorphize. Draining the queue may enqueue more (a generic
+        // calling another, or itself), so loop until no new specialization remains.
+        loop {
+            let next = self.pending.borrow_mut().pop();
+            let Some((gname, type_args)) = next else { break };
+            let mangled = mangle_generic(&gname, &type_args);
+            let f = generics[&gname];
+            let type_params = self.generic_info[&gname].type_params.clone();
+            let mut env = HashMap::new();
+            for (k, tp) in type_params.into_iter().enumerate() {
+                env.insert(tp, type_args[k]);
+            }
+            self.type_env.borrow_mut().push(env);
+            let lowered = self.lower_func(f, mangled);
+            self.type_env.borrow_mut().pop();
+            funcs.push(lowered?);
+        }
         Ok(z::Module { funcs, structs })
+    }
+
+    /// Precompute the owned monomorphization metadata for a generic function.
+    fn generic_info_of(
+        &self,
+        f: &Function,
+        decl: &TSTypeParameterDeclaration,
+    ) -> LResult<GenericInfo> {
+        let type_params: Vec<String> =
+            decl.params.iter().map(|p| p.name.name.as_str().to_string()).collect();
+        if type_params.is_empty() {
+            return Err(self.err(f.span, "generic function has no type parameters"));
+        }
+        // A type param is inferable if some parameter's type is exactly `T`.
+        let mut infer_from = vec![None; type_params.len()];
+        for (pi, p) in f.params.items.iter().enumerate() {
+            if let Some(ann) = &p.type_annotation {
+                if let Some(tn) = bare_type_ref_name(&ann.type_annotation) {
+                    if let Some(k) = type_params.iter().position(|t| t == tn) {
+                        if infer_from[k].is_none() {
+                            infer_from[k] = Some(pi);
+                        }
+                    }
+                }
+            }
+        }
+        let ret = match &f.return_type {
+            Some(ann) => self.ret_tpl(&ann.type_annotation, &type_params),
+            None => return Err(self.err(f.span, "functions need an explicit return type")),
+        };
+        Ok(GenericInfo { type_params, infer_from, ret })
+    }
+
+    /// A generic's return type as a template: a bare type param, else (if it has
+    /// no type params) a concrete type, else `None` (instantiation result type
+    /// stays unknown — fine, it just can't be a method receiver without help).
+    fn ret_tpl(&self, t: &TSType, type_params: &[String]) -> Option<TypeTpl> {
+        if let Some(tn) = bare_type_ref_name(t) {
+            if let Some(k) = type_params.iter().position(|x| x == tn) {
+                return Some(TypeTpl::Param(k));
+            }
+        }
+        self.ty(t).ok().map(TypeTpl::Concrete)
     }
 
     fn interface(&self, decl: &TSInterfaceDeclaration) -> LResult<z::StructDecl> {
@@ -430,7 +554,7 @@ impl Lower<'_> {
             z::Expr::Str(_) => z::Type::Str,
             z::Expr::Var(n) => self.lookup(n)?,
             z::Expr::Cast { to, .. } => *to,
-            z::Expr::Call { name, .. } => *self.fn_rets.get(name)?,
+            z::Expr::Call { name, .. } => self.fn_rets.borrow().get(name).copied()?,
             z::Expr::StructLit { name, .. } => z::Type::Struct(*self.structs.get(name)?),
             z::Expr::Field { base, field } => {
                 let z::Type::Struct(id) = self.ztype_of(base)? else { return None };
@@ -464,6 +588,12 @@ impl Lower<'_> {
             .name
             .as_str()
             .to_string();
+        self.lower_func(f, name)
+    }
+
+    /// Lower a function (or one generic instantiation) under whatever type
+    /// environment is currently active, emitting it under `name`.
+    fn lower_func(&self, f: &Function, name: String) -> LResult<z::Func> {
         self.push_scope();
         let mut params = Vec::new();
         for p in &f.params.items {
@@ -532,10 +662,18 @@ impl Lower<'_> {
                     "f64" => z::Type::F64,
                     "bool" => z::Type::Bool,
                     "string" | "str" => z::Type::Str,
-                    other => match self.structs.get(other) {
-                        Some(&id) => z::Type::Struct(id),
-                        None => return Err(self.err(r.span, format!("unknown type '{other}'"))),
-                    },
+                    other => {
+                        // A generic type parameter currently in scope?
+                        if let Some(t) =
+                            self.type_env.borrow().iter().rev().find_map(|m| m.get(other).copied())
+                        {
+                            t
+                        } else if let Some(&id) = self.structs.get(other) {
+                            z::Type::Struct(id)
+                        } else {
+                            return Err(self.err(r.span, format!("unknown type '{other}'")));
+                        }
+                    }
                 }
             }
             TSType::TSParenthesizedType(p) => self.ty(&p.type_annotation)?,
@@ -822,7 +960,7 @@ impl Lower<'_> {
                     _ => return Err(self.err(n.span, "`new` requires a class name")),
                 };
                 let factory = format!("{cname}__new");
-                if !self.fn_rets.contains_key(&factory) {
+                if !self.fn_rets.borrow().contains_key(&factory) {
                     return Err(self.err(n.span, format!("`new {cname}(…)`: '{cname}' isn't a class")));
                 }
                 let mut args = Vec::new();
@@ -903,7 +1041,75 @@ impl Lower<'_> {
             }
             return Ok(z::Expr::Cast { to, e: Box::new(args.into_iter().next().unwrap()) });
         }
+        // Generic call → monomorphize: resolve the type arguments (explicit or
+        // inferred), queue the specialization, and call the mangled name.
+        if self.generic_info.contains_key(&name) {
+            let type_args = self.resolve_type_args(c, &name, &args)?;
+            let mangled = mangle_generic(&name, &type_args);
+            self.request_inst(&name, type_args, &mangled);
+            return Ok(z::Expr::Call { name: mangled, args });
+        }
         Ok(z::Expr::Call { name, args })
+    }
+
+    /// Resolve a generic call's type arguments — explicit `f<A,B>(…)` if present,
+    /// else inferred from arguments typed exactly `T`.
+    fn resolve_type_args(
+        &self,
+        c: &CallExpression,
+        name: &str,
+        args: &[z::Expr],
+    ) -> LResult<Vec<z::Type>> {
+        let nparams = self.generic_info[name].type_params.len();
+        if let Some(ta) = &c.type_arguments {
+            if ta.params.len() != nparams {
+                return Err(self.err(
+                    c.span,
+                    format!("{name} expects {nparams} type argument(s), got {}", ta.params.len()),
+                ));
+            }
+            return ta.params.iter().map(|p| self.ty(p)).collect();
+        }
+        let mut out = Vec::with_capacity(nparams);
+        for k in 0..nparams {
+            let tp = &self.generic_info[name].type_params[k];
+            let idx = self.generic_info[name].infer_from[k].ok_or_else(|| {
+                self.err(
+                    c.span,
+                    format!("can't infer type argument '{tp}' for {name}; call it as {name}<…>(…)"),
+                )
+            })?;
+            let t = args.get(idx).and_then(|a| self.ztype_of(a)).ok_or_else(|| {
+                self.err(
+                    c.span,
+                    format!("can't infer type argument '{tp}' for {name}; call it as {name}<…>(…)"),
+                )
+            })?;
+            out.push(t);
+        }
+        Ok(out)
+    }
+
+    /// Queue a generic instantiation (dedup by mangled name) and register its
+    /// concrete return type so call results can be typed.
+    fn request_inst(&self, name: &str, type_args: Vec<z::Type>, mangled: &str) {
+        if let Some(ret) = self.concrete_ret(name, &type_args) {
+            self.fn_rets.borrow_mut().insert(mangled.to_string(), ret);
+        }
+        if self.done_insts.borrow().contains(mangled) {
+            return;
+        }
+        self.done_insts.borrow_mut().insert(mangled.to_string());
+        self.pending.borrow_mut().push((name.to_string(), type_args));
+    }
+
+    /// A generic instantiation's concrete return type, if known.
+    fn concrete_ret(&self, name: &str, type_args: &[z::Type]) -> Option<z::Type> {
+        match &self.generic_info[name].ret {
+            Some(TypeTpl::Concrete(t)) => Some(*t),
+            Some(TypeTpl::Param(k)) => type_args.get(*k).copied(),
+            None => None,
+        }
     }
 
     fn bin_op(&self, op: BinaryOperator, span: Span) -> LResult<z::BinOp> {
@@ -959,6 +1165,47 @@ fn assign_bin_op(op: AssignmentOperator) -> Option<z::BinOp> {
         A::ShiftLeft => Some(z::BinOp::Shl),
         A::ShiftRight => Some(z::BinOp::Shr),
         _ => None, // unsupported compound ops fall through as plain assign (checker will catch type errors)
+    }
+}
+
+/// The name of a bare type reference (`T`), used to spot type parameters.
+fn bare_type_ref_name<'a>(t: &'a TSType<'a>) -> Option<&'a str> {
+    if let TSType::TSTypeReference(r) = t {
+        if let TSTypeName::IdentifierReference(id) = &r.type_name {
+            return Some(id.name.as_str());
+        }
+    }
+    None
+}
+
+/// Mangle a generic instantiation to a unique, valid ZIPP function name.
+fn mangle_generic(name: &str, args: &[z::Type]) -> String {
+    let mut s = format!("{name}__G");
+    for a in args {
+        s.push('_');
+        s.push_str(&mangle_type(*a));
+    }
+    s
+}
+
+fn mangle_type(t: z::Type) -> String {
+    match t {
+        z::Type::I64 => "i64".into(),
+        z::Type::F64 => "f64".into(),
+        z::Type::Bool => "bool".into(),
+        z::Type::Str => "str".into(),
+        z::Type::I32 => "i32".into(),
+        z::Type::U32 => "u32".into(),
+        z::Type::U64 => "u64".into(),
+        z::Type::Array(e) => format!(
+            "arr{}",
+            match e {
+                z::Elem::I64 => "i64",
+                z::Elem::F64 => "f64",
+                z::Elem::Bool => "bool",
+            }
+        ),
+        z::Type::Struct(id) => format!("s{id}"),
     }
 }
 
@@ -1042,6 +1289,28 @@ mod tests {
                    } \
                    function main(): i64 { let a = new Acc(); return a.addn(23); }";
         assert_eq!(run_i64(ts3), 123);
+    }
+
+    #[test]
+    fn generics_monomorphized() {
+        // identity at two types (inferred + explicit), and a 2-type-param generic
+        // that itself instantiates another generic with one of its type params.
+        let ts = "function id<T>(x: T): T { return x; } \
+                  function pick<A, B>(a: A, b: B): A { return id<A>(a); } \
+                  function main(): i64 { \
+                    let x = id(7); \
+                    let y = id<i64>(35); \
+                    return pick<i64, bool>(x + y, true); }";
+        assert_eq!(run_i64(ts), 42);
+        // generic over a struct: the instantiation's result is typed (`c.v` works)
+        let ts2 = "interface Box { v: i64; } \
+                   function thru<T>(b: T): T { return b; } \
+                   function main(): i64 { let b: Box = { v: 9 }; let c = thru<Box>(b); return c.v; }";
+        assert_eq!(run_i64(ts2), 9);
+        // generic recursion: the type param is threaded through each call
+        let ts3 = "function rec<T>(x: T, n: i64): i64 { if (n <= 0) { return 0; } return 1 + rec<T>(x, n - 1); } \
+                   function main(): i64 { return rec<bool>(true, 5); }";
+        assert_eq!(run_i64(ts3), 5);
     }
 
     #[test]
