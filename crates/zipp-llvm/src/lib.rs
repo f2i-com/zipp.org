@@ -27,13 +27,14 @@ enum LTy {
     I64,
     F64,
     Arr(bool),
+    Str,
 }
 
 fn llname(t: LTy) -> &'static str {
     match t {
         LTy::I64 => "i64",
         LTy::F64 => "double",
-        LTy::Arr(_) => "ptr",
+        LTy::Arr(_) | LTy::Str => "ptr",
     }
 }
 
@@ -45,29 +46,21 @@ fn lty_of(t: Type) -> LTy {
     match t {
         Type::F64 => LTy::F64,
         Type::Array(e) => LTy::Arr(matches!(e, Elem::F64)),
+        Type::Str => LTy::Str,
         _ => LTy::I64, // i64, bool (bool is an i64 0/1)
     }
 }
 
-fn llvm_ty_ok(t: Type) -> bool {
-    matches!(t, Type::I64 | Type::F64 | Type::Bool | Type::Array(_))
-}
-
-/// Reason a program can't use the LLVM tier (scalar subset + arrays), or `None`.
+/// Reason a program can't use the LLVM tier, or `None`. Only math builtins are
+/// left unsupported (scalars, arrays, strings all compile).
 pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     for ins in &prog.code {
         let bad = match ins {
-            Instr::SConst { .. } => "strings",
             Instr::Builtin { .. } => "builtins",
             Instr::NewStruct { .. } | Instr::GetField { .. } | Instr::SetField { .. } => "structs",
             _ => continue,
         };
         return Some(bad);
-    }
-    for f in &prog.funcs {
-        if !llvm_ty_ok(f.ret) || f.params.iter().any(|t| !llvm_ty_ok(*t)) {
-            return Some("non-scalar/array function signatures");
-        }
     }
     None
 }
@@ -82,6 +75,7 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
         match &prog.code[pc as usize] {
             Instr::Const { dst, .. } => t[*dst as usize] = LTy::I64,
             Instr::FConst { dst, .. } => t[*dst as usize] = LTy::F64,
+            Instr::SConst { dst, .. } => t[*dst as usize] = LTy::Str,
             Instr::Cast { dst, to, .. } => t[*dst as usize] = lty_of(*to),
             Instr::Mov { dst, src } => t[*dst as usize] = t[*src as usize],
             Instr::Bin { op, dst, a, .. } => {
@@ -315,6 +309,35 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> String {
                 let sv = load(&mut s, &mut tmp, &rty, *src);
                 store(&mut s, &rty, *dst, &sv);
             }
+            Instr::SConst { dst, .. } => {
+                // The literal lives in a module-level constant @.sconst_{pc};
+                // the string handle is just its address.
+                store(&mut s, &rty, *dst, &format!("@.sconst_{pc}"));
+            }
+            Instr::Bin { op, dst, a, b } if rty[*a as usize] == LTy::Str => {
+                // String concat (+) / equality (==, !=) via the runtime.
+                let av = load(&mut s, &mut tmp, &rty, *a);
+                let bv = load(&mut s, &mut tmp, &rty, *b);
+                let r = match op {
+                    BinOp::Add => {
+                        let t = fresh(&mut tmp);
+                        s.push_str(&format!("  {t} = call ptr @zipp_str_concat(ptr {av}, ptr {bv})\n"));
+                        t
+                    }
+                    _ => {
+                        let e = fresh(&mut tmp);
+                        s.push_str(&format!("  {e} = call i64 @zipp_str_eq(ptr {av}, ptr {bv})\n"));
+                        if matches!(op, BinOp::Ne) {
+                            let t = fresh(&mut tmp);
+                            s.push_str(&format!("  {t} = xor i64 {e}, 1\n")); // !eq
+                            t
+                        } else {
+                            e
+                        }
+                    }
+                };
+                store(&mut s, &rty, *dst, &r);
+            }
             Instr::Bin { op, dst, a, b } => {
                 let av = load(&mut s, &mut tmp, &rty, *a);
                 let bv = load(&mut s, &mut tmp, &rty, *b);
@@ -381,11 +404,15 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> String {
             }
             Instr::Print { a } => {
                 let v = load(&mut s, &mut tmp, &rty, *a);
-                let (fmt, ty) = match rty[*a as usize] {
-                    LTy::F64 => ("@.fmt_f64", "double"),
-                    _ => ("@.fmt_i64", "i64"),
-                };
-                s.push_str(&format!("  call i32 (ptr, ...) @printf(ptr {fmt}, {ty} {v})\n"));
+                if rty[*a as usize] == LTy::Str {
+                    s.push_str(&format!("  call void @zipp_print_str(ptr {v})\n"));
+                } else {
+                    let (fmt, ty) = match rty[*a as usize] {
+                        LTy::F64 => ("@.fmt_f64", "double"),
+                        _ => ("@.fmt_i64", "i64"),
+                    };
+                    s.push_str(&format!("  call i32 (ptr, ...) @printf(ptr {fmt}, {ty} {v})\n"));
+                }
             }
             Instr::ArrayLit { dst, elems } => {
                 let p = fresh(&mut tmp);
@@ -534,11 +561,77 @@ end:
 
 "#;
 
+/// String runtime, emitted into every module (stripped by -O3 if unused). A
+/// string is a `ptr` to `[ len:i64 | utf8 bytes… ]`. Literals are module-level
+/// constants (`@.sconst_N`); concat mallocs a fresh block. Leaks (no GC v0).
+const STRING_RUNTIME: &str = r#"declare ptr @malloc(i64)
+declare i32 @memcmp(ptr, ptr, i64)
+declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+
+define internal ptr @zipp_str_concat(ptr %a, ptr %b) {
+entry:
+  %la = load i64, ptr %a
+  %lb = load i64, ptr %b
+  %tot = add i64 %la, %lb
+  %sz = add i64 %tot, 8
+  %p = call ptr @malloc(i64 %sz)
+  store i64 %tot, ptr %p
+  %pd = getelementptr inbounds i8, ptr %p, i64 8
+  %pa = getelementptr inbounds i8, ptr %a, i64 8
+  %pb = getelementptr inbounds i8, ptr %b, i64 8
+  call void @llvm.memcpy.p0.p0.i64(ptr %pd, ptr %pa, i64 %la, i1 false)
+  %pd2 = getelementptr inbounds i8, ptr %pd, i64 %la
+  call void @llvm.memcpy.p0.p0.i64(ptr %pd2, ptr %pb, i64 %lb, i1 false)
+  ret ptr %p
+}
+
+define internal i64 @zipp_str_eq(ptr %a, ptr %b) {
+entry:
+  %la = load i64, ptr %a
+  %lb = load i64, ptr %b
+  %lne = icmp ne i64 %la, %lb
+  br i1 %lne, label %neq, label %cmp
+neq:
+  ret i64 0
+cmp:
+  %pa = getelementptr inbounds i8, ptr %a, i64 8
+  %pb = getelementptr inbounds i8, ptr %b, i64 8
+  %c = call i32 @memcmp(ptr %pa, ptr %pb, i64 %la)
+  %eq = icmp eq i32 %c, 0
+  %r = zext i1 %eq to i64
+  ret i64 %r
+}
+
+define internal void @zipp_print_str(ptr %s) {
+entry:
+  %l = load i64, ptr %s
+  %li = trunc i64 %l to i32
+  %p = getelementptr inbounds i8, ptr %s, i64 8
+  call i32 (ptr, ...) @printf(ptr @.fmt_str, i32 %li, ptr %p)
+  ret void
+}
+
+"#;
+
+/// LLVM byte-escape (no trailing nul — strings are length-prefixed, not C
+/// strings). Printable ASCII except `"` and `\` stays literal; else `\XX`.
+fn escape_bytes(s: &str) -> String {
+    let mut esc = String::new();
+    for &b in s.as_bytes() {
+        if (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\' {
+            esc.push(b as char);
+        } else {
+            esc.push_str(&format!("\\{b:02X}"));
+        }
+    }
+    esc
+}
+
 /// Lower a whole program to textual LLVM IR (a self-contained module with a C
 /// `main` that times the entry call with `clock()` and prints the result).
 pub fn emit_ir(prog: &Program) -> Result<String, String> {
     if let Some(bad) = ineligible_reason(prog) {
-        return Err(format!("--llvm supports the scalar subset + arrays only (program uses {bad})"));
+        return Err(format!("--llvm supports scalars + arrays + strings only (program uses {bad})"));
     }
     let mut out = String::new();
     out.push_str("; ZIPP → LLVM IR (release tier)\n");
@@ -554,11 +647,26 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     out.push_str(&cstr_global(".fmt_time", "__ZTIME_MS__:%d\n"));
     out.push_str(&cstr_global(".fmt_neg", "zipp: array length cannot be negative (%lld)\n"));
     out.push_str(&cstr_global(".fmt_oob", "zipp: array index %lld out of bounds (len %lld)\n"));
+    out.push_str(&cstr_global(".fmt_str", "%.*s\n"));
     out.push('\n');
 
-    // Array runtime: a length-prefixed i64 block via calloc (zero-init, leaked —
-    // no GC in v0). `internal` so -O3 strips these when a program has no arrays.
+    // String literals: one module-level constant each, laid out as the runtime
+    // expects — a packed `{ i64 len, [len x i8] bytes }`.
+    for (pc, ins) in prog.code.iter().enumerate() {
+        if let Instr::SConst { imm, .. } = ins {
+            let n = imm.as_bytes().len();
+            out.push_str(&format!(
+                "@.sconst_{pc} = private unnamed_addr constant <{{ i64, [{n} x i8] }}> <{{ i64 {n}, [{n} x i8] c\"{}\" }}>\n",
+                escape_bytes(imm)
+            ));
+        }
+    }
+    out.push('\n');
+
+    // Array + string runtimes (calloc/malloc-backed, leaked — no GC in v0).
+    // `internal` so -O3 strips whichever a given program doesn't use.
     out.push_str(ARRAY_RUNTIME);
+    out.push_str(STRING_RUNTIME);
 
     for i in 0..prog.funcs.len() {
         let end = if i + 1 < prog.funcs.len() {
@@ -698,9 +806,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_strings() {
-        // arrays now emit; strings still fall back.
-        let prog = zippc::compile("fn main(): i64 { let x = \"hi\"; return len(x); }").unwrap();
+    fn emits_ir_for_string_programs() {
+        let prog = zippc::compile(
+            "fn main(): i64 { let s = \"foo\" + \"bar\"; print(s); return len(s); }",
+        )
+        .unwrap();
+        let ir = emit_ir(&prog).unwrap();
+        assert!(ir.contains("@.sconst_"));
+        assert!(ir.contains("@zipp_str_concat"));
+        assert!(ir.contains("@zipp_print_str"));
+    }
+
+    #[test]
+    fn rejects_structs() {
+        // arrays + strings now emit; structs still fall back (next).
+        let prog = zippc::compile(
+            "struct P { x: i64 } fn main(): i64 { let p = P { x: 7 }; return p.x; }",
+        )
+        .unwrap();
         assert!(emit_ir(&prog).is_err());
     }
 }

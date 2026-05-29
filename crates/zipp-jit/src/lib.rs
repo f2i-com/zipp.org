@@ -70,14 +70,66 @@ extern "C" fn zipp_oob(idx: i64, len: i64) {
     std::process::abort();
 }
 
+// Strings: a pointer to an 8-aligned block `[ len:i64 | utf8 bytes… ]`, like an
+// array but with packed bytes. Immutable. Literals are baked at compile time
+// (`leak_str_blob`); concat allocates a fresh block. All leak (no GC v0).
+
+/// Allocate an 8-aligned `[len|bytes]` string block, return its address.
+fn make_str(bytes: &[u8]) -> i64 {
+    let nslots = 1 + bytes.len().div_ceil(8);
+    let mut v: Vec<i64> = vec![0; nslots];
+    v[0] = bytes.len() as i64;
+    // SAFETY: v has room for 8 + bytes.len() bytes after the length slot.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), (v.as_mut_ptr() as *mut u8).add(8), bytes.len());
+    }
+    let p = v.as_ptr() as i64;
+    std::mem::forget(v); // leaked until process exit
+    p
+}
+
+/// Bytes slice of a string block (used by concat/eq/print).
+unsafe fn str_bytes<'a>(s: i64) -> &'a [u8] {
+    let len = *(s as *const i64) as usize;
+    std::slice::from_raw_parts((s as *const u8).add(8), len)
+}
+
+/// Bake a literal into a leaked `[len|bytes]` block at JIT-compile time; the
+/// address is embedded as a constant in the generated code.
+fn leak_str_blob(s: &str) -> i64 {
+    make_str(s.as_bytes())
+}
+
+extern "C" fn zipp_str_concat(a: i64, b: i64) -> i64 {
+    // SAFETY: a, b are valid string blocks produced by make_str/leak_str_blob.
+    let (sa, sb) = unsafe { (str_bytes(a), str_bytes(b)) };
+    let mut bytes = Vec::with_capacity(sa.len() + sb.len());
+    bytes.extend_from_slice(sa);
+    bytes.extend_from_slice(sb);
+    make_str(&bytes)
+}
+
+extern "C" fn zipp_str_eq(a: i64, b: i64) -> i64 {
+    // SAFETY: as above.
+    (unsafe { str_bytes(a) == str_bytes(b) }) as i64
+}
+
+extern "C" fn zipp_print_str(s: i64) {
+    // SAFETY: as above.
+    println!("{}", String::from_utf8_lossy(unsafe { str_bytes(s) }));
+}
+
 /// Runtime symbols the JIT calls into.
 #[derive(Clone, Copy)]
 struct RuntimeIds {
     print_i64: FuncId,
     print_f64: FuncId,
+    print_str: FuncId,
     alloc: FuncId,
     array_repeat: FuncId,
     oob: FuncId,
+    str_concat: FuncId,
+    str_eq: FuncId,
 }
 
 /// Result of a JIT'd `main`.
@@ -114,6 +166,7 @@ enum JTy {
     I64,
     F64,
     Arr(bool),
+    Str,
 }
 
 impl JTy {
@@ -121,7 +174,7 @@ impl JTy {
         if matches!(self, JTy::F64) {
             types::F64
         } else {
-            types::I64 // i64, bool, and array pointers
+            types::I64 // i64, bool, and array/string pointers
         }
     }
     fn arr_f64(self) -> bool {
@@ -133,16 +186,12 @@ fn jty_of(t: Type) -> JTy {
     match t {
         Type::F64 => JTy::F64,
         Type::Array(e) => JTy::Arr(matches!(e, Elem::F64)),
+        Type::Str => JTy::Str,
         _ => JTy::I64,
     }
 }
 
-/// A type usable across the JIT ABI: a scalar or a 1-D array of scalars.
-fn jit_ty_ok(t: Type) -> bool {
-    matches!(t, Type::I64 | Type::F64 | Type::Bool | Type::Array(_))
-}
-
-/// Cranelift type for a ZIPP type (bool / array pointers are i64).
+/// Cranelift type for a ZIPP type (bool / array / string pointers are i64).
 fn clif_ty(t: Type) -> ClifType {
     jty_of(t).clif()
 }
@@ -151,21 +200,16 @@ fn var(r: u32) -> Variable {
     Variable::from_u32(r)
 }
 
-/// Reason a program can't be JIT-compiled (scalar subset + arrays), or `None`.
+/// Reason a program can't be JIT-compiled, or `None`. Only math builtins are
+/// left unsupported (everything else — scalars, arrays, strings — compiles).
 pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     for ins in &prog.code {
         let bad = match ins {
-            Instr::SConst { .. } => "strings",
             Instr::Builtin { .. } => "builtins",
             Instr::NewStruct { .. } | Instr::GetField { .. } | Instr::SetField { .. } => "structs",
             _ => continue,
         };
         return Some(bad);
-    }
-    for f in &prog.funcs {
-        if !jit_ty_ok(f.ret) || f.params.iter().any(|t| !jit_ty_ok(*t)) {
-            return Some("non-scalar/array function signatures");
-        }
     }
     None
 }
@@ -212,9 +256,12 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     let mut jit = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     jit.symbol("zipp_print_i64", zipp_print_i64 as *const u8);
     jit.symbol("zipp_print_f64", zipp_print_f64 as *const u8);
+    jit.symbol("zipp_print_str", zipp_print_str as *const u8);
     jit.symbol("zipp_alloc", zipp_alloc as *const u8);
     jit.symbol("zipp_array_repeat", zipp_array_repeat as *const u8);
     jit.symbol("zipp_oob", zipp_oob as *const u8);
+    jit.symbol("zipp_str_concat", zipp_str_concat as *const u8);
+    jit.symbol("zipp_str_eq", zipp_str_eq as *const u8);
     let mut module = JITModule::new(jit);
 
     let mut func_ids = Vec::with_capacity(prog.funcs.len());
@@ -240,9 +287,12 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     let rt = RuntimeIds {
         print_i64: import(&mut module, "zipp_print_i64", &[types::I64], None)?,
         print_f64: import(&mut module, "zipp_print_f64", &[types::F64], None)?,
+        print_str: import(&mut module, "zipp_print_str", &[types::I64], None)?,
         alloc: import(&mut module, "zipp_alloc", &[types::I64], Some(types::I64))?,
         array_repeat: import(&mut module, "zipp_array_repeat", &[types::I64, types::I64], Some(types::I64))?,
         oob: import(&mut module, "zipp_oob", &[types::I64, types::I64], None)?,
+        str_concat: import(&mut module, "zipp_str_concat", &[types::I64, types::I64], Some(types::I64))?,
+        str_eq: import(&mut module, "zipp_str_eq", &[types::I64, types::I64], Some(types::I64))?,
     };
 
     let mut ctx = module.make_context();
@@ -294,6 +344,7 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
         match &prog.code[pc as usize] {
             Instr::Const { dst, .. } => t[*dst as usize] = JTy::I64,
             Instr::FConst { dst, .. } => t[*dst as usize] = JTy::F64,
+            Instr::SConst { dst, .. } => t[*dst as usize] = JTy::Str,
             Instr::Cast { dst, to, .. } => t[*dst as usize] = jty_of(*to),
             Instr::Mov { dst, src } => t[*dst as usize] = t[*src as usize],
             Instr::Bin { op, dst, a, .. } => {
@@ -535,6 +586,12 @@ fn compile_function(
                 let c = builder.ins().f64const(*imm);
                 builder.def_var(var(*dst), c);
             }
+            Instr::SConst { dst, imm } => {
+                // Bake the literal into a leaked [len|bytes] block now; embed its
+                // address as a constant (valid for this JIT process's lifetime).
+                let addr = builder.ins().iconst(types::I64, leak_str_blob(imm));
+                builder.def_var(var(*dst), addr);
+            }
             Instr::Cast { dst, src, to } => {
                 let sval = builder.use_var(var(*src));
                 let src_ty = rty[*src as usize].clif();
@@ -553,7 +610,20 @@ fn compile_function(
                 builder.def_var(var(*dst), s);
             }
             Instr::Bin { op, dst, a, b } => {
-                let res = if let Some(fp) = fma_plan.get(&pc) {
+                let res = if matches!(rty[*a as usize], JTy::Str) {
+                    // String concat (+) / equality (==, !=) via the runtime.
+                    let av = builder.use_var(var(*a));
+                    let bv = builder.use_var(var(*b));
+                    let id = if matches!(op, BinOp::Add) { rt.str_concat } else { rt.str_eq };
+                    let f = module.declare_func_in_func(id, builder.func);
+                    let call = builder.ins().call(f, &[av, bv]);
+                    let r = builder.inst_results(call)[0];
+                    if matches!(op, BinOp::Ne) {
+                        builder.ins().bxor_imm(r, 1) // !eq
+                    } else {
+                        r
+                    }
+                } else if let Some(fp) = fma_plan.get(&pc) {
                     let mut pv = builder.use_var(var(fp.p));
                     let qv = builder.use_var(var(fp.q));
                     let mut rv = builder.use_var(var(fp.r));
@@ -612,10 +682,10 @@ fn compile_function(
                 terminated = true;
             }
             Instr::Print { a } => {
-                let id = if rty[*a as usize].clif() == types::F64 {
-                    rt.print_f64
-                } else {
-                    rt.print_i64
+                let id = match rty[*a as usize] {
+                    JTy::Str => rt.print_str,
+                    JTy::F64 => rt.print_f64,
+                    _ => rt.print_i64,
                 };
                 let p = module.declare_func_in_func(id, builder.func);
                 let av = builder.use_var(var(*a));
@@ -838,9 +908,23 @@ mod tests {
     }
 
     #[test]
-    fn rejects_strings_and_structs() {
-        // arrays now JIT; strings/structs still fall back.
-        let s = zippc::compile("fn main(): i64 { let x = \"hi\"; return len(x); }").unwrap();
-        assert!(run(&s).is_err());
+    fn strings() {
+        // len (byte length), concat, equality (via branches), print
+        assert_eq!(jit_i64("fn main(): i64 { let s = \"hello\"; return len(s); }"), 5);
+        assert_eq!(jit_i64("fn main(): i64 { let s = \"foo\" + \"bar\"; return len(s); }"), 6);
+        let eq = "fn main(): i64 { if (\"ab\" == \"ab\") { return 1; } return 0; }";
+        assert_eq!(jit_i64(eq), 1);
+        let ne = "fn main(): i64 { if (\"ab\" != \"cd\") { return 1; } return 0; }";
+        assert_eq!(jit_i64(ne), 1);
+    }
+
+    #[test]
+    fn rejects_structs() {
+        // arrays + strings now JIT; structs still fall back (next).
+        let st = zippc::compile(
+            "struct P { x: i64 } fn main(): i64 { let p = P { x: 7 }; return p.x; }",
+        )
+        .unwrap();
+        assert!(run(&st).is_err());
     }
 }
