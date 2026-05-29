@@ -987,8 +987,11 @@ impl Lower<'_> {
                 z::UnOp::Not => z::Type::Bool,
                 _ => self.ztype_of(e)?,
             },
-            // A function value's type is the interned `Func` type recorded for it.
-            z::Expr::FuncRef(name) => self.fn_value_types.borrow().get(name).copied()?,
+            // A function value / closure's type is the interned `Func` type
+            // recorded for it (a closure's type is its explicit signature).
+            z::Expr::FuncRef(name) | z::Expr::MakeClosure { name, .. } => {
+                self.fn_value_types.borrow().get(name).copied()?
+            }
             // An indirect call yields the function type's return type.
             z::Expr::CallValue { callee, .. } => {
                 let z::Type::Func(id) = self.ztype_of(callee)? else { return None };
@@ -1059,9 +1062,12 @@ impl Lower<'_> {
         Ok(z::Func { name, params, ret, body })
     }
 
-    /// Lower an arrow lambda `(p: T, …) => expr` to a lifted top-level function,
-    /// returning a `FuncRef` to it. v0: expression body, explicitly-typed params,
-    /// and no capture of enclosing locals (pass them as parameters instead).
+    /// Lower an arrow lambda `(p: T, …) => expr` to a lifted top-level function.
+    /// Captured enclosing locals become the lifted function's LEADING parameters
+    /// (keeping their names, so the body is unchanged); the arrow expression then
+    /// lowers to a `MakeClosure` that snapshots those captures (a bare `FuncRef`
+    /// when nothing is captured). v0: expression body, explicitly-typed params,
+    /// capture-by-value.
     fn lower_arrow(&self, a: &ArrowFunctionExpression) -> LResult<z::Expr> {
         if a.type_parameters.is_some() {
             return Err(self.err(a.span, "generic arrow functions aren't supported (v0)"));
@@ -1077,23 +1083,16 @@ impl Lower<'_> {
             _ => return Err(self.err(a.span, "expected an expression-bodied arrow")),
         };
         self.push_scope();
-        let mut params = Vec::with_capacity(a.params.items.len());
+        let mut explicit = Vec::with_capacity(a.params.items.len());
         let mut param_names = HashSet::new();
         for p in &a.params.items {
             let (pname, pty) = self.param(p)?;
             self.bind(&pname, pty);
             param_names.insert(pname.clone());
-            params.push(z::Param { name: pname, ty: pty });
+            explicit.push(z::Param { name: pname, ty: pty });
         }
         let body = self.expr(body_ast)?;
-        // v0: no closures — reject any reference to an enclosing local.
-        if let Some(name) = self.captured_local(&body, &param_names) {
-            self.pop_scope();
-            return Err(self.err(
-                a.span,
-                format!("arrow can't capture local '{name}' yet (v0) — pass it as a parameter"),
-            ));
-        }
+        let captures = self.collect_captures(&body, &param_names);
         let ret = match &a.return_type {
             Some(ann) => self.ty(&ann.type_annotation)?,
             None => self.ztype_of(&body).ok_or_else(|| {
@@ -1101,32 +1100,65 @@ impl Lower<'_> {
             })?,
         };
         self.pop_scope();
+        // Lifted signature: captures first, then the explicit params.
+        let mut lifted_params: Vec<z::Param> =
+            captures.iter().map(|(n, t)| z::Param { name: n.clone(), ty: *t }).collect();
+        lifted_params.extend(explicit.iter().cloned());
         let id = self.next_lambda.get();
         self.next_lambda.set(id + 1);
         let name = format!("__lambda{id}");
         let line = self.line(a.span);
-        let fty = self.intern_func_type(params.iter().map(|p| p.ty).collect(), ret);
+        // The closure's *value* type is the explicit signature (captures are bound).
+        let fty = self.intern_func_type(explicit.iter().map(|p| p.ty).collect(), ret);
         self.lambdas.borrow_mut().push(z::Func {
             name: name.clone(),
-            params,
+            params: lifted_params,
             ret,
             body: vec![z::Stmt { kind: z::StmtKind::Return(Some(body)), line }],
         });
         self.fn_rets.borrow_mut().insert(name.clone(), ret);
         self.fn_value_types.borrow_mut().insert(name.clone(), fty);
-        Ok(z::Expr::FuncRef(name))
+        if captures.is_empty() {
+            Ok(z::Expr::FuncRef(name))
+        } else {
+            let cap_exprs = captures.into_iter().map(|(n, _)| z::Expr::Var(n)).collect();
+            Ok(z::Expr::MakeClosure { name, captures: cap_exprs })
+        }
     }
 
-    /// The first variable in `body` that names an enclosing local (a capture) and
-    /// isn't one of the arrow's own `params`, if any.
-    fn captured_local(&self, body: &z::Expr, params: &HashSet<String>) -> Option<String> {
-        let mut vars = Vec::new();
-        collect_vars(body, &mut vars);
+    /// Captured enclosing locals referenced in `body` (deduped, first-appearance
+    /// order), excluding the arrow's own `params`. Each is paired with its type
+    /// from the enclosing scope. Capture is by value (snapshot at creation).
+    fn collect_captures(
+        &self,
+        body: &z::Expr,
+        params: &HashSet<String>,
+    ) -> Vec<(String, z::Type)> {
+        let mut all = Vec::new();
+        collect_vars(body, &mut all);
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for v in all {
+            if params.contains(&v) || !seen.insert(v.clone()) {
+                continue;
+            }
+            // A capture resolves to an enclosing local — not a parameter (the top
+            // frame), not a global function/enum (no scope binding).
+            if let Some(t) = self.enclosing_type(&v) {
+                out.push((v, t));
+            }
+        }
+        out
+    }
+
+    /// Type of `name` in the *enclosing* scope (every frame except the innermost,
+    /// which holds the arrow's own parameters), if it's a local there.
+    fn enclosing_type(&self, name: &str) -> Option<z::Type> {
         let scope = self.scope.borrow();
-        // Every frame except the top one (the arrow's own params) is enclosing.
-        let enclosing = if scope.len() >= 2 { &scope[..scope.len() - 1] } else { &[][..] };
-        vars.into_iter()
-            .find(|n| !params.contains(n) && enclosing.iter().any(|m| m.contains_key(n)))
+        if scope.len() < 2 {
+            return None;
+        }
+        scope[..scope.len() - 1].iter().rev().find_map(|m| m.get(name).copied())
     }
 
     /// Lower one formal parameter to `(name, type)`. Rejects destructuring and
@@ -2038,8 +2070,21 @@ impl Lower<'_> {
         })
     }
 
+    /// Lower a call's positional arguments (rejecting spreads).
+    fn lower_args(&self, c: &CallExpression) -> LResult<Vec<z::Expr>> {
+        let mut args = Vec::with_capacity(c.arguments.len());
+        for a in &c.arguments {
+            let ex = a
+                .as_expression()
+                .ok_or_else(|| self.err(c.span, "spread arguments aren't supported"))?;
+            args.push(self.expr(ex)?);
+        }
+        Ok(args)
+    }
+
     /// A call is a method call (`obj.m(args)`), a numeric cast (`i64(x)`),
-    /// `len`/a math builtin, or a user function call.
+    /// `len`/a math builtin, an indirect call through a function value, or a
+    /// user function call.
     fn call(&self, c: &CallExpression) -> LResult<z::Expr> {
         // Method call: `obj.m(args)` → `Class__m(obj, args)`. Resolve the
         // receiver's class via the type tracker.
@@ -2072,17 +2117,25 @@ impl Lower<'_> {
             self.apply_defaults(&mname, &mut args);
             return Ok(z::Expr::Call { name: mname, args });
         }
+        // Indirect call on a non-identifier callee (a closure returned by a call,
+        // a parenthesized/immediately-invoked arrow): lower it and dispatch when
+        // it's function-typed.
+        if !matches!(&c.callee, Expression::Identifier(_)) {
+            let callee = self.expr(&c.callee)?;
+            if matches!(self.ztype_of(&callee), Some(z::Type::Func(_))) {
+                let args = self.lower_args(c)?;
+                return Ok(z::Expr::CallValue { callee: Box::new(callee), args });
+            }
+            return Err(self.err(
+                c.span,
+                "this expression isn't callable (only functions and methods can be called)",
+            ));
+        }
         let name = match &c.callee {
             Expression::Identifier(id) => id.name.as_str().to_string(),
-            _ => return Err(self.err(c.span, "only direct function calls are supported")),
+            _ => unreachable!("non-identifier callees handled above"),
         };
-        let mut args = Vec::new();
-        for a in &c.arguments {
-            let ex = a
-                .as_expression()
-                .ok_or_else(|| self.err(c.span, "spread arguments aren't supported"))?;
-            args.push(self.expr(ex)?);
-        }
+        let mut args = self.lower_args(c)?;
         // Indirect call through a function-valued local (a parameter or `let`
         // holding a function). Direct calls to named functions fall through.
         if matches!(self.lookup(&name), Some(z::Type::Func(_))) {
@@ -2311,6 +2364,9 @@ fn collect_vars(e: &z::Expr, out: &mut Vec<String>) {
             collect_vars(callee, out);
             args.iter().for_each(|a| collect_vars(a, out));
         }
+        // A closure's captures are expressions in the enclosing scope — their
+        // variables count (this is how a nested arrow's captures propagate out).
+        MakeClosure { captures, .. } => captures.iter().for_each(|c| collect_vars(c, out)),
         FuncRef(_) | Int(_) | Float(_) | Bool(_) | Str(_) | Null => {}
     }
 }
@@ -2343,11 +2399,12 @@ fn expr_has_var(e: &z::Expr) -> bool {
             expr_has_var(recv) || args.iter().any(expr_has_var) || expr_has_var(default)
         }
         // A function value names a function, not a variable; an indirect call's
-        // callee/args may.
+        // callee/args may; a closure's captures do.
         z::Expr::FuncRef(_) => false,
         z::Expr::CallValue { callee, args } => {
             expr_has_var(callee) || args.iter().any(expr_has_var)
         }
+        z::Expr::MakeClosure { captures, .. } => captures.iter().any(expr_has_var),
         z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) | z::Expr::Null => {
             false
         }
@@ -2625,10 +2682,35 @@ mod tests {
         let prog = zippc::compile_module(&m).expect("compile");
         assert!(prog.uses_func_value);
 
-        // arrows can't capture enclosing locals yet — a clear error, not a silently
-        // wrong (capture-by-value) result.
+        // capturing an enclosing local works now (covered in depth by
+        // `closures_capture`).
         let cap = "function main(): i64 { let k = 3; const f = (n: i64) => n + k; return f(1); }";
-        assert!(compile_ts(cap).is_err());
+        assert_eq!(run_i64(cap), 4);
+    }
+
+    #[test]
+    fn closures_capture() {
+        // capture a parameter: adder(n) returns a closure remembering n
+        let ts = "function adder(n: i64): (x: i64) => i64 { return (x: i64) => x + n; } \
+                  function main(): i64 { const a = adder(10); const b = adder(100); \
+                    return a(5) + b(5); }";
+        assert_eq!(run_i64(ts), 120); // 15 + 105
+
+        // capture a local
+        let ts2 = "function main(): i64 { let base = 7; const f = (x: i64) => x * base; \
+                    return f(6); }";
+        assert_eq!(run_i64(ts2), 42);
+
+        // nested / curried closures: transitive capture, called inline
+        let ts3 = "function add3(a: i64): (b: i64) => (c: i64) => i64 { \
+                     return (b: i64) => (c: i64) => a + b + c; } \
+                   function main(): i64 { return add3(1)(2)(3); }";
+        assert_eq!(run_i64(ts3), 6);
+
+        // capture-by-value: reassigning after creation doesn't change the closure
+        let ts4 = "function main(): i64 { let k = 1; const f = (x: i64) => x + k; \
+                    k = 100; return f(0); }";
+        assert_eq!(run_i64(ts4), 1); // snapshot k = 1, not 100
     }
 
     #[test]

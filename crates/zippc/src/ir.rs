@@ -40,8 +40,10 @@ pub enum Instr {
     // `None` for a bare comparison operand.
     ConstNull { dst: u32, ty: Option<Type> },
     // First-class functions (interpreter-only in v0). `FuncRef` loads a function
-    // index as a value; `CallValue` calls through such a value.
+    // index as a value; `MakeClosure` bundles a function with captured values;
+    // `CallValue` calls through either.
     FuncRef { dst: u32, func: u32 },
+    MakeClosure { dst: u32, func: u32, captures: Vec<u32> },
     CallValue { dst: u32, callee: u32, arg_base: u32, argc: u32 },
 }
 
@@ -193,8 +195,12 @@ pub fn lower(m: &Module) -> Result<Program, String> {
             types: sd.fields.iter().map(|(_, t)| *t).collect(),
         })
         .collect();
-    let uses_func_value =
-        code.iter().any(|i| matches!(i, Instr::FuncRef { .. } | Instr::CallValue { .. }));
+    let uses_func_value = code.iter().any(|i| {
+        matches!(
+            i,
+            Instr::FuncRef { .. } | Instr::MakeClosure { .. } | Instr::CallValue { .. }
+        )
+    });
     Ok(Program {
         code,
         funcs,
@@ -729,6 +735,20 @@ impl<'a> Gen<'a> {
                     .ok_or_else(|| format!("ir error: reference to unknown function '{name}'"))?;
                 let dst = self.alloc();
                 self.code.push(Instr::FuncRef { dst, func });
+                Ok(dst)
+            }
+            // A closure: a lifted function plus its captured values.
+            Expr::MakeClosure { name, captures } => {
+                let func = *self
+                    .func_index
+                    .get(name)
+                    .ok_or_else(|| format!("ir error: reference to unknown function '{name}'"))?;
+                let cap_regs = captures
+                    .iter()
+                    .map(|c| self.gen_expr(c))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dst = self.alloc();
+                self.code.push(Instr::MakeClosure { dst, func, captures: cap_regs });
                 Ok(dst)
             }
             // An indirect call through a function value.

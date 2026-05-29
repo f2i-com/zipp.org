@@ -721,7 +721,7 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
             }
             // First-class functions are interpreter-only; `ineligible_reason`
             // gates them out before codegen, so this is never reached.
-            Instr::FuncRef { .. } | Instr::CallValue { .. } => {
+            Instr::FuncRef { .. } | Instr::MakeClosure { .. } | Instr::CallValue { .. } => {
                 return Err("internal: first-class functions reached the LLVM backend".into())
             }
             Instr::Builtin { op, dst, args } => {

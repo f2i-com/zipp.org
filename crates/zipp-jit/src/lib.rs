@@ -826,7 +826,7 @@ fn compile_function(
             }
             // First-class functions are interpreter-only; `ineligible_reason`
             // gates them out before codegen, so this is never reached.
-            Instr::FuncRef { .. } | Instr::CallValue { .. } => {
+            Instr::FuncRef { .. } | Instr::MakeClosure { .. } | Instr::CallValue { .. } => {
                 return Err("internal: first-class functions reached the JIT".into())
             }
             Instr::Builtin { op, dst, args } => {

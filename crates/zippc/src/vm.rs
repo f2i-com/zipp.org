@@ -26,6 +26,8 @@ pub enum Value {
     Null,
     /// A first-class function value: an index into the program's `funcs`.
     Func(u32),
+    /// A closure: a function index plus a heap index of its captured-value vector.
+    Closure { func: u32, env: usize },
 }
 
 impl Value {
@@ -36,9 +38,12 @@ impl Value {
             Value::U32(x) => x == 0,
             Value::U64(x) => x == 0,
             Value::F64(f) => f == 0.0,
-            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } | Value::Null | Value::Func(_) => {
-                false
-            }
+            Value::Arr(_)
+            | Value::Str(_)
+            | Value::Struct { .. }
+            | Value::Null
+            | Value::Func(_)
+            | Value::Closure { .. } => false,
         }
     }
     /// The i64 payload, or `None` for non-`i64` values. (Array index / repeat
@@ -59,7 +64,12 @@ impl Value {
             Value::I32(x) => x as i64,
             Value::U32(x) => x as i64,
             Value::U64(x) => x as i64,
-            Value::Arr(_) | Value::Str(_) | Value::Struct { .. } | Value::Null | Value::Func(_) => 0,
+            Value::Arr(_)
+            | Value::Str(_)
+            | Value::Struct { .. }
+            | Value::Null
+            | Value::Func(_)
+            | Value::Closure { .. } => 0,
         }
     }
 }
@@ -76,7 +86,7 @@ impl std::fmt::Display for Value {
             Value::Str(_) => write!(f, "[str]"),
             Value::Struct { .. } => write!(f, "[struct]"),
             Value::Null => write!(f, "null"),
-            Value::Func(_) => write!(f, "[function]"),
+            Value::Func(_) | Value::Closure { .. } => write!(f, "[function]"),
         }
     }
 }
@@ -122,6 +132,8 @@ const ZK_INT_ONLY: &str = "--prove is integer-only: this program uses f64 (the z
 const ZK_NO_ARRAY: &str = "--prove does not support arrays yet (the zk profile is integer-only)";
 const ZK_NO_STR: &str = "--prove does not support strings (the zk profile is integer-only)";
 const ZK_NO_STRUCT: &str = "--prove does not support structs (the zk profile is integer-only)";
+const ZK_NO_FUNC: &str =
+    "--prove does not support first-class functions (the zk profile is integer-only)";
 
 pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
     let main = &prog.funcs[prog.main as usize];
@@ -264,21 +276,48 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 pc = callee.entry;
             }
             Instr::FuncRef { dst, func } => {
+                if record_trace {
+                    return Err(ZK_NO_FUNC.into());
+                }
                 reg[base + *dst as usize] = Value::Func(*func);
-                rec!(OpKind::Other, 0, 0, 0, 0);
+            }
+            Instr::MakeClosure { dst, func, captures } => {
+                if record_trace {
+                    return Err(ZK_NO_FUNC.into());
+                }
+                if captures.is_empty() {
+                    reg[base + *dst as usize] = Value::Func(*func);
+                } else {
+                    let vals: Vec<Value> =
+                        captures.iter().map(|r| reg[base + *r as usize]).collect();
+                    let env = heap.len();
+                    heap.push(vals);
+                    reg[base + *dst as usize] = Value::Closure { func: *func, env };
+                }
             }
             Instr::CallValue { dst, callee, arg_base, argc } => {
-                let f = match reg[base + *callee as usize] {
-                    Value::Func(i) => i,
+                if record_trace {
+                    return Err(ZK_NO_FUNC.into());
+                }
+                // A closure prepends its captured environment to the call args;
+                // a bare function value has no captures.
+                let (f, env_opt) = match reg[base + *callee as usize] {
+                    Value::Func(i) => (i, None),
+                    Value::Closure { func, env } => (func, Some(env)),
                     _ => return Err("runtime error: called a non-function value".into()),
                 };
+                let ncaps = env_opt.map_or(0, |e| heap[e].len());
                 let callee_fn = &prog.funcs[f as usize];
                 let new_base = reg.len();
                 reg.resize(new_base + callee_fn.nregs as usize, Value::I64(0));
-                for i in 0..*argc as usize {
-                    reg[new_base + i] = reg[base + *arg_base as usize + i];
+                if let Some(e) = env_opt {
+                    for i in 0..ncaps {
+                        reg[new_base + i] = heap[e][i];
+                    }
                 }
-                rec!(OpKind::Other, 0, 0, 0, 0);
+                for i in 0..*argc as usize {
+                    reg[new_base + ncaps + i] = reg[base + *arg_base as usize + i];
+                }
                 call_stack.push(Frame { ret_pc: pc, base, dst: *dst });
                 base = new_base;
                 pc = callee_fn.entry;
@@ -491,7 +530,7 @@ fn render(v: Value, strs: &[String]) -> String {
         Value::Arr(_) => "[array]".to_string(),
         Value::Struct { .. } => "[struct]".to_string(),
         Value::Null => "null".to_string(),
-        Value::Func(_) => "[function]".to_string(),
+        Value::Func(_) | Value::Closure { .. } => "[function]".to_string(),
     }
 }
 

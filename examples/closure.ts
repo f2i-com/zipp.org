@@ -1,0 +1,27 @@
+// Closures: arrow lambdas that capture enclosing variables.
+//
+// A captured variable becomes a hidden leading parameter of the lifted
+// function (keeping its name), and creating the closure snapshots its current
+// value. So `adder(10)` returns a function that remembers `n = 10`. (v0
+// captures by value; like all function values, this runs on the interpreter.)
+
+function adder(n: i64): (x: i64) => i64 {
+  return (x: i64) => x + n; // captures the parameter `n`
+}
+
+function applyTwice(f: (n: i64) => i64, x: i64): i64 {
+  return f(f(x));
+}
+
+function main(): i64 {
+  const add10 = adder(10);
+  const add100 = adder(100);
+  console.log(add10(5)); // 15
+  console.log(add100(5)); // 105
+
+  const base = 3;
+  const scale = (x: i64) => x * base; // captures the local `base`
+  console.log(applyTwice(scale, 2)); // scale(scale(2)) = 18
+
+  return add10(5) + add100(5) + applyTwice(scale, 2); // 15 + 105 + 18 = 138
+}

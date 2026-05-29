@@ -703,6 +703,39 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                 .ok_or_else(|| format!("type error: no function type interned for '{name}'"))?;
             Ok(Type::Func(id as u32))
         }
+        // A closure: drop the captured leading params to recover the function's
+        // (explicit) value type, after checking each capture matches its param.
+        Expr::MakeClosure { name, captures } => {
+            let sig = cx
+                .sigs
+                .get(name)
+                .ok_or_else(|| format!("type error: closure target '{name}' is not a function"))?;
+            let params = sig.params.clone();
+            let ret = sig.ret;
+            if captures.len() > params.len() {
+                return Err(format!(
+                    "type error: closure '{name}' has {} captures but only {} parameters",
+                    captures.len(),
+                    params.len()
+                ));
+            }
+            for (i, c) in captures.iter().enumerate() {
+                let ct = type_of(c, scope, cx)?;
+                if !assignable(ct, params[i]) {
+                    return Err(format!(
+                        "type error: closure capture {i} expects {:?}, found {ct:?}",
+                        params[i]
+                    ));
+                }
+            }
+            let explicit = &params[captures.len()..];
+            let id = cx
+                .func_types
+                .iter()
+                .position(|ft| ft.params.as_slice() == explicit && ft.ret == ret)
+                .ok_or_else(|| format!("type error: no function type interned for closure '{name}'"))?;
+            Ok(Type::Func(id as u32))
+        }
         // Indirect call: the callee must be a function value.
         Expr::CallValue { callee, args } => {
             let ct = type_of(callee, scope, cx)?;

@@ -196,6 +196,11 @@ pub enum Expr {
     /// A named function (or lifted lambda) used as a first-class value. Its type
     /// is the corresponding `Type::Func`.
     FuncRef(String),
+    /// A closure: a lifted function plus the values it captures. The lifted
+    /// function takes the captures as its leading parameters; `captures` are the
+    /// expressions (evaluated in the enclosing scope) that supply them. Its type
+    /// is the `Func` type of the *remaining* (explicit) parameters.
+    MakeClosure { name: String, captures: Vec<Expr> },
     /// An indirect call through a function value `f(args)` (where `f` has a
     /// `Type::Func`). Distinguished from `Call` (a direct, statically-named call).
     CallValue { callee: Box<Expr>, args: Vec<Expr> },
