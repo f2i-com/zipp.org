@@ -92,8 +92,8 @@ struct Lower<'s> {
     pending_classes: RefCell<Vec<(String, Vec<z::Type>, u32)>>,
     /// Mangled instantiation names already emitted or queued (dedup).
     done_insts: RefCell<HashSet<String>>,
-    /// Numeric enum: name → (member name → integer value).
-    enums: HashMap<String, HashMap<String, i64>>,
+    /// Enum: name → its members (numeric → i64, or string → str).
+    enums: HashMap<String, EnumKind>,
     /// Counter for fresh temporary names (e.g. `for…of` desugaring).
     tmp: Cell<u32>,
 }
@@ -125,6 +125,12 @@ enum TypeTpl {
     Param(usize),
 }
 
+/// An enum's members: numeric (i64-backed) or string (str-backed).
+enum EnumKind {
+    Int(HashMap<String, i64>),
+    Str(HashMap<String, String>),
+}
+
 type LResult<T> = Result<T, String>;
 
 impl Lower<'_> {
@@ -141,32 +147,52 @@ impl Lower<'_> {
     }
 
     fn module(&mut self, program: &Program) -> LResult<z::Module> {
-        // Pass 0: numeric enums — compute each member's integer value, so both a
-        // type reference (`Color`→i64) and `Color.Member` resolve everywhere.
+        // Pass 0: enums — numeric (auto-incrementing i64) or string (every member
+        // a string literal). Registered so a type reference (`Color`) and
+        // `Color.Member` resolve everywhere.
         for stmt in &program.body {
             if let Statement::TSEnumDeclaration(decl) = stmt {
                 let name = decl.id.name.as_str().to_string();
                 if self.enums.contains_key(&name) {
                     return Err(self.err(decl.span, format!("enum '{name}' redefined")));
                 }
-                let mut members = HashMap::new();
-                let mut next = 0i64;
-                for m in &decl.body.members {
-                    let mname = match &m.id {
-                        TSEnumMemberName::Identifier(id) => id.name.as_str().to_string(),
-                        TSEnumMemberName::String(s) => s.value.as_str().to_string(),
-                        _ => {
-                            return Err(self.err(m.span, "computed enum member names aren't supported"))
-                        }
-                    };
-                    let val = match &m.initializer {
-                        Some(e) => self.enum_value(e)?,
-                        None => next,
-                    };
-                    members.insert(mname, val);
-                    next = val + 1;
-                }
-                self.enums.insert(name, members);
+                // a string enum if any member is given a string literal
+                let is_str = decl
+                    .body
+                    .members
+                    .iter()
+                    .any(|m| matches!(&m.initializer, Some(Expression::StringLiteral(_))));
+                let kind = if is_str {
+                    let mut members = HashMap::new();
+                    for m in &decl.body.members {
+                        let mname = self.enum_member_name(&m.id, m.span)?;
+                        let val = match &m.initializer {
+                            Some(Expression::StringLiteral(s)) => s.value.as_str().to_string(),
+                            _ => {
+                                return Err(self.err(
+                                    m.span,
+                                    "every member of a string enum needs a string value",
+                                ))
+                            }
+                        };
+                        members.insert(mname, val);
+                    }
+                    EnumKind::Str(members)
+                } else {
+                    let mut members = HashMap::new();
+                    let mut next = 0i64;
+                    for m in &decl.body.members {
+                        let mname = self.enum_member_name(&m.id, m.span)?;
+                        let val = match &m.initializer {
+                            Some(e) => self.enum_value(e)?,
+                            None => next,
+                        };
+                        members.insert(mname, val);
+                        next = val + 1;
+                    }
+                    EnumKind::Int(members)
+                };
+                self.enums.insert(name, kind);
             }
         }
 
@@ -377,6 +403,15 @@ impl Lower<'_> {
             }
         }
         self.ty(t).ok().map(TypeTpl::Concrete)
+    }
+
+    /// An enum member's name (`Identifier` or string-literal key).
+    fn enum_member_name(&self, id: &TSEnumMemberName, span: Span) -> LResult<String> {
+        match id {
+            TSEnumMemberName::Identifier(i) => Ok(i.name.as_str().to_string()),
+            TSEnumMemberName::String(s) => Ok(s.value.as_str().to_string()),
+            _ => Err(self.err(span, "computed enum member names aren't supported")),
+        }
     }
 
     /// Evaluate a constant integer enum initializer (`= 5`, `= -1`).
@@ -982,8 +1017,11 @@ impl Lower<'_> {
                             self.type_env.borrow().iter().rev().find_map(|m| m.get(other).copied())
                         {
                             t
-                        } else if self.enums.contains_key(other) {
-                            z::Type::I64 // a numeric enum is represented as i64
+                        } else if let Some(k) = self.enums.get(other) {
+                            match k {
+                                EnumKind::Int(_) => z::Type::I64,
+                                EnumKind::Str(_) => z::Type::Str,
+                            }
                         } else if self.generic_class_info.contains_key(other) {
                             // `Box<i64>` → instantiate the generic class
                             let args = match &r.type_arguments {
@@ -1226,33 +1264,108 @@ impl Lower<'_> {
     /// Lower a `let`/`const` (one or more declarators) into ZIPP `Let`s.
     fn var_decl(&self, v: &VariableDeclaration, out: &mut Vec<z::Stmt>) -> LResult<()> {
         for d in &v.declarations {
-            let name = match &d.id {
-                BindingPattern::BindingIdentifier(bi) => bi.name.as_str().to_string(),
-                _ => return Err(self.err(d.span, "destructuring `let` isn't supported")),
-            };
-            let value = d
+            let init = d
                 .init
                 .as_ref()
-                .ok_or_else(|| self.err(d.span, format!("'{name}' must be initialized")))?;
-            let ty = match &d.type_annotation {
-                Some(a) => Some(self.ty(&a.type_annotation)?),
-                None => None,
-            };
-            // `let p: Point = { ... }` — the annotation names the struct.
-            let value = match (&ty, value) {
-                (Some(z::Type::Struct(id)), Expression::ObjectExpression(obj)) => {
-                    self.obj_struct_lit(obj, *id)?
+                .ok_or_else(|| self.err(d.span, "a `let`/`const` must be initialized"))?;
+            match &d.id {
+                BindingPattern::BindingIdentifier(bi) => {
+                    let name = bi.name.as_str().to_string();
+                    let ty = match &d.type_annotation {
+                        Some(a) => Some(self.ty(&a.type_annotation)?),
+                        None => None,
+                    };
+                    // `let p: Point = { ... }` — the annotation names the struct.
+                    let value = match (&ty, init) {
+                        (Some(z::Type::Struct(id)), Expression::ObjectExpression(obj)) => {
+                            self.obj_struct_lit(obj, *id)?
+                        }
+                        _ => self.expr(init)?,
+                    };
+                    // Track the variable's type (annotation, else inferred).
+                    if let Some(t) = ty.or_else(|| self.ztype_of(&value)) {
+                        self.bind(&name, t);
+                    }
+                    out.push(z::Stmt {
+                        kind: z::StmtKind::Let { name, ty, value },
+                        line: self.line(d.span),
+                    });
                 }
-                _ => self.expr(value)?,
+                BindingPattern::ArrayPattern(arr) => self.destructure_array(arr, init, out)?,
+                BindingPattern::ObjectPattern(obj) => self.destructure_object(obj, init, out)?,
+                _ => return Err(self.err(d.span, "this binding pattern isn't supported")),
+            }
+        }
+        Ok(())
+    }
+
+    /// `const [a, b] = arr` → hoist `arr` once, then `let a = __d[0]; let b = __d[1]`.
+    fn destructure_array(
+        &self,
+        arr: &ArrayPattern,
+        init: &Expression,
+        out: &mut Vec<z::Stmt>,
+    ) -> LResult<()> {
+        if arr.rest.is_some() {
+            return Err(self.err(arr.span, "a rest element `...` in array destructuring isn't supported"));
+        }
+        let value = self.expr(init)?;
+        let tmp = self.fresh("d");
+        let line = self.line(arr.span);
+        out.push(z::Stmt { kind: z::StmtKind::Let { name: tmp.clone(), ty: None, value }, line });
+        for (i, el) in arr.elements.iter().enumerate() {
+            let Some(pat) = el else { continue }; // hole, e.g. `[, b]`
+            let name = match pat {
+                BindingPattern::BindingIdentifier(bi) => bi.name.as_str().to_string(),
+                _ => return Err(self.err(arr.span, "nested destructuring isn't supported")),
             };
-            // Track the variable's type (annotation, else inferred) for dispatch.
-            if let Some(t) = ty.or_else(|| self.ztype_of(&value)) {
+            out.push(z::Stmt {
+                kind: z::StmtKind::Let {
+                    name,
+                    ty: None,
+                    value: z::Expr::Index {
+                        arr: Box::new(z::Expr::Var(tmp.clone())),
+                        index: Box::new(z::Expr::Int(i as i64)),
+                    },
+                },
+                line,
+            });
+        }
+        Ok(())
+    }
+
+    /// `const {x, y: z} = s` → hoist `s` once, then `let x = __d.x; let z = __d.y`.
+    fn destructure_object(
+        &self,
+        obj: &ObjectPattern,
+        init: &Expression,
+        out: &mut Vec<z::Stmt>,
+    ) -> LResult<()> {
+        if obj.rest.is_some() {
+            return Err(self.err(obj.span, "a rest element `...` in object destructuring isn't supported"));
+        }
+        let value = self.expr(init)?;
+        let tmp = self.fresh("d");
+        let line = self.line(obj.span);
+        let tmp_ty = self.ztype_of(&value);
+        out.push(z::Stmt { kind: z::StmtKind::Let { name: tmp.clone(), ty: None, value }, line });
+        if let Some(t) = tmp_ty {
+            self.bind(&tmp, t); // so `__d.field` resolves below
+        }
+        for p in &obj.properties {
+            if p.computed {
+                return Err(self.err(p.span, "computed keys in destructuring aren't supported"));
+            }
+            let field = self.prop_name(&p.key, p.span)?;
+            let name = match &p.value {
+                BindingPattern::BindingIdentifier(bi) => bi.name.as_str().to_string(),
+                _ => return Err(self.err(p.span, "nested destructuring isn't supported")),
+            };
+            let value = z::Expr::Field { base: Box::new(z::Expr::Var(tmp.clone())), field };
+            if let Some(t) = self.ztype_of(&value) {
                 self.bind(&name, t);
             }
-            out.push(z::Stmt {
-                kind: z::StmtKind::Let { name, ty, value },
-                line: self.line(d.span),
-            });
+            out.push(z::Stmt { kind: z::StmtKind::Let { name, ty: None, value }, line });
         }
         Ok(())
     }
@@ -1421,15 +1534,18 @@ impl Lower<'_> {
             Expression::StaticMemberExpression(m) => {
                 // `Color.Red` → the enum member's integer value.
                 if let Expression::Identifier(obj) = &m.object {
-                    if let Some(members) = self.enums.get(obj.name.as_str()) {
+                    if let Some(kind) = self.enums.get(obj.name.as_str()) {
                         let member = m.property.name.as_str();
-                        return match members.get(member) {
-                            Some(&v) => Ok(z::Expr::Int(v)),
-                            None => Err(self.err(
+                        let val = match kind {
+                            EnumKind::Int(mem) => mem.get(member).map(|&v| z::Expr::Int(v)),
+                            EnumKind::Str(mem) => mem.get(member).map(|s| z::Expr::Str(s.clone())),
+                        };
+                        return val.ok_or_else(|| {
+                            self.err(
                                 m.span,
                                 format!("enum '{}' has no member '{member}'", obj.name.as_str()),
-                            )),
-                        };
+                            )
+                        });
                     }
                 }
                 if m.property.name.as_str() == "length" {
@@ -1890,6 +2006,30 @@ mod tests {
                    function unwrap(b: Box<i64>): i64 { return b.get(); } \
                    function main(): i64 { return unwrap(new Box(99)); }";
         assert_eq!(run_i64(ts3), 99);
+    }
+
+    #[test]
+    fn string_enums_and_destructuring() {
+        // string enum: members are `str`; `E.M` is a string literal; concat works
+        let ts = "enum Dir { North = \"N\", South = \"S\" } \
+                  function main(): i64 { \
+                    let d: Dir = Dir.North; \
+                    let s: str = d + Dir.South; \
+                    return len(s); }";
+        assert_eq!(run_i64(ts), 2); // "NS"
+        // array destructuring, including a hole
+        let ts2 = "function main(): i64 { \
+                     let xs: i64[] = [10, 20, 30]; \
+                     let [a, , c] = xs; \
+                     return a + c; }";
+        assert_eq!(run_i64(ts2), 40); // 10 + 30
+        // object destructuring from a struct: shorthand + renamed
+        let ts3 = "interface P { x: i64; y: i64; } \
+                   function main(): i64 { \
+                     let p: P = { x: 5, y: 7 }; \
+                     let { x, y: why } = p; \
+                     return x * why; }";
+        assert_eq!(run_i64(ts3), 35); // 5 * 7
     }
 
     #[test]
