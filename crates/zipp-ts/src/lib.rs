@@ -51,6 +51,7 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
         ret_struct: Cell::new(None),
         generic_info: HashMap::new(),
         generic_class_info: HashMap::new(),
+        fn_defaults: HashMap::new(),
         type_env: RefCell::new(Vec::new()),
         pending: RefCell::new(Vec::new()),
         pending_classes: RefCell::new(Vec::new()),
@@ -83,6 +84,9 @@ struct Lower<'s> {
     generic_info: HashMap<String, GenericInfo>,
     /// Generic class name → owned monomorphization metadata.
     generic_class_info: HashMap<String, ClassGenericInfo>,
+    /// Callable name (as emitted) → per-parameter default value, lowered once.
+    /// A call site appends the missing trailing defaults.
+    fn_defaults: HashMap<String, Vec<Option<z::Expr>>>,
     /// Active type-parameter bindings (a stack, for nested instantiation).
     type_env: RefCell<Vec<HashMap<String, z::Type>>>,
     /// Queue of generic function instantiations still to emit: (name, type args).
@@ -260,6 +264,8 @@ impl Lower<'_> {
                     if let Some(id) = &f.id {
                         let r = self.fn_ret_type(f)?;
                         self.fn_rets.borrow_mut().insert(id.name.as_str().to_string(), r);
+                        let defs = self.lower_defaults(&f.params)?;
+                        self.fn_defaults.insert(id.name.as_str().to_string(), defs);
                     }
                 }
                 Statement::ClassDeclaration(c) => {
@@ -269,12 +275,28 @@ impl Lower<'_> {
                     let cname = c.id.as_ref().unwrap().name.as_str().to_string();
                     let cid = self.struct_id(&cname).unwrap();
                     self.fn_rets.borrow_mut().insert(format!("{cname}__new"), z::Type::Struct(cid));
+                    // constructor defaults (factory `C__new` takes the ctor params)
+                    if let Some(ctor) = c.body.body.iter().find_map(|el| match el {
+                        ClassElement::MethodDefinition(m)
+                            if matches!(m.kind, MethodDefinitionKind::Constructor) =>
+                        {
+                            Some(m)
+                        }
+                        _ => None,
+                    }) {
+                        let defs = self.lower_defaults(&ctor.value.params)?;
+                        self.fn_defaults.insert(format!("{cname}__new"), defs);
+                    }
                     for el in &c.body.body {
                         if let ClassElement::MethodDefinition(m) = el {
                             if matches!(m.kind, MethodDefinitionKind::Method) {
                                 let mname = self.prop_name(&m.key, m.span)?;
                                 let r = self.fn_ret_type(&m.value)?;
                                 self.fn_rets.borrow_mut().insert(format!("{cname}__{mname}"), r);
+                                // `this` is param 0 (always provided), then the rest
+                                let mut defs = vec![None];
+                                defs.extend(self.lower_defaults(&m.value.params)?);
+                                self.fn_defaults.insert(format!("{cname}__{mname}"), defs);
                             }
                         }
                     }
@@ -985,6 +1007,42 @@ impl Lower<'_> {
         }
     }
 
+    /// Lower each parameter's default value (`= …`). Defaults must be constant
+    /// (they're evaluated at the call site), so a variable reference is rejected.
+    fn lower_defaults(&self, params: &FormalParameters) -> LResult<Vec<Option<z::Expr>>> {
+        let mut out = Vec::with_capacity(params.items.len());
+        for p in &params.items {
+            let d = match &p.initializer {
+                Some(e) => {
+                    let lowered = self.expr(e)?;
+                    if expr_has_var(&lowered) {
+                        return Err(self.err(
+                            p.span,
+                            "a default parameter value must be constant (it can't reference \
+                             variables or other parameters)",
+                        ));
+                    }
+                    Some(lowered)
+                }
+                None => None,
+            };
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    /// Append the missing trailing default arguments for a call to `name`.
+    fn apply_defaults(&self, name: &str, args: &mut Vec<z::Expr>) {
+        if let Some(defs) = self.fn_defaults.get(name) {
+            while args.len() < defs.len() {
+                match &defs[args.len()] {
+                    Some(d) => args.push(d.clone()),
+                    None => break, // a non-defaulted gap; the checker reports the arity error
+                }
+            }
+        }
+    }
+
     fn ty(&self, t: &TSType) -> LResult<z::Type> {
         Ok(match t {
             TSType::TSNumberKeyword(_) => z::Type::F64, // TS `number` is f64
@@ -1602,6 +1660,7 @@ impl Lower<'_> {
                     }
                     f
                 };
+                self.apply_defaults(&factory, &mut args);
                 z::Expr::Call { name: factory, args }
             }
             Expression::ObjectExpression(o) => {
@@ -1645,7 +1704,9 @@ impl Lower<'_> {
                     .ok_or_else(|| self.err(c.span, "spread arguments aren't supported"))?;
                 args.push(self.expr(ex)?);
             }
-            return Ok(z::Expr::Call { name: format!("{cname}__{method}"), args });
+            let mname = format!("{cname}__{method}");
+            self.apply_defaults(&mname, &mut args);
+            return Ok(z::Expr::Call { name: mname, args });
         }
         let name = match &c.callee {
             Expression::Identifier(id) => id.name.as_str().to_string(),
@@ -1681,6 +1742,7 @@ impl Lower<'_> {
             self.request_inst(&name, type_args, &mangled);
             return Ok(z::Expr::Call { name: mangled, args });
         }
+        self.apply_defaults(&name, &mut args);
         Ok(z::Expr::Call { name, args })
     }
 
@@ -1828,6 +1890,26 @@ fn stmt_has_switch_break(s: &Statement) -> bool {
         }
         Statement::BlockStatement(b) => b.body.iter().any(stmt_has_switch_break),
         _ => false,
+    }
+}
+
+/// Does a lowered expression reference any variable? Used to keep default
+/// parameter values constant (they're cloned into call sites).
+fn expr_has_var(e: &z::Expr) -> bool {
+    match e {
+        z::Expr::Var(_) => true,
+        z::Expr::Cast { e, .. } | z::Expr::Unary { e, .. } => expr_has_var(e),
+        z::Expr::Bin { l, r, .. } => expr_has_var(l) || expr_has_var(r),
+        z::Expr::Cond { cond, then, els } => {
+            expr_has_var(cond) || expr_has_var(then) || expr_has_var(els)
+        }
+        z::Expr::Call { args, .. } => args.iter().any(expr_has_var),
+        z::Expr::Array(es) => es.iter().any(expr_has_var),
+        z::Expr::Repeat { value, count } => expr_has_var(value) || expr_has_var(count),
+        z::Expr::Index { arr, index } => expr_has_var(arr) || expr_has_var(index),
+        z::Expr::Field { base, .. } => expr_has_var(base),
+        z::Expr::StructLit { fields, .. } => fields.iter().any(|(_, e)| expr_has_var(e)),
+        z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) => false,
     }
 }
 
@@ -2006,6 +2088,30 @@ mod tests {
                    function unwrap(b: Box<i64>): i64 { return b.get(); } \
                    function main(): i64 { return unwrap(new Box(99)); }";
         assert_eq!(run_i64(ts3), 99);
+    }
+
+    #[test]
+    fn default_params() {
+        // default on a top-level function — omitted then provided
+        let ts = "function inc(x: i64, by: i64 = 1): i64 { return x + by; } \
+                  function main(): i64 { return inc(10) + inc(10, 5); }";
+        assert_eq!(run_i64(ts), 26); // 11 + 15
+        // defaults on a constructor and a method
+        let ts2 = "class Counter { \
+                     n: i64; \
+                     constructor(start: i64 = 100) { this.n = start; } \
+                     add(d: i64 = 2): i64 { this.n = this.n + d; return this.n; } \
+                   } \
+                   function main(): i64 { \
+                     let a = new Counter(); a.add(); \
+                     let b = new Counter(0); b.add(40); \
+                     return a.add() + b.n; }";
+        assert_eq!(run_i64(ts2), 144); // a: 100→102→104 ; b: 0→40 ; 104 + 40
+        // an enum member is a valid (constant) default
+        let ts3 = "enum Mode { Off, On } \
+                   function f(m: Mode = Mode.On): i64 { return m; } \
+                   function main(): i64 { return f() + f(Mode.Off); }";
+        assert_eq!(run_i64(ts3), 1); // 1 + 0
     }
 
     #[test]

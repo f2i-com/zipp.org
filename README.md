@@ -109,6 +109,7 @@ cargo build --release
 ./target/release/zipp run --wasm examples/calc.ts    # switch (runs in the contract profile)
 ./target/release/zipp run --jit examples/ternary.ts  # ternary ?: (a lazy recursive fib)
 ./target/release/zipp run examples/destructure.ts    # string enum + destructuring
+./target/release/zipp run examples/defaults.ts       # default parameter values
 
 # run the language test suite
 cargo test
@@ -341,7 +342,8 @@ app.ts ─[oxc]→ TS AST ─[lower the subset]→ ZIPP AST ─→ check → IR 
 
 `oxc` parses *all* TS syntax; we lower what maps to ZIPP's sound core and reject
 the rest with a line-numbered error. **Supported (v0):** typed functions +
-recursion, `let`/`const` (incl. array/object **destructuring**),
+recursion (with **default parameters**), `let`/`const` (incl. array/object
+**destructuring**),
 `if`/`while`/`for`/`for…of`/`switch`, `break`/`continue`, the operator set +
 ternary `?:`, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing,
 `.length`), numeric **and string `enum`s**, **`interface`s and `class`es →
@@ -359,7 +361,7 @@ identically on all four backends; `sum.ts` shows a `u64` loop + arrays;
 `point.ts` interfaces; `account.ts` a class with methods; `generic.ts`
 monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
 `for…of`; `calc.ts` a `switch`; `ternary.ts` the `?:` operator; `destructure.ts`
-a string enum + array/object destructuring.
+a string enum + array/object destructuring; `defaults.ts` default parameters.
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,
