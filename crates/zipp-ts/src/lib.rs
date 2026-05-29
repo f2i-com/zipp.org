@@ -63,6 +63,7 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
         lambdas: RefCell::new(Vec::new()),
         next_lambda: Cell::new(0),
         fn_value_types: RefCell::new(HashMap::new()),
+        array_helpers: RefCell::new(HashSet::new()),
     };
     lower.module(&ret.program)
 }
@@ -119,6 +120,9 @@ struct Lower<'s> {
     /// Callable name → its first-class function type (`Type::Func`). Lets a bare
     /// function reference and `ztype_of` resolve a function used as a value.
     fn_value_types: RefCell<HashMap<String, z::Type>>,
+    /// Names of synthesized array-method helpers already generated (dedup, so a
+    /// given `map`/`filter`/`reduce` at fixed element types is emitted once).
+    array_helpers: RefCell<HashSet<String>>,
 }
 
 /// Owned metadata to monomorphize a generic function without re-touching the AST.
@@ -976,6 +980,14 @@ impl Lower<'_> {
             }
             z::Expr::Cond { then, .. } => self.ztype_of(then)?,
             z::Expr::Coalesce { rhs, .. } => self.ztype_of(rhs)?,
+            // An array literal's type comes from its first element.
+            z::Expr::Array(es) => z::Type::Array(self.ztype_of(es.first()?)?.as_elem()?),
+            // `arr.push(x)` is the new length; `arr.pop()` is the element type.
+            z::Expr::Push { .. } => z::Type::I64,
+            z::Expr::Pop { arr } => {
+                let z::Type::Array(e) = self.ztype_of(arr)? else { return None };
+                e.to_type()
+            }
             // Comparisons/logicals are bool; arithmetic/bitwise share the operand
             // type. Lets arrow return types infer from simple bodies.
             z::Expr::Bin { op, l, .. } => match op {
@@ -1618,6 +1630,15 @@ impl Lower<'_> {
                         {
                             self.arr_tuple_lit(arr, *id)?
                         }
+                        // `let xs: T[] = []` — a typed empty (growable) array.
+                        (Some(z::Type::Array(elem)), Expression::ArrayExpression(arr))
+                            if arr.elements.is_empty() =>
+                        {
+                            z::Expr::Repeat {
+                                value: Box::new(elem_default(*elem)),
+                                count: Box::new(z::Expr::Int(0)),
+                            }
+                        }
                         _ => self.expr(init)?,
                     };
                     // Track the variable's type (annotation, else inferred).
@@ -1963,6 +1984,13 @@ impl Lower<'_> {
             }
             Expression::CallExpression(c) => self.call(c)?,
             Expression::ArrayExpression(a) => {
+                if a.elements.is_empty() {
+                    return Err(self.err(
+                        a.span,
+                        "an empty array literal `[]` needs a type — annotate the binding \
+                         (`let xs: i64[] = []`)",
+                    ));
+                }
                 let mut elems = Vec::new();
                 for el in &a.elements {
                     let ex = el
@@ -2027,6 +2055,9 @@ impl Lower<'_> {
                     self.expr(&a.expression)?
                 }
             }
+            // `e!` non-null assertion — a no-op for lowering (ZIPP's own checker
+            // tracks nullability); lets `arr.pop()!` satisfy tsc's `T | undefined`.
+            Expression::TSNonNullExpression(n) => self.expr(&n.expression)?,
             // `this` inside a method/constructor → the synthetic `this` binding.
             Expression::ThisExpression(_) => z::Expr::Var("this".into()),
             // `new C(args)` → the class factory `C__new(args)`.
@@ -2070,6 +2101,128 @@ impl Lower<'_> {
         })
     }
 
+    /// Dispatch a builtin array method on an array receiver of element type `elem`.
+    /// `push`/`pop` are primitives; `map`/`filter`/`reduce` call a synthesized,
+    /// per-element-type helper function (a plain loop) generated on demand.
+    fn array_method(
+        &self,
+        recv: z::Expr,
+        elem: z::Elem,
+        method: &str,
+        c: &CallExpression,
+    ) -> LResult<z::Expr> {
+        let mut args = self.lower_args(c)?;
+        match method {
+            "push" => {
+                if args.len() != 1 {
+                    return Err(self.err(c.span, "push(x) takes one argument"));
+                }
+                Ok(z::Expr::Push { arr: Box::new(recv), value: Box::new(args.remove(0)) })
+            }
+            "pop" => {
+                if !args.is_empty() {
+                    return Err(self.err(c.span, "pop() takes no arguments"));
+                }
+                Ok(z::Expr::Pop { arr: Box::new(recv) })
+            }
+            "map" | "filter" | "reduce" => self.array_hof(recv, elem, method, args, c.span),
+            other => Err(self.err(
+                c.span,
+                format!(
+                    "unknown array method '.{other}()' — supported: push, pop, map, filter, reduce"
+                ),
+            )),
+        }
+    }
+
+    /// Higher-order array methods. Resolves the callback's interned function type,
+    /// validates its shape, ensures the matching helper exists, and emits a call
+    /// `__method_<types>(arr, callback[, init])`.
+    fn array_hof(
+        &self,
+        recv: z::Expr,
+        elem: z::Elem,
+        method: &str,
+        args: Vec<z::Expr>,
+        span: Span,
+    ) -> LResult<z::Expr> {
+        let cb = args.first().ok_or_else(|| {
+            self.err(span, format!(".{method}() needs a callback function"))
+        })?;
+        let z::Type::Func(fid) = self.ztype_of(cb).ok_or_else(|| {
+            self.err(span, format!(".{method}()'s callback type is unknown — pass an arrow or a named function"))
+        })?
+        else {
+            return Err(self.err(span, format!(".{method}() expects a function argument")));
+        };
+        let ft = self.func_types.borrow()[fid as usize].clone();
+        let t = elem.to_type();
+        let f_ty = z::Type::Func(fid);
+        let (name, call_args) = match method {
+            "map" => {
+                if args.len() != 1 || ft.params != [t] {
+                    return Err(self.err(span, "map((x: T) => U) takes one callback of one element"));
+                }
+                let u = ft.ret.as_elem().ok_or_else(|| {
+                    self.err(span, "map's callback must return a scalar (array element type)")
+                })?;
+                let name = self.ensure_array_helper(method, elem, u, f_ty);
+                (name, prepend(recv, args))
+            }
+            "filter" => {
+                if args.len() != 1 || ft.params != [t] || ft.ret != z::Type::Bool {
+                    return Err(self.err(span, "filter((x: T) => bool) takes one boolean predicate"));
+                }
+                let name = self.ensure_array_helper(method, elem, elem, f_ty);
+                (name, prepend(recv, args))
+            }
+            "reduce" => {
+                if args.len() != 2 {
+                    return Err(self.err(span, "reduce((acc, x) => acc, init) takes a callback and an initial value"));
+                }
+                let u = ft.ret.as_elem().ok_or_else(|| {
+                    self.err(span, "reduce's accumulator must be a scalar (i64/f64/bool)")
+                })?;
+                if ft.params != [ft.ret, t] {
+                    return Err(self.err(span, "reduce's callback must be `(acc: U, x: T) => U`"));
+                }
+                let init_ty = self.ztype_of(&args[1]).ok_or_else(|| {
+                    self.err(span, "reduce's initial value has an unknown type")
+                })?;
+                if init_ty != ft.ret {
+                    return Err(self.err(span, format!("reduce's initial value must be {:?}", ft.ret)));
+                }
+                let name = self.ensure_array_helper(method, elem, u, f_ty);
+                (name, prepend(recv, args))
+            }
+            _ => unreachable!(),
+        };
+        Ok(z::Expr::Call { name, args: call_args })
+    }
+
+    /// Generate (once) and register a `map`/`filter`/`reduce` helper for the given
+    /// element types, returning its mangled name.
+    fn ensure_array_helper(
+        &self,
+        method: &str,
+        t: z::Elem,
+        u: z::Elem,
+        f_ty: z::Type,
+    ) -> String {
+        let name = format!("__{method}_{}_{}", elem_tag(t), elem_tag(u));
+        if self.array_helpers.borrow_mut().insert(name.clone()) {
+            let (func, ret) = match method {
+                "map" => (build_map_helper(&name, t, u, f_ty), z::Type::Array(u)),
+                "filter" => (build_filter_helper(&name, t, f_ty), z::Type::Array(t)),
+                "reduce" => (build_reduce_helper(&name, t, u, f_ty), u.to_type()),
+                _ => unreachable!(),
+            };
+            self.fn_rets.borrow_mut().insert(name.clone(), ret);
+            self.lambdas.borrow_mut().push(func);
+        }
+        name
+    }
+
     /// Lower a call's positional arguments (rejecting spreads).
     fn lower_args(&self, c: &CallExpression) -> LResult<Vec<z::Expr>> {
         let mut args = Vec::with_capacity(c.arguments.len());
@@ -2091,6 +2244,10 @@ impl Lower<'_> {
         if let Expression::StaticMemberExpression(m) = &c.callee {
             let method = m.property.name.as_str();
             let recv = self.expr(&m.object)?;
+            // Builtin array methods (push/pop/map/filter/reduce) on an array receiver.
+            if let Some(z::Type::Array(elem)) = self.ztype_of(&recv) {
+                return self.array_method(recv, elem, method, c);
+            }
             let cid = match self.ztype_of(&recv) {
                 Some(z::Type::Struct(id)) => id,
                 _ => {
@@ -2367,6 +2524,11 @@ fn collect_vars(e: &z::Expr, out: &mut Vec<String>) {
         // A closure's captures are expressions in the enclosing scope — their
         // variables count (this is how a nested arrow's captures propagate out).
         MakeClosure { captures, .. } => captures.iter().for_each(|c| collect_vars(c, out)),
+        Push { arr, value } => {
+            collect_vars(arr, out);
+            collect_vars(value, out);
+        }
+        Pop { arr } => collect_vars(arr, out),
         FuncRef(_) | Int(_) | Float(_) | Bool(_) | Str(_) | Null => {}
     }
 }
@@ -2405,6 +2567,8 @@ fn expr_has_var(e: &z::Expr) -> bool {
             expr_has_var(callee) || args.iter().any(expr_has_var)
         }
         z::Expr::MakeClosure { captures, .. } => captures.iter().any(expr_has_var),
+        z::Expr::Push { arr, value } => expr_has_var(arr) || expr_has_var(value),
+        z::Expr::Pop { arr } => expr_has_var(arr),
         z::Expr::Int(_) | z::Expr::Float(_) | z::Expr::Bool(_) | z::Expr::Str(_) | z::Expr::Null => {
             false
         }
@@ -2457,6 +2621,163 @@ fn bare_type_ref_name<'a>(t: &'a TSType<'a>) -> Option<&'a str> {
         }
     }
     None
+}
+
+// --- Synthesized array-method helpers (plain ZIPP loops over a growable array) ---
+
+fn stmt(kind: z::StmtKind) -> z::Stmt {
+    z::Stmt { kind, line: 0 }
+}
+fn prepend(head: z::Expr, rest: Vec<z::Expr>) -> Vec<z::Expr> {
+    let mut v = Vec::with_capacity(rest.len() + 1);
+    v.push(head);
+    v.extend(rest);
+    v
+}
+fn elem_tag(e: z::Elem) -> &'static str {
+    match e {
+        z::Elem::I64 => "i64",
+        z::Elem::F64 => "f64",
+        z::Elem::Bool => "bool",
+    }
+}
+fn elem_default(e: z::Elem) -> z::Expr {
+    match e {
+        z::Elem::I64 => z::Expr::Int(0),
+        z::Elem::F64 => z::Expr::Float(0.0),
+        z::Elem::Bool => z::Expr::Bool(false),
+    }
+}
+/// `__i < len(arr)` — the shared loop condition.
+fn lt_len() -> z::Expr {
+    z::Expr::Bin {
+        op: z::BinOp::Lt,
+        l: Box::new(z::Expr::Var("__i".into())),
+        r: Box::new(z::Expr::Call { name: "len".into(), args: vec![z::Expr::Var("arr".into())] }),
+    }
+}
+/// `let __i = 0` and `__i = __i + 1` — the shared loop init/step.
+fn loop_init() -> z::Stmt {
+    stmt(z::StmtKind::Let { name: "__i".into(), ty: None, value: z::Expr::Int(0) })
+}
+fn loop_step() -> z::Stmt {
+    stmt(z::StmtKind::Assign {
+        target: z::Expr::Var("__i".into()),
+        value: z::Expr::Bin {
+            op: z::BinOp::Add,
+            l: Box::new(z::Expr::Var("__i".into())),
+            r: Box::new(z::Expr::Int(1)),
+        },
+    })
+}
+/// `arr[__i]`.
+fn arr_at_i() -> z::Expr {
+    z::Expr::Index {
+        arr: Box::new(z::Expr::Var("arr".into())),
+        index: Box::new(z::Expr::Var("__i".into())),
+    }
+}
+/// `f(args)` — call the callback parameter.
+fn call_f(args: Vec<z::Expr>) -> z::Expr {
+    z::Expr::CallValue { callee: Box::new(z::Expr::Var("f".into())), args }
+}
+
+/// `function __map_T_U(arr: T[], f: (T)=>U): U[] { let __r: U[] = []; for (…) __r.push(f(arr[__i])); return __r; }`
+fn build_map_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::Func {
+    use z::{Expr, Param, StmtKind, Type};
+    let body = vec![
+        stmt(StmtKind::Let {
+            name: "__r".into(),
+            ty: Some(Type::Array(u)),
+            value: Expr::Repeat { value: Box::new(elem_default(u)), count: Box::new(Expr::Int(0)) },
+        }),
+        stmt(StmtKind::For {
+            init: Some(Box::new(loop_init())),
+            cond: lt_len(),
+            step: Some(Box::new(loop_step())),
+            body: vec![stmt(StmtKind::ExprStmt(Expr::Push {
+                arr: Box::new(Expr::Var("__r".into())),
+                value: Box::new(call_f(vec![arr_at_i()])),
+            }))],
+        }),
+        stmt(StmtKind::Return(Some(Expr::Var("__r".into())))),
+    ];
+    z::Func {
+        name: name.into(),
+        params: vec![
+            Param { name: "arr".into(), ty: Type::Array(t) },
+            Param { name: "f".into(), ty: f_ty },
+        ],
+        ret: Type::Array(u),
+        body,
+    }
+}
+
+/// `function __filter_T(arr: T[], f: (T)=>bool): T[] { … if (f(arr[__i])) __r.push(arr[__i]); … }`
+fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type) -> z::Func {
+    use z::{Expr, Param, StmtKind, Type};
+    let body = vec![
+        stmt(StmtKind::Let {
+            name: "__r".into(),
+            ty: Some(Type::Array(t)),
+            value: Expr::Repeat { value: Box::new(elem_default(t)), count: Box::new(Expr::Int(0)) },
+        }),
+        stmt(StmtKind::For {
+            init: Some(Box::new(loop_init())),
+            cond: lt_len(),
+            step: Some(Box::new(loop_step())),
+            body: vec![stmt(StmtKind::If {
+                cond: call_f(vec![arr_at_i()]),
+                then_b: vec![stmt(StmtKind::ExprStmt(Expr::Push {
+                    arr: Box::new(Expr::Var("__r".into())),
+                    value: Box::new(arr_at_i()),
+                }))],
+                else_b: vec![],
+            })],
+        }),
+        stmt(StmtKind::Return(Some(Expr::Var("__r".into())))),
+    ];
+    z::Func {
+        name: name.into(),
+        params: vec![
+            Param { name: "arr".into(), ty: Type::Array(t) },
+            Param { name: "f".into(), ty: f_ty },
+        ],
+        ret: Type::Array(t),
+        body,
+    }
+}
+
+/// `function __reduce_T_U(arr: T[], f: (U,T)=>U, init: U): U { let __acc = init; for (…) __acc = f(__acc, arr[__i]); return __acc; }`
+fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::Func {
+    use z::{Expr, Param, StmtKind, Type};
+    let body = vec![
+        stmt(StmtKind::Let {
+            name: "__acc".into(),
+            ty: Some(u.to_type()),
+            value: Expr::Var("init".into()),
+        }),
+        stmt(StmtKind::For {
+            init: Some(Box::new(loop_init())),
+            cond: lt_len(),
+            step: Some(Box::new(loop_step())),
+            body: vec![stmt(StmtKind::Assign {
+                target: Expr::Var("__acc".into()),
+                value: call_f(vec![Expr::Var("__acc".into()), arr_at_i()]),
+            })],
+        }),
+        stmt(StmtKind::Return(Some(Expr::Var("__acc".into())))),
+    ];
+    z::Func {
+        name: name.into(),
+        params: vec![
+            Param { name: "arr".into(), ty: Type::Array(t) },
+            Param { name: "f".into(), ty: f_ty },
+            Param { name: "init".into(), ty: u.to_type() },
+        ],
+        ret: u.to_type(),
+        body,
+    }
 }
 
 /// Mangle a generic instantiation to a unique, valid ZIPP function name.
@@ -2686,6 +3007,37 @@ mod tests {
         // `closures_capture`).
         let cap = "function main(): i64 { let k = 3; const f = (n: i64) => n + k; return f(1); }";
         assert_eq!(run_i64(cap), 4);
+    }
+
+    #[test]
+    fn growable_arrays_and_methods() {
+        // push / pop / len
+        let ts = "function main(): i64 { const xs: i64[] = []; \
+                    xs.push(10); xs.push(20); xs.push(30); \
+                    let last = xs.pop()!; return len(xs) * 100 + last; }";
+        assert_eq!(run_i64(ts), 230); // len 2, last 30
+
+        // map (arrow) + filter (named predicate) + reduce
+        let ts2 = "function odd(n: i64): bool { return n % 2 === 1; } \
+                   function main(): i64 { \
+                     const xs: i64[] = []; for (let i = 1; i <= 4; i = i + 1) { xs.push(i); } \
+                     const sq = xs.map((x: i64) => x * x); \
+                     const odds = xs.filter(odd); \
+                     const sum = sq.reduce((a: i64, b: i64) => a + b, 0); \
+                     return sum * 10 + len(odds); }";
+        // xs=[1,2,3,4]; sq=[1,4,9,16] → sum 30; odds=[1,3] → len 2  ⇒ 302
+        assert_eq!(run_i64(ts2), 302);
+
+        // reduce with a capturing closure
+        let ts3 = "function main(): i64 { const xs: i64[] = []; \
+                     xs.push(1); xs.push(2); xs.push(3); \
+                     const k = 10; return xs.reduce((a: i64, x: i64) => a + x * k, 0); }";
+        assert_eq!(run_i64(ts3), 60); // (1+2+3)*10
+
+        // growable arrays flag the program interpreter-only
+        let m = compile_ts(ts).expect("lower");
+        let prog = zippc::compile_module(&m).expect("compile");
+        assert!(prog.uses_growable);
     }
 
     #[test]

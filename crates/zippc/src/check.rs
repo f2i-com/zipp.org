@@ -760,5 +760,25 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
             }
             Ok(ft.ret)
         }
+        // `arr.push(value)` — append; result is the new length.
+        Expr::Push { arr, value } => {
+            let at = type_of(arr, scope, cx)?;
+            let Type::Array(e) = at else {
+                return Err(format!("type error: push on a non-array {at:?}"));
+            };
+            let vt = type_of(value, scope, cx)?;
+            if !assignable(vt, e.to_type()) {
+                return Err(format!("type error: push expects {:?}, found {vt:?}", e.to_type()));
+            }
+            Ok(Type::I64)
+        }
+        // `arr.pop()` — remove the last element; result is the element type.
+        Expr::Pop { arr } => {
+            let at = type_of(arr, scope, cx)?;
+            let Type::Array(e) = at else {
+                return Err(format!("type error: pop on a non-array {at:?}"));
+            };
+            Ok(e.to_type())
+        }
     }
 }

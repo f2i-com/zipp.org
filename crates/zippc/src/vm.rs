@@ -322,6 +322,29 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 base = new_base;
                 pc = callee_fn.entry;
             }
+            Instr::Push { dst, arr, value } => {
+                if record_trace {
+                    return Err(ZK_NO_ARRAY.into());
+                }
+                let v = reg[base + *value as usize];
+                let h = match reg[base + *arr as usize] {
+                    Value::Arr(i) => i,
+                    _ => return Err("runtime error: push on a non-array value".into()),
+                };
+                heap[h].push(v);
+                reg[base + *dst as usize] = Value::I64(heap[h].len() as i64);
+            }
+            Instr::Pop { dst, arr } => {
+                if record_trace {
+                    return Err(ZK_NO_ARRAY.into());
+                }
+                let h = match reg[base + *arr as usize] {
+                    Value::Arr(i) => i,
+                    _ => return Err("runtime error: pop on a non-array value".into()),
+                };
+                let v = heap[h].pop().ok_or("runtime error: pop from an empty array")?;
+                reg[base + *dst as usize] = v;
+            }
             Instr::Ret { src } => {
                 let v = reg[base + *src as usize];
                 rec!(OpKind::Other, v.trace_i64(), 0, v.trace_i64(), 0);

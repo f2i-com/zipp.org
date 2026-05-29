@@ -204,6 +204,12 @@ pub enum Expr {
     /// An indirect call through a function value `f(args)` (where `f` has a
     /// `Type::Func`). Distinguished from `Call` (a direct, statically-named call).
     CallValue { callee: Box<Expr>, args: Vec<Expr> },
+    /// `arr.push(value)` — append to a growable array, returns the new length
+    /// (`i64`). Mutates `arr`. Growable arrays are interpreter-tier in v0.
+    Push { arr: Box<Expr>, value: Box<Expr> },
+    /// `arr.pop()` — remove and return the last element (a runtime error if the
+    /// array is empty). Result is the element type.
+    Pop { arr: Box<Expr> },
 }
 
 /// A statement plus the source line it starts on (for error messages).

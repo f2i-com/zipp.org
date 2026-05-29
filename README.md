@@ -119,6 +119,7 @@ cargo build --release
 ./target/release/zipp run examples/nullable_scalar.ts # i64 | null (interpreter tier)
 ./target/release/zipp run examples/lambda.ts         # first-class functions + arrow lambdas
 ./target/release/zipp run examples/closure.ts        # closures (arrows capture enclosing vars)
+./target/release/zipp run examples/arraymethods.ts   # growable arrays + map/filter/reduce/push/pop
 
 # run the language test suite
 cargo test
@@ -355,7 +356,9 @@ recursion (with **default parameters**), `let`/`const` (incl. array/object
 **destructuring**),
 `if`/`while`/`for`/`for…of`/`switch`, `break`/`continue`, the operator set +
 ternary `?:`, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing,
-`.length`), **tuples** (`[i64, str]` — positional indexing + destructuring),
+`.length`, **growable** with `push`/`pop`, and the higher-order methods
+`map`/`filter`/`reduce`), **tuples** (`[i64, str]` — positional indexing +
+destructuring),
 numeric **and string `enum`s**, **`interface`s and `class`es → structs**
 (interfaces construct with `let p: T = {…}` / `{…} as T`; classes give you
 fields, a constructor, methods, `this`, and `new C(…)` — a class lowers to a
@@ -384,16 +387,19 @@ a string enum + array/object destructuring; `defaults.ts` default parameters;
 `optional.ts` nullable references (`T | null`, `??`, narrowing); `chain.ts`
 optional chaining; `nullable_heap.ts` `str | null` + `T[] | null`;
 `nullable_scalar.ts` `i64 | null`; `lambda.ts` first-class functions + arrow
-lambdas; `closure.ts` closures (capture). Most run on all four backends;
+lambdas; `closure.ts` closures (capture); `arraymethods.ts` growable arrays +
+`map`/`filter`/`reduce`. Most run on all four backends;
 **nullable
 *heap* types — structs, `str`, arrays — run natively on `--jit` and `--llvm`**
 (a null is a 0/null pointer; `=== null` is a pointer compare). **Nullable
 *scalars* (`i64 | null`) run on the interpreter** — scalars have no spare null
 value, so the native tiers fall back (they'd need boxing). **First-class
-functions and closures also run on the interpreter** in v0 (`--jit`/`--llvm`/`--wasm`
-fall back) — a closure captures **by value** (snapshotting the variable at
-creation; reassigning it afterward doesn't change the closure). `--wasm` falls
-back for all nullable (its contract profile stays scalar-only).
+functions, closures, and growable arrays (`push`/`pop`/`map`/`filter`/`reduce`)
+also run on the interpreter** in v0 (`--jit`/`--llvm`/`--wasm` fall back) — a
+closure captures **by value** (snapshotting the variable at creation; reassigning
+it afterward doesn't change the closure), and `map`/`filter`/`reduce` lower to
+synthesized per-element-type loop helpers. `--wasm` falls back for all nullable
+(its contract profile stays scalar-only).
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,

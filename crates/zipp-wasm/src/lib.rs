@@ -82,6 +82,7 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
             Instr::FuncRef { .. } | Instr::MakeClosure { .. } | Instr::CallValue { .. } => {
                 "first-class functions"
             }
+            Instr::Push { .. } | Instr::Pop { .. } => "growable arrays (push/pop)",
             _ => continue,
         };
         return Some(bad);

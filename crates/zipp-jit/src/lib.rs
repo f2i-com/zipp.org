@@ -164,6 +164,10 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     if prog.uses_func_value {
         return Some("first-class functions");
     }
+    // Growable arrays (push/pop) are interpreter-only in v0.
+    if prog.uses_growable {
+        return Some("growable arrays (push/pop)");
+    }
     None
 }
 
@@ -828,6 +832,10 @@ fn compile_function(
             // gates them out before codegen, so this is never reached.
             Instr::FuncRef { .. } | Instr::MakeClosure { .. } | Instr::CallValue { .. } => {
                 return Err("internal: first-class functions reached the JIT".into())
+            }
+            // Growable arrays are interpreter-only; gated out before codegen.
+            Instr::Push { .. } | Instr::Pop { .. } => {
+                return Err("internal: growable arrays reached the JIT".into())
             }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;

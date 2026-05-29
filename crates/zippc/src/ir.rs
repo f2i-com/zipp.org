@@ -45,6 +45,9 @@ pub enum Instr {
     FuncRef { dst: u32, func: u32 },
     MakeClosure { dst: u32, func: u32, captures: Vec<u32> },
     CallValue { dst: u32, callee: u32, arg_base: u32, argc: u32 },
+    // Growable arrays (interpreter-only in v0): append / remove-last.
+    Push { dst: u32, arr: u32, value: u32 },
+    Pop { dst: u32, arr: u32 },
 }
 
 /// Field names of a struct, in declaration order (indexed by struct id). The VM
@@ -108,6 +111,9 @@ pub struct Program {
     /// The program uses first-class function values (`FuncRef`/`CallValue`), which
     /// only the interpreter handles in v0; native tiers fall back.
     pub uses_func_value: bool,
+    /// The program uses growable arrays (`push`/`pop`), which only the interpreter
+    /// handles in v0 (native arrays are fixed-layout); native tiers fall back.
+    pub uses_growable: bool,
 }
 
 fn is_opt_scalar(t: Type) -> bool {
@@ -201,6 +207,8 @@ pub fn lower(m: &Module) -> Result<Program, String> {
             Instr::FuncRef { .. } | Instr::MakeClosure { .. } | Instr::CallValue { .. }
         )
     });
+    let uses_growable =
+        code.iter().any(|i| matches!(i, Instr::Push { .. } | Instr::Pop { .. }));
     Ok(Program {
         code,
         funcs,
@@ -208,6 +216,7 @@ pub fn lower(m: &Module) -> Result<Program, String> {
         structs,
         uses_opt_scalar: module_uses_opt_scalar(m),
         uses_func_value,
+        uses_growable,
     })
 }
 
@@ -749,6 +758,20 @@ impl<'a> Gen<'a> {
                     .collect::<Result<Vec<_>, _>>()?;
                 let dst = self.alloc();
                 self.code.push(Instr::MakeClosure { dst, func, captures: cap_regs });
+                Ok(dst)
+            }
+            // Growable-array append/remove-last.
+            Expr::Push { arr, value } => {
+                let a = self.gen_expr(arr)?;
+                let v = self.gen_expr(value)?;
+                let dst = self.alloc();
+                self.code.push(Instr::Push { dst, arr: a, value: v });
+                Ok(dst)
+            }
+            Expr::Pop { arr } => {
+                let a = self.gen_expr(arr)?;
+                let dst = self.alloc();
+                self.code.push(Instr::Pop { dst, arr: a });
                 Ok(dst)
             }
             // An indirect call through a function value.
