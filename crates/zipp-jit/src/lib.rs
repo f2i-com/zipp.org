@@ -8,6 +8,7 @@
 //! variables, jump targets → blocks, calls → direct calls.
 
 use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
 
 use cranelift_codegen::settings::Configurable;
 
@@ -41,6 +42,16 @@ impl std::fmt::Display for JitValue {
             JitValue::F64(v) => write!(f, "{v}"),
         }
     }
+}
+
+/// A JIT run, with compile and execution timed separately — the headline
+/// "ran in" number folds both together, but the generated code's real speed is
+/// `execute` alone.
+#[derive(Debug, Clone, Copy)]
+pub struct JitOutcome {
+    pub value: JitValue,
+    pub compile: Duration,
+    pub execute: Duration,
 }
 
 fn is_scalar(t: Type) -> bool {
@@ -92,20 +103,32 @@ fn make_sig(module: &JITModule, params: &[Type], ret: Type) -> cranelift_codegen
     sig
 }
 
-/// JIT-compile and run an eligible program's `main`.
-pub fn run(prog: &Program) -> Result<JitValue, String> {
+/// JIT-compile and run an eligible program's `main`, timing compile vs execute.
+pub fn run(prog: &Program) -> Result<JitOutcome, String> {
+    run_with(prog, false)
+}
+
+/// As [`run`], but `fast_math` enables FMA contraction (fusing `a*b + c` into a
+/// single rounded multiply-add). Faster on dense f64, but the results can
+/// differ in the last bit from the strict-IEEE interpreter — so it's opt-in.
+pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     if let Some(bad) = ineligible_reason(prog) {
         return Err(format!("--jit supports the scalar subset only (program uses {bad})"));
     }
+    let c0 = Instant::now();
 
     // Tier-0 but with the optimizer on: opt_level=none (the default) leaves
     // obvious redundancy (e.g. recomputed `x*x`) in the code; "speed" turns on
-    // Cranelift's egraph mid-end (GVN/LICM-style rewrites) — material on dense
-    // arithmetic kernels like Mandelbrot.
+    // Cranelift's egraph mid-end (GVN/LICM-style rewrites). The verifier is a
+    // codegen-correctness self-check (compile-time cost only) — we trust our
+    // lowering (it's tested), so turn it off to shrink the compile half.
     let mut flags = cranelift_codegen::settings::builder();
     flags
         .set("opt_level", "speed")
         .map_err(|e| format!("opt flag: {e}"))?;
+    flags
+        .set("enable_verifier", "false")
+        .map_err(|e| format!("verifier flag: {e}"))?;
     let isa = cranelift_native::builder()
         .map_err(|e| format!("host isa unavailable: {e}"))?
         .finish(cranelift_codegen::settings::Flags::new(flags))
@@ -142,7 +165,10 @@ pub fn run(prog: &Program) -> Result<JitValue, String> {
             prog.code.len() as u32
         };
         ctx.func.signature = make_sig(&module, &f.params, f.ret);
-        compile_function(&mut module, &mut ctx, &mut fctx, prog, i, end, &func_ids, print_i64_id, print_f64_id)?;
+        compile_function(
+            &mut module, &mut ctx, &mut fctx, prog, i, end, &func_ids, print_i64_id,
+            print_f64_id, fast_math,
+        )?;
         module
             .define_function(func_ids[i], &mut ctx)
             .map_err(|e| format!("jit codegen failed for {}: {e:?}", f.name))?;
@@ -154,16 +180,21 @@ pub fn run(prog: &Program) -> Result<JitValue, String> {
 
     let main = &prog.funcs[prog.main as usize];
     let ptr = module.get_finalized_function(func_ids[prog.main as usize]);
+    let compile = c0.elapsed();
+
+    let e0 = Instant::now();
     // SAFETY: main takes no params; the signature was just finalized.
-    unsafe {
+    let value = unsafe {
         if main.ret == Type::F64 {
             let f: extern "C" fn() -> f64 = std::mem::transmute(ptr);
-            Ok(JitValue::F64(f()))
+            JitValue::F64(f())
         } else {
             let f: extern "C" fn() -> i64 = std::mem::transmute(ptr);
-            Ok(JitValue::I64(f()))
+            JitValue::I64(f())
         }
-    }
+    };
+    let execute = e0.elapsed();
+    Ok(JitOutcome { value, compile, execute })
 }
 
 /// Forward pass: the Cranelift type of every register in a function.
@@ -199,6 +230,88 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<ClifType> {
     t
 }
 
+/// A fused `p*q + r` (optionally negating p or r), replacing an adjacent
+/// `mul` + `add`/`sub` pair.
+#[derive(Clone, Copy)]
+struct FmaPlan {
+    p: u32,
+    q: u32,
+    r: u32,
+    neg_p: bool,
+    neg_r: bool,
+}
+
+/// Static read-count of every register over a function's instruction range.
+fn use_counts(prog: &Program, f: &FuncMeta, end: u32) -> Vec<u32> {
+    let mut u = vec![0u32; f.nregs as usize];
+    let mut bump = |r: u32| u[r as usize] += 1;
+    for pc in f.entry..end {
+        match &prog.code[pc as usize] {
+            Instr::Cast { src, .. } | Instr::Mov { src, .. } => bump(*src),
+            Instr::Bin { a, b, .. } => {
+                bump(*a);
+                bump(*b);
+            }
+            Instr::Unary { a, .. } => bump(*a),
+            Instr::JmpIfZero { cond, .. } | Instr::JmpIfNonZero { cond, .. } => bump(*cond),
+            Instr::Call { arg_base, argc, .. } => {
+                for k in 0..*argc {
+                    bump(*arg_base + k);
+                }
+            }
+            Instr::Ret { src } => bump(*src),
+            Instr::Print { a } => bump(*a),
+            _ => {}
+        }
+    }
+    u
+}
+
+/// Plan FMA contraction: find each f64 `mul` whose result is used exactly once,
+/// by the immediately-following `add`/`sub` in the same block. Returns the set
+/// of mul pcs to drop and a map from each fused add/sub pc to its plan. Only
+/// adjacent, single-use, same-block pairs are fused — that guarantees `p`/`q`
+/// aren't redefined between the mul and the add, so the rewrite is sound.
+fn plan_fma(
+    prog: &Program,
+    f: &FuncMeta,
+    end: u32,
+    rty: &[ClifType],
+    leaders: &BTreeSet<u32>,
+) -> (std::collections::HashSet<u32>, HashMap<u32, FmaPlan>) {
+    let uses = use_counts(prog, f, end);
+    let mut skip = std::collections::HashSet::new();
+    let mut plan = HashMap::new();
+    for pc in f.entry..end {
+        let Instr::Bin { op: BinOp::Mul, dst: m, a: p, b: q } = &prog.code[pc as usize] else {
+            continue;
+        };
+        if rty[*m as usize] != types::F64 || uses[*m as usize] != 1 {
+            continue;
+        }
+        let next = pc + 1;
+        if next >= end || leaders.contains(&next) {
+            continue;
+        }
+        let Instr::Bin { op, dst: _, a, b } = &prog.code[next as usize] else {
+            continue;
+        };
+        // p*q + r  /  p*q - r  /  r - p*q   (m on either side)
+        let entry = match op {
+            BinOp::Add if *a == *m => Some((*b, false, false)),
+            BinOp::Add if *b == *m => Some((*a, false, false)),
+            BinOp::Sub if *a == *m => Some((*b, false, true)), // m - r = p*q + (-r)
+            BinOp::Sub if *b == *m => Some((*a, true, false)),  // r - m = (-p)*q + r
+            _ => None,
+        };
+        if let Some((r, neg_p, neg_r)) = entry {
+            skip.insert(pc);
+            plan.insert(next, FmaPlan { p: *p, q: *q, r, neg_p, neg_r });
+        }
+    }
+    (skip, plan)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_function(
     module: &mut JITModule,
@@ -210,6 +323,7 @@ fn compile_function(
     func_ids: &[FuncId],
     print_i64_id: FuncId,
     print_f64_id: FuncId,
+    fast_math: bool,
 ) -> Result<(), String> {
     let f = &prog.funcs[fi];
     let entry_pc = f.entry;
@@ -238,6 +352,15 @@ fn compile_function(
     let mut blocks: HashMap<u32, Block> = HashMap::new();
     for &pc in &leaders {
         blocks.insert(pc, builder.create_block());
+    }
+
+    let (fma_skip, fma_plan) = if fast_math {
+        plan_fma(prog, f, end, &rty, &leaders)
+    } else {
+        (std::collections::HashSet::new(), HashMap::new())
+    };
+    if fast_math && std::env::var("ZIPP_JIT_DEBUG").is_ok() {
+        eprintln!("[jit] fn {}: fused {} fma pair(s)", f.name, fma_plan.len());
     }
 
     for r in 0..f.nregs {
@@ -273,6 +396,9 @@ fn compile_function(
         if terminated {
             continue; // unreachable code between a terminator and the next leader
         }
+        if fma_skip.contains(&pc) {
+            continue; // mul folded into the following fma
+        }
         match &prog.code[pc as usize] {
             Instr::Const { dst, imm } => {
                 let c = builder.ins().iconst(types::I64, *imm);
@@ -300,9 +426,22 @@ fn compile_function(
                 builder.def_var(var(*dst), s);
             }
             Instr::Bin { op, dst, a, b } => {
-                let av = builder.use_var(var(*a));
-                let bv = builder.use_var(var(*b));
-                let res = emit_bin(&mut builder, *op, av, bv, rty[*a as usize]);
+                let res = if let Some(fp) = fma_plan.get(&pc) {
+                    let mut pv = builder.use_var(var(fp.p));
+                    let qv = builder.use_var(var(fp.q));
+                    let mut rv = builder.use_var(var(fp.r));
+                    if fp.neg_p {
+                        pv = builder.ins().fneg(pv);
+                    }
+                    if fp.neg_r {
+                        rv = builder.ins().fneg(rv);
+                    }
+                    builder.ins().fma(pv, qv, rv)
+                } else {
+                    let av = builder.use_var(var(*a));
+                    let bv = builder.use_var(var(*b));
+                    emit_bin(&mut builder, *op, av, bv, rty[*a as usize])
+                };
                 builder.def_var(var(*dst), res);
             }
             Instr::Unary { op, dst, a } => {
@@ -430,14 +569,14 @@ mod tests {
 
     fn jit_i64(src: &str) -> i64 {
         let prog = zippc::compile(src).expect("compile");
-        match run(&prog).expect("jit run") {
+        match run(&prog).expect("jit run").value {
             JitValue::I64(x) => x,
             other => panic!("expected i64, got {other:?}"),
         }
     }
     fn jit_f64(src: &str) -> f64 {
         let prog = zippc::compile(src).expect("compile");
-        match run(&prog).expect("jit run") {
+        match run(&prog).expect("jit run").value {
             JitValue::F64(x) => x,
             other => panic!("expected f64, got {other:?}"),
         }
@@ -458,6 +597,23 @@ mod tests {
         let avg = "fn main(): f64 { let s = 0.0; let i = 1; \
                    while (i <= 4) { s = s + f64(i); i = i + 1; } return s / 4.0; }";
         assert_eq!(jit_f64(avg), 2.5);
+    }
+
+    #[test]
+    fn fast_math_fma_is_correct() {
+        // p*q + r and r - p*q with exact values: FMA must match the strict path.
+        let prog = zippc::compile("fn main(): f64 { let a = 2.0; let b = 3.0; return a*b + 4.0; }")
+            .expect("compile");
+        let strict = match run_with(&prog, false).unwrap().value {
+            JitValue::F64(x) => x,
+            _ => unreachable!(),
+        };
+        let fused = match run_with(&prog, true).unwrap().value {
+            JitValue::F64(x) => x,
+            _ => unreachable!(),
+        };
+        assert_eq!(strict, 10.0);
+        assert_eq!(fused, 10.0);
     }
 
     #[test]

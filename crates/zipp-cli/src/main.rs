@@ -27,17 +27,22 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("run") => {
             let mut prove = false;
             let mut jit = false;
+            let mut fast_math = false;
             let mut path: Option<String> = None;
             for a in it {
                 match a.as_str() {
                     "--prove" => prove = true,
                     "--jit" => jit = true,
+                    "--ffast-math" => fast_math = true,
                     s if s.starts_with("--") => return Err(format!("unknown flag '{s}'")),
                     s => path = Some(s.to_string()),
                 }
             }
-            let path = path.ok_or("usage: zipp run [--prove] [--jit] <file.zipp>")?;
-            run_file(&path, prove, jit)
+            let path = path.ok_or("usage: zipp run [--prove] [--jit [--ffast-math]] <file.zipp>")?;
+            if fast_math && !jit {
+                return Err("--ffast-math only applies with --jit".into());
+            }
+            run_file(&path, prove, jit, fast_math)
         }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
@@ -50,7 +55,7 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn run_file(path: &str, prove: bool, jit: bool) -> Result<(), String> {
+fn run_file(path: &str, prove: bool, jit: bool, fast_math: bool) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
     let program = zippc::compile(&src)?;
 
@@ -58,8 +63,11 @@ fn run_file(path: &str, prove: bool, jit: bool) -> Result<(), String> {
         return Err("--jit and --prove can't be combined (the prover needs the interpreter trace)".into());
     }
     if jit {
-        if let Some((r, dur)) = jit_run(&program)? {
-            println!("=> {r} (jit · native · ran in {dur:.2?})");
+        if let Some((r, compile, execute)) = jit_run(&program, fast_math)? {
+            let fm = if fast_math { " · ffast-math" } else { "" };
+            println!(
+                "=> {r} (jit · native{fm} · compiled in {compile:.2?}, ran in {execute:.2?})"
+            );
             return Ok(());
         }
         // ineligible — jit_run explained why; fall through to the interpreter.
@@ -94,21 +102,28 @@ fn hash_source(s: &str) -> u64 {
     h
 }
 
-// Returns the result *formatted* (not the JitValue) so the non-jit stub below
-// shares one signature without naming a zipp_jit type.
+// Returns (formatted result, compile time, execute time) so the non-jit stub
+// below shares one signature without naming a zipp_jit type. Compile and
+// execute are reported separately — the generated code's real speed is the
+// execute half; compile is one-shot AOT cost.
 #[cfg(feature = "jit")]
-fn jit_run(program: &zippc::Program) -> Result<Option<(String, std::time::Duration)>, String> {
+type JitTimed = (String, std::time::Duration, std::time::Duration);
+
+#[cfg(feature = "jit")]
+fn jit_run(program: &zippc::Program, fast_math: bool) -> Result<Option<JitTimed>, String> {
     if let Some(bad) = zipp_jit::ineligible_reason(program) {
         eprintln!("zipp: --jit covers the scalar subset only (program uses {bad}); using the interpreter");
         return Ok(None);
     }
-    let t = Instant::now();
-    let r = zipp_jit::run(program)?;
-    Ok(Some((r.to_string(), t.elapsed())))
+    let o = zipp_jit::run_with(program, fast_math)?;
+    Ok(Some((o.value.to_string(), o.compile, o.execute)))
 }
 
 #[cfg(not(feature = "jit"))]
-fn jit_run(_program: &zippc::Program) -> Result<Option<(String, std::time::Duration)>, String> {
+fn jit_run(
+    _program: &zippc::Program,
+    _fast_math: bool,
+) -> Result<Option<(String, std::time::Duration, std::time::Duration)>, String> {
     Err("this build has no jit profile — rebuild with the `jit` feature".into())
 }
 

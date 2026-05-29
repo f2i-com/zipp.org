@@ -1,0 +1,35 @@
+// Same Mandelbrot, but the two recurrences are written reassociated so the
+// JIT's adjacent-pair FMA contraction (--ffast-math) builds a *nested* FMA on
+// each — shortening the latency-bound critical path (x*x - y*y + cx is what
+// binds the loop). Diagnostic for "why didn't FMA help the plain version":
+//   plain:    xt = x*x - y*y + cx   -> only y*y fuses; x-chain stays ~12 cyc
+//   this:     xt = (cx - y*y) + x*x -> fma(x,x, fma(-y,y,cx)); x-chain ~8 cyc
+// Reassociation changes float rounding, so this is an --ffast-math-only kernel.
+fn main(): i64 {
+    let width = 1000;
+    let height = 1000;
+    let max_iter = 256;
+    let total = 0;
+    let py = 0;
+    while (py < height) {
+        let px = 0;
+        while (px < width) {
+            let cx = f64(px) / f64(width) * 3.5 - 2.5;
+            let cy = f64(py) / f64(height) * 2.0 - 1.0;
+            let x = 0.0;
+            let y = 0.0;
+            let iter = 0;
+            while (x * x + y * y <= 4.0 && iter < max_iter) {
+                let xt = (cx - y * y) + x * x;
+                y = 2.0 * x * y + cy;
+                x = xt;
+                iter = iter + 1;
+            }
+            total = total + iter;
+            px = px + 1;
+        }
+        py = py + 1;
+    }
+    print(total);
+    return total;
+}

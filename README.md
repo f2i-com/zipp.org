@@ -82,6 +82,9 @@ cargo test
 ./target/release/zipp run --jit examples/pi.zipp    # f64 + casts
 ./target/release/zipp run --jit bench/loop.zipp
 
+# opt-in FMA contraction (faster dense f64; changes float rounding, so not default)
+./target/release/zipp run --jit --ffast-math bench/mandelbrot_fma.zipp
+
 # run + zk-STARK prove + verify the execution
 ./target/release/zipp run --prove examples/add.zipp
 ./target/release/zipp run --prove examples/sum.zipp
@@ -133,13 +136,15 @@ the same path `zk-formlogic` took to its 78-column trace.
 
 ## Performance (honest, measured)
 
-Two kernels, vs Node 24 (V8). ZIPP `--jit` times include compilation; all
-engines compute the identical result on each kernel (so the comparison is
-apples-to-apples). Both kernels are in `bench/` with byte-identical `.js` twins.
+Two kernels, vs Node 24 (V8). All engines compute the identical result on each
+kernel (the comparison is apples-to-apples); kernels are in `bench/` with
+`.js` twins. The JIT reports **compile and execute separately** — the headline
+"as fast as" question is about the *generated code* (execute), and JIT compile
+is a one-shot ~1 ms either way.
 
 **Integer** — 50M-iteration sum loop (`bench/loop.zipp`):
 
-| engine | time | vs V8 |
+| engine | execute | vs V8 |
 |---|---|---|
 | ZIPP interpreter | ~566 ms | ~19× slower |
 | Node 24 (V8 JIT) | ~30 ms | 1× |
@@ -147,34 +152,56 @@ apples-to-apples). Both kernels are in `bench/` with byte-identical `.js` twins.
 
 **Dense f64** — 1000×1000 Mandelbrot, 256-iter cap (`bench/mandelbrot.zipp`):
 
-| engine | time | vs V8 |
+| engine | execute | vs V8 |
 |---|---|---|
 | Node 24 (V8 JIT) | ~100 ms | 1× |
-| **ZIPP `--jit` (Cranelift, native)** | **~127 ms** | **~1.27× slower** |
+| ZIPP `--jit` (Cranelift, strict IEEE) | ~127 ms | ~1.27× slower |
+| **ZIPP `--jit --ffast-math`, reassociated** (`bench/mandelbrot_fma.zipp`) | **~109 ms** | **~1.07× slower** |
 
-The story these two tell is the honest one. The **native JIT** (`--jit`,
-PLAN.md tier-0) compiles the scalar subset (`i64` + `f64`, casts, arithmetic,
-control flow, functions, `print`) to machine code; arrays / strings / structs
-still fall back to the interpreter.
+The **native JIT** (`--jit`, PLAN.md tier-0) compiles the scalar subset (`i64` +
+`f64`, casts, arithmetic, control flow, functions, `print`) to machine code;
+arrays / strings / structs still fall back to the interpreter.
 
 - On the **integer** loop there's nothing for an optimizing compiler to do, so
   ZIPP's AOT-no-deopt-guards code **beats V8 ~3×** — the §6 sweet spot.
-- On **dense f64**, V8's optimizing tier (TurboFan — better register
-  allocation, and almost certainly FMA contraction of the `a*b + c` terms)
-  pulls **~30% ahead**. Cranelift is a *baseline* compiler (even at
-  `opt_level="speed"`, which is enabled here); it does no FMA contraction
-  (float semantics) and lighter scheduling. So ZIPP is "on par" — same
-  ballpark, within ~1.3× — but not yet ahead on this class.
+- On **dense f64**, V8's optimizing tier (TurboFan) is ~27% ahead of strict
+  Cranelift. We chased that gap empirically (see below): it's a *latency-bound
+  recurrence* + FMA story, and reassociated `--ffast-math` closes it to ~7%.
 
-Closing the dense-f64 gap is the planned **LLVM release tier** (Phases 8–9:
-`-O3` + LTO/PGO/SIMD), which is the engine meant to win this race. Per-kernel
-f64 also already crushes the interpreter — the Leibniz-π loop (`examples/pi.zipp`)
-is ~1.7 ms native vs ~29 ms interpreted (~17×). Next on the JIT itself: heap
-types via a runtime (unlocks the array benchmarks — n-body, spectral-norm).
+### Why dense f64 trails — and what closes it
 
-One kernel isn't the whole story (PLAN.md §6/§11 — different workloads favour
-different engines, and V8's hand-tuned stdlib is a separate battle), but it's
-real evidence the thesis holds where the design predicts it should.
+The Mandelbrot inner loop is a dependency chain: each iteration's `x,y` depend
+on the last, so wall-clock is set by the **critical path**, not throughput.
+
+1. **Compile time is negligible** (~1 ms) — the gap is the generated code.
+2. **FMA contraction alone doesn't help.** `--ffast-math` fuses `a*b ± c` into
+   one rounded multiply-add (CPU `vfmadd`). It fires (3 pairs in Mandelbrot)
+   but naive left-to-right fusion only shortens the `y` update; the *binding*
+   path is the `x` update `x*x - y*y + cx`, which is unchanged → no speedup.
+3. **Reassociation is the lever.** Writing the `x` update as `(cx - y*y) + x*x`
+   lets the fuser build a *nested* FMA `fma(x, x, fma(-y, y, cx))`, shortening
+   that path. Result: ~109 ms — within ~7% of V8. This is exactly the transform
+   LLVM does automatically at `-O3 -ffast-math`; Cranelift (a fast-compile
+   *baseline* JIT) does not auto-reassociate, so today it's opt-in via source.
+
+So the knobs *inside* Cranelift are now set — `opt_level="speed"`, host-ISA
+features (AVX/FMA via `cranelift-native`), verifier off, and opt-in FMA
+(`--ffast-math`). To reliably **match or beat** V8 on dense f64 without
+hand-reassociated source, the plan is the **LLVM release tier** (Phases 8–9:
+`-O3`, auto FMA + reassociation + auto-vectorization + scheduling). Cranelift
+stays as the fast-startup tier — where ZIPP already wins. Per-kernel f64 also
+already crushes the interpreter: the Leibniz-π loop (`examples/pi.zipp`) is
+~0.8 ms native (execute) vs ~29 ms interpreted (~36×).
+
+Next on the JIT itself: heap types via a runtime (unlocks array benchmarks —
+n-body, spectral-norm). One kernel isn't the whole story (PLAN.md §6/§11 —
+different workloads favour different engines, and V8's hand-tuned stdlib is a
+separate battle), but this is real, reproducible evidence of where the design
+stands.
+
+`--ffast-math` is **opt-in** and `--jit`-only: FMA/reassociation change float
+rounding (last-bit), so the strict default keeps the JIT bit-identical to the
+interpreter — which matters for the deterministic contract/provable profiles.
 
 ## License
 
