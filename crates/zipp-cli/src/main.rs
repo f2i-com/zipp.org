@@ -94,19 +94,21 @@ fn hash_source(s: &str) -> u64 {
     h
 }
 
+// Returns the result *formatted* (not the JitValue) so the non-jit stub below
+// shares one signature without naming a zipp_jit type.
 #[cfg(feature = "jit")]
-fn jit_run(program: &zippc::Program) -> Result<Option<(i64, std::time::Duration)>, String> {
+fn jit_run(program: &zippc::Program) -> Result<Option<(String, std::time::Duration)>, String> {
     if let Some(bad) = zipp_jit::ineligible_reason(program) {
-        eprintln!("zipp: --jit covers the integer subset only (program uses {bad}); using the interpreter");
+        eprintln!("zipp: --jit covers the scalar subset only (program uses {bad}); using the interpreter");
         return Ok(None);
     }
     let t = Instant::now();
     let r = zipp_jit::run(program)?;
-    Ok(Some((r, t.elapsed())))
+    Ok(Some((r.to_string(), t.elapsed())))
 }
 
 #[cfg(not(feature = "jit"))]
-fn jit_run(_program: &zippc::Program) -> Result<Option<(i64, std::time::Duration)>, String> {
+fn jit_run(_program: &zippc::Program) -> Result<Option<(String, std::time::Duration)>, String> {
     Err("this build has no jit profile — rebuild with the `jit` feature".into())
 }
 

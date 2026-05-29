@@ -1,35 +1,67 @@
-//! ZIPP native backend — a Cranelift JIT for the **integer subset** (PLAN.md
-//! tier-0). Programs that only use `i64` (arithmetic, comparison, bitwise,
-//! control flow, function calls, `print`) compile to native machine code;
-//! anything using f64/arrays/strings/structs/builtins is reported ineligible so
-//! the caller can fall back to the interpreter.
+//! ZIPP native backend — a Cranelift JIT for the **scalar subset** (`i64` and
+//! `f64`, incl. casts). Programs using arrays/strings/structs/builtins fall
+//! back to the interpreter.
 //!
-//! Each ZIPP function becomes a Cranelift function: registers map to SSA
-//! variables, jump targets to basic blocks, and calls to direct calls.
+//! Registers are statically typed (the IR allocates them monotonically, so each
+//! has one type); a forward pass infers each register's Cranelift type, then
+//! every ZIPP function is lowered to a Cranelift function — registers → SSA
+//! variables, jump targets → blocks, calls → direct calls.
 
 use std::collections::{BTreeSet, HashMap};
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, Value};
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::{types, AbiParam, Block, InstBuilder, Type as ClifType, Value};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 
-use zippc::ast::{BinOp, UnOp};
-use zippc::ir::{Instr, Program};
+use zippc::ast::{BinOp, Type, UnOp};
+use zippc::ir::{FuncMeta, Instr, Program};
 
-/// Runtime hook for `print` from JIT'd code.
-extern "C" fn zipp_print(x: i64) {
+extern "C" fn zipp_print_i64(x: i64) {
+    println!("{x}");
+}
+extern "C" fn zipp_print_f64(x: f64) {
     println!("{x}");
 }
 
-/// Reason a program can't be JIT-compiled (integer subset only), or `None`.
+/// Result of a JIT'd `main`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JitValue {
+    I64(i64),
+    F64(f64),
+}
+
+impl std::fmt::Display for JitValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JitValue::I64(x) => write!(f, "{x}"),
+            JitValue::F64(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+fn is_scalar(t: Type) -> bool {
+    matches!(t, Type::I64 | Type::F64 | Type::Bool)
+}
+
+/// Cranelift type for a ZIPP type (bool is an i64 0/1).
+fn clif_ty(t: Type) -> ClifType {
+    match t {
+        Type::F64 => types::F64,
+        _ => types::I64,
+    }
+}
+
+fn var(r: u32) -> Variable {
+    Variable::from_u32(r)
+}
+
+/// Reason a program can't be JIT-compiled (scalar subset only), or `None`.
 pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     for ins in &prog.code {
         let bad = match ins {
-            Instr::FConst { .. } => "f64",
             Instr::SConst { .. } => "strings",
-            Instr::Cast { .. } => "casts",
             Instr::ArrayLit { .. }
             | Instr::ArrayRepeat { .. }
             | Instr::Index { .. }
@@ -41,53 +73,53 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
         };
         return Some(bad);
     }
+    for f in &prog.funcs {
+        if !is_scalar(f.ret) || f.params.iter().any(|t| !is_scalar(*t)) {
+            return Some("non-scalar function signatures");
+        }
+    }
     None
 }
 
-fn var(r: u32) -> Variable {
-    Variable::from_u32(r)
+fn make_sig(module: &JITModule, params: &[Type], ret: Type) -> cranelift_codegen::ir::Signature {
+    let mut sig = module.make_signature();
+    for p in params {
+        sig.params.push(AbiParam::new(clif_ty(*p)));
+    }
+    sig.returns.push(AbiParam::new(clif_ty(ret)));
+    sig
 }
 
-/// JIT-compile and run an eligible program's `main`, returning its i64 result.
-pub fn run(prog: &Program) -> Result<i64, String> {
+/// JIT-compile and run an eligible program's `main`.
+pub fn run(prog: &Program) -> Result<JitValue, String> {
     if let Some(bad) = ineligible_reason(prog) {
-        return Err(format!("--jit supports the integer subset only (program uses {bad})"));
+        return Err(format!("--jit supports the scalar subset only (program uses {bad})"));
     }
 
-    let jit = JITBuilder::new(cranelift_module::default_libcall_names())
+    let mut jit = JITBuilder::new(cranelift_module::default_libcall_names())
         .map_err(|e| format!("jit init failed: {e}"))?;
-    let mut jit = jit;
-    jit.symbol("zipp_print", zipp_print as *const u8);
+    jit.symbol("zipp_print_i64", zipp_print_i64 as *const u8);
+    jit.symbol("zipp_print_f64", zipp_print_f64 as *const u8);
     let mut module = JITModule::new(jit);
 
-    let make_sig = |module: &JITModule, nparams: u32| {
-        let mut sig = module.make_signature();
-        for _ in 0..nparams {
-            sig.params.push(AbiParam::new(types::I64));
-        }
-        sig.returns.push(AbiParam::new(types::I64));
-        sig
-    };
-
-    // Declare every ZIPP function first so calls can reference them.
     let mut func_ids = Vec::with_capacity(prog.funcs.len());
     for (i, f) in prog.funcs.iter().enumerate() {
-        let sig = make_sig(&module, f.nparams);
+        let sig = make_sig(&module, &f.params, f.ret);
         let id = module
             .declare_function(&format!("zfn{i}"), Linkage::Local, &sig)
             .map_err(|e| format!("declare {}: {e}", f.name))?;
         func_ids.push(id);
     }
-    // The `print` runtime import: (i64) -> ().
-    let print_id = {
+    let import = |module: &mut JITModule, name: &str, ty: ClifType| {
         let mut sig = module.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ty));
         module
-            .declare_function("zipp_print", Linkage::Import, &sig)
-            .map_err(|e| format!("declare print: {e}"))?
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| format!("declare {name}: {e}"))
     };
+    let print_i64_id = import(&mut module, "zipp_print_i64", types::I64)?;
+    let print_f64_id = import(&mut module, "zipp_print_f64", types::F64)?;
 
-    // Define each function.
     let mut ctx = module.make_context();
     let mut fctx = FunctionBuilderContext::new();
     for (i, f) in prog.funcs.iter().enumerate() {
@@ -96,8 +128,8 @@ pub fn run(prog: &Program) -> Result<i64, String> {
         } else {
             prog.code.len() as u32
         };
-        ctx.func.signature = make_sig(&module, f.nparams);
-        compile_function(&mut module, &mut ctx, &mut fctx, prog, i, end, &func_ids, print_id)?;
+        ctx.func.signature = make_sig(&module, &f.params, f.ret);
+        compile_function(&mut module, &mut ctx, &mut fctx, prog, i, end, &func_ids, print_i64_id, print_f64_id)?;
         module
             .define_function(func_ids[i], &mut ctx)
             .map_err(|e| format!("jit codegen failed for {}: {e:?}", f.name))?;
@@ -107,11 +139,51 @@ pub fn run(prog: &Program) -> Result<i64, String> {
         .finalize_definitions()
         .map_err(|e| format!("finalize failed: {e}"))?;
 
-    let main_ptr = module.get_finalized_function(func_ids[prog.main as usize]);
-    // SAFETY: main has signature () -> i64 (the checker guarantees main takes no
-    // params), and the code was just finalized by this module.
-    let main_fn: extern "C" fn() -> i64 = unsafe { std::mem::transmute(main_ptr) };
-    Ok(main_fn())
+    let main = &prog.funcs[prog.main as usize];
+    let ptr = module.get_finalized_function(func_ids[prog.main as usize]);
+    // SAFETY: main takes no params; the signature was just finalized.
+    unsafe {
+        if main.ret == Type::F64 {
+            let f: extern "C" fn() -> f64 = std::mem::transmute(ptr);
+            Ok(JitValue::F64(f()))
+        } else {
+            let f: extern "C" fn() -> i64 = std::mem::transmute(ptr);
+            Ok(JitValue::I64(f()))
+        }
+    }
+}
+
+/// Forward pass: the Cranelift type of every register in a function.
+fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<ClifType> {
+    let mut t = vec![types::I64; f.nregs as usize];
+    for (i, pt) in f.params.iter().enumerate() {
+        t[i] = clif_ty(*pt);
+    }
+    for pc in f.entry..end {
+        match &prog.code[pc as usize] {
+            Instr::Const { dst, .. } => t[*dst as usize] = types::I64,
+            Instr::FConst { dst, .. } => t[*dst as usize] = types::F64,
+            Instr::Cast { dst, to, .. } => t[*dst as usize] = clif_ty(*to),
+            Instr::Mov { dst, src } => t[*dst as usize] = t[*src as usize],
+            Instr::Bin { op, dst, a, .. } => {
+                t[*dst as usize] = match op {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => t[*a as usize],
+                    _ => types::I64, // comparisons (bool), mod/bitwise/shift
+                };
+            }
+            Instr::Unary { op, dst, a } => {
+                t[*dst as usize] = match op {
+                    UnOp::Neg => t[*a as usize],
+                    _ => types::I64,
+                };
+            }
+            Instr::Call { func, dst, .. } => {
+                t[*dst as usize] = clif_ty(prog.funcs[*func as usize].ret);
+            }
+            _ => {}
+        }
+    }
+    t
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -122,15 +194,15 @@ fn compile_function(
     prog: &Program,
     fi: usize,
     end: u32,
-    func_ids: &[cranelift_module::FuncId],
-    print_id: cranelift_module::FuncId,
+    func_ids: &[FuncId],
+    print_i64_id: FuncId,
+    print_f64_id: FuncId,
 ) -> Result<(), String> {
     let f = &prog.funcs[fi];
     let entry_pc = f.entry;
+    let rty = infer_reg_types(prog, f, end);
     let mut builder = FunctionBuilder::new(&mut ctx.func, fctx);
 
-    // Basic-block leaders: the entry, every branch target, and the instruction
-    // after every branch.
     let mut leaders: BTreeSet<u32> = BTreeSet::new();
     leaders.insert(entry_pc);
     for pc in entry_pc..end {
@@ -156,7 +228,7 @@ fn compile_function(
     }
 
     for r in 0..f.nregs {
-        builder.declare_var(var(r), types::I64);
+        builder.declare_var(var(r), rty[r as usize]);
     }
 
     let entry_blk = blocks[&entry_pc];
@@ -166,9 +238,13 @@ fn compile_function(
     for (idx, pv) in params.iter().enumerate() {
         builder.def_var(var(idx as u32), *pv);
     }
-    let zero = builder.ins().iconst(types::I64, 0);
     for r in f.nparams..f.nregs {
-        builder.def_var(var(r), zero);
+        let z = if rty[r as usize] == types::F64 {
+            builder.ins().f64const(0.0)
+        } else {
+            builder.ins().iconst(types::I64, 0)
+        };
+        builder.def_var(var(r), z);
     }
 
     let mut terminated = false;
@@ -182,14 +258,29 @@ fn compile_function(
             terminated = false;
         }
         if terminated {
-            // Unreachable code between a terminator and the next block leader
-            // (e.g. the IR's fallthrough `return` after an explicit return).
-            continue;
+            continue; // unreachable code between a terminator and the next leader
         }
         match &prog.code[pc as usize] {
             Instr::Const { dst, imm } => {
                 let c = builder.ins().iconst(types::I64, *imm);
                 builder.def_var(var(*dst), c);
+            }
+            Instr::FConst { dst, imm } => {
+                let c = builder.ins().f64const(*imm);
+                builder.def_var(var(*dst), c);
+            }
+            Instr::Cast { dst, src, to } => {
+                let sval = builder.use_var(var(*src));
+                let src_ty = rty[*src as usize];
+                let to_ty = clif_ty(*to);
+                let res = if src_ty == types::I64 && to_ty == types::F64 {
+                    builder.ins().fcvt_from_sint(types::F64, sval)
+                } else if src_ty == types::F64 && to_ty == types::I64 {
+                    builder.ins().fcvt_to_sint_sat(types::I64, sval)
+                } else {
+                    sval
+                };
+                builder.def_var(var(*dst), res);
             }
             Instr::Mov { dst, src } => {
                 let s = builder.use_var(var(*src));
@@ -198,12 +289,13 @@ fn compile_function(
             Instr::Bin { op, dst, a, b } => {
                 let av = builder.use_var(var(*a));
                 let bv = builder.use_var(var(*b));
-                let res = emit_bin(&mut builder, *op, av, bv);
+                let res = emit_bin(&mut builder, *op, av, bv, rty[*a as usize]);
                 builder.def_var(var(*dst), res);
             }
             Instr::Unary { op, dst, a } => {
                 let av = builder.use_var(var(*a));
                 let res = match op {
+                    UnOp::Neg if rty[*a as usize] == types::F64 => builder.ins().fneg(av),
                     UnOp::Neg => builder.ins().ineg(av),
                     UnOp::BitNot => builder.ins().bnot(av),
                     UnOp::Not => {
@@ -219,7 +311,6 @@ fn compile_function(
             }
             Instr::JmpIfZero { cond, target } => {
                 let c = builder.use_var(var(*cond));
-                // brif goes to the first block when cond != 0.
                 builder.ins().brif(c, blocks[&(pc + 1)], &[], blocks[target], &[]);
                 terminated = true;
             }
@@ -242,7 +333,12 @@ fn compile_function(
                 terminated = true;
             }
             Instr::Print { a } => {
-                let p = module.declare_func_in_func(print_id, builder.func);
+                let id = if rty[*a as usize] == types::F64 {
+                    print_f64_id
+                } else {
+                    print_i64_id
+                };
+                let p = module.declare_func_in_func(id, builder.func);
                 let av = builder.use_var(var(*a));
                 builder.ins().call(p, &[av]);
             }
@@ -255,83 +351,107 @@ fn compile_function(
     Ok(())
 }
 
+fn emit_bin(bld: &mut FunctionBuilder, op: BinOp, x: Value, y: Value, ty: ClifType) -> Value {
+    use BinOp::*;
+    if ty == types::F64 {
+        let fc = |bld: &mut FunctionBuilder, cc: FloatCC| {
+            let c = bld.ins().fcmp(cc, x, y);
+            bld.ins().uextend(types::I64, c)
+        };
+        match op {
+            Add => bld.ins().fadd(x, y),
+            Sub => bld.ins().fsub(x, y),
+            Mul => bld.ins().fmul(x, y),
+            Div => bld.ins().fdiv(x, y),
+            Eq => fc(bld, FloatCC::Equal),
+            Ne => fc(bld, FloatCC::NotEqual),
+            Lt => fc(bld, FloatCC::LessThan),
+            Le => fc(bld, FloatCC::LessThanOrEqual),
+            Gt => fc(bld, FloatCC::GreaterThan),
+            Ge => fc(bld, FloatCC::GreaterThanOrEqual),
+            _ => bld.ins().iconst(types::I64, 0), // mod/bitwise/shift/&&/|| invalid on f64
+        }
+    } else {
+        let ic = |bld: &mut FunctionBuilder, cc: IntCC| {
+            let c = bld.ins().icmp(cc, x, y);
+            bld.ins().uextend(types::I64, c)
+        };
+        match op {
+            Add => bld.ins().iadd(x, y),
+            Sub => bld.ins().isub(x, y),
+            Mul => bld.ins().imul(x, y),
+            Div => bld.ins().sdiv(x, y),
+            Mod => bld.ins().srem(x, y),
+            BitAnd => bld.ins().band(x, y),
+            BitOr => bld.ins().bor(x, y),
+            BitXor => bld.ins().bxor(x, y),
+            Shl => bld.ins().ishl(x, y),
+            Shr => bld.ins().sshr(x, y),
+            Eq => ic(bld, IntCC::Equal),
+            Ne => ic(bld, IntCC::NotEqual),
+            Lt => ic(bld, IntCC::SignedLessThan),
+            Le => ic(bld, IntCC::SignedLessThanOrEqual),
+            Gt => ic(bld, IntCC::SignedGreaterThan),
+            Ge => ic(bld, IntCC::SignedGreaterThanOrEqual),
+            And => {
+                let xn = bld.ins().icmp_imm(IntCC::NotEqual, x, 0);
+                let yn = bld.ins().icmp_imm(IntCC::NotEqual, y, 0);
+                let xe = bld.ins().uextend(types::I64, xn);
+                let ye = bld.ins().uextend(types::I64, yn);
+                bld.ins().band(xe, ye)
+            }
+            Or => {
+                let xn = bld.ins().icmp_imm(IntCC::NotEqual, x, 0);
+                let yn = bld.ins().icmp_imm(IntCC::NotEqual, y, 0);
+                let xe = bld.ins().uextend(types::I64, xn);
+                let ye = bld.ins().uextend(types::I64, yn);
+                bld.ins().bor(xe, ye)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn jit(src: &str) -> i64 {
+    fn jit_i64(src: &str) -> i64 {
         let prog = zippc::compile(src).expect("compile");
-        run(&prog).expect("jit run")
+        match run(&prog).expect("jit run") {
+            JitValue::I64(x) => x,
+            other => panic!("expected i64, got {other:?}"),
+        }
+    }
+    fn jit_f64(src: &str) -> f64 {
+        let prog = zippc::compile(src).expect("compile");
+        match run(&prog).expect("jit run") {
+            JitValue::F64(x) => x,
+            other => panic!("expected f64, got {other:?}"),
+        }
     }
 
     #[test]
-    fn arithmetic_and_precedence() {
-        assert_eq!(jit("fn main(): i64 { return 7 * 6 + 3; }"), 45);
-        assert_eq!(jit("fn main(): i64 { return (12 & 10) | (1 << 4); }"), 24);
-    }
-
-    #[test]
-    fn recursion_matches_interpreter() {
-        let src = "fn fib(n: i64): i64 { if (n < 2) { return n; } return fib(n-1) + fib(n-2); } \
+    fn integer_programs() {
+        assert_eq!(jit_i64("fn main(): i64 { return 7 * 6 + 3; }"), 45);
+        let fib = "fn fib(n: i64): i64 { if (n < 2) { return n; } return fib(n-1)+fib(n-2); } \
                    fn main(): i64 { return fib(20); }";
-        assert_eq!(jit(src), 6765);
+        assert_eq!(jit_i64(fib), 6765);
     }
 
     #[test]
-    fn loops_and_branches() {
-        assert_eq!(
-            jit("fn main(): i64 { let s = 0; let i = 0; while (i < 1000) { if (i % 2 == 0) { s += i; } i += 1; } return s; }"),
-            249500
-        );
+    fn float_programs() {
+        assert_eq!(jit_f64("fn main(): f64 { return 1.5 + 2.5 * 2.0; }"), 6.5);
+        // i64 <-> f64 casts + a float loop
+        let avg = "fn main(): f64 { let s = 0.0; let i = 1; \
+                   while (i <= 4) { s = s + f64(i); i = i + 1; } return s / 4.0; }";
+        assert_eq!(jit_f64(avg), 2.5);
     }
 
     #[test]
-    fn rejects_non_integer_programs() {
-        let f = zippc::compile("fn main(): f64 { return 1.5; }").unwrap();
-        assert!(run(&f).is_err());
+    fn rejects_heap_programs() {
         let a = zippc::compile("fn main(): i64 { let x = [1, 2]; return x[0]; }").unwrap();
         assert!(run(&a).is_err());
-    }
-}
-
-fn emit_bin(b: &mut FunctionBuilder, op: BinOp, x: Value, y: Value) -> Value {
-    use BinOp::*;
-    let cmp = |b: &mut FunctionBuilder, cc: IntCC| {
-        let c = b.ins().icmp(cc, x, y);
-        b.ins().uextend(types::I64, c)
-    };
-    match op {
-        Add => b.ins().iadd(x, y),
-        Sub => b.ins().isub(x, y),
-        Mul => b.ins().imul(x, y),
-        Div => b.ins().sdiv(x, y),
-        Mod => b.ins().srem(x, y),
-        BitAnd => b.ins().band(x, y),
-        BitOr => b.ins().bor(x, y),
-        BitXor => b.ins().bxor(x, y),
-        Shl => b.ins().ishl(x, y),
-        Shr => b.ins().sshr(x, y),
-        Eq => cmp(b, IntCC::Equal),
-        Ne => cmp(b, IntCC::NotEqual),
-        Lt => cmp(b, IntCC::SignedLessThan),
-        Le => cmp(b, IntCC::SignedLessThanOrEqual),
-        Gt => cmp(b, IntCC::SignedGreaterThan),
-        Ge => cmp(b, IntCC::SignedGreaterThanOrEqual),
-        // && / || are lowered to branches by the IR, so these are unused; handle
-        // anyway as eager 0/1 logic.
-        And => {
-            let xn = b.ins().icmp_imm(IntCC::NotEqual, x, 0);
-            let yn = b.ins().icmp_imm(IntCC::NotEqual, y, 0);
-            let xe = b.ins().uextend(types::I64, xn);
-            let ye = b.ins().uextend(types::I64, yn);
-            b.ins().band(xe, ye)
-        }
-        Or => {
-            let xn = b.ins().icmp_imm(IntCC::NotEqual, x, 0);
-            let yn = b.ins().icmp_imm(IntCC::NotEqual, y, 0);
-            let xe = b.ins().uextend(types::I64, xn);
-            let ye = b.ins().uextend(types::I64, yn);
-            b.ins().bor(xe, ye)
-        }
+        let s = zippc::compile("fn main(): i64 { let x = \"hi\"; return len(x); }").unwrap();
+        assert!(run(&s).is_err());
     }
 }

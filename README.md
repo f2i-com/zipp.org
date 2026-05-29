@@ -40,8 +40,9 @@ with `--no-default-features` and the language still runs.
 - A **VM** that runs it (`zipp run`)
 - The **optional zk-STARK profile** (`zipp run --prove`): Winterfell proof +
   verification over the VM execution trace
-- A **native JIT** (`zipp run --jit`, Cranelift): compiles the integer subset to
-  machine code — on a tight loop it beats V8 (see Performance below)
+- A **native JIT** (`zipp run --jit`, Cranelift): compiles the scalar subset
+  (`i64` + `f64`, incl. casts) to machine code — on a tight loop it beats V8
+  (see Performance below)
 - An integration **test suite** (`cargo test`)
 - **Positioned errors** — parse errors report `line:col`, type errors report the
   statement line (e.g. `type error: arithmetic Add on I64 and Bool [line 2]`)
@@ -51,8 +52,9 @@ with `--no-default-features` and the language still runs.
 - Runtime-error positions (bytecode → source mapping; compile errors are done)
 - Frontend: swap the hand-written parser for **oxc/SWC** (real TS/JSX)
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
-- Backends: **Cranelift** tier-0 JIT — *integer subset done*; extend to the full
-  language (f64/heap via a runtime), then **LLVM** release (+LTO/PGO/SIMD) and **WASM-contract**
+- Backends: **Cranelift** tier-0 JIT — *scalar subset (`i64` + `f64`, casts) done*;
+  extend to heap types (arrays/strings/structs via a runtime), then **LLVM**
+  release (+LTO/PGO/SIMD) and **WASM-contract**
 - Parallel work-stealing scheduler (the §5.8 flagship), GC/arenas, fast stdlib
 - zk hardening: PC-integrity + memory-permutation arguments, 64-bit range checks
 
@@ -75,8 +77,9 @@ cargo build --release
 # run the language test suite
 cargo test
 
-# run natively via the Cranelift JIT (integer programs; falls back otherwise)
-./target/release/zipp run --jit examples/fib.zipp
+# run natively via the Cranelift JIT (scalar i64/f64 programs; falls back otherwise)
+./target/release/zipp run --jit examples/fib.zipp   # i64
+./target/release/zipp run --jit examples/pi.zipp    # f64 + casts
 ./target/release/zipp run --jit bench/loop.zipp
 
 # run + zk-STARK prove + verify the execution
@@ -139,12 +142,14 @@ the same path `zk-formlogic` took to its 78-column trace.
 | **ZIPP `--jit` (Cranelift, native)** | **~10 ms** | **~3× faster** |
 
 The bytecode interpreter is ~20× slower than V8 (expected — it interprets; V8
-JITs). The new **native JIT** (`--jit`, PLAN.md tier-0) compiles the integer
+JITs). The new **native JIT** (`--jit`, PLAN.md tier-0) compiles the scalar
 subset to machine code and on this kernel **beats V8** — the §6 sweet spot
-(native integers, no deopt guards, AOT). It currently covers `i64` programs
-(arithmetic, control flow, functions, `print`); f64 / arrays / strings / structs
-fall back to the interpreter. Next: extend codegen to the full language, then an
-LLVM release tier (+LTO/PGO), per Phases 7–9.
+(native scalars, no deopt guards, AOT). It now covers the scalar subset (`i64`
+and `f64`, casts, arithmetic, control flow, functions, `print`); arrays /
+strings / structs still fall back to the interpreter. **f64 JITs too**: the
+Leibniz-π loop (`examples/pi.zipp`) runs in ~1.7 ms native vs ~29 ms interpreted
+(~17×). Next: heap types via a runtime, then an LLVM release tier (+LTO/PGO),
+per Phases 7–9.
 
 One kernel isn't the whole story (PLAN.md §6/§11 — different workloads favour
 different engines, and V8's hand-tuned stdlib is a separate battle), but it's

@@ -76,6 +76,10 @@ pub struct FuncMeta {
     pub entry: u32,
     pub nregs: u32,
     pub nparams: u32,
+    /// Return type and parameter types (used by the native JIT for signatures
+    /// and per-register type inference).
+    pub ret: Type,
+    pub params: Vec<Type>,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +130,8 @@ pub fn lower(m: &Module) -> Result<Program, String> {
             entry,
             nregs: g.max_reg,
             nparams: f.params.len() as u32,
+            ret: f.ret,
+            params: f.params.iter().map(|p| p.ty).collect(),
         });
     }
 
@@ -175,8 +181,9 @@ impl<'a> Gen<'a> {
     }
 
     fn exit(&mut self) {
-        let (_, saved) = self.scopes.pop().expect("scope underflow");
-        self.next_reg = saved; // reclaim registers used inside the block
+        self.scopes.pop().expect("scope underflow");
+        // Registers are NOT reclaimed on scope exit: monotonic allocation gives
+        // each register a single static type, which the native JIT relies on.
     }
 
     fn declare(&mut self, name: &str) -> u32 {
