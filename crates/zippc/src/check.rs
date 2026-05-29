@@ -139,7 +139,10 @@ fn check_stmt(
             Ok(())
         }
         Stmt::Print(e) => {
-            expect_type(e, Type::I64, scope, sigs, "print")?;
+            let t = type_of(e, scope, sigs)?;
+            if t != Type::I64 && t != Type::F64 {
+                return Err(format!("type error: print expects a number, found {t:?}"));
+            }
             Ok(())
         }
         Stmt::ExprStmt(e) => {
@@ -185,14 +188,23 @@ fn expect_type(
 fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type, String> {
     match e {
         Expr::Int(_) => Ok(Type::I64),
+        Expr::Float(_) => Ok(Type::F64),
         Expr::Bool(_) => Ok(Type::Bool),
         Expr::Var(name) => scope
             .lookup(name)
             .ok_or_else(|| format!("type error: use of undeclared variable '{name}'")),
+        Expr::Cast { to, e } => {
+            let t = type_of(e, scope, sigs)?;
+            if t == Type::I64 || t == Type::F64 {
+                Ok(*to)
+            } else {
+                Err(format!("type error: cannot cast {t:?} to {to:?} (numbers only)"))
+            }
+        }
         Expr::Unary { op, e } => {
             let t = type_of(e, scope, sigs)?;
             match op {
-                UnOp::Neg if t == Type::I64 => Ok(Type::I64),
+                UnOp::Neg if t == Type::I64 || t == Type::F64 => Ok(t),
                 UnOp::BitNot if t == Type::I64 => Ok(Type::I64),
                 UnOp::Not if t == Type::Bool => Ok(Type::Bool),
                 _ => Err(format!("type error: unary {op:?} on {t:?}")),
@@ -202,8 +214,18 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
             let lt = type_of(l, scope, sigs)?;
             let rt = type_of(r, scope, sigs)?;
             use BinOp::*;
+            let numeric = |t: Type| t == Type::I64 || t == Type::F64;
             match op {
-                Add | Sub | Mul | Div | Mod | BitAnd | BitOr | BitXor | Shl | Shr => {
+                // +, -, *, / work on i64 OR f64 (operands must match — no implicit mixing).
+                Add | Sub | Mul | Div => {
+                    if lt == rt && numeric(lt) {
+                        Ok(lt)
+                    } else {
+                        Err(format!("type error: arithmetic {op:?} on {lt:?} and {rt:?}"))
+                    }
+                }
+                // %, bitwise and shifts are integer-only.
+                Mod | BitAnd | BitOr | BitXor | Shl | Shr => {
                     if lt == Type::I64 && rt == Type::I64 {
                         Ok(Type::I64)
                     } else {
@@ -211,7 +233,7 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
                     }
                 }
                 Lt | Le | Gt | Ge => {
-                    if lt == Type::I64 && rt == Type::I64 {
+                    if lt == rt && numeric(lt) {
                         Ok(Type::Bool)
                     } else {
                         Err(format!("type error: comparison {op:?} on {lt:?} and {rt:?}"))

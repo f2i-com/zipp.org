@@ -6,12 +6,14 @@
 //! registers). `&&`/`||` are short-circuited; `break`/`continue` patch to the
 //! enclosing loop. Jumps use absolute code offsets and are backpatched.
 
-use crate::ast::{BinOp, Expr, Module, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, Module, Stmt, Type, UnOp};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum Instr {
     Const { dst: u32, imm: i64 },
+    FConst { dst: u32, imm: f64 },
+    Cast { dst: u32, src: u32, to: Type },
     Mov { dst: u32, src: u32 },
     Bin { op: BinOp, dst: u32, a: u32, b: u32 },
     Unary { op: UnOp, dst: u32, a: u32 },
@@ -63,9 +65,14 @@ pub fn lower(m: &Module) -> Result<Program, String> {
         g.next_reg = f.params.len() as u32;
         g.max_reg = g.next_reg;
         g.gen_block(&f.body)?;
-        // Fallthrough `return 0` so execution never runs off the end.
+        // Fallthrough return of the zero value of the return type, so execution
+        // never runs off the end.
         let z = g.alloc();
-        g.code.push(Instr::Const { dst: z, imm: 0 });
+        if f.ret == Type::F64 {
+            g.code.push(Instr::FConst { dst: z, imm: 0.0 });
+        } else {
+            g.code.push(Instr::Const { dst: z, imm: 0 });
+        }
         g.code.push(Instr::Ret { src: z });
         funcs.push(FuncMeta {
             name: f.name.clone(),
@@ -242,12 +249,23 @@ impl<'a> Gen<'a> {
                 self.code.push(Instr::Const { dst: r, imm: *n });
                 Ok(r)
             }
+            Expr::Float(f) => {
+                let r = self.alloc();
+                self.code.push(Instr::FConst { dst: r, imm: *f });
+                Ok(r)
+            }
             Expr::Bool(b) => {
                 let r = self.alloc();
                 self.code.push(Instr::Const { dst: r, imm: if *b { 1 } else { 0 } });
                 Ok(r)
             }
             Expr::Var(name) => self.resolve(name),
+            Expr::Cast { to, e } => {
+                let src = self.gen_expr(e)?;
+                let r = self.alloc();
+                self.code.push(Instr::Cast { dst: r, src, to: *to });
+                Ok(r)
+            }
             Expr::Unary { op, e } => {
                 let a = self.gen_expr(e)?;
                 let r = self.alloc();

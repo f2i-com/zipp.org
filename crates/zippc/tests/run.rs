@@ -1,12 +1,26 @@
 //! End-to-end language tests: source -> result / output / error.
 
-use zippc::run;
+use zippc::{run, Value};
 
 fn result(src: &str) -> i64 {
-    run(src).expect("program should run").result
+    match run(src).expect("program should run").result {
+        Value::I64(x) => x,
+        other => panic!("expected i64 result, got {other:?}"),
+    }
+}
+fn fresult(src: &str) -> f64 {
+    match run(src).expect("program should run").result {
+        Value::F64(f) => f,
+        other => panic!("expected f64 result, got {other:?}"),
+    }
 }
 fn output(src: &str) -> Vec<i64> {
-    run(src).expect("program should run").output
+    run(src)
+        .expect("program should run")
+        .output
+        .into_iter()
+        .map(|v| v.as_i64().expect("i64 output"))
+        .collect()
 }
 
 #[test]
@@ -101,4 +115,41 @@ fn rejects_undeclared_and_out_of_scope() {
 fn rejects_arity_and_unknown_fn() {
     assert!(run("fn f(a: i64): i64 { return a; } fn main(): i64 { return f(1, 2); }").is_err());
     assert!(run("fn main(): i64 { return g(1); }").is_err());
+}
+
+// ── f64 ──
+
+#[test]
+fn float_arithmetic() {
+    assert_eq!(fresult("fn main(): f64 { return 1.5 + 2.5 * 2.0; }"), 6.5);
+    assert_eq!(fresult("fn main(): f64 { return 10.0 / 4.0; }"), 2.5);
+}
+
+#[test]
+fn casts_bridge_int_and_float() {
+    // i64 -> f64 then float divide.
+    assert_eq!(fresult("fn main(): f64 { let n = 7; return f64(n) / 2.0; }"), 3.5);
+    // f64 -> i64 truncates.
+    assert_eq!(result("fn main(): i64 { return i64(3.9); }"), 3);
+}
+
+#[test]
+fn float_comparison_is_bool() {
+    assert_eq!(result("fn main(): i64 { if (2.5 > 2.0) { return 1; } return 0; }"), 1);
+}
+
+#[test]
+fn rejects_mixing_int_and_float() {
+    assert!(run("fn main(): f64 { return 1 + 2.0; }").is_err());
+    assert!(run("fn main(): i64 { return 5.0 % 2.0; }").is_err()); // % is integer-only
+    assert!(run("fn main(): f64 { return 1.0 & 2.0; }").is_err()); // bitwise integer-only
+}
+
+#[test]
+fn prove_profile_is_integer_only() {
+    // A float program runs fine...
+    let prog = zippc::compile("fn main(): f64 { return 1.5 + 2.5; }").unwrap();
+    assert!(zippc::vm::run(&prog, false).is_ok());
+    // ...but recording a trace for it (what --prove does) is rejected.
+    assert!(zippc::vm::run(&prog, true).is_err());
 }

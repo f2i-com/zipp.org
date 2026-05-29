@@ -64,6 +64,7 @@ impl<'a> Parser<'a> {
     fn ty(&mut self) -> Result<Type, String> {
         match self.bump()? {
             Tok::TyI64 => Ok(Type::I64),
+            Tok::TyF64 => Ok(Type::F64),
             Tok::TyBool => Ok(Type::Bool),
             other => Err(format!("parse error: expected type, found {other:?}")),
         }
@@ -342,8 +343,22 @@ impl<'a> Parser<'a> {
     fn primary(&mut self) -> Result<Expr, String> {
         match self.bump()? {
             Tok::Int(n) => Ok(Expr::Int(n)),
+            Tok::Float(f) => Ok(Expr::Float(f)),
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
+            // Casts: `i64(expr)` / `f64(expr)`.
+            Tok::TyI64 => {
+                self.expect(&Tok::LParen)?;
+                let e = self.expr()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Expr::Cast { to: Type::I64, e: Box::new(e) })
+            }
+            Tok::TyF64 => {
+                self.expect(&Tok::LParen)?;
+                let e = self.expr()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Expr::Cast { to: Type::F64, e: Box::new(e) })
+            }
             Tok::LParen => {
                 let e = self.expr()?;
                 self.expect(&Tok::RParen)?;

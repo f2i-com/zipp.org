@@ -8,6 +8,7 @@
 pub enum Tok {
     // literals / identifiers
     Int(i64),
+    Float(f64),
     Ident(String),
     // keywords
     Fn,
@@ -22,6 +23,7 @@ pub enum Tok {
     False,
     Print,
     TyI64,
+    TyF64,
     TyBool,
     // punctuation
     LParen,
@@ -193,11 +195,27 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
                     i += 1;
                 }
-                let s = &src[start..i];
-                let n: i64 = s
-                    .parse()
-                    .map_err(|_| format!("lex error: bad integer literal '{s}'"))?;
-                out.push(Tok::Int(n));
+                // Float literal: digits '.' digits  (e.g. 3.14, 2.0).
+                let is_float = i + 1 < bytes.len()
+                    && bytes[i] == b'.'
+                    && (bytes[i + 1] as char).is_ascii_digit();
+                if is_float {
+                    i += 1; // consume '.'
+                    while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
+                        i += 1;
+                    }
+                    let s = &src[start..i];
+                    let f: f64 = s
+                        .parse()
+                        .map_err(|_| format!("lex error: bad float literal '{s}'"))?;
+                    out.push(Tok::Float(f));
+                } else {
+                    let s = &src[start..i];
+                    let n: i64 = s
+                        .parse()
+                        .map_err(|_| format!("lex error: bad integer literal '{s}'"))?;
+                    out.push(Tok::Int(n));
+                }
             }
             c if c.is_ascii_alphabetic() || c == '_' => {
                 let start = i;
@@ -220,6 +238,7 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     "false" => Tok::False,
                     "print" => Tok::Print,
                     "i64" => Tok::TyI64,
+                    "f64" => Tok::TyF64,
                     "bool" => Tok::TyBool,
                     _ => Tok::Ident(s.to_string()),
                 });

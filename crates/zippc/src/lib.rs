@@ -16,7 +16,7 @@ pub mod parser;
 pub mod vm;
 
 pub use ir::Program;
-pub use vm::{OpKind, RunResult, TraceStep};
+pub use vm::{OpKind, RunResult, TraceStep, Value};
 
 /// Compile ZIPP source text to executable bytecode.
 pub fn compile(src: &str) -> Result<Program, String> {

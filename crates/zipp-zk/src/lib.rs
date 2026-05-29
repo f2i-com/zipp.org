@@ -136,7 +136,7 @@ mod tests {
     fn trace_of(src: &str) -> (Vec<TraceStep>, i64) {
         let prog = zippc::compile(src).expect("compile");
         let r = zippc::vm::run(&prog, true).expect("run");
-        (r.trace, r.result)
+        (r.trace, r.result.as_i64().expect("integer result"))
     }
 
     // NOTE: run with `cargo test -p zipp-zk --release` — the AIR degree check is

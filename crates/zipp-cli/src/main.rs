@@ -62,7 +62,11 @@ fn run_file(path: &str, prove: bool) -> Result<(), String> {
     println!("=> {} ({} fns, ran in {:.2?})", result.result, program.funcs.len(), elapsed);
 
     if prove {
-        prove_and_verify(&result.trace, result.result)?;
+        let r = result
+            .result
+            .as_i64()
+            .ok_or("internal: prove produced a non-integer result")?;
+        prove_and_verify(&result.trace, r)?;
     }
     Ok(())
 }

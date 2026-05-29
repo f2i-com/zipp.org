@@ -22,8 +22,10 @@ with `--no-default-features` and the language still runs.
 ## Status (v0 — a working vertical slice, not the finished language)
 
 ✅ Working end-to-end today:
-- Lexer → recursive-descent parser → **sound-subset type checker** (`i64`/`bool`,
+- Lexer → recursive-descent parser → **sound-subset type checker** (`i64`/`f64`/`bool`,
   no implicit coercions, arity/return checking)
+- **`f64` floating-point** with `i64()` / `f64()` casts (the zk profile stays
+  integer-only — `--prove` rejects f64, per PLAN.md §7)
 - **Lexical block scoping with shadowing**; `break` / `continue`; **short-circuit**
   `&&` / `||`
 - Full operator set incl. **bitwise/shift** `& | ^ << >> ~`
@@ -34,7 +36,7 @@ with `--no-default-features` and the language still runs.
 - An integration **test suite** (`cargo test`)
 
 🚧 Roadmap (see `../ZIPP.md` for the full plan):
-- Types: `f64`, sized integers (`i32`/`u32`/`u64`), then strings
+- Types: sized integers (`i32`/`u32`/`u64`), then strings
 - Better errors with source line/column
 - Frontend: swap the hand-written parser for **oxc/SWC** (real TS/JSX)
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
@@ -51,6 +53,7 @@ cargo build --release
 ./target/release/zipp run examples/fib.zipp        # => 55
 ./target/release/zipp run examples/sum.zipp         # => 385
 ./target/release/zipp run examples/bits.zipp        # => 247  (bitwise/shift)
+./target/release/zipp run examples/pi.zipp          # => 3.14159...  (f64 + casts)
 
 # run the language test suite
 cargo test
@@ -85,7 +88,7 @@ zipp-lang/
 │   ├── zippc/        # compiler core + register VM: lexer, ast, parser, check, ir, vm
 │   ├── zipp-zk/      # OPTIONAL zk-STARK profile (Winterfell prover/verifier over the trace)
 │   └── zipp-cli/     # the `zipp` binary
-└── examples/         # add.zipp, sum.zipp, fib.zipp, bits.zipp
+└── examples/         # add.zipp, sum.zipp, fib.zipp, bits.zipp, pi.zipp
 ```
 
 The modules inside `zippc` map onto the separate crates in `../ZIPP.md §15`

@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     I64,
+    F64,
     Bool,
 }
 
@@ -39,8 +40,10 @@ pub enum UnOp {
 #[derive(Debug, Clone)]
 pub enum Expr {
     Int(i64),
+    Float(f64),
     Bool(bool),
     Var(String),
+    Cast { to: Type, e: Box<Expr> },
     Unary { op: UnOp, e: Box<Expr> },
     Bin { op: BinOp, l: Box<Expr>, r: Box<Expr> },
     Call { name: String, args: Vec<Expr> },
