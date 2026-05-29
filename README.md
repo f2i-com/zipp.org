@@ -120,6 +120,8 @@ cargo build --release
 ./target/release/zipp run examples/lambda.ts         # first-class functions + arrow lambdas
 ./target/release/zipp run examples/closure.ts        # closures (arrows capture enclosing vars)
 ./target/release/zipp run examples/arraymethods.ts   # growable arrays + map/filter/reduce/push/pop
+./target/release/zipp run examples/arraymethods2.ts  # some/every/findIndex/slice/concat/reverse/fill
+./target/release/zipp run --jit examples/arraysearch.ts # indexOf/includes/reverse/fill run NATIVE
 
 # run the language test suite
 cargo test
@@ -356,9 +358,9 @@ recursion (with **default parameters**), `let`/`const` (incl. array/object
 **destructuring**),
 `if`/`while`/`for`/`for…of`/`switch`, `break`/`continue`, the operator set +
 ternary `?:`, numeric casts (`i64(x)`/`u32(x)`/…), arrays (`T[]`, indexing,
-`.length`, **growable** with `push`/`pop`, and the higher-order methods
-`map`/`filter`/`reduce`), **tuples** (`[i64, str]` — positional indexing +
-destructuring),
+`.length`, **growable** with `push`/`pop`, and a **method stdlib**:
+`map`/`filter`/`reduce`/`some`/`every`/`findIndex`/`indexOf`/`includes`/`slice`/`concat`/`reverse`/`fill`),
+**tuples** (`[i64, str]` — positional indexing + destructuring),
 numeric **and string `enum`s**, **`interface`s and `class`es → structs**
 (interfaces construct with `let p: T = {…}` / `{…} as T`; classes give you
 fields, a constructor, methods, `this`, and `new C(…)` — a class lowers to a
@@ -387,19 +389,22 @@ a string enum + array/object destructuring; `defaults.ts` default parameters;
 `optional.ts` nullable references (`T | null`, `??`, narrowing); `chain.ts`
 optional chaining; `nullable_heap.ts` `str | null` + `T[] | null`;
 `nullable_scalar.ts` `i64 | null`; `lambda.ts` first-class functions + arrow
-lambdas; `closure.ts` closures (capture); `arraymethods.ts` growable arrays +
-`map`/`filter`/`reduce`. Most run on all four backends;
+lambdas; `closure.ts` closures (capture); `arraymethods.ts` + `arraymethods2.ts`
+the array method stdlib; `arraysearch.ts` the search/in-place methods running
+native. Most run on all four backends;
 **nullable
 *heap* types — structs, `str`, arrays — run natively on `--jit` and `--llvm`**
 (a null is a 0/null pointer; `=== null` is a pointer compare). **Nullable
 *scalars* (`i64 | null`) run on the interpreter** — scalars have no spare null
 value, so the native tiers fall back (they'd need boxing). **First-class
-functions, closures, and growable arrays (`push`/`pop`/`map`/`filter`/`reduce`)
-also run on the interpreter** in v0 (`--jit`/`--llvm`/`--wasm` fall back) — a
-closure captures **by value** (snapshotting the variable at creation; reassigning
-it afterward doesn't change the closure), and `map`/`filter`/`reduce` lower to
-synthesized per-element-type loop helpers. `--wasm` falls back for all nullable
-(its contract profile stays scalar-only).
+functions, closures, and growable/closure array methods also run on the
+interpreter** in v0 (`--jit`/`--llvm`/`--wasm` fall back) — a closure captures
+**by value** (snapshotting the variable at creation; reassigning it afterward
+doesn't change the closure), and the higher-order array methods lower to
+synthesized per-element-type loop helpers. The **pure array methods**
+(`indexOf`/`includes`/`reverse`/`fill` — no closure, no `push`) stay **native** on
+`--jit`/`--llvm`. `--wasm` falls back for all nullable (its contract profile stays
+scalar-only).
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,

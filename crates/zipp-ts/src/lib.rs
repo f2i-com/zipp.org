@@ -2102,8 +2102,9 @@ impl Lower<'_> {
     }
 
     /// Dispatch a builtin array method on an array receiver of element type `elem`.
-    /// `push`/`pop` are primitives; `map`/`filter`/`reduce` call a synthesized,
-    /// per-element-type helper function (a plain loop) generated on demand.
+    /// `push`/`pop` are primitives; the rest call a synthesized, per-element-type
+    /// helper function (a plain loop) generated on demand. The helper's signature
+    /// also enforces argument types (via the normal `Call` type-check).
     fn array_method(
         &self,
         recv: z::Expr,
@@ -2112,6 +2113,7 @@ impl Lower<'_> {
         c: &CallExpression,
     ) -> LResult<z::Expr> {
         let mut args = self.lower_args(c)?;
+        let tag = elem_tag(elem);
         match method {
             "push" => {
                 if args.len() != 1 {
@@ -2125,19 +2127,74 @@ impl Lower<'_> {
                 }
                 Ok(z::Expr::Pop { arr: Box::new(recv) })
             }
-            "map" | "filter" | "reduce" => self.array_hof(recv, elem, method, args, c.span),
+            // value scans → native (no push, no closure)
+            "indexOf" | "includes" => {
+                if args.len() != 1 {
+                    return Err(self.err(c.span, format!("{method}(x) takes one argument")));
+                }
+                let includes = method == "includes";
+                let ret = if includes { z::Type::Bool } else { z::Type::I64 };
+                let name = self.ensure_helper(format!("__{method}_{tag}"), ret, |n| {
+                    build_find_helper(n, elem, includes)
+                });
+                Ok(z::Expr::Call { name, args: prepend(recv, args) })
+            }
+            // in-place mutation → native, returns the receiver
+            "reverse" => {
+                if !args.is_empty() {
+                    return Err(self.err(c.span, "reverse() takes no arguments"));
+                }
+                let name = self.ensure_helper(format!("__reverse_{tag}"), z::Type::Array(elem), |n| {
+                    build_reverse_helper(n, elem)
+                });
+                Ok(z::Expr::Call { name, args: vec![recv] })
+            }
+            "fill" => {
+                if args.is_empty() || args.len() > 3 {
+                    return Err(self.err(c.span, "fill(value, start?, end?) takes 1 to 3 arguments"));
+                }
+                let n = args.len();
+                let name = self.ensure_helper(format!("__fill{n}_{tag}"), z::Type::Array(elem), |nm| {
+                    build_fill_helper(nm, elem, n)
+                });
+                Ok(z::Expr::Call { name, args: prepend(recv, args) })
+            }
+            // fresh-copy builders → interpreter-tier (push)
+            "slice" => {
+                if args.len() > 2 {
+                    return Err(self.err(c.span, "slice(start?, end?) takes 0 to 2 arguments"));
+                }
+                let n = args.len();
+                let name = self.ensure_helper(format!("__slice{n}_{tag}"), z::Type::Array(elem), |nm| {
+                    build_slice_helper(nm, elem, n)
+                });
+                Ok(z::Expr::Call { name, args: prepend(recv, args) })
+            }
+            "concat" => {
+                if args.len() != 1 {
+                    return Err(self.err(c.span, "concat(other) takes one array argument"));
+                }
+                let name = self.ensure_helper(format!("__concat_{tag}"), z::Type::Array(elem), |n| {
+                    build_concat_helper(n, elem)
+                });
+                Ok(z::Expr::Call { name, args: prepend(recv, args) })
+            }
+            "map" | "filter" | "reduce" | "some" | "every" | "findIndex" => {
+                self.array_hof(recv, elem, method, args, c.span)
+            }
             other => Err(self.err(
                 c.span,
                 format!(
-                    "unknown array method '.{other}()' — supported: push, pop, map, filter, reduce"
+                    "unknown array method '.{other}()' — supported: push, pop, indexOf, includes, \
+                     reverse, fill, slice, concat, map, filter, reduce, some, every, findIndex"
                 ),
             )),
         }
     }
 
-    /// Higher-order array methods. Resolves the callback's interned function type,
-    /// validates its shape, ensures the matching helper exists, and emits a call
-    /// `__method_<types>(arr, callback[, init])`.
+    /// Higher-order (callback-taking) array methods. Resolves the callback's
+    /// interned function type, validates its shape, ensures the matching helper
+    /// exists, and emits `__method_<types>(arr, callback[, init])`.
     fn array_hof(
         &self,
         recv: z::Expr,
@@ -2158,6 +2215,7 @@ impl Lower<'_> {
         let ft = self.func_types.borrow()[fid as usize].clone();
         let t = elem.to_type();
         let f_ty = z::Type::Func(fid);
+        let tag = elem_tag(elem);
         let (name, call_args) = match method {
             "map" => {
                 if args.len() != 1 || ft.params != [t] {
@@ -2166,14 +2224,20 @@ impl Lower<'_> {
                 let u = ft.ret.as_elem().ok_or_else(|| {
                     self.err(span, "map's callback must return a scalar (array element type)")
                 })?;
-                let name = self.ensure_array_helper(method, elem, u, f_ty);
+                let name = self.ensure_helper(
+                    format!("__map_{tag}_{}", elem_tag(u)),
+                    z::Type::Array(u),
+                    |n| build_map_helper(n, elem, u, f_ty),
+                );
                 (name, prepend(recv, args))
             }
             "filter" => {
                 if args.len() != 1 || ft.params != [t] || ft.ret != z::Type::Bool {
                     return Err(self.err(span, "filter((x: T) => bool) takes one boolean predicate"));
                 }
-                let name = self.ensure_array_helper(method, elem, elem, f_ty);
+                let name = self.ensure_helper(format!("__filter_{tag}"), z::Type::Array(elem), |n| {
+                    build_filter_helper(n, elem, f_ty)
+                });
                 (name, prepend(recv, args))
             }
             "reduce" => {
@@ -2192,7 +2256,26 @@ impl Lower<'_> {
                 if init_ty != ft.ret {
                     return Err(self.err(span, format!("reduce's initial value must be {:?}", ft.ret)));
                 }
-                let name = self.ensure_array_helper(method, elem, u, f_ty);
+                let name = self.ensure_helper(
+                    format!("__reduce_{tag}_{}", elem_tag(u)),
+                    u.to_type(),
+                    |n| build_reduce_helper(n, elem, u, f_ty),
+                );
+                (name, prepend(recv, args))
+            }
+            // predicate scans: some/every → bool, findIndex → i64
+            "some" | "every" | "findIndex" => {
+                if args.len() != 1 || ft.params != [t] || ft.ret != z::Type::Bool {
+                    return Err(self.err(
+                        span,
+                        format!(".{method}((x: T) => bool) takes one boolean predicate"),
+                    ));
+                }
+                let ret = if method == "findIndex" { z::Type::I64 } else { z::Type::Bool };
+                let m = method.to_string();
+                let name = self.ensure_helper(format!("__{method}_{tag}"), ret, |n| {
+                    build_predicate_helper(n, elem, f_ty, &m)
+                });
                 (name, prepend(recv, args))
             }
             _ => unreachable!(),
@@ -2200,23 +2283,16 @@ impl Lower<'_> {
         Ok(z::Expr::Call { name, args: call_args })
     }
 
-    /// Generate (once) and register a `map`/`filter`/`reduce` helper for the given
-    /// element types, returning its mangled name.
-    fn ensure_array_helper(
+    /// Generate (once) and register a synthesized array helper, returning its name.
+    /// `build` is only run the first time a given name is seen.
+    fn ensure_helper(
         &self,
-        method: &str,
-        t: z::Elem,
-        u: z::Elem,
-        f_ty: z::Type,
+        name: String,
+        ret: z::Type,
+        build: impl FnOnce(&str) -> z::Func,
     ) -> String {
-        let name = format!("__{method}_{}_{}", elem_tag(t), elem_tag(u));
         if self.array_helpers.borrow_mut().insert(name.clone()) {
-            let (func, ret) = match method {
-                "map" => (build_map_helper(&name, t, u, f_ty), z::Type::Array(u)),
-                "filter" => (build_filter_helper(&name, t, f_ty), z::Type::Array(t)),
-                "reduce" => (build_reduce_helper(&name, t, u, f_ty), u.to_type()),
-                _ => unreachable!(),
-            };
+            let func = build(&name);
             self.fn_rets.borrow_mut().insert(name.clone(), ret);
             self.lambdas.borrow_mut().push(func);
         }
@@ -2780,6 +2856,273 @@ fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::
     }
 }
 
+// Compact AST constructors for the synthesized helpers above.
+fn var(n: &str) -> z::Expr {
+    z::Expr::Var(n.into())
+}
+fn int(i: i64) -> z::Expr {
+    z::Expr::Int(i)
+}
+fn bin(op: z::BinOp, l: z::Expr, r: z::Expr) -> z::Expr {
+    z::Expr::Bin { op, l: Box::new(l), r: Box::new(r) }
+}
+fn idx(arr: z::Expr, i: z::Expr) -> z::Expr {
+    z::Expr::Index { arr: Box::new(arr), index: Box::new(i) }
+}
+fn len_of(arr: &str) -> z::Expr {
+    z::Expr::Call { name: "len".into(), args: vec![var(arr)] }
+}
+fn ret(e: z::Expr) -> z::Stmt {
+    stmt(z::StmtKind::Return(Some(e)))
+}
+fn let_(n: &str, val: z::Expr) -> z::Stmt {
+    stmt(z::StmtKind::Let { name: n.into(), ty: None, value: val })
+}
+fn assign(target: z::Expr, val: z::Expr) -> z::Stmt {
+    stmt(z::StmtKind::Assign { target, value: val })
+}
+fn inc(n: &str) -> z::Stmt {
+    assign(var(n), bin(z::BinOp::Add, var(n), int(1)))
+}
+fn while_(cond: z::Expr, body: Vec<z::Stmt>) -> z::Stmt {
+    stmt(z::StmtKind::While { cond, body })
+}
+fn if_then(cond: z::Expr, then_b: Vec<z::Stmt>) -> z::Stmt {
+    stmt(z::StmtKind::If { cond, then_b, else_b: vec![] })
+}
+fn push_stmt(arr: &str, val: z::Expr) -> z::Stmt {
+    stmt(z::StmtKind::ExprStmt(z::Expr::Push {
+        arr: Box::new(var(arr)),
+        value: Box::new(val),
+    }))
+}
+/// `for (let __i = 0; __i < len(arr); __i = __i + 1) { body }`.
+fn for_i(body: Vec<z::Stmt>) -> z::Stmt {
+    stmt(z::StmtKind::For {
+        init: Some(Box::new(loop_init())),
+        cond: lt_len(),
+        step: Some(Box::new(loop_step())),
+        body,
+    })
+}
+/// Clamp/normalize a slice index `src` against `__n` (TS semantics): a negative
+/// index counts from the end, then clamp to `[0, __n]`.
+fn norm_idx(src: z::Expr) -> z::Expr {
+    z::Expr::Cond {
+        cond: Box::new(bin(z::BinOp::Lt, src.clone(), int(0))),
+        then: Box::new(z::Expr::Call {
+            name: "max".into(),
+            args: vec![bin(z::BinOp::Add, var("__n"), src.clone()), int(0)],
+        }),
+        els: Box::new(z::Expr::Call { name: "min".into(), args: vec![src, var("__n")] }),
+    }
+}
+/// `arr[__i] (==|SameValueZero) x` — the element comparison for indexOf/includes.
+/// `includes` on an `f64` array also matches NaN (`e !== e && x !== x`).
+fn elem_eq(t: z::Elem, same_value_zero: bool) -> z::Expr {
+    let plain = bin(z::BinOp::Eq, arr_at_i(), var("x"));
+    if same_value_zero && t == z::Elem::F64 {
+        bin(
+            z::BinOp::Or,
+            plain,
+            bin(
+                z::BinOp::And,
+                bin(z::BinOp::Ne, arr_at_i(), arr_at_i()),
+                bin(z::BinOp::Ne, var("x"), var("x")),
+            ),
+        )
+    } else {
+        plain
+    }
+}
+
+/// `function __indexOf_T(arr: T[], x: T): i64` / `__includes_T(...): bool` —
+/// a linear scan; `includes` uses SameValueZero so it matches NaN.
+fn build_find_helper(name: &str, t: z::Elem, includes: bool) -> z::Func {
+    use z::{Param, Type};
+    let (matched, sentinel, ret_ty) = if includes {
+        (z::Expr::Bool(true), z::Expr::Bool(false), Type::Bool)
+    } else {
+        (var("__i"), int(-1), Type::I64)
+    };
+    z::Func {
+        name: name.into(),
+        params: vec![
+            Param { name: "arr".into(), ty: Type::Array(t) },
+            Param { name: "x".into(), ty: t.to_type() },
+        ],
+        ret: ret_ty,
+        body: vec![
+            for_i(vec![if_then(elem_eq(t, includes), vec![ret(matched)])]),
+            ret(sentinel),
+        ],
+    }
+}
+
+/// A callback array helper that scans with `pred` and returns on the first match:
+/// `some` (→ true/false), `every` (→ false on first !pred / true), `findIndex`
+/// (→ index / -1).
+fn build_predicate_helper(name: &str, t: z::Elem, f_ty: z::Type, kind: &str) -> z::Func {
+    use z::{Param, Type};
+    let test = call_f(vec![arr_at_i()]);
+    let (loop_body, tail, ret_ty) = match kind {
+        "some" => (
+            vec![if_then(test, vec![ret(z::Expr::Bool(true))])],
+            ret(z::Expr::Bool(false)),
+            Type::Bool,
+        ),
+        "every" => (
+            vec![if_then(
+                z::Expr::Unary { op: z::UnOp::Not, e: Box::new(test) },
+                vec![ret(z::Expr::Bool(false))],
+            )],
+            ret(z::Expr::Bool(true)),
+            Type::Bool,
+        ),
+        "findIndex" => (
+            vec![if_then(test, vec![ret(var("__i"))])],
+            ret(int(-1)),
+            Type::I64,
+        ),
+        _ => unreachable!(),
+    };
+    z::Func {
+        name: name.into(),
+        params: vec![
+            Param { name: "arr".into(), ty: Type::Array(t) },
+            Param { name: "f".into(), ty: f_ty },
+        ],
+        ret: ret_ty,
+        body: vec![for_i(loop_body), tail],
+    }
+}
+
+/// `function __reverse_T(arr: T[]): T[]` — in-place two-pointer swap, returns the
+/// (aliased) receiver.
+fn build_reverse_helper(name: &str, t: z::Elem) -> z::Func {
+    use z::{BinOp, Param, Type};
+    z::Func {
+        name: name.into(),
+        params: vec![Param { name: "arr".into(), ty: Type::Array(t) }],
+        ret: Type::Array(t),
+        body: vec![
+            let_("__i", int(0)),
+            let_("__j", bin(BinOp::Sub, len_of("arr"), int(1))),
+            while_(
+                bin(BinOp::Lt, var("__i"), var("__j")),
+                vec![
+                    let_("__t", idx(var("arr"), var("__i"))),
+                    assign(idx(var("arr"), var("__i")), idx(var("arr"), var("__j"))),
+                    assign(idx(var("arr"), var("__j")), var("__t")),
+                    inc("__i"),
+                    assign(var("__j"), bin(BinOp::Sub, var("__j"), int(1))),
+                ],
+            ),
+            ret(var("arr")),
+        ],
+    }
+}
+
+/// `function __fillN_T(arr: T[], value: T[, start[, end]]): T[]` — in-place fill
+/// of `[start, end)` (TS clamping), returns the receiver. Native (no push).
+fn build_fill_helper(name: &str, t: z::Elem, nargs: usize) -> z::Func {
+    use z::{BinOp, Param, Type};
+    let mut params = vec![
+        Param { name: "arr".into(), ty: Type::Array(t) },
+        Param { name: "value".into(), ty: t.to_type() },
+    ];
+    if nargs >= 2 {
+        params.push(Param { name: "start".into(), ty: Type::I64 });
+    }
+    if nargs >= 3 {
+        params.push(Param { name: "end".into(), ty: Type::I64 });
+    }
+    let s = if nargs >= 2 { norm_idx(var("start")) } else { int(0) };
+    let e = if nargs >= 3 { norm_idx(var("end")) } else { var("__n") };
+    z::Func {
+        name: name.into(),
+        params,
+        ret: Type::Array(t),
+        body: vec![
+            let_("__n", len_of("arr")),
+            let_("__i", s),
+            let_("__e", e),
+            while_(
+                bin(BinOp::Lt, var("__i"), var("__e")),
+                vec![assign(idx(var("arr"), var("__i")), var("value")), inc("__i")],
+            ),
+            ret(var("arr")),
+        ],
+    }
+}
+
+/// `function __sliceN_T(arr: T[][, start[, end]]): T[]` — a fresh copy of
+/// `[start, end)` with TS clamping. Interpreter-tier (builds via push).
+fn build_slice_helper(name: &str, t: z::Elem, nargs: usize) -> z::Func {
+    use z::{BinOp, Expr, Param, Type};
+    let mut params = vec![Param { name: "arr".into(), ty: Type::Array(t) }];
+    if nargs >= 1 {
+        params.push(Param { name: "start".into(), ty: Type::I64 });
+    }
+    if nargs >= 2 {
+        params.push(Param { name: "end".into(), ty: Type::I64 });
+    }
+    let s = if nargs >= 1 { norm_idx(var("start")) } else { int(0) };
+    let e = if nargs >= 2 { norm_idx(var("end")) } else { var("__n") };
+    z::Func {
+        name: name.into(),
+        params,
+        ret: Type::Array(t),
+        body: vec![
+            let_("__n", len_of("arr")),
+            let_("__i", s),
+            let_("__e", e),
+            stmt(z::StmtKind::Let {
+                name: "__r".into(),
+                ty: Some(Type::Array(t)),
+                value: Expr::Repeat { value: Box::new(elem_default(t)), count: Box::new(int(0)) },
+            }),
+            while_(
+                bin(BinOp::Lt, var("__i"), var("__e")),
+                vec![push_stmt("__r", idx(var("arr"), var("__i"))), inc("__i")],
+            ),
+            ret(var("__r")),
+        ],
+    }
+}
+
+/// `function __concat_T(arr: T[], other: T[]): T[]` — fresh array of both, in
+/// order. Interpreter-tier (push).
+fn build_concat_helper(name: &str, t: z::Elem) -> z::Func {
+    use z::{BinOp, Expr, Param, Type};
+    z::Func {
+        name: name.into(),
+        params: vec![
+            Param { name: "arr".into(), ty: Type::Array(t) },
+            Param { name: "other".into(), ty: Type::Array(t) },
+        ],
+        ret: Type::Array(t),
+        body: vec![
+            stmt(z::StmtKind::Let {
+                name: "__r".into(),
+                ty: Some(Type::Array(t)),
+                value: Expr::Repeat { value: Box::new(elem_default(t)), count: Box::new(int(0)) },
+            }),
+            let_("__i", int(0)),
+            while_(
+                bin(BinOp::Lt, var("__i"), len_of("arr")),
+                vec![push_stmt("__r", idx(var("arr"), var("__i"))), inc("__i")],
+            ),
+            let_("__j", int(0)),
+            while_(
+                bin(BinOp::Lt, var("__j"), len_of("other")),
+                vec![push_stmt("__r", idx(var("other"), var("__j"))), inc("__j")],
+            ),
+            ret(var("__r")),
+        ],
+    }
+}
+
 /// Mangle a generic instantiation to a unique, valid ZIPP function name.
 fn mangle_generic(name: &str, args: &[z::Type]) -> String {
     let mut s = format!("{name}__G");
@@ -3038,6 +3381,77 @@ mod tests {
         let m = compile_ts(ts).expect("lower");
         let prog = zippc::compile_module(&m).expect("compile");
         assert!(prog.uses_growable);
+    }
+
+    #[test]
+    fn array_methods_extended() {
+        // indexOf: first match / not found / final index
+        assert_eq!(run_i64("function main(): i64 { const xs = [3,1,2,1]; return xs.indexOf(1); }"), 1);
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; return xs.indexOf(9); }"), -1);
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; return xs.indexOf(3); }"), 2);
+
+        // includes
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; return xs.includes(2) ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; return xs.includes(9) ? 1 : 0; }"), 0);
+
+        // NaN: SameValueZero in includes matches; strict-eq in indexOf does not
+        let nan = "function nan(): f64 { return 0.0 / 0.0; } \
+                   function main(): i64 { const xs: f64[] = [nan()]; \
+                     const inc = xs.includes(nan()) ? 1 : 0; \
+                     const idx = xs.indexOf(nan()); \
+                     return inc * 100 + (idx + 1); }"; // includes→1, indexOf→-1 ⇒ 100
+        assert_eq!(run_i64(nan), 100);
+
+        // some / every empty identities
+        assert_eq!(run_i64("function main(): i64 { const xs: i64[] = []; return xs.some((x: i64) => x > 0) ? 1 : 0; }"), 0);
+        assert_eq!(run_i64("function main(): i64 { const xs: i64[] = []; return xs.every((x: i64) => x > 0) ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { const xs = [2,4,6]; return xs.every((x: i64) => x % 2 === 0) ? 1 : 0; }"), 1);
+        assert_eq!(run_i64("function main(): i64 { const xs = [2,4,5]; return xs.every((x: i64) => x % 2 === 0) ? 1 : 0; }"), 0);
+
+        // some short-circuits: a capturing closure records each visited element
+        let sc = "function main(): i64 { const xs = [1,2,3,4]; const seen: i64[] = []; \
+                    const found = xs.some((x: i64) => seen.push(x) > 0 && x === 2); \
+                    return (found ? 1 : 0) * 100 + len(seen); }"; // stops at 2 ⇒ seen=[1,2] ⇒ 102
+        assert_eq!(run_i64(sc), 102);
+
+        // findIndex
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; return xs.findIndex((x: i64) => x > 1); }"), 1);
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; return xs.findIndex((x: i64) => x > 9); }"), -1);
+
+        // reverse: in-place; involution
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; xs.reverse(); return xs[0] * 100 + xs[2]; }"), 301);
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; xs.reverse().reverse(); return xs[0]; }"), 1);
+
+        // fill: range [start,end), in place
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3,4]; xs.fill(9,1,3); return xs[0]*1000+xs[1]*100+xs[2]*10+xs[3]; }"), 1994);
+
+        // slice: to-end, negative, and COPY independence (fill on the copy)
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3,4]; const ys = xs.slice(2); return len(ys)*10 + ys[0]; }"), 23);
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3,4]; const ys = xs.slice(1,-1); return len(ys)*100 + ys[0]*10 + ys[1]; }"), 223);
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; const ys = xs.slice(0); ys.fill(0); return xs[0]+xs[1]+xs[2]; }"), 6);
+
+        // concat: order + length
+        assert_eq!(run_i64("function main(): i64 { const a = [1,2]; const b = [3,4]; const c = a.concat(b); return len(c)*1000 + c[0]*100 + c[2]*10 + c[3]; }"), 4134);
+
+        // chaining across helper results
+        assert_eq!(run_i64("function main(): i64 { return [1,2,3,4].filter((x: i64) => x % 2 === 0).map((x: i64) => x * 10).indexOf(40); }"), 1);
+
+        // two DIFFERENT callbacks of the same type reuse the one helper
+        // (structural func-type interning keeps it polymorphic, not baked to one fn)
+        assert_eq!(run_i64("function main(): i64 { const xs = [1,2,3]; \
+                    const a = xs.map((x: i64) => x + 1); const b = xs.map((x: i64) => x * 10); \
+                    return a[2] * 100 + b[2]; }"), 430); // a=[2,3,4], b=[10,20,30]
+
+        // indexOf / includes / reverse / fill use neither push nor a closure, so a
+        // program built only from them stays native-eligible (no fallback).
+        let native = "function main(): i64 { const xs = [3,1,2]; xs.reverse(); xs.fill(7,0,1); \
+                      return xs.indexOf(7) + (xs.includes(3) ? 1 : 0); }";
+        let m = compile_ts(native).expect("lower");
+        let prog = zippc::compile_module(&m).expect("compile");
+        assert!(
+            !prog.uses_growable && !prog.uses_func_value,
+            "indexOf/includes/reverse/fill must stay native-eligible"
+        );
     }
 
     #[test]
