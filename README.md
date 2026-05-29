@@ -42,8 +42,8 @@ with `--no-default-features` and the language still runs.
   verification over the VM execution trace
 - A **native JIT** (`zipp run --jit`, Cranelift): compiles the **entire
   language** — scalars (`i64`/`f64`, casts), arrays, strings, structs, math
-  builtins — to machine code; nothing falls back. A fast-compile tier-0 that
-  beats V8 on integer loops (see Performance below)
+  builtins — to machine code with a **conservative mark-sweep GC**; nothing
+  falls back. A fast-compile tier-0 that beats V8 on integer loops (see below)
 - An **LLVM release tier** (`zipp run --llvm`): emits LLVM IR and compiles it
   with `clang -O3 -march=native` — same coverage, **matches V8 on dense f64**
   and **beats V8 and Bun on dense-f64 arrays** (matmul). No `llvm-sys` linkage;
@@ -59,8 +59,9 @@ with `--no-default-features` and the language still runs.
 - IR: split into ZHIR + ZMIR (monomorphization, comptime, escape analysis, SoA)
 - Backends: **Cranelift** tier-0 JIT and an **LLVM** release tier (`clang -O3`)
   — *scalars + arrays + strings + structs done* (matches V8 on dense f64; beats
-  V8/Bun on matmul); the **whole language** compiles natively now — next: a GC
-  (heap currently leaks), LTO/PGO, and a **WASM-contract** target
+  V8/Bun on matmul); the **whole language** compiles natively now, and the JIT
+  has a **conservative mark-sweep GC**. Next: a GC for the LLVM AOT tier (shared
+  runtime), LTO/PGO, and a **WASM-contract** target
 - Parallel work-stealing scheduler (the §5.8 flagship), GC/arenas, fast stdlib
 - zk hardening: PC-integrity + memory-permutation arguments, 64-bit range checks
 
@@ -241,10 +242,33 @@ host AVX/FMA, verifier off, opt-in FMA; LLVM: `-O3 -march=native`).
 rounding (last-bit), so the strict default keeps native output bit-identical to
 the interpreter — which matters for the deterministic contract/provable profiles.
 
-The whole language now compiles natively; next is a GC (the array/string/struct
-heap currently leaks). One kernel isn't the whole story (PLAN.md §6/§11 —
-workloads differ, and V8's hand-tuned stdlib is a separate battle), but this is
-real, reproducible evidence the thesis holds where the design predicts.
+One kernel isn't the whole story (PLAN.md §6/§11 — workloads differ, and V8's
+hand-tuned stdlib is a separate battle), but this is real, reproducible evidence
+the thesis holds where the design predicts.
+
+### Garbage collection (JIT)
+
+The JIT runtime has a **conservative mark-sweep GC**. ZIPP heap handles
+(arrays/strings/structs) are always `i64`, so they only ever live in GPRs or on
+the stack — never in float registers — which bounds the root set: the collector
+captures the callee-saved GPRs and conservatively scans the machine stack, marks
+through reachable objects (so a struct field holding an array keeps it alive),
+and sweeps the rest. It's sound for this value model with no codegen changes or
+stack maps; it's per-thread (matching ZIPP's single-threaded execution); and it
+never moves objects, so handles stay valid.
+
+On `bench/churn.zipp` (a fresh 64-element array every iteration, 2M iterations,
+only the current one live):
+
+| | peak RSS | result |
+|---|---|---|
+| **GC on** (default) | **~11 MB** | ✓ |
+| GC off (`ZIPP_GC=0`) | ~1.1 GB | ✓ |
+
+~100× less memory, same answer. String *literals* are allocated outside the GC
+(immortal — they're baked into the code as constants). The `--llvm` AOT tier is
+a separate process and still leaks; giving it this same collector via a shared
+runtime static lib is the next step. (Set `ZIPP_GC=0` to disable collection.)
 
 ## License
 
