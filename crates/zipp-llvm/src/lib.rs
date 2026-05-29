@@ -71,10 +71,12 @@ fn lty_of(t: Type) -> LTy {
         Type::Array(e) => LTy::Arr(matches!(e, Elem::F64)),
         Type::Str => LTy::Str,
         Type::Struct(id) => LTy::Struct(id),
+        // a nullable struct is a struct pointer that may be null
+        Type::OptStruct(id) => LTy::Struct(id),
         Type::I32 => LTy::I32,
         Type::U32 => LTy::U32,
         Type::U64 => LTy::U64,
-        _ => LTy::I64, // i64, bool (bool is an i64 0/1)
+        _ => LTy::I64, // i64, bool, null
     }
 }
 
@@ -102,6 +104,24 @@ fn to_slot(body: &mut String, tmp: &mut usize, lty: LTy, val: &str) -> String {
     }
 }
 
+/// Coerce a value between `i64` and `ptr` (a null/struct pointer crossing a
+/// boundary — e.g. an `i64` null passed where a nullable-struct `ptr` is wanted).
+fn coerce(body: &mut String, tmp: &mut usize, from: LTy, to: LTy, val: &str) -> String {
+    match (llname(from), llname(to)) {
+        ("i64", "ptr") => {
+            let x = fresh(tmp);
+            body.push_str(&format!("  {x} = inttoptr i64 {val} to ptr\n"));
+            x
+        }
+        ("ptr", "i64") => {
+            let x = fresh(tmp);
+            body.push_str(&format!("  {x} = ptrtoint ptr {val} to i64\n"));
+            x
+        }
+        _ => val.to_string(),
+    }
+}
+
 /// Convert a raw i64 slot back to its typed value.
 fn from_slot(body: &mut String, tmp: &mut usize, lty: LTy, raw: &str) -> String {
     match lty {
@@ -121,11 +141,8 @@ fn from_slot(body: &mut String, tmp: &mut usize, lty: LTy, raw: &str) -> String 
 
 /// Reason a program can't use the LLVM tier, or `None`. The tier now covers the
 /// whole language, so this is always `None` (kept for the CLI's fallback path).
-pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
-    if prog.uses_nullable() {
-        return Some("nullable types (T | null)");
-    }
-    None
+pub fn ineligible_reason(_prog: &Program) -> Option<&'static str> {
+    None // the LLVM tier compiles the whole language, including nullable structs
 }
 
 /// Per-register LLVM type (registers are monotonic ⇒ one static type each).
@@ -140,7 +157,20 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
             Instr::FConst { dst, .. } => t[*dst as usize] = LTy::F64,
             Instr::SConst { dst, .. } => t[*dst as usize] = LTy::Str,
             Instr::Cast { dst, to, .. } => t[*dst as usize] = lty_of(*to),
-            Instr::Mov { dst, src } => t[*dst as usize] = t[*src as usize],
+            Instr::Mov { dst, src } => {
+                // a null (i64 0) moved into a heap/struct register keeps that type
+                let s = t[*src as usize];
+                let heap = matches!(t[*dst as usize], LTy::Struct(_) | LTy::Arr(_) | LTy::Str);
+                if !(s == LTy::I64 && heap) {
+                    t[*dst as usize] = s;
+                }
+            }
+            Instr::ConstNull { dst, id } => {
+                t[*dst as usize] = match id {
+                    Some(s) => LTy::Struct(*s),
+                    None => LTy::I64,
+                };
+            }
             Instr::Bin { op, dst, a, .. } => {
                 use BinOp::*;
                 t[*dst as usize] = match op {
@@ -448,9 +478,27 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 store(&mut s, &rty, *dst, &r);
             }
             Instr::Bin { op, dst, a, b } => {
-                let av = load(&mut s, &mut tmp, &rty, *a);
-                let bv = load(&mut s, &mut tmp, &rty, *b);
-                let r = emit_bin(&mut s, &mut tmp, *op, rty[*a as usize], &av, &bv);
+                let mut av = load(&mut s, &mut tmp, &rty, *a);
+                let mut bv = load(&mut s, &mut tmp, &rty, *b);
+                let mut op_ty = rty[*a as usize];
+                // `x === null` / pointer equality: compare as integers, since one
+                // side may be an i64 null and LLVM `icmp` needs matching types.
+                let ptr_eq = matches!(op, BinOp::Eq | BinOp::Ne)
+                    && (llname(rty[*a as usize]) == "ptr" || llname(rty[*b as usize]) == "ptr");
+                if ptr_eq {
+                    if llname(rty[*a as usize]) == "ptr" {
+                        let t = fresh(&mut tmp);
+                        s.push_str(&format!("  {t} = ptrtoint ptr {av} to i64\n"));
+                        av = t;
+                    }
+                    if llname(rty[*b as usize]) == "ptr" {
+                        let t = fresh(&mut tmp);
+                        s.push_str(&format!("  {t} = ptrtoint ptr {bv} to i64\n"));
+                        bv = t;
+                    }
+                    op_ty = LTy::I64;
+                }
+                let r = emit_bin(&mut s, &mut tmp, *op, op_ty, &av, &bv);
                 store(&mut s, &rty, *dst, &r);
             }
             Instr::Unary { op, dst, a } => {
@@ -496,9 +544,12 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
             Instr::Call { func, arg_base, argc, dst } => {
                 let args: Vec<String> = (0..*argc)
                     .map(|k| {
+                        let aty = rty[(*arg_base + k) as usize];
+                        let pty = lty_of(prog.funcs[*func as usize].params[k as usize]);
                         let v = load(&mut s, &mut tmp, &rty, *arg_base + k);
-                        let pty = llname(lty_of(prog.funcs[*func as usize].params[k as usize]));
-                        format!("{pty} {v}")
+                        // coerce a null/pointer arg to the parameter's type
+                        let v = coerce(&mut s, &mut tmp, aty, pty, &v);
+                        format!("{} {v}", llname(pty))
                     })
                     .collect();
                 let rt = llname(lty_of(prog.funcs[*func as usize].ret));
@@ -507,8 +558,11 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 store(&mut s, &rty, *dst, &t);
             }
             Instr::Ret { src } => {
+                let retty = lty_of(f.ret);
                 let v = load(&mut s, &mut tmp, &rty, *src);
-                s.push_str(&format!("  ret {} {v}\n", llname(rty[*src as usize])));
+                // coerce the returned value to the function's declared return type
+                let v = coerce(&mut s, &mut tmp, rty[*src as usize], retty, &v);
+                s.push_str(&format!("  ret {} {v}\n", llname(retty)));
                 term = true;
             }
             Instr::Print { a } => {
@@ -645,8 +699,11 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 ));
                 s.push_str(&format!("  store i64 {raw}, ptr {sp}\n"));
             }
-            Instr::ConstNull { .. } => {
-                return Err("internal: nullable types run on the interpreter".into());
+            Instr::ConstNull { dst, .. } => {
+                // a struct-typed register gets a `ptr null`; a comparison-operand
+                // null is `i64 0` (both round-trip to 0).
+                let v = if llname(rty[*dst as usize]) == "ptr" { "null" } else { "0" };
+                store(&mut s, &rty, *dst, v);
             }
             Instr::Builtin { op, dst, args } => {
                 use BuiltinOp::*;
@@ -942,6 +999,25 @@ mod tests {
         assert!(ir.contains("define i64 @zfn"));
         assert!(ir.contains("@main"));
         assert!(ir.contains("alloca"));
+    }
+
+    #[test]
+    fn emits_ir_for_nullable_structs() {
+        // nullable param + narrowing + `??` — LLVM now compiles this natively
+        // (a null is a `ptr null` / `i64 0`, struct equality via `ptrtoint`).
+        let ts = "interface User { age: i64; } \
+                  function ageOr(u: User | null, fb: i64): i64 { \
+                    if (u !== null) { return u.age; } return fb; \
+                  } \
+                  function main(): i64 { \
+                    let some: User | null = { age: 5 } as User; \
+                    return ageOr(some, -1) + ageOr(null, -1); }";
+        let module = zipp_ts::compile_ts(ts).expect("lower");
+        let prog = zippc::compile_module(&module).expect("compile");
+        assert!(ineligible_reason(&prog).is_none()); // no interpreter fallback
+        let ir = emit_ir(&prog).unwrap();
+        assert!(ir.contains("define i64 @zfn"));
+        assert!(ir.contains("ptrtoint") || ir.contains("inttoptr")); // null/ptr crossing
     }
 
     #[test]

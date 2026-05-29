@@ -11,3 +11,8 @@ description = "ZIPP optional release tier — emit LLVM IR text, compile with cl
 # LLVM -O3 optimize + codegen).
 [dependencies]
 zippc = { path = "../zippc" }
+
+[dev-dependencies]
+# Tests use the TypeScript frontend to exercise nullable structs (no `.zipp`
+# syntax for `null`).
+zipp-ts = { path = "../zipp-ts" }

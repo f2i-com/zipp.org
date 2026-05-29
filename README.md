@@ -111,7 +111,7 @@ cargo build --release
 ./target/release/zipp run examples/destructure.ts    # string enum + destructuring
 ./target/release/zipp run examples/defaults.ts       # default parameter values
 ./target/release/zipp run examples/optional.ts       # T | null, ??, narrowing
-./target/release/zipp run --jit examples/chain.ts    # optional chaining a?.b?.c ?? d
+./target/release/zipp run --llvm examples/chain.ts   # optional chaining a?.b?.c ?? d
 
 # run the language test suite
 cargo test
@@ -368,9 +368,9 @@ monomorphized generic functions; `box.ts` generic classes; `cards.ts` an enum +
 a string enum + array/object destructuring; `defaults.ts` default parameters;
 `optional.ts` nullable references (`T | null`, `??`, narrowing); `chain.ts`
 optional chaining. Most run on all
-four backends; **nullable (`T | null`) also runs natively on `--jit`** (a null is
-a 0 pointer — struct handles are `i64` in Cranelift), with `--llvm`/`--wasm`
-falling back to the interpreter for it (no null representation there yet).
+four backends; **nullable (`T | null`) runs natively on `--jit` and `--llvm`**
+(a null is a 0 / null pointer; `=== null` is a pointer compare), with `--wasm`
+falling back to the interpreter for it (its contract profile stays scalar-only).
 
 **Editor + `tsc` support:** the repo ships a `zipp.d.ts` declaring the
 `i64`/`u32`/… types, the cast functions, the math builtins, `print`/`console`,

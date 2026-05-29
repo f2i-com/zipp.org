@@ -1272,6 +1272,7 @@ dependencies = [
 name = "zipp-llvm"
 version = "0.0.1"
 dependencies = [
+ "zipp-ts",
  "zippc",
 ]
 

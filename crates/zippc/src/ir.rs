@@ -96,17 +96,6 @@ pub struct Program {
     pub structs: Vec<StructLayout>,
 }
 
-impl Program {
-    /// True if the program uses nullable struct references (`T | null`). The
-    /// native tiers (jit/llvm/wasm) fall back to the interpreter for these (v0).
-    pub fn uses_nullable(&self) -> bool {
-        let opt = |t: &Type| matches!(t, Type::OptStruct(_) | Type::Null);
-        self.code.iter().any(|i| matches!(i, Instr::ConstNull { .. }))
-            || self.funcs.iter().any(|f| opt(&f.ret) || f.params.iter().any(opt))
-            || self.structs.iter().any(|s| s.types.iter().any(opt))
-    }
-}
-
 pub fn lower(m: &Module) -> Result<Program, String> {
     let mut func_index: HashMap<String, u32> = HashMap::new();
     for (i, f) in m.funcs.iter().enumerate() {
