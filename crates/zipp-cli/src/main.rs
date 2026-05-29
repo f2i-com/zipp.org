@@ -28,34 +28,43 @@ fn run(args: &[String]) -> Result<(), String> {
             let mut prove = false;
             let mut jit = false;
             let mut llvm = false;
+            let mut wasm = false;
             let mut fast_math = false;
+            let mut gas: u64 = 1_000_000_000;
             let mut path: Option<String> = None;
-            for a in it {
+            let mut it = it.peekable();
+            while let Some(a) = it.next() {
                 match a.as_str() {
                     "--prove" => prove = true,
                     "--jit" => jit = true,
                     "--llvm" => llvm = true,
+                    "--wasm" => wasm = true,
                     "--ffast-math" => fast_math = true,
+                    "--gas" => {
+                        let v = it.next().ok_or("--gas needs a value")?;
+                        gas = v.parse().map_err(|_| format!("invalid --gas value '{v}'"))?;
+                    }
                     s if s.starts_with("--") => return Err(format!("unknown flag '{s}'")),
                     s => path = Some(s.to_string()),
                 }
             }
-            let path =
-                path.ok_or("usage: zipp run [--prove] [--jit|--llvm [--ffast-math]] <file.zipp>")?;
-            if jit && llvm {
-                return Err("--jit (Cranelift) and --llvm (clang -O3) are different backends; pick one".into());
+            let path = path
+                .ok_or("usage: zipp run [--prove] [--jit|--llvm|--wasm] [--ffast-math] [--gas N] <file.zipp>")?;
+            if [jit, llvm, wasm].iter().filter(|x| **x).count() > 1 {
+                return Err("--jit, --llvm and --wasm are different backends; pick one".into());
             }
             if fast_math && !(jit || llvm) {
                 return Err("--ffast-math only applies with --jit or --llvm".into());
             }
-            run_file(&path, prove, jit, llvm, fast_math)
+            run_file(&path, prove, jit, llvm, wasm, gas, fast_math)
         }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
             println!("usage:");
             println!("  zipp run <file.zipp>            compile + run (interpreter)");
-            println!("  zipp run --jit <file.zipp>      Cranelift JIT, scalar subset (tier-0)");
-            println!("  zipp run --llvm <file.zipp>     clang -O3 release tier, scalar subset");
+            println!("  zipp run --jit <file.zipp>      Cranelift JIT (fast-compile tier-0)");
+            println!("  zipp run --llvm <file.zipp>     clang -O3 release tier");
+            println!("  zipp run --wasm <file.zipp>     gas-metered WebAssembly (contract profile; --gas N)");
             println!("  zipp run --jit|--llvm --ffast-math <file.zipp>   + FMA/reassoc (changes float rounding)");
             println!("  zipp run --prove <file.zipp>    run, then zk-STARK prove + verify the execution");
             Ok(())
@@ -64,11 +73,20 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn run_file(path: &str, prove: bool, jit: bool, llvm: bool, fast_math: bool) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn run_file(
+    path: &str,
+    prove: bool,
+    jit: bool,
+    llvm: bool,
+    wasm: bool,
+    gas: u64,
+    fast_math: bool,
+) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
     let program = zippc::compile(&src)?;
 
-    if (jit || llvm) && prove {
+    if (jit || llvm || wasm) && prove {
         return Err("--prove needs the interpreter trace; it can't be combined with a native backend".into());
     }
     if jit {
@@ -91,6 +109,16 @@ fn run_file(path: &str, prove: bool, jit: bool, llvm: bool, fast_math: bool) -> 
             return Ok(());
         }
         // ineligible — llvm_run explained why; fall through to the interpreter.
+    }
+    if wasm {
+        if let Some((r, out, gas_used, bytes)) = wasm_run(&program, gas)? {
+            print!("{out}"); // program output captured from the wasm host
+            println!(
+                "=> {r} (wasm · contract · {bytes} bytes · {gas_used} gas of {gas})"
+            );
+            return Ok(());
+        }
+        // ineligible — wasm_run explained why; fall through to the interpreter.
     }
 
     let t0 = Instant::now();
@@ -167,6 +195,22 @@ fn llvm_run(
     _fast_math: bool,
 ) -> Result<Option<(String, String, std::time::Duration, std::time::Duration)>, String> {
     Err("this build has no llvm tier — rebuild with the `llvm` feature".into())
+}
+
+// (formatted result, program output, gas used, wasm size in bytes)
+#[cfg(feature = "wasm")]
+fn wasm_run(program: &zippc::Program, gas: u64) -> Result<Option<(String, String, u64, usize)>, String> {
+    if let Some(bad) = zipp_wasm::ineligible_reason(program) {
+        eprintln!("zipp: --wasm covers the scalar subset only (program uses {bad}); using the interpreter");
+        return Ok(None);
+    }
+    let r = zipp_wasm::build_and_run(program, gas)?;
+    Ok(Some((r.result, r.program_output, r.gas_used, r.wasm_bytes)))
+}
+
+#[cfg(not(feature = "wasm"))]
+fn wasm_run(_program: &zippc::Program, _gas: u64) -> Result<Option<(String, String, u64, usize)>, String> {
+    Err("this build has no wasm profile — rebuild with the `wasm` feature".into())
 }
 
 #[cfg(feature = "zk")]

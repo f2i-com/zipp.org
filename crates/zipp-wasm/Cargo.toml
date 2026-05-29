@@ -1,0 +1,11 @@
+[package]
+name = "zipp-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP OPTIONAL contract profile — emit deterministic, gas-metered WebAssembly (ZIPP.md §7, the EVM lane)"
+
+[dependencies]
+zippc = { path = "../zippc" }
+# Pure-Rust WAT (WebAssembly text) assembler — no C toolchain needed.
+wat = "1"

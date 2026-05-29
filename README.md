@@ -5,19 +5,25 @@ in [`../ZIPP.md`](../ZIPP.md); this repo is the standalone implementation.
 
 ZIPP has **three execution profiles** from one frontend + IR:
 
-| Profile | Target | Optimized for | Competes with |
-|---|---|---|---|
-| **native / dApp** | native + WASM (Cranelift/LLVM) | raw speed | V8 |
-| **contract** | deterministic gas-metered WASM | determinism, code size | the EVM |
-| **provable** *(optional)* | zk-STARK over a register-VM trace | verifiable execution | Cairo / a STARK VM |
+ZIPP has **three execution profiles** from one frontend + IR — all three are
+implemented:
 
-The **provable** profile is the new third lane (this commit). It's `--prove`: run
-a program, then produce *and verify* a zk-STARK proof that the execution was
-computed correctly — the same application-specific-STARK approach the ZIPP chain
-uses for FormLogic, but over ZIPP's own VM. That makes ZIPP a candidate successor
-to FormLogic as the chain's contract language (a "Cairo for ZIPP"), while the
-native profile targets off-chain dApp/tooling speed. zk is **optional**: build
-with `--no-default-features` and the language still runs.
+| Profile | Flag | Target | Competes with |
+|---|---|---|---|
+| **native / dApp** | `--jit` / `--llvm` | machine code (Cranelift / clang -O3) | V8 |
+| **contract** | `--wasm` | deterministic, gas-metered WebAssembly | the EVM |
+| **provable** *(optional)* | `--prove` | zk-STARK over a register-VM trace | Cairo / a STARK VM |
+
+- **native**: the JIT and LLVM tiers (above) — match/beat V8 & Bun, GC'd.
+- **contract**: `--wasm` emits a small gas-metered WASM module that runs anywhere
+  (deterministic, sandboxed) and traps when it runs out of gas — the on-chain
+  contract lane, a candidate successor to FormLogic ("Cairo for ZIPP").
+- **provable**: `--prove` produces *and verifies* a zk-STARK proof that the
+  execution was computed correctly, the same application-specific-STARK approach
+  the ZIPP chain uses for FormLogic, over ZIPP's own VM.
+
+The optional profiles build out by default; `--no-default-features` drops the
+heavy deps (Winterfell/Cranelift) and the language still runs on the interpreter.
 
 ## Status (v0 — a working vertical slice, not the finished language)
 
@@ -51,6 +57,10 @@ with `--no-default-features` and the language still runs.
   with `clang -O3 -march=native` — same coverage (incl. the GC), **matches V8 on
   dense f64** and **beats V8 and Bun on dense-f64 arrays** (matmul). No
   `llvm-sys` linkage; it shells out to `clang` and links the shared runtime.
+- A **WASM contract profile** (`zipp run --wasm`): emits **deterministic,
+  gas-metered WebAssembly** for the scalar subset — the ZIPP.md §7 lane that
+  competes with the EVM. Pure-Rust assembler (`wat`); a per-basic-block gas
+  counter traps on exhaustion (`--gas N`). Heap types fall back to the interpreter.
 - An integration **test suite** (`cargo test`)
 - **Positioned errors** — parse errors report `line:col`, type errors report the
   statement line (e.g. `type error: arithmetic Add on I64 and Bool [line 2]`)
@@ -100,6 +110,10 @@ cargo test
 ./target/release/zipp run --llvm bench/matmul.zipp     # 256x256 f64 array kernel
 ./target/release/zipp run --jit  examples/arrays.zipp  # arrays JIT too (bubble sort)
 
+# contract profile: deterministic, gas-metered WebAssembly (needs node to run)
+./target/release/zipp run --wasm examples/fib.zipp           # => 55  (… N gas)
+./target/release/zipp run --wasm --gas 1000 bench/loop.zipp  # traps: out of gas
+
 # run + zk-STARK prove + verify the execution
 ./target/release/zipp run --prove examples/add.zipp
 ./target/release/zipp run --prove examples/sum.zipp
@@ -132,6 +146,7 @@ zipp-lang/
 │   ├── zipp-rt/      # shared native runtime: allocator + conservative GC (rlib + staticlib)
 │   ├── zipp-jit/     # OPTIONAL native backend (Cranelift JIT, tier-0)
 │   ├── zipp-llvm/    # OPTIONAL release tier (emit LLVM IR, compile with clang -O3)
+│   ├── zipp-wasm/    # OPTIONAL contract profile (emit gas-metered WebAssembly)
 │   └── zipp-cli/     # the `zipp` binary
 └── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz, math, structs, fnv
 ```
@@ -274,6 +289,27 @@ only the current one live), peak RSS — GC on vs off (`ZIPP_GC=0`):
 ~100–140× less memory, same answer. String *literals* are allocated outside the
 GC (immortal — the JIT bakes them into the code, the LLVM tier puts them in the
 exe's read-only data). Set `ZIPP_GC=0` to disable collection.
+
+## Contract profile (WASM, gas-metered)
+
+`zipp run --wasm` compiles the scalar subset to a small, deterministic WASM
+module and runs it (under Node) with a **gas budget**. Gas is emitted *into* the
+module — a `$gas` global is charged per basic block and traps (`unreachable`)
+when it hits zero — so metering is part of the artifact, not the runtime, exactly
+like an on-chain VM. Arbitrary control flow is lowered with the standard
+`br_table` dispatch loop (no relooper). Heap types fall back to the interpreter.
+
+| program | module | gas | result |
+|---|---|---|---|
+| `examples/fib.zipp` | 559 B | 1,773 | 55 |
+| `examples/bits.zipp` | 404 B | 20 | 247 |
+| `examples/pi.zipp` (f64) | 604 B | 18,000,016 | 3.14159… |
+| `bench/loop.zipp` (50M) | 446 B | 450,000,011 | 1250000025000000 |
+
+`--gas N` sets the budget; a runaway loop traps "out of gas" (e.g.
+`zipp run --wasm --gas 1000 bench/loop.zipp`). Results match the interpreter
+exactly. The pure-Rust `wat` crate assembles the text to a `.wasm`; no external
+toolchain. *(Future: a gas-priced heap/runtime to lift the scalar-only limit.)*
 
 ## License
 

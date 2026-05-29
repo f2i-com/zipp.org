@@ -14,13 +14,15 @@ path = "src/main.rs"
 # (Winterfell, Cranelift); the LLVM tier itself has no build-time dependency
 # (it shells out to clang), so it's cheap to keep.
 [features]
-default = ["zk", "jit", "llvm"]
+default = ["zk", "jit", "llvm", "wasm"]
 zk = ["dep:zipp-zk"]
 jit = ["dep:zipp-jit"]
 llvm = ["dep:zipp-llvm"]
+wasm = ["dep:zipp-wasm"]
 
 [dependencies]
 zippc = { path = "../zippc" }
 zipp-zk = { path = "../zipp-zk", optional = true }
 zipp-jit = { path = "../zipp-jit", optional = true }
 zipp-llvm = { path = "../zipp-llvm", optional = true }
+zipp-wasm = { path = "../zipp-wasm", optional = true }
