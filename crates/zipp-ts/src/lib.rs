@@ -2334,6 +2334,32 @@ mod tests {
     }
 
     #[test]
+    fn string_switch_and_early_narrowing() {
+        // switch on a string discriminant (+ empty-case stacking)
+        let ts = "function code(s: str): i64 { \
+                    switch (s) { \
+                      case \"red\": return 1; \
+                      case \"green\": case \"lime\": return 2; \
+                      default: return 0; \
+                    } \
+                  } \
+                  function main(): i64 { return code(\"red\") + code(\"lime\") + code(\"blue\"); }";
+        assert_eq!(run_i64(ts), 3); // 1 + 2 + 0
+        // early-return narrowing: `if (x === null) return …;` then use x non-null
+        let ts2 = "interface User { age: i64; } \
+                   function ageOf(u: User | null): i64 { \
+                     if (u === null) { return -1; } \
+                     return u.age; \
+                   } \
+                   function main(): i64 { let a: User = { age: 40 }; return ageOf(a) + ageOf(null); }";
+        assert_eq!(run_i64(ts2), 39); // 40 + (-1)
+        // …also for a nullable scalar
+        let ts3 = "function f(n: i64 | null): i64 { if (n === null) { return 0; } return n + 1; } \
+                   function main(): i64 { return f(10) + f(null); }";
+        assert_eq!(run_i64(ts3), 11); // 11 + 0
+    }
+
+    #[test]
     fn tuples() {
         // tuple return + destructuring (the multiple-return-values pattern)
         let ts = "function divmod(a: i64, b: i64): [i64, i64] { return [a / b, a % b]; } \

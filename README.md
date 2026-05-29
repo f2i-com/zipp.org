@@ -108,6 +108,7 @@ cargo build --release
 ./target/release/zipp run --llvm examples/tuple.ts   # tuples [i64,str] + destructuring
 ./target/release/zipp run examples/cards.ts          # numeric enum + for...of
 ./target/release/zipp run --wasm examples/calc.ts    # switch (runs in the contract profile)
+./target/release/zipp run --jit examples/narrow.ts   # string switch + early-return narrowing
 ./target/release/zipp run --jit examples/ternary.ts  # ternary ?: (a lazy recursive fib)
 ./target/release/zipp run examples/destructure.ts    # string enum + destructuring
 ./target/release/zipp run examples/defaults.ts       # default parameter values
@@ -361,8 +362,9 @@ concrete types (inferred or explicit), so the backends only ever see concrete
 code (a `Box<i64>` and a `Box<bool>` are two distinct structs), **optionals** —
 `T | null` for heap types (structs, `str`, arrays) and nullable scalars
 `i64 | null` / `f64 | null` / `bool | null`, plus `null`, `x ?? y`, `=== null`,
-`if (x !== null)` flow narrowing, and optional chaining `a?.b` / `a?.b ?? default`,
-`console.log`, math builtins. **Type mapping:** `number`→f64, `bigint`→i64,
+flow narrowing (`if (x !== null) {…}` and early-return `if (x === null) return;`),
+and optional chaining `a?.b` / `a?.b ?? default`, `console.log`, math builtins.
+(`switch` works on numbers, strings, and enums.) **Type mapping:** `number`→f64, `bigint`→i64,
 `boolean`→bool,
 `string`→str, and `i64`/`i32`/`u32`/`u64`/`f64` and your
 `interface`/`class`/`enum` names usable directly. `examples/fib.ts` runs

@@ -40,6 +40,25 @@ impl Scope {
     fn lookup(&self, name: &str) -> Option<Type> {
         self.frames.iter().rev().find_map(|f| f.get(name).copied())
     }
+    /// Set a name's type in the innermost frame (overwriting), shadowing any
+    /// outer binding for the rest of this scope. Used for flow narrowing.
+    fn set_local(&mut self, name: &str, ty: Type) {
+        self.frames.last_mut().expect("at least one scope").insert(name.to_string(), ty);
+    }
+}
+
+/// Does a statement always leave the enclosing block (return/break/continue, or
+/// an `if`/`else` whose branches all do)? Used for early-return flow narrowing.
+fn stmt_diverges(s: &Stmt) -> bool {
+    match &s.kind {
+        StmtKind::Return(_) | StmtKind::Break | StmtKind::Continue => true,
+        StmtKind::If { then_b, else_b, .. } => block_diverges(then_b) && block_diverges(else_b),
+        _ => false,
+    }
+}
+
+fn block_diverges(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(stmt_diverges)
 }
 
 /// Checker context: function signatures + struct declarations.
@@ -105,10 +124,9 @@ fn check_func(f: &Func, cx: &Cx) -> Result<(), String> {
             format!("type error: parameter '{}' declared twice in '{}'", p.name, f.name)
         })?;
     }
-    for s in &f.body {
-        check_stmt(s, &mut scope, cx, f.ret, &f.name, 0)?;
-    }
-    Ok(())
+    // Check the body as a block (params stay in the outer frame) so flow
+    // narrowing applies to the function's top-level statements too.
+    check_block(&f.body, &mut scope, cx, f.ret, &f.name, 0)
 }
 
 fn check_stmt(
@@ -261,6 +279,24 @@ fn check_block(
     let r = (|| {
         for s in stmts {
             check_stmt(s, scope, cx, ret, fname, loop_depth)?;
+            // Early-return narrowing: after `if (x === null) { <diverges> }` (or
+            // `if (x !== null) {} else { <diverges> }`), `x` is non-null for the
+            // rest of the block.
+            if let StmtKind::If { cond, then_b, else_b } = &s.kind {
+                if let Some((x, narrow_in_then)) = null_guard(cond) {
+                    // the rest is non-null if the *null* branch always diverges
+                    let rest_nonnull = if narrow_in_then {
+                        block_diverges(else_b) // `x !== null`: else is the null branch
+                    } else {
+                        block_diverges(then_b) // `x === null`: then is the null branch
+                    };
+                    if rest_nonnull {
+                        if let Some(inner) = scope.lookup(x).and_then(Type::opt_inner) {
+                            scope.set_local(x, inner);
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     })();
