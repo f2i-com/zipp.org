@@ -15,6 +15,10 @@ type u32 = number;
 type u64 = number;
 type f64 = number;
 
+// ── ZIPP aliases for the built-in scalar types ──
+type bool = boolean;
+type str = string;
+
 // ── numeric casts (runtime conversions in ZIPP; `i64(x)` truncates, etc.) ──
 declare function i64(x: number): i64;
 declare function i32(x: number): i32;

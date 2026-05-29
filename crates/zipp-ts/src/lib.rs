@@ -16,11 +16,12 @@
 //! `i64`/`i32`/`u32`/`u64`/`f64` usable directly. `interface`s and `class`es
 //! become ZIPP structs (a class lowers to a `C__new` factory plus methods that
 //! take `this` as their first parameter; `new`/`this`/`obj.method()` are
-//! rewritten accordingly). Generic functions are **monomorphized**: every call
-//! is specialized to concrete types (inferred or explicit `f<T>(…)`), so the
-//! backends only ever see concrete code. Not yet: generic classes, closures,
-//! inheritance — and never the dynamic core (`any`, prototypes, `eval`,
-//! exceptions, async), which is off-mission for an AOT/provable language.
+//! rewritten accordingly). Generic functions **and classes** are
+//! **monomorphized**: every use is specialized to concrete types (inferred or
+//! explicit `<T>`) — a generic class instantiation becomes a fresh struct plus a
+//! factory and methods — so the backends only ever see concrete code. Not yet:
+//! closures, inheritance — and never the dynamic core (`any`, prototypes,
+//! `eval`, exceptions, async), which is off-mission for an AOT/provable language.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -43,14 +44,16 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
     }
     let mut lower = Lower {
         src,
-        structs: HashMap::new(),
-        struct_fields: Vec::new(),
+        structs: RefCell::new(HashMap::new()),
+        struct_decls: RefCell::new(Vec::new()),
         fn_rets: RefCell::new(HashMap::new()),
         scope: RefCell::new(Vec::new()),
         ret_struct: Cell::new(None),
         generic_info: HashMap::new(),
+        generic_class_info: HashMap::new(),
         type_env: RefCell::new(Vec::new()),
         pending: RefCell::new(Vec::new()),
+        pending_classes: RefCell::new(Vec::new()),
         done_insts: RefCell::new(HashSet::new()),
         enums: HashMap::new(),
         tmp: Cell::new(0),
@@ -60,11 +63,13 @@ pub fn compile_ts(src: &str) -> Result<z::Module, String> {
 
 struct Lower<'s> {
     src: &'s str,
-    /// Interface/class name → struct index (in `Module::structs`).
-    structs: HashMap<String, u32>,
-    /// Parallel to `structs`: struct id → its `(field, type)` list. Used to infer
-    /// `obj.field` types (and so resolve method-call receivers).
-    struct_fields: Vec<Vec<(String, z::Type)>>,
+    /// Interface/class/struct-instantiation name → struct index (in
+    /// `Module::structs`). `RefCell` because generic-class instantiations add new
+    /// structs on demand during lowering.
+    structs: RefCell<HashMap<String, u32>>,
+    /// Struct id → its decl. Parallel to `structs`; the module's `structs` vector
+    /// is taken from here at the end. Grows as generic classes are instantiated.
+    struct_decls: RefCell<Vec<z::StructDecl>>,
     /// Every callable's return type — top-level functions, class factories
     /// (`C__new`), methods (`C__m`), and generic instantiations. Lets a call
     /// (or method) resolve a receiver whose type comes from a call result.
@@ -76,10 +81,15 @@ struct Lower<'s> {
     ret_struct: Cell<Option<u32>>,
     /// Generic function name → owned monomorphization metadata.
     generic_info: HashMap<String, GenericInfo>,
+    /// Generic class name → owned monomorphization metadata.
+    generic_class_info: HashMap<String, ClassGenericInfo>,
     /// Active type-parameter bindings (a stack, for nested instantiation).
     type_env: RefCell<Vec<HashMap<String, z::Type>>>,
-    /// Queue of generic instantiations still to emit: (generic name, type args).
+    /// Queue of generic function instantiations still to emit: (name, type args).
     pending: RefCell<Vec<(String, Vec<z::Type>)>>,
+    /// Queue of generic class instantiations to flesh out: (name, type args, the
+    /// already-allocated struct id whose fields/methods still need emitting).
+    pending_classes: RefCell<Vec<(String, Vec<z::Type>, u32)>>,
     /// Mangled instantiation names already emitted or queued (dedup).
     done_insts: RefCell<HashSet<String>>,
     /// Numeric enum: name → (member name → integer value).
@@ -98,7 +108,18 @@ struct GenericInfo {
     ret: Option<TypeTpl>,
 }
 
-/// A generic function's return type expressed against its type parameters.
+/// Owned metadata to monomorphize a generic class (`class C<T> { … }`).
+struct ClassGenericInfo {
+    type_params: Vec<String>,
+    /// Per type param: a constructor-argument index to infer it from (a ctor
+    /// param typed exactly `T`), or `None` (then `new C<…>()` is required).
+    ctor_infer: Vec<Option<usize>>,
+    /// Each method's `(name, return-type template)` — for the instantiation's
+    /// `fn_rets` entries.
+    methods: Vec<(String, Option<TypeTpl>)>,
+}
+
+/// A generic return/field type expressed against the type parameters.
 enum TypeTpl {
     Concrete(z::Type),
     Param(usize),
@@ -149,38 +170,57 @@ impl Lower<'_> {
             }
         }
 
-        // Pass 1a: register every interface/class name → struct id (source order),
-        // so type references and constructions resolve regardless of order.
-        let mut next_id = 0u32;
-        for stmt in &program.body {
-            let (name, span) = match stmt {
-                Statement::TSInterfaceDeclaration(i) => (i.id.name.as_str(), i.span),
-                Statement::ClassDeclaration(c) => {
-                    let id = c
-                        .id
-                        .as_ref()
-                        .ok_or_else(|| self.err(c.span, "classes must be named"))?;
-                    (id.name.as_str(), c.span)
-                }
-                _ => continue,
-            };
-            if self.structs.contains_key(name) {
-                return Err(self.err(span, format!("type '{name}' redefined")));
-            }
-            self.structs.insert(name.to_string(), next_id);
-            next_id += 1;
-        }
-
-        // Pass 1b: lower struct bodies (interface fields / class fields).
-        let mut structs: Vec<z::StructDecl> = Vec::new();
+        // Pass 1a: register names. Non-generic interfaces/classes get a struct id
+        // now (a placeholder filled in pass 1b); a generic class instead gets
+        // owned metadata + a borrow of its AST to instantiate from. Source order,
+        // so forward references resolve.
+        let mut generic_classes: HashMap<String, &Class> = HashMap::new();
         for stmt in &program.body {
             match stmt {
-                Statement::TSInterfaceDeclaration(i) => structs.push(self.interface(i)?),
-                Statement::ClassDeclaration(c) => structs.push(self.class_struct(c)?),
-                _ => continue,
+                Statement::TSInterfaceDeclaration(i) => {
+                    let name = i.id.name.as_str();
+                    self.check_type_unique(name, i.span)?;
+                    self.add_struct(z::StructDecl { name: name.to_string(), fields: Vec::new() });
+                }
+                Statement::ClassDeclaration(c) => {
+                    let name = c
+                        .id
+                        .as_ref()
+                        .ok_or_else(|| self.err(c.span, "classes must be named"))?
+                        .name
+                        .as_str();
+                    self.check_type_unique(name, c.span)?;
+                    if let Some(decl) = &c.type_parameters {
+                        let info = self.class_generic_info_of(c, decl)?;
+                        self.generic_class_info.insert(name.to_string(), info);
+                        generic_classes.insert(name.to_string(), c);
+                    } else {
+                        self.add_struct(z::StructDecl {
+                            name: name.to_string(),
+                            fields: Vec::new(),
+                        });
+                    }
+                }
+                _ => {}
             }
         }
-        self.struct_fields = structs.iter().map(|s| s.fields.clone()).collect();
+
+        // Pass 1b: fill in the non-generic struct bodies (placeholders from 1a).
+        for stmt in &program.body {
+            match stmt {
+                Statement::TSInterfaceDeclaration(i) => {
+                    let id = self.struct_id(i.id.name.as_str()).unwrap();
+                    let decl = self.interface(i)?;
+                    self.struct_decls.borrow_mut()[id as usize] = decl;
+                }
+                Statement::ClassDeclaration(c) if c.type_parameters.is_none() => {
+                    let id = self.struct_id(c.id.as_ref().unwrap().name.as_str()).unwrap();
+                    let decl = self.class_struct(c)?;
+                    self.struct_decls.borrow_mut()[id as usize] = decl;
+                }
+                _ => {}
+            }
+        }
 
         // Pass 1c: collect the return type of every NON-generic callable up front
         // (generic instantiations register theirs at the call site). Methods can
@@ -197,8 +237,11 @@ impl Lower<'_> {
                     }
                 }
                 Statement::ClassDeclaration(c) => {
+                    if c.type_parameters.is_some() {
+                        continue; // generic — registered per instantiation
+                    }
                     let cname = c.id.as_ref().unwrap().name.as_str().to_string();
-                    let cid = self.structs[cname.as_str()];
+                    let cid = self.struct_id(&cname).unwrap();
                     self.fn_rets.borrow_mut().insert(format!("{cname}__new"), z::Type::Struct(cid));
                     for el in &c.body.body {
                         if let ClassElement::MethodDefinition(m) = el {
@@ -248,7 +291,11 @@ impl Lower<'_> {
                         funcs.push(self.func(f)?);
                     }
                 }
-                Statement::ClassDeclaration(c) => self.lower_class(c, &mut funcs)?,
+                Statement::ClassDeclaration(c) => {
+                    if c.type_parameters.is_none() {
+                        self.lower_class(c, &mut funcs)?;
+                    }
+                }
                 Statement::TSInterfaceDeclaration(_)
                 | Statement::TSTypeAliasDeclaration(_)
                 | Statement::TSEnumDeclaration(_)
@@ -262,24 +309,31 @@ impl Lower<'_> {
             }
         }
 
-        // Pass 3: monomorphize. Draining the queue may enqueue more (a generic
-        // calling another, or itself), so loop until no new specialization remains.
+        // Pass 3: monomorphize. Instantiating a generic (function or class) may
+        // request more, so drain both queues until empty.
         loop {
-            let next = self.pending.borrow_mut().pop();
-            let Some((gname, type_args)) = next else { break };
-            let mangled = mangle_generic(&gname, &type_args);
-            let f = generics[&gname];
-            let type_params = self.generic_info[&gname].type_params.clone();
-            let mut env = HashMap::new();
-            for (k, tp) in type_params.into_iter().enumerate() {
-                env.insert(tp, type_args[k]);
+            if let Some((gname, type_args)) = self.pending.borrow_mut().pop() {
+                let mangled = mangle_generic(&gname, &type_args);
+                let f = generics[&gname];
+                let type_params = self.generic_info[&gname].type_params.clone();
+                self.push_type_env(&type_params, &type_args);
+                let lowered = self.lower_func(f, mangled);
+                self.type_env.borrow_mut().pop();
+                funcs.push(lowered?);
+                continue;
             }
-            self.type_env.borrow_mut().push(env);
-            let lowered = self.lower_func(f, mangled);
-            self.type_env.borrow_mut().pop();
-            funcs.push(lowered?);
+            if let Some((cname, type_args, cid)) = self.pending_classes.borrow_mut().pop() {
+                let c = generic_classes[&cname];
+                let type_params = self.generic_class_info[&cname].type_params.clone();
+                self.push_type_env(&type_params, &type_args);
+                let r = self.instantiate_class_body(c, cid, &mut funcs);
+                self.type_env.borrow_mut().pop();
+                r?;
+                continue;
+            }
+            break;
         }
-        Ok(z::Module { funcs, structs })
+        Ok(z::Module { funcs, structs: self.struct_decls.take() })
     }
 
     /// Precompute the owned monomorphization metadata for a generic function.
@@ -354,6 +408,160 @@ impl Lower<'_> {
         format!("__z{tag}{n}")
     }
 
+    /// Error if a type name is already taken (struct/interface/enum/generic class).
+    fn check_type_unique(&self, name: &str, span: Span) -> LResult<()> {
+        if self.struct_id(name).is_some()
+            || self.generic_class_info.contains_key(name)
+            || self.enums.contains_key(name)
+        {
+            return Err(self.err(span, format!("type '{name}' redefined")));
+        }
+        Ok(())
+    }
+
+    /// Push a fresh type-parameter → concrete-type scope.
+    fn push_type_env(&self, params: &[String], args: &[z::Type]) {
+        let mut env = HashMap::new();
+        for (k, tp) in params.iter().enumerate() {
+            if let Some(t) = args.get(k) {
+                env.insert(tp.clone(), *t);
+            }
+        }
+        self.type_env.borrow_mut().push(env);
+    }
+
+    /// Precompute owned monomorphization metadata for a generic class.
+    fn class_generic_info_of(
+        &self,
+        c: &Class,
+        decl: &TSTypeParameterDeclaration,
+    ) -> LResult<ClassGenericInfo> {
+        let type_params: Vec<String> =
+            decl.params.iter().map(|p| p.name.name.as_str().to_string()).collect();
+        if type_params.is_empty() {
+            return Err(self.err(c.span, "generic class has no type parameters"));
+        }
+        // constructor-argument inference: a ctor param typed exactly `T`
+        let mut ctor_infer = vec![None; type_params.len()];
+        let ctor = c.body.body.iter().find_map(|el| match el {
+            ClassElement::MethodDefinition(m)
+                if matches!(m.kind, MethodDefinitionKind::Constructor) =>
+            {
+                Some(m)
+            }
+            _ => None,
+        });
+        if let Some(ctor) = ctor {
+            for (pi, p) in ctor.value.params.items.iter().enumerate() {
+                if let Some(ann) = &p.type_annotation {
+                    if let Some(tn) = bare_type_ref_name(&ann.type_annotation) {
+                        if let Some(k) = type_params.iter().position(|t| t == tn) {
+                            if ctor_infer[k].is_none() {
+                                ctor_infer[k] = Some(pi);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // each method's return-type template
+        let mut methods = Vec::new();
+        for el in &c.body.body {
+            if let ClassElement::MethodDefinition(m) = el {
+                if matches!(m.kind, MethodDefinitionKind::Method) {
+                    let mname = self.prop_name(&m.key, m.span)?;
+                    let ret = match &m.value.return_type {
+                        Some(ann) => self.ret_tpl(&ann.type_annotation, &type_params),
+                        None => None,
+                    };
+                    methods.push((mname, ret));
+                }
+            }
+        }
+        Ok(ClassGenericInfo { type_params, ctor_infer, methods })
+    }
+
+    /// Ensure a generic class is instantiated for `type_args`, returning the
+    /// struct id. Allocates the struct immediately (fields filled in pass 3) and
+    /// registers the factory/method return types for call-result typing.
+    fn instantiate_generic_class(
+        &self,
+        name: &str,
+        type_args: Vec<z::Type>,
+        span: Span,
+    ) -> LResult<u32> {
+        let nparams = self.generic_class_info[name].type_params.len();
+        if type_args.len() != nparams {
+            return Err(self.err(
+                span,
+                format!("{name} expects {nparams} type argument(s), got {}", type_args.len()),
+            ));
+        }
+        let mangled = mangle_generic(name, &type_args);
+        if let Some(id) = self.struct_id(&mangled) {
+            return Ok(id); // already instantiated
+        }
+        let id = self.add_struct(z::StructDecl { name: mangled.clone(), fields: Vec::new() });
+        self.fn_rets.borrow_mut().insert(format!("{mangled}__new"), z::Type::Struct(id));
+        for k in 0..self.generic_class_info[name].methods.len() {
+            let (mname, ret) = &self.generic_class_info[name].methods[k];
+            let rt = match ret {
+                Some(TypeTpl::Concrete(t)) => Some(*t),
+                Some(TypeTpl::Param(p)) => type_args.get(*p).copied(),
+                None => None,
+            };
+            if let Some(rt) = rt {
+                self.fn_rets.borrow_mut().insert(format!("{mangled}__{mname}"), rt);
+            }
+        }
+        self.pending_classes.borrow_mut().push((name.to_string(), type_args, id));
+        Ok(id)
+    }
+
+    /// Fill an instantiated class's struct fields and emit its factory/methods.
+    fn instantiate_class_body(
+        &self,
+        c: &Class,
+        cid: u32,
+        funcs: &mut Vec<z::Func>,
+    ) -> LResult<()> {
+        let fields = self.class_fields(c)?;
+        self.struct_decls.borrow_mut()[cid as usize].fields = fields;
+        self.emit_class_fns(c, cid, funcs)
+    }
+
+    /// Resolve a `new C(…)` call's type arguments — explicit `new C<A>(…)`, else
+    /// inferred from constructor arguments.
+    fn class_type_args(
+        &self,
+        n: &NewExpression,
+        name: &str,
+        args: &[z::Expr],
+    ) -> LResult<Vec<z::Type>> {
+        let nparams = self.generic_class_info[name].type_params.len();
+        if let Some(ta) = &n.type_arguments {
+            if ta.params.len() != nparams {
+                return Err(self.err(
+                    n.span,
+                    format!("{name} expects {nparams} type argument(s), got {}", ta.params.len()),
+                ));
+            }
+            return ta.params.iter().map(|p| self.ty(p)).collect();
+        }
+        let mut out = Vec::with_capacity(nparams);
+        for k in 0..nparams {
+            let tp = &self.generic_class_info[name].type_params[k];
+            let idx = self.generic_class_info[name].ctor_infer[k].ok_or_else(|| {
+                self.err(n.span, format!("can't infer '{tp}' for {name}; write `new {name}<…>(…)`"))
+            })?;
+            let t = args.get(idx).and_then(|a| self.ztype_of(a)).ok_or_else(|| {
+                self.err(n.span, format!("can't infer '{tp}' for {name}; write `new {name}<…>(…)`"))
+            })?;
+            out.push(t);
+        }
+        Ok(out)
+    }
+
     fn interface(&self, decl: &TSInterfaceDeclaration) -> LResult<z::StructDecl> {
         let name = decl.id.name.as_str().to_string();
         let mut fields = Vec::new();
@@ -383,10 +591,7 @@ impl Lower<'_> {
     /// struct identified by `id` (the ZIPP checker reorders/validates fields).
     fn obj_struct_lit(&self, obj: &ObjectExpression, id: u32) -> LResult<z::Expr> {
         let name = self
-            .structs
-            .iter()
-            .find(|(_, &v)| v == id)
-            .map(|(k, _)| k.clone())
+            .struct_name(id)
             .ok_or_else(|| self.err(obj.span, "internal: unknown struct id"))?;
         let mut fields = Vec::new();
         for p in &obj.properties {
@@ -423,14 +628,10 @@ impl Lower<'_> {
         }
     }
 
-    /// Lower a class's fields to a `StructDecl` (methods are lowered separately).
-    fn class_struct(&self, c: &Class) -> LResult<z::StructDecl> {
-        let name = c.id.as_ref().unwrap().name.as_str().to_string();
+    /// Lower a class's fields (under the active type env) to `(name, type)` pairs.
+    fn class_fields(&self, c: &Class) -> LResult<Vec<(String, z::Type)>> {
         if c.super_class.is_some() {
             return Err(self.err(c.span, "class inheritance (`extends`) isn't supported"));
-        }
-        if c.type_parameters.is_some() {
-            return Err(self.err(c.span, "generic classes aren't supported yet"));
         }
         let mut fields = Vec::new();
         for el in &c.body.body {
@@ -448,7 +649,7 @@ impl Lower<'_> {
                     })?;
                     fields.push((fname, self.ty(&ann.type_annotation)?));
                 }
-                ClassElement::MethodDefinition(_) => {} // lowered in `lower_class`
+                ClassElement::MethodDefinition(_) => {} // lowered separately
                 ClassElement::StaticBlock(s) => {
                     return Err(self.err(s.span, "static blocks aren't supported"))
                 }
@@ -460,13 +661,19 @@ impl Lower<'_> {
                 }
             }
         }
-        Ok(z::StructDecl { name, fields })
+        Ok(fields)
     }
 
-    /// Emit a class's factory + method functions into `funcs`.
-    fn lower_class(&self, c: &Class, funcs: &mut Vec<z::Func>) -> LResult<()> {
-        let cname = c.id.as_ref().unwrap().name.as_str().to_string();
-        let cid = self.structs[cname.as_str()];
+    /// Lower a (non-generic) class's fields to a `StructDecl`.
+    fn class_struct(&self, c: &Class) -> LResult<z::StructDecl> {
+        let name = c.id.as_ref().unwrap().name.as_str().to_string();
+        Ok(z::StructDecl { name, fields: self.class_fields(c)? })
+    }
+
+    /// Emit a class's factory + method functions into `funcs`, named off `cid`'s
+    /// struct name (which is mangled for a generic instantiation).
+    fn emit_class_fns(&self, c: &Class, cid: u32, funcs: &mut Vec<z::Func>) -> LResult<()> {
+        let cname = self.struct_name(cid).unwrap();
         funcs.push(self.class_factory(c, cid)?);
         for el in &c.body.body {
             if let ClassElement::MethodDefinition(m) = el {
@@ -486,6 +693,12 @@ impl Lower<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Emit a non-generic class's factory + methods (its struct already built).
+    fn lower_class(&self, c: &Class, funcs: &mut Vec<z::Func>) -> LResult<()> {
+        let cid = self.struct_id(c.id.as_ref().unwrap().name.as_str()).unwrap();
+        self.emit_class_fns(c, cid, funcs)
     }
 
     /// Synthesize `C__new`: `let this: C = {defaults}; <ctor body>; return this;`.
@@ -592,20 +805,56 @@ impl Lower<'_> {
         Ok(z::Func { name: format!("{cname}__{mname}"), params, ret, body })
     }
 
-    /// A zero/empty default value for a class field type (scalars and strings).
+    /// A zero/empty default value for a class field type (the constructor usually
+    /// overwrites it). Scalars → 0/false/"", arrays → empty; structs have no
+    /// default (must be given an initializer).
     fn type_default(&self, ty: z::Type) -> Option<z::Expr> {
         Some(match ty {
             z::Type::I64 | z::Type::I32 | z::Type::U32 | z::Type::U64 => z::Expr::Int(0),
             z::Type::F64 => z::Expr::Float(0.0),
             z::Type::Bool => z::Expr::Bool(false),
             z::Type::Str => z::Expr::Str(String::new()),
-            z::Type::Array(_) | z::Type::Struct(_) => return None,
+            // an empty array `[elem; 0]` — the constructor typically reassigns it
+            z::Type::Array(e) => {
+                let elem = match e {
+                    z::Elem::I64 => z::Expr::Int(0),
+                    z::Elem::F64 => z::Expr::Float(0.0),
+                    z::Elem::Bool => z::Expr::Bool(false),
+                };
+                z::Expr::Repeat { value: Box::new(elem), count: Box::new(z::Expr::Int(0)) }
+            }
+            z::Type::Struct(_) => return None,
         })
     }
 
-    /// The declared name of a struct id (reverse of `self.structs`).
+    /// The declared name of a struct id.
     fn struct_name(&self, id: u32) -> Option<String> {
-        self.structs.iter().find(|(_, &v)| v == id).map(|(k, _)| k.clone())
+        self.struct_decls.borrow().get(id as usize).map(|d| d.name.clone())
+    }
+
+    /// Look up a struct id by name.
+    fn struct_id(&self, name: &str) -> Option<u32> {
+        self.structs.borrow().get(name).copied()
+    }
+
+    /// A struct field's type (for `obj.field` inference).
+    fn struct_field_type(&self, id: u32, field: &str) -> Option<z::Type> {
+        self.struct_decls
+            .borrow()
+            .get(id as usize)?
+            .fields
+            .iter()
+            .find(|(n, _)| n == field)
+            .map(|(_, t)| *t)
+    }
+
+    /// Register a new struct, returning its id.
+    fn add_struct(&self, decl: z::StructDecl) -> u32 {
+        let mut decls = self.struct_decls.borrow_mut();
+        let id = decls.len() as u32;
+        self.structs.borrow_mut().insert(decl.name.clone(), id);
+        decls.push(decl);
+        id
     }
 
     /// Best-effort static type of a lowered expression — enough to resolve a
@@ -620,11 +869,10 @@ impl Lower<'_> {
             z::Expr::Var(n) => self.lookup(n)?,
             z::Expr::Cast { to, .. } => *to,
             z::Expr::Call { name, .. } => self.fn_rets.borrow().get(name).copied()?,
-            z::Expr::StructLit { name, .. } => z::Type::Struct(*self.structs.get(name)?),
+            z::Expr::StructLit { name, .. } => z::Type::Struct(self.struct_id(name)?),
             z::Expr::Field { base, field } => {
                 let z::Type::Struct(id) = self.ztype_of(base)? else { return None };
-                let fields = self.struct_fields.get(id as usize)?;
-                *fields.iter().find(|(n, _)| n == field).map(|(_, t)| t)?
+                self.struct_field_type(id, field)?
             }
             _ => return None,
         })
@@ -735,7 +983,23 @@ impl Lower<'_> {
                             t
                         } else if self.enums.contains_key(other) {
                             z::Type::I64 // a numeric enum is represented as i64
-                        } else if let Some(&id) = self.structs.get(other) {
+                        } else if self.generic_class_info.contains_key(other) {
+                            // `Box<i64>` → instantiate the generic class
+                            let args = match &r.type_arguments {
+                                Some(ta) => ta
+                                    .params
+                                    .iter()
+                                    .map(|p| self.ty(p))
+                                    .collect::<LResult<Vec<_>>>()?,
+                                None => {
+                                    return Err(self.err(
+                                        r.span,
+                                        format!("'{other}' is generic — write `{other}<…>`"),
+                                    ))
+                                }
+                            };
+                            z::Type::Struct(self.instantiate_generic_class(other, args, r.span)?)
+                        } else if let Some(id) = self.struct_id(other) {
                             z::Type::Struct(id)
                         } else {
                             return Err(self.err(r.span, format!("unknown type '{other}'")));
@@ -1112,10 +1376,6 @@ impl Lower<'_> {
                     Expression::Identifier(id) => id.name.as_str().to_string(),
                     _ => return Err(self.err(n.span, "`new` requires a class name")),
                 };
-                let factory = format!("{cname}__new");
-                if !self.fn_rets.borrow().contains_key(&factory) {
-                    return Err(self.err(n.span, format!("`new {cname}(…)`: '{cname}' isn't a class")));
-                }
                 let mut args = Vec::new();
                 for a in &n.arguments {
                     let ex = a
@@ -1123,6 +1383,20 @@ impl Lower<'_> {
                         .ok_or_else(|| self.err(n.span, "spread arguments aren't supported"))?;
                     args.push(self.expr(ex)?);
                 }
+                // Generic class: resolve type args, instantiate, call its factory.
+                let factory = if self.generic_class_info.contains_key(&cname) {
+                    let type_args = self.class_type_args(n, &cname, &args)?;
+                    let id = self.instantiate_generic_class(&cname, type_args, n.span)?;
+                    format!("{}__new", self.struct_name(id).unwrap())
+                } else {
+                    let f = format!("{cname}__new");
+                    if !self.fn_rets.borrow().contains_key(&f) {
+                        return Err(
+                            self.err(n.span, format!("`new {cname}(…)`: '{cname}' isn't a class")),
+                        );
+                    }
+                    f
+                };
                 z::Expr::Call { name: factory, args }
             }
             Expression::ObjectExpression(o) => {
@@ -1464,6 +1738,38 @@ mod tests {
         let ts3 = "function rec<T>(x: T, n: i64): i64 { if (n <= 0) { return 0; } return 1 + rec<T>(x, n - 1); } \
                    function main(): i64 { return rec<bool>(true, 5); }";
         assert_eq!(run_i64(ts3), 5);
+    }
+
+    #[test]
+    fn generic_classes() {
+        // one generic class instantiated at two types (i64 and bool → two distinct
+        // structs), explicit construction, method dispatch + field mutation
+        let ts = "class Box<T> { \
+                    value: T; \
+                    constructor(v: T) { this.value = v; } \
+                    get(): T { return this.value; } \
+                    set(v: T): T { this.value = v; return v; } \
+                  } \
+                  function main(): i64 { \
+                    let a = new Box<i64>(10); \
+                    a.set(25); \
+                    let b = new Box<bool>(true); \
+                    if (b.get()) { return a.get() + 5; } \
+                    return a.get(); }";
+        assert_eq!(run_i64(ts), 30);
+        // two type params + explicit args; a method returning one component
+        let ts2 = "class Pair<A, B> { \
+                     a: A; b: B; \
+                     constructor(a: A, b: B) { this.a = a; this.b = b; } \
+                     first(): A { return this.a; } \
+                   } \
+                   function main(): i64 { let p = new Pair<i64, bool>(42, true); return p.first(); }";
+        assert_eq!(run_i64(ts2), 42);
+        // a generic class as a typed parameter + constructor-arg inference
+        let ts3 = "class Box<T> { v: T; constructor(v: T) { this.v = v; } get(): T { return this.v; } } \
+                   function unwrap(b: Box<i64>): i64 { return b.get(); } \
+                   function main(): i64 { return unwrap(new Box(99)); }";
+        assert_eq!(run_i64(ts3), 99);
     }
 
     #[test]
