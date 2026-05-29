@@ -66,6 +66,7 @@ impl<'a> Parser<'a> {
             Tok::TyI64 => Ok(Type::I64),
             Tok::TyF64 => Ok(Type::F64),
             Tok::TyBool => Ok(Type::Bool),
+            Tok::TyStr => Ok(Type::Str),
             Tok::LBracket => {
                 let inner = self.ty()?;
                 self.expect(&Tok::RBracket)?;
@@ -366,6 +367,7 @@ impl<'a> Parser<'a> {
         match self.bump()? {
             Tok::Int(n) => Ok(Expr::Int(n)),
             Tok::Float(f) => Ok(Expr::Float(f)),
+            Tok::Str(s) => Ok(Expr::Str(s)),
             Tok::True => Ok(Expr::Bool(true)),
             Tok::False => Ok(Expr::Bool(false)),
             // Casts: `i64(expr)` / `f64(expr)`.

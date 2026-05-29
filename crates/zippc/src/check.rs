@@ -138,8 +138,8 @@ fn check_stmt(
         }
         Stmt::Print(e) => {
             let t = type_of(e, scope, sigs)?;
-            if t != Type::I64 && t != Type::F64 {
-                return Err(format!("type error: print expects a number, found {t:?}"));
+            if t != Type::I64 && t != Type::F64 && t != Type::Str {
+                return Err(format!("type error: print expects a number or string, found {t:?}"));
             }
             Ok(())
         }
@@ -188,6 +188,7 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
         Expr::Int(_) => Ok(Type::I64),
         Expr::Float(_) => Ok(Type::F64),
         Expr::Bool(_) => Ok(Type::Bool),
+        Expr::Str(_) => Ok(Type::Str),
         Expr::Var(name) => scope
             .lookup(name)
             .ok_or_else(|| format!("type error: use of undeclared variable '{name}'")),
@@ -248,6 +249,14 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
             let lt = type_of(l, scope, sigs)?;
             let rt = type_of(r, scope, sigs)?;
             use BinOp::*;
+            // String operations: `+` concatenates, `==`/`!=` compare.
+            if lt == Type::Str || rt == Type::Str {
+                return match op {
+                    Add if lt == Type::Str && rt == Type::Str => Ok(Type::Str),
+                    Eq | Ne if lt == Type::Str && rt == Type::Str => Ok(Type::Bool),
+                    _ => Err(format!("type error: operator {op:?} is not valid on strings")),
+                };
+            }
             let numeric = |t: Type| t == Type::I64 || t == Type::F64;
             match op {
                 // +, -, *, / work on i64 OR f64 (operands must match — no implicit mixing).
@@ -296,8 +305,10 @@ fn type_of(e: &Expr, scope: &Scope, sigs: &HashMap<String, Sig>) -> Result<Type,
                     return Err("type error: len expects 1 array argument".into());
                 }
                 return match type_of(&args[0], scope, sigs)? {
-                    Type::Array(_) => Ok(Type::I64),
-                    other => Err(format!("type error: len expects an array, found {other:?}")),
+                    Type::Array(_) | Type::Str => Ok(Type::I64),
+                    other => Err(format!(
+                        "type error: len expects an array or string, found {other:?}"
+                    )),
                 };
             }
             let sig = sigs

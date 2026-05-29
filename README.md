@@ -22,7 +22,7 @@ with `--no-default-features` and the language still runs.
 ## Status (v0 — a working vertical slice, not the finished language)
 
 ✅ Working end-to-end today:
-- Lexer → recursive-descent parser → **sound-subset type checker** (`i64`/`f64`/`bool`,
+- Lexer → recursive-descent parser → **sound-subset type checker** (`i64`/`f64`/`bool`/`str`,
   no implicit coercions, arity/return checking)
 - **`f64` floating-point** with `i64()` / `f64()` casts (the zk profile stays
   integer-only — `--prove` rejects f64, per PLAN.md §7)
@@ -31,6 +31,8 @@ with `--no-default-features` and the language still runs.
 - Full operator set incl. **bitwise/shift** `& | ^ << >> ~`
 - **Arrays**: literals `[a, b, c]`, repeat `[v; n]`, indexing read/write, `len()`,
   runtime bounds checks (reference types; also `--prove`-gated for now)
+- **Strings**: literals with escapes, `+` concat, `==`/`!=`, `len()`, `print`
+  (heap-backed, immutable; `--prove`-gated)
 - Lowering to **register-machine bytecode**; functions, recursion, `if` / `while`
 - A **VM** that runs it (`zipp run`)
 - The **optional zk-STARK profile** (`zipp run --prove`): Winterfell proof +
@@ -57,6 +59,7 @@ cargo build --release
 ./target/release/zipp run examples/bits.zipp        # => 247  (bitwise/shift)
 ./target/release/zipp run examples/pi.zipp          # => 3.14159...  (f64 + casts)
 ./target/release/zipp run examples/arrays.zipp      # bubble sort (arrays + len)
+./target/release/zipp run examples/hello.zipp       # strings: concat, len
 
 # run the language test suite
 cargo test
@@ -91,7 +94,7 @@ zipp-lang/
 │   ├── zippc/        # compiler core + register VM: lexer, ast, parser, check, ir, vm
 │   ├── zipp-zk/      # OPTIONAL zk-STARK profile (Winterfell prover/verifier over the trace)
 │   └── zipp-cli/     # the `zipp` binary
-└── examples/         # add.zipp, sum.zipp, fib.zipp, bits.zipp, pi.zipp, arrays.zipp
+└── examples/         # add, sum, fib, bits, pi, arrays, hello
 ```
 
 The modules inside `zippc` map onto the separate crates in `../ZIPP.md §15`

@@ -14,13 +14,8 @@ fn fresult(src: &str) -> f64 {
         other => panic!("expected f64 result, got {other:?}"),
     }
 }
-fn output(src: &str) -> Vec<i64> {
-    run(src)
-        .expect("program should run")
-        .output
-        .into_iter()
-        .map(|v| v.as_i64().expect("i64 output"))
-        .collect()
+fn output(src: &str) -> Vec<String> {
+    run(src).expect("program should run").output
 }
 
 #[test]
@@ -88,7 +83,10 @@ fn block_scoping_does_not_leak() {
 
 #[test]
 fn print_collects_output() {
-    assert_eq!(output("fn main(): i64 { print(1); print(2); print(3); return 0; }"), vec![1, 2, 3]);
+    assert_eq!(
+        output("fn main(): i64 { print(1); print(2); print(3); return 0; }"),
+        ["1", "2", "3"].map(String::from).to_vec()
+    );
 }
 
 // ── these must be rejected ──
@@ -193,6 +191,43 @@ fn rejects_bad_array_use() {
 #[test]
 fn prove_profile_rejects_arrays() {
     let prog = zippc::compile("fn main(): i64 { let a = [1, 2, 3]; return a[1]; }").unwrap();
+    assert!(zippc::vm::run(&prog, false).is_ok());
+    assert!(zippc::vm::run(&prog, true).is_err());
+}
+
+// ── strings ──
+
+#[test]
+fn string_concat_len_print() {
+    assert_eq!(result("fn main(): i64 { let s = \"foo\" + \"bar\"; return len(s); }"), 6);
+    assert_eq!(
+        output("fn main(): i64 { print(\"hello, world\"); return 0; }"),
+        ["hello, world"].map(String::from).to_vec()
+    );
+    // string-typed params and returns
+    let greet = "fn greet(name: str): str { return \"hi \" + name; } \
+                 fn main(): i64 { print(greet(\"zipp\")); return 0; }";
+    assert_eq!(output(greet), ["hi zipp"].map(String::from).to_vec());
+}
+
+#[test]
+fn string_equality_and_escapes() {
+    assert_eq!(result("fn main(): i64 { if (\"a\" + \"b\" == \"ab\") { return 1; } return 0; }"), 1);
+    assert_eq!(result("fn main(): i64 { if (\"a\" != \"b\") { return 1; } return 0; }"), 1);
+    // "a\nb" -> a, newline, b -> 3 bytes
+    assert_eq!(result("fn main(): i64 { return len(\"a\\nb\"); }"), 3);
+}
+
+#[test]
+fn rejects_bad_string_use() {
+    assert!(run("fn main(): str { return \"x\" - \"y\"; }").is_err()); // '-' invalid on str
+    assert!(run("fn main(): str { return \"x\" + 1; }").is_err()); // mixed str + int
+    assert!(run("fn main(): i64 { return \"x\" * 2; }").is_err());
+}
+
+#[test]
+fn prove_profile_rejects_strings() {
+    let prog = zippc::compile("fn main(): i64 { let s = \"hi\"; return len(s); }").unwrap();
     assert!(zippc::vm::run(&prog, false).is_ok());
     assert!(zippc::vm::run(&prog, true).is_err());
 }

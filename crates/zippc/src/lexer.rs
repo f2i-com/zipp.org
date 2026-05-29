@@ -9,6 +9,7 @@ pub enum Tok {
     // literals / identifiers
     Int(i64),
     Float(f64),
+    Str(String),
     Ident(String),
     // keywords
     Fn,
@@ -25,6 +26,7 @@ pub enum Tok {
     TyI64,
     TyF64,
     TyBool,
+    TyStr,
     // punctuation
     LParen,
     RParen,
@@ -200,6 +202,40 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                 out.push(Tok::BitNot);
                 i += 1;
             }
+            '"' => {
+                i += 1; // opening quote
+                let mut s = String::new();
+                loop {
+                    if i >= bytes.len() {
+                        return Err("lex error: unterminated string literal".into());
+                    }
+                    let ch = bytes[i] as char;
+                    if ch == '"' {
+                        i += 1;
+                        break;
+                    }
+                    if ch == '\\' {
+                        i += 1;
+                        if i >= bytes.len() {
+                            return Err("lex error: unterminated escape in string".into());
+                        }
+                        s.push(match bytes[i] as char {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            '"' => '"',
+                            '\\' => '\\',
+                            '0' => '\0',
+                            other => return Err(format!("lex error: unknown escape '\\{other}'")),
+                        });
+                        i += 1;
+                    } else {
+                        s.push(ch);
+                        i += 1;
+                    }
+                }
+                out.push(Tok::Str(s));
+            }
             c if c.is_ascii_digit() => {
                 let start = i;
                 while i < bytes.len() && (bytes[i] as char).is_ascii_digit() {
@@ -250,6 +286,7 @@ pub fn lex(src: &str) -> Result<Vec<Tok>, String> {
                     "i64" => Tok::TyI64,
                     "f64" => Tok::TyF64,
                     "bool" => Tok::TyBool,
+                    "str" => Tok::TyStr,
                     _ => Tok::Ident(s.to_string()),
                 });
             }

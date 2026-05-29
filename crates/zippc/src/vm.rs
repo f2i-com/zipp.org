@@ -9,13 +9,14 @@
 use crate::ast::{BinOp, Type, UnOp};
 use crate::ir::{Instr, Program};
 
-/// A runtime value. `Arr` is an index into the VM heap (arrays are reference
-/// types — passing or assigning an array shares it).
+/// A runtime value. `Arr`/`Str` are indices into VM heaps (arrays are reference
+/// types — passing or assigning shares them; strings are immutable).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
     I64(i64),
     F64(f64),
     Arr(usize),
+    Str(usize),
 }
 
 impl Value {
@@ -23,7 +24,7 @@ impl Value {
         match self {
             Value::I64(x) => x == 0,
             Value::F64(f) => f == 0.0,
-            Value::Arr(_) => false,
+            Value::Arr(_) | Value::Str(_) => false,
         }
     }
     /// The i64 payload, or `None` for non-integers.
@@ -34,12 +35,12 @@ impl Value {
         }
     }
     /// i64 view for trace columns. Only reached for `I64` under trace recording
-    /// (f64 and arrays are gated out), so this is exact there.
+    /// (f64/arrays/strings are gated out), so this is exact there.
     fn trace_i64(self) -> i64 {
         match self {
             Value::I64(x) => x,
             Value::F64(f) => f as i64,
-            Value::Arr(_) => 0,
+            Value::Arr(_) | Value::Str(_) => 0,
         }
     }
 }
@@ -50,6 +51,7 @@ impl std::fmt::Display for Value {
             Value::I64(x) => write!(f, "{x}"),
             Value::F64(v) => write!(f, "{v}"),
             Value::Arr(_) => write!(f, "[array]"),
+            Value::Str(_) => write!(f, "[str]"),
         }
     }
 }
@@ -77,7 +79,8 @@ pub struct TraceStep {
 #[derive(Debug, Clone)]
 pub struct RunResult {
     pub result: Value,
-    pub output: Vec<Value>,
+    /// Lines emitted by `print`, already rendered to text.
+    pub output: Vec<String>,
     pub trace: Vec<TraceStep>,
 }
 
@@ -92,6 +95,7 @@ pub const MAX_TRACE_STEPS: usize = 1 << 19;
 
 const ZK_INT_ONLY: &str = "--prove is integer-only: this program uses f64 (the zk profile is integer-only by design)";
 const ZK_NO_ARRAY: &str = "--prove does not support arrays yet (the zk profile is integer-only)";
+const ZK_NO_STR: &str = "--prove does not support strings (the zk profile is integer-only)";
 
 pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
     let main = &prog.funcs[prog.main as usize];
@@ -99,8 +103,9 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
     let mut base: usize = 0;
     let mut pc: u32 = main.entry;
     let mut call_stack: Vec<Frame> = Vec::new();
-    let mut output: Vec<Value> = Vec::new();
+    let mut output: Vec<String> = Vec::new();
     let mut heap: Vec<Vec<Value>> = Vec::new();
+    let mut str_heap: Vec<String> = Vec::new();
     let mut trace: Vec<TraceStep> = Vec::new();
     let mut clk: u64 = 0;
 
@@ -138,6 +143,14 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 }
                 reg[base + *dst as usize] = Value::F64(*imm);
             }
+            Instr::SConst { dst, imm } => {
+                if record_trace {
+                    return Err(ZK_NO_STR.into());
+                }
+                let i = str_heap.len();
+                str_heap.push(imm.clone());
+                reg[base + *dst as usize] = Value::Str(i);
+            }
             Instr::Cast { dst, src, to } => {
                 if record_trace && *to == Type::F64 {
                     return Err(ZK_INT_ONLY.into());
@@ -155,7 +168,21 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
             Instr::Bin { op, dst, a, b } => {
                 let av = reg[base + *a as usize];
                 let bv = reg[base + *b as usize];
-                let res = eval_bin(*op, av, bv)?;
+                let res = match (av, bv) {
+                    // String concatenation / comparison (needs heap access).
+                    (Value::Str(x), Value::Str(y)) => match op {
+                        BinOp::Add => {
+                            let s = format!("{}{}", str_heap[x], str_heap[y]);
+                            let i = str_heap.len();
+                            str_heap.push(s);
+                            Value::Str(i)
+                        }
+                        BinOp::Eq => Value::I64((str_heap[x] == str_heap[y]) as i64),
+                        BinOp::Ne => Value::I64((str_heap[x] != str_heap[y]) as i64),
+                        _ => return Err(format!("runtime error: operator {op:?} not valid on strings")),
+                    },
+                    _ => eval_bin(*op, av, bv)?,
+                };
                 reg[base + *dst as usize] = res;
                 let kind = match op {
                     BinOp::Add => OpKind::Add,
@@ -216,7 +243,7 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
             }
             Instr::Print { a } => {
                 let v = reg[base + *a as usize];
-                output.push(v);
+                output.push(render(v, &str_heap));
                 rec!(OpKind::Other, v.trace_i64(), 0, v.trace_i64(), 0);
             }
             Instr::ArrayLit { dst, elems } => {
@@ -273,11 +300,12 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 heap[h][i as usize] = v;
             }
             Instr::Len { dst, arr } => {
-                if record_trace {
-                    return Err(ZK_NO_ARRAY.into());
-                }
-                let h = array_ref(reg[base + *arr as usize])?;
-                reg[base + *dst as usize] = Value::I64(heap[h].len() as i64);
+                let n = match reg[base + *arr as usize] {
+                    Value::Arr(h) => heap[h].len(),
+                    Value::Str(s) => str_heap[s].len(),
+                    _ => return Err("runtime error: len expects an array or string".into()),
+                };
+                reg[base + *dst as usize] = Value::I64(n as i64);
             }
         }
         clk += 1;
@@ -297,6 +325,16 @@ fn array_ref(v: Value) -> Result<usize, String> {
     match v {
         Value::Arr(h) => Ok(h),
         _ => Err("runtime error: expected an array".into()),
+    }
+}
+
+/// Resolve a value to printable text (needs the string heap for `Str`).
+fn render(v: Value, strs: &[String]) -> String {
+    match v {
+        Value::I64(x) => x.to_string(),
+        Value::F64(f) => f.to_string(),
+        Value::Str(i) => strs[i].clone(),
+        Value::Arr(_) => "[array]".to_string(),
     }
 }
 

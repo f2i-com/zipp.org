@@ -13,6 +13,7 @@ use std::collections::HashMap;
 pub enum Instr {
     Const { dst: u32, imm: i64 },
     FConst { dst: u32, imm: f64 },
+    SConst { dst: u32, imm: String },
     Cast { dst: u32, src: u32, to: Type },
     Mov { dst: u32, src: u32 },
     Bin { op: BinOp, dst: u32, a: u32, b: u32 },
@@ -268,6 +269,11 @@ impl<'a> Gen<'a> {
             Expr::Float(f) => {
                 let r = self.alloc();
                 self.code.push(Instr::FConst { dst: r, imm: *f });
+                Ok(r)
+            }
+            Expr::Str(s) => {
+                let r = self.alloc();
+                self.code.push(Instr::SConst { dst: r, imm: s.clone() });
                 Ok(r)
             }
             Expr::Bool(b) => {

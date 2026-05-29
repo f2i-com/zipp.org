@@ -23,17 +23,19 @@ pub enum Type {
     I64,
     F64,
     Bool,
+    Str,
     Array(Elem),
 }
 
 impl Type {
     /// As a scalar element type (for use as an array element), if scalar.
+    /// v0 arrays hold i64/f64/bool (not strings or nested arrays).
     pub fn as_elem(self) -> Option<Elem> {
         match self {
             Type::I64 => Some(Elem::I64),
             Type::F64 => Some(Elem::F64),
             Type::Bool => Some(Elem::Bool),
-            Type::Array(_) => None,
+            Type::Str | Type::Array(_) => None,
         }
     }
 }
@@ -73,6 +75,7 @@ pub enum Expr {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Str(String),
     Var(String),
     Cast { to: Type, e: Box<Expr> },
     Unary { op: UnOp, e: Box<Expr> },
