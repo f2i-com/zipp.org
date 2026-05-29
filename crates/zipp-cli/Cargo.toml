@@ -9,12 +9,14 @@ description = "ZIPP command-line interface: `zipp run [--prove] file.zipp`"
 name = "zipp"
 path = "src/main.rs"
 
+# The zk-STARK proving profile and the native JIT are OPTIONAL (on by default).
+# `--no-default-features` drops both heavy dependencies (Winterfell, Cranelift).
 [features]
-# The zk-STARK proving profile is OPTIONAL (on by default). Build with
-# `--no-default-features` to drop the Winterfell dependency entirely.
-default = ["zk"]
+default = ["zk", "jit"]
 zk = ["dep:zipp-zk"]
+jit = ["dep:zipp-jit"]
 
 [dependencies]
 zippc = { path = "../zippc" }
 zipp-zk = { path = "../zipp-zk", optional = true }
+zipp-jit = { path = "../zipp-jit", optional = true }

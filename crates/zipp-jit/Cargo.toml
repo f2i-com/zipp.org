@@ -1,0 +1,13 @@
+[package]
+name = "zipp-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIPP optional native backend — Cranelift JIT for the integer subset (PLAN.md tier-0)"
+
+[dependencies]
+cranelift-codegen = "0.116"
+cranelift-frontend = "0.116"
+cranelift-jit = "0.116"
+cranelift-module = "0.116"
+zippc = { path = "../zippc" }

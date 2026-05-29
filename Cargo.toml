@@ -9,7 +9,8 @@ resolver = "2"
 members = [
     "crates/zippc",     # compiler core + register VM (lexer, ast, parser, check, ir, vm)
     "crates/zipp-zk",   # OPTIONAL zk-STARK profile: Winterfell prover/verifier over the VM trace
-    "crates/zipp-cli",  # `zipp run [--prove] file.zipp`
+    "crates/zipp-jit",  # OPTIONAL native backend: Cranelift JIT for the integer subset
+    "crates/zipp-cli",  # `zipp run [--prove] [--jit] file.zipp`
 ]
 
 [workspace.package]

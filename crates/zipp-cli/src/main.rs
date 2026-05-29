@@ -26,16 +26,18 @@ fn run(args: &[String]) -> Result<(), String> {
     match cmd {
         Some("run") => {
             let mut prove = false;
+            let mut jit = false;
             let mut path: Option<String> = None;
             for a in it {
                 match a.as_str() {
                     "--prove" => prove = true,
+                    "--jit" => jit = true,
                     s if s.starts_with("--") => return Err(format!("unknown flag '{s}'")),
                     s => path = Some(s.to_string()),
                 }
             }
-            let path = path.ok_or("usage: zipp run [--prove] <file.zipp>")?;
-            run_file(&path, prove)
+            let path = path.ok_or("usage: zipp run [--prove] [--jit] <file.zipp>")?;
+            run_file(&path, prove, jit)
         }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
@@ -48,9 +50,20 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn run_file(path: &str, prove: bool) -> Result<(), String> {
+fn run_file(path: &str, prove: bool, jit: bool) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
     let program = zippc::compile(&src)?;
+
+    if jit && prove {
+        return Err("--jit and --prove can't be combined (the prover needs the interpreter trace)".into());
+    }
+    if jit {
+        if let Some((r, dur)) = jit_run(&program)? {
+            println!("=> {r} (jit · native · ran in {dur:.2?})");
+            return Ok(());
+        }
+        // ineligible — jit_run explained why; fall through to the interpreter.
+    }
 
     let t0 = Instant::now();
     let result = zippc::vm::run(&program, prove)?;
@@ -79,6 +92,22 @@ fn hash_source(s: &str) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01B3);
     }
     h
+}
+
+#[cfg(feature = "jit")]
+fn jit_run(program: &zippc::Program) -> Result<Option<(i64, std::time::Duration)>, String> {
+    if let Some(bad) = zipp_jit::ineligible_reason(program) {
+        eprintln!("zipp: --jit covers the integer subset only (program uses {bad}); using the interpreter");
+        return Ok(None);
+    }
+    let t = Instant::now();
+    let r = zipp_jit::run(program)?;
+    Ok(Some((r, t.elapsed())))
+}
+
+#[cfg(not(feature = "jit"))]
+fn jit_run(_program: &zippc::Program) -> Result<Option<(i64, std::time::Duration)>, String> {
+    Err("this build has no jit profile — rebuild with the `jit` feature".into())
 }
 
 #[cfg(feature = "zk")]
