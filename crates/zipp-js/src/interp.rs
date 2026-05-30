@@ -936,6 +936,28 @@ impl Interp {
             InstanceOf => return self.instance_of(&l, &r),
             _ => {}
         }
+        // Fast path: both operands already numbers — the dominant case in hot
+        // loops. Compute directly, skipping the ToPrimitive/ToNumber dispatch and
+        // the per-arm clones below. Only ops with unambiguous two-number
+        // semantics are handled; Mod/Pow/bitwise fall through. For two numbers,
+        // loose == and strict === coincide, and Rust's f64 ops already match JS
+        // (NaN comparisons -> false, +0 == -0).
+        if let (JsValue::Num(a), JsValue::Num(b)) = (&l, &r) {
+            let (a, b) = (*a, *b);
+            match op {
+                Add => return Ok(JsValue::Num(a + b)),
+                Sub => return Ok(JsValue::Num(a - b)),
+                Mul => return Ok(JsValue::Num(a * b)),
+                Div => return Ok(JsValue::Num(a / b)),
+                Lt => return Ok(JsValue::Bool(a < b)),
+                Le => return Ok(JsValue::Bool(a <= b)),
+                Gt => return Ok(JsValue::Bool(a > b)),
+                Ge => return Ok(JsValue::Bool(a >= b)),
+                EqEq | StrictEq => return Ok(JsValue::Bool(a == b)),
+                NotEq | StrictNotEq => return Ok(JsValue::Bool(a != b)),
+                _ => {}
+            }
+        }
         Ok(match op {
             Add => {
                 // ToPrimitive(default): for objects this is the user `toString`
