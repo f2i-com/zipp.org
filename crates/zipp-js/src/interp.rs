@@ -70,6 +70,20 @@ impl Interp {
     fn exec(&self, stmt: &Stmt, scope: &Rc<RefCell<Scope>>) -> EvalResult<Flow> {
         match stmt {
             Stmt::Empty | Stmt::Func(_) => Ok(Flow::Normal),
+            Stmt::Class(cd) => {
+                let ctor = JsValue::Object(Object::function(cd.ctor.clone(), scope.clone()));
+                let proto = self.get_member(&ctor, "prototype")?; // vivifies prototype obj
+                for (mname, fd) in &cd.methods {
+                    let m = JsValue::Object(Object::function(fd.clone(), scope.clone()));
+                    self.set_member(&proto, mname, m)?;
+                }
+                for (sname, fd) in &cd.statics {
+                    let m = JsValue::Object(Object::function(fd.clone(), scope.clone()));
+                    self.set_member(&ctor, sname, m)?;
+                }
+                scope.borrow_mut().declare(&cd.name, ctor);
+                Ok(Flow::Normal)
+            }
             Stmt::Expr(e) => {
                 self.eval(e, scope)?;
                 Ok(Flow::Normal)

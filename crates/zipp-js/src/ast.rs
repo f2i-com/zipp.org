@@ -99,6 +99,8 @@ pub enum Stmt {
     Continue,
     /// A hoisted function declaration.
     Func(Rc<FuncDef>),
+    /// A class declaration (lowered to a constructor + prototype/static methods).
+    Class(Rc<ClassDef>),
     Throw(Expr),
     Try {
         block: Vec<Stmt>,
@@ -195,4 +197,15 @@ pub struct FuncDef {
     /// Arrow functions inherit `this` lexically; regular functions bind it per
     /// call. (An arrow with an expression body is lowered to `[Return(expr)]`.)
     pub is_arrow: bool,
+}
+
+/// A class lowered to: a constructor function (instance field initializers
+/// prepended to its body), instance methods (→ `C.prototype`), and static
+/// methods (→ `C`). (v0: no `extends`/`super`, getters/setters, private fields.)
+#[derive(Debug)]
+pub struct ClassDef {
+    pub name: String,
+    pub ctor: Rc<FuncDef>,
+    pub methods: Vec<(String, Rc<FuncDef>)>,
+    pub statics: Vec<(String, Rc<FuncDef>)>,
 }

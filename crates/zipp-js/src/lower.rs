@@ -48,6 +48,7 @@ fn stmt(s: &ox::Statement) -> R<Stmt> {
         S::BreakStatement(_) => Stmt::Break,
         S::ContinueStatement(_) => Stmt::Continue,
         S::FunctionDeclaration(f) => Stmt::Func(Rc::new(func_def(f)?)),
+        S::ClassDeclaration(c) => lower_class(c)?,
         S::ThrowStatement(t) => Stmt::Throw(expr(&t.argument)?),
         S::TryStatement(t) => try_stmt(t)?,
         S::EmptyStatement(_) => Stmt::Empty,
@@ -128,6 +129,85 @@ fn try_stmt(t: &ox::TryStatement) -> R<Stmt> {
 
 fn params(p: &ox::FormalParameters) -> R<Vec<String>> {
     p.items.iter().map(|item| binding_name(&item.pattern)).collect()
+}
+
+fn class_key_name(k: &ox::PropertyKey) -> R<String> {
+    match k {
+        ox::PropertyKey::StaticIdentifier(id) => Ok(id.name.to_string()),
+        ox::PropertyKey::StringLiteral(s) => Ok(s.value.to_string()),
+        ox::PropertyKey::NumericLiteral(n) => Ok(crate::value::num_to_string(n.value)),
+        _ => Err("computed/private class member names aren't in the v0 JS engine yet".into()),
+    }
+}
+
+fn lower_class(c: &ox::Class) -> R<Stmt> {
+    if c.super_class.is_some() {
+        return Err("class `extends`/`super` isn't in the v0 JS engine yet".into());
+    }
+    let name = c
+        .id
+        .as_ref()
+        .map(|i| i.name.to_string())
+        .ok_or("anonymous class declarations aren't supported")?;
+    let mut ctor: Option<FuncDef> = None;
+    let mut methods: Vec<(String, Rc<FuncDef>)> = Vec::new();
+    let mut statics: Vec<(String, Rc<FuncDef>)> = Vec::new();
+    let mut field_inits: Vec<Stmt> = Vec::new();
+
+    for el in &c.body.body {
+        match el {
+            ox::ClassElement::MethodDefinition(m) => {
+                let fd = func_def(&m.value)?;
+                match m.kind {
+                    ox::MethodDefinitionKind::Constructor => ctor = Some(fd),
+                    ox::MethodDefinitionKind::Method => {
+                        let key = class_key_name(&m.key)?;
+                        if m.r#static {
+                            statics.push((key, Rc::new(fd)));
+                        } else {
+                            methods.push((key, Rc::new(fd)));
+                        }
+                    }
+                    _ => return Err("class getters/setters aren't in the v0 JS engine yet".into()),
+                }
+            }
+            ox::ClassElement::PropertyDefinition(p) if !p.r#static => {
+                let key = class_key_name(&p.key)?;
+                let init = match &p.value {
+                    Some(e) => expr(e)?,
+                    None => Expr::Undefined,
+                };
+                // `this.field = init;` — prepended to the constructor body.
+                field_inits.push(Stmt::Expr(Expr::Assign {
+                    op: None,
+                    target: Box::new(Expr::Member {
+                        obj: Box::new(Expr::This),
+                        prop: Box::new(Expr::Str(key.into())),
+                        computed: false,
+                    }),
+                    value: Box::new(init),
+                }));
+            }
+            _ => {} // static fields / static blocks: deferred
+        }
+    }
+
+    // Build the constructor: field initializers run first, then the explicit
+    // constructor body (or just the field inits, if no constructor).
+    let ctor = match ctor {
+        Some(fd) => {
+            let mut body = field_inits;
+            body.extend(fd.body.iter().cloned());
+            Rc::new(FuncDef { name: Some(name.clone()), params: fd.params, body, is_arrow: false })
+        }
+        None => Rc::new(FuncDef {
+            name: Some(name.clone()),
+            params: Vec::new(),
+            body: field_inits,
+            is_arrow: false,
+        }),
+    };
+    Ok(Stmt::Class(Rc::new(ClassDef { name, ctor, methods, statics })))
 }
 
 fn func_def(f: &ox::Function) -> R<FuncDef> {
