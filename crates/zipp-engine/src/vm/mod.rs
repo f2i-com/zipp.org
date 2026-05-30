@@ -1012,6 +1012,14 @@ pub unsafe extern "win64" fn djit_call_helper(
     let needed = new_reg_base + reg_window;
 
     if needed > STACK_SIZE {
+        // Value-stack overflow on a JIT'd call (deep recursion). Signal it
+        // as a catchable error instead of silently returning `undefined`:
+        // stash StackOverflow so the dispatcher's post-JIT `take_jit_error`
+        // converts it to a thrown `RangeError: maximum call stack size
+        // exceeded` (rvm maps VMError::StackOverflow to that string),
+        // matching node/V8. Without this, `try { deepRecurse() } catch (e)`
+        // saw `e === undefined` and execution continued past the overflow.
+        vm.jit_error.get_or_insert(VMError::StackOverflow);
         return Value::UNDEFINED.bits();
     }
     while vm.stack.len() < needed {
