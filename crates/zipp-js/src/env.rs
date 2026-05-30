@@ -41,15 +41,22 @@ impl Hasher for FxHasher {
 pub type VarMap = HashMap<String, JsValue, BuildHasherDefault<FxHasher>>;
 
 /// A frame past this many bindings is promoted from the linear `Vec` to a hashed
-/// map. Activation records and blocks almost always hold a handful of bindings
-/// (cheap linear scan, small allocation, no hashing); only large frames like the
-/// global scope — which holds every builtin — pay for the map.
+/// map. Activation records and blocks almost always hold a handful of bindings,
+/// so a linear scan with no hashing wins; only large frames like the global
+/// scope (which holds every builtin) pay for the map.
 const PROMOTE_AT: usize = 16;
 
-/// Variable storage for one scope frame. Starts as a linear-scan `Vec` (cheap to
-/// allocate, cache-friendly, no hashing) and auto-promotes to a hashed `VarMap`
-/// once it grows past [`PROMOTE_AT`].
+/// Variable storage for one scope frame, sized to the binding count:
+/// - `Empty`: zero bindings — a freshly-created activation/block scope. NO heap
+///   allocation at all (the common case for a function called with its body not
+///   yet executed, and for blocks with no `let`).
+/// - `One`: exactly one binding — the dominant activation-record shape (one
+///   param, or one `let`). Inline; avoids a `Vec` allocation entirely.
+/// - `Small`: a linear-scan `Vec` for a handful of bindings.
+/// - `Map`: the FxHash map for the global scope and any frame past `PROMOTE_AT`.
 enum VarStore {
+    Empty,
+    One(Box<str>, JsValue),
     Small(Vec<(Box<str>, JsValue)>),
     Map(VarMap),
 }
@@ -58,6 +65,8 @@ impl VarStore {
     #[inline]
     fn get(&self, name: &str) -> Option<JsValue> {
         match self {
+            VarStore::Empty => None,
+            VarStore::One(k, v) => (&**k == name).then(|| v.clone()),
             VarStore::Small(v) => v.iter().find(|(k, _)| &**k == name).map(|(_, val)| val.clone()),
             VarStore::Map(m) => m.get(name).cloned(),
         }
@@ -66,6 +75,15 @@ impl VarStore {
     /// Overwrite an existing binding; returns false if `name` isn't present here.
     fn set_existing(&mut self, name: &str, val: JsValue) -> bool {
         match self {
+            VarStore::Empty => false,
+            VarStore::One(k, v) => {
+                if &**k == name {
+                    *v = val;
+                    true
+                } else {
+                    false
+                }
+            }
             VarStore::Small(v) => {
                 if let Some(slot) = v.iter_mut().find(|(k, _)| &**k == name) {
                     slot.1 = val;
@@ -87,27 +105,47 @@ impl VarStore {
 
     /// Declare (or redeclare) a binding in this frame.
     fn declare(&mut self, name: &str, val: JsValue) {
+        // First, the in-place cases that don't change the variant.
         match self {
+            VarStore::Empty => {
+                *self = VarStore::One(name.into(), val);
+                return;
+            }
+            VarStore::One(k, v) if &**k == name => {
+                *v = val;
+                return;
+            }
             VarStore::Small(v) => {
                 if let Some(slot) = v.iter_mut().find(|(k, _)| &**k == name) {
                     slot.1 = val;
                     return;
                 }
-                if v.len() >= PROMOTE_AT {
-                    // Promote to the hashed map, then insert.
-                    let mut m = VarMap::default();
-                    for (k, val) in v.drain(..) {
-                        m.insert(k.into(), val);
-                    }
-                    m.insert(name.to_string(), val);
-                    *self = VarStore::Map(m);
-                } else {
+                if v.len() < PROMOTE_AT {
                     v.push((name.into(), val));
+                    return;
                 }
+                // else: needs promotion to a Map — handled below.
             }
             VarStore::Map(m) => {
                 m.insert(name.to_string(), val);
+                return;
             }
+            VarStore::One(_, _) => {} // different key — grow to Small, handled below
+        }
+        // Variant transitions that need ownership of `self`.
+        match std::mem::replace(self, VarStore::Empty) {
+            VarStore::One(ok, ov) => {
+                *self = VarStore::Small(vec![(ok, ov), (name.into(), val)]);
+            }
+            VarStore::Small(mut v) => {
+                let mut m = VarMap::default();
+                for (k, val) in v.drain(..) {
+                    m.insert(k.into(), val);
+                }
+                m.insert(name.to_string(), val);
+                *self = VarStore::Map(m);
+            }
+            other => *self = other, // unreachable: the in-place match handled these
         }
     }
 }
@@ -124,8 +162,9 @@ impl Scope {
     }
 
     pub fn child(parent: &Rc<RefCell<Scope>>) -> Rc<RefCell<Scope>> {
-        // Child frames are almost always tiny — start linear.
-        Rc::new(RefCell::new(Scope { vars: VarStore::Small(Vec::new()), parent: Some(parent.clone()) }))
+        // Child frames start empty — no heap allocation until the first binding,
+        // and a one-binding frame (the common activation record) stays inline.
+        Rc::new(RefCell::new(Scope { vars: VarStore::Empty, parent: Some(parent.clone()) }))
     }
 
     /// Declare (or redeclare) a binding in this frame.
