@@ -3,10 +3,7 @@ name = "zipp-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-authors.workspace = true
-repository.workspace = true
-rust-version.workspace = true
-description = "Sandboxed JavaScript-subset bytecode VM with x86-64/AArch64 JIT backend."
+description = "ZIPP fast dynamic-JS engine: NaN-boxed value, register-bytecode VM, shapes + inline caches, optional dynasm JIT."
 readme = "../../README.md"
 keywords = ["vm", "jit", "javascript", "sandbox", "scripting"]
 categories = ["compilers", "wasm"]
@@ -46,4 +43,6 @@ dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-js-sys = { workspace = true }
+# Only compiled for the wasm32 target (the ZIPP native build never pulls this);
+# inlined here since the ZIPP workspace doesn't declare js-sys.
+js-sys = "0.3"

@@ -65,14 +65,14 @@ fn run(args: &[String]) -> Result<(), String> {
             let path = it.next().ok_or("usage: zipp js <file.js>")?;
             let src =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
-            let result = zipp_engine::ZippEngine::default().eval(&src);
-            for line in &result.console {
-                println!("{line}");
+            // `console.log` writes straight to stdout inside the engine, so we
+            // just run and propagate any uncaught error. eval returns the final
+            // value (ignored — scripts communicate via console, like node).
+            let engine = zipp_engine::engine::ZippEngine::default();
+            match engine.eval(&src) {
+                Ok(_value) => Ok(()),
+                Err(e) => Err(format!("{e}")),
             }
-            if let Err(e) = result.value {
-                return Err(format!("Uncaught {}", e.message()));
-            }
-            Ok(())
         }
         Some("js-tw") => {
             // Dynamic JavaScript engine (tree-walker): the original Lane-3
