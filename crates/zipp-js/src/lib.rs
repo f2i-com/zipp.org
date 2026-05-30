@@ -166,6 +166,19 @@ mod tests {
     }
 
     #[test]
+    fn array_search_from_index() {
+        assert_eq!(out("var a=[1,2,3,2,1]; console.log(a.indexOf(2), a.indexOf(2,2), a.indexOf(2,-2))"), "1 3 3");
+        assert_eq!(out("var a=[1,2,3,2,1]; console.log(a.indexOf(2,100), a.indexOf(2,-100), a.indexOf(1,3))"), "-1 1 4");
+        assert_eq!(out("var a=[1,2,3,2,1]; console.log(a.lastIndexOf(2), a.lastIndexOf(2,2), a.lastIndexOf(1,0))"), "3 1 0");
+        assert_eq!(out("var a=[1,2,3,2,1]; console.log(a.lastIndexOf(1,-100), a.lastIndexOf(2,100))"), "-1 3");
+        assert_eq!(out("var a=[1,2,3,2,1]; console.log(a.includes(2,2), a.includes(2,4), a.includes(1,-1))"), "true false true");
+        // includes uses SameValueZero (NaN matches); indexOf uses === (does not)
+        assert_eq!(out("console.log([NaN].includes(NaN), [NaN].indexOf(NaN), [0].includes(-0))"), "true -1 true");
+        // fractional fromIndex truncates; empty arrays
+        assert_eq!(out("var a=[1,2,3,2,1]; console.log(a.indexOf(2,1.9), [].indexOf(1), [].includes(1))"), "1 -1 false");
+    }
+
+    #[test]
     fn array_join_to_string() {
         assert_eq!(out("var o={toString(){return 'X'}}; console.log([o,o].join('|'))"), "X|X");
         assert_eq!(out("var p={v:7,toString(){return '<'+this.v+'>'}}; console.log([p,5,p].join(' '))"), "<7> 5 <7>");

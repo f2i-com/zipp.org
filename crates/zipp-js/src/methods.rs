@@ -29,6 +29,17 @@ fn arg(args: &[JsValue], i: usize) -> JsValue {
     args.get(i).cloned().unwrap_or(JsValue::Undefined)
 }
 
+// ToIntegerOrInfinity for a fromIndex argument: NaN/undefined -> 0, else
+// truncate toward zero (±Infinity pass through).
+fn to_integer_or_zero(v: &JsValue) -> f64 {
+    let n = v.to_number();
+    if n.is_nan() {
+        0.0
+    } else {
+        n.trunc()
+    }
+}
+
 /// Normalize a (possibly negative / out-of-range) index against `len`.
 fn rel_index(v: &JsValue, len: usize, default: usize) -> usize {
     if matches!(v, JsValue::Undefined) {
@@ -168,7 +179,14 @@ fn arr_join(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue
 fn arr_index_of(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
     let o = as_array(this).ok_or_else(|| it.type_error("indexOf called on non-array"))?;
     let target = arg(args, 0);
-    for (i, v) in snapshot(&o).iter().enumerate() {
+    let items = snapshot(&o);
+    let len = items.len() as f64;
+    let n = args.get(1).map_or(0.0, to_integer_or_zero);
+    if n >= len {
+        return Ok(JsValue::Num(-1.0));
+    }
+    let start = if n >= 0.0 { n } else { (len + n).max(0.0) } as usize;
+    for (i, v) in items.iter().enumerate().skip(start) {
         if v.strict_eq(&target) {
             return Ok(JsValue::Num(i as f64));
         }
@@ -180,7 +198,21 @@ fn arr_last_index_of(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResul
     let o = as_array(this).ok_or_else(|| it.type_error("lastIndexOf called on non-array"))?;
     let target = arg(args, 0);
     let items = snapshot(&o);
-    for i in (0..items.len()).rev() {
+    let len = items.len();
+    if len == 0 {
+        return Ok(JsValue::Num(-1.0));
+    }
+    // default fromIndex is the last element; negatives count from the end
+    let n = args.get(1).map_or((len as f64) - 1.0, to_integer_or_zero);
+    let k = if n >= 0.0 {
+        n.min((len - 1) as f64) as isize
+    } else {
+        (len as f64 + n) as isize
+    };
+    if k < 0 {
+        return Ok(JsValue::Num(-1.0));
+    }
+    for i in (0..=(k as usize)).rev() {
         if items[i].strict_eq(&target) {
             return Ok(JsValue::Num(i as f64));
         }
@@ -191,7 +223,15 @@ fn arr_last_index_of(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResul
 fn arr_includes(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
     let o = as_array(this).ok_or_else(|| it.type_error("includes called on non-array"))?;
     let target = arg(args, 0);
-    let found = snapshot(&o).iter().any(|v| {
+    let items = snapshot(&o);
+    let len = items.len() as f64;
+    let n = args.get(1).map_or(0.0, to_integer_or_zero);
+    if n >= len {
+        return Ok(JsValue::Bool(false));
+    }
+    let start = if n >= 0.0 { n } else { (len + n).max(0.0) } as usize;
+    // SameValueZero: === plus NaN matching NaN.
+    let found = items[start..].iter().any(|v| {
         v.strict_eq(&target)
             || matches!((v, &target), (JsValue::Num(a), JsValue::Num(b)) if a.is_nan() && b.is_nan())
     });
