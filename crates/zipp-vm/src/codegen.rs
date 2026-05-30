@@ -36,10 +36,10 @@
 
 #![cfg(all(feature = "jit", target_arch = "x86_64"))]
 
-use std::collections::HashMap;
 use std::mem;
 
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, ExecutableBuffer};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bytecode::{FuncProto, Instr};
 use crate::value::Value;
@@ -91,9 +91,9 @@ impl JitFn {
 /// functions that aren't eligible (so we don't re-attempt them every tick).
 #[derive(Default)]
 pub struct Jit {
-    counts: HashMap<u32, u32>,
-    compiled: HashMap<u32, JitFn>,
-    blacklist: std::collections::HashSet<u32>,
+    counts: FxHashMap<u32, u32>,
+    compiled: FxHashMap<u32, JitFn>,
+    blacklist: FxHashSet<u32>,
 }
 
 impl Jit {
