@@ -410,11 +410,17 @@ binary search (a native imperative algorithm). Most run on all four backends;
 (a null is a 0/null pointer; `=== null` is a pointer compare). **Nullable
 *scalars* (`i64 | null`) run on the interpreter** — scalars have no spare null
 value, so the native tiers fall back (they'd need boxing). **First-class
-functions, closures, and growable/closure array methods also run on the
-interpreter** in v0 (`--jit`/`--llvm`/`--wasm` fall back) — a closure captures
+functions and closures run natively on `--jit` and `--llvm`** via an
+env-pointer calling convention: a function value is a `{code, env}` block, a
+capturing closure stashes its captures in a small env struct that the lifted
+function reads back, and each indirect call dispatches on the env slot (a bare
+function and a closure can even reach the same call site). A closure captures
 **by value** (snapshotting the variable at creation; reassigning it afterward
-doesn't change the closure), and the higher-order array methods lower to
-synthesized per-element-type loop helpers. The **pure array methods**
+doesn't change the closure); `--wasm` still falls back (no heap). **Growable
+arrays (`push`/`pop`) and the closure-based array methods** (`map`/`filter`/
+`reduce`, which lower to synthesized per-element-type loop helpers built on
+growable arrays) still **run on the interpreter** in v0 — the native tiers fall
+back. The **pure array methods**
 (`indexOf`/`includes`/`reverse`/`fill` — no closure, no `push`) stay **native** on
 `--jit`/`--llvm`. **String methods run natively too** — each is a `zipp_str_*`
 runtime call shared by the interpreter and both native backends. They are
