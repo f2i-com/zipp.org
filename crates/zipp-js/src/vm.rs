@@ -167,11 +167,15 @@ impl Interp {
                     }
                 }
                 Op::Call(argc) => {
+                    // Stack layout: [callee, arg0, arg1, ...]. Pass the args as a
+                    // slice of the operand stack (no per-call Vec allocation) —
+                    // safe because a nested call gets its OWN pooled buffers and
+                    // never touches this `stack`. Then drop callee+args, push result.
                     let argc = *argc as usize;
-                    let at = stack.len() - argc;
-                    let args: Vec<JsValue> = stack.split_off(at);
-                    let callee = stack.pop().unwrap_or(JsValue::Undefined);
-                    let r = self.call(&callee, &JsValue::Undefined, &args)?;
+                    let base = stack.len() - argc - 1;
+                    let callee = stack[base].clone();
+                    let r = self.call(&callee, &JsValue::Undefined, &stack[base + 1..])?;
+                    stack.truncate(base);
                     stack.push(r);
                 }
                 Op::Return => {
