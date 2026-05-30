@@ -825,9 +825,603 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
     true
 }
 
-/// Compile the loop region `[start, end]` (entered at `start`) to native code
-/// using the double/SSE path. Returns `None` if any op is unsupported.
+/// Compile the loop region `[start, end]` (entered at `start`). Tries the
+/// register-promoting path first (values live in xmm/gpr across the loop, no
+/// per-op memory traffic — competitive with V8) and falls back to the simpler
+/// memory-based path if the region's shape is outside the register allocator's
+/// subset. Returns `None` only if even the fallback can't handle it.
 fn compile_region(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    globals_base_helper: usize,
+) -> Option<JitFn> {
+    if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper) {
+        return Some(f);
+    }
+    compile_region_mem(proto, start, end, globals_base_helper)
+}
+
+/// Inferred type of a region value. The allocator places numbers in xmm
+/// registers and booleans (compare results) in gprs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VTy {
+    Num,
+    Bool,
+}
+
+/// Where a region value lives for the duration of the loop.
+#[derive(Clone, Copy)]
+enum Home {
+    Xmm(u8),
+    Gpr(u8),
+}
+
+/// Register-allocation plan for a region: a fixed xmm/gpr home per VM register
+/// and per global, computed by a type+liveness pass. `None` (decline) when the
+/// region is outside the allocator's subset (too many live values, a type
+/// conflict, an unsupported live-in, etc.) — the caller then uses the memory path.
+struct RegionPlan {
+    reg_home: FxHashMap<u16, Home>,
+    glob_home: FxHashMap<u32, u8>, // global slot → xmm index
+    /// Numeric registers that are read before written (must be loaded at entry).
+    live_in_regs: Vec<(u16, u8)>, // (reg, xmm)
+    /// Globals read before written (loaded + guarded at entry).
+    live_in_globs: Vec<(u32, u8)>, // (slot, xmm)
+    /// All numeric reg homes (flushed to the reg file on exit).
+    num_regs: Vec<(u16, u8)>,
+    /// All bool reg homes (boxed + flushed on exit).
+    bool_regs: Vec<(u16, u8)>,
+    /// All globals touched (flushed to globals memory on exit).
+    globs: Vec<(u32, u8)>,
+}
+
+/// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops
+/// that need a temporary). xmm2..=xmm15 ⇒ 14 numeric homes.
+const HOME_XMM_FIRST: u8 = 2;
+const HOME_XMM_LAST: u8 = 15;
+/// Gpr pool for boolean homes (r8..r11, all volatile; the region issues no calls
+/// in its body so they survive). 4 simultaneous bools.
+const BOOL_GPRS: [u8; 4] = [8, 9, 10, 11];
+
+/// Plan register homes for `[start, end]`, or `None` to decline (use mem path).
+fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    let mut ty: FxHashMap<u16, VTy> = FxHashMap::default();
+    let mut first_seen: FxHashMap<u16, bool> = FxHashMap::default(); // reg → was first occurrence a def?
+    let mut glob_first_read: FxHashMap<u32, bool> = FxHashMap::default(); // slot → first touch was a read?
+    let mut reg_order: Vec<u16> = Vec::new();
+    let mut glob_order: Vec<u32> = Vec::new();
+
+    // Record a use (operand) of reg `r` with required type `req`.
+    // Returns false on a type conflict (caller declines).
+    let mut note_def = |r: u16, t: VTy, ty: &mut FxHashMap<u16, VTy>, first_seen: &mut FxHashMap<u16, bool>, reg_order: &mut Vec<u16>| -> bool {
+        if let Some(prev) = ty.get(&r) {
+            if *prev != t {
+                return false;
+            }
+        } else {
+            ty.insert(r, t);
+            reg_order.push(r);
+        }
+        first_seen.entry(r).or_insert(true); // first occurrence is a def
+        true
+    };
+
+    // Two passes are awkward with closures; do a single ordered pass collecting
+    // type (from defs) and first-occurrence (def vs use). Operand type
+    // requirements are validated in a second loop once types are known.
+    for instr in &code[s..=e] {
+        let (def, dty): (Option<u16>, VTy) = match *instr {
+            Instr::LoadInt { dst, .. } => (Some(dst), VTy::Num),
+            Instr::LoadConst { dst, .. } => (Some(dst), VTy::Num),
+            Instr::LoadGlobal { dst, .. } => (Some(dst), VTy::Num),
+            Instr::AddInt { dst, .. } => (Some(dst), VTy::Num),
+            Instr::Neg { dst, .. } => (Some(dst), VTy::Num),
+            Instr::Add { dst, .. }
+            | Instr::Sub { dst, .. }
+            | Instr::Mul { dst, .. }
+            | Instr::Div { dst, .. } => (Some(dst), VTy::Num),
+            Instr::Lt { dst, .. }
+            | Instr::Le { dst, .. }
+            | Instr::Gt { dst, .. }
+            | Instr::Ge { dst, .. }
+            | Instr::Eq { dst, .. }
+            | Instr::Ne { dst, .. } => (Some(dst), VTy::Bool),
+            Instr::Move { dst, .. } => (Some(dst), VTy::Num), // refined below
+            _ => (None, VTy::Num),
+        };
+        // Record operand first-occurrences (uses) BEFORE the def, so a reg used
+        // and defined by the same op counts the use first (live-in).
+        for u in instr_uses(instr) {
+            first_seen.entry(u).or_insert(false); // first occurrence is a use ⇒ live-in
+            if !ty.contains_key(&u) {
+                // Type not yet known; tentatively untyped — refined when defined.
+            }
+        }
+        if let Some(d) = def {
+            // Move's dst type follows its src; default Num is corrected here.
+            let t = if let Instr::Move { src, .. } = *instr {
+                *ty.get(&src).unwrap_or(&VTy::Num)
+            } else {
+                dty
+            };
+            if !note_def(d, t, &mut ty, &mut first_seen, &mut reg_order) {
+                return None;
+            }
+        }
+        // Globals: order + first-touch direction.
+        match *instr {
+            Instr::LoadGlobal { idx, .. } => {
+                glob_first_read.entry(idx).or_insert(true);
+                if !glob_order.contains(&idx) {
+                    glob_order.push(idx);
+                }
+            }
+            Instr::StoreGlobal { idx, .. } => {
+                glob_first_read.entry(idx).or_insert(false);
+                if !glob_order.contains(&idx) {
+                    glob_order.push(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A register used but never defined in the region is a read-only live-in.
+    // Loading/typing it correctly (numeric vs bool) is fiddly, so decline and
+    // let the memory path handle it (it reads everything from the reg file).
+    for instr in &code[s..=e] {
+        for u in instr_uses(instr) {
+            if !ty.contains_key(&u) {
+                return None;
+            }
+        }
+    }
+
+    // Validate operand type requirements now that types are known.
+    for instr in &code[s..=e] {
+        match *instr {
+            Instr::Add { a, b, .. }
+            | Instr::Sub { a, b, .. }
+            | Instr::Mul { a, b, .. }
+            | Instr::Div { a, b, .. }
+            | Instr::Lt { a, b, .. }
+            | Instr::Le { a, b, .. }
+            | Instr::Gt { a, b, .. }
+            | Instr::Ge { a, b, .. }
+            | Instr::Eq { a, b, .. }
+            | Instr::Ne { a, b, .. }
+            | Instr::JumpIfNotLt { a, b, .. }
+            | Instr::JumpIfNotLe { a, b, .. } => {
+                if ty.get(&a) == Some(&VTy::Bool) || ty.get(&b) == Some(&VTy::Bool) {
+                    return None; // numeric op on a bool — outside the subset
+                }
+            }
+            Instr::AddInt { a, .. } | Instr::Neg { a, .. } => {
+                if ty.get(&a) == Some(&VTy::Bool) {
+                    return None;
+                }
+            }
+            Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => {
+                // Only bool conditions are supported (the loop-guard shape).
+                if ty.get(&cond) != Some(&VTy::Bool) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Allocate homes. Numeric regs + globals share the xmm pool; bools use gprs.
+    let mut next_xmm = HOME_XMM_FIRST;
+    let mut next_bool = 0usize;
+    let mut reg_home: FxHashMap<u16, Home> = FxHashMap::default();
+    let mut glob_home: FxHashMap<u32, u8> = FxHashMap::default();
+    let mut num_regs = Vec::new();
+    let mut bool_regs = Vec::new();
+    let mut live_in_regs = Vec::new();
+    for &r in &reg_order {
+        match ty[&r] {
+            VTy::Num => {
+                if next_xmm > HOME_XMM_LAST {
+                    return None; // out of xmm homes
+                }
+                let x = next_xmm;
+                next_xmm += 1;
+                reg_home.insert(r, Home::Xmm(x));
+                num_regs.push((r, x));
+                if first_seen.get(&r) == Some(&false) {
+                    live_in_regs.push((r, x));
+                }
+            }
+            VTy::Bool => {
+                // A live-in bool would need to be unboxed from the reg file at
+                // entry; not supported (bools are loop-ephemeral in practice).
+                if first_seen.get(&r) == Some(&false) {
+                    return None;
+                }
+                if next_bool >= BOOL_GPRS.len() {
+                    return None;
+                }
+                let g = BOOL_GPRS[next_bool];
+                next_bool += 1;
+                reg_home.insert(r, Home::Gpr(g));
+                bool_regs.push((r, g));
+            }
+        }
+    }
+    let mut globs = Vec::new();
+    let mut live_in_globs = Vec::new();
+    for &gi in &glob_order {
+        if next_xmm > HOME_XMM_LAST {
+            return None;
+        }
+        let x = next_xmm;
+        next_xmm += 1;
+        glob_home.insert(gi, x);
+        globs.push((gi, x));
+        if glob_first_read.get(&gi) == Some(&true) {
+            live_in_globs.push((gi, x));
+        }
+    }
+
+    Some(RegionPlan {
+        reg_home,
+        glob_home,
+        live_in_regs,
+        live_in_globs,
+        num_regs,
+        bool_regs,
+        globs,
+    })
+}
+
+/// The VM registers an instruction reads (operands). Used for live-in analysis.
+fn instr_uses(i: &Instr) -> Vec<u16> {
+    match *i {
+        Instr::Move { src, .. } => vec![src],
+        Instr::StoreGlobal { src, .. } => vec![src],
+        Instr::AddInt { a, .. } | Instr::Neg { a, .. } => vec![a],
+        Instr::Add { a, b, .. }
+        | Instr::Sub { a, b, .. }
+        | Instr::Mul { a, b, .. }
+        | Instr::Div { a, b, .. }
+        | Instr::Lt { a, b, .. }
+        | Instr::Le { a, b, .. }
+        | Instr::Gt { a, b, .. }
+        | Instr::Ge { a, b, .. }
+        | Instr::Eq { a, b, .. }
+        | Instr::Ne { a, b, .. }
+        | Instr::JumpIfNotLt { a, b, .. }
+        | Instr::JumpIfNotLe { a, b, .. } => vec![a, b],
+        Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => vec![cond],
+        Instr::Return { src } => vec![src],
+        _ => vec![],
+    }
+}
+
+/// Register-promoting region codegen: each region value lives in a fixed xmm
+/// (numbers) or gpr (booleans) home for the whole loop. Live-in values are
+/// loaded + type-guarded ONCE at entry; the loop body is then pure register SSE
+/// with NO per-op guards or memory traffic (this is what makes it competitive
+/// with V8). All homes are flushed back to the reg file / globals on every exit.
+fn compile_region_regalloc(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    globals_base_helper: usize,
+) -> Option<JitFn> {
+    if !region_can_compile(proto, start, end) {
+        return None;
+    }
+    let plan = plan_region(proto, start, end)?;
+    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let (s, e) = (start as usize, end as usize);
+
+    let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
+    let mut exit_stubs: FxHashMap<u32, dynasmrt::DynamicLabel> = FxHashMap::default();
+    let flush_exit = ops.new_dynamic_label(); // flush homes, then restore + ret
+    let entry_bail = ops.new_dynamic_label(); // entry guard failed: restore + ret, NO flush
+    let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
+
+    // ── prologue ── save callee-saved gprs, fetch globals base, save the
+    // nonvolatile xmm6..15 (we may use them as homes), load live-in homes, jump
+    // to the loop header. No call occurs after the globals-base fetch, so stack
+    // alignment past that point is irrelevant and movdqu (unaligned) is fine.
+    dynasm!(ops
+        ; push rbx
+        ; push rsi
+        ; push rdi
+        ; push r12
+        ; mov rbx, rcx
+        ; mov rsi, rdx
+        ; mov rdi, r8
+        ; sub rsp, 40                 // shadow space (32) + 8 pad ⇒ rsp 16-aligned
+        ; mov rcx, rdi
+        ; mov rax, QWORD globals_base_helper as i64
+        ; call rax
+        ; mov r12, rax
+        ; add rsp, 40
+        ; sub rsp, 160                // save area for xmm6..15 (10 × 16)
+    );
+    for k in 0..10u32 {
+        let xi = 6 + k as u8;
+        dynasm!(ops ; movdqu [rsp + (k as i32) * 16], Rx(xi));
+    }
+    // Load live-in globals (guarded) and live-in registers (guarded).
+    for &(gi, x) in &plan.live_in_globs {
+        dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]);
+        emit_box_to_home(&mut ops, x, entry_bail);
+    }
+    for &(r, x) in &plan.live_in_regs {
+        dynasm!(ops ; mov rax, [rbx + dreg(r)]);
+        emit_box_to_home(&mut ops, x, entry_bail);
+    }
+    dynasm!(ops ; jmp => lbl(start, &in_region));
+
+    // ── body ──
+    for ip in s..=e {
+        dynasm!(ops ; => lbl(ip as u32, &in_region));
+        match proto.code[ip] {
+            Instr::LoadInt { dst, val } => {
+                let h = xh(&plan, dst);
+                dynasm!(ops ; mov eax, val ; cvtsi2sd Rx(h), eax);
+            }
+            Instr::LoadConst { dst, idx } => {
+                let h = xh(&plan, dst);
+                let v = proto.constants[idx as usize];
+                if v.is_int() {
+                    let payload = v.bits() as u32 as i32; // i32 payload
+                    dynasm!(ops ; mov eax, payload ; cvtsi2sd Rx(h), eax);
+                } else {
+                    dynasm!(ops ; mov rax, QWORD v.bits() as i64 ; movq Rx(h), rax);
+                }
+            }
+            Instr::Move { dst, src } => match home(&plan, dst) {
+                Home::Xmm(d) => {
+                    let srx = xh(&plan, src);
+                    dynasm!(ops ; movsd Rx(d), Rx(srx));
+                }
+                Home::Gpr(d) => {
+                    let sg = gh(&plan, src);
+                    dynasm!(ops ; mov Rq(d), Rq(sg));
+                }
+            },
+            Instr::LoadGlobal { dst, idx } => {
+                let d = xh(&plan, dst);
+                let g = plan.glob_home[&idx];
+                dynasm!(ops ; movsd Rx(d), Rx(g));
+            }
+            Instr::StoreGlobal { idx, src } => {
+                let g = plan.glob_home[&idx];
+                let srx = xh(&plan, src);
+                dynasm!(ops ; movsd Rx(g), Rx(srx));
+            }
+            Instr::Add { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Add),
+            Instr::Sub { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Sub),
+            Instr::Mul { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Mul),
+            Instr::Div { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Div),
+            Instr::AddInt { dst, a, imm } => {
+                let d = xh(&plan, dst);
+                let ax = xh(&plan, a);
+                dynasm!(ops
+                    ; mov eax, imm
+                    ; cvtsi2sd xmm0, eax
+                );
+                if d != ax {
+                    dynasm!(ops ; movsd Rx(d), Rx(ax));
+                }
+                dynasm!(ops ; addsd Rx(d), xmm0);
+            }
+            Instr::Neg { dst, a } => {
+                let d = xh(&plan, dst);
+                let ax = xh(&plan, a);
+                dynasm!(ops
+                    ; xorps xmm0, xmm0
+                    ; subsd xmm0, Rx(ax)
+                    ; movsd Rx(d), xmm0
+                );
+            }
+            Instr::Lt { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Lt),
+            Instr::Le { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Le),
+            Instr::Gt { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Gt),
+            Instr::Ge { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Ge),
+            Instr::Eq { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Eq),
+            Instr::Ne { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Ne),
+            Instr::Jump { target } => {
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                dynasm!(ops ; jmp => t);
+            }
+            Instr::JumpIfFalse { cond, target } => {
+                let c = gh(&plan, cond);
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                dynasm!(ops ; test Rq(c), Rq(c) ; jz => t);
+            }
+            Instr::JumpIfTrue { cond, target } => {
+                let c = gh(&plan, cond);
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                dynasm!(ops ; test Rq(c), Rq(c) ; jnz => t);
+            }
+            Instr::JumpIfNotLt { a, b, target } => {
+                let (ax, bx) = (xh(&plan, a), xh(&plan, b));
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                dynasm!(ops ; ucomisd Rx(bx), Rx(ax) ; jbe => t); // !(a<b)
+            }
+            Instr::JumpIfNotLe { a, b, target } => {
+                let (ax, bx) = (xh(&plan, a), xh(&plan, b));
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                dynasm!(ops ; ucomisd Rx(bx), Rx(ax) ; jb => t); // !(a<=b)
+            }
+            Instr::Return { .. } | Instr::ReturnUndefined => {
+                dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
+            }
+            _ => return None,
+        }
+    }
+
+    // ── exit stubs ── set the resume ip, then flush+restore+ret.
+    for (target, label) in &exit_stubs {
+        dynasm!(ops
+            ; => *label
+            ; mov DWORD [rsi], *target as i32
+            ; jmp => flush_exit
+        );
+    }
+
+    // ── flush_exit ── write every home back to the reg file / globals (so the
+    // interpreter resumes with consistent state), restore xmm6..15 + the stack,
+    // and return. [rsi] already holds the resume ip.
+    dynasm!(ops ; => flush_exit);
+    for &(r, x) in &plan.num_regs {
+        dynasm!(ops ; movq rax, Rx(x) ; mov [rbx + dreg(r)], rax);
+    }
+    for &(r, g) in &plan.bool_regs {
+        // Box the 0/1 in the gpr into a Bool Value.
+        dynasm!(ops
+            ; mov rax, QWORD BOOL_TAG as i64
+            ; or rax, Rq(g)
+            ; mov [rbx + dreg(r)], rax
+        );
+    }
+    for &(gi, x) in &plan.globs {
+        dynasm!(ops ; movq rax, Rx(x) ; mov [r12 + (gi as i32) * 8], rax);
+    }
+    emit_region_restore(&mut ops);
+
+    // ── entry_bail ── a live-in type guard failed; nothing was computed yet, so
+    // restore (NO flush — reg file / globals are still consistent) and resume at
+    // the header. [rsi] is set here to the loop header.
+    dynasm!(ops
+        ; => entry_bail
+        ; mov DWORD [rsi], start as i32
+    );
+    emit_region_restore(&mut ops);
+
+    let buf = ops.finalize().ok()?;
+    let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    Some(JitFn { _buf: buf, entry: entry_ptr })
+}
+
+/// Restore xmm6..15 from the save area and the saved gprs, then `ret`.
+fn emit_region_restore(ops: &mut dynasmrt::x64::Assembler) {
+    for k in 0..10u32 {
+        let xi = 6 + k as u8;
+        dynasm!(ops ; movdqu Rx(xi), [rsp + (k as i32) * 16]);
+    }
+    dynasm!(ops
+        ; add rsp, 160
+        ; pop r12
+        ; pop rdi
+        ; pop rsi
+        ; pop rbx
+        ; ret
+    );
+}
+
+/// Guard that the Value bits already in `rax` are a number and load them into
+/// xmm home `home` as f64 (Int → cvtsi2sd; double → movq); else jump to `bail`.
+/// Used only at region entry for live-in values (the loop body is guard-free).
+fn emit_box_to_home(ops: &mut dynasmrt::x64::Assembler, home: u8, bail: dynasmrt::DynamicLabel) {
+    let int_path = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; je => int_path
+        ; sub r10d, (INT_TAG_HI + 1) as i32      // 0x7FFA (bool tag)
+        ; cmp r10d, 3                            // high16 ∈ [0x7FFA,0x7FFD] ⇒ not a number
+        ; jbe => bail
+        ; movq Rx(home), rax
+        ; jmp => done
+        ; => int_path
+        ; cvtsi2sd Rx(home), eax
+        ; => done
+    );
+}
+
+/// The xmm home index of numeric register `r` (panics only on an allocator bug).
+fn xh(plan: &RegionPlan, r: u16) -> u8 {
+    match plan.reg_home[&r] {
+        Home::Xmm(x) => x,
+        Home::Gpr(_) => unreachable!("numeric use of a bool-homed register"),
+    }
+}
+/// The gpr home index of bool register `r`.
+fn gh(plan: &RegionPlan, r: u16) -> u8 {
+    match plan.reg_home[&r] {
+        Home::Gpr(g) => g,
+        Home::Xmm(_) => unreachable!("bool use of a number-homed register"),
+    }
+}
+fn home(plan: &RegionPlan, r: u16) -> Home {
+    plan.reg_home[&r]
+}
+
+/// Emit a register-to-register f64 binop into the dst home, handling aliasing.
+fn emit_dbin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, op: DOp) {
+    let (d, ax, bx) = (xh(plan, dst), xh(plan, a), xh(plan, b));
+    let commutative = matches!(op, DOp::Add | DOp::Mul);
+    // Arrange operands so the accumulator is `d`. For non-commutative ops where
+    // d == b (and d != a), use xmm0 as a temp to avoid clobbering b.
+    if d == ax {
+        emit_dop(ops, d, bx, op);
+    } else if d == bx {
+        if commutative {
+            emit_dop(ops, d, ax, op); // d holds b; d = b op a == a op b
+        } else {
+            dynasm!(ops ; movsd xmm0, Rx(ax));
+            emit_dop_xmm0(ops, bx, op); // xmm0 = a op b
+            dynasm!(ops ; movsd Rx(d), xmm0);
+        }
+    } else {
+        dynasm!(ops ; movsd Rx(d), Rx(ax));
+        emit_dop(ops, d, bx, op);
+    }
+}
+
+/// `xmm[d] <op>= xmm[src]`.
+fn emit_dop(ops: &mut dynasmrt::x64::Assembler, d: u8, src: u8, op: DOp) {
+    match op {
+        DOp::Add => dynasm!(ops ; addsd Rx(d), Rx(src)),
+        DOp::Sub => dynasm!(ops ; subsd Rx(d), Rx(src)),
+        DOp::Mul => dynasm!(ops ; mulsd Rx(d), Rx(src)),
+        DOp::Div => dynasm!(ops ; divsd Rx(d), Rx(src)),
+    }
+}
+/// `xmm0 <op>= xmm[src]`.
+fn emit_dop_xmm0(ops: &mut dynasmrt::x64::Assembler, src: u8, op: DOp) {
+    match op {
+        DOp::Add => dynasm!(ops ; addsd xmm0, Rx(src)),
+        DOp::Sub => dynasm!(ops ; subsd xmm0, Rx(src)),
+        DOp::Mul => dynasm!(ops ; mulsd xmm0, Rx(src)),
+        DOp::Div => dynasm!(ops ; divsd xmm0, Rx(src)),
+    }
+}
+
+/// Emit `bool_home[dst] = (a <cmp> b)` using f64 ordered comparison.
+fn emit_dcmp(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, cmp: Cmp) {
+    let (ax, bx) = (xh(plan, a), xh(plan, b));
+    let d = gh(plan, dst);
+    match cmp {
+        Cmp::Lt => dynasm!(ops ; ucomisd Rx(bx), Rx(ax) ; seta al),
+        Cmp::Le => dynasm!(ops ; ucomisd Rx(bx), Rx(ax) ; setae al),
+        Cmp::Gt => dynasm!(ops ; ucomisd Rx(ax), Rx(bx) ; seta al),
+        Cmp::Ge => dynasm!(ops ; ucomisd Rx(ax), Rx(bx) ; setae al),
+        Cmp::Eq => dynasm!(ops ; ucomisd Rx(ax), Rx(bx) ; sete al ; setnp cl ; and al, cl),
+        Cmp::Ne => dynasm!(ops ; ucomisd Rx(ax), Rx(bx) ; setne al ; setp cl ; or al, cl),
+    }
+    dynasm!(ops ; movzx Rq(d), al);
+}
+
+/// Memory-based region codegen: every op loads operands from the register file
+/// (with a type guard) and stores results back, globals via the pinned base
+/// pointer. Correct and simple; ~4x faster than the interpreter but leaves
+/// per-iteration memory traffic on the table (the register-promoting path above
+/// removes it). Kept as the fallback for regions the allocator declines.
+fn compile_region_mem(
     proto: &FuncProto,
     start: u32,
     end: u32,

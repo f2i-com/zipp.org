@@ -54,6 +54,16 @@ pub fn run(src: &str) -> Result<Outcome, String> {
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
     let program = compile::compile_program(&ret.program)?;
+    // Dev aid: `ZIPP_VM_DUMP=1` prints each function's bytecode to stderr before
+    // running (so the JIT-able regions can be inspected).
+    if std::env::var_os("ZIPP_VM_DUMP").is_some() {
+        for (fid, f) in program.functions.iter().enumerate() {
+            eprintln!("── fn {fid} (regs={}, params={}) ──", f.reg_count, f.param_count);
+            for (ip, instr) in f.code.iter().enumerate() {
+                eprintln!("  {ip:4}  {instr:?}");
+            }
+        }
+    }
     let mut vm = vm::Vm::new(&program);
     match vm.run() {
         Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
