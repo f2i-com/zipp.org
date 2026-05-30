@@ -115,6 +115,10 @@ pub fn install(it: &Interp) {
         nm.set("MAX_SAFE_INTEGER", JsValue::Num(9007199254740991.0));
         nm.set("MIN_SAFE_INTEGER", JsValue::Num(-9007199254740991.0));
         nm.set("EPSILON", JsValue::Num(f64::EPSILON));
+        nm.set("MAX_VALUE", JsValue::Num(f64::MAX));
+        // JS Number.MIN_VALUE is the smallest positive *denormal* (5e-324 =
+        // f64::from_bits(1)), NOT Rust's f64::MIN_POSITIVE (smallest *normal*).
+        nm.set("MIN_VALUE", JsValue::Num(f64::from_bits(1)));
         nm.set("POSITIVE_INFINITY", JsValue::Num(f64::INFINITY));
         nm.set("NEGATIVE_INFINITY", JsValue::Num(f64::NEG_INFINITY));
         nm.set("NaN", JsValue::Num(f64::NAN));

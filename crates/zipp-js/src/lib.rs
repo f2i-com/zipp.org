@@ -118,6 +118,13 @@ mod tests {
     }
 
     #[test]
+    fn number_constants() {
+        assert_eq!(out("console.log(Number.MAX_VALUE)"), "1.7976931348623157e+308");
+        assert_eq!(out("console.log(Number.MIN_VALUE)"), "5e-324");
+        assert_eq!(out("console.log(Number.MAX_VALUE > 1e308, Number.MIN_VALUE > 0)"), "true true");
+    }
+
+    #[test]
     fn to_number_coercion() {
         // ToNumber(object) via ToPrimitive (string form), and radix-prefixed /
         // Infinity / invalid string forms.
