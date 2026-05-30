@@ -19,6 +19,7 @@
 //! reported honestly at each step.
 
 mod bytecode;
+mod capture;
 mod compile;
 mod heap;
 pub mod value;

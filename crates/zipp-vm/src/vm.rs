@@ -19,7 +19,7 @@
 //! JIT'd engine and than V8; the point is a clean substrate that a JIT can
 //! later make faster.
 
-use crate::bytecode::{Instr, Program};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{Heap, HeapObj, ObjMap};
 use crate::value::Value;
 
@@ -27,6 +27,10 @@ use crate::value::Value;
 /// than growing unbounded. 100k is far beyond any non-pathological recursion
 /// and the flat register file makes each frame cheap.
 const MAX_FRAMES: usize = 100_000;
+
+/// Sentinel `closure` value for a frame whose callee is a plain (capture-free)
+/// function rather than a closure. Real heap indices are always `< u32::MAX`.
+const NO_CLOSURE: u32 = u32::MAX;
 
 /// One activation record.
 struct Frame {
@@ -37,6 +41,10 @@ struct Frame {
     ip: usize,
     /// Register in the *caller's* window that receives this call's result.
     ret_dst: u16,
+    /// Heap index of the `Closure` object this frame is executing, or
+    /// `NO_CLOSURE` for a plain function. `UpvalGet`/`UpvalSet` read the
+    /// closure's captured cell indices through it.
+    closure: u32,
 }
 
 pub struct Vm<'p> {
@@ -96,7 +104,7 @@ impl<'p> Vm<'p> {
         let top = &self.program.functions[0];
         let base = 0usize;
         self.regs.resize(top.reg_count as usize, Value::UNDEFINED);
-        self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0 });
+        self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE });
         // Run until the top-level frame returns (frames drains back to 0).
         self.run_loop(0)
     }
@@ -112,7 +120,7 @@ impl<'p> Vm<'p> {
     /// calling itself) does NOT — it stays on the frame stack. The frame cap
     /// still bounds total depth.
     fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
-        let func_id = self.resolve_callable(callee)?;
+        let (func_id, closure) = self.resolve_callable(callee)?;
         if self.frames.len() >= MAX_FRAMES {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
@@ -129,7 +137,7 @@ impl<'p> Vm<'p> {
         }
 
         let stop_depth = self.frames.len();
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0 });
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0, closure });
         self.run_loop(stop_depth)
     }
 
@@ -159,6 +167,7 @@ impl<'p> Vm<'p> {
             let func_id = self.frames[frame_idx].func;
             let base = self.frames[frame_idx].base;
             let mut ip = self.frames[frame_idx].ip;
+            let cur_closure = self.frames[frame_idx].closure;
             let code: *const Vec<Instr> = &self.program.functions[func_id as usize].code;
             // SAFETY: `code` borrows immutable program data that outlives the
             // loop; we never mutate program functions during execution.
@@ -371,6 +380,61 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::MakeClosure { dst, func_id } => {
+                        // Capture each upvalue's cell index, resolved in THIS
+                        // (defining) frame: a ParentLocal source reads the cell
+                        // index from a local register (the local was boxed via
+                        // MakeCell); a ParentUpval source forwards one of this
+                        // frame's own captured cells.
+                        let sources = &self.program.functions[func_id as usize].upvalues;
+                        let mut cells = Vec::with_capacity(sources.len());
+                        for src in sources {
+                            let cell = match *src {
+                                UpvalSource::ParentLocal(reg) => {
+                                    self.get(base, reg).heap_index()
+                                }
+                                UpvalSource::ParentUpval(idx) => {
+                                    self.closure_upvalue(cur_closure, idx)
+                                }
+                            };
+                            cells.push(cell);
+                        }
+                        let v = Value::heap(
+                            self.heap.alloc(HeapObj::Closure { func: func_id, upvalues: cells }),
+                        );
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::MakeCell { reg } => {
+                        let v = self.get(base, reg);
+                        let cell = self.heap.alloc(HeapObj::Cell(v));
+                        self.set(base, reg, Value::heap(cell));
+                        ip += 1;
+                    }
+                    Instr::CellGet { dst, cell } => {
+                        let cell_idx = self.get(base, cell).heap_index();
+                        let v = self.heap.cell_get(cell_idx);
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::CellSet { cell, src } => {
+                        let cell_idx = self.get(base, cell).heap_index();
+                        let v = self.get(base, src);
+                        self.heap.cell_set(cell_idx, v);
+                        ip += 1;
+                    }
+                    Instr::UpvalGet { dst, idx } => {
+                        let cell = self.closure_upvalue(cur_closure, idx);
+                        let v = self.heap.cell_get(cell);
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::UpvalSet { idx, src } => {
+                        let cell = self.closure_upvalue(cur_closure, idx);
+                        let v = self.get(base, src);
+                        self.heap.cell_set(cell, v);
+                        ip += 1;
+                    }
                     Instr::NewArray { dst, arg_base, argc } => {
                         let mut items = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
@@ -420,9 +484,10 @@ impl<'p> Vm<'p> {
 
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
-                        let func_id_to_call = self.resolve_callable(callee_v)?;
+                        let (fid, closure) = self.resolve_callable(callee_v)?;
                         self.setup_call(
-                            func_id_to_call,
+                            fid,
+                            closure,
                             Value::UNDEFINED,
                             base,
                             arg_base,
@@ -448,8 +513,8 @@ impl<'p> Vm<'p> {
                         // Otherwise the property must resolve to a user function
                         // (a method on an object); call it with `this = recv`.
                         let prop = self.get_prop(recv, &key)?;
-                        let func_id_to_call = self.resolve_callable(prop)?;
-                        self.setup_call(func_id_to_call, recv, base, arg_base, argc, dst, ip + 1)?;
+                        let (fid, closure) = self.resolve_callable(prop)?;
+                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1)?;
                         break;
                     }
 
@@ -501,10 +566,28 @@ impl<'p> Vm<'p> {
     // ── call setup ──
 
     /// Resolve a value to a callable function id, or throw a TypeError.
-    fn resolve_callable(&self, v: Value) -> Result<u32, Thrown> {
+    /// The cell heap-index captured at upvalue slot `idx` of the closure heap
+    /// object `closure`. Panics only on a miscompiled program (an UpvalGet in a
+    /// frame with no closure, or an out-of-range slot), which the compiler must
+    /// not emit.
+    #[inline]
+    fn closure_upvalue(&self, closure: u32, idx: u16) -> u32 {
+        match self.heap.get(closure) {
+            HeapObj::Closure { upvalues, .. } => upvalues[idx as usize],
+            _ => panic!("UpvalGet/Set in a frame without a closure"),
+        }
+    }
+
+    /// Resolve a value to `(func_id, closure_heap_idx)`. `closure_heap_idx` is
+    /// the value's heap index when it is a `Closure` (so the frame can reach its
+    /// captured cells), or `NO_CLOSURE` for a plain `Func`.
+    fn resolve_callable(&self, v: Value) -> Result<(u32, u32), Thrown> {
         if v.is_heap() {
-            if let Some((id, _upvalues)) = self.heap.as_callable(v.heap_index()) {
-                return Ok(id);
+            let idx = v.heap_index();
+            match self.heap.get(idx) {
+                HeapObj::Func(id) => return Ok((*id, NO_CLOSURE)),
+                HeapObj::Closure { func, .. } => return Ok((*func, idx)),
+                _ => {}
             }
         }
         Err(Thrown(format!("TypeError: {} is not a function", self.display(v))))
@@ -517,6 +600,7 @@ impl<'p> Vm<'p> {
     fn setup_call(
         &mut self,
         func_id: u32,
+        closure: u32,
         this_val: Value,
         caller_base: usize,
         arg_base: u16,
@@ -544,7 +628,7 @@ impl<'p> Vm<'p> {
 
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst });
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure });
         Ok(())
     }
 

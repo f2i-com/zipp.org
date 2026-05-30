@@ -76,10 +76,27 @@ pub enum Instr {
     JumpIfNotLe { a: Reg, b: Reg, target: u32 },
 
     // ── reference types ──
-    /// `dst = <function object for functions[func_id]>`. v1 creates a
-    /// capture-free function object; closures (Stage 3) extend this with
-    /// upvalue cells.
+    /// `dst = <function object for functions[func_id]>`. Capture-free: used for
+    /// functions that reference no enclosing variables.
     MakeFunc { dst: Reg, func_id: u32 },
+    /// `dst = <closure over functions[func_id]>` capturing upvalue cells named
+    /// by `functions[func_id].upvalues`. Each upvalue source is resolved in the
+    /// CURRENT (defining) frame: either a local register that holds a cell, or
+    /// one of the current frame's own upvalues (for nested-of-nested capture).
+    MakeClosure { dst: Reg, func_id: u32 },
+
+    /// Box the value currently in `reg` into a fresh heap Cell and write the
+    /// cell reference back into `reg`. Emitted for a captured local/param so
+    /// later reads/writes go through the shared cell.
+    MakeCell { reg: Reg },
+    /// `dst = *<cell in reg>` — read a captured local's cell.
+    CellGet { dst: Reg, cell: Reg },
+    /// `*<cell in reg> = src` — write a captured local's cell.
+    CellSet { cell: Reg, src: Reg },
+    /// `dst = *<upvalue[idx]>` — read one of this closure's captured cells.
+    UpvalGet { dst: Reg, idx: u16 },
+    /// `*<upvalue[idx]> = src` — write one of this closure's captured cells.
+    UpvalSet { idx: u16, src: Reg },
     /// `dst = [reg[arg_base], …, reg[arg_base+argc-1]]` — array literal.
     NewArray { dst: Reg, arg_base: Reg, argc: u16 },
     /// `dst = {}` — empty object (populated by following SetProp/SetIndex).
@@ -128,6 +145,20 @@ pub struct FuncProto {
     /// If this function's name is hoisted to a global binding, the slot index;
     /// the VM materialises a function object into that global at startup.
     pub name_global: Option<u16>,
+    /// Upvalues this function captures, in order. Index `i` of a `UpvalGet`/
+    /// `UpvalSet` refers to `upvalues[i]`. Each entry says where the DEFINING
+    /// frame finds the cell to capture: a local register holding a cell, or one
+    /// of the defining frame's own upvalues (nested-of-nested capture).
+    pub upvalues: Vec<UpvalSource>,
+}
+
+/// Where a closure's upvalue is sourced from, evaluated in the defining frame.
+#[derive(Clone, Copy, Debug)]
+pub enum UpvalSource {
+    /// Capture the cell currently in the defining frame's register `reg`.
+    ParentLocal(Reg),
+    /// Capture the defining frame's own upvalue `idx` (re-capture up the chain).
+    ParentUpval(u16),
 }
 
 /// A whole program: the top-level function plus every nested function, indexed
