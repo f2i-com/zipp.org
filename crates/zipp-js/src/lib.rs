@@ -198,6 +198,20 @@ mod tests {
     }
 
     #[test]
+    fn optional_chaining() {
+        assert_eq!(out("const o={a:{b:{c:42}}}; console.log(o?.a?.b?.c)"), "42");
+        assert_eq!(out("const o={a:1}; console.log(o?.x?.y?.z)"), "undefined");
+        assert_eq!(out("const o={}; console.log(o?.missing?.deep ?? 'dflt')"), "dflt");
+        assert_eq!(out("const o={list:[10,20,30]}; console.log(o?.list?.[1], o?.gone?.[5])"), "20 undefined");
+        assert_eq!(out("const o={fn:()=>'hi'}; console.log(o?.fn?.(), o?.nofn?.())"), "hi undefined");
+        assert_eq!(out("const u=null; console.log(u?.a?.b, u?.x ?? 'safe')"), "undefined safe");
+        assert_eq!(
+            out("function g(x){ return x?.value?.toUpperCase(); } console.log(g({value:'hi'}), g(null), g({}))"),
+            "HI undefined undefined"
+        );
+    }
+
+    #[test]
     fn classes_and_inheritance() {
         assert_eq!(
             out("class P { constructor(x,y){ this.x=x; this.y=y; } sum(){ return this.x+this.y; } static make(){ return new P(1,2); } } const p = new P(3,4); console.log(p.sum(), P.make().sum(), p instanceof P)"),

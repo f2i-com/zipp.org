@@ -410,7 +410,42 @@ impl Interp {
             }
             Expr::Super => Err(self.super_err()),
             Expr::Spread(_) => Err(self.type_error("unexpected spread")),
+            Expr::OptChain { base, steps } => self.eval_optchain(base, steps, scope),
         }
+    }
+
+    /// Evaluate an optional chain. Walks `base` then each step; a nullish value at
+    /// an `?.` step short-circuits the whole chain to `undefined`. Tracks the
+    /// receiver so a method call within the chain binds `this` correctly.
+    fn eval_optchain(
+        &self,
+        base: &Expr,
+        steps: &[ChainStep],
+        scope: &Rc<RefCell<Scope>>,
+    ) -> EvalResult<JsValue> {
+        let mut cur = self.eval(base, scope)?;
+        let mut recv = JsValue::Undefined; // `this` for a following call step
+        for step in steps {
+            match step {
+                ChainStep::Member { prop, computed, optional } => {
+                    if *optional && matches!(cur, JsValue::Undefined | JsValue::Null) {
+                        return Ok(JsValue::Undefined);
+                    }
+                    let key = self.member_key(prop, *computed, scope)?;
+                    recv = cur.clone();
+                    cur = self.get_member(&cur, &key)?;
+                }
+                ChainStep::Call { args, optional } => {
+                    if *optional && matches!(cur, JsValue::Undefined | JsValue::Null) {
+                        return Ok(JsValue::Undefined);
+                    }
+                    let argv = self.eval_args(args, scope)?;
+                    cur = self.call(&cur, &recv, &argv)?;
+                    recv = JsValue::Undefined; // reset `this` after a call
+                }
+            }
+        }
+        Ok(cur)
     }
 
     fn unary(&self, op: UnOp, arg: &Expr, scope: &Rc<RefCell<Scope>>) -> EvalResult<JsValue> {

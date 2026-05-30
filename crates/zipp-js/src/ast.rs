@@ -211,6 +211,21 @@ pub enum Expr {
     Super,
     /// `...expr` in an argument or array-element position (spread).
     Spread(Box<Expr>),
+    /// An optional chain `a?.b.c?.()` — a base expression plus a sequence of
+    /// member/call steps, where a nullish value at any `?.` step short-circuits
+    /// the whole chain to `undefined`. (Modelled as one flattened node so the
+    /// short-circuit boundary is explicit and existing Member/Call stay simple.)
+    OptChain { base: Box<Expr>, steps: Vec<ChainStep> },
+}
+
+/// One step of an [`Expr::OptChain`]. `optional` marks a `?.` step (short-circuit
+/// if the current value is nullish).
+#[derive(Debug, Clone)]
+pub enum ChainStep {
+    /// `.prop` / `?.prop` / `[expr]` / `?.[expr]`.
+    Member { prop: Box<Expr>, computed: bool, optional: bool },
+    /// `(args)` / `?.(args)`.
+    Call { args: Vec<Expr>, optional: bool },
 }
 
 #[derive(Debug, Clone)]

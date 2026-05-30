@@ -354,6 +354,7 @@ fn expr(e: &ox::Expression) -> R<Expr> {
             els: Box::new(expr(&c.alternate)?),
         },
         E::CallExpression(c) => call(c)?,
+        E::ChainExpression(c) => lower_chain_expression(&c.expression)?,
         E::NewExpression(n) => Expr::New {
             callee: Box::new(expr(&n.callee)?),
             args: call_args(&n.arguments)?,
@@ -595,4 +596,71 @@ fn call(c: &ox::CallExpression) -> R<Expr> {
         callee: Box::new(expr(&c.callee)?),
         args: call_args(&c.arguments)?,
     })
+}
+
+/// Lower an optional chain (`a?.b.c?.()`) into a flattened `Expr::OptChain`: the
+/// innermost base expression plus member/call steps in evaluation order.
+fn lower_chain_expression(e: &ox::ChainElement) -> R<Expr> {
+    let mut steps = Vec::new();
+    let base = flatten_chain_element(e, &mut steps)?;
+    steps.reverse(); // collected outermost-first; want innermost-first
+    Ok(Expr::OptChain { base: Box::new(base), steps })
+}
+
+/// Walk a chain element inward, pushing each step (outermost first) and returning
+/// the base expression the chain starts from.
+fn flatten_chain_element(e: &ox::ChainElement, steps: &mut Vec<ChainStep>) -> R<Expr> {
+    match e {
+        ox::ChainElement::StaticMemberExpression(m) => {
+            steps.push(ChainStep::Member {
+                prop: Box::new(Expr::Str(m.property.name.as_str().into())),
+                computed: false,
+                optional: m.optional,
+            });
+            flatten_chain_object(&m.object, steps)
+        }
+        ox::ChainElement::ComputedMemberExpression(m) => {
+            steps.push(ChainStep::Member {
+                prop: Box::new(expr(&m.expression)?),
+                computed: true,
+                optional: m.optional,
+            });
+            flatten_chain_object(&m.object, steps)
+        }
+        ox::ChainElement::CallExpression(c) => {
+            steps.push(ChainStep::Call { args: call_args(&c.arguments)?, optional: c.optional });
+            flatten_chain_object(&c.callee, steps)
+        }
+        ox::ChainElement::TSNonNullExpression(_) | ox::ChainElement::PrivateFieldExpression(_) => {
+            Err("`!` / private fields in an optional chain aren't in the v0 JS engine yet".into())
+        }
+    }
+}
+
+/// Continue flattening: a nested member/call within the chain stays in the chain;
+/// anything else is the chain's base.
+fn flatten_chain_object(e: &ox::Expression, steps: &mut Vec<ChainStep>) -> R<Expr> {
+    match e {
+        ox::Expression::StaticMemberExpression(m) => {
+            steps.push(ChainStep::Member {
+                prop: Box::new(Expr::Str(m.property.name.as_str().into())),
+                computed: false,
+                optional: m.optional,
+            });
+            flatten_chain_object(&m.object, steps)
+        }
+        ox::Expression::ComputedMemberExpression(m) => {
+            steps.push(ChainStep::Member {
+                prop: Box::new(expr(&m.expression)?),
+                computed: true,
+                optional: m.optional,
+            });
+            flatten_chain_object(&m.object, steps)
+        }
+        ox::Expression::CallExpression(c) => {
+            steps.push(ChainStep::Call { args: call_args(&c.arguments)?, optional: c.optional });
+            flatten_chain_object(&c.callee, steps)
+        }
+        other => expr(other),
+    }
 }
