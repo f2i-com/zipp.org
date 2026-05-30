@@ -315,6 +315,9 @@ impl JsValue {
                 seen.pop();
                 out
             }
+            // `console.log(-0)` shows "-0" (whereas String(-0) / toString give
+            // "0"); the sign is only surfaced by the inspector, not by coercion.
+            JsValue::Num(n) if *n == 0.0 && n.is_sign_negative() => "-0".into(),
             other => other.to_js_string(),
         }
     }

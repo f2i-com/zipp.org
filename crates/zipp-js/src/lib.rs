@@ -108,7 +108,11 @@ mod tests {
         assert_eq!(out("console.log(0.1)"), "0.1");
         assert_eq!(out("console.log(1000000)"), "1000000");
         assert_eq!(out("console.log(-1234.5678)"), "-1234.5678");
-        assert_eq!(out("console.log(-0)"), "0");
+        // console.log shows -0 with its sign, but String(-0)/toString give "0".
+        assert_eq!(out("console.log(-0)"), "-0");
+        assert_eq!(out("console.log(String(-0), `${-0}`, (-0).toString())"), "0 0 0");
+        assert_eq!(out("console.log(0)"), "0");
+        assert_eq!(out("console.log(-0 === 0)"), "true");
         assert_eq!(out("console.log(123.456)"), "123.456");
         assert_eq!(out("console.log(-1e-21)"), "-1e-21");
     }
