@@ -18,7 +18,7 @@ fn n(a: &[JsValue], i: usize) -> f64 {
 /// Install all globals into the interpreter's global scope.
 pub fn install(it: &Interp) {
     let g = &it.global;
-    let mut decl = |name: &str, v: JsValue| g.borrow_mut().declare(name, v);
+    let decl = |name: &str, v: JsValue| g.borrow_mut().declare(name, v);
 
     // value globals
     decl("undefined", JsValue::Undefined);

@@ -38,6 +38,8 @@ pub struct Object {
     /// Named own properties, kept in insertion order via the `order` list.
     pub props: BTreeMap<String, JsValue>,
     pub order: Vec<String>,
+    /// The prototype link (`[[Prototype]]`); `None` ends the chain.
+    pub proto: Option<Obj>,
     pub data: ObjData,
 }
 
@@ -59,6 +61,7 @@ impl Object {
         Rc::new(RefCell::new(Object {
             props: BTreeMap::new(),
             order: Vec::new(),
+            proto: None,
             data: ObjData::Plain,
         }))
     }
@@ -66,6 +69,7 @@ impl Object {
         Rc::new(RefCell::new(Object {
             props: BTreeMap::new(),
             order: Vec::new(),
+            proto: None,
             data: ObjData::Array(items),
         }))
     }
@@ -73,6 +77,7 @@ impl Object {
         Rc::new(RefCell::new(Object {
             props: BTreeMap::new(),
             order: Vec::new(),
+            proto: None,
             data: ObjData::Function { def, scope },
         }))
     }
@@ -80,6 +85,7 @@ impl Object {
         Rc::new(RefCell::new(Object {
             props: BTreeMap::new(),
             order: Vec::new(),
+            proto: None,
             data: ObjData::Native { name: name.into(), f },
         }))
     }

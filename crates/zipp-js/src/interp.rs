@@ -398,6 +398,54 @@ impl Interp {
         }
     }
 
+    /// The values a `for-of`/spread iterates: array elements, or string chars.
+    /// (The full iterator protocol / generators are a later tier.)
+    fn iterable_values(&self, v: &JsValue) -> EvalResult<Vec<JsValue>> {
+        match v {
+            JsValue::Object(o) => {
+                if let ObjData::Array(items) = &o.borrow().data {
+                    Ok(items.clone())
+                } else {
+                    Err(self.type_error("value is not iterable"))
+                }
+            }
+            JsValue::Str(s) => Ok(s.chars().map(|c| JsValue::str(c.to_string())).collect()),
+            _ => Err(self.type_error(&format!("{} is not iterable", v.to_js_string()))),
+        }
+    }
+
+    /// The own enumerable keys a `for-in` iterates.
+    fn enum_keys(&self, v: &JsValue) -> Vec<String> {
+        match v {
+            JsValue::Object(o) => {
+                let b = o.borrow();
+                match &b.data {
+                    ObjData::Array(items) => (0..items.len()).map(|i| i.to_string()).collect(),
+                    _ => b.order.clone(),
+                }
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Bind a `for-of`/`for-in` loop variable: a fresh per-iteration binding for
+    /// `let`/`const`/`var` (so closures capture distinct values), else an
+    /// assignment to an existing variable.
+    fn bind_loop_var(
+        &self,
+        decl: &Option<DeclKind>,
+        name: &str,
+        v: JsValue,
+        outer: &Rc<RefCell<Scope>>,
+        iter_scope: &Rc<RefCell<Scope>>,
+    ) {
+        if decl.is_some() {
+            iter_scope.borrow_mut().declare(name, v);
+        } else if !env::set(outer, name, v.clone()) {
+            self.global.borrow_mut().declare(name, v);
+        }
+    }
+
     fn member_key(&self, prop: &Expr, computed: bool, scope: &Rc<RefCell<Scope>>) -> EvalResult<String> {
         if !computed {
             if let Expr::Str(s) = prop {
