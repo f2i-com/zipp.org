@@ -38,6 +38,9 @@ pub use value::Value;
 /// flushing stdout before reporting the error).
 pub struct Outcome {
     pub output: Vec<String>,
+    /// Lines from `console.error`/`console.warn` (the caller writes these to
+    /// stderr, matching node).
+    pub errput: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -53,9 +56,10 @@ pub fn run(src: &str) -> Result<Outcome, String> {
     let program = compile::compile_program(&ret.program)?;
     let mut vm = vm::Vm::new(&program);
     match vm.run() {
-        Ok(_) => Ok(Outcome { output: vm.output, error: None }),
+        Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
         Err(thrown) => Ok(Outcome {
             output: std::mem::take(&mut vm.output),
+            errput: std::mem::take(&mut vm.errput),
             error: Some(thrown.0),
         }),
     }

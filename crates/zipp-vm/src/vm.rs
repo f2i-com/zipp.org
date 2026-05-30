@@ -68,8 +68,13 @@ pub struct Vm<'p> {
     /// the window `[base, base + reg_count)`.
     regs: Vec<Value>,
     frames: Vec<Frame>,
-    /// Lines produced by `Print` (console.log), in order.
+    /// Lines produced by `Print` (console.log/info/debug → stdout), in order.
     pub output: Vec<String>,
+    /// Lines produced by `console.error`/`console.warn` (→ stderr in node).
+    pub errput: Vec<String>,
+    /// VM start instant — the zero point for `performance.now()` (which reports
+    /// fractional milliseconds elapsed since the program began).
+    start: std::time::Instant,
     /// The JS value currently being thrown, set when a `Throw` (or an internal
     /// error) begins unwinding and cleared when a `catch` handler receives it.
     /// Carrying the real `Value` (not just a message) lets `catch (e)` bind the
@@ -119,6 +124,8 @@ impl<'p> Vm<'p> {
             regs: Vec::new(),
             frames: Vec::new(),
             output: Vec::new(),
+            errput: Vec::new(),
+            start: std::time::Instant::now(),
             pending_throw: None,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
@@ -537,6 +544,20 @@ impl<'p> Vm<'p> {
                         self.globals[idx as usize] = v;
                         ip += 1;
                     }
+                    Instr::Now { dst, epoch } => {
+                        let ms = if epoch {
+                            // Date.now(): integer ms since the Unix epoch.
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as f64)
+                                .unwrap_or(0.0)
+                        } else {
+                            // performance.now(): fractional ms since VM start.
+                            self.start.elapsed().as_secs_f64() * 1000.0
+                        };
+                        self.set(base, dst, Value::num(ms));
+                        ip += 1;
+                    }
 
                     Instr::Add { dst, a, b } => {
                         let r = self.add(base, a, b)?;
@@ -699,13 +720,18 @@ impl<'p> Vm<'p> {
                         }
                     }
 
-                    Instr::Print { arg_base, argc } => {
+                    Instr::Print { arg_base, argc, to_stderr } => {
                         let mut parts = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
                             let v = self.get(base, arg_base + i);
                             parts.push(self.inspect(v));
                         }
-                        self.output.push(parts.join(" "));
+                        let line = parts.join(" ");
+                        if to_stderr {
+                            self.errput.push(line);
+                        } else {
+                            self.output.push(line);
+                        }
                         ip += 1;
                     }
 
@@ -1220,16 +1246,37 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> Result<Option<Value>, Thrown> {
+        let args: Vec<Value> = (0..argc)
+            .map(|i| self.regs[base + arg_base as usize + i as usize])
+            .collect();
+        // Number receivers (Int or double) support a small method set.
+        if recv.is_number() {
+            return self.number_method(recv, name, &args);
+        }
         if !recv.is_heap() {
             return Ok(None);
         }
         let idx = recv.heap_index();
-        let args: Vec<Value> = (0..argc)
-            .map(|i| self.regs[base + arg_base as usize + i as usize])
-            .collect();
         match self.heap.get(idx) {
             HeapObj::Array(_) => self.array_method(idx, name, &args),
             HeapObj::Str(_) => self.string_method(idx, name, &args),
+            _ => Ok(None),
+        }
+    }
+
+    /// Methods on a number receiver: `toFixed`, `toString`. Returns `Ok(None)`
+    /// for an unrecognised name (the caller then treats it as a missing property
+    /// → TypeError, matching JS).
+    fn number_method(&mut self, recv: Value, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let n = recv.as_f64();
+        match name {
+            "toFixed" => {
+                let digits = args.first().map(|a| a.as_f64() as usize).unwrap_or(0).min(100);
+                Ok(Some(self.alloc_str(format!("{n:.digits$}"))))
+            }
+            // Base-10 uses the engine's canonical number rendering for node
+            // parity; a radix argument (toString(2|16|…)) is out of v1 scope.
+            "toString" => Ok(Some(self.alloc_str(self.display(recv)))),
             _ => Ok(None),
         }
     }
@@ -1764,6 +1811,91 @@ pub(crate) extern "win64" fn jit_self_call(
         Ok(bits) => bits,
         Err(_) => crate::codegen::SELF_CALL_DEOPT,
     }
+}
+
+/// Win64 helper: `obj.<string_constants[name_idx]>` for JIT'd code. `obj_bits`
+/// is the receiver Value; `name_idx` indexes the COMPILING function's
+/// string_constants (passed because the property key text lives there). Returns
+/// the property Value bits, or `SELF_CALL_DEOPT` to make the native code bail
+/// (non-object receiver, or a throw — e.g. property of null/undefined).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_get_prop(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    func_id: u32,
+    name_idx: u32,
+) -> u64 {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        let key = vm.program.functions[func_id as usize].string_constants[name_idx as usize].clone();
+        match vm.get_prop(Value::from_bits(obj_bits), &key) {
+            Ok(v) => v.bits(),
+            // A throw (e.g. prop of null): set pending_throw so the native bail
+            // unwinds correctly, and signal deopt.
+            Err(t) => {
+                let tv = vm.alloc_str(t.0);
+                vm.pending_throw = Some(tv);
+                crate::codegen::SELF_CALL_DEOPT
+            }
+        }
+    }));
+    r.unwrap_or(crate::codegen::SELF_CALL_DEOPT)
+}
+
+/// Win64 helper: `obj.<string_constants[name_idx]> = val` for JIT'd code.
+/// Returns `0` on success or `SELF_CALL_DEOPT` to bail (non-object / throw).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_set_prop(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    val_bits: u64,
+    packed_ids: u64,
+) -> u64 {
+    // packed_ids = (func_id as u64) << 32 | name_idx; avoids a 5th arg (win64
+    // passes only 4 in registers).
+    let func_id = (packed_ids >> 32) as u32;
+    let name_idx = packed_ids as u32;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        let key = vm.program.functions[func_id as usize].string_constants[name_idx as usize].clone();
+        match vm.set_prop(Value::from_bits(obj_bits), &key, Value::from_bits(val_bits)) {
+            Ok(()) => 0u64,
+            Err(t) => {
+                let tv = vm.alloc_str(t.0);
+                vm.pending_throw = Some(tv);
+                crate::codegen::SELF_CALL_DEOPT
+            }
+        }
+    }));
+    r.unwrap_or(crate::codegen::SELF_CALL_DEOPT)
+}
+
+/// Win64 helper: read `globals[idx]` for JIT'd code. Globals live in a Vec the
+/// asm can't easily reach, so a thin helper returns the Value bits.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `idx` is a valid global slot (the compiler only
+/// emits in-range slots).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_load_global(vm: *mut core::ffi::c_void, idx: u32) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    vm.globals[idx as usize].bits()
+}
+
+/// Win64 helper: `globals[idx] = val` for JIT'd code.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `idx` is a valid global slot.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_store_global(vm: *mut core::ffi::c_void, idx: u32, val_bits: u64) {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.globals[idx as usize] = Value::from_bits(val_bits);
 }
 
 /// Normalise a (possibly negative) slice index into `[0, len]`. Negative

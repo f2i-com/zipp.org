@@ -1423,9 +1423,27 @@ impl<'a> FnCompiler<'a> {
                 if obj.name == "console"
                     && matches!(m.property.name.as_str(), "log" | "info" | "warn" | "error" | "debug")
                 {
+                    // node routes console.error / console.warn to stderr.
+                    let to_stderr = matches!(m.property.name.as_str(), "error" | "warn");
                     let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
-                    self.emit(Instr::Print { arg_base, argc });
+                    self.emit(Instr::Print { arg_base, argc, to_stderr });
                     self.emit(Instr::LoadUndefined { dst });
+                    return Ok(dst);
+                }
+            }
+        }
+
+        // Clock idioms: `performance.now()` and `Date.now()` → Now opcode. They
+        // have no real global object in the subset, so recognise the call shape.
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            if let ox::Expression::Identifier(obj) = &m.object {
+                let epoch = match (obj.name.as_str(), m.property.name.as_str()) {
+                    ("performance", "now") => Some(false),
+                    ("Date", "now") => Some(true),
+                    _ => None,
+                };
+                if let Some(epoch) = epoch {
+                    self.emit(Instr::Now { dst, epoch });
                     return Ok(dst);
                 }
             }

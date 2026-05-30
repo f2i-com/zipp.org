@@ -112,6 +112,10 @@ fn run(args: &[String]) -> Result<(), String> {
             for line in &outcome.output {
                 println!("{line}");
             }
+            // console.error / console.warn → stderr, matching node.
+            for line in &outcome.errput {
+                eprintln!("{line}");
+            }
             if let Some(err) = outcome.error {
                 return Err(err);
             }

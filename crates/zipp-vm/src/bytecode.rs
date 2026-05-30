@@ -39,6 +39,12 @@ pub enum Instr {
     /// `globals[idx] = src`
     StoreGlobal { idx: u32, src: Reg },
 
+    /// A clock read: `performance.now()` (`epoch = false`, fractional ms since
+    /// VM start) or `Date.now()` (`epoch = true`, integer ms since the Unix
+    /// epoch). Both yield an f64 `Value`. Recognised at compile time so the
+    /// common timing idiom works without a real global object model.
+    Now { dst: Reg, epoch: bool },
+
     // ── arithmetic (generic: operands may be any number) ──
     Add { dst: Reg, a: Reg, b: Reg },
     Sub { dst: Reg, a: Reg, b: Reg },
@@ -146,8 +152,9 @@ pub enum Instr {
 
     /// `console.log`-style print of `argc` values starting at `arg_base`.
     /// A dedicated opcode keeps the v1 stdlib trivial; later this becomes an
-    /// ordinary builtin call.
-    Print { arg_base: Reg, argc: u16 },
+    /// ordinary builtin call. `to_stderr` is set for `console.error`/`warn`
+    /// (which write to stderr in node), clear for `log`/`info`/`debug`.
+    Print { arg_base: Reg, argc: u16, to_stderr: bool },
 }
 
 /// A compiled function: its code, register-file size, parameter count, and the
