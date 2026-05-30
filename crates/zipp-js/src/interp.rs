@@ -682,8 +682,7 @@ impl Interp {
             }
             _ => (self.eval(callee, scope)?, JsValue::Undefined),
         };
-        let argv = self.eval_args(args, scope)?;
-        self.call(&func, &this, &argv)
+        self.call_with_args(&func, &this, args, scope)
     }
 
     fn super_err(&self) -> JsValue {
