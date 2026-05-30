@@ -153,4 +153,91 @@ mod tests {
         assert_eq!(run_ok("console.log('a' + 'b' + 'c')"), vec!["abc"]);
         assert_eq!(run_ok("console.log('n=' + 42)"), vec!["n=42"]);
     }
+
+    // ── Stage 1: reference types ──
+
+    #[test]
+    fn array_literal_and_index() {
+        assert_eq!(run_ok("let a = [10, 20, 30]; console.log(a[0], a[1], a[2])"), vec!["10 20 30"]);
+        assert_eq!(run_ok("let a = [1,2,3]; console.log(a.length)"), vec!["3"]);
+        assert_eq!(run_ok("let a = [1,2,3]; a[1] = 99; console.log(a[1])"), vec!["99"]);
+    }
+
+    #[test]
+    fn array_inspect_matches_node() {
+        // node renders arrays with spaced brackets.
+        assert_eq!(run_ok("console.log([1, 2, 3])"), vec!["[ 1, 2, 3 ]"]);
+        assert_eq!(run_ok("console.log([])"), vec!["[]"]);
+    }
+
+    #[test]
+    fn array_coercion_is_comma_join() {
+        assert_eq!(run_ok("console.log('x' + [1,2,3])"), vec!["x1,2,3"]);
+        assert_eq!(run_ok("console.log([1,2,3].join('-'))"), vec!["1-2-3"]);
+    }
+
+    #[test]
+    fn array_push_pop() {
+        assert_eq!(
+            run_ok("let a = [1]; a.push(2); a.push(3); console.log(a.length, a[2])"),
+            vec!["3 3"]
+        );
+        assert_eq!(run_ok("let a = [1,2,3]; let x = a.pop(); console.log(x, a.length)"), vec!["3 2"]);
+    }
+
+    #[test]
+    fn object_literal_and_props() {
+        assert_eq!(run_ok("let o = {a: 1, b: 2}; console.log(o.a, o.b)"), vec!["1 2"]);
+        assert_eq!(run_ok("let o = {}; o.x = 5; console.log(o.x)"), vec!["5"]);
+        assert_eq!(run_ok("let o = {a: 1}; o['b'] = 2; console.log(o['a'], o['b'])"), vec!["1 2"]);
+    }
+
+    #[test]
+    fn object_inspect_matches_node() {
+        assert_eq!(run_ok("console.log({a: 1, b: 2})"), vec!["{ a: 1, b: 2 }"]);
+        assert_eq!(run_ok("console.log({})"), vec!["{}"]);
+    }
+
+    #[test]
+    fn object_reference_semantics() {
+        // Aliasing: mutating through one binding is visible through the other.
+        assert_eq!(run_ok("let a = {n: 1}; let b = a; b.n = 9; console.log(a.n)"), vec!["9"]);
+    }
+
+    #[test]
+    fn method_call_with_this() {
+        assert_eq!(
+            run_ok("let o = {x: 10, get() { return this.x }}; console.log(o.get())"),
+            vec!["10"]
+        );
+    }
+
+    #[test]
+    fn this_recursive_method() {
+        assert_eq!(
+            run_ok("let o = {fact(n){ return n <= 1 ? 1 : n * this.fact(n-1) }}; console.log(o.fact(5))"),
+            vec!["120"]
+        );
+    }
+
+    #[test]
+    fn function_expression_and_arrow() {
+        assert_eq!(run_ok("let f = function(a){ return a*2 }; console.log(f(21))"), vec!["42"]);
+        assert_eq!(run_ok("let g = a => a + 1; console.log(g(41))"), vec!["42"]);
+        assert_eq!(run_ok("let h = (a, b) => a * b; console.log(h(6, 7))"), vec!["42"]);
+    }
+
+    #[test]
+    fn nested_arrays_and_objects_inspect() {
+        assert_eq!(run_ok("console.log([1, [2, 3], 4])"), vec!["[ 1, [ 2, 3 ], 4 ]"]);
+        assert_eq!(run_ok("console.log({a: [1, 2], b: {c: 3}})"), vec!["{ a: [ 1, 2 ], b: { c: 3 } }"]);
+    }
+
+    #[test]
+    fn array_as_loop_accumulator() {
+        assert_eq!(
+            run_ok("let a = []; for (let i = 0; i < 4; i++) { a.push(i * i) } console.log(a.join(','))"),
+            vec!["0,1,4,9"]
+        );
+    }
 }

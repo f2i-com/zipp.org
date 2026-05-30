@@ -1,16 +1,65 @@
-//! Minimal heap for the v1 engine: strings and function objects.
+//! Heap object storage.
 //!
-//! Heap values are referenced by a `u32` index packed into a `Value`. The heap
-//! is a plain `Vec`; v1 does not reclaim (programs are short-lived per `eval`).
-//! A real GC slots in here later without touching the value representation.
+//! Heap values are referenced by a `u32` index packed into a [`crate::value::Value`].
+//! Reference semantics fall out naturally: copying a `Value` copies the index,
+//! so `let b = a` makes `a` and `b` alias the same heap slot, and a mutation
+//! through either is visible through both — exactly JS object/array semantics.
+//!
+//! v1 does not reclaim memory (programs are short-lived per `eval`); a real GC
+//! slots in here later without touching the value representation. Objects use a
+//! simple insertion-ordered property list, which preserves JS string-key
+//! enumeration order and is correct (if not yet fast — shapes/inline-caches are
+//! a later tier).
+
+use crate::value::Value;
+
+/// A JS object: insertion-ordered string-keyed properties.
+#[derive(Clone, Debug, Default)]
+pub struct ObjMap {
+    pub keys: Vec<String>,
+    pub vals: Vec<Value>,
+}
+
+impl ObjMap {
+    pub fn new() -> ObjMap {
+        ObjMap { keys: Vec::new(), vals: Vec::new() }
+    }
+
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.keys.iter().position(|k| k == key).map(|i| self.vals[i])
+    }
+
+    pub fn set(&mut self, key: &str, val: Value) {
+        if let Some(i) = self.keys.iter().position(|k| k == key) {
+            self.vals[i] = val;
+        } else {
+            self.keys.push(key.to_string());
+            self.vals.push(val);
+        }
+    }
+
+    pub fn has(&self, key: &str) -> bool {
+        self.keys.iter().any(|k| k == key)
+    }
+}
 
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
-    /// An interned-or-owned JS string.
+    /// An owned JS string.
     Str(String),
-    /// A function: index into `Program::functions`.
+    /// A plain function: index into `Program::functions`. No captured state.
     Func(u32),
+    /// A closure: a function id plus captured upvalue cells (indices of `Cell`
+    /// heap objects). Captured variables are boxed into cells so mutation is
+    /// shared between the closure and its defining scope.
+    Closure { func: u32, upvalues: Vec<u32> },
+    /// A boxed mutable variable cell (an upvalue's storage).
+    Cell(Value),
+    /// A dense array.
+    Array(Vec<Value>),
+    /// A plain object.
+    Object(ObjMap),
 }
 
 #[derive(Default)]
@@ -36,6 +85,11 @@ impl Heap {
     }
 
     #[inline]
+    pub fn get_mut(&mut self, idx: u32) -> &mut HeapObj {
+        &mut self.objs[idx as usize]
+    }
+
+    #[inline]
     pub fn alloc_str(&mut self, s: String) -> u32 {
         self.alloc(HeapObj::Str(s))
     }
@@ -49,12 +103,29 @@ impl Heap {
         }
     }
 
-    /// Resolve a function-object index to its program function id.
+    /// Resolve a callable (plain function or closure) to its function id and
+    /// upvalue list. Returns `None` for non-callables.
     #[inline]
-    pub fn as_func(&self, idx: u32) -> Option<u32> {
+    pub fn as_callable(&self, idx: u32) -> Option<(u32, &[u32])> {
         match self.get(idx) {
-            HeapObj::Func(id) => Some(*id),
+            HeapObj::Func(id) => Some((*id, &[])),
+            HeapObj::Closure { func, upvalues } => Some((*func, upvalues.as_slice())),
             _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn cell_get(&self, idx: u32) -> Value {
+        match self.get(idx) {
+            HeapObj::Cell(v) => *v,
+            _ => Value::UNDEFINED,
+        }
+    }
+
+    #[inline]
+    pub fn cell_set(&mut self, idx: u32, v: Value) {
+        if let HeapObj::Cell(slot) = self.get_mut(idx) {
+            *slot = v;
         }
     }
 }

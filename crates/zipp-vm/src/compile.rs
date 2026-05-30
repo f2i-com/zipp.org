@@ -84,15 +84,16 @@ impl Compiler {
         is_script: bool,
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params);
+        fc.is_script = is_script;
 
-        // Hoist nested function declarations within this body so calls resolve
-        // before their textual definition.
+        // Hoist function declarations in this body so calls resolve before the
+        // textual definition. Top-level names become globals (the VM
+        // materialises the function object at startup via `name_global`).
+        // Nested names become locals, populated by a `MakeFunc` at the point
+        // `func_decl` reaches them.
         for s in body {
             if let ox::Statement::FunctionDeclaration(f) = s {
                 if let Some(id) = &f.id {
-                    // Nested functions bind to a local register holding their
-                    // function object (created at block entry). For the script
-                    // top-level, function names are globals (already hoisted).
                     if is_script {
                         fc.cx.global_slot(id.name.as_str());
                     } else {
@@ -102,18 +103,10 @@ impl Compiler {
             }
         }
 
-        // Pre-compile nested functions (so their ids exist) and emit binding
-        // instructions in body order below.
         for s in body {
             fc.stmt(s)?;
         }
         fc.emit(Instr::ReturnUndefined);
-
-        let name_global = if is_script {
-            None
-        } else {
-            name.map(|n| fc.cx.global_slot(n))
-        };
 
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
@@ -122,7 +115,52 @@ impl Compiler {
             param_count: params.len() as u16,
             constants: fc.constants,
             string_constants: fc.string_constants,
-            name_global,
+            name_global: None, // set by the caller for top-level declarations
+        })
+    }
+
+    /// Compile an arrow function body (expression- or block-bodied).
+    fn compile_arrow_body(
+        &mut self,
+        params: &[String],
+        a: &ox::ArrowFunctionExpression,
+    ) -> R<FuncProto> {
+        let mut fc = FnCompiler::new(self, params);
+        if a.expression {
+            // `x => expr`: the body is a single ExpressionStatement to return.
+            let mut returned = false;
+            for s in &a.body.statements {
+                if let ox::Statement::ExpressionStatement(es) = s {
+                    let r = fc.expr(&es.expression)?;
+                    fc.emit(Instr::Return { src: r });
+                    returned = true;
+                }
+            }
+            if !returned {
+                fc.emit(Instr::ReturnUndefined);
+            }
+        } else {
+            // hoist nested function declarations (same as a normal body)
+            for s in &a.body.statements {
+                if let ox::Statement::FunctionDeclaration(f) = s {
+                    if let Some(id) = &f.id {
+                        fc.declare_local(id.name.as_str());
+                    }
+                }
+            }
+            for s in &a.body.statements {
+                fc.stmt(s)?;
+            }
+            fc.emit(Instr::ReturnUndefined);
+        }
+        Ok(FuncProto {
+            name: "<arrow>".to_string(),
+            code: fc.code,
+            reg_count: fc.max_reg,
+            param_count: params.len() as u16,
+            constants: fc.constants,
+            string_constants: fc.string_constants,
+            name_global: None,
         })
     }
 }
@@ -150,6 +188,9 @@ struct FnCompiler<'a> {
     /// Next free register / high-water mark.
     next_reg: Reg,
     max_reg: Reg,
+    /// True for the top-level script body: function declarations bind to
+    /// globals rather than locals.
+    is_script: bool,
 }
 
 impl<'a> FnCompiler<'a> {
@@ -162,8 +203,13 @@ impl<'a> FnCompiler<'a> {
             scopes: vec![Vec::new()],
             next_reg: 0,
             max_reg: 0,
+            is_script: false,
         };
-        // Parameters occupy the first registers, in order.
+        // Register 0 is reserved for `this` in every function (undefined for
+        // plain calls, the receiver for method calls). Parameters follow at
+        // registers 1.., in order. This uniform convention lets the call path
+        // treat `this` as just another register slot.
+        let _this_reg = fc.alloc_reg(); // reg 0 = this
         for p in params {
             let r = fc.alloc_reg();
             fc.scopes[0].push((p.clone(), r));
@@ -298,13 +344,60 @@ impl<'a> FnCompiler<'a> {
     fn func_decl(&mut self, f: &ox::Function) -> R<()> {
         let name = f.id.as_ref().map(|i| i.name.to_string());
         let (params, body) = function_parts(f)?;
+        let mut proto =
+            self.cx
+                .compile_function_body(name.as_deref(), &params, body, false)?;
+        let id = self.cx.functions.len() as u32;
+        if self.is_script {
+            // Top-level: bind the name to a global; the VM materialises the
+            // function object at startup. No instruction needed here.
+            if let Some(n) = &name {
+                let slot = self.cx.global_slot(n);
+                proto.name_global = Some(slot);
+            }
+            self.cx.functions.push(proto);
+        } else {
+            // Nested: create the function object now into the local the
+            // hoisting pre-pass reserved for this name.
+            self.cx.functions.push(proto);
+            if let Some(n) = &name {
+                if let Binding::Local(reg) = self.resolve(n) {
+                    self.emit(Instr::MakeFunc { dst: reg, func_id: id });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a function expression, returning its function id. Unlike a
+    /// declaration, the name (if any) is not hoisted — the value is produced
+    /// explicitly by a `MakeFunc` at the use site.
+    fn compile_func_expr(&mut self, name: Option<String>, f: &ox::Function) -> R<u32> {
+        let (params, body) = function_parts(f)?;
         let proto =
             self.cx
                 .compile_function_body(name.as_deref(), &params, body, false)?;
+        let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);
-        // Top-level function names are hoisted as globals and materialised by
-        // the VM at startup, so no binding instruction is needed here.
-        Ok(())
+        Ok(id)
+    }
+
+    /// Compile an arrow function, returning its function id. An expression-bodied
+    /// arrow (`x => x + 1`) is compiled as a function whose single statement is
+    /// `return <expr>`. Note: `this` is NOT yet lexically captured (arrows see
+    /// their own reg-0 `this`); refine when closures land.
+    fn compile_arrow(&mut self, a: &ox::ArrowFunctionExpression) -> R<u32> {
+        let mut params = Vec::new();
+        for item in &a.params.items {
+            match &item.pattern {
+                ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
+                _ => return Err("arrow parameter patterns not in the zipp-vm subset yet".into()),
+            }
+        }
+        let proto = self.cx.compile_arrow_body(&params, a)?;
+        let id = self.cx.functions.len() as u32;
+        self.cx.functions.push(proto);
+        Ok(id)
     }
 
     fn if_stmt(&mut self, i: &ox::IfStatement) -> R<()> {
@@ -428,6 +521,10 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
             }
+            E::ThisExpression(_) => {
+                // `this` lives in register 0 of the current function.
+                Ok(0)
+            }
             E::ParenthesizedExpression(p) => self.expr_into(&p.expression, dst),
             E::BinaryExpression(b) => self.binary(b, dst),
             E::LogicalExpression(l) => self.logical(l, dst),
@@ -436,8 +533,85 @@ impl<'a> FnCompiler<'a> {
             E::AssignmentExpression(a) => self.assign(a, dst),
             E::ConditionalExpression(c) => self.conditional(c, dst),
             E::CallExpression(c) => self.call(c, dst),
+            E::FunctionExpression(f) => {
+                let id = self.compile_func_expr(f.id.as_ref().map(|i| i.name.to_string()), f)?;
+                self.emit(Instr::MakeFunc { dst, func_id: id });
+                Ok(dst)
+            }
+            E::ArrowFunctionExpression(a) => {
+                let id = self.compile_arrow(a)?;
+                self.emit(Instr::MakeFunc { dst, func_id: id });
+                Ok(dst)
+            }
+            E::ArrayExpression(a) => self.array_literal(a, dst),
+            E::ObjectExpression(o) => self.object_literal(o, dst),
+            E::StaticMemberExpression(m) => {
+                let obj = self.expr(&m.object)?;
+                let name = self.add_string_const(m.property.name.as_str());
+                self.emit(Instr::GetProp { dst, obj, name });
+                Ok(dst)
+            }
+            E::ComputedMemberExpression(m) => {
+                let obj = self.expr(&m.object)?;
+                let key = self.expr(&m.expression)?;
+                self.emit(Instr::GetIndex { dst, obj, key });
+                Ok(dst)
+            }
             _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
         }
+    }
+
+    fn array_literal(&mut self, a: &ox::ArrayExpression, dst: Reg) -> R<Reg> {
+        // Elements must occupy a contiguous register run for NewArray.
+        let base = self.next_reg;
+        let mut count = 0u16;
+        for el in &a.elements {
+            let slot = self.alloc_reg();
+            match el {
+                ox::ArrayExpressionElement::Elision(_) => {
+                    self.emit(Instr::LoadUndefined { dst: slot });
+                }
+                ox::ArrayExpressionElement::SpreadElement(_) => {
+                    return Err("array spread is not in the zipp-vm subset yet".into());
+                }
+                other => {
+                    let e = other
+                        .as_expression()
+                        .ok_or("unsupported array element")?;
+                    let v = self.expr_into(e, slot)?;
+                    if v != slot {
+                        self.emit(Instr::Move { dst: slot, src: v });
+                    }
+                }
+            }
+            count += 1;
+        }
+        self.emit(Instr::NewArray { dst, arg_base: base, argc: count });
+        Ok(dst)
+    }
+
+    fn object_literal(&mut self, o: &ox::ObjectExpression, dst: Reg) -> R<Reg> {
+        self.emit(Instr::NewObject { dst });
+        for prop in &o.properties {
+            match prop {
+                ox::ObjectPropertyKind::ObjectProperty(p) => {
+                    // Key: a plain identifier or string/number literal key.
+                    let key = match &p.key {
+                        ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                        ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                        ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
+                        _ => return Err("computed object keys not in the zipp-vm subset yet".into()),
+                    };
+                    let name = self.add_string_const(&key);
+                    let v = self.expr(&p.value)?;
+                    self.emit(Instr::SetProp { obj: dst, name, val: v });
+                }
+                ox::ObjectPropertyKind::SpreadProperty(_) => {
+                    return Err("object spread is not in the zipp-vm subset yet".into());
+                }
+            }
+        }
+        Ok(dst)
     }
 
     fn load_number(&mut self, dst: Reg, n: f64) {
@@ -595,6 +769,37 @@ impl<'a> FnCompiler<'a> {
 
     fn assign(&mut self, a: &ox::AssignmentExpression, dst: Reg) -> R<Reg> {
         use ox::AssignmentOperator as Op;
+        // Member-target assignment: `obj.x = v` / `arr[i] = v`. Only plain
+        // `=` is supported for members in this subset.
+        match &a.left {
+            ox::AssignmentTarget::StaticMemberExpression(m) => {
+                if !matches!(a.operator, Op::Assign) {
+                    return Err("compound assignment to a property not in the zipp-vm subset yet".into());
+                }
+                let obj = self.expr(&m.object)?;
+                let val = self.expr_into(&a.right, dst)?;
+                if val != dst {
+                    self.emit(Instr::Move { dst, src: val });
+                }
+                let name = self.add_string_const(m.property.name.as_str());
+                self.emit(Instr::SetProp { obj, name, val: dst });
+                return Ok(dst);
+            }
+            ox::AssignmentTarget::ComputedMemberExpression(m) => {
+                if !matches!(a.operator, Op::Assign) {
+                    return Err("compound assignment to an index not in the zipp-vm subset yet".into());
+                }
+                let obj = self.expr(&m.object)?;
+                let key = self.expr(&m.expression)?;
+                let val = self.expr_into(&a.right, dst)?;
+                if val != dst {
+                    self.emit(Instr::Move { dst, src: val });
+                }
+                self.emit(Instr::SetIndex { obj, key, val: dst });
+                return Ok(dst);
+            }
+            _ => {}
+        }
         let name = match &a.left {
             ox::AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
             _ => return Err("assignment to non-identifier not in zipp-vm v1".into()),
@@ -679,6 +884,16 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // Method call `obj.name(args…)` → CallMethod, binding `this` to obj.
+        // (Computed-member calls `obj[k](…)` fall through to the generic path.)
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            let obj = self.expr(&m.object)?;
+            let name = self.add_string_const(m.property.name.as_str());
+            let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+            self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc });
+            return Ok(dst);
+        }
+
         // General call: evaluate callee, then contiguous args.
         let callee = self.expr(&c.callee)?;
         let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
@@ -713,6 +928,15 @@ impl<'a> FnCompiler<'a> {
 enum Binding {
     Local(Reg),
     Global(u32),
+}
+
+/// Render a numeric object key the way JS does (`{0: 'a'}` has key `"0"`).
+fn fmt_key_num(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e21 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
 }
 
 /// Conservative static check: is this expression definitely a number? Used to

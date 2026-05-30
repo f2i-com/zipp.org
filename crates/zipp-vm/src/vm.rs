@@ -20,7 +20,7 @@
 //! later make faster.
 
 use crate::bytecode::{Instr, Program};
-use crate::heap::{Heap, HeapObj};
+use crate::heap::{Heap, HeapObj, ObjMap};
 use crate::value::Value;
 
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
@@ -324,63 +324,97 @@ impl<'p> Vm<'p> {
                         let mut parts = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
                             let v = self.get(base, arg_base + i);
-                            parts.push(self.display(v));
+                            parts.push(self.inspect(v));
                         }
                         self.output.push(parts.join(" "));
                         ip += 1;
                     }
 
+                    Instr::MakeFunc { dst, func_id } => {
+                        let v = Value::heap(self.heap.alloc(HeapObj::Func(func_id)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::NewArray { dst, arg_base, argc } => {
+                        let mut items = Vec::with_capacity(argc as usize);
+                        for i in 0..argc {
+                            items.push(self.get(base, arg_base + i));
+                        }
+                        let v = Value::heap(self.heap.alloc(HeapObj::Array(items)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::NewObject { dst } => {
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::GetIndex { dst, obj, key } => {
+                        let o = self.get(base, obj);
+                        let k = self.get(base, key);
+                        let r = self.get_index(o, k)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::SetIndex { obj, key, val } => {
+                        let o = self.get(base, obj);
+                        let k = self.get(base, key);
+                        let v = self.get(base, val);
+                        self.set_index(o, k, v)?;
+                        ip += 1;
+                    }
+                    Instr::GetProp { dst, obj, name } => {
+                        let o = self.get(base, obj);
+                        let key = self.program.functions[func_id as usize]
+                            .string_constants[name as usize]
+                            .clone();
+                        let r = self.get_prop(o, &key)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::SetProp { obj, name, val } => {
+                        let o = self.get(base, obj);
+                        let v = self.get(base, val);
+                        let key = self.program.functions[func_id as usize]
+                            .string_constants[name as usize]
+                            .clone();
+                        self.set_prop(o, &key, v)?;
+                        ip += 1;
+                    }
+
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
-                        if !callee_v.is_heap() {
-                            return Err(Thrown(format!(
-                                "TypeError: {} is not a function",
-                                self.display(callee_v)
-                            )));
-                        }
-                        let func_id_to_call = match self.heap.as_func(callee_v.heap_index()) {
-                            Some(id) => id,
-                            None => {
-                                return Err(Thrown(format!(
-                                    "TypeError: {} is not a function",
-                                    self.display(callee_v)
-                                )))
-                            }
-                        };
-                        if self.frames.len() >= MAX_FRAMES {
-                            return Err(Thrown(
-                                "RangeError: Maximum call stack size exceeded".into(),
-                            ));
-                        }
-                        let callee_proto = &self.program.functions[func_id_to_call as usize];
-                        let callee_regs = callee_proto.reg_count as usize;
-                        let callee_params = callee_proto.param_count as usize;
+                        let func_id_to_call = self.resolve_callable(callee_v)?;
+                        self.setup_call(
+                            func_id_to_call,
+                            Value::UNDEFINED,
+                            base,
+                            arg_base,
+                            argc,
+                            dst,
+                            ip + 1,
+                        )?;
+                        break;
+                    }
 
-                        // The new frame's window starts at the current top of
-                        // the register file.
-                        let new_base = self.regs.len();
-                        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
-
-                        // Copy arguments into the callee's parameter registers
-                        // (params occupy registers 0..param_count). Missing
-                        // args default to undefined; extra args are dropped.
-                        let n = (argc as usize).min(callee_params);
-                        for i in 0..n {
-                            let v = self.regs[base + arg_base as usize + i];
-                            self.regs[new_base + i] = v;
+                    Instr::CallMethod { dst, obj, name, arg_base, argc } => {
+                        let recv = self.get(base, obj);
+                        let key = self.program.functions[func_id as usize]
+                            .string_constants[name as usize]
+                            .clone();
+                        // Builtin methods (array/string) execute inline and
+                        // produce a result without pushing a frame.
+                        if let Some(result) = self.try_builtin_method(recv, &key, base, arg_base, argc)? {
+                            self.set(base, dst, result);
+                            ip += 1;
+                            continue;
                         }
-
-                        // Write back the caller's ip (points past the Call) so
-                        // we resume correctly on return.
-                        let last = self.frames.len() - 1;
-                        self.frames[last].ip = ip + 1;
-                        self.frames.push(Frame {
-                            func: func_id_to_call,
-                            base: new_base,
-                            ip: 0,
-                            ret_dst: dst,
-                        });
-                        break; // re-enter outer loop with the new frame
+                        // Otherwise the property must resolve to a user function
+                        // (a method on an object); call it with `this = recv`.
+                        let prop = self.get_prop(recv, &key)?;
+                        let func_id_to_call = self.resolve_callable(prop)?;
+                        self.setup_call(func_id_to_call, recv, base, arg_base, argc, dst, ip + 1)?;
+                        break;
                     }
 
                     Instr::Return { src } => {
@@ -426,6 +460,229 @@ impl<'p> Vm<'p> {
     #[inline(always)]
     fn set(&mut self, base: usize, r: u16, v: Value) {
         self.regs[base + r as usize] = v;
+    }
+
+    // ── call setup ──
+
+    /// Resolve a value to a callable function id, or throw a TypeError.
+    fn resolve_callable(&self, v: Value) -> Result<u32, Thrown> {
+        if v.is_heap() {
+            if let Some((id, _upvalues)) = self.heap.as_callable(v.heap_index()) {
+                return Ok(id);
+            }
+        }
+        Err(Thrown(format!("TypeError: {} is not a function", self.display(v))))
+    }
+
+    /// Push a new frame for `func_id`, binding `this_val` to register 0 and the
+    /// `argc` arguments (staged at `caller_base + arg_base ..`) into registers
+    /// `1..`. Records the caller's resume ip and result register.
+    #[allow(clippy::too_many_arguments)]
+    fn setup_call(
+        &mut self,
+        func_id: u32,
+        this_val: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        dst: u16,
+        caller_ip_next: usize,
+    ) -> Result<(), Thrown> {
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
+        let proto = &self.program.functions[func_id as usize];
+        let callee_regs = (proto.reg_count as usize).max(1);
+        let callee_params = proto.param_count as usize;
+
+        let new_base = self.regs.len();
+        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
+
+        // Register 0 = `this`; parameters at registers 1..1+param_count.
+        self.regs[new_base] = this_val;
+        let n = (argc as usize).min(callee_params);
+        for i in 0..n {
+            let v = self.regs[caller_base + arg_base as usize + i];
+            self.regs[new_base + 1 + i] = v;
+        }
+
+        let last = self.frames.len() - 1;
+        self.frames[last].ip = caller_ip_next;
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst });
+        Ok(())
+    }
+
+    // ── property / index access ──
+
+    fn get_index(&mut self, obj: Value, key: Value) -> Result<Value, Thrown> {
+        if !obj.is_heap() {
+            return Err(Thrown(format!(
+                "TypeError: cannot read property of {}",
+                self.display(obj)
+            )));
+        }
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Array(items) => {
+                if key.is_int() {
+                    let i = key.as_int();
+                    if i >= 0 && (i as usize) < items.len() {
+                        return Ok(items[i as usize]);
+                    }
+                    return Ok(Value::UNDEFINED);
+                }
+                // Non-int key on an array: "length" or out of range → undefined.
+                let k = self.display(key);
+                if k == "length" {
+                    return Ok(Value::int(items.len() as i32));
+                }
+                Ok(Value::UNDEFINED)
+            }
+            HeapObj::Object(map) => {
+                let k = self.display(key);
+                Ok(map.get(&k).unwrap_or(Value::UNDEFINED))
+            }
+            HeapObj::Str(s) => {
+                if key.is_int() {
+                    let i = key.as_int();
+                    if i >= 0 {
+                        if let Some(ch) = s.chars().nth(i as usize) {
+                            let cs = ch.to_string();
+                            return Ok(self.alloc_str(cs));
+                        }
+                    }
+                    return Ok(Value::UNDEFINED);
+                }
+                Ok(Value::UNDEFINED)
+            }
+            _ => Ok(Value::UNDEFINED),
+        }
+    }
+
+    fn set_index(&mut self, obj: Value, key: Value, val: Value) -> Result<(), Thrown> {
+        if !obj.is_heap() {
+            return Err(Thrown("TypeError: cannot set property of non-object".into()));
+        }
+        let idx = obj.heap_index();
+        match self.heap.get_mut(idx) {
+            HeapObj::Array(items) => {
+                if key.is_int() {
+                    let i = key.as_int();
+                    if i >= 0 {
+                        let i = i as usize;
+                        if i >= items.len() {
+                            items.resize(i + 1, Value::UNDEFINED);
+                        }
+                        items[i] = val;
+                        return Ok(());
+                    }
+                }
+                // Non-int / negative key falls back to nothing in this subset.
+                Ok(())
+            }
+            HeapObj::Object(_) => {
+                let k = self.display(key);
+                if let HeapObj::Object(map) = self.heap.get_mut(idx) {
+                    map.set(&k, val);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn get_prop(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
+        if !obj.is_heap() {
+            // `"abc".length` and the like on primitive strings handled here too.
+            return Ok(Value::UNDEFINED);
+        }
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Array(items) => {
+                if key == "length" {
+                    Ok(Value::int(items.len() as i32))
+                } else {
+                    Ok(Value::UNDEFINED)
+                }
+            }
+            HeapObj::Str(s) => {
+                if key == "length" {
+                    Ok(Value::int(s.chars().count() as i32))
+                } else {
+                    Ok(Value::UNDEFINED)
+                }
+            }
+            HeapObj::Object(map) => Ok(map.get(key).unwrap_or(Value::UNDEFINED)),
+            _ => Ok(Value::UNDEFINED),
+        }
+    }
+
+    fn set_prop(&mut self, obj: Value, key: &str, val: Value) -> Result<(), Thrown> {
+        if !obj.is_heap() {
+            return Err(Thrown("TypeError: cannot set property of non-object".into()));
+        }
+        let idx = obj.heap_index();
+        if let HeapObj::Object(map) = self.heap.get_mut(idx) {
+            map.set(key, val);
+        }
+        Ok(())
+    }
+
+    /// Try a builtin method (array/string). Returns `Ok(Some(result))` if the
+    /// method was a recognised builtin, `Ok(None)` if not (caller then treats
+    /// it as a user method). Builtins that take callbacks are deferred to a
+    /// later stage; this set covers the non-callback corpus methods.
+    fn try_builtin_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        if !recv.is_heap() {
+            return Ok(None);
+        }
+        let arg = |this: &Self, i: u16| -> Value {
+            if i < argc {
+                this.regs[base + arg_base as usize + i as usize]
+            } else {
+                Value::UNDEFINED
+            }
+        };
+        let idx = recv.heap_index();
+        match self.heap.get(idx) {
+            HeapObj::Array(_) => match name {
+                "push" => {
+                    let v = arg(self, 0);
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        items.push(v);
+                        return Ok(Some(Value::int(items.len() as i32)));
+                    }
+                    Ok(Some(Value::UNDEFINED))
+                }
+                "pop" => {
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        return Ok(Some(items.pop().unwrap_or(Value::UNDEFINED)));
+                    }
+                    Ok(Some(Value::UNDEFINED))
+                }
+                "join" => {
+                    let sep = if argc > 0 { self.display(arg(self, 0)) } else { ",".to_string() };
+                    let parts: Vec<String> = match self.heap.get(idx) {
+                        HeapObj::Array(items) => {
+                            items.iter().map(|v| {
+                                if v.is_nullish() { String::new() } else { self.display(*v) }
+                            }).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    let s = parts.join(&sep);
+                    Ok(Some(self.alloc_str(s)))
+                }
+                _ => Ok(None),
+            },
+            HeapObj::Str(_) => Ok(None),
+            _ => Ok(None),
+        }
     }
 
     // ── arithmetic / coercion helpers ──
@@ -533,7 +790,8 @@ impl<'p> Vm<'p> {
         Ok(f64::NAN)
     }
 
-    /// Render a value the way `console.log` / string-concat does.
+    /// String COERCION (`String(v)`, `'' + v`, property keys). Arrays join with
+    /// commas; objects become `[object Object]` — JS `toString` semantics.
     fn display(&self, v: Value) -> String {
         if v.is_int() {
             v.as_int().to_string()
@@ -548,10 +806,60 @@ impl<'p> Vm<'p> {
         } else if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::Str(s) => s.clone(),
-                HeapObj::Func(_) => "function".into(),
+                HeapObj::Func(_) | HeapObj::Closure { .. } => "function".into(),
+                HeapObj::Cell(inner) => self.display(*inner),
+                HeapObj::Array(items) => items
+                    .iter()
+                    .map(|e| if e.is_nullish() { String::new() } else { self.display(*e) })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                HeapObj::Object(_) => "[object Object]".into(),
             }
         } else {
             "undefined".into()
+        }
+    }
+
+    /// INSPECT (`console.log` rendering). Strings are quoted only when nested;
+    /// arrays/objects use node's spaced bracket style (`[ 1, 2, 3 ]`,
+    /// `{ a: 1 }`).
+    fn inspect(&self, v: Value) -> String {
+        if v.is_heap() {
+            match self.heap.get(v.heap_index()) {
+                HeapObj::Str(s) => return s.clone(), // top-level strings unquoted
+                _ => return self.inspect_nested(v),
+            }
+        }
+        self.display(v)
+    }
+
+    fn inspect_nested(&self, v: Value) -> String {
+        if !v.is_heap() {
+            return self.display(v);
+        }
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Str(s) => format!("'{s}'"),
+            HeapObj::Func(_) | HeapObj::Closure { .. } => "[Function]".into(),
+            HeapObj::Cell(inner) => self.inspect_nested(*inner),
+            HeapObj::Array(items) => {
+                if items.is_empty() {
+                    return "[]".into();
+                }
+                let parts: Vec<String> = items.iter().map(|e| self.inspect_nested(*e)).collect();
+                format!("[ {} ]", parts.join(", "))
+            }
+            HeapObj::Object(map) => {
+                if map.keys.is_empty() {
+                    return "{}".into();
+                }
+                let parts: Vec<String> = map
+                    .keys
+                    .iter()
+                    .zip(map.vals.iter())
+                    .map(|(k, val)| format!("{k}: {}", self.inspect_nested(*val)))
+                    .collect();
+                format!("{{ {} }}", parts.join(", "))
+            }
         }
     }
 

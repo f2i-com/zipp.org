@@ -75,9 +75,32 @@ pub enum Instr {
     JumpIfNotLt { a: Reg, b: Reg, target: u32 },
     JumpIfNotLe { a: Reg, b: Reg, target: u32 },
 
+    // ── reference types ──
+    /// `dst = <function object for functions[func_id]>`. v1 creates a
+    /// capture-free function object; closures (Stage 3) extend this with
+    /// upvalue cells.
+    MakeFunc { dst: Reg, func_id: u32 },
+    /// `dst = [reg[arg_base], …, reg[arg_base+argc-1]]` — array literal.
+    NewArray { dst: Reg, arg_base: Reg, argc: u16 },
+    /// `dst = {}` — empty object (populated by following SetProp/SetIndex).
+    NewObject { dst: Reg },
+    /// `dst = obj[key]` — computed member read (array element or object prop).
+    GetIndex { dst: Reg, obj: Reg, key: Reg },
+    /// `obj[key] = val` — computed member write.
+    SetIndex { obj: Reg, key: Reg, val: Reg },
+    /// `dst = obj.<string_constants[name]>` — static property read
+    /// (also resolves `.length` for arrays/strings).
+    GetProp { dst: Reg, obj: Reg, name: u32 },
+    /// `obj.<string_constants[name]> = val` — static property write.
+    SetProp { obj: Reg, name: u32, val: Reg },
+
     /// Call `callee` with `argc` arguments staged in registers
     /// `[arg_base, arg_base+argc)`. Result lands in `dst`.
     Call { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
+
+    /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
+    /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
+    CallMethod { dst: Reg, obj: Reg, name: u32, arg_base: Reg, argc: u16 },
 
     /// Return `src` from the current function.
     Return { src: Reg },
