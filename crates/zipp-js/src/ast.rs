@@ -276,6 +276,11 @@ pub struct FuncDef {
     /// once at lower time; conservative — a false positive only keeps the eager
     /// allocation, never changing behavior.
     pub uses_arguments: bool,
+    /// Whether the body reads `this` — directly (`this`) or via `super(...)` /
+    /// `super.m()`, both of which read `this` from scope. When false, a non-arrow
+    /// call skips declaring `this`. Computed once at lower time; conservative — a
+    /// false positive only keeps the (cheap) declaration.
+    pub uses_this: bool,
 }
 
 /// A class lowered to: a constructor function (instance field initializers

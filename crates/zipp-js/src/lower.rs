@@ -371,6 +371,7 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
             let mut body = field_inits;
             body.extend(fd.body.iter().cloned());
             let uses_arguments = body_uses_arguments(&body);
+            let uses_this = body_uses_this(&body);
             Rc::new(FuncDef {
                 name: Some(name.clone()),
                 params: fd.params,
@@ -378,6 +379,7 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
                 body,
                 is_arrow: false,
                 uses_arguments,
+                uses_this,
             })
         }
         None => {
@@ -392,6 +394,7 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
             }
             body.extend(field_inits);
             let uses_arguments = body_uses_arguments(&body);
+            let uses_this = body_uses_this(&body);
             Rc::new(FuncDef {
                 name: Some(name.clone()),
                 params: Vec::new(),
@@ -399,6 +402,7 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
                 body,
                 is_arrow: false,
                 uses_arguments,
+                uses_this,
             })
         }
     };
@@ -423,6 +427,17 @@ fn body_uses_arguments(body: &[Stmt]) -> bool {
     format!("{body:?}").contains("Ident(\"arguments\")")
 }
 
+/// Does this (already-lowered) body read `this`? True if it contains `Expr::This`
+/// (Debug `This`) or `Expr::Super` (Debug `Super`) — `super(...)` and `super.m()`
+/// both read `this` from scope. Whole-body scan includes nested arrows (which
+/// share the enclosing `this`); conservative — a false positive (e.g. a string
+/// literal "This", or a nested non-arrow with its own `this`) only keeps the
+/// cheap `this` declaration, never changing behavior.
+fn body_uses_this(body: &[Stmt]) -> bool {
+    let s = format!("{body:?}");
+    s.contains("This") || s.contains("Super")
+}
+
 fn func_def(f: &ox::Function) -> R<FuncDef> {
     let body = match &f.body {
         Some(b) => fn_body(b)?,
@@ -430,6 +445,7 @@ fn func_def(f: &ox::Function) -> R<FuncDef> {
     };
     let (params, rest) = params_of(&f.params)?;
     let uses_arguments = body_uses_arguments(&body);
+    let uses_this = body_uses_this(&body);
     Ok(FuncDef {
         name: f.id.as_ref().map(|i| i.name.to_string()),
         params,
@@ -437,6 +453,7 @@ fn func_def(f: &ox::Function) -> R<FuncDef> {
         body,
         is_arrow: false,
         uses_arguments,
+        uses_this,
     })
 }
 
@@ -464,7 +481,7 @@ fn arrow_def(a: &ox::ArrowFunctionExpression) -> R<FuncDef> {
     let (params, rest) = params_of(&a.params)?;
     // An arrow has no `arguments` of its own (it uses the enclosing function's),
     // so this flag is unused for arrows; the call path skips it via `is_arrow`.
-    Ok(FuncDef { name: None, params, rest, body, is_arrow: true, uses_arguments: false })
+    Ok(FuncDef { name: None, params, rest, body, is_arrow: true, uses_arguments: false, uses_this: false })
 }
 
 // ───────────────────────── expressions ─────────────────────────

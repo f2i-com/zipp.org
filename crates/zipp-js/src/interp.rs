@@ -713,9 +713,12 @@ impl Interp {
             Kind::User(def, closure) => {
                 let act = Scope::child(&closure);
                 if !def.is_arrow {
-                    act.borrow_mut().declare("this", this.clone());
-                    // Only materialize the `arguments` array when the body uses
-                    // it (most calls don't) — skips a Vec+Rc+RefCell per call.
+                    // Only declare `this`/`arguments` when the body actually uses
+                    // them (most hot calls don't) — each saves a scope insertion,
+                    // and `arguments` also a Vec+Rc+RefCell, per call.
+                    if def.uses_this {
+                        act.borrow_mut().declare("this", this.clone());
+                    }
                     if def.uses_arguments {
                         act.borrow_mut().declare("arguments", JsValue::Object(Object::array(args.to_vec())));
                     }
