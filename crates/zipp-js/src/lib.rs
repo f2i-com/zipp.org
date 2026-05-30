@@ -118,6 +118,18 @@ mod tests {
     }
 
     #[test]
+    fn math_signed_zero() {
+        // round of a negative in [-0.5, 0) is -0; round ties go toward +Infinity.
+        assert_eq!(out("console.log(Math.round(-0.2), Math.round(-0.5))"), "-0 -0");
+        assert_eq!(out("console.log(Math.round(2.5), Math.round(0.5), Math.round(-0.6))"), "3 1 -1");
+        // max prefers +0 over -0; min prefers -0 over +0.
+        assert_eq!(out("console.log(Math.max(-0, 0), Math.max(0, -0))"), "0 0");
+        assert_eq!(out("console.log(Math.min(-0, 0), Math.min(0, -0))"), "-0 -0");
+        // sign / floor / ceil preserve -0.
+        assert_eq!(out("console.log(Math.sign(-0), Math.floor(-0), Math.ceil(-0.5))"), "-0 -0 -0");
+    }
+
+    #[test]
     fn number_constants() {
         assert_eq!(out("console.log(Number.MAX_VALUE)"), "1.7976931348623157e+308");
         assert_eq!(out("console.log(Number.MIN_VALUE)"), "5e-324");

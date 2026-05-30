@@ -221,10 +221,17 @@ fn console_log(it: &Interp, _this: &JsValue, args: &[JsValue]) -> EvalResult<JsV
 
 fn js_round(x: f64) -> f64 {
     // JS rounds .5 toward +Infinity (Rust's round is half-away-from-zero).
-    if x.is_nan() || x.is_infinite() {
+    // NaN/±Inf/integers (incl. -0) pass through unchanged.
+    if x.is_nan() || x.is_infinite() || x.fract() == 0.0 {
         return x;
     }
-    (x + 0.5).floor()
+    let r = (x + 0.5).floor();
+    // A negative value in [-0.5, 0) rounds to -0, not +0.
+    if r == 0.0 && x < 0.0 {
+        -0.0
+    } else {
+        r
+    }
 }
 
 fn js_sign(x: f64) -> f64 {
@@ -246,7 +253,8 @@ fn math_min(_: &Interp, _: &JsValue, a: &[JsValue]) -> EvalResult<JsValue> {
         if x.is_nan() {
             return Ok(JsValue::Num(f64::NAN));
         }
-        if x < m {
+        // `<` treats +0 == -0; per spec Math.min prefers -0 over +0.
+        if x < m || (x == 0.0 && m == 0.0 && x.is_sign_negative() && m.is_sign_positive()) {
             m = x;
         }
     }
@@ -260,7 +268,8 @@ fn math_max(_: &Interp, _: &JsValue, a: &[JsValue]) -> EvalResult<JsValue> {
         if x.is_nan() {
             return Ok(JsValue::Num(f64::NAN));
         }
-        if x > m {
+        // `>` treats +0 == -0; per spec Math.max prefers +0 over -0.
+        if x > m || (x == 0.0 && m == 0.0 && x.is_sign_positive() && m.is_sign_negative()) {
             m = x;
         }
     }
