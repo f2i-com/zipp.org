@@ -6,7 +6,7 @@
 //! registers). `&&`/`||` are short-circuited; `break`/`continue` patch to the
 //! enclosing loop. Jumps use absolute code offsets and are backpatched.
 
-use crate::ast::{BinOp, Expr, Module, Stmt, StmtKind, StructDecl, Type, UnOp};
+use crate::ast::{BinOp, Expr, FuncType, Module, Stmt, StmtKind, StructDecl, Type, UnOp};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -44,7 +44,7 @@ pub enum Instr {
     // `CallValue` calls through either.
     FuncRef { dst: u32, func: u32 },
     MakeClosure { dst: u32, func: u32, captures: Vec<u32> },
-    CallValue { dst: u32, callee: u32, arg_base: u32, argc: u32 },
+    CallValue { dst: u32, callee: u32, arg_base: u32, argc: u32, sig: u32 },
     // Growable arrays (interpreter-only in v0): append / remove-last.
     Push { dst: u32, arr: u32, value: u32 },
     Pop { dst: u32, arr: u32 },
@@ -117,6 +117,10 @@ pub struct Program {
     /// The program uses growable arrays (`push`/`pop`), which only the interpreter
     /// handles in v0 (native arrays are fixed-layout); native tiers fall back.
     pub uses_growable: bool,
+    /// Interned first-class function types (copied from `Module::func_types`).
+    /// Indexed by `Instr::CallValue::sig` so a backend can build the indirect-call
+    /// signature `(env_ptr, explicit_params…) -> ret`.
+    pub func_types: Vec<FuncType>,
 }
 
 fn is_opt_scalar(t: Type) -> bool {
@@ -220,6 +224,7 @@ pub fn lower(m: &Module) -> Result<Program, String> {
         uses_opt_scalar: module_uses_opt_scalar(m),
         uses_func_value,
         uses_growable,
+        func_types: m.func_types.clone(),
     })
 }
 
@@ -789,7 +794,7 @@ impl<'a> Gen<'a> {
                 Ok(dst)
             }
             // An indirect call through a function value.
-            Expr::CallValue { callee, args } => {
+            Expr::CallValue { callee, args, sig } => {
                 let callee_reg = self.gen_expr(callee)?;
                 let argc = args.len() as u32;
                 let arg_base = self.next_reg;
@@ -801,7 +806,7 @@ impl<'a> Gen<'a> {
                     self.code.push(Instr::Mov { dst: arg_base + i as u32, src: v });
                 }
                 let dst = self.alloc();
-                self.code.push(Instr::CallValue { dst, callee: callee_reg, arg_base, argc });
+                self.code.push(Instr::CallValue { dst, callee: callee_reg, arg_base, argc, sig: *sig });
                 Ok(dst)
             }
         }

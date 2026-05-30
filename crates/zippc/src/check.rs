@@ -737,7 +737,7 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
             Ok(Type::Func(id as u32))
         }
         // Indirect call: the callee must be a function value.
-        Expr::CallValue { callee, args } => {
+        Expr::CallValue { callee, args, .. } => {
             let ct = type_of(callee, scope, cx)?;
             let Type::Func(id) = ct else {
                 return Err(format!("type error: called a non-function value of type {ct:?}"));

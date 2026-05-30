@@ -2474,9 +2474,9 @@ impl Lower<'_> {
         // it's function-typed.
         if !matches!(&c.callee, Expression::Identifier(_)) {
             let callee = self.expr(&c.callee)?;
-            if matches!(self.ztype_of(&callee), Some(z::Type::Func(_))) {
+            if let Some(z::Type::Func(sig)) = self.ztype_of(&callee) {
                 let args = self.lower_args(c)?;
-                return Ok(z::Expr::CallValue { callee: Box::new(callee), args });
+                return Ok(z::Expr::CallValue { callee: Box::new(callee), args, sig });
             }
             return Err(self.err(
                 c.span,
@@ -2490,8 +2490,8 @@ impl Lower<'_> {
         let mut args = self.lower_args(c)?;
         // Indirect call through a function-valued local (a parameter or `let`
         // holding a function). Direct calls to named functions fall through.
-        if matches!(self.lookup(&name), Some(z::Type::Func(_))) {
-            return Ok(z::Expr::CallValue { callee: Box::new(z::Expr::Var(name)), args });
+        if let Some(z::Type::Func(sig)) = self.lookup(&name) {
+            return Ok(z::Expr::CallValue { callee: Box::new(z::Expr::Var(name)), args, sig });
         }
         // Numeric cast keywords used as calls.
         let cast = match name.as_str() {
@@ -2712,7 +2712,7 @@ fn collect_vars(e: &z::Expr, out: &mut Vec<String>) {
             args.iter().for_each(|a| collect_vars(a, out));
             collect_vars(default, out);
         }
-        CallValue { callee, args } => {
+        CallValue { callee, args, .. } => {
             collect_vars(callee, out);
             args.iter().for_each(|a| collect_vars(a, out));
         }
@@ -2759,7 +2759,7 @@ fn expr_has_var(e: &z::Expr) -> bool {
         // A function value names a function, not a variable; an indirect call's
         // callee/args may; a closure's captures do.
         z::Expr::FuncRef(_) => false,
-        z::Expr::CallValue { callee, args } => {
+        z::Expr::CallValue { callee, args, .. } => {
             expr_has_var(callee) || args.iter().any(expr_has_var)
         }
         z::Expr::MakeClosure { captures, .. } => captures.iter().any(expr_has_var),
@@ -2875,8 +2875,12 @@ fn arr_at_i() -> z::Expr {
     }
 }
 /// `f(args)` — call the callback parameter.
-fn call_f(args: Vec<z::Expr>) -> z::Expr {
-    z::Expr::CallValue { callee: Box::new(z::Expr::Var("f".into())), args }
+fn call_f(f_ty: z::Type, args: Vec<z::Expr>) -> z::Expr {
+    let sig = match f_ty {
+        z::Type::Func(id) => id,
+        _ => 0,
+    };
+    z::Expr::CallValue { callee: Box::new(z::Expr::Var("f".into())), args, sig }
 }
 
 /// `function __map_T_U(arr: T[], f: (T)=>U): U[] { let __r: U[] = []; for (…) __r.push(f(arr[__i])); return __r; }`
@@ -2894,7 +2898,7 @@ fn build_map_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::Fun
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::ExprStmt(Expr::Push {
                 arr: Box::new(Expr::Var("__r".into())),
-                value: Box::new(call_f(vec![arr_at_i()])),
+                value: Box::new(call_f(f_ty, vec![arr_at_i()])),
             }))],
         }),
         stmt(StmtKind::Return(Some(Expr::Var("__r".into())))),
@@ -2924,7 +2928,7 @@ fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type) -> z::Func {
             cond: lt_len(),
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::If {
-                cond: call_f(vec![arr_at_i()]),
+                cond: call_f(f_ty, vec![arr_at_i()]),
                 then_b: vec![stmt(StmtKind::ExprStmt(Expr::Push {
                     arr: Box::new(Expr::Var("__r".into())),
                     value: Box::new(arr_at_i()),
@@ -2960,7 +2964,7 @@ fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::Assign {
                 target: Expr::Var("__acc".into()),
-                value: call_f(vec![Expr::Var("__acc".into()), arr_at_i()]),
+                value: call_f(f_ty, vec![Expr::Var("__acc".into()), arr_at_i()]),
             })],
         }),
         stmt(StmtKind::Return(Some(Expr::Var("__acc".into())))),
@@ -3085,7 +3089,7 @@ fn build_find_helper(name: &str, t: z::Elem, includes: bool) -> z::Func {
 /// (→ index / -1).
 fn build_predicate_helper(name: &str, t: z::Elem, f_ty: z::Type, kind: &str) -> z::Func {
     use z::{Param, Type};
-    let test = call_f(vec![arr_at_i()]);
+    let test = call_f(f_ty, vec![arr_at_i()]);
     let (loop_body, tail, ret_ty) = match kind {
         "some" => (
             vec![if_then(test, vec![ret(z::Expr::Bool(true))])],
@@ -3447,6 +3451,30 @@ mod tests {
                      if (n !== null) { return head.val + n.val; } \
                      return head.val; }";
         assert_eq!(run_i64(ts3), 3); // 1 + 2
+    }
+
+    #[test]
+    fn callvalue_carries_func_signature() {
+        // Stage 0 of native closures: the IR now carries Program.func_types and
+        // each CallValue.sig indexes it, so a backend can later build the
+        // indirect-call signature. Behavior-neutral; this just checks the plumbing.
+        let ts = "function twice(f: (n: i64) => i64, x: i64): i64 { return f(f(x)); } \
+                  function inc(n: i64): i64 { return n + 1; } \
+                  function main(): i64 { return twice(inc, 10); }";
+        let m = compile_ts(ts).expect("lower");
+        let prog = zippc::compile_module(&m).expect("compile");
+        assert!(!prog.func_types.is_empty(), "func_types should be populated");
+        let sig = prog
+            .code
+            .iter()
+            .find_map(|i| match i {
+                zippc::ir::Instr::CallValue { sig, .. } => Some(*sig),
+                _ => None,
+            })
+            .expect("expected a CallValue instruction");
+        let ft = &prog.func_types[sig as usize];
+        assert_eq!(ft.params, vec![zippc::ast::Type::I64]); // (n: i64) => i64
+        assert_eq!(ft.ret, zippc::ast::Type::I64);
     }
 
     #[test]

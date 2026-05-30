@@ -238,7 +238,9 @@ pub enum Expr {
     MakeClosure { name: String, captures: Vec<Expr> },
     /// An indirect call through a function value `f(args)` (where `f` has a
     /// `Type::Func`). Distinguished from `Call` (a direct, statically-named call).
-    CallValue { callee: Box<Expr>, args: Vec<Expr> },
+    /// `sig` is the callee's `Func` type id (index into `Module::func_types`) — the
+    /// explicit signature the native backends use to build the indirect call.
+    CallValue { callee: Box<Expr>, args: Vec<Expr>, sig: u32 },
     /// `arr.push(value)` — append to a growable array, returns the new length
     /// (`i64`). Mutates `arr`. Growable arrays are interpreter-tier in v0.
     Push { arr: Box<Expr>, value: Box<Expr> },

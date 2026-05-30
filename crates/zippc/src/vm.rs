@@ -295,7 +295,7 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                     reg[base + *dst as usize] = Value::Closure { func: *func, env };
                 }
             }
-            Instr::CallValue { dst, callee, arg_base, argc } => {
+            Instr::CallValue { dst, callee, arg_base, argc, sig: _ } => {
                 if record_trace {
                     return Err(ZK_NO_FUNC.into());
                 }
