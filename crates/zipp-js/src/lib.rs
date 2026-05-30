@@ -198,6 +198,29 @@ mod tests {
     }
 
     #[test]
+    fn getters_setters() {
+        // object-literal getter
+        assert_eq!(out("const o={a:2,get d(){return this.a*2;}}; console.log(o.d)"), "4");
+        // object-literal setter
+        assert_eq!(
+            out("const o={_x:0,get x(){return this._x;},set x(v){this._x=v+1;}}; o.x=5; console.log(o.x)"),
+            "6"
+        );
+        // class instance getter + setter
+        assert_eq!(
+            out("class T{constructor(c){this._c=c;} get f(){return this._c*9/5+32;} set f(v){this._c=(v-32)*5/9;}} const t=new T(0); console.log(t.f); t.f=212; console.log(t._c)"),
+            "32\n100"
+        );
+        // class getter using another property
+        assert_eq!(
+            out("class C{constructor(r){this.r=r;} get area(){return this.r*this.r;}} console.log(new C(4).area)"),
+            "16"
+        );
+        // setter-only: reading yields undefined
+        assert_eq!(out("const o={set w(v){this._w=v;}}; o.w=3; console.log(o._w, o.w)"), "3 undefined");
+    }
+
+    #[test]
     fn object_spread() {
         assert_eq!(out("const a={x:1,y:2}; console.log(JSON.stringify({...a,z:3}))"), "{\"x\":1,\"y\":2,\"z\":3}");
         // later keys win over spread

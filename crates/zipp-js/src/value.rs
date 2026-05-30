@@ -38,9 +38,19 @@ pub struct Object {
     /// Named own properties, kept in insertion order via the `order` list.
     pub props: BTreeMap<String, JsValue>,
     pub order: Vec<String>,
+    /// Accessor (getter/setter) properties, keyed by name. A key here takes
+    /// precedence over `props` during get/set.
+    pub accessors: BTreeMap<String, Accessor>,
     /// The prototype link (`[[Prototype]]`); `None` ends the chain.
     pub proto: Option<Obj>,
     pub data: ObjData,
+}
+
+/// A getter/setter pair (each a callable `JsValue`, or `None`).
+#[derive(Clone, Default)]
+pub struct Accessor {
+    pub get: Option<JsValue>,
+    pub set: Option<JsValue>,
 }
 
 pub enum ObjData {
@@ -61,6 +71,7 @@ impl Object {
         Rc::new(RefCell::new(Object {
             props: BTreeMap::new(),
             order: Vec::new(),
+            accessors: BTreeMap::new(),
             proto: None,
             data: ObjData::Plain,
         }))
@@ -69,6 +80,7 @@ impl Object {
         Rc::new(RefCell::new(Object {
             props: BTreeMap::new(),
             order: Vec::new(),
+            accessors: BTreeMap::new(),
             proto: None,
             data: ObjData::Array(items),
         }))
@@ -77,6 +89,7 @@ impl Object {
         Rc::new(RefCell::new(Object {
             props: BTreeMap::new(),
             order: Vec::new(),
+            accessors: BTreeMap::new(),
             proto: None,
             data: ObjData::Function { def, scope },
         }))
@@ -85,6 +98,7 @@ impl Object {
         Rc::new(RefCell::new(Object {
             props: BTreeMap::new(),
             order: Vec::new(),
+            accessors: BTreeMap::new(),
             proto: None,
             data: ObjData::Native { name: name.into(), f },
         }))

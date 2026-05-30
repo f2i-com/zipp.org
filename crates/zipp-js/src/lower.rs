@@ -310,6 +310,8 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
     let mut ctor: Option<FuncDef> = None;
     let mut methods: Vec<(String, Rc<FuncDef>)> = Vec::new();
     let mut statics: Vec<(String, Rc<FuncDef>)> = Vec::new();
+    let mut accessors: Vec<(String, AccessorKind, Rc<FuncDef>)> = Vec::new();
+    let mut static_accessors: Vec<(String, AccessorKind, Rc<FuncDef>)> = Vec::new();
     let mut field_inits: Vec<Stmt> = Vec::new();
 
     for el in &c.body.body {
@@ -326,7 +328,19 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
                             methods.push((key, Rc::new(fd)));
                         }
                     }
-                    _ => return Err("class getters/setters aren't in the v0 JS engine yet".into()),
+                    ox::MethodDefinitionKind::Get | ox::MethodDefinitionKind::Set => {
+                        let key = class_key_name(&m.key)?;
+                        let kind = if matches!(m.kind, ox::MethodDefinitionKind::Get) {
+                            AccessorKind::Get
+                        } else {
+                            AccessorKind::Set
+                        };
+                        if m.r#static {
+                            static_accessors.push((key, kind, Rc::new(fd)));
+                        } else {
+                            accessors.push((key, kind, Rc::new(fd)));
+                        }
+                    }
                 }
             }
             ox::ClassElement::PropertyDefinition(p) if !p.r#static => {
@@ -384,7 +398,15 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
             })
         }
     };
-    Ok(Stmt::Class(Rc::new(ClassDef { name, superclass, ctor, methods, statics })))
+    Ok(Stmt::Class(Rc::new(ClassDef {
+        name,
+        superclass,
+        ctor,
+        methods,
+        statics,
+        accessors,
+        static_accessors,
+    })))
 }
 
 fn func_def(f: &ox::Function) -> R<FuncDef> {
@@ -517,7 +539,23 @@ fn object_expr(o: &ox::ObjectExpression) -> R<Expr> {
         match p {
             ox::ObjectPropertyKind::ObjectProperty(op) => {
                 let key = prop_key(&op.key, op.computed)?;
-                props.push(Prop::KeyVal { key, value: expr(&op.value)? });
+                match op.kind {
+                    ox::PropertyKind::Init => {
+                        props.push(Prop::KeyVal { key, value: expr(&op.value)? });
+                    }
+                    ox::PropertyKind::Get | ox::PropertyKind::Set => {
+                        // `{ get x(){…} }` — the value is a function expression.
+                        let ox::Expression::FunctionExpression(f) = &op.value else {
+                            return Err("malformed object accessor".into());
+                        };
+                        let kind = if matches!(op.kind, ox::PropertyKind::Get) {
+                            AccessorKind::Get
+                        } else {
+                            AccessorKind::Set
+                        };
+                        props.push(Prop::Accessor { key, kind, func: Rc::new(func_def(f)?) });
+                    }
+                }
             }
             ox::ObjectPropertyKind::SpreadProperty(s) => {
                 props.push(Prop::Spread(expr(&s.argument)?));

@@ -233,6 +233,15 @@ pub enum Prop {
     KeyVal { key: PropKey, value: Expr },
     /// `{ ...expr }` — copy the source object's own enumerable properties.
     Spread(Expr),
+    /// `{ get x(){…} }` / `{ set x(v){…} }` — an accessor property.
+    Accessor { key: PropKey, kind: AccessorKind, func: Rc<FuncDef> },
+}
+
+/// Whether an accessor is a getter or a setter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessorKind {
+    Get,
+    Set,
 }
 
 #[derive(Debug, Clone)]
@@ -274,4 +283,8 @@ pub struct ClassDef {
     pub ctor: Rc<FuncDef>,
     pub methods: Vec<(String, Rc<FuncDef>)>,
     pub statics: Vec<(String, Rc<FuncDef>)>,
+    /// Instance accessors (→ `C.prototype`) and static accessors (→ `C`):
+    /// `(name, get-or-set, function)`.
+    pub accessors: Vec<(String, AccessorKind, Rc<FuncDef>)>,
+    pub static_accessors: Vec<(String, AccessorKind, Rc<FuncDef>)>,
 }

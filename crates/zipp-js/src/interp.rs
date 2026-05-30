@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::ast::*;
 use crate::env::{self, Scope};
-use crate::value::{JsValue, NativeFn, ObjData, Object};
+use crate::value::{Accessor, JsValue, NativeFn, Obj, ObjData, Object};
 
 /// `Ok` = a value; `Err` = a thrown JS value (an `Error` object or anything).
 pub type EvalResult<T> = Result<T, JsValue>;
@@ -103,6 +103,22 @@ impl Interp {
                     let m = JsValue::Object(Object::function(fd.clone(), cscope.clone()));
                     self.set_member(&ctor, sname, m)?;
                 }
+                // Accessors: instance ones on the prototype, static ones on the
+                // constructor. `define_accessor` is on the target's Object.
+                let install = |target: &JsValue, accs: &[(String, AccessorKind, Rc<FuncDef>)]| {
+                    if let JsValue::Object(t) = target {
+                        for (name, kind, fd) in accs {
+                            let f = JsValue::Object(Object::function(fd.clone(), cscope.clone()));
+                            let (g, s) = match kind {
+                                AccessorKind::Get => (Some(f), None),
+                                AccessorKind::Set => (None, Some(f)),
+                            };
+                            t.borrow_mut().define_accessor(name, g, s);
+                        }
+                    }
+                };
+                install(&proto, &cd.accessors);
+                install(&ctor, &cd.static_accessors);
                 scope.borrow_mut().declare(&cd.name, ctor);
                 Ok(Flow::Normal)
             }
@@ -683,7 +699,30 @@ impl Interp {
 
     // ───────────────────────── member access ─────────────────────────
 
+    /// Find an accessor for `key` on `o` or its prototype chain (the getter/setter
+    /// pair). Returns `None` if no accessor exists at any level.
+    fn find_accessor(&self, o: &Obj, key: &str) -> Option<Accessor> {
+        let mut cur = Some(o.clone());
+        while let Some(c) = cur {
+            if let Some(a) = c.borrow().accessors.get(key) {
+                return Some(a.clone());
+            }
+            cur = c.borrow().proto.clone();
+        }
+        None
+    }
+
     pub fn get_member(&self, obj: &JsValue, key: &str) -> EvalResult<JsValue> {
+        // An accessor (getter) on the object or its chain takes precedence over a
+        // data property; invoke it with `this = obj`.
+        if let JsValue::Object(o) = obj {
+            if let Some(acc) = self.find_accessor(o, key) {
+                return match acc.get {
+                    Some(g) => self.call(&g, obj, &[]),
+                    None => Ok(JsValue::Undefined), // set-only accessor reads undefined
+                };
+            }
+        }
         match obj {
             JsValue::Object(o) => {
                 {
@@ -754,6 +793,13 @@ impl Interp {
         let JsValue::Object(o) = obj else {
             return Ok(()); // writing a property on a primitive is a no-op in sloppy mode
         };
+        // A setter accessor on the object or its chain intercepts the write.
+        if let Some(acc) = self.find_accessor(o, key) {
+            if let Some(s) = acc.set {
+                self.call(&s, obj, &[v])?;
+            }
+            return Ok(()); // getter-only: silently ignored in sloppy mode
+        }
         {
             let mut b = o.borrow_mut();
             if let ObjData::Array(items) = &mut b.data {
