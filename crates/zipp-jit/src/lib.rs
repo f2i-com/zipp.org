@@ -42,6 +42,7 @@ struct RuntimeIds {
     print_f64: FuncId,
     print_str: FuncId,
     alloc: FuncId,
+    arr_new: FuncId,
     array_repeat: FuncId,
     oob: FuncId,
     str_concat: FuncId,
@@ -223,6 +224,7 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     jit.symbol("zipp_print_f64", zipp_rt::zipp_print_f64 as *const u8);
     jit.symbol("zipp_print_str", zipp_rt::zipp_print_str as *const u8);
     jit.symbol("zipp_alloc", zipp_rt::zipp_alloc as *const u8);
+    jit.symbol("zipp_arr_new", zipp_rt::zipp_arr_new as *const u8);
     jit.symbol("zipp_array_repeat", zipp_rt::zipp_array_repeat as *const u8);
     jit.symbol("zipp_oob", zipp_rt::zipp_oob as *const u8);
     jit.symbol("zipp_str_concat", zipp_rt::zipp_str_concat as *const u8);
@@ -264,6 +266,7 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
         print_f64: import(&mut module, "zipp_print_f64", &[types::F64], None)?,
         print_str: import(&mut module, "zipp_print_str", &[types::I64], None)?,
         alloc: import(&mut module, "zipp_alloc", &[types::I64], Some(types::I64))?,
+        arr_new: import(&mut module, "zipp_arr_new", &[types::I64], Some(types::I64))?,
         array_repeat: import(&mut module, "zipp_array_repeat", &[types::I64, types::I64], Some(types::I64))?,
         oob: import(&mut module, "zipp_oob", &[types::I64, types::I64], None)?,
         str_concat: import(&mut module, "zipp_str_concat", &[types::I64, types::I64], Some(types::I64))?,
@@ -522,10 +525,11 @@ fn plan_fma(
     (skip, plan)
 }
 
-/// Compute a bounds-checked element address `base + 8*(idx+1)`, aborting via
-/// `zipp_oob` if `idx` is out of range (the unsigned compare also catches
-/// negatives). Splits the current block into an out-of-bounds path and the
-/// in-bounds continuation, and leaves the builder positioned in the latter.
+/// Compute a bounds-checked element address `data + 8*idx`, where `base` is the
+/// array header `[len | cap | data]` (len at +0, data buffer ptr at +16),
+/// aborting via `zipp_oob` if `idx` is out of range (the unsigned compare also
+/// catches negatives). Splits the current block into an out-of-bounds path and
+/// the in-bounds continuation, and leaves the builder positioned in the latter.
 fn checked_addr(
     module: &mut JITModule,
     builder: &mut FunctionBuilder,
@@ -544,9 +548,9 @@ fn checked_addr(
     builder.ins().call(f, &[idx, len]);
     builder.ins().trap(TrapCode::HEAP_OUT_OF_BOUNDS); // zipp_oob aborts; unreachable
     builder.switch_to_block(ok);
-    let i1 = builder.ins().iadd_imm(idx, 1);
-    let off = builder.ins().imul_imm(i1, 8);
-    builder.ins().iadd(base, off)
+    let data = builder.ins().load(types::I64, flags, base, 16);
+    let off = builder.ins().imul_imm(idx, 8);
+    builder.ins().iadd(data, off)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -767,11 +771,13 @@ fn compile_function(
             }
             Instr::ArrayLit { dst, elems } => {
                 let n = builder.ins().iconst(types::I64, elems.len() as i64);
-                let alloc = module.declare_func_in_func(rt.alloc, builder.func);
-                let call = builder.ins().call(alloc, &[n]);
-                let ptr = builder.inst_results(call)[0];
-                let elem_f64 = rty[*dst as usize].arr_f64();
+                let arr_new = module.declare_func_in_func(rt.arr_new, builder.func);
+                let call = builder.ins().call(arr_new, &[n]);
+                let hdr = builder.inst_results(call)[0];
                 let flags = MemFlags::trusted();
+                // elements live in the separate data buffer (header +16), at 8*i
+                let data = builder.ins().load(types::I64, flags, hdr, 16);
+                let elem_f64 = rty[*dst as usize].arr_f64();
                 for (i, e) in elems.iter().enumerate() {
                     let ev = builder.use_var(var(*e));
                     let raw = if elem_f64 {
@@ -779,9 +785,9 @@ fn compile_function(
                     } else {
                         ev
                     };
-                    builder.ins().store(flags, raw, ptr, 8 * (i as i32 + 1));
+                    builder.ins().store(flags, raw, data, 8 * i as i32);
                 }
-                builder.def_var(var(*dst), ptr);
+                builder.def_var(var(*dst), hdr);
             }
             Instr::ArrayRepeat { dst, value, count } => {
                 let cv = builder.use_var(var(*count));

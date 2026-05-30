@@ -251,9 +251,10 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
     t
 }
 
-/// Emit a bounds-checked element-address GEP (`base[idx+1]`), aborting via
-/// `@zipp_oob` if out of range. Leaves emission in the in-bounds block; returns
-/// the element-slot `ptr` SSA name.
+/// Emit a bounds-checked element-address GEP into the array's data buffer, where
+/// `base` is the header `[len | cap | data]` (len at +0, data ptr at +16) and the
+/// element is `data[idx]`. Aborts via `@zipp_oob` if out of range. Leaves
+/// emission in the in-bounds block; returns the element-slot `ptr` SSA name.
 fn checked_slot(body: &mut String, tmp: &mut usize, base: &str, idx: &str) -> String {
     let n = *tmp;
     *tmp += 1;
@@ -267,10 +268,12 @@ fn checked_slot(body: &mut String, tmp: &mut usize, base: &str, idx: &str) -> St
     body.push_str(&format!("  call void @zipp_oob(i64 {idx}, i64 {len})\n"));
     body.push_str("  unreachable\n");
     body.push_str(&format!("{ok}:\n"));
-    let i1 = fresh(tmp);
-    body.push_str(&format!("  {i1} = add i64 {idx}, 1\n"));
+    let dslot = fresh(tmp);
+    body.push_str(&format!("  {dslot} = getelementptr inbounds i64, ptr {base}, i64 2\n"));
+    let data = fresh(tmp);
+    body.push_str(&format!("  {data} = load ptr, ptr {dslot}\n"));
     let slot = fresh(tmp);
-    body.push_str(&format!("  {slot} = getelementptr inbounds i64, ptr {base}, i64 {i1}\n"));
+    body.push_str(&format!("  {slot} = getelementptr inbounds i64, ptr {data}, i64 {idx}\n"));
     slot
 }
 
@@ -617,8 +620,13 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 }
             }
             Instr::ArrayLit { dst, elems } => {
-                let p = fresh(&mut tmp);
-                s.push_str(&format!("  {p} = call ptr @zipp_alloc(i64 {})\n", elems.len()));
+                let hdr = fresh(&mut tmp);
+                s.push_str(&format!("  {hdr} = call ptr @zipp_arr_new(i64 {})\n", elems.len()));
+                // data buffer ptr lives in header slot 2 (+16)
+                let dslot = fresh(&mut tmp);
+                s.push_str(&format!("  {dslot} = getelementptr inbounds i64, ptr {hdr}, i64 2\n"));
+                let data = fresh(&mut tmp);
+                s.push_str(&format!("  {data} = load ptr, ptr {dslot}\n"));
                 let elem_f64 = arr_f64(rty[*dst as usize]);
                 for (i, e) in elems.iter().enumerate() {
                     let ev = load(&mut s, &mut tmp, &rty, *e);
@@ -631,12 +639,11 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                     };
                     let slot = fresh(&mut tmp);
                     s.push_str(&format!(
-                        "  {slot} = getelementptr inbounds i64, ptr {p}, i64 {}\n",
-                        i + 1
+                        "  {slot} = getelementptr inbounds i64, ptr {data}, i64 {i}\n"
                     ));
                     s.push_str(&format!("  store i64 {raw}, ptr {slot}\n"));
                 }
-                store(&mut s, &rty, *dst, &p);
+                store(&mut s, &rty, *dst, &hdr);
             }
             Instr::ArrayRepeat { dst, value, count } => {
                 let cv = load(&mut s, &mut tmp, &rty, *count);
@@ -976,6 +983,7 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     // CLI result/time markers — is provided by the zipp-rt static library.
     out.push_str("declare void @zipp_set_stack_bottom(i64)\n");
     out.push_str("declare ptr @zipp_alloc(i64)\n");
+    out.push_str("declare ptr @zipp_arr_new(i64)\n");
     out.push_str("declare ptr @zipp_array_repeat(i64, i64)\n");
     out.push_str("declare void @zipp_oob(i64, i64)\n");
     out.push_str("declare ptr @zipp_str_concat(ptr, ptr)\n");

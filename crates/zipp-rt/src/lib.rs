@@ -72,10 +72,12 @@ pub extern "C" fn zipp_set_stack_bottom(addr: i64) {
     gc::set_stack_bottom(addr as usize);
 }
 
-// ───────────────────────── arrays / structs ─────────────────────────
+// ───────────────────────── structs / closures ─────────────────────────
 
-/// Allocate an array (or struct) block of `n` 8-byte slots, length-prefixed,
-/// zero-initialized, from the GC heap. Returns the base pointer as an i64.
+/// Allocate a **struct/closure** block of `n` 8-byte slots, length-prefixed
+/// (`[len | slot0 | … ]`), zero-initialized, from the GC heap. Returns the base
+/// pointer as an i64. Used for structs and the `{code, env}` closure block —
+/// fixed-shape records. (Arrays use the Vec-style header below.)
 #[no_mangle]
 pub extern "C" fn zipp_alloc(n: i64) -> i64 {
     if n < 0 {
@@ -89,17 +91,54 @@ pub extern "C" fn zipp_alloc(n: i64) -> i64 {
     p as i64
 }
 
-/// `[value; n]` — allocate then fill. `val` is the raw 8-byte payload.
+// ───────────────────────── arrays (Vec-style) ─────────────────────────
+//
+// An array is a stable 3-word HEADER `[ +0 len | +8 cap | +16 data ]` that never
+// moves (so the handle is stable under aliasing and a future `push` can realloc
+// the data buffer without changing the array's identity), plus a SEPARATE data
+// buffer of `cap` 8-byte element slots (f64 elements bit-reinterpreted; no length
+// prefix — that lives in the header). Element address = `data + 8*idx` (NO +1).
+// The GC follows the `data` pointer at +16 when it traces the header, so the
+// buffer stays live as long as the header is reachable. `len()` reads +0 (same
+// offset as a string's length, so the shared `Len` opcode covers both).
+
+/// Allocate an array header + a zeroed data buffer for `n` elements
+/// (`len == cap == n`). Returns the header pointer as an i64.
+#[no_mangle]
+pub extern "C" fn zipp_arr_new(n: i64) -> i64 {
+    if n < 0 {
+        eprintln!("zipp: array length cannot be negative ({n})");
+        std::process::abort();
+    }
+    let cap = n as usize;
+    // Data buffer first; `data` stays live in a local across the header alloc, so
+    // a collection triggered by that alloc finds it on the stack (conservative
+    // scan) and won't free it. gc_alloc zeroes and rounds size up to ≥ 8 bytes.
+    let data = gc::gc_alloc(cap * 8) as i64;
+    let hdr = gc::gc_alloc(3 * 8) as *mut i64;
+    // SAFETY: hdr has 3 i64 slots; data is a valid buffer of `cap` slots.
+    unsafe {
+        *hdr = n; // len
+        *hdr.add(1) = cap as i64; // cap
+        *hdr.add(2) = data; // data ptr
+    }
+    hdr as i64
+}
+
+/// `[value; n]` — allocate an array then fill its `n` element slots with the raw
+/// 8-byte payload `val`.
 #[no_mangle]
 pub extern "C" fn zipp_array_repeat(n: i64, val: i64) -> i64 {
-    let base = zipp_alloc(n) as *mut i64;
-    // SAFETY: zipp_alloc gave us n+1 valid slots; fill the n element slots.
+    let hdr = zipp_arr_new(n) as *mut i64;
+    // SAFETY: hdr is a fresh array header; its data buffer has `n` slots. No
+    // allocation happens in the fill loop, so nothing can move/free it.
     unsafe {
-        for i in 0..n {
-            *base.add(1 + i as usize) = val;
+        let data = *hdr.add(2) as *mut i64;
+        for i in 0..n as usize {
+            *data.add(i) = val;
         }
     }
-    base as i64
+    hdr as i64
 }
 
 #[no_mangle]
