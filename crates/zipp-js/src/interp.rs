@@ -36,6 +36,9 @@ pub struct Interp {
     /// `Array.prototype` — fallback proto for array literals so
     /// `[].constructor === Array`. Populated by `builtins::install`.
     pub array_proto: RefCell<Option<Obj>>,
+    /// Bytecode-chunk cache, keyed by FuncDef identity: `Some` = compiled (run on
+    /// the VM), `None` = unsupported (stay on the tree-walker). See `crate::vm`.
+    pub(crate) compiled: crate::vm::CompileCache,
 }
 
 impl Default for Interp {
@@ -52,6 +55,7 @@ impl Interp {
             error_protos: RefCell::new(std::collections::HashMap::new()),
             object_proto: RefCell::new(None),
             array_proto: RefCell::new(None),
+            compiled: RefCell::new(std::collections::HashMap::new()),
         };
         crate::builtins::install(&it);
         it
@@ -711,6 +715,12 @@ impl Interp {
         match kind {
             Kind::Native(f) => f(self, this, args),
             Kind::User(def, closure) => {
+                // Fast tier: if this function compiled to bytecode, run it on the
+                // VM (flat locals, no scope map). Unsupported functions fall
+                // through to the tree-walker below.
+                if let Some(chunk) = self.get_chunk(&def) {
+                    return self.run_chunk(&chunk, &closure, args);
+                }
                 let act = Scope::child(&closure);
                 if !def.is_arrow {
                     // Only declare `this`/`arguments` when the body actually uses
@@ -959,7 +969,7 @@ impl Interp {
 
     // ───────────────────────── operators ─────────────────────────
 
-    fn binop(&self, op: BinOp, l: JsValue, r: JsValue) -> EvalResult<JsValue> {
+    pub(crate) fn binop(&self, op: BinOp, l: JsValue, r: JsValue) -> EvalResult<JsValue> {
         use BinOp::*;
         match op {
             In => return self.in_op(&l, &r),

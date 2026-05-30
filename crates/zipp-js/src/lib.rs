@@ -14,12 +14,15 @@
 
 mod ast;
 mod builtins;
+mod bytecode;
+mod compile;
 mod env;
 mod interp;
 mod json;
 mod lower;
 mod methods;
 mod value;
+mod vm;
 
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
