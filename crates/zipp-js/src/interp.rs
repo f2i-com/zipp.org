@@ -399,6 +399,7 @@ impl Interp {
                 self.get_member(&ov, &key)
             }
             Expr::Call { callee, args } => self.eval_call(callee, args, scope),
+            Expr::New { callee, args } => self.eval_new(callee, args, scope),
             Expr::Func(def) => Ok(JsValue::Object(Object::function(def.clone(), scope.clone()))),
             Expr::Seq(exprs) => {
                 let mut last = JsValue::Undefined;
