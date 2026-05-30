@@ -2281,6 +2281,19 @@ impl Lower<'_> {
         let t = elem.to_type();
         let f_ty = z::Type::Func(fid);
         let tag = elem_tag(elem);
+        // A statically-known callback (a lifted arrow or a named function, lowered
+        // to `FuncRef`) is direct-called by a helper SPECIALIZED to it, so the LLVM
+        // tier can inline the per-element work (no indirect call) — the way V8
+        // specializes after warmup. An unknown function value (a function-typed
+        // variable, or a capturing closure → `MakeClosure`) uses the generic
+        // indirect helper. The helper name is suffixed with the callback so each
+        // specialization is distinct (and shared across identical call sites).
+        let direct: Option<String> = match cb {
+            z::Expr::FuncRef(n) => Some(n.clone()),
+            _ => None,
+        };
+        let d = direct.as_deref();
+        let sfx = d.map(|n| format!("_{n}")).unwrap_or_default();
         let (name, call_args) = match method {
             "map" => {
                 if args.len() != 1 || ft.params != [t] {
@@ -2290,20 +2303,20 @@ impl Lower<'_> {
                     self.err(span, "map's callback must return a scalar (array element type)")
                 })?;
                 let name = self.ensure_helper(
-                    format!("__map_{tag}_{}", elem_tag(u)),
+                    format!("__map_{tag}_{}{sfx}", elem_tag(u)),
                     z::Type::Array(u),
-                    |n| build_map_helper(n, elem, u, f_ty),
+                    |n| build_map_helper(n, elem, u, f_ty, d),
                 );
-                (name, prepend(recv, args))
+                (name, if direct.is_some() { vec![recv] } else { prepend(recv, args) })
             }
             "filter" => {
                 if args.len() != 1 || ft.params != [t] || ft.ret != z::Type::Bool {
                     return Err(self.err(span, "filter((x: T) => bool) takes one boolean predicate"));
                 }
-                let name = self.ensure_helper(format!("__filter_{tag}"), z::Type::Array(elem), |n| {
-                    build_filter_helper(n, elem, f_ty)
+                let name = self.ensure_helper(format!("__filter_{tag}{sfx}"), z::Type::Array(elem), |n| {
+                    build_filter_helper(n, elem, f_ty, d)
                 });
-                (name, prepend(recv, args))
+                (name, if direct.is_some() { vec![recv] } else { prepend(recv, args) })
             }
             "reduce" => {
                 if args.len() != 2 {
@@ -2322,11 +2335,17 @@ impl Lower<'_> {
                     return Err(self.err(span, format!("reduce's initial value must be {:?}", ft.ret)));
                 }
                 let name = self.ensure_helper(
-                    format!("__reduce_{tag}_{}", elem_tag(u)),
+                    format!("__reduce_{tag}_{}{sfx}", elem_tag(u)),
                     u.to_type(),
-                    |n| build_reduce_helper(n, elem, u, f_ty),
+                    |n| build_reduce_helper(n, elem, u, f_ty, d),
                 );
-                (name, prepend(recv, args))
+                // generic: (arr, f, init); specialized: (arr, init).
+                let call_args = if direct.is_some() {
+                    vec![recv, args[1].clone()]
+                } else {
+                    prepend(recv, args)
+                };
+                (name, call_args)
             }
             // predicate scans: some/every → bool, findIndex → i64
             "some" | "every" | "findIndex" => {
@@ -2338,10 +2357,10 @@ impl Lower<'_> {
                 }
                 let ret = if method == "findIndex" { z::Type::I64 } else { z::Type::Bool };
                 let m = method.to_string();
-                let name = self.ensure_helper(format!("__{method}_{tag}"), ret, |n| {
-                    build_predicate_helper(n, elem, f_ty, &m)
+                let name = self.ensure_helper(format!("__{method}_{tag}{sfx}"), ret, |n| {
+                    build_predicate_helper(n, elem, f_ty, &m, d)
                 });
-                (name, prepend(recv, args))
+                (name, if direct.is_some() { vec![recv] } else { prepend(recv, args) })
             }
             _ => unreachable!(),
         };
@@ -2914,9 +2933,36 @@ fn call_f(f_ty: z::Type, args: Vec<z::Expr>) -> z::Expr {
     z::Expr::CallValue { callee: Box::new(z::Expr::Var("f".into())), args, sig }
 }
 
+/// How a synthesized helper invokes its callback. `Some(name)` → a DIRECT call to
+/// the concrete (lifted-arrow or named) function — the helper is specialized to
+/// that callback and omits the `f` parameter; this lets the LLVM tier inline the
+/// per-element work (no indirect call), the way V8 does after warmup. `None` →
+/// the generic helper that takes `f` as a function-value parameter and calls it
+/// indirectly (`CallValue`), used when the callback isn't a statically-known
+/// function (e.g. a function-typed variable).
+fn call_cb(direct: Option<&str>, f_ty: z::Type, args: Vec<z::Expr>) -> z::Expr {
+    match direct {
+        Some(name) => z::Expr::Call { name: name.to_string(), args },
+        None => call_f(f_ty, args),
+    }
+}
+
+/// Leading params for a callback helper: `arr: T[]`, then the `f: <Func>` param
+/// only when the callback is invoked indirectly (`direct` is `None`), then any
+/// `extra` trailing params (e.g. `init` for reduce).
+fn cb_params(t: z::Elem, f_ty: z::Type, direct: Option<&str>, extra: Vec<z::Param>) -> Vec<z::Param> {
+    let mut p = vec![z::Param { name: "arr".into(), ty: z::Type::Array(t) }];
+    if direct.is_none() {
+        p.push(z::Param { name: "f".into(), ty: f_ty });
+    }
+    p.extend(extra);
+    p
+}
+
 /// `function __map_T_U(arr: T[], f: (T)=>U): U[] { let __r: U[] = []; for (…) __r.push(f(arr[__i])); return __r; }`
-fn build_map_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::Func {
-    use z::{Expr, Param, StmtKind, Type};
+/// (`direct = Some(name)` direct-calls `name` and drops the `f` param.)
+fn build_map_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type, direct: Option<&str>) -> z::Func {
+    use z::{Expr, StmtKind, Type};
     let body = vec![
         stmt(StmtKind::Let {
             name: "__r".into(),
@@ -2929,25 +2975,23 @@ fn build_map_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::Fun
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::ExprStmt(Expr::Push {
                 arr: Box::new(Expr::Var("__r".into())),
-                value: Box::new(call_f(f_ty, vec![arr_at_i()])),
+                value: Box::new(call_cb(direct, f_ty, vec![arr_at_i()])),
             }))],
         }),
         stmt(StmtKind::Return(Some(Expr::Var("__r".into())))),
     ];
     z::Func {
         name: name.into(),
-        params: vec![
-            Param { name: "arr".into(), ty: Type::Array(t) },
-            Param { name: "f".into(), ty: f_ty },
-        ],
+        params: cb_params(t, f_ty, direct, vec![]),
         ret: Type::Array(u),
         body,
     }
 }
 
 /// `function __filter_T(arr: T[], f: (T)=>bool): T[] { … if (f(arr[__i])) __r.push(arr[__i]); … }`
-fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type) -> z::Func {
-    use z::{Expr, Param, StmtKind, Type};
+/// (`direct = Some(name)` direct-calls `name` and drops the `f` param.)
+fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type, direct: Option<&str>) -> z::Func {
+    use z::{Expr, StmtKind, Type};
     let body = vec![
         stmt(StmtKind::Let {
             name: "__r".into(),
@@ -2959,7 +3003,7 @@ fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type) -> z::Func {
             cond: lt_len(),
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::If {
-                cond: call_f(f_ty, vec![arr_at_i()]),
+                cond: call_cb(direct, f_ty, vec![arr_at_i()]),
                 then_b: vec![stmt(StmtKind::ExprStmt(Expr::Push {
                     arr: Box::new(Expr::Var("__r".into())),
                     value: Box::new(arr_at_i()),
@@ -2971,18 +3015,16 @@ fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type) -> z::Func {
     ];
     z::Func {
         name: name.into(),
-        params: vec![
-            Param { name: "arr".into(), ty: Type::Array(t) },
-            Param { name: "f".into(), ty: f_ty },
-        ],
+        params: cb_params(t, f_ty, direct, vec![]),
         ret: Type::Array(t),
         body,
     }
 }
 
 /// `function __reduce_T_U(arr: T[], f: (U,T)=>U, init: U): U { let __acc = init; for (…) __acc = f(__acc, arr[__i]); return __acc; }`
-fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::Func {
-    use z::{Expr, Param, StmtKind, Type};
+/// (`direct = Some(name)` direct-calls `name` and drops the `f` param.)
+fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type, direct: Option<&str>) -> z::Func {
+    use z::{Expr, Param, StmtKind};
     let body = vec![
         stmt(StmtKind::Let {
             name: "__acc".into(),
@@ -2995,18 +3037,14 @@ fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type) -> z::
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::Assign {
                 target: Expr::Var("__acc".into()),
-                value: call_f(f_ty, vec![Expr::Var("__acc".into()), arr_at_i()]),
+                value: call_cb(direct, f_ty, vec![Expr::Var("__acc".into()), arr_at_i()]),
             })],
         }),
         stmt(StmtKind::Return(Some(Expr::Var("__acc".into())))),
     ];
     z::Func {
         name: name.into(),
-        params: vec![
-            Param { name: "arr".into(), ty: Type::Array(t) },
-            Param { name: "f".into(), ty: f_ty },
-            Param { name: "init".into(), ty: u.to_type() },
-        ],
+        params: cb_params(t, f_ty, direct, vec![Param { name: "init".into(), ty: u.to_type() }]),
         ret: u.to_type(),
         body,
     }
@@ -3118,9 +3156,9 @@ fn build_find_helper(name: &str, t: z::Elem, includes: bool) -> z::Func {
 /// A callback array helper that scans with `pred` and returns on the first match:
 /// `some` (→ true/false), `every` (→ false on first !pred / true), `findIndex`
 /// (→ index / -1).
-fn build_predicate_helper(name: &str, t: z::Elem, f_ty: z::Type, kind: &str) -> z::Func {
-    use z::{Param, Type};
-    let test = call_f(f_ty, vec![arr_at_i()]);
+fn build_predicate_helper(name: &str, t: z::Elem, f_ty: z::Type, kind: &str, direct: Option<&str>) -> z::Func {
+    use z::Type;
+    let test = call_cb(direct, f_ty, vec![arr_at_i()]);
     let (loop_body, tail, ret_ty) = match kind {
         "some" => (
             vec![if_then(test, vec![ret(z::Expr::Bool(true))])],
@@ -3144,10 +3182,7 @@ fn build_predicate_helper(name: &str, t: z::Elem, f_ty: z::Type, kind: &str) -> 
     };
     z::Func {
         name: name.into(),
-        params: vec![
-            Param { name: "arr".into(), ty: Type::Array(t) },
-            Param { name: "f".into(), ty: f_ty },
-        ],
+        params: cb_params(t, f_ty, direct, vec![]),
         ret: ret_ty,
         body: vec![for_i(loop_body), tail],
     }
