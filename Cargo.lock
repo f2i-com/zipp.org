@@ -1269,6 +1269,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zipp-js"
+version = "0.0.1"
+dependencies = [
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_parser",
+ "oxc_span",
+ "oxc_syntax",
+]
+
+[[package]]
 name = "zipp-llvm"
 version = "0.0.1"
 dependencies = [

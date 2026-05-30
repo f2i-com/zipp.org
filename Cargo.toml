@@ -14,6 +14,7 @@ members = [
     "crates/zipp-llvm", # OPTIONAL release tier: emit LLVM IR, compile with clang -O3
     "crates/zipp-wasm", # OPTIONAL contract profile: emit gas-metered WebAssembly
     "crates/zipp-ts",   # OPTIONAL TypeScript frontend: parse .ts with oxc, lower the subset
+    "crates/zipp-js",   # OPTIONAL dynamic JS engine (Lane 3): tree-walking interpreter over the oxc AST
     "crates/zipp-cli",  # `zipp run [--prove] [--jit|--llvm|--wasm] file.zipp`
 ]
 

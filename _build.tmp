@@ -1,0 +1,10 @@
+﻿
+error[E0433]: failed to resolve: could not find `BindingPatternKind` in `ox`
+  --> crates\zipp-js\src\lower.rs:78:13
+   |             help: an enum with a similar name exists: `BindingPattern`
+error[E0609]: no field `kind` on type `&BindingPattern<'_>`
+  --> crates\zipp-js\src\lower.rs:77:14
+  --> crates\zipp-js\src\builtins.rs:21:9
+   |         help: remove this `mut`
+
+
