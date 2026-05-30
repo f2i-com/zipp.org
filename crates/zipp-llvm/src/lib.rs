@@ -148,10 +148,8 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     if prog.uses_opt_scalar {
         return Some("nullable scalars (i64 | null)");
     }
-    // First-class functions are interpreter-only in v0.
-    if prog.uses_func_value {
-        return Some("first-class functions");
-    }
+    // Function values — bare (FuncRef) and capturing closures (MakeClosure, via
+    // the env-pointer ABI) — both run natively now.
     // Growable arrays (push/pop) are interpreter-only in v0.
     if prog.uses_growable {
         return Some("growable arrays (push/pop)");
@@ -237,6 +235,15 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
                     Slice | SliceFrom | Repeat | CharAt => LTy::Str,
                     ByteAt | IndexOf | LastIndexOf | EndsWith => LTy::I64,
                 };
+            }
+            // A function value is a `[len|code|env]` closure block, carried as an
+            // i64 handle (matching `lty_of(Type::Func)`); an indirect call yields
+            // the callee's return type (from its interned signature).
+            Instr::FuncRef { dst, .. } | Instr::MakeClosure { dst, .. } => {
+                t[*dst as usize] = LTy::I64
+            }
+            Instr::CallValue { dst, sig, .. } => {
+                t[*dst as usize] = lty_of(prog.func_types[*sig as usize].ret);
             }
             _ => {}
         }
@@ -734,10 +741,118 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 let v = if llname(rty[*dst as usize]) == "ptr" { "null" } else { "0" };
                 store(&mut s, &rty, *dst, v);
             }
-            // First-class functions are interpreter-only; `ineligible_reason`
-            // gates them out before codegen, so this is never reached.
-            Instr::FuncRef { .. } | Instr::MakeClosure { .. } | Instr::CallValue { .. } => {
-                return Err("internal: first-class functions reached the LLVM backend".into())
+            // A function value is a `[len | code | env]` closure block (slot 1 =
+            // code pointer, slot 2 = env). A bare function stores env = 0; a
+            // capturing closure stores a pointer to its env struct. The register
+            // holds the block as an i64 handle.
+            Instr::FuncRef { dst, func } => {
+                let blk = fresh(&mut tmp);
+                s.push_str(&format!("  {blk} = call ptr @zipp_alloc(i64 2)\n"));
+                let cs = fresh(&mut tmp);
+                s.push_str(&format!("  {cs} = getelementptr inbounds i64, ptr {blk}, i64 1\n"));
+                s.push_str(&format!(
+                    "  store i64 ptrtoint (ptr @zfn{func} to i64), ptr {cs}\n"
+                ));
+                let es = fresh(&mut tmp);
+                s.push_str(&format!("  {es} = getelementptr inbounds i64, ptr {blk}, i64 2\n"));
+                s.push_str(&format!("  store i64 0, ptr {es}\n"));
+                let bi = fresh(&mut tmp);
+                s.push_str(&format!("  {bi} = ptrtoint ptr {blk} to i64\n"));
+                store(&mut s, &rty, *dst, &bi);
+            }
+            // A capturing closure: build the env struct (`zipp_alloc(ncaps)`,
+            // storing each capture like `NewStruct`), then the `[len|code|env]`
+            // block pointing at it. The lifted function reads its captures out of
+            // the env via `GetField`.
+            Instr::MakeClosure { dst, func, captures } => {
+                let env = fresh(&mut tmp);
+                s.push_str(&format!(
+                    "  {env} = call ptr @zipp_alloc(i64 {})\n",
+                    captures.len()
+                ));
+                for (i, cr) in captures.iter().enumerate() {
+                    let cv = load(&mut s, &mut tmp, &rty, *cr);
+                    let raw = to_slot(&mut s, &mut tmp, rty[*cr as usize], &cv);
+                    let slot = fresh(&mut tmp);
+                    s.push_str(&format!(
+                        "  {slot} = getelementptr inbounds i64, ptr {env}, i64 {}\n",
+                        i + 1
+                    ));
+                    s.push_str(&format!("  store i64 {raw}, ptr {slot}\n"));
+                }
+                let blk = fresh(&mut tmp);
+                s.push_str(&format!("  {blk} = call ptr @zipp_alloc(i64 2)\n"));
+                let cs = fresh(&mut tmp);
+                s.push_str(&format!("  {cs} = getelementptr inbounds i64, ptr {blk}, i64 1\n"));
+                s.push_str(&format!(
+                    "  store i64 ptrtoint (ptr @zfn{func} to i64), ptr {cs}\n"
+                ));
+                let es = fresh(&mut tmp);
+                s.push_str(&format!("  {es} = getelementptr inbounds i64, ptr {blk}, i64 2\n"));
+                let envi = fresh(&mut tmp);
+                s.push_str(&format!("  {envi} = ptrtoint ptr {env} to i64\n"));
+                s.push_str(&format!("  store i64 {envi}, ptr {es}\n"));
+                let bi = fresh(&mut tmp);
+                s.push_str(&format!("  {bi} = ptrtoint ptr {blk} to i64\n"));
+                store(&mut s, &rty, *dst, &bi);
+            }
+            // Indirect call through a function value. The closure block carries its
+            // env at slot 2 (0 for a bare function). A capturing closure's lifted
+            // code wants the env as a leading argument and a bare function does
+            // not — so dispatch on the env slot.
+            Instr::CallValue { dst, callee, arg_base, argc, sig } => {
+                let ft = &prog.func_types[*sig as usize];
+                let rt = llname(lty_of(ft.ret));
+                let bi = load(&mut s, &mut tmp, &rty, *callee);
+                let blk = fresh(&mut tmp);
+                s.push_str(&format!("  {blk} = inttoptr i64 {bi} to ptr\n"));
+                let cs = fresh(&mut tmp);
+                s.push_str(&format!("  {cs} = getelementptr inbounds i64, ptr {blk}, i64 1\n"));
+                let codei = fresh(&mut tmp);
+                s.push_str(&format!("  {codei} = load i64, ptr {cs}\n"));
+                let code = fresh(&mut tmp);
+                s.push_str(&format!("  {code} = inttoptr i64 {codei} to ptr\n"));
+                let es = fresh(&mut tmp);
+                s.push_str(&format!("  {es} = getelementptr inbounds i64, ptr {blk}, i64 2\n"));
+                let envi = fresh(&mut tmp);
+                s.push_str(&format!("  {envi} = load i64, ptr {es}\n"));
+                // explicit args, coerced to the interned signature's param types
+                let mut argstr: Vec<String> = Vec::with_capacity(*argc as usize);
+                for k in 0..*argc {
+                    let aty = rty[(*arg_base + k) as usize];
+                    let pty = lty_of(ft.params[k as usize]);
+                    let v = load(&mut s, &mut tmp, &rty, *arg_base + k);
+                    let v = coerce(&mut s, &mut tmp, aty, pty, &v);
+                    argstr.push(format!("{} {v}", llname(pty)));
+                }
+                let n = tmp;
+                tmp += 1;
+                let (plain, envl, merge) =
+                    (format!("cv{n}.plain"), format!("cv{n}.env"), format!("cv{n}.merge"));
+                let isbare = fresh(&mut tmp);
+                s.push_str(&format!("  {isbare} = icmp eq i64 {envi}, 0\n"));
+                s.push_str(&format!("  br i1 {isbare}, label %{plain}, label %{envl}\n"));
+                // bare path: plain signature (explicit args only)
+                s.push_str(&format!("{plain}:\n"));
+                let rp = fresh(&mut tmp);
+                s.push_str(&format!("  {rp} = call {rt} {code}({})\n", argstr.join(", ")));
+                s.push_str(&format!("  br label %{merge}\n"));
+                // capturing path: env-leading signature
+                s.push_str(&format!("{envl}:\n"));
+                let env = fresh(&mut tmp);
+                s.push_str(&format!("  {env} = inttoptr i64 {envi} to ptr\n"));
+                let mut env_args = vec![format!("ptr {env}")];
+                env_args.extend(argstr.iter().cloned());
+                let re = fresh(&mut tmp);
+                s.push_str(&format!("  {re} = call {rt} {code}({})\n", env_args.join(", ")));
+                s.push_str(&format!("  br label %{merge}\n"));
+                // merge: result is the phi of both paths
+                s.push_str(&format!("{merge}:\n"));
+                let res = fresh(&mut tmp);
+                s.push_str(&format!(
+                    "  {res} = phi {rt} [ {rp}, %{plain} ], [ {re}, %{envl} ]\n"
+                ));
+                store(&mut s, &rty, *dst, &res);
             }
             // Growable arrays are interpreter-only; gated out before codegen.
             Instr::Push { .. } | Instr::Pop { .. } => {
@@ -1097,6 +1212,24 @@ mod tests {
         let ir = emit_ir(&prog).unwrap();
         assert!(ir.contains("define i64 @zfn"));
         assert!(ir.contains("ptrtoint") || ir.contains("inttoptr")); // null/ptr crossing
+    }
+
+    #[test]
+    fn emits_ir_for_closures() {
+        // Capturing closures compile natively via the env-pointer ABI: the
+        // closure block is `[len|code|env]`, and the indirect call branches on the
+        // env slot (bare function → plain sig, closure → env-leading sig).
+        let ts = "function adder(n: i64): (x: i64) => i64 { return (x: i64) => x + n; } \
+                  function main(): i64 { const a = adder(10); return a(5) + a(20); }";
+        let module = zipp_ts::compile_ts(ts).expect("lower");
+        let prog = zippc::compile_module(&module).expect("compile");
+        assert!(prog.uses_capturing_closure);
+        assert!(ineligible_reason(&prog).is_none()); // runs natively, no fallback
+        let ir = emit_ir(&prog).unwrap();
+        assert!(ir.contains("@zipp_alloc")); // closure block + env struct
+        assert!(ir.contains("ptrtoint (ptr @zfn")); // code pointer baked in
+        assert!(ir.contains("icmp eq i64")); // env-slot dispatch
+        assert!(ir.contains("phi")); // result merge of the two call forms
     }
 
     #[test]
