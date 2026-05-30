@@ -733,9 +733,23 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             E::Identifier(id) => {
-                if id.name == "undefined" {
-                    self.emit(Instr::LoadUndefined { dst });
-                    return Ok(dst);
+                // Special global value identifiers that are not user bindings.
+                match id.name.as_str() {
+                    "undefined" => {
+                        self.emit(Instr::LoadUndefined { dst });
+                        return Ok(dst);
+                    }
+                    "NaN" => {
+                        let idx = self.add_const(Value::num(f64::NAN));
+                        self.emit(Instr::LoadConst { dst, idx });
+                        return Ok(dst);
+                    }
+                    "Infinity" => {
+                        let idx = self.add_const(Value::num(f64::INFINITY));
+                        self.emit(Instr::LoadConst { dst, idx });
+                        return Ok(dst);
+                    }
+                    _ => {}
                 }
                 match self.resolve(id.name.as_str()) {
                     Binding::Local(r) => Ok(r), // already in a register
@@ -900,8 +914,8 @@ impl<'a> FnCompiler<'a> {
             Op::GreaterEqualThan => Instr::Ge { dst, a, b: r },
             Op::StrictEquality => Instr::Eq { dst, a, b: r },
             Op::StrictInequality => Instr::Ne { dst, a, b: r },
-            Op::Equality => Instr::Eq { dst, a, b: r }, // v1: == behaves like ===
-            Op::Inequality => Instr::Ne { dst, a, b: r },
+            Op::Equality => Instr::LooseEq { dst, a, b: r },
+            Op::Inequality => Instr::LooseNe { dst, a, b: r },
             _ => return Err("unsupported binary operator (zipp-vm v1)".into()),
         };
         self.emit(instr);

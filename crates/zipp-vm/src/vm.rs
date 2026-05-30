@@ -312,6 +312,20 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
+                    Instr::LooseEq { dst, a, b } => {
+                        let va = self.get(base, a);
+                        let vb = self.get(base, b);
+                        let r = self.loose_eq(va, vb)?;
+                        self.set(base, dst, Value::bool(r));
+                        ip += 1;
+                    }
+                    Instr::LooseNe { dst, a, b } => {
+                        let va = self.get(base, a);
+                        let vb = self.get(base, b);
+                        let r = self.loose_eq(va, vb)?;
+                        self.set(base, dst, Value::bool(!r));
+                        ip += 1;
+                    }
                     Instr::Eq { dst, a, b } => {
                         let r = self.strict_eq(base, a, b);
                         self.set(base, dst, Value::bool(r));
@@ -1018,6 +1032,42 @@ impl<'p> Vm<'p> {
             }
         }
         false
+    }
+
+    /// JS loose equality `==` (the Abstract Equality Comparison). Same-type
+    /// compares like `===`; cross-type coerces per spec: null == undefined;
+    /// number vs string coerces the string to a number; boolean coerces to a
+    /// number; an object vs a primitive coerces the object to its primitive
+    /// (here: string coercion, since we have no valueOf). NaN is never equal.
+    fn loose_eq(&self, a: Value, b: Value) -> Result<bool, Thrown> {
+        // Same NaN-box tag class → strict semantics already cover it.
+        if (a.is_number() && b.is_number())
+            || (a.is_bool() && b.is_bool())
+            || (a.is_heap() && b.is_heap())
+        {
+            return Ok(self.values_strict_eq(a, b));
+        }
+        // null == undefined (and each with itself), but not with anything else.
+        if a.is_nullish() || b.is_nullish() {
+            return Ok(a.is_nullish() && b.is_nullish());
+        }
+        // From here neither side is null/undefined. Coerce toward numbers,
+        // except string-vs-string (handled above via the heap case) and
+        // string-vs-heapobject which JS compares by string.
+        // boolean → number, then retry.
+        if a.is_bool() {
+            return self.loose_eq(Value::num(if a.as_bool() { 1.0 } else { 0.0 }), b);
+        }
+        if b.is_bool() {
+            return self.loose_eq(a, Value::num(if b.as_bool() { 1.0 } else { 0.0 }));
+        }
+        // number vs string: coerce string to number.
+        // string vs object / number vs object: coerce via to_number (objects
+        // become NaN here, matching `1 == {}` → false; `"[object Object]"`
+        // string comparisons aren't reached because both-heap is handled above).
+        let an = self.to_number(a)?;
+        let bn = self.to_number(b)?;
+        Ok(an == bn)
     }
 
     // ── arithmetic / coercion helpers ──

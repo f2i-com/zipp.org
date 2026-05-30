@@ -59,6 +59,10 @@ pub enum Instr {
     Eq { dst: Reg, a: Reg, b: Reg },
     /// strict `!==`
     Ne { dst: Reg, a: Reg, b: Reg },
+    /// loose `==` (with type coercion)
+    LooseEq { dst: Reg, a: Reg, b: Reg },
+    /// loose `!=` (with type coercion)
+    LooseNe { dst: Reg, a: Reg, b: Reg },
 
     Not { dst: Reg, a: Reg },
 

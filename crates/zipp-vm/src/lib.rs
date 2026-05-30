@@ -370,6 +370,35 @@ mod tests {
         );
     }
 
+    // ── Stage 4: loose equality ──
+
+    #[test]
+    fn loose_equality_matches_node() {
+        assert_eq!(run_ok("console.log(1 == '1')"), vec!["true"]);
+        assert_eq!(run_ok("console.log(null == undefined)"), vec!["true"]);
+        assert_eq!(run_ok("console.log(0 == false)"), vec!["true"]);
+        assert_eq!(run_ok("console.log('' == 0)"), vec!["true"]);
+        assert_eq!(run_ok("console.log('2' == 2)"), vec!["true"]);
+        assert_eq!(run_ok("console.log(true == 1)"), vec!["true"]);
+        assert_eq!(run_ok("console.log(null == 0)"), vec!["false"]);
+        assert_eq!(run_ok("console.log(undefined == 0)"), vec!["false"]);
+        assert_eq!(run_ok("console.log(1 != '1')"), vec!["false"]);
+        assert_eq!(run_ok("console.log(null != undefined)"), vec!["false"]);
+    }
+
+    #[test]
+    fn strict_vs_loose_distinct() {
+        assert_eq!(run_ok("console.log(1 === '1', 1 == '1')"), vec!["false true"]);
+        assert_eq!(run_ok("console.log(null === undefined, null == undefined)"), vec!["false true"]);
+    }
+
+    #[test]
+    fn nan_and_infinity_globals() {
+        assert_eq!(run_ok("console.log(NaN == NaN)"), vec!["false"]);
+        assert_eq!(run_ok("let x = 0/0; console.log(x === x)"), vec!["false"]);
+        assert_eq!(run_ok("console.log(Infinity > 1e308, -Infinity < 0)"), vec!["true true"]);
+    }
+
     #[test]
     fn known_limitation_per_iteration_let_in_for() {
         // KNOWN GAP vs node: a `let` loop variable captured inside a for-loop
