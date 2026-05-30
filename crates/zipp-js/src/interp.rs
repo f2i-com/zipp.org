@@ -780,6 +780,18 @@ impl Interp {
     }
 
     pub fn get_member(&self, obj: &JsValue, key: &str) -> EvalResult<JsValue> {
+        // Fast path: an OWN data property not shadowed by an own accessor wins
+        // over anything inherited (per spec), so return it without the full
+        // accessor proto-chain walk below. This is the common case for plain
+        // object property reads and skips a chain traversal each time.
+        if let JsValue::Object(o) = obj {
+            let b = o.borrow();
+            if !b.accessors.contains_key(key) {
+                if let Some(v) = b.props.get(key) {
+                    return Ok(v.clone());
+                }
+            }
+        }
         // An accessor (getter) on the object or its chain takes precedence over a
         // data property; invoke it with `this = obj`.
         if let JsValue::Object(o) = obj {
