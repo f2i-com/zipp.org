@@ -316,4 +316,69 @@ mod tests {
             vec!["1"]
         );
     }
+
+    // ── Stage 3: closures ──
+
+    #[test]
+    fn closure_counter_shares_mutable_state() {
+        // The classic: each call mutates the captured `c`, shared across calls.
+        assert_eq!(
+            run_ok("function counter(){ let c=0; return function(){ c++; return c } } let f=counter(); console.log(f(), f(), f())"),
+            vec!["1 2 3"]
+        );
+    }
+
+    #[test]
+    fn closure_captures_parameter() {
+        assert_eq!(
+            run_ok("function adder(n){ return x => x + n } let a5 = adder(5); console.log(a5(10), a5(20))"),
+            vec!["15 25"]
+        );
+    }
+
+    #[test]
+    fn arrow_captures_outer_let() {
+        assert_eq!(run_ok("let mul = 3; let f = x => x * mul; console.log(f(10))"), vec!["30"]);
+    }
+
+    #[test]
+    fn nested_of_nested_capture() {
+        // Three levels: innermost captures `a` from the grandparent (ParentUpval
+        // re-sourcing) and `b` from the parent (ParentLocal).
+        assert_eq!(
+            run_ok("function outer(){ let a=1; function mid(){ let b=10; return function(){ return a+b } } return mid() } console.log(outer()())"),
+            vec!["11"]
+        );
+    }
+
+    #[test]
+    fn closures_are_independent_instances() {
+        // Two counters from the same factory must not share state.
+        assert_eq!(
+            run_ok("function mk(){ let c=0; return ()=>++c } let a=mk(); let b=mk(); console.log(a(),a(),b(),a())"),
+            vec!["1 2 1 3"]
+        );
+    }
+
+    #[test]
+    fn closure_mutates_captured_from_inner() {
+        // Writing a captured upvalue from the inner function is visible to a
+        // sibling reader closure (shared cell).
+        assert_eq!(
+            run_ok("function mk(){ let v=0; let set=x=>{v=x}; let get=()=>v; return [set,get] } let p=mk(); p[0](42); console.log(p[1]())"),
+            vec!["42"]
+        );
+    }
+
+    #[test]
+    fn known_limitation_per_iteration_let_in_for() {
+        // KNOWN GAP vs node: a `let` loop variable captured inside a for-loop
+        // body should produce a FRESH binding per iteration (node → "0 1 2").
+        // zipp-vm v1 shares one cell across iterations (→ "3 3 3", i.e. `var`
+        // semantics). Documented here so the divergence is explicit and tracked;
+        // per-iteration loop bindings are a future refinement.
+        let out = run("function mk(){ let xs=[]; for(let i=0;i<3;i++){ xs.push(()=>i) } return xs } let f=mk(); console.log(f[0](), f[1](), f[2]())")
+            .expect("compile");
+        assert_eq!(out.output, vec!["3 3 3"]); // NOT node's "0 1 2" — see comment
+    }
 }

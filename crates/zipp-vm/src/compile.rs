@@ -16,13 +16,28 @@
 //! `console.log`. Anything else is a clear compile error — coverage grows over
 //! time, the same way the old engine did.
 
+use std::collections::HashSet;
+
 use oxc_ast::ast as ox;
 
-use crate::bytecode::{FuncProto, Instr, Program, Reg};
+use crate::bytecode::{FuncProto, Instr, Program, Reg, UpvalSource};
 use crate::value::Value;
 use crate::vm::STRING_CONST_BIT;
 
 type R<T> = Result<T, String>;
+
+/// A read-only snapshot of an enclosing function's binding environment, used by
+/// a nested function to resolve free variables to upvalues. The chain is ordered
+/// outermost → innermost-parent; the last entry is the direct parent.
+#[derive(Clone)]
+struct EnclosingFn {
+    /// name → register holding that binding's CELL in the parent frame. Only
+    /// captured bindings appear here (non-captured locals can't be upvalues).
+    cell_locals: Vec<(String, Reg)>,
+    /// Upvalue names the parent itself captured, in upvalue-index order — so a
+    /// grandchild can re-capture through the parent (ParentUpval sourcing).
+    upvalue_names: Vec<String>,
+}
 
 /// Compile a parsed program into bytecode.
 pub fn compile_program(prog: &ox::Program) -> R<Program> {
@@ -68,8 +83,17 @@ impl Compiler {
             }
         }
 
-        // Compile the top-level body as function 0.
-        let top = self.compile_function_body(None, &[], &prog.body, true)?;
+        // Compile the top-level body as function 0. The script has no enclosing
+        // scope and binds everything to globals, so nothing it declares is a
+        // captured cell.
+        let top = self.compile_function_body(
+            None,
+            &[],
+            &prog.body,
+            true,
+            HashSet::new(),
+            Vec::new(),
+        )?;
         self.functions[0] = top;
         Ok(())
     }
@@ -82,8 +106,10 @@ impl Compiler {
         params: &[String],
         body: &[ox::Statement],
         is_script: bool,
+        captured: HashSet<String>,
+        enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
-        let mut fc = FnCompiler::new(self, params);
+        let mut fc = FnCompiler::new(self, params, captured, enclosing);
         fc.is_script = is_script;
 
         // Hoist function declarations in this body so calls resolve before the
@@ -116,7 +142,7 @@ impl Compiler {
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
-            upvalues: Vec::new(), // set by the caller after capture analysis
+            upvalues: fc.upvalues.iter().map(|(_, s)| *s).collect(),
         })
     }
 
@@ -125,8 +151,10 @@ impl Compiler {
         &mut self,
         params: &[String],
         a: &ox::ArrowFunctionExpression,
+        captured: HashSet<String>,
+        enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
-        let mut fc = FnCompiler::new(self, params);
+        let mut fc = FnCompiler::new(self, params, captured, enclosing);
         if a.expression {
             // `x => expr`: the body is a single ExpressionStatement to return.
             let mut returned = false;
@@ -162,7 +190,7 @@ impl Compiler {
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
-            upvalues: Vec::new(),
+            upvalues: fc.upvalues.iter().map(|(_, s)| *s).collect(),
         })
     }
 }
@@ -191,13 +219,30 @@ struct FnCompiler<'a> {
     /// Next free register / high-water mark.
     next_reg: Reg,
     max_reg: Reg,
-    /// True for the top-level script body: function declarations bind to
-    /// globals rather than locals.
+    /// True for the top-level script body: declarations (functions AND
+    /// let/const/var) bind to globals rather than registers, so only genuinely
+    /// nested functions ever capture.
     is_script: bool,
+    /// This function's own bindings that some nested function captures; these
+    /// are boxed into heap cells at declaration so the closure shares the slot.
+    captured: HashSet<String>,
+    /// Registers currently holding a CELL (a boxed captured binding), so reads/
+    /// writes of them go through CellGet/CellSet.
+    cell_regs: HashSet<Reg>,
+    /// Upvalues this function captures, built lazily as free vars are resolved:
+    /// (name, source-in-parent). Index in this Vec is the runtime upvalue index.
+    upvalues: Vec<(String, UpvalSource)>,
+    /// Enclosing functions' binding snapshots (outermost → direct parent).
+    enclosing: Vec<EnclosingFn>,
 }
 
 impl<'a> FnCompiler<'a> {
-    fn new(cx: &'a mut Compiler, params: &[String]) -> FnCompiler<'a> {
+    fn new(
+        cx: &'a mut Compiler,
+        params: &[String],
+        captured: HashSet<String>,
+        enclosing: Vec<EnclosingFn>,
+    ) -> FnCompiler<'a> {
         let mut fc = FnCompiler {
             cx,
             code: Vec::new(),
@@ -207,6 +252,10 @@ impl<'a> FnCompiler<'a> {
             next_reg: 0,
             max_reg: 0,
             is_script: false,
+            captured,
+            cell_regs: HashSet::new(),
+            upvalues: Vec::new(),
+            enclosing,
         };
         // Register 0 is reserved for `this` in every function (undefined for
         // plain calls, the receiver for method calls). Parameters follow at
@@ -216,8 +265,54 @@ impl<'a> FnCompiler<'a> {
         for p in params {
             let r = fc.alloc_reg();
             fc.scopes[0].push((p.clone(), r));
+            // A captured parameter is boxed into a cell immediately so a nested
+            // closure shares the live slot (mutations visible both ways).
+            if fc.captured.contains(p) {
+                fc.emit(Instr::MakeCell { reg: r });
+                fc.cell_regs.insert(r);
+            }
         }
         fc
+    }
+
+    /// Snapshot this function's environment for a nested function to capture
+    /// from: cell-backed locals in scope, plus this function's own upvalue names
+    /// (so a grandchild can re-source through us via ParentUpval).
+    fn snapshot(&self) -> EnclosingFn {
+        let mut cell_locals = Vec::new();
+        for scope in &self.scopes {
+            for (name, reg) in scope {
+                if self.cell_regs.contains(reg) {
+                    cell_locals.push((name.clone(), *reg));
+                }
+            }
+        }
+        EnclosingFn {
+            cell_locals,
+            upvalue_names: self.upvalues.iter().map(|(n, _)| n.clone()).collect(),
+        }
+    }
+
+    /// Resolve a free variable to an upvalue index in THIS function, creating
+    /// the upvalue on first use. `None` if not found in any enclosing function.
+    fn resolve_upvalue(&mut self, name: &str) -> Option<u16> {
+        if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
+            return Some(i as u16);
+        }
+        let parent = self.enclosing.last()?.clone();
+        if let Some((_, reg)) = parent.cell_locals.iter().find(|(n, _)| n == name) {
+            return Some(self.add_upvalue(name, UpvalSource::ParentLocal(*reg)));
+        }
+        if let Some(idx) = parent.upvalue_names.iter().position(|n| n == name) {
+            return Some(self.add_upvalue(name, UpvalSource::ParentUpval(idx as u16)));
+        }
+        None
+    }
+
+    fn add_upvalue(&mut self, name: &str, src: UpvalSource) -> u16 {
+        let idx = self.upvalues.len() as u16;
+        self.upvalues.push((name.to_string(), src));
+        idx
     }
 
     // ── register allocation ──
@@ -254,17 +349,32 @@ impl<'a> FnCompiler<'a> {
     fn declare_local(&mut self, name: &str) -> Reg {
         let r = self.alloc_reg();
         self.scopes.last_mut().unwrap().push((name.to_string(), r));
+        // Box the local into a cell if a nested function captures it, so the
+        // closure and this scope share one mutable slot.
+        if self.captured.contains(name) {
+            self.emit(Instr::MakeCell { reg: r });
+            self.cell_regs.insert(r);
+        }
         r
     }
 
-    /// Resolve a name to a (Local register) or a (Global slot).
+    /// Resolve a name to a local register (plain or cell-backed), an upvalue, or
+    /// a global slot. Upvalue resolution lazily threads captures up the chain.
     fn resolve(&mut self, name: &str) -> Binding {
         for scope in self.scopes.iter().rev() {
             for (n, r) in scope.iter().rev() {
                 if n == name {
-                    return Binding::Local(*r);
+                    return if self.cell_regs.contains(r) {
+                        Binding::LocalCell(*r)
+                    } else {
+                        Binding::Local(*r)
+                    };
                 }
             }
+        }
+        // A free variable that resolves in an enclosing function is an upvalue.
+        if let Some(idx) = self.resolve_upvalue(name) {
+            return Binding::Upvalue(idx);
         }
         if let Some(i) = self.cx.globals.iter().position(|g| g == name) {
             return Binding::Global(i as u32);
@@ -329,17 +439,48 @@ impl<'a> FnCompiler<'a> {
                 ox::BindingPattern::BindingIdentifier(id) => id.name.as_str(),
                 _ => return Err("destructuring is not in the zipp-vm v1 subset yet".into()),
             };
+
+            // Top-level `let`/`const`/`var` bind to GLOBAL slots, so that a
+            // nested function referencing them resolves via LoadGlobal (a
+            // top-level binding is never an upvalue). This keeps the capture
+            // machinery confined to genuinely nested scopes.
+            if self.is_script {
+                let slot = self.cx.global_slot(name) as u32;
+                let tmp = self.temp();
+                let v = if let Some(init) = &decl.init {
+                    self.expr_into(init, tmp)?
+                } else {
+                    self.emit(Instr::LoadUndefined { dst: tmp });
+                    tmp
+                };
+                self.emit(Instr::StoreGlobal { idx: slot, src: v });
+                self.next_reg -= 1; // reclaim tmp
+                continue;
+            }
+
             // Allocate the local FIRST so `let x = x`-style self-reference and
-            // ordinary declarations land in a stable register.
+            // ordinary declarations land in a stable register. declare_local
+            // boxes the register into a cell if a nested function captures it.
             let reg = self.declare_local(name);
+            let is_cell = self.cell_regs.contains(&reg);
             if let Some(init) = &decl.init {
-                let v = self.expr_into(init, reg)?;
-                if v != reg {
-                    self.emit(Instr::Move { dst: reg, src: v });
+                if is_cell {
+                    // The init value must be written THROUGH the cell.
+                    let tmp = self.temp();
+                    let v = self.expr_into(init, tmp)?;
+                    self.emit(Instr::CellSet { cell: reg, src: v });
+                    self.next_reg -= 1; // reclaim tmp
+                } else {
+                    let v = self.expr_into(init, reg)?;
+                    if v != reg {
+                        self.emit(Instr::Move { dst: reg, src: v });
+                    }
                 }
-            } else {
+            } else if !is_cell {
                 self.emit(Instr::LoadUndefined { dst: reg });
             }
+            // A captured local with no initializer keeps the cell's default
+            // (undefined), set when MakeCell boxed the freshly-undefined reg.
         }
         Ok(())
     }
@@ -347,49 +488,83 @@ impl<'a> FnCompiler<'a> {
     fn func_decl(&mut self, f: &ox::Function) -> R<()> {
         let name = f.id.as_ref().map(|i| i.name.to_string());
         let (params, body) = function_parts(f)?;
-        let mut proto =
-            self.cx
-                .compile_function_body(name.as_deref(), &params, body, false)?;
+        let captured = capture::captured_locals(&params, body);
+        let enclosing = self.child_enclosing();
+        let mut proto = self.cx.compile_function_body(
+            name.as_deref(),
+            &params,
+            body,
+            false,
+            captured,
+            enclosing,
+        )?;
         let id = self.cx.functions.len() as u32;
+        let has_upvalues = !proto.upvalues.is_empty();
         if self.is_script {
             // Top-level: bind the name to a global; the VM materialises the
-            // function object at startup. No instruction needed here.
+            // function object at startup. A top-level function's free vars are
+            // all globals, so it never captures — no MakeClosure needed.
             if let Some(n) = &name {
                 let slot = self.cx.global_slot(n);
                 proto.name_global = Some(slot);
             }
             self.cx.functions.push(proto);
         } else {
-            // Nested: create the function object now into the local the
-            // hoisting pre-pass reserved for this name.
+            // Nested: create the function object now into the local the hoisting
+            // pre-pass reserved for this name. If it captures, build a closure;
+            // otherwise a plain function object. The name's own binding may be a
+            // plain register or a cell (when a sibling/inner function captures
+            // this function name).
             self.cx.functions.push(proto);
             if let Some(n) = &name {
-                if let Binding::Local(reg) = self.resolve(n) {
-                    self.emit(Instr::MakeFunc { dst: reg, func_id: id });
+                match self.resolve(n) {
+                    Binding::Local(reg) => self.emit_make_callable(reg, id, has_upvalues),
+                    Binding::LocalCell(cell) => {
+                        let tmp = self.temp();
+                        self.emit_make_callable(tmp, id, has_upvalues);
+                        self.emit(Instr::CellSet { cell, src: tmp });
+                        self.next_reg -= 1;
+                    }
+                    _ => {}
                 }
             }
         }
         Ok(())
     }
 
-    /// Compile a function expression, returning its function id. Unlike a
-    /// declaration, the name (if any) is not hoisted — the value is produced
-    /// explicitly by a `MakeFunc` at the use site.
-    fn compile_func_expr(&mut self, name: Option<String>, f: &ox::Function) -> R<u32> {
-        let (params, body) = function_parts(f)?;
-        let proto =
-            self.cx
-                .compile_function_body(name.as_deref(), &params, body, false)?;
-        let id = self.cx.functions.len() as u32;
-        self.cx.functions.push(proto);
-        Ok(id)
+    /// The enclosing-function chain to hand a function nested in THIS one: our
+    /// own enclosing chain plus a snapshot of our current bindings.
+    fn child_enclosing(&self) -> Vec<EnclosingFn> {
+        let mut e = self.enclosing.clone();
+        e.push(self.snapshot());
+        e
     }
 
-    /// Compile an arrow function, returning its function id. An expression-bodied
-    /// arrow (`x => x + 1`) is compiled as a function whose single statement is
-    /// `return <expr>`. Note: `this` is NOT yet lexically captured (arrows see
-    /// their own reg-0 `this`); refine when closures land.
-    fn compile_arrow(&mut self, a: &ox::ArrowFunctionExpression) -> R<u32> {
+    /// Compile a function expression, returning `(func_id, has_upvalues)`. The
+    /// name (if any) is not hoisted — the value is produced explicitly by a
+    /// `MakeFunc`/`MakeClosure` at the use site.
+    fn compile_func_expr(&mut self, name: Option<String>, f: &ox::Function) -> R<(u32, bool)> {
+        let (params, body) = function_parts(f)?;
+        let captured = capture::captured_locals(&params, body);
+        let enclosing = self.child_enclosing();
+        let proto = self.cx.compile_function_body(
+            name.as_deref(),
+            &params,
+            body,
+            false,
+            captured,
+            enclosing,
+        )?;
+        let has_upvalues = !proto.upvalues.is_empty();
+        let id = self.cx.functions.len() as u32;
+        self.cx.functions.push(proto);
+        Ok((id, has_upvalues))
+    }
+
+    /// Compile an arrow function, returning `(func_id, has_upvalues)`. An
+    /// expression-bodied arrow (`x => x + 1`) is a function whose single
+    /// statement returns the expression.
+    fn compile_arrow(&mut self, a: &ox::ArrowFunctionExpression) -> R<(u32, bool)> {
         let mut params = Vec::new();
         for item in &a.params.items {
             match &item.pattern {
@@ -397,10 +572,23 @@ impl<'a> FnCompiler<'a> {
                 _ => return Err("arrow parameter patterns not in the zipp-vm subset yet".into()),
             }
         }
-        let proto = self.cx.compile_arrow_body(&params, a)?;
+        let captured = capture::captured_locals(&params, &a.body.statements);
+        let enclosing = self.child_enclosing();
+        let proto = self.cx.compile_arrow_body(&params, a, captured, enclosing)?;
+        let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);
-        Ok(id)
+        Ok((id, has_upvalues))
+    }
+
+    /// Emit `MakeClosure` if the just-compiled function captures upvalues, else
+    /// `MakeFunc`.
+    fn emit_make_callable(&mut self, dst: Reg, id: u32, has_upvalues: bool) {
+        if has_upvalues {
+            self.emit(Instr::MakeClosure { dst, func_id: id });
+        } else {
+            self.emit(Instr::MakeFunc { dst, func_id: id });
+        }
     }
 
     fn if_stmt(&mut self, i: &ox::IfStatement) -> R<()> {
@@ -518,6 +706,14 @@ impl<'a> FnCompiler<'a> {
                 }
                 match self.resolve(id.name.as_str()) {
                     Binding::Local(r) => Ok(r), // already in a register
+                    Binding::LocalCell(cell) => {
+                        self.emit(Instr::CellGet { dst, cell });
+                        Ok(dst)
+                    }
+                    Binding::Upvalue(idx) => {
+                        self.emit(Instr::UpvalGet { dst, idx });
+                        Ok(dst)
+                    }
                     Binding::Global(idx) => {
                         self.emit(Instr::LoadGlobal { dst, idx });
                         Ok(dst)
@@ -537,13 +733,14 @@ impl<'a> FnCompiler<'a> {
             E::ConditionalExpression(c) => self.conditional(c, dst),
             E::CallExpression(c) => self.call(c, dst),
             E::FunctionExpression(f) => {
-                let id = self.compile_func_expr(f.id.as_ref().map(|i| i.name.to_string()), f)?;
-                self.emit(Instr::MakeFunc { dst, func_id: id });
+                let (id, has_up) =
+                    self.compile_func_expr(f.id.as_ref().map(|i| i.name.to_string()), f)?;
+                self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
             E::ArrowFunctionExpression(a) => {
-                let id = self.compile_arrow(a)?;
-                self.emit(Instr::MakeFunc { dst, func_id: id });
+                let (id, has_up) = self.compile_arrow(a)?;
+                self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
             E::ArrayExpression(a) => self.array_literal(a, dst),
@@ -739,39 +936,71 @@ impl<'a> FnCompiler<'a> {
             _ => return Err("update on non-identifier not in zipp-vm v1".into()),
         };
         let binding = self.resolve(&name);
-        let cur = match binding {
-            Binding::Local(r) => r,
-            Binding::Global(idx) => {
-                self.emit(Instr::LoadGlobal { dst, idx });
-                dst
-            }
-        };
         let delta = match u.operator {
             ox::UpdateOperator::Increment => 1,
             ox::UpdateOperator::Decrement => -1,
         };
-        if u.prefix {
-            // ++x: increment then yield new value.
-            self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta });
-            self.store_binding(&binding, cur);
-            if cur != dst {
-                self.emit(Instr::Move { dst, src: cur });
+        if let Binding::Local(r) = binding {
+            // Plain register local: mutate in place.
+            if u.prefix {
+                self.emit(Instr::AddInt { dst: r, a: r, imm: delta });
+                if r != dst {
+                    self.emit(Instr::Move { dst, src: r });
+                }
+            } else {
+                self.emit(Instr::Move { dst, src: r }); // yield old value
+                self.emit(Instr::AddInt { dst: r, a: r, imm: delta });
             }
-            Ok(dst)
-        } else {
-            // x++: yield old value, then increment.
-            self.emit(Instr::Move { dst, src: cur });
+            return Ok(dst);
+        }
+        // Cell / upvalue / global: read into `dst`, compute, store back.
+        let cur = self.load_binding(&binding, dst); // == dst
+        if u.prefix {
             self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta });
             self.store_binding(&binding, cur);
-            Ok(dst)
+            Ok(dst) // dst holds the new value
+        } else {
+            // Keep the old value in `dst`; compute the new value in a temp.
+            let tmp = self.temp();
+            self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta });
+            self.store_binding(&binding, tmp);
+            self.next_reg -= 1; // reclaim tmp
+            Ok(dst) // dst still holds the old value
         }
     }
 
-    fn store_binding(&mut self, b: &Binding, src: Reg) {
-        if let Binding::Global(idx) = b {
-            self.emit(Instr::StoreGlobal { idx: *idx, src });
+    /// Emit a read of `binding` into `dst`; returns the register holding the
+    /// value (the binding's own register for a plain Local, else `dst`).
+    fn load_binding(&mut self, binding: &Binding, dst: Reg) -> Reg {
+        match binding {
+            Binding::Local(r) => *r,
+            Binding::LocalCell(cell) => {
+                self.emit(Instr::CellGet { dst, cell: *cell });
+                dst
+            }
+            Binding::Upvalue(idx) => {
+                self.emit(Instr::UpvalGet { dst, idx: *idx });
+                dst
+            }
+            Binding::Global(idx) => {
+                self.emit(Instr::LoadGlobal { dst, idx: *idx });
+                dst
+            }
         }
-        // Local: already written in place.
+    }
+
+    /// Emit a write of `src` to `binding`.
+    fn store_binding(&mut self, b: &Binding, src: Reg) {
+        match b {
+            Binding::Local(r) => {
+                if *r != src {
+                    self.emit(Instr::Move { dst: *r, src });
+                }
+            }
+            Binding::LocalCell(cell) => self.emit(Instr::CellSet { cell: *cell, src }),
+            Binding::Upvalue(idx) => self.emit(Instr::UpvalSet { idx: *idx, src }),
+            Binding::Global(idx) => self.emit(Instr::StoreGlobal { idx: *idx, src }),
+        }
     }
 
     fn assign(&mut self, a: &ox::AssignmentExpression, dst: Reg) -> R<Reg> {
@@ -814,41 +1043,53 @@ impl<'a> FnCompiler<'a> {
         let binding = self.resolve(&name);
         match a.operator {
             Op::Assign => {
-                let target = match binding {
-                    Binding::Local(r) => r,
-                    Binding::Global(_) => dst,
-                };
-                let v = self.expr_into(&a.right, target)?;
-                if v != target {
-                    self.emit(Instr::Move { dst: target, src: v });
-                }
-                self.store_binding(&binding, target);
-                if target != dst {
-                    self.emit(Instr::Move { dst, src: target });
+                if let Binding::Local(r) = binding {
+                    // Plain local: evaluate the RHS directly into its register.
+                    let v = self.expr_into(&a.right, r)?;
+                    if v != r {
+                        self.emit(Instr::Move { dst: r, src: v });
+                    }
+                    if r != dst {
+                        self.emit(Instr::Move { dst, src: r });
+                    }
+                } else {
+                    // Cell / upvalue / global: evaluate into dst, then store.
+                    let v = self.expr_into(&a.right, dst)?;
+                    if v != dst {
+                        self.emit(Instr::Move { dst, src: v });
+                    }
+                    self.store_binding(&binding, dst);
                 }
                 Ok(dst)
             }
             Op::Addition | Op::Subtraction | Op::Multiplication => {
-                let cur = match binding {
-                    Binding::Local(r) => r,
-                    Binding::Global(idx) => {
-                        self.emit(Instr::LoadGlobal { dst, idx });
-                        dst
+                if let Binding::Local(r) = binding {
+                    // Plain local: compute in place.
+                    let rhs = self.expr(&a.right)?;
+                    let instr = match a.operator {
+                        Op::Addition => Instr::Add { dst: r, a: r, b: rhs },
+                        Op::Subtraction => Instr::Sub { dst: r, a: r, b: rhs },
+                        Op::Multiplication => Instr::Mul { dst: r, a: r, b: rhs },
+                        _ => unreachable!(),
+                    };
+                    self.emit(instr);
+                    if r != dst {
+                        self.emit(Instr::Move { dst, src: r });
                     }
-                };
+                    return Ok(dst);
+                }
+                // Cell / upvalue / global: load current → dst, compute → dst,
+                // store back through the binding.
+                let cur = self.load_binding(&binding, dst); // == dst
                 let rhs = self.expr(&a.right)?;
-                let target = if let Binding::Local(r) = binding { r } else { dst };
                 let instr = match a.operator {
-                    Op::Addition => Instr::Add { dst: target, a: cur, b: rhs },
-                    Op::Subtraction => Instr::Sub { dst: target, a: cur, b: rhs },
-                    Op::Multiplication => Instr::Mul { dst: target, a: cur, b: rhs },
+                    Op::Addition => Instr::Add { dst, a: cur, b: rhs },
+                    Op::Subtraction => Instr::Sub { dst, a: cur, b: rhs },
+                    Op::Multiplication => Instr::Mul { dst, a: cur, b: rhs },
                     _ => unreachable!(),
                 };
                 self.emit(instr);
-                self.store_binding(&binding, target);
-                if target != dst {
-                    self.emit(Instr::Move { dst, src: target });
-                }
+                self.store_binding(&binding, dst);
                 Ok(dst)
             }
             _ => Err("unsupported assignment operator (zipp-vm v1)".into()),
@@ -956,7 +1197,14 @@ impl<'a> FnCompiler<'a> {
 }
 
 enum Binding {
+    /// Plain register-resident local (the fast path; no capture).
     Local(Reg),
+    /// Local that has been boxed into a heap cell because a nested function
+    /// captures it; the register holds the cell reference.
+    LocalCell(Reg),
+    /// A variable captured from an enclosing function: index into this
+    /// function's upvalue list.
+    Upvalue(u16),
     Global(u32),
 }
 
