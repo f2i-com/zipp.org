@@ -169,9 +169,10 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     if prog.uses_opt_scalar {
         return Some("nullable scalars (i64 | null)");
     }
-    // First-class functions are interpreter-only in v0.
-    if prog.uses_func_value {
-        return Some("first-class functions");
+    // Bare function values (FuncRef + CallValue) run natively; capturing closures
+    // still need the env-pointer ABI and fall back.
+    if prog.uses_capturing_closure {
+        return Some("capturing closures");
     }
     // Growable arrays (push/pop) are interpreter-only in v0.
     if prog.uses_growable {
@@ -427,6 +428,12 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
                     Slice | SliceFrom | Repeat | CharAt => JTy::Str,
                     ByteAt | IndexOf | LastIndexOf | EndsWith => JTy::I64,
                 };
+            }
+            // A function value is a closure-block pointer (i64); an indirect call
+            // yields the callee's return type (from its interned signature).
+            Instr::FuncRef { dst, .. } => t[*dst as usize] = JTy::I64,
+            Instr::CallValue { dst, sig, .. } => {
+                t[*dst as usize] = jty_of(prog.func_types[*sig as usize].ret);
             }
             _ => {}
         }
@@ -876,8 +883,40 @@ fn compile_function(
             }
             // First-class functions are interpreter-only; `ineligible_reason`
             // gates them out before codegen, so this is never reached.
-            Instr::FuncRef { .. } | Instr::MakeClosure { .. } | Instr::CallValue { .. } => {
-                return Err("internal: first-class functions reached the JIT".into())
+            // A function value is a `[len=2 | code | env]` GC block (env = 0 for a
+            // bare function; capturing closures, which need env, are gated out).
+            Instr::FuncRef { dst, func } => {
+                let fref = module.declare_func_in_func(func_ids[*func as usize], builder.func);
+                let code = builder.ins().func_addr(types::I64, fref);
+                let alloc = module.declare_func_in_func(rt.alloc, builder.func);
+                let two = builder.ins().iconst(types::I64, 2);
+                let acall = builder.ins().call(alloc, &[two]);
+                let block = builder.inst_results(acall)[0];
+                builder.ins().store(MemFlags::trusted(), code, block, 8);
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder.ins().store(MemFlags::trusted(), zero, block, 16);
+                builder.def_var(var(*dst), block);
+            }
+            // Indirect call: load the code pointer from the closure block and
+            // call it with the explicit args (the plain signature; no env yet).
+            Instr::CallValue { dst, callee, arg_base, argc, sig } => {
+                let block = builder.use_var(var(*callee));
+                let code = builder.ins().load(types::I64, MemFlags::trusted(), block, 8);
+                let ft = &prog.func_types[*sig as usize];
+                let mut s = module.make_signature();
+                for p in &ft.params {
+                    s.params.push(AbiParam::new(clif_ty(*p)));
+                }
+                s.returns.push(AbiParam::new(clif_ty(ft.ret)));
+                let sigref = builder.import_signature(s);
+                let args: Vec<Value> =
+                    (0..*argc).map(|k| builder.use_var(var(*arg_base + k))).collect();
+                let icall = builder.ins().call_indirect(sigref, code, &args);
+                let r = builder.inst_results(icall)[0];
+                builder.def_var(var(*dst), r);
+            }
+            Instr::MakeClosure { .. } => {
+                return Err("internal: capturing closures reached the JIT".into())
             }
             // Growable arrays are interpreter-only; gated out before codegen.
             Instr::Push { .. } | Instr::Pop { .. } => {
@@ -1125,6 +1164,42 @@ mod tests {
         // non-ASCII slice at a non-char boundary is lossy (U+FFFD, 0xEF=239) on the
         // JIT exactly as on the interpreter — the make_str_lossy parity fix.
         assert_eq!(jit_ts_i64("function main(): i64 { return \"é\".slice(0, 1).charCodeAt(0); }"), 239);
+    }
+
+    #[test]
+    fn native_function_values() {
+        // Stage 1 of native closures: NON-capturing function values run natively
+        // on the JIT via call_indirect (capturing closures still fall back).
+        assert_eq!(
+            jit_ts_i64("function inc(n: i64): i64 { return n + 1; } \
+                        function main(): i64 { const f = inc; return f(41); }"),
+            42
+        );
+        // a non-capturing arrow lambda
+        assert_eq!(
+            jit_ts_i64("function main(): i64 { const d = (n: i64) => n * 2; return d(21); }"),
+            42
+        );
+        // higher-order: a function value passed as a parameter, called indirectly
+        assert_eq!(
+            jit_ts_i64("function twice(f: (n: i64) => i64, x: i64): i64 { return f(f(x)); } \
+                        function inc(n: i64): i64 { return n + 1; } \
+                        function main(): i64 { return twice(inc, 10); }"),
+            12
+        );
+        // f64 params/return through the indirect call (exercises the call sig)
+        assert_eq!(
+            jit_ts_i64("function main(): i64 { const h = (x: f64) => x * 2.0; return i64(h(3.5)); }"),
+            7
+        );
+        // such a program is native-eligible on the JIT (no capturing closure)
+        let m = zipp_ts::compile_ts(
+            "function inc(n: i64): i64 { return n + 1; } \
+             function main(): i64 { const f = inc; return f(1); }",
+        )
+        .unwrap();
+        let prog = zippc::compile_module(&m).unwrap();
+        assert!(!prog.uses_capturing_closure);
     }
 
     #[test]

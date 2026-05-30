@@ -114,6 +114,10 @@ pub struct Program {
     /// The program uses first-class function values (`FuncRef`/`CallValue`), which
     /// only the interpreter handles in v0; native tiers fall back.
     pub uses_func_value: bool,
+    /// The program uses a *capturing* closure (`MakeClosure`). Bare function values
+    /// run natively on the JIT; capturing closures still need the env-pointer ABI
+    /// and fall back.
+    pub uses_capturing_closure: bool,
     /// The program uses growable arrays (`push`/`pop`), which only the interpreter
     /// handles in v0 (native arrays are fixed-layout); native tiers fall back.
     pub uses_growable: bool,
@@ -216,6 +220,10 @@ pub fn lower(m: &Module) -> Result<Program, String> {
     });
     let uses_growable =
         code.iter().any(|i| matches!(i, Instr::Push { .. } | Instr::Pop { .. }));
+    // A CAPTURING closure (MakeClosure) needs the env-pointer calling convention;
+    // bare function values (FuncRef + CallValue) use the plain signature and can
+    // run natively. The frontend only emits MakeClosure when there ARE captures.
+    let uses_capturing_closure = code.iter().any(|i| matches!(i, Instr::MakeClosure { .. }));
     Ok(Program {
         code,
         funcs,
@@ -224,6 +232,7 @@ pub fn lower(m: &Module) -> Result<Program, String> {
         uses_opt_scalar: module_uses_opt_scalar(m),
         uses_func_value,
         uses_growable,
+        uses_capturing_closure,
         func_types: m.func_types.clone(),
     })
 }
