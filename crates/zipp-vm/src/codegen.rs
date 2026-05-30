@@ -64,17 +64,25 @@ pub struct JitFn {
 }
 
 impl JitFn {
-    /// Run the native code over `regs`. Returns `(result_bits, bail_ip)`:
-    /// `bail_ip == NO_BAIL` means a normal return with `result_bits`; otherwise
-    /// the interpreter must resume at `bail_ip` (result_bits is meaningless).
+    /// Raw native entry pointer (for self-recursive calls that re-enter the
+    /// same code through the win64 trampoline).
+    pub fn entry(&self) -> *const u8 {
+        self.entry
+    }
+
+    /// Run the native code over `regs`. ABI: `(regs, bail_ip, vm) -> result`.
+    /// Returns `(result_bits, bail_ip)`: `bail_ip == NO_BAIL` means a normal
+    /// return with `result_bits`; otherwise the interpreter must resume at
+    /// `bail_ip` (result_bits is meaningless).
     ///
     /// # Safety
     /// `regs` must point to at least the function's `reg_count` valid `Value`
-    /// slots; the buffer must outlive the call (it does — held in `self`).
-    pub unsafe fn run(&self, regs: *mut u64) -> (u64, u32) {
-        let f: extern "win64" fn(*mut u64, *mut u32) -> u64 = mem::transmute(self.entry);
+    /// slots; `vm` must be a valid `*mut Vm`; the buffer outlives the call.
+    pub unsafe fn run(&self, regs: *mut u64, vm: *mut core::ffi::c_void) -> (u64, u32) {
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            mem::transmute(self.entry);
         let mut bail: u32 = NO_BAIL;
-        let r = f(regs, &mut bail as *mut u32);
+        let r = f(regs, &mut bail as *mut u32, vm);
         (r, bail)
     }
 }
@@ -112,11 +120,19 @@ impl Jit {
 
     /// Attempt to compile `proto` (id `func_id`). On success it becomes
     /// available via `get`; on failure the id is blacklisted and never retried.
-    pub fn compile(&mut self, func_id: u32, proto: &FuncProto) {
+    /// `self_call_helper` is the address of the depth-guarded Rust trampoline
+    /// the native code invokes for a self-recursive call (see vm.rs).
+    pub fn compile(
+        &mut self,
+        func_id: u32,
+        proto: &FuncProto,
+        self_call_helper: usize,
+        self_val_bits: u64,
+    ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
         }
-        match compile_proto(proto) {
+        match compile_proto(proto, func_id, self_call_helper, self_val_bits) {
             Some(f) => {
                 self.compiled.insert(func_id, f);
             }
@@ -129,11 +145,19 @@ impl Jit {
 
 /// Can this function be JIT-compiled in the current (leaf-int) subset? Rejects
 /// any op outside the integer subset and any call/heap/closure/throw op.
-fn can_compile(proto: &FuncProto) -> bool {
+///
+/// `self_slot` is this function's own `name_global` (if it is a hoisted
+/// top-level function). When present, the SELF-CALL pattern is allowed:
+/// `LoadGlobal(self_slot) -> r` immediately followed by `Call{callee=r}`. That
+/// lets a self-recursive integer function (fib) be compiled — the `LoadGlobal`
+/// of the own slot is a no-op marker (its value is only the call target, which
+/// the helper resolves), and the `Call` becomes a depth-guarded native recurse.
+fn can_compile(proto: &FuncProto, self_slot: Option<u16>) -> bool {
     if proto.code.is_empty() {
         return false;
     }
-    for instr in &proto.code {
+    let code = &proto.code;
+    for (ip, instr) in code.iter().enumerate() {
         match instr {
             Instr::LoadInt { .. }
             | Instr::Move { .. }
@@ -154,12 +178,58 @@ fn can_compile(proto: &FuncProto) -> bool {
             | Instr::JumpIfNotLe { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
-            // Everything else (LoadConst, globals, Div/Mod, heap, calls,
-            // closures, throw, print, …) is out of the subset for now.
+            // `LoadGlobal(self_slot)` is allowed only as the immediately-
+            // preceding callee load of a self `Call` (checked at the Call).
+            Instr::LoadGlobal { idx, .. } if Some(*idx as u16) == self_slot => {}
+            // A self-call: callee must be loaded from self_slot by the prior op.
+            Instr::Call { callee, .. } => {
+                if !is_self_call(code, ip, *callee, self_slot) {
+                    return false;
+                }
+            }
             _ => return false,
         }
     }
     true
+}
+
+/// Is the `Call` at `ip` (with callee register `callee`) a self-call — i.e. was
+/// `callee` produced by a `LoadGlobal(self_slot)` earlier with no intervening
+/// write to that register? Conservative: scans backward for the nearest writer.
+fn is_self_call(code: &[Instr], ip: usize, callee: u16, self_slot: Option<u16>) -> bool {
+    let self_slot = match self_slot {
+        Some(s) => s,
+        None => return false,
+    };
+    for j in (0..ip).rev() {
+        if let Some(w) = writes_reg(&code[j]) {
+            if w == callee {
+                return matches!(&code[j], Instr::LoadGlobal { idx, .. } if *idx as u16 == self_slot);
+            }
+        }
+    }
+    false
+}
+
+/// The destination register an instruction writes, if it writes exactly one.
+fn writes_reg(i: &Instr) -> Option<u16> {
+    match *i {
+        Instr::LoadInt { dst, .. }
+        | Instr::Move { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::Sub { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Lt { dst, .. }
+        | Instr::Le { dst, .. }
+        | Instr::Gt { dst, .. }
+        | Instr::Ge { dst, .. }
+        | Instr::Eq { dst, .. }
+        | Instr::Ne { dst, .. }
+        | Instr::LoadGlobal { dst, .. }
+        | Instr::Call { dst, .. } => Some(dst),
+        _ => None,
+    }
 }
 
 /// Win64 register plan (integer subset):
@@ -169,9 +239,23 @@ fn can_compile(proto: &FuncProto) -> bool {
 /// * `rax`, `r8`, `r9`, `r10`, `r11` = scratch (all volatile under win64, and
 ///   we make no calls, so no save needed).
 ///
-/// A register `Value` lives at `[rcx + reg*8]`.
-fn compile_proto(proto: &FuncProto) -> Option<JitFn> {
-    if !can_compile(proto) {
+/// Because a self-call invokes a Rust helper (which clobbers the volatile
+/// argument registers), the prologue moves the three inputs into NON-VOLATILE
+/// (callee-saved) registers that survive any helper call:
+/// * `rbx` = regs base pointer   (was rcx)
+/// * `rsi` = bail_ip out-pointer (was rdx)
+/// * `rdi` = vm pointer          (was r8)
+/// A register `Value` lives at `[rbx + reg*8]`. We push/pop rbx/rsi/rdi and keep
+/// the stack 16-byte aligned, reserving 32 bytes of shadow space for any helper
+/// call (win64 requires the caller to provide it).
+fn compile_proto(
+    proto: &FuncProto,
+    self_func_id: u32,
+    self_call_helper: usize,
+    self_val_bits: u64,
+) -> Option<JitFn> {
+    let self_slot = proto.name_global;
+    if !can_compile(proto, self_slot) {
         return None;
     }
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
@@ -180,6 +264,23 @@ fn compile_proto(proto: &FuncProto) -> Option<JitFn> {
     // `labels[n]` is the fall-off-the-end label (treated as ReturnUndefined).
     let n = proto.code.len();
     let labels: Vec<_> = (0..=n).map(|_| ops.new_dynamic_label()).collect();
+    // Shared epilogue: every Return/bail sets rax + [rsi] then jumps here, which
+    // restores the stack frame and callee-saved regs before `ret`.
+    let epilogue = ops.new_dynamic_label();
+
+    // ── prologue ── save callee-saved regs, stash the 3 inputs, reserve shadow.
+    // 3 pushes (24B) + sub 8 → 32B from a 16-aligned entry ⇒ 16-aligned, and
+    // gives 32B shadow space below for helper calls (we sub 0x28 = 40 to also
+    // hold the shadow region; 3 pushes + 40 = 64, 16-aligned).
+    dynasm!(ops
+        ; push rbx
+        ; push rsi
+        ; push rdi
+        ; sub rsp, 32
+        ; mov rbx, rcx        // regs base
+        ; mov rsi, rdx        // bail_ip ptr
+        ; mov rdi, r8         // vm ptr
+    );
 
     for (ip, instr) in proto.code.iter().enumerate() {
         let ipl = labels[ip];
@@ -194,19 +295,19 @@ fn compile_proto(proto: &FuncProto) -> Option<JitFn> {
                 let boxed = INT_TAG | (val as u32 as u64);
                 dynasm!(ops
                     ; mov rax, QWORD boxed as i64
-                    ; mov [rcx + dreg(dst)], rax
+                    ; mov [rbx + dreg(dst)], rax
                 );
             }
             Instr::Move { dst, src } => {
                 dynasm!(ops
-                    ; mov rax, [rcx + dreg(src)]
-                    ; mov [rcx + dreg(dst)], rax
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov [rbx + dreg(dst)], rax
                 );
             }
             Instr::AddInt { dst, a, imm } => {
                 guard_int(&mut ops, a, bail);
                 dynasm!(ops
-                    ; mov eax, [rcx + dreg(a)]    // low 32 bits = i32 payload
+                    ; mov eax, [rbx + dreg(a)]    // low 32 bits = i32 payload
                     ; add eax, imm
                     ; jo => bail
                 );
@@ -231,7 +332,7 @@ fn compile_proto(proto: &FuncProto) -> Option<JitFn> {
                 // bail (e.g. a double/heap cond needs the interpreter's truthy).
                 guard_int_or_bool(&mut ops, cond, bail);
                 dynasm!(ops
-                    ; mov eax, [rcx + dreg(cond)]
+                    ; mov eax, [rbx + dreg(cond)]
                     ; test eax, eax
                     ; jz => labels[target as usize]
                 );
@@ -240,7 +341,7 @@ fn compile_proto(proto: &FuncProto) -> Option<JitFn> {
             Instr::JumpIfTrue { cond, target } => {
                 guard_int_or_bool(&mut ops, cond, bail);
                 dynasm!(ops
-                    ; mov eax, [rcx + dreg(cond)]
+                    ; mov eax, [rbx + dreg(cond)]
                     ; test eax, eax
                     ; jnz => labels[target as usize]
                 );
@@ -252,29 +353,58 @@ fn compile_proto(proto: &FuncProto) -> Option<JitFn> {
             Instr::JumpIfNotLe { a, b, target } => {
                 jump_if_not_cmp(&mut ops, ip, bail, a, b, Cmp::Le, labels[target as usize]);
             }
+            Instr::LoadGlobal { dst, .. } => {
+                // Only reached for `LoadGlobal(self_slot)` (can_compile gated).
+                // Store the REAL self-function Value (embedded at compile time,
+                // stable since hoisting). This matters when a self-`Call` deopts
+                // to the interpreter: it resumes at the Call op and reads this
+                // register as the callee, which must be the actual function.
+                dynasm!(ops
+                    ; mov rax, QWORD self_val_bits as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::Call { dst, arg_base, argc, .. } => {
+                // Self-recursive call (can_compile verified callee == self_slot).
+                // Marshal args, call the depth-guarded Rust helper, store result.
+                emit_self_call(
+                    &mut ops, ip, bail, self_func_id, self_call_helper, dst, arg_base, argc,
+                );
+            }
             Instr::Return { src } => {
                 dynasm!(ops
-                    ; mov DWORD [rdx], NO_BAIL as i32   // bail_ip = NO_BAIL
-                    ; mov rax, [rcx + dreg(src)]        // result = regs[src]
-                    ; ret
+                    ; mov DWORD [rsi], NO_BAIL as i32   // bail_ip = NO_BAIL
+                    ; mov rax, [rbx + dreg(src)]        // result = regs[src]
+                    ; jmp => epilogue
                 );
             }
             Instr::ReturnUndefined => {
                 let undef = Value::UNDEFINED.bits();
                 dynasm!(ops
-                    ; mov DWORD [rdx], NO_BAIL as i32
+                    ; mov DWORD [rsi], NO_BAIL as i32
                     ; mov rax, QWORD undef as i64
-                    ; ret
+                    ; jmp => epilogue
                 );
             }
             _ => return None, // can_compile already filtered; defensive
         }
     }
-    // Falling off the end behaves like ReturnUndefined.
+    // Falling off the end behaves like ReturnUndefined (jumps to epilogue).
     dynasm!(ops
         ; => labels[n]
-        ; mov DWORD [rdx], NO_BAIL as i32
+        ; mov DWORD [rsi], NO_BAIL as i32
         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; jmp => epilogue
+    );
+
+    // ── epilogue ── undo the prologue and return (rax already holds the result
+    // or 0-for-bail; [rsi] already holds NO_BAIL or the bail ip).
+    dynasm!(ops
+        ; => epilogue
+        ; add rsp, 32
+        ; pop rdi
+        ; pop rsi
+        ; pop rbx
         ; ret
     );
 
@@ -305,16 +435,21 @@ fn dreg(r: u16) -> i32 {
     (r as i32) * 8
 }
 
-/// Emit this op's bail block at `bail`: skip it on the success path, then the
-/// block records `ip` into `[rdx]` and returns. Must be called once per op that
-/// has guards/overflow jumps to `bail`, placed after the op's success code.
+/// Emit this op's bail block at `bail`: the success path skips it; the block
+/// records `ip` into `[rsi]` (bail_ip), then performs the FULL epilogue
+/// (restore stack + callee-saved regs) and returns — a bare `ret` would leave
+/// the prologue's pushes/`sub rsp` on the stack and corrupt the caller.
 fn emit_bail(ops: &mut dynasmrt::x64::Assembler, ip: usize, bail: dynasmrt::DynamicLabel) {
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; jmp => done            // success path skips the bail block
         ; => bail
-        ; mov DWORD [rdx], ip as i32
+        ; mov DWORD [rsi], ip as i32
         ; xor rax, rax
+        ; add rsp, 32
+        ; pop rdi
+        ; pop rsi
+        ; pop rbx
         ; ret
         ; => done
     );
@@ -324,7 +459,7 @@ fn emit_bail(ops: &mut dynasmrt::x64::Assembler, ip: usize, bail: dynasmrt::Dyna
 /// high 16 bits and compares to `INT_TAG_HI`.
 fn guard_int(ops: &mut dynasmrt::x64::Assembler, r: u16, bail: dynasmrt::DynamicLabel) {
     dynasm!(ops
-        ; mov rax, [rcx + dreg(r)]
+        ; mov rax, [rbx + dreg(r)]
         ; shr rax, 48
         ; cmp eax, INT_TAG_HI as i32
         ; jne => bail
@@ -336,7 +471,7 @@ fn guard_int(ops: &mut dynasmrt::x64::Assembler, r: u16, bail: dynasmrt::Dynamic
 fn guard_int_or_bool(ops: &mut dynasmrt::x64::Assembler, r: u16, bail: dynasmrt::DynamicLabel) {
     let ok = ops.new_dynamic_label();
     dynasm!(ops
-        ; mov rax, [rcx + dreg(r)]
+        ; mov rax, [rbx + dreg(r)]
         ; shr rax, 48
         ; cmp eax, INT_TAG_HI as i32
         ; je => ok
@@ -352,7 +487,7 @@ fn box_eax(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
         ; mov r8, QWORD INT_TAG as i64
         ; mov eax, eax            // zero-extend i32 payload into rax
         ; or rax, r8
-        ; mov [rcx + dreg(dst)], rax
+        ; mov [rbx + dreg(dst)], rax
     );
 }
 
@@ -368,8 +503,8 @@ fn int_binop(
     guard_int(ops, a, bail);
     guard_int(ops, b, bail);
     dynasm!(ops
-        ; mov eax, [rcx + dreg(a)]
-        ; mov r9d, [rcx + dreg(b)]
+        ; mov eax, [rbx + dreg(a)]
+        ; mov r9d, [rbx + dreg(b)]
     );
     match op {
         BinOp::Add => dynasm!(ops ; add eax, r9d ; jo => bail),
@@ -394,8 +529,8 @@ fn int_cmp(
     guard_int(ops, b, bail);
     let bool_tag = INT_TAG + (1u64 << 48); // 0x7FFA…
     dynasm!(ops
-        ; mov eax, [rcx + dreg(a)]
-        ; mov r9d, [rcx + dreg(b)]
+        ; mov eax, [rbx + dreg(a)]
+        ; mov r9d, [rbx + dreg(b)]
         ; cmp eax, r9d
     );
     match cmp {
@@ -410,7 +545,7 @@ fn int_cmp(
         ; movzx rax, al
         ; mov r8, QWORD bool_tag as i64
         ; or rax, r8
-        ; mov [rcx + dreg(dst)], rax
+        ; mov [rbx + dreg(dst)], rax
     );
     emit_bail(ops, ip, bail);
 }
@@ -428,8 +563,8 @@ fn jump_if_not_cmp(
     guard_int(ops, a, bail);
     guard_int(ops, b, bail);
     dynasm!(ops
-        ; mov eax, [rcx + dreg(a)]
-        ; mov r9d, [rcx + dreg(b)]
+        ; mov eax, [rbx + dreg(a)]
+        ; mov r9d, [rbx + dreg(b)]
         ; cmp eax, r9d
     );
     // Jump to target when the comparison is FALSE.
@@ -438,5 +573,47 @@ fn jump_if_not_cmp(
         Cmp::Le => dynasm!(ops ; jg => target),   // !(a<=b) ⇔ a>b
         _ => {}
     }
+    emit_bail(ops, ip, bail);
+}
+
+/// DEOPT sentinel the self-call helper returns when it can't run the recursion
+/// natively (depth limit, non-int arg, or callee not int-JIT'd). On seeing it,
+/// the native code bails to the interpreter at this Call's ip so the call is
+/// retried through the normal interpreter path. Chosen as a quiet-NaN tag value
+/// no real `Value` produces (it is NOT a valid boxed Value).
+pub const SELF_CALL_DEOPT: u64 = 0x7FFE_DEAD_BEEF_0000;
+
+/// Emit a self-recursive call: `regs[dst] = self(regs[arg_base..arg_base+argc])`.
+///
+/// The args already sit contiguously in this frame's register window (the
+/// compiler stages them there), so we pass `args_ptr = rbx + arg_base*8`
+/// directly — no marshaling. Win64 call: rcx=vm, rdx=func_id, r8=args_ptr,
+/// r9=argc. The helper (vm.rs `jit_self_call`) does the depth-guarded recursion
+/// and returns the result Value bits, or `SELF_CALL_DEOPT` to bail. rbx/rsi/rdi
+/// are callee-saved so they survive the call; 32B shadow space was reserved in
+/// the prologue (rsp stays 16-aligned: prologue did 3 pushes + sub 40 = 64B).
+fn emit_self_call(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    func_id: u32,
+    helper: usize,
+    dst: u16,
+    arg_base: u16,
+    argc: u16,
+) {
+    dynasm!(ops
+        ; mov rcx, rdi                       // vm
+        ; mov edx, func_id as i32            // func_id
+        ; lea r8, [rbx + dreg(arg_base)]     // args_ptr (in the reg window)
+        ; mov r9d, argc as i32               // argc
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        // rax = result bits OR SELF_CALL_DEOPT. Compare against the sentinel.
+        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, r10
+        ; je => bail
+        ; mov [rbx + dreg(dst)], rax
+    );
     emit_bail(ops, ip, bail);
 }
