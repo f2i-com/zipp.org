@@ -913,6 +913,21 @@ impl Interp {
         let JsValue::Object(o) = obj else {
             return Ok(()); // writing a property on a primitive is a no-op in sloppy mode
         };
+        // Fast path: overwriting an existing own data property of a non-array
+        // object that has no own accessor for `key`. An own data property shadows
+        // any inherited setter (OrdinarySetWithOwnDescriptor), so this is
+        // spec-correct and skips the find_accessor prototype-chain walk on the
+        // very common re-assignment case (e.g. `o.x = …` in a loop).
+        {
+            let mut b = o.borrow_mut();
+            if !matches!(b.data, ObjData::Array(_))
+                && !b.accessors.contains_key(key)
+                && b.props.contains_key(key)
+            {
+                b.set(key, v);
+                return Ok(());
+            }
+        }
         // A setter accessor on the object or its chain intercepts the write.
         if let Some(acc) = self.find_accessor(o, key) {
             if let Some(s) = acc.set {
