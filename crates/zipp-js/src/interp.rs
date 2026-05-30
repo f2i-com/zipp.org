@@ -699,7 +699,11 @@ impl Interp {
                 let act = Scope::child(&closure);
                 if !def.is_arrow {
                     act.borrow_mut().declare("this", this.clone());
-                    act.borrow_mut().declare("arguments", JsValue::Object(Object::array(args.to_vec())));
+                    // Only materialize the `arguments` array when the body uses
+                    // it (most calls don't) — skips a Vec+Rc+RefCell per call.
+                    if def.uses_arguments {
+                        act.borrow_mut().declare("arguments", JsValue::Object(Object::array(args.to_vec())));
+                    }
                 }
                 for (i, p) in def.params.iter().enumerate() {
                     // A default value applies when the argument is missing OR

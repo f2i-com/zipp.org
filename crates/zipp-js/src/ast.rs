@@ -270,6 +270,12 @@ pub struct FuncDef {
     /// Arrow functions inherit `this` lexically; regular functions bind it per
     /// call. (An arrow with an expression body is lowered to `[Return(expr)]`.)
     pub is_arrow: bool,
+    /// Whether the body references `arguments` (incl. nested arrows, which share
+    /// the enclosing function's `arguments`). When false, the call path skips
+    /// materializing the `arguments` array — a big win for hot calls. Computed
+    /// once at lower time; conservative — a false positive only keeps the eager
+    /// allocation, never changing behavior.
+    pub uses_arguments: bool,
 }
 
 /// A class lowered to: a constructor function (instance field initializers

@@ -370,12 +370,14 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
         Some(fd) => {
             let mut body = field_inits;
             body.extend(fd.body.iter().cloned());
+            let uses_arguments = body_uses_arguments(&body);
             Rc::new(FuncDef {
                 name: Some(name.clone()),
                 params: fd.params,
                 rest: fd.rest,
                 body,
                 is_arrow: false,
+                uses_arguments,
             })
         }
         None => {
@@ -389,12 +391,14 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
                 }));
             }
             body.extend(field_inits);
+            let uses_arguments = body_uses_arguments(&body);
             Rc::new(FuncDef {
                 name: Some(name.clone()),
                 params: Vec::new(),
                 rest: None,
                 body,
                 is_arrow: false,
+                uses_arguments,
             })
         }
     };
@@ -409,18 +413,30 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
     })))
 }
 
+/// Does this (already-lowered) body reference the `arguments` object? Detected
+/// via the Debug form of the owned AST: an identifier read lowers to
+/// `Expr::Ident(String)`, whose Debug is `Ident("arguments")` — distinct from a
+/// property name or a string literal (those are `Str(...)`). Nested function /
+/// arrow bodies are included (arrows share the enclosing `arguments`). Heuristic
+/// and conservative: a false positive only keeps the eager allocation.
+fn body_uses_arguments(body: &[Stmt]) -> bool {
+    format!("{body:?}").contains("Ident(\"arguments\")")
+}
+
 fn func_def(f: &ox::Function) -> R<FuncDef> {
     let body = match &f.body {
         Some(b) => fn_body(b)?,
         None => Vec::new(),
     };
     let (params, rest) = params_of(&f.params)?;
+    let uses_arguments = body_uses_arguments(&body);
     Ok(FuncDef {
         name: f.id.as_ref().map(|i| i.name.to_string()),
         params,
         rest,
         body,
         is_arrow: false,
+        uses_arguments,
     })
 }
 
@@ -446,7 +462,9 @@ fn arrow_def(a: &ox::ArrowFunctionExpression) -> R<FuncDef> {
         fn_body(&a.body)?
     };
     let (params, rest) = params_of(&a.params)?;
-    Ok(FuncDef { name: None, params, rest, body, is_arrow: true })
+    // An arrow has no `arguments` of its own (it uses the enclosing function's),
+    // so this flag is unused for arrows; the call path skips it via `is_arrow`.
+    Ok(FuncDef { name: None, params, rest, body, is_arrow: true, uses_arguments: false })
 }
 
 // ───────────────────────── expressions ─────────────────────────

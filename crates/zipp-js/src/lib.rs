@@ -199,6 +199,17 @@ mod tests {
     }
 
     #[test]
+    fn arguments_object() {
+        // explicit `arguments` use must still materialize the object
+        assert_eq!(out("function sum(){let s=0;for(let i=0;i<arguments.length;i++)s+=arguments[i];return s} console.log(sum(1,2,3,4))"), "10");
+        assert_eq!(out("function argc(){return arguments.length} console.log(argc(), argc(1), argc(1,2,3))"), "0 1 3");
+        // an arrow uses the enclosing function's `arguments`
+        assert_eq!(out("function outer(){const f=()=>arguments[0]+arguments[1];return f()} console.log(outer(10,20))"), "30");
+        // a derived class's synthesized ctor forwards super(...arguments)
+        assert_eq!(out("class A{constructor(x,y){this.v=x+y}} class B extends A{} console.log(new B(3,4).v)"), "7");
+    }
+
+    #[test]
     fn well_known_constructors() {
         // ({}).constructor / [].constructor resolve to Object / Array (BUG22)
         assert_eq!(out("console.log(({}).constructor === Object, ({}).constructor.name)"), "true Object");
