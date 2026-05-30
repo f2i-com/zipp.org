@@ -703,8 +703,9 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                 .ok_or_else(|| format!("type error: no function type interned for '{name}'"))?;
             Ok(Type::Func(id as u32))
         }
-        // A closure: drop the captured leading params to recover the function's
-        // (explicit) value type, after checking each capture matches its param.
+        // A closure: the lifted function's first parameter is an env struct whose
+        // fields are exactly the captures; the explicit (caller-visible) value type
+        // is the remaining parameters. Check each capture against its env field.
         Expr::MakeClosure { name, captures } => {
             let sig = cx
                 .sigs
@@ -712,23 +713,27 @@ fn type_of(e: &Expr, scope: &Scope, cx: &Cx) -> Result<Type, String> {
                 .ok_or_else(|| format!("type error: closure target '{name}' is not a function"))?;
             let params = sig.params.clone();
             let ret = sig.ret;
-            if captures.len() > params.len() {
+            let Some(Type::Struct(env_id)) = params.first().copied() else {
+                return Err(format!("type error: closure '{name}' has no env parameter"));
+            };
+            let env_fields = &cx.structs[env_id as usize].fields;
+            if captures.len() != env_fields.len() {
                 return Err(format!(
-                    "type error: closure '{name}' has {} captures but only {} parameters",
+                    "type error: closure '{name}' captures {} value(s) but its env has {} field(s)",
                     captures.len(),
-                    params.len()
+                    env_fields.len()
                 ));
             }
             for (i, c) in captures.iter().enumerate() {
                 let ct = type_of(c, scope, cx)?;
-                if !assignable(ct, params[i]) {
+                let fty = env_fields[i].1;
+                if !assignable(ct, fty) {
                     return Err(format!(
-                        "type error: closure capture {i} expects {:?}, found {ct:?}",
-                        params[i]
+                        "type error: closure capture {i} expects {fty:?}, found {ct:?}"
                     ));
                 }
             }
-            let explicit = &params[captures.len()..];
+            let explicit = &params[1..];
             let id = cx
                 .func_types
                 .iter()

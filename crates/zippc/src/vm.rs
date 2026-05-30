@@ -299,24 +299,31 @@ pub fn run(prog: &Program, record_trace: bool) -> Result<RunResult, String> {
                 if record_trace {
                     return Err(ZK_NO_FUNC.into());
                 }
-                // A closure prepends its captured environment to the call args;
-                // a bare function value has no captures.
+                // Env-as-struct ABI: a capturing closure passes its env struct as
+                // the single leading argument (the lifted function unpacks captures
+                // from it); a bare function value has no env (plain signature).
                 let (f, env_opt) = match reg[base + *callee as usize] {
                     Value::Func(i) => (i, None),
                     Value::Closure { func, env } => (func, Some(env)),
                     _ => return Err("runtime error: called a non-function value".into()),
                 };
-                let ncaps = env_opt.map_or(0, |e| heap[e].len());
                 let callee_fn = &prog.funcs[f as usize];
                 let new_base = reg.len();
                 reg.resize(new_base + callee_fn.nregs as usize, Value::I64(0));
-                if let Some(e) = env_opt {
-                    for i in 0..ncaps {
-                        reg[new_base + i] = heap[e][i];
-                    }
-                }
+                let nlead = if let Some(e) = env_opt {
+                    // wrap the captures block as its env struct so GetField in the
+                    // lifted body resolves each capture by name
+                    let env_id = match callee_fn.params.first() {
+                        Some(Type::Struct(id)) => *id,
+                        _ => return Err("runtime error: closure has no env parameter".into()),
+                    };
+                    reg[new_base] = Value::Struct { id: env_id, ptr: e };
+                    1
+                } else {
+                    0
+                };
                 for i in 0..*argc as usize {
-                    reg[new_base + ncaps + i] = reg[base + *arg_base as usize + i];
+                    reg[new_base + nlead + i] = reg[base + *arg_base as usize + i];
                 }
                 call_stack.push(Frame { ret_pc: pc, base, dst: *dst });
                 base = new_base;

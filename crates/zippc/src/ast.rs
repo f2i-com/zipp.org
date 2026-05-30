@@ -232,9 +232,12 @@ pub enum Expr {
     /// is the corresponding `Type::Func`.
     FuncRef(String),
     /// A closure: a lifted function plus the values it captures. The lifted
-    /// function takes the captures as its leading parameters; `captures` are the
-    /// expressions (evaluated in the enclosing scope) that supply them. Its type
-    /// is the `Func` type of the *remaining* (explicit) parameters.
+    /// function takes one leading `__env` parameter — a synthesized struct whose
+    /// fields are the captures — and opens by unpacking each capture into a local;
+    /// `captures` are the expressions (evaluated in the enclosing scope) that
+    /// build that env. Its value type is the `Func` type of the *remaining*
+    /// (explicit) parameters. This env-pointer ABI is uniform across closures so
+    /// the native backends can build the indirect call without seeing captures.
     MakeClosure { name: String, captures: Vec<Expr> },
     /// An indirect call through a function value `f(args)` (where `f` has a
     /// `Type::Func`). Distinguished from `Call` (a direct, statically-named call).

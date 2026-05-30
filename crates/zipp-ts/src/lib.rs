@@ -1146,30 +1146,61 @@ impl Lower<'_> {
             })?,
         };
         self.pop_scope();
-        // Lifted signature: captures first, then the explicit params.
-        let mut lifted_params: Vec<z::Param> =
-            captures.iter().map(|(n, t)| z::Param { name: n.clone(), ty: *t }).collect();
-        lifted_params.extend(explicit.iter().cloned());
         let id = self.next_lambda.get();
         self.next_lambda.set(id + 1);
         let name = format!("__lambda{id}");
         let line = self.line(a.span);
         // The closure's *value* type is the explicit signature (captures are bound).
         let fty = self.intern_func_type(explicit.iter().map(|p| p.ty).collect(), ret);
-        self.lambdas.borrow_mut().push(z::Func {
-            name: name.clone(),
-            params: lifted_params,
-            ret,
-            body: vec![z::Stmt { kind: z::StmtKind::Return(Some(body)), line }],
-        });
-        self.fn_rets.borrow_mut().insert(name.clone(), ret);
-        self.fn_value_types.borrow_mut().insert(name.clone(), fty);
-        if captures.is_empty() {
-            Ok(z::Expr::FuncRef(name))
+        let result = if captures.is_empty() {
+            // Non-capturing → a plain lifted function, referenced directly.
+            self.lambdas.borrow_mut().push(z::Func {
+                name: name.clone(),
+                params: explicit,
+                ret,
+                body: vec![z::Stmt { kind: z::StmtKind::Return(Some(body)), line }],
+            });
+            z::Expr::FuncRef(name.clone())
         } else {
+            // Capturing → env-as-struct: the lifted function takes one `__env`
+            // parameter (a synthesized struct of the captures) and opens by
+            // unpacking each capture into a local of its original name, so the body
+            // is unchanged. This gives every closure ONE uniform calling
+            // convention (env pointer + explicit args) — the form the native
+            // backends need (a call site can't see heterogeneous captures).
+            let env_id = self.add_struct(z::StructDecl {
+                name: format!("__Env_{name}"),
+                fields: captures.clone(),
+            });
+            let mut lifted_params = vec![z::Param { name: "__env".into(), ty: z::Type::Struct(env_id) }];
+            lifted_params.extend(explicit.iter().cloned());
+            let mut lifted_body: Vec<z::Stmt> = captures
+                .iter()
+                .map(|(cn, _)| z::Stmt {
+                    kind: z::StmtKind::Let {
+                        name: cn.clone(),
+                        ty: None,
+                        value: z::Expr::Field {
+                            base: Box::new(z::Expr::Var("__env".into())),
+                            field: cn.clone(),
+                        },
+                    },
+                    line,
+                })
+                .collect();
+            lifted_body.push(z::Stmt { kind: z::StmtKind::Return(Some(body)), line });
+            self.lambdas.borrow_mut().push(z::Func {
+                name: name.clone(),
+                params: lifted_params,
+                ret,
+                body: lifted_body,
+            });
             let cap_exprs = captures.into_iter().map(|(n, _)| z::Expr::Var(n)).collect();
-            Ok(z::Expr::MakeClosure { name, captures: cap_exprs })
-        }
+            z::Expr::MakeClosure { name: name.clone(), captures: cap_exprs }
+        };
+        self.fn_rets.borrow_mut().insert(name.clone(), ret);
+        self.fn_value_types.borrow_mut().insert(name, fty);
+        Ok(result)
     }
 
     /// Captured enclosing locals referenced in `body` (deduped, first-appearance
