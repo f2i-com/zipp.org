@@ -321,24 +321,54 @@ impl JsValue {
 }
 
 /// JS number → string (integers without a decimal, `Infinity`/`NaN`, etc.).
+/// JS `Number.prototype.toString()` (base 10) — the ECMAScript Number::toString
+/// algorithm. Rust's `{:e}` gives the shortest round-trip mantissa+exponent
+/// (`d[.ddd]eEXP`, value = mantissa × 10^EXP), which supplies the spec's digit
+/// string `s` (k digits) and decimal-point position `point = EXP + 1`.
 pub fn num_to_string(n: f64) -> String {
     if n.is_nan() {
-        "NaN".into()
-    } else if n.is_infinite() {
-        if n < 0.0 {
-            "-Infinity".into()
-        } else {
-            "Infinity".into()
-        }
-    } else if n == 0.0 {
-        "0".into() // also handles -0 → "0"
-    } else if n.fract() == 0.0 && n.abs() < 1e21 {
-        format!("{}", n as i64)
+        return "NaN".into();
+    }
+    if n == 0.0 {
+        return "0".into(); // also handles -0 → "0"
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Infinity".into() } else { "Infinity".into() };
+    }
+    let neg = n < 0.0;
+    let m = n.abs();
+    let e = format!("{m:e}"); // e.g. "1e21", "1.5e-10", "2.555e2"
+    let (mant, exp_str) = e.split_once('e').expect("{:e} always contains 'e'");
+    let exp: i32 = exp_str.parse().expect("valid exponent from {:e}");
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let s = digits.as_str();
+    let k = s.len() as i32; // number of significant digits
+    let point = exp + 1; // spec `n`: digit-string position of the decimal point
+
+    let body = if k <= point && point <= 21 {
+        // integer, possibly with trailing zeros: e.g. 1e20 → "1" + 20 zeros
+        format!("{}{}", s, "0".repeat((point - k) as usize))
+    } else if 0 < point && point <= 21 {
+        // decimal point falls inside the digits: e.g. 255.5 → "255" "." "5"
+        format!("{}.{}", &s[..point as usize], &s[point as usize..])
+    } else if -6 < point && point <= 0 {
+        // small fraction: e.g. 0.001 → "0." + 2 zeros + "1"
+        format!("0.{}{}", "0".repeat((-point) as usize), s)
     } else {
-        // Rust's default float formatting matches JS for most non-integers; exact
-        // ECMAScript Number::toString (shortest round-trip) is a later refinement.
-        let s = format!("{n}");
-        s
+        // exponential: d[.rest]e±(point-1)
+        let exp_part = point - 1;
+        let sign = if exp_part >= 0 { "+" } else { "-" };
+        let mag = exp_part.unsigned_abs();
+        if k == 1 {
+            format!("{s}e{sign}{mag}")
+        } else {
+            format!("{}.{}e{sign}{mag}", &s[..1], &s[1..])
+        }
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
     }
 }
 

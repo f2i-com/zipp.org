@@ -92,6 +92,28 @@ mod tests {
     }
 
     #[test]
+    fn number_formatting() {
+        // ECMAScript Number::toString — exponential thresholds + no i64 overflow.
+        assert_eq!(out("console.log(1e21)"), "1e+21");
+        assert_eq!(out("console.log(1e-7)"), "1e-7");
+        assert_eq!(out("console.log(1e-6)"), "0.000001");
+        assert_eq!(out("console.log(1e30)"), "1e+30");
+        assert_eq!(out("console.log(1.5e-10)"), "1.5e-10");
+        assert_eq!(out("console.log(1e100)"), "1e+100");
+        // large integers must NOT saturate to i64::MAX
+        assert_eq!(out("console.log(100000000000000000000)"), "100000000000000000000");
+        assert_eq!(out("console.log(1234567890123456789012345)"), "1.2345678901234568e+24");
+        // ordinary values
+        assert_eq!(out("console.log(255.5)"), "255.5");
+        assert_eq!(out("console.log(0.1)"), "0.1");
+        assert_eq!(out("console.log(1000000)"), "1000000");
+        assert_eq!(out("console.log(-1234.5678)"), "-1234.5678");
+        assert_eq!(out("console.log(-0)"), "0");
+        assert_eq!(out("console.log(123.456)"), "123.456");
+        assert_eq!(out("console.log(-1e-21)"), "-1e-21");
+    }
+
+    #[test]
     fn arithmetic_and_coercion() {
         assert_eq!(out("console.log(1 + 2 * 3)"), "7");
         assert_eq!(out("console.log(10 / 4)"), "2.5");
