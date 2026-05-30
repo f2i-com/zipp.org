@@ -97,6 +97,29 @@ pub fn install(it: &Interp) {
         o.set("entries", nf("entries", obj_entries));
         o.set("assign", nf("assign", obj_assign));
         o.set("freeze", nf("freeze", |_, _, a| Ok(a.first().cloned().unwrap_or(JsValue::Undefined))));
+        // Object.is — SameValue: like === but NaN equals NaN and +0 differs from -0.
+        o.set("is", nf("is", |_, _, a| {
+            let x = a.first().unwrap_or(&JsValue::Undefined);
+            let y = a.get(1).unwrap_or(&JsValue::Undefined);
+            let same = match (x, y) {
+                (JsValue::Num(p), JsValue::Num(q)) => {
+                    if p.is_nan() || q.is_nan() {
+                        p.is_nan() && q.is_nan()
+                    } else if *p == 0.0 && *q == 0.0 {
+                        p.is_sign_negative() == q.is_sign_negative()
+                    } else {
+                        p == q
+                    }
+                }
+                (JsValue::Undefined, JsValue::Undefined) => true,
+                (JsValue::Null, JsValue::Null) => true,
+                (JsValue::Bool(p), JsValue::Bool(q)) => p == q,
+                (JsValue::Str(p), JsValue::Str(q)) => p == q,
+                (JsValue::Object(p), JsValue::Object(q)) => std::rc::Rc::ptr_eq(p, q),
+                _ => false,
+            };
+            Ok(JsValue::Bool(same))
+        }));
         o.set("create", nf("create", |_, _, _| Ok(JsValue::Object(Object::plain()))));
     }
     decl("Object", JsValue::Object(object));

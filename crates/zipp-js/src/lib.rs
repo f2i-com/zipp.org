@@ -166,6 +166,15 @@ mod tests {
     }
 
     #[test]
+    fn object_is() {
+        // SameValue: NaN==NaN, +0!=-0, otherwise like ===
+        assert_eq!(out("console.log(Object.is(NaN, NaN), Object.is(0, -0), Object.is(-0, -0))"), "true false true");
+        assert_eq!(out("console.log(Object.is('a','a'), Object.is(1,1), Object.is(1,'1'))"), "true true false");
+        assert_eq!(out("var o={}; console.log(Object.is(o,o), Object.is({},{}))"), "true false");
+        assert_eq!(out("console.log(Object.is(null,null), Object.is(null,undefined), Object.is())"), "true false true");
+    }
+
+    #[test]
     fn arithmetic_and_coercion() {
         assert_eq!(out("console.log(1 + 2 * 3)"), "7");
         assert_eq!(out("console.log(10 / 4)"), "2.5");
