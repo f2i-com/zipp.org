@@ -30,6 +30,12 @@ pub struct Interp {
     /// so engine-thrown errors and `new TypeError()` share one prototype chain
     /// (making `e instanceof Error` work). Populated by `builtins::install`.
     pub error_protos: RefCell<std::collections::HashMap<String, Obj>>,
+    /// `Object.prototype` — fallback proto for plain object literals so
+    /// `({}).constructor === Object`. Populated by `builtins::install`.
+    pub object_proto: RefCell<Option<Obj>>,
+    /// `Array.prototype` — fallback proto for array literals so
+    /// `[].constructor === Array`. Populated by `builtins::install`.
+    pub array_proto: RefCell<Option<Obj>>,
 }
 
 impl Default for Interp {
@@ -44,6 +50,8 @@ impl Interp {
             global: Scope::global(),
             out: RefCell::new(Vec::new()),
             error_protos: RefCell::new(std::collections::HashMap::new()),
+            object_proto: RefCell::new(None),
+            array_proto: RefCell::new(None),
         };
         crate::builtins::install(&it);
         it
@@ -777,6 +785,12 @@ impl Interp {
                         if let Some(f) = crate::methods::array_method(key) {
                             return Ok(native(key, f));
                         }
+                        // fall back to the well-known Array.prototype (e.g. `constructor`)
+                        if let Some(p) = self.array_proto.borrow().as_ref() {
+                            if let Some(v) = p.borrow().props.get(key) {
+                                return Ok(v.clone());
+                            }
+                        }
                         return Ok(JsValue::Undefined);
                     }
                     if let Some(v) = b.props.get(key) {
@@ -823,6 +837,15 @@ impl Interp {
                             return Ok(JsValue::Num(len));
                         }
                         _ => {}
+                    }
+                }
+                // plain object literals have no own proto chain — fall back to the
+                // well-known Object.prototype (e.g. `({}).constructor === Object`)
+                if !is_fn {
+                    if let Some(p) = self.object_proto.borrow().as_ref() {
+                        if let Some(v) = p.borrow().props.get(key) {
+                            return Ok(v.clone());
+                        }
                     }
                 }
                 Ok(JsValue::Undefined)

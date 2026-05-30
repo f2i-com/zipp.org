@@ -122,6 +122,12 @@ pub fn install(it: &Interp) {
         }));
         o.set("create", nf("create", |_, _, _| Ok(JsValue::Object(Object::plain()))));
     }
+    // Object.prototype — the well-known proto for plain objects, with a
+    // non-enumerable `constructor` back-link so `({}).constructor === Object`.
+    let object_proto = Object::plain();
+    object_proto.borrow_mut().set_hidden("constructor", JsValue::Object(object.clone()));
+    object.borrow_mut().set("prototype", JsValue::Object(object_proto.clone()));
+    *it.object_proto.borrow_mut() = Some(object_proto);
     decl("Object", JsValue::Object(object));
 
     // Array (static methods)
@@ -132,6 +138,12 @@ pub fn install(it: &Interp) {
         a.set("from", nf("from", array_from));
         a.set("of", nf("of", |_, _, a| Ok(JsValue::Object(Object::array(a.to_vec())))));
     }
+    // Array.prototype — the well-known proto for arrays, with a non-enumerable
+    // `constructor` back-link so `[].constructor === Array`.
+    let array_proto = Object::plain();
+    array_proto.borrow_mut().set_hidden("constructor", JsValue::Object(array.clone()));
+    array.borrow_mut().set("prototype", JsValue::Object(array_proto.clone()));
+    *it.array_proto.borrow_mut() = Some(array_proto);
     decl("Array", JsValue::Object(array));
 
     // Number (static)

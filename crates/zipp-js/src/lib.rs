@@ -199,6 +199,19 @@ mod tests {
     }
 
     #[test]
+    fn well_known_constructors() {
+        // ({}).constructor / [].constructor resolve to Object / Array (BUG22)
+        assert_eq!(out("console.log(({}).constructor === Object, ({}).constructor.name)"), "true Object");
+        assert_eq!(out("console.log([].constructor === Array, [].constructor.name)"), "true Array");
+        assert_eq!(out("console.log(({}).constructor.name, [].constructor.name)"), "Object Array");
+        // constructor stays non-enumerable: no leak into Object.keys / JSON / for-in
+        assert_eq!(out("console.log(Object.keys({a:1,b:2}).join(','), JSON.stringify({a:1}))"), "a,b {\"a\":1}");
+        assert_eq!(out("var k=[]; for(const x in {a:1}) k.push(x); console.log(JSON.stringify(k))"), "[\"a\"]");
+        // array methods / length / indexing unaffected
+        assert_eq!(out("console.log([1,2,3].map(x=>x*2).join(','), [1,2,3].indexOf(2), [1,2,3].length)"), "2,4,6 1 3");
+    }
+
+    #[test]
     fn error_constructor_and_fn_name() {
         // constructed error: .constructor identity + .name (BUG21)
         assert_eq!(out("const e=new TypeError('m'); console.log(e.constructor===TypeError, e.constructor.name, e.name, e instanceof Error)"), "true TypeError TypeError true");
