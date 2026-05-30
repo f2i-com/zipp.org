@@ -54,7 +54,15 @@ pub fn install(it: &Interp) {
         m.set("sign", nf("sign", |_, _, a| Ok(JsValue::Num(js_sign(n(a, 0))))));
         m.set("sqrt", nf("sqrt", |_, _, a| Ok(JsValue::Num(n(a, 0).sqrt()))));
         m.set("cbrt", nf("cbrt", |_, _, a| Ok(JsValue::Num(n(a, 0).cbrt()))));
-        m.set("pow", nf("pow", |_, _, a| Ok(JsValue::Num(n(a, 0).powf(n(a, 1))))));
+        m.set("pow", nf("pow", |_, _, a| {
+            let (base, exp) = (n(a, 0), n(a, 1));
+            // V8's Math.pow delegates to std::pow, where pow(1, y) == 1 for any
+            // y including NaN. Rust's powf returns NaN for 1.powf(NaN) on some
+            // platforms (e.g. Windows), so pin the base==1 case. (The `**`
+            // operator stays spec-correct -> NaN, matching V8.)
+            let r = if base == 1.0 { 1.0 } else { base.powf(exp) };
+            Ok(JsValue::Num(r))
+        }));
         m.set("exp", nf("exp", |_, _, a| Ok(JsValue::Num(n(a, 0).exp()))));
         m.set("log", nf("log", |_, _, a| Ok(JsValue::Num(n(a, 0).ln()))));
         m.set("log2", nf("log2", |_, _, a| Ok(JsValue::Num(n(a, 0).log2()))));
