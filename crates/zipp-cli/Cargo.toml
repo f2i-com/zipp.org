@@ -30,3 +30,4 @@ zipp-wasm = { path = "../zipp-wasm", optional = true }
 zipp-ts = { path = "../zipp-ts", optional = true }
 zipp-js = { path = "../zipp-js" }
 zipp-engine = { path = "../zipp-engine", features = ["djit"] }
+zipp-vm = { path = "../zipp-vm" }

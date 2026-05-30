@@ -1,0 +1,758 @@
+//! Compile the oxc AST directly to register bytecode.
+//!
+//! Two passes over the source:
+//!
+//! 1. **Hoist**: every top-level `function f(...)` and `var/let f = function`
+//!    name is assigned a global slot, so calls resolve regardless of textual
+//!    order (matching JS function hoisting) and recursion works.
+//! 2. **Emit**: each function body compiles to a `FuncProto`. Locals and
+//!    parameters live in registers, tracked by a `Scope` (name → register).
+//!    Expression results flow into caller-chosen destination registers, which
+//!    is what lets a value stay in one place across a basic block.
+//!
+//! The supported subset (v1): numbers/strings/bools/null, `let`/`const`/`var`,
+//! function declarations + calls + recursion, `if/else`, `while`, C-style
+//! `for`, `return`, the arithmetic/comparison/logical operators, and
+//! `console.log`. Anything else is a clear compile error — coverage grows over
+//! time, the same way the old engine did.
+
+use oxc_ast::ast as ox;
+
+use crate::bytecode::{FuncProto, Instr, Program, Reg};
+use crate::value::Value;
+use crate::vm::STRING_CONST_BIT;
+
+type R<T> = Result<T, String>;
+
+/// Compile a parsed program into bytecode.
+pub fn compile_program(prog: &ox::Program) -> R<Program> {
+    let mut c = Compiler::new();
+    c.compile(prog)?;
+    Ok(Program {
+        functions: c.functions,
+        global_count: c.globals.len() as u32,
+    })
+}
+
+struct Compiler {
+    functions: Vec<FuncProto>,
+    /// Global name → slot.
+    globals: Vec<String>,
+}
+
+impl Compiler {
+    fn new() -> Compiler {
+        Compiler { functions: Vec::new(), globals: Vec::new() }
+    }
+
+    fn global_slot(&mut self, name: &str) -> u16 {
+        if let Some(i) = self.globals.iter().position(|g| g == name) {
+            return i as u16;
+        }
+        let i = self.globals.len() as u16;
+        self.globals.push(name.to_string());
+        i
+    }
+
+    fn compile(&mut self, prog: &ox::Program) -> R<()> {
+        // Reserve function id 0 for the top-level script body; fill it last so
+        // nested function ids are stable as we discover them.
+        self.functions.push(placeholder("<script>"));
+
+        // Pass 1: hoist top-level function declaration names to globals.
+        for s in &prog.body {
+            if let ox::Statement::FunctionDeclaration(f) = s {
+                if let Some(id) = &f.id {
+                    self.global_slot(id.name.as_str());
+                }
+            }
+        }
+
+        // Compile the top-level body as function 0.
+        let top = self.compile_function_body(None, &[], &prog.body, true)?;
+        self.functions[0] = top;
+        Ok(())
+    }
+
+    /// Compile a function (or the script top-level when `is_script`).
+    /// `params` are parameter names; `body` are its statements.
+    fn compile_function_body(
+        &mut self,
+        name: Option<&str>,
+        params: &[String],
+        body: &[ox::Statement],
+        is_script: bool,
+    ) -> R<FuncProto> {
+        let mut fc = FnCompiler::new(self, params);
+
+        // Hoist nested function declarations within this body so calls resolve
+        // before their textual definition.
+        for s in body {
+            if let ox::Statement::FunctionDeclaration(f) = s {
+                if let Some(id) = &f.id {
+                    // Nested functions bind to a local register holding their
+                    // function object (created at block entry). For the script
+                    // top-level, function names are globals (already hoisted).
+                    if is_script {
+                        fc.cx.global_slot(id.name.as_str());
+                    } else {
+                        fc.declare_local(id.name.as_str());
+                    }
+                }
+            }
+        }
+
+        // Pre-compile nested functions (so their ids exist) and emit binding
+        // instructions in body order below.
+        for s in body {
+            fc.stmt(s)?;
+        }
+        fc.emit(Instr::ReturnUndefined);
+
+        let name_global = if is_script {
+            None
+        } else {
+            name.map(|n| fc.cx.global_slot(n))
+        };
+
+        Ok(FuncProto {
+            name: name.unwrap_or("<script>").to_string(),
+            code: fc.code,
+            reg_count: fc.max_reg,
+            param_count: params.len() as u16,
+            constants: fc.constants,
+            string_constants: fc.string_constants,
+            name_global,
+        })
+    }
+}
+
+fn placeholder(name: &str) -> FuncProto {
+    FuncProto {
+        name: name.to_string(),
+        code: Vec::new(),
+        reg_count: 0,
+        param_count: 0,
+        constants: Vec::new(),
+        string_constants: Vec::new(),
+        name_global: None,
+    }
+}
+
+/// Per-function compilation state.
+struct FnCompiler<'a> {
+    cx: &'a mut Compiler,
+    code: Vec<Instr>,
+    constants: Vec<Value>,
+    string_constants: Vec<String>,
+    /// Lexical scope chain: each entry is (name, register).
+    scopes: Vec<Vec<(String, Reg)>>,
+    /// Next free register / high-water mark.
+    next_reg: Reg,
+    max_reg: Reg,
+}
+
+impl<'a> FnCompiler<'a> {
+    fn new(cx: &'a mut Compiler, params: &[String]) -> FnCompiler<'a> {
+        let mut fc = FnCompiler {
+            cx,
+            code: Vec::new(),
+            constants: Vec::new(),
+            string_constants: Vec::new(),
+            scopes: vec![Vec::new()],
+            next_reg: 0,
+            max_reg: 0,
+        };
+        // Parameters occupy the first registers, in order.
+        for p in params {
+            let r = fc.alloc_reg();
+            fc.scopes[0].push((p.clone(), r));
+        }
+        fc
+    }
+
+    // ── register allocation ──
+    fn alloc_reg(&mut self) -> Reg {
+        let r = self.next_reg;
+        self.next_reg += 1;
+        if self.next_reg > self.max_reg {
+            self.max_reg = self.next_reg;
+        }
+        r
+    }
+    /// A scratch register that the caller will stop using immediately; we still
+    /// bump the high-water mark but let it be reused by resetting next_reg.
+    fn temp(&mut self) -> Reg {
+        self.alloc_reg()
+    }
+
+    fn emit(&mut self, i: Instr) {
+        self.code.push(i);
+    }
+    fn here(&self) -> u32 {
+        self.code.len() as u32
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(Vec::new());
+    }
+    fn pop_scope(&mut self) {
+        let scope = self.scopes.pop().unwrap();
+        // Free the registers the scope's locals used (block-local reuse).
+        self.next_reg -= scope.len() as Reg;
+    }
+
+    fn declare_local(&mut self, name: &str) -> Reg {
+        let r = self.alloc_reg();
+        self.scopes.last_mut().unwrap().push((name.to_string(), r));
+        r
+    }
+
+    /// Resolve a name to a (Local register) or a (Global slot).
+    fn resolve(&mut self, name: &str) -> Binding {
+        for scope in self.scopes.iter().rev() {
+            for (n, r) in scope.iter().rev() {
+                if n == name {
+                    return Binding::Local(*r);
+                }
+            }
+        }
+        if let Some(i) = self.cx.globals.iter().position(|g| g == name) {
+            return Binding::Global(i as u32);
+        }
+        // Unknown name → treat as a global (read yields undefined; matches JS
+        // for declared-later globals; genuine ReferenceErrors are out of v1
+        // scope). Reserve a slot so writes/reads are consistent.
+        let slot = self.cx.global_slot(name);
+        Binding::Global(slot as u32)
+    }
+
+    fn add_const(&mut self, v: Value) -> u32 {
+        let i = self.constants.len() as u32;
+        self.constants.push(v);
+        i
+    }
+    fn add_string_const(&mut self, s: &str) -> u32 {
+        let si = self.string_constants.len() as u32;
+        self.string_constants.push(s.to_string());
+        // Encode as a "pending string" heap Value the VM interns on first load.
+        let v = Value::heap(STRING_CONST_BIT | si);
+        self.add_const(v)
+    }
+
+    // ── statements ──
+    fn stmt(&mut self, s: &ox::Statement) -> R<()> {
+        use ox::Statement as S;
+        match s {
+            S::ExpressionStatement(e) => {
+                let r = self.expr(&e.expression)?;
+                let _ = r; // value discarded
+            }
+            S::VariableDeclaration(d) => self.var_decl(d)?,
+            S::BlockStatement(b) => {
+                self.push_scope();
+                for st in &b.body {
+                    self.stmt(st)?;
+                }
+                self.pop_scope();
+            }
+            S::IfStatement(i) => self.if_stmt(i)?,
+            S::WhileStatement(w) => self.while_stmt(w)?,
+            S::ForStatement(f) => self.for_stmt(f)?,
+            S::ReturnStatement(r) => {
+                if let Some(arg) = &r.argument {
+                    let v = self.expr(arg)?;
+                    self.emit(Instr::Return { src: v });
+                } else {
+                    self.emit(Instr::ReturnUndefined);
+                }
+            }
+            S::FunctionDeclaration(f) => self.func_decl(f)?,
+            S::EmptyStatement(_) => {}
+            _ => return Err("unsupported statement (not in the zipp-vm v1 subset yet)".into()),
+        }
+        Ok(())
+    }
+
+    fn var_decl(&mut self, d: &ox::VariableDeclaration) -> R<()> {
+        for decl in &d.declarations {
+            let name = match &decl.id {
+                ox::BindingPattern::BindingIdentifier(id) => id.name.as_str(),
+                _ => return Err("destructuring is not in the zipp-vm v1 subset yet".into()),
+            };
+            // Allocate the local FIRST so `let x = x`-style self-reference and
+            // ordinary declarations land in a stable register.
+            let reg = self.declare_local(name);
+            if let Some(init) = &decl.init {
+                let v = self.expr_into(init, reg)?;
+                if v != reg {
+                    self.emit(Instr::Move { dst: reg, src: v });
+                }
+            } else {
+                self.emit(Instr::LoadUndefined { dst: reg });
+            }
+        }
+        Ok(())
+    }
+
+    fn func_decl(&mut self, f: &ox::Function) -> R<()> {
+        let name = f.id.as_ref().map(|i| i.name.to_string());
+        let (params, body) = function_parts(f)?;
+        let proto =
+            self.cx
+                .compile_function_body(name.as_deref(), &params, body, false)?;
+        self.cx.functions.push(proto);
+        // Top-level function names are hoisted as globals and materialised by
+        // the VM at startup, so no binding instruction is needed here.
+        Ok(())
+    }
+
+    fn if_stmt(&mut self, i: &ox::IfStatement) -> R<()> {
+        let cond = self.expr(&i.test)?;
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond, target: 0 }); // patched
+        self.stmt(&i.consequent)?;
+        if let Some(alt) = &i.alternate {
+            let jmp = self.here();
+            self.emit(Instr::Jump { target: 0 }); // patched
+            let else_start = self.here();
+            self.patch_jump(jf, else_start);
+            self.stmt(alt)?;
+            let end = self.here();
+            self.patch_jump(jmp, end);
+        } else {
+            let end = self.here();
+            self.patch_jump(jf, end);
+        }
+        Ok(())
+    }
+
+    fn while_stmt(&mut self, w: &ox::WhileStatement) -> R<()> {
+        let top = self.here();
+        let cond = self.expr(&w.test)?;
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond, target: 0 });
+        self.stmt(&w.body)?;
+        self.emit(Instr::Jump { target: top });
+        let end = self.here();
+        self.patch_jump(jf, end);
+        Ok(())
+    }
+
+    fn for_stmt(&mut self, f: &ox::ForStatement) -> R<()> {
+        self.push_scope();
+        // init
+        if let Some(init) = &f.init {
+            match init {
+                ox::ForStatementInit::VariableDeclaration(d) => self.var_decl(d)?,
+                other => {
+                    let e = other
+                        .as_expression()
+                        .ok_or("unsupported for-init")?;
+                    self.expr(e)?;
+                }
+            }
+        }
+        let top = self.here();
+        let jf = match &f.test {
+            Some(t) => {
+                let cond = self.expr(t)?;
+                let j = self.here();
+                self.emit(Instr::JumpIfFalse { cond, target: 0 });
+                Some(j)
+            }
+            None => None,
+        };
+        self.stmt(&f.body)?;
+        if let Some(update) = &f.update {
+            self.expr(update)?;
+        }
+        self.emit(Instr::Jump { target: top });
+        let end = self.here();
+        if let Some(j) = jf {
+            self.patch_jump(j, end);
+        }
+        self.pop_scope();
+        Ok(())
+    }
+
+    fn patch_jump(&mut self, at: u32, target: u32) {
+        match &mut self.code[at as usize] {
+            Instr::Jump { target: t }
+            | Instr::JumpIfFalse { target: t, .. }
+            | Instr::JumpIfTrue { target: t, .. } => *t = target,
+            _ => panic!("patch_jump on non-jump"),
+        }
+    }
+
+    // ── expressions ──
+    /// Compile `e`, returning the register holding its value.
+    fn expr(&mut self, e: &ox::Expression) -> R<Reg> {
+        let dst = self.temp();
+        self.expr_into(e, dst)
+    }
+
+    /// Compile `e` placing its value into `dst` (or another register it already
+    /// occupies, which the caller may use directly). Returns the register that
+    /// actually holds the result.
+    fn expr_into(&mut self, e: &ox::Expression, dst: Reg) -> R<Reg> {
+        use ox::Expression as E;
+        match e {
+            E::NumericLiteral(n) => {
+                self.load_number(dst, n.value);
+                Ok(dst)
+            }
+            E::StringLiteral(s) => {
+                let idx = self.add_string_const(s.value.as_str());
+                self.emit(Instr::LoadConst { dst, idx });
+                Ok(dst)
+            }
+            E::BooleanLiteral(b) => {
+                self.emit(Instr::LoadBool { dst, val: b.value });
+                Ok(dst)
+            }
+            E::NullLiteral(_) => {
+                self.emit(Instr::LoadNull { dst });
+                Ok(dst)
+            }
+            E::Identifier(id) => {
+                if id.name == "undefined" {
+                    self.emit(Instr::LoadUndefined { dst });
+                    return Ok(dst);
+                }
+                match self.resolve(id.name.as_str()) {
+                    Binding::Local(r) => Ok(r), // already in a register
+                    Binding::Global(idx) => {
+                        self.emit(Instr::LoadGlobal { dst, idx });
+                        Ok(dst)
+                    }
+                }
+            }
+            E::ParenthesizedExpression(p) => self.expr_into(&p.expression, dst),
+            E::BinaryExpression(b) => self.binary(b, dst),
+            E::LogicalExpression(l) => self.logical(l, dst),
+            E::UnaryExpression(u) => self.unary(u, dst),
+            E::UpdateExpression(u) => self.update(u, dst),
+            E::AssignmentExpression(a) => self.assign(a, dst),
+            E::ConditionalExpression(c) => self.conditional(c, dst),
+            E::CallExpression(c) => self.call(c, dst),
+            _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
+        }
+    }
+
+    fn load_number(&mut self, dst: Reg, n: f64) {
+        if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+            self.emit(Instr::LoadInt { dst, val: n as i32 });
+        } else {
+            let idx = self.add_const(Value::num(n));
+            self.emit(Instr::LoadConst { dst, idx });
+        }
+    }
+
+    fn binary(&mut self, b: &ox::BinaryExpression, dst: Reg) -> R<Reg> {
+        use ox::BinaryOperator as Op;
+        // `a - <int literal>` and `a + <int literal>` → AddInt fast path, but
+        // ONLY when the left operand is provably numeric. `+` is overloaded for
+        // string concatenation, so `'n=' + 42` must NOT take the integer path
+        // (it would coerce the string to NaN). Subtraction is always numeric,
+        // so it's always eligible; addition is eligible only when `left` is a
+        // numeric literal or another arithmetic expression we just produced a
+        // number from. When unsure, fall through to the generic `Add`, which
+        // handles string concatenation correctly.
+        if let ox::Expression::NumericLiteral(n) = &b.right {
+            let imm_ok = n.value.fract() == 0.0
+                && n.value >= i32::MIN as f64
+                && n.value <= i32::MAX as f64;
+            let eligible = matches!(b.operator, Op::Subtraction)
+                || (matches!(b.operator, Op::Addition) && is_numeric_expr(&b.left));
+            if imm_ok && eligible {
+                let a = self.expr(&b.left)?;
+                let mut imm = n.value as i32;
+                if matches!(b.operator, Op::Subtraction) {
+                    imm = -imm;
+                }
+                self.emit(Instr::AddInt { dst, a, imm });
+                return Ok(dst);
+            }
+        }
+        let a = self.expr(&b.left)?;
+        let r = self.expr(&b.right)?;
+        let instr = match b.operator {
+            Op::Addition => Instr::Add { dst, a, b: r },
+            Op::Subtraction => Instr::Sub { dst, a, b: r },
+            Op::Multiplication => Instr::Mul { dst, a, b: r },
+            Op::Division => Instr::Div { dst, a, b: r },
+            Op::Remainder => Instr::Mod { dst, a, b: r },
+            Op::LessThan => Instr::Lt { dst, a, b: r },
+            Op::LessEqualThan => Instr::Le { dst, a, b: r },
+            Op::GreaterThan => Instr::Gt { dst, a, b: r },
+            Op::GreaterEqualThan => Instr::Ge { dst, a, b: r },
+            Op::StrictEquality => Instr::Eq { dst, a, b: r },
+            Op::StrictInequality => Instr::Ne { dst, a, b: r },
+            Op::Equality => Instr::Eq { dst, a, b: r }, // v1: == behaves like ===
+            Op::Inequality => Instr::Ne { dst, a, b: r },
+            _ => return Err("unsupported binary operator (zipp-vm v1)".into()),
+        };
+        self.emit(instr);
+        Ok(dst)
+    }
+
+    fn logical(&mut self, l: &ox::LogicalExpression, dst: Reg) -> R<Reg> {
+        use ox::LogicalOperator as Op;
+        // `a && b`: eval a into dst; if falsy, short-circuit; else eval b.
+        let _a = self.expr_into(&l.left, dst)?;
+        if _a != dst {
+            self.emit(Instr::Move { dst, src: _a });
+        }
+        match l.operator {
+            Op::And => {
+                let j = self.here();
+                self.emit(Instr::JumpIfFalse { cond: dst, target: 0 });
+                let b = self.expr_into(&l.right, dst)?;
+                if b != dst {
+                    self.emit(Instr::Move { dst, src: b });
+                }
+                let end = self.here();
+                self.patch_jump(j, end);
+            }
+            Op::Or => {
+                let j = self.here();
+                self.emit(Instr::JumpIfTrue { cond: dst, target: 0 });
+                let b = self.expr_into(&l.right, dst)?;
+                if b != dst {
+                    self.emit(Instr::Move { dst, src: b });
+                }
+                let end = self.here();
+                self.patch_jump(j, end);
+            }
+            Op::Coalesce => return Err("?? is not in the zipp-vm v1 subset yet".into()),
+        }
+        Ok(dst)
+    }
+
+    fn unary(&mut self, u: &ox::UnaryExpression, dst: Reg) -> R<Reg> {
+        use ox::UnaryOperator as Op;
+        match u.operator {
+            Op::UnaryNegation => {
+                let a = self.expr(&u.argument)?;
+                self.emit(Instr::Neg { dst, a });
+                Ok(dst)
+            }
+            Op::UnaryPlus => {
+                let a = self.expr_into(&u.argument, dst)?;
+                Ok(a)
+            }
+            Op::LogicalNot => {
+                let a = self.expr(&u.argument)?;
+                self.emit(Instr::Not { dst, a });
+                Ok(dst)
+            }
+            _ => Err("unsupported unary operator (zipp-vm v1)".into()),
+        }
+    }
+
+    fn update(&mut self, u: &ox::UpdateExpression, dst: Reg) -> R<Reg> {
+        // `x++` / `++x` / `x--` / `--x` on a simple identifier.
+        let name = match &u.argument {
+            ox::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
+            _ => return Err("update on non-identifier not in zipp-vm v1".into()),
+        };
+        let binding = self.resolve(&name);
+        let cur = match binding {
+            Binding::Local(r) => r,
+            Binding::Global(idx) => {
+                self.emit(Instr::LoadGlobal { dst, idx });
+                dst
+            }
+        };
+        let delta = match u.operator {
+            ox::UpdateOperator::Increment => 1,
+            ox::UpdateOperator::Decrement => -1,
+        };
+        if u.prefix {
+            // ++x: increment then yield new value.
+            self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta });
+            self.store_binding(&binding, cur);
+            if cur != dst {
+                self.emit(Instr::Move { dst, src: cur });
+            }
+            Ok(dst)
+        } else {
+            // x++: yield old value, then increment.
+            self.emit(Instr::Move { dst, src: cur });
+            self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta });
+            self.store_binding(&binding, cur);
+            Ok(dst)
+        }
+    }
+
+    fn store_binding(&mut self, b: &Binding, src: Reg) {
+        if let Binding::Global(idx) = b {
+            self.emit(Instr::StoreGlobal { idx: *idx, src });
+        }
+        // Local: already written in place.
+    }
+
+    fn assign(&mut self, a: &ox::AssignmentExpression, dst: Reg) -> R<Reg> {
+        use ox::AssignmentOperator as Op;
+        let name = match &a.left {
+            ox::AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
+            _ => return Err("assignment to non-identifier not in zipp-vm v1".into()),
+        };
+        let binding = self.resolve(&name);
+        match a.operator {
+            Op::Assign => {
+                let target = match binding {
+                    Binding::Local(r) => r,
+                    Binding::Global(_) => dst,
+                };
+                let v = self.expr_into(&a.right, target)?;
+                if v != target {
+                    self.emit(Instr::Move { dst: target, src: v });
+                }
+                self.store_binding(&binding, target);
+                if target != dst {
+                    self.emit(Instr::Move { dst, src: target });
+                }
+                Ok(dst)
+            }
+            Op::Addition | Op::Subtraction | Op::Multiplication => {
+                let cur = match binding {
+                    Binding::Local(r) => r,
+                    Binding::Global(idx) => {
+                        self.emit(Instr::LoadGlobal { dst, idx });
+                        dst
+                    }
+                };
+                let rhs = self.expr(&a.right)?;
+                let target = if let Binding::Local(r) = binding { r } else { dst };
+                let instr = match a.operator {
+                    Op::Addition => Instr::Add { dst: target, a: cur, b: rhs },
+                    Op::Subtraction => Instr::Sub { dst: target, a: cur, b: rhs },
+                    Op::Multiplication => Instr::Mul { dst: target, a: cur, b: rhs },
+                    _ => unreachable!(),
+                };
+                self.emit(instr);
+                self.store_binding(&binding, target);
+                if target != dst {
+                    self.emit(Instr::Move { dst, src: target });
+                }
+                Ok(dst)
+            }
+            _ => Err("unsupported assignment operator (zipp-vm v1)".into()),
+        }
+    }
+
+    fn conditional(&mut self, c: &ox::ConditionalExpression, dst: Reg) -> R<Reg> {
+        let cond = self.expr(&c.test)?;
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond, target: 0 });
+        let t = self.expr_into(&c.consequent, dst)?;
+        if t != dst {
+            self.emit(Instr::Move { dst, src: t });
+        }
+        let jmp = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let else_start = self.here();
+        self.patch_jump(jf, else_start);
+        let e = self.expr_into(&c.alternate, dst)?;
+        if e != dst {
+            self.emit(Instr::Move { dst, src: e });
+        }
+        let end = self.here();
+        self.patch_jump(jmp, end);
+        Ok(dst)
+    }
+
+    fn call(&mut self, c: &ox::CallExpression, dst: Reg) -> R<Reg> {
+        // console.log(...) → Print opcode.
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            if let ox::Expression::Identifier(obj) = &m.object {
+                if obj.name == "console"
+                    && matches!(m.property.name.as_str(), "log" | "info" | "warn" | "error" | "debug")
+                {
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    self.emit(Instr::Print { arg_base, argc });
+                    self.emit(Instr::LoadUndefined { dst });
+                    return Ok(dst);
+                }
+            }
+        }
+
+        // General call: evaluate callee, then contiguous args.
+        let callee = self.expr(&c.callee)?;
+        let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+        self.emit(Instr::Call { dst, callee, arg_base, argc });
+        Ok(dst)
+    }
+
+    /// Evaluate call arguments into a contiguous run of fresh registers and
+    /// return (first register, count). The run must be contiguous because the
+    /// `Call`/`Print` opcodes address args as `[arg_base, arg_base+argc)`.
+    fn eval_args_contiguous(
+        &mut self,
+        args: &oxc_allocator::Vec<ox::Argument>,
+    ) -> R<(Reg, u16)> {
+        let base = self.next_reg;
+        let mut count = 0u16;
+        for a in args {
+            let slot = self.alloc_reg();
+            let e = a
+                .as_expression()
+                .ok_or("spread arguments are not in the zipp-vm v1 subset yet")?;
+            let v = self.expr_into(e, slot)?;
+            if v != slot {
+                self.emit(Instr::Move { dst: slot, src: v });
+            }
+            count += 1;
+        }
+        Ok((base, count))
+    }
+}
+
+enum Binding {
+    Local(Reg),
+    Global(u32),
+}
+
+/// Conservative static check: is this expression definitely a number? Used to
+/// gate the `+ <int>` fast path (where `+` could otherwise mean string concat).
+/// Only returns true for cases that cannot be strings.
+fn is_numeric_expr(e: &ox::Expression) -> bool {
+    use ox::Expression as E;
+    match e {
+        E::NumericLiteral(_) => true,
+        E::ParenthesizedExpression(p) => is_numeric_expr(&p.expression),
+        E::UnaryExpression(u) => matches!(
+            u.operator,
+            ox::UnaryOperator::UnaryNegation | ox::UnaryOperator::UnaryPlus
+        ),
+        E::BinaryExpression(b) => matches!(
+            b.operator,
+            ox::BinaryOperator::Subtraction
+                | ox::BinaryOperator::Multiplication
+                | ox::BinaryOperator::Division
+                | ox::BinaryOperator::Remainder
+        ),
+        _ => false,
+    }
+}
+
+/// Extract (param names, body statements) from an oxc function.
+fn function_parts<'a>(f: &'a ox::Function) -> R<(Vec<String>, &'a [ox::Statement<'a>])> {
+    let mut params = Vec::new();
+    for item in &f.params.items {
+        match &item.pattern {
+            ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
+            _ => return Err("parameter patterns are not in the zipp-vm v1 subset yet".into()),
+        }
+    }
+    if f.params.rest.is_some() {
+        return Err("rest parameters are not in the zipp-vm v1 subset yet".into());
+    }
+    let body = match &f.body {
+        Some(b) => b.statements.as_slice(),
+        None => &[],
+    };
+    Ok((params, body))
+}

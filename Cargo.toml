@@ -16,6 +16,7 @@ members = [
     "crates/zipp-ts",   # OPTIONAL TypeScript frontend: parse .ts with oxc, lower the subset
     "crates/zipp-js",   # OPTIONAL dynamic JS engine (Lane 3): tree-walking interpreter over the oxc AST
     "crates/zipp-engine", # dynamic JS engine (fast tier): NaN-boxed value, register-bytecode VM, shapes + inline caches, optional dynasm JIT (absorbed from the FormLogic prototype, rebranded)
+    "crates/zipp-vm",   # dynamic JS engine v2: clean-sheet explicit-frame register VM (recursion in an explicit frame stack, not the native stack) designed as a JIT-ready substrate
     "crates/zipp-cli",  # `zipp run [--prove] [--jit|--llvm|--wasm] file.zipp`
 ]
 

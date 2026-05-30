@@ -99,6 +99,24 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        Some("js-vm") => {
+            // EXPERIMENTAL clean-sheet engine v2 (zipp-vm): explicit-frame
+            // register VM, recursion in an explicit frame stack (not the native
+            // stack), built as a JIT-ready substrate. Interpreter tier only so
+            // far — slower than `zipp js` (the JIT engine); here to develop the
+            // v2 path toward beating V8. Subset of JS for now.
+            let path = it.next().ok_or("usage: zipp js-vm <file.js>")?;
+            let src =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            let outcome = zipp_vm::run(&src)?;
+            for line in &outcome.output {
+                println!("{line}");
+            }
+            if let Some(err) = outcome.error {
+                return Err(err);
+            }
+            Ok(())
+        }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
             println!("usage:");

@@ -1484,6 +1484,7 @@ dependencies = [
  "zipp-js",
  "zipp-llvm",
  "zipp-ts",
+ "zipp-vm",
  "zipp-wasm",
  "zipp-zk",
  "zippc",
@@ -1551,6 +1552,18 @@ dependencies = [
  "oxc_span",
  "oxc_syntax",
  "zippc",
+]
+
+[[package]]
+name = "zipp-vm"
+version = "0.0.1"
+dependencies = [
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_parser",
+ "oxc_span",
+ "oxc_syntax",
+ "rustc-hash",
 ]
 
 [[package]]
