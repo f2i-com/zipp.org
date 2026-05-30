@@ -71,14 +71,36 @@ impl Interp {
         match stmt {
             Stmt::Empty | Stmt::Func(_) => Ok(Flow::Normal),
             Stmt::Class(cd) => {
-                let ctor = JsValue::Object(Object::function(cd.ctor.clone(), scope.clone()));
+                // The constructor + methods live in a class scope that holds
+                // `%super%` (the parent constructor), so `super(...)`/`super.m()`
+                // resolve from within them.
+                let cscope = Scope::child(scope);
+                let sup = match &cd.superclass {
+                    Some(e) => Some(self.eval(e, scope)?),
+                    None => None,
+                };
+                if let Some(s) = &sup {
+                    cscope.borrow_mut().declare("%super%", s.clone());
+                }
+                let ctor = JsValue::Object(Object::function(cd.ctor.clone(), cscope.clone()));
                 let proto = self.get_member(&ctor, "prototype")?; // vivifies prototype obj
+                if let Some(s) = &sup {
+                    // D.prototype.[[Prototype]] = B.prototype (instance/method
+                    // inheritance); D.[[Prototype]] = B (static inheritance).
+                    let sproto = self.get_member(s, "prototype")?;
+                    if let (JsValue::Object(p), JsValue::Object(sp)) = (&proto, &sproto) {
+                        p.borrow_mut().proto = Some(sp.clone());
+                    }
+                    if let (JsValue::Object(c), JsValue::Object(sc)) = (&ctor, s) {
+                        c.borrow_mut().proto = Some(sc.clone());
+                    }
+                }
                 for (mname, fd) in &cd.methods {
-                    let m = JsValue::Object(Object::function(fd.clone(), scope.clone()));
+                    let m = JsValue::Object(Object::function(fd.clone(), cscope.clone()));
                     self.set_member(&proto, mname, m)?;
                 }
                 for (sname, fd) in &cd.statics {
-                    let m = JsValue::Object(Object::function(fd.clone(), scope.clone()));
+                    let m = JsValue::Object(Object::function(fd.clone(), cscope.clone()));
                     self.set_member(&ctor, sname, m)?;
                 }
                 scope.borrow_mut().declare(&cd.name, ctor);
@@ -232,10 +254,14 @@ impl Interp {
             Expr::Array(elems) => {
                 let mut items = Vec::with_capacity(elems.len());
                 for el in elems {
-                    items.push(match el {
-                        Some(e) => self.eval(e, scope)?,
-                        None => JsValue::Undefined,
-                    });
+                    match el {
+                        Some(Expr::Spread(inner)) => {
+                            let val = self.eval(inner, scope)?;
+                            items.extend(self.iterable_values(&val)?);
+                        }
+                        Some(e) => items.push(self.eval(e, scope)?),
+                        None => items.push(JsValue::Undefined),
+                    }
                 }
                 Ok(JsValue::Object(Object::array(items)))
             }
@@ -307,6 +333,8 @@ impl Interp {
                 }
                 Ok(last)
             }
+            Expr::Super => Err(self.super_err()),
+            Expr::Spread(_) => Err(self.type_error("unexpected spread")),
         }
     }
 
@@ -379,7 +407,40 @@ impl Interp {
         Ok(self.eval(prop, scope)?.to_js_string())
     }
 
+    fn eval_args(&self, args: &[Expr], scope: &Rc<RefCell<Scope>>) -> EvalResult<Vec<JsValue>> {
+        let mut v = Vec::with_capacity(args.len());
+        for a in args {
+            if let Expr::Spread(inner) = a {
+                let val = self.eval(inner, scope)?;
+                v.extend(self.iterable_values(&val)?);
+            } else {
+                v.push(self.eval(a, scope)?);
+            }
+        }
+        Ok(v)
+    }
+
     fn eval_call(&self, callee: &Expr, args: &[Expr], scope: &Rc<RefCell<Scope>>) -> EvalResult<JsValue> {
+        // `super(...)` — invoke the parent constructor with the current `this`.
+        if matches!(callee, Expr::Super) {
+            let sup = env::get(scope, "%super%").ok_or_else(|| self.super_err())?;
+            let this = env::get(scope, "this").unwrap_or(JsValue::Undefined);
+            let argv = self.eval_args(args, scope)?;
+            self.call(&sup, &this, &argv)?;
+            return Ok(JsValue::Undefined);
+        }
+        // `super.m(...)` — invoke a parent prototype method with the current `this`.
+        if let Expr::Member { obj, prop, computed } = callee {
+            if matches!(obj.as_ref(), Expr::Super) {
+                let sup = env::get(scope, "%super%").ok_or_else(|| self.super_err())?;
+                let sproto = self.get_member(&sup, "prototype")?;
+                let key = self.member_key(prop, *computed, scope)?;
+                let m = self.get_member(&sproto, &key)?;
+                let this = env::get(scope, "this").unwrap_or(JsValue::Undefined);
+                let argv = self.eval_args(args, scope)?;
+                return self.call(&m, &this, &argv);
+            }
+        }
         // A method call `obj.m(args)` binds `this = obj`.
         let (func, this) = match callee {
             Expr::Member { obj, prop, computed } => {
@@ -390,11 +451,12 @@ impl Interp {
             }
             _ => (self.eval(callee, scope)?, JsValue::Undefined),
         };
-        let mut argv = Vec::with_capacity(args.len());
-        for a in args {
-            argv.push(self.eval(a, scope)?);
-        }
+        let argv = self.eval_args(args, scope)?;
         self.call(&func, &this, &argv)
+    }
+
+    fn super_err(&self) -> JsValue {
+        self.make_error("SyntaxError", "'super' keyword unexpected here")
     }
 
     /// Call a function value with `this` and arguments.
@@ -425,7 +487,20 @@ impl Interp {
                     act.borrow_mut().declare("arguments", JsValue::Object(Object::array(args.to_vec())));
                 }
                 for (i, p) in def.params.iter().enumerate() {
-                    act.borrow_mut().declare(p, args.get(i).cloned().unwrap_or(JsValue::Undefined));
+                    // A default value applies when the argument is missing OR
+                    // explicitly `undefined`; defaults see earlier params.
+                    let v = match args.get(i) {
+                        Some(a) if !matches!(a, JsValue::Undefined) => a.clone(),
+                        _ => match &p.default {
+                            Some(d) => self.eval(d, &act)?,
+                            None => JsValue::Undefined,
+                        },
+                    };
+                    act.borrow_mut().declare(&p.name, v);
+                }
+                if let Some(rest) = &def.rest {
+                    let extra: Vec<JsValue> = args.iter().skip(def.params.len()).cloned().collect();
+                    act.borrow_mut().declare(rest, JsValue::Object(Object::array(extra)));
                 }
                 self.hoist(&def.body, &act);
                 match self.exec_block(&def.body, &act)? {

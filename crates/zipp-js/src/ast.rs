@@ -173,6 +173,10 @@ pub enum Expr {
     Func(Rc<FuncDef>),
     /// The comma operator `(a, b, c)` — evaluates all, yields the last.
     Seq(Vec<Expr>),
+    /// The `super` keyword — only valid as `super(args)` or `super.member`.
+    Super,
+    /// `...expr` in an argument or array-element position (spread).
+    Spread(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -188,11 +192,20 @@ pub enum PropKey {
     Computed(Expr),
 }
 
+/// A function parameter: a name plus an optional default value (`x = expr`).
+/// (Destructuring parameters are a later tier.)
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: String,
+    pub default: Option<Expr>,
+}
+
 #[derive(Debug)]
 pub struct FuncDef {
     pub name: Option<String>,
-    /// v0: plain identifier parameters (no defaults / destructuring / rest).
-    pub params: Vec<String>,
+    pub params: Vec<Param>,
+    /// A rest parameter `...name`, if present (gathers the remaining args).
+    pub rest: Option<String>,
     pub body: Vec<Stmt>,
     /// Arrow functions inherit `this` lexically; regular functions bind it per
     /// call. (An arrow with an expression body is lowered to `[Return(expr)]`.)
@@ -205,6 +218,8 @@ pub struct FuncDef {
 #[derive(Debug)]
 pub struct ClassDef {
     pub name: String,
+    /// The `extends` expression (parent constructor), if any.
+    pub superclass: Option<Expr>,
     pub ctor: Rc<FuncDef>,
     pub methods: Vec<(String, Rc<FuncDef>)>,
     pub statics: Vec<(String, Rc<FuncDef>)>,

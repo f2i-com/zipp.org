@@ -127,8 +127,29 @@ fn try_stmt(t: &ox::TryStatement) -> R<Stmt> {
 
 // ───────────────────────── functions ─────────────────────────
 
-fn params(p: &ox::FormalParameters) -> R<Vec<String>> {
-    p.items.iter().map(|item| binding_name(&item.pattern)).collect()
+fn one_param(item: &ox::FormalParameter) -> R<Param> {
+    match &item.pattern.kind {
+        ox::BindingPatternKind::BindingIdentifier(id) => {
+            Ok(Param { name: id.name.to_string(), default: None })
+        }
+        ox::BindingPatternKind::AssignmentPattern(ap) => {
+            let name = match &ap.left.kind {
+                ox::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
+                _ => return Err("destructuring parameters aren't in the v0 JS engine yet".into()),
+            };
+            Ok(Param { name, default: Some(expr(&ap.right)?) })
+        }
+        _ => Err("destructuring parameters aren't in the v0 JS engine yet".into()),
+    }
+}
+
+fn params_of(p: &ox::FormalParameters) -> R<(Vec<Param>, Option<String>)> {
+    let params = p.items.iter().map(one_param).collect::<R<Vec<_>>>()?;
+    let rest = match &p.rest {
+        Some(r) => Some(binding_name(&r.argument)?),
+        None => None,
+    };
+    Ok((params, rest))
 }
 
 fn class_key_name(k: &ox::PropertyKey) -> R<String> {
@@ -141,9 +162,10 @@ fn class_key_name(k: &ox::PropertyKey) -> R<String> {
 }
 
 fn lower_class(c: &ox::Class) -> R<Stmt> {
-    if c.super_class.is_some() {
-        return Err("class `extends`/`super` isn't in the v0 JS engine yet".into());
-    }
+    let superclass = match &c.super_class {
+        Some(e) => Some(expr(e)?),
+        None => None,
+    };
     let name = c
         .id
         .as_ref()
@@ -198,16 +220,35 @@ fn lower_class(c: &ox::Class) -> R<Stmt> {
         Some(fd) => {
             let mut body = field_inits;
             body.extend(fd.body.iter().cloned());
-            Rc::new(FuncDef { name: Some(name.clone()), params: fd.params, body, is_arrow: false })
+            Rc::new(FuncDef {
+                name: Some(name.clone()),
+                params: fd.params,
+                rest: fd.rest,
+                body,
+                is_arrow: false,
+            })
         }
-        None => Rc::new(FuncDef {
-            name: Some(name.clone()),
-            params: Vec::new(),
-            body: field_inits,
-            is_arrow: false,
-        }),
+        None => {
+            // A derived class with no explicit constructor gets the implicit
+            // `constructor(...args) { super(...args); }`.
+            let mut body = Vec::new();
+            if c.super_class.is_some() {
+                body.push(Stmt::Expr(Expr::Call {
+                    callee: Box::new(Expr::Super),
+                    args: vec![Expr::Spread(Box::new(Expr::Ident("arguments".into())))],
+                }));
+            }
+            body.extend(field_inits);
+            Rc::new(FuncDef {
+                name: Some(name.clone()),
+                params: Vec::new(),
+                rest: None,
+                body,
+                is_arrow: false,
+            })
+        }
     };
-    Ok(Stmt::Class(Rc::new(ClassDef { name, ctor, methods, statics })))
+    Ok(Stmt::Class(Rc::new(ClassDef { name, superclass, ctor, methods, statics })))
 }
 
 fn func_def(f: &ox::Function) -> R<FuncDef> {
@@ -215,9 +256,11 @@ fn func_def(f: &ox::Function) -> R<FuncDef> {
         Some(b) => fn_body(b)?,
         None => Vec::new(),
     };
+    let (params, rest) = params_of(&f.params)?;
     Ok(FuncDef {
         name: f.id.as_ref().map(|i| i.name.to_string()),
-        params: params(&f.params)?,
+        params,
+        rest,
         body,
         is_arrow: false,
     })
@@ -244,12 +287,8 @@ fn arrow_def(a: &ox::ArrowFunctionExpression) -> R<FuncDef> {
     } else {
         fn_body(&a.body)?
     };
-    Ok(FuncDef {
-        name: None,
-        params: params(&a.params)?,
-        body,
-        is_arrow: true,
-    })
+    let (params, rest) = params_of(&a.params)?;
+    Ok(FuncDef { name: None, params, rest, body, is_arrow: true })
 }
 
 // ───────────────────────── expressions ─────────────────────────
@@ -269,6 +308,7 @@ fn expr(e: &ox::Expression) -> R<Expr> {
             }
         }
         E::ThisExpression(_) => Expr::This,
+        E::Super(_) => Expr::Super,
         E::TemplateLiteral(t) => template(t)?,
         E::ArrayExpression(a) => array_expr(a)?,
         E::ObjectExpression(o) => object_expr(o)?,
@@ -318,8 +358,8 @@ fn array_expr(a: &ox::ArrayExpression) -> R<Expr> {
     for el in &a.elements {
         match el {
             ox::ArrayExpressionElement::Elision(_) => out.push(None),
-            ox::ArrayExpressionElement::SpreadElement(_) => {
-                return Err("array spread isn't in the v0 JS engine yet".into())
+            ox::ArrayExpressionElement::SpreadElement(s) => {
+                out.push(Some(Expr::Spread(Box::new(expr(&s.argument)?))))
             }
             other => {
                 let e = other.as_expression().ok_or("bad array element")?;
