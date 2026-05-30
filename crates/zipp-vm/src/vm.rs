@@ -718,13 +718,26 @@ impl<'p> Vm<'p> {
     }
 
     // ── register access ──
+    //
+    // Unchecked: the compiler allocates `reg_count` registers per function and
+    // never emits a register index ≥ `reg_count` (it tracks a `max_reg`
+    // high-water mark), and every frame resizes `self.regs` to
+    // `base + reg_count` on entry — so `base + r` is always in bounds. We index
+    // `self.regs` freshly each call (no cached pointer), so a reallocation of
+    // the register Vec by a re-entrant call/alloc is handled correctly. The
+    // `debug_assert!` turns any compiler bug into a loud test failure in debug
+    // builds while release elides the bounds check.
     #[inline(always)]
     fn get(&self, base: usize, r: u16) -> Value {
-        self.regs[base + r as usize]
+        debug_assert!((base + r as usize) < self.regs.len(), "reg read out of bounds");
+        unsafe { *self.regs.get_unchecked(base + r as usize) }
     }
     #[inline(always)]
     fn set(&mut self, base: usize, r: u16, v: Value) {
-        self.regs[base + r as usize] = v;
+        debug_assert!((base + r as usize) < self.regs.len(), "reg write out of bounds");
+        unsafe {
+            *self.regs.get_unchecked_mut(base + r as usize) = v;
+        }
     }
 
     // ── call setup ──
