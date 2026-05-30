@@ -247,15 +247,49 @@ fastest. (Interpreter: ~455 ms, so the JIT/LLVM are ~28–32× over it.)
 | ZIPP `--jit` (Cranelift) | ~10 ms | ~3× faster |
 | ZIPP `--llvm` (clang -O3) | ~0 ms* | loop solved at compile time |
 
+**Closures — call throughput** — 20M calls through a capturing closure
+(`bench/closures.{ts,js}`); stresses the env-pointer indirect-call ABI:
+
+| engine | execute | vs V8 |
+|---|---|---|
+| Node 24 (V8 JIT) | ~370 ms | 1× |
+| Bun 1.3 (JSC) | ~192 ms | ~1.9× faster |
+| ZIPP `--jit` | ~75 ms | ~4.9× faster |
+| **ZIPP `--llvm`** | **~43 ms** | **~8.6× faster** |
+
+**Functional pipeline** — 2000× a `map → filter → reduce` over a 2000-element
+array (`bench/pipeline.{ts,js}`); allocation-heavy *and* closure-heavy:
+
+| engine | execute | vs V8 |
+|---|---|---|
+| ZIPP interpreter | ~383 ms | ~12× slower |
+| Bun 1.3 (JSC) | ~34 ms | ~1.1× slower |
+| Node 24 (V8 JIT) | ~30 ms | 1× |
+| ZIPP `--jit` | ~39 ms | ~1.3× slower |
+| **ZIPP `--llvm`** | **~26 ms** | **~1.15× faster** |
+
+A fluent `xs.map(f).filter(g).reduce(h, init)` chain is **fused** (deforestation)
+into a single pass with no intermediate arrays — so `--llvm` edges out V8 even on
+the alloc-heavy functional workload, the one regime AOT normally trails a tracing
+JIT. (Closures lower to a cheap `call_indirect`, no deopt/inline-cache overhead,
+on native `i64` — hence the lopsided closure-throughput win.)
+
 ZIPP has **three native paths**: the Cranelift **`--jit`** (PLAN.md tier-0 — a
 fast-*compile* baseline) and the **`--llvm`** release tier (`clang -O3`),
 plus the interpreter fallback (now only used when you don't pass `--jit`/`--llvm`).
 Both native backends cover the **entire language** — scalars (`i64` + `f64`,
-casts), 1-D arrays, strings, structs, and math builtins.
+casts), 1-D arrays, strings, structs, math builtins, **first-class functions +
+closures, and growable arrays + the `map`/`filter`/`reduce` stdlib** (only
+nullable *scalars* still fall back to the interpreter).
 
 - **`--llvm` matches V8 on dense f64** (~99 ms vs ~101 ms) and **beats V8/Bun on
   dense-f64 arrays** (matmul). `-O3` auto-FMAs, schedules, reassociates and
   vectorizes; on this CPU it lands level-with or ahead-of TurboFan.
+- **`--llvm` beats V8 on closures (~8.6×) and the functional pipeline (~1.15×).**
+  Closures compile to a cheap `call_indirect` (env-pointer ABI, no deopt/IC
+  overhead) on native `i64`; fluent `map/filter/reduce` chains are **fused** into
+  one pass with no intermediate arrays — so even the alloc-heavy functional case
+  edges out V8, the one regime AOT usually trails a tracing JIT.
 - **`--jit` beats V8 ~3× on the integer loop** (~10 ms vs ~30 ms) and edges it on
   matmul, but trails it ~27% on dense-f64 Mandelbrot (~127 ms) — Cranelift is a
   fast-compile *baseline* compiler, not an optimizer (see below).
