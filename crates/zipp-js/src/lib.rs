@@ -198,6 +198,19 @@ mod tests {
     }
 
     #[test]
+    fn object_spread() {
+        assert_eq!(out("const a={x:1,y:2}; console.log(JSON.stringify({...a,z:3}))"), "{\"x\":1,\"y\":2,\"z\":3}");
+        // later keys win over spread
+        assert_eq!(out("const a={x:1}; console.log(JSON.stringify({...a,x:99}))"), "{\"x\":99}");
+        // spread overrides an earlier literal key
+        assert_eq!(out("const a={x:7}; console.log(JSON.stringify({x:1,...a}))"), "{\"x\":7}");
+        // null/undefined sources are skipped
+        assert_eq!(out("console.log(JSON.stringify({...null,...undefined,k:1}))"), "{\"k\":1}");
+        // shallow clone is independent
+        assert_eq!(out("const o={p:1}; const c={...o}; c.p=2; console.log(o.p,c.p)"), "1 2");
+    }
+
+    #[test]
     fn destructuring() {
         assert_eq!(out("const {a,b}={a:1,b:2,c:3}; console.log(a,b)"), "1 2");
         assert_eq!(out("const {a:x,c:y}={a:1,b:2,c:3}; console.log(x,y)"), "1 3");

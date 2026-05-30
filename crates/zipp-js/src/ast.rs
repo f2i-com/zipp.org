@@ -231,6 +231,8 @@ pub enum ChainStep {
 #[derive(Debug, Clone)]
 pub enum Prop {
     KeyVal { key: PropKey, value: Expr },
+    /// `{ ...expr }` — copy the source object's own enumerable properties.
+    Spread(Expr),
 }
 
 #[derive(Debug, Clone)]

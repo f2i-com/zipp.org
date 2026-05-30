@@ -327,13 +327,25 @@ impl Interp {
             Expr::Object(props) => {
                 let o = Object::plain();
                 for p in props {
-                    let Prop::KeyVal { key, value } = p;
-                    let k = match key {
-                        PropKey::Static(s) => s.clone(),
-                        PropKey::Computed(e) => self.eval(e, scope)?.to_js_string(),
-                    };
-                    let v = self.eval(value, scope)?;
-                    o.borrow_mut().set(&k, v);
+                    match p {
+                        Prop::KeyVal { key, value } => {
+                            let k = match key {
+                                PropKey::Static(s) => s.clone(),
+                                PropKey::Computed(e) => self.eval(e, scope)?.to_js_string(),
+                            };
+                            let v = self.eval(value, scope)?;
+                            o.borrow_mut().set(&k, v);
+                        }
+                        Prop::Spread(e) => {
+                            // `{ ...src }` — copy src's own enumerable properties
+                            // (null/undefined sources are silently skipped, per spec).
+                            let src = self.eval(e, scope)?;
+                            for k in self.enum_keys(&src) {
+                                let v = self.get_member(&src, &k)?;
+                                o.borrow_mut().set(&k, v);
+                            }
+                        }
+                    }
                 }
                 Ok(JsValue::Object(o))
             }

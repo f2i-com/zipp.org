@@ -519,8 +519,8 @@ fn object_expr(o: &ox::ObjectExpression) -> R<Expr> {
                 let key = prop_key(&op.key, op.computed)?;
                 props.push(Prop::KeyVal { key, value: expr(&op.value)? });
             }
-            ox::ObjectPropertyKind::SpreadProperty(_) => {
-                return Err("object spread isn't in the v0 JS engine yet".into())
+            ox::ObjectPropertyKind::SpreadProperty(s) => {
+                props.push(Prop::Spread(expr(&s.argument)?));
             }
         }
     }
