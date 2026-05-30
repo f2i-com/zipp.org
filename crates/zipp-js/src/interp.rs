@@ -26,6 +26,10 @@ pub struct Interp {
     pub global: Rc<RefCell<Scope>>,
     /// Captured `console` output (one entry per `console.log` call).
     pub out: RefCell<Vec<String>>,
+    /// Prototype object for each built-in error kind ("Error", "TypeError", …),
+    /// so engine-thrown errors and `new TypeError()` share one prototype chain
+    /// (making `e instanceof Error` work). Populated by `builtins::install`.
+    pub error_protos: RefCell<std::collections::HashMap<String, Obj>>,
 }
 
 impl Default for Interp {
