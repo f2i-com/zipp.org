@@ -126,6 +126,7 @@ cargo build --release
 ./target/release/zipp run --jit examples/arraysearch.ts # indexOf/includes/reverse/fill run NATIVE
 ./target/release/zipp run --jit examples/strings.ts  # string methods (slice/indexOf/… run NATIVE)
 ./target/release/zipp run --jit examples/calculator.ts # recursive-descent calculator (runs NATIVE)
+./target/release/zipp run examples/analytics.ts      # data pipeline: closures + map/filter/reduce
 
 # run the language test suite
 cargo test
@@ -400,7 +401,8 @@ lambdas; `closure.ts` closures (capture); `arraymethods.ts` + `arraymethods2.ts`
 the array method stdlib; `arraysearch.ts` the search/in-place methods running
 native; `strings.ts` the native string-method stdlib; `calculator.ts` a
 recursive-descent arithmetic evaluator (classes + recursion + `charCodeAt`,
-running natively). Most run on all four backends;
+running natively); `analytics.ts` a data pipeline (growable arrays + closures +
+`map`/`filter`/`reduce` chaining). Most run on all four backends;
 **nullable
 *heap* types — structs, `str`, arrays — run natively on `--jit` and `--llvm`**
 (a null is a 0/null pointer; `=== null` is a pointer compare). **Nullable

@@ -982,6 +982,38 @@ impl Lower<'_> {
             z::Expr::Coalesce { rhs, .. } => self.ztype_of(rhs)?,
             // An array literal's type comes from its first element.
             z::Expr::Array(es) => z::Type::Array(self.ztype_of(es.first()?)?.as_elem()?),
+            // Indexing an array yields its element type; `[v; n]` has the value's.
+            // (Without these, `const x = arr[i]` couldn't infer x's type — which
+            // hid x from method dispatch AND from closure-capture analysis.)
+            z::Expr::Index { arr, .. } => {
+                let z::Type::Array(e) = self.ztype_of(arr)? else { return None };
+                e.to_type()
+            }
+            z::Expr::Repeat { value, .. } => z::Type::Array(self.ztype_of(value)?.as_elem()?),
+            // Optional-chaining results (so a `const x = a?.b ?? d` is typed too).
+            z::Expr::OptField { base, field } => {
+                let id = match self.ztype_of(base)? {
+                    z::Type::Struct(id) | z::Type::OptStruct(id) => id,
+                    _ => return None,
+                };
+                self.struct_field_type(id, field)?.into_opt()?
+            }
+            z::Expr::OptFieldOr { base, field, .. } => {
+                let id = match self.ztype_of(base)? {
+                    z::Type::Struct(id) | z::Type::OptStruct(id) => id,
+                    _ => return None,
+                };
+                let ft = self.struct_field_type(id, field)?;
+                ft.opt_inner().unwrap_or(ft)
+            }
+            z::Expr::OptCall { name, .. } => {
+                let ret = self.fn_rets.borrow().get(name).copied()?;
+                ret.opt_inner().unwrap_or(ret).into_opt()?
+            }
+            z::Expr::OptCallOr { name, .. } => {
+                let ret = self.fn_rets.borrow().get(name).copied()?;
+                ret.opt_inner().unwrap_or(ret)
+            }
             // `arr.push(x)` is the new length; `arr.pop()` is the element type.
             z::Expr::Push { .. } => z::Type::I64,
             z::Expr::Pop { arr } => {
@@ -3645,6 +3677,13 @@ mod tests {
         let ts4 = "function main(): i64 { let k = 1; const f = (x: i64) => x + k; \
                     k = 100; return f(0); }";
         assert_eq!(run_i64(ts4), 1); // snapshot k = 1, not 100
+
+        // regression: capturing a local whose initializer is an array-index read
+        // (ztype_of had no Index arm → the local was untyped → capture missed it).
+        let ts5 = "function makeAdder(ws: i64[]): (x: i64) => i64 { \
+                     const bias = ws[0]; return (x: i64) => x + bias; } \
+                   function main(): i64 { const a = makeAdder([2, 3, 4]); return a(5); }";
+        assert_eq!(run_i64(ts5), 7); // 5 + ws[0] = 5 + 2
     }
 
     #[test]
