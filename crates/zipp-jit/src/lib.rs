@@ -1439,6 +1439,56 @@ mod tests {
     }
 
     #[test]
+    fn fused_chains_run_native() {
+        // Fluent map/filter…reduce chains are FUSED into one native pass (no
+        // intermediate arrays). `jit_ts_i64` errors on an ineligible program, so
+        // these only pass if the fused helper genuinely compiled.
+        let build = "let xs: i64[] = []; let i = 1; while (i <= 10) { xs.push(i); i = i + 1; }";
+        // map → filter → reduce (all non-capturing)
+        assert_eq!(
+            jit_ts_i64(&format!(
+                "function main(): i64 {{ {build} \
+                 return xs.map((x: i64) => x * 2).filter((x: i64) => x % 3 === 0).reduce((a: i64, b: i64) => a + b, 0); }}"
+            )),
+            36 // [1..10]*2 → [6,12,18] (÷3) → 36
+        );
+        // CAPTURING map stage (DirectEnv): env reconstructed + direct-called
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { let xs: i64[] = []; let i = 1; while (i <= 4) { xs.push(i); i = i + 1; } \
+                 const k = 5; \
+                 return xs.map((x: i64) => x + k).filter((x: i64) => x > 7).reduce((a: i64, b: i64) => a + b, 0); }"
+            ),
+            17 // [1..4]+5 → [6,7,8,9] (>7) → [8,9] → 17
+        );
+        // two map stages then reduce (element type threads through both)
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { let xs: i64[] = []; let i = 1; while (i <= 3) { xs.push(i); i = i + 1; } \
+                 return xs.map((x: i64) => x + 1).map((x: i64) => x * x).reduce((a: i64, b: i64) => a + b, 0); }"
+            ),
+            29 // [1,2,3] → [2,3,4] → [4,9,16] → 29
+        );
+        // f64 lane through the fused chain
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { let xs: f64[] = []; let i = 1; while (i <= 3) { xs.push(f64(i)); i = i + 1; } \
+                 const r = xs.map((x: f64) => x * 2.0).filter((x: f64) => x > 3.0).reduce((a: f64, b: f64) => a + b, 0.0); \
+                 return i64(r); }"
+            ),
+            10 // [1,2,3]*2 → [2,4,6] (>3) → [4,6] → 10.0
+        );
+        // filter that drops everything → reduce of an empty stream → init
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { let xs: i64[] = []; let i = 1; while (i <= 5) { xs.push(i); i = i + 1; } \
+                 return xs.filter((x: i64) => x > 100).map((x: i64) => x * x).reduce((a: i64, b: i64) => a + b, 7); }"
+            ),
+            7 // nothing survives the filter → init
+        );
+    }
+
+    #[test]
     fn bitnot_and_neg_on_sized_ints() {
         // Regression: unary ~ (and -) on a 32-bit integer were lowered at i64
         // width — a Cranelift "declared type doesn't match" panic on the JIT and
