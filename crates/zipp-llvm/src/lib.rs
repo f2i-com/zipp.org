@@ -868,15 +868,51 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 ));
                 store(&mut s, &rty, *dst, &res);
             }
-            // arr.push(value) — append (growing the data buffer if full), returns
-            // the new length. The value is passed in slot form (f64 → raw bits).
+            // arr.push(value) — append, returns the new length. Fast path inlined:
+            // when len < cap, store into the data buffer and bump len with no call;
+            // only a grow (len == cap) falls back to the runtime. The value is
+            // passed in slot form (f64 → raw bits).
             Instr::Push { dst, arr, value } => {
                 let hdr = load(&mut s, &mut tmp, &rty, *arr);
                 let vv = load(&mut s, &mut tmp, &rty, *value);
                 let raw = to_slot(&mut s, &mut tmp, rty[*value as usize], &vv);
-                let r = fresh(&mut tmp);
-                s.push_str(&format!("  {r} = call i64 @zipp_arr_push(ptr {hdr}, i64 {raw})\n"));
-                store(&mut s, &rty, *dst, &r);
+                let n = tmp;
+                tmp += 1;
+                let (fast, slow, merge) =
+                    (format!("push{n}.fast"), format!("push{n}.slow"), format!("push{n}.merge"));
+                let len = fresh(&mut tmp);
+                s.push_str(&format!("  {len} = load i64, ptr {hdr}\n"));
+                let capslot = fresh(&mut tmp);
+                s.push_str(&format!("  {capslot} = getelementptr inbounds i64, ptr {hdr}, i64 1\n"));
+                let cap = fresh(&mut tmp);
+                s.push_str(&format!("  {cap} = load i64, ptr {capslot}\n"));
+                let room = fresh(&mut tmp);
+                s.push_str(&format!("  {room} = icmp ult i64 {len}, {cap}\n"));
+                s.push_str(&format!("  br i1 {room}, label %{fast}, label %{slow}\n"));
+                // fast path: store at data[len], len += 1
+                s.push_str(&format!("{fast}:\n"));
+                let dslot = fresh(&mut tmp);
+                s.push_str(&format!("  {dslot} = getelementptr inbounds i64, ptr {hdr}, i64 2\n"));
+                let data = fresh(&mut tmp);
+                s.push_str(&format!("  {data} = load ptr, ptr {dslot}\n"));
+                let eslot = fresh(&mut tmp);
+                s.push_str(&format!("  {eslot} = getelementptr inbounds i64, ptr {data}, i64 {len}\n"));
+                s.push_str(&format!("  store i64 {raw}, ptr {eslot}\n"));
+                let nl1 = fresh(&mut tmp);
+                s.push_str(&format!("  {nl1} = add i64 {len}, 1\n"));
+                s.push_str(&format!("  store i64 {nl1}, ptr {hdr}\n"));
+                s.push_str(&format!("  br label %{merge}\n"));
+                // slow path: the runtime grows the buffer then stores
+                s.push_str(&format!("{slow}:\n"));
+                let nl2 = fresh(&mut tmp);
+                s.push_str(&format!("  {nl2} = call i64 @zipp_arr_push(ptr {hdr}, i64 {raw})\n"));
+                s.push_str(&format!("  br label %{merge}\n"));
+                s.push_str(&format!("{merge}:\n"));
+                let newlen = fresh(&mut tmp);
+                s.push_str(&format!(
+                    "  {newlen} = phi i64 [ {nl1}, %{fast} ], [ {nl2}, %{slow} ]\n"
+                ));
+                store(&mut s, &rty, *dst, &newlen);
             }
             // arr.pop() — remove + return the last element (aborts if empty).
             Instr::Pop { dst, arr } => {

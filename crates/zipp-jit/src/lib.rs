@@ -991,8 +991,10 @@ fn compile_function(
                 // merge: `dst` is the phi of both paths
                 builder.switch_to_block(merge_blk);
             }
-            // arr.push(value) — append (growing the data buffer if full), returns
-            // the new length. The value is stored in slot form (f64 → raw bits).
+            // arr.push(value) — append, returns the new length. Fast path inlined:
+            // when len < cap, store into the data buffer and bump len with no call;
+            // only a grow (len == cap) falls back to the runtime. The value is
+            // stored in slot form (f64 → raw bits).
             Instr::Push { dst, arr, value } => {
                 let hdr = builder.use_var(var(*arr));
                 let vv = builder.use_var(var(*value));
@@ -1001,9 +1003,32 @@ fn compile_function(
                 } else {
                     vv
                 };
+                let flags = MemFlags::trusted();
+                let len = builder.ins().load(types::I64, flags, hdr, 0);
+                let cap = builder.ins().load(types::I64, flags, hdr, 8);
+                let has_room = builder.ins().icmp(IntCC::UnsignedLessThan, len, cap);
+                let fast = builder.create_block();
+                let slow = builder.create_block();
+                let merge = builder.create_block();
+                builder.append_block_param(merge, types::I64);
+                builder.ins().brif(has_room, fast, &[], slow, &[]);
+                // fast path: store at data + 8*len, len += 1
+                builder.switch_to_block(fast);
+                let data = builder.ins().load(types::I64, flags, hdr, 16);
+                let off = builder.ins().imul_imm(len, 8);
+                let slot = builder.ins().iadd(data, off);
+                builder.ins().store(flags, raw, slot, 0);
+                let nl = builder.ins().iadd_imm(len, 1);
+                builder.ins().store(flags, nl, hdr, 0);
+                builder.ins().jump(merge, &[nl]);
+                // slow path: the runtime grows the buffer then stores
+                builder.switch_to_block(slow);
                 let push = module.declare_func_in_func(rt.arr_push, builder.func);
                 let call = builder.ins().call(push, &[hdr, raw]);
-                let newlen = builder.inst_results(call)[0];
+                let nl2 = builder.inst_results(call)[0];
+                builder.ins().jump(merge, &[nl2]);
+                builder.switch_to_block(merge);
+                let newlen = builder.block_params(merge)[0];
                 builder.def_var(var(*dst), newlen);
             }
             // arr.pop() — remove + return the last element (aborts if empty).
