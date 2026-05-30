@@ -194,8 +194,9 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
             }
             Instr::Unary { op, dst, a } => {
                 t[*dst as usize] = match op {
-                    UnOp::Neg => t[*a as usize],
-                    _ => LTy::I64,
+                    // Neg / bitwise-NOT preserve the operand width; `!` → i64 bool.
+                    UnOp::Neg | UnOp::BitNot => t[*a as usize],
+                    UnOp::Not => LTy::I64,
                 };
             }
             Instr::Call { func, dst, .. } => {
@@ -535,13 +536,16 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                         t
                     }
                     UnOp::Neg => {
+                        // integer negate at the operand's width (i32/u32/u64/i64)
                         let t = fresh(&mut tmp);
-                        s.push_str(&format!("  {t} = sub i64 0, {av}\n"));
+                        s.push_str(&format!("  {t} = sub {w} 0, {av}\n", w = llname(rty[*a as usize])));
                         t
                     }
                     UnOp::BitNot => {
+                        // bitwise NOT at the operand's width (was hardcoded i64,
+                        // which produced invalid IR / a JIT type mismatch for i32/u32)
                         let t = fresh(&mut tmp);
-                        s.push_str(&format!("  {t} = xor i64 {av}, -1\n"));
+                        s.push_str(&format!("  {t} = xor {w} {av}, -1\n", w = llname(rty[*a as usize])));
                         t
                     }
                     UnOp::Not => cmp(&mut s, &mut tmp, "icmp", "eq", "i64", &av, "0"),
@@ -1065,6 +1069,15 @@ mod tests {
         assert!(ir.contains("define i64 @zfn"));
         assert!(ir.contains("@main"));
         assert!(ir.contains("alloca"));
+    }
+
+    #[test]
+    fn bitnot_on_i32_emitted_at_operand_width() {
+        // Regression: ~ on a 32-bit integer was emitted as `xor i64` (invalid IR
+        // for an i32 operand). It must use the operand's width.
+        let prog = zippc::compile("fn main(): i64 { return i64(~i32(5)); }").unwrap();
+        let ir = emit_ir(&prog).unwrap();
+        assert!(ir.contains("xor i32"), "expected an i32-width NOT; IR:\n{ir}");
     }
 
     #[test]

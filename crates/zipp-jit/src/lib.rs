@@ -377,8 +377,10 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
             }
             Instr::Unary { op, dst, a } => {
                 t[*dst as usize] = match op {
-                    UnOp::Neg => t[*a as usize],
-                    _ => JTy::I64,
+                    // Neg and bitwise-NOT preserve the operand's width (i32/u32/
+                    // u64/i64/f64); only logical `!` yields an i64 boolean.
+                    UnOp::Neg | UnOp::BitNot => t[*a as usize],
+                    UnOp::Not => JTy::I64,
                 };
             }
             Instr::Call { func, dst, .. } => {
@@ -1123,6 +1125,18 @@ mod tests {
         // non-ASCII slice at a non-char boundary is lossy (U+FFFD, 0xEF=239) on the
         // JIT exactly as on the interpreter — the make_str_lossy parity fix.
         assert_eq!(jit_ts_i64("function main(): i64 { return \"é\".slice(0, 1).charCodeAt(0); }"), 239);
+    }
+
+    #[test]
+    fn bitnot_and_neg_on_sized_ints() {
+        // Regression: unary ~ (and -) on a 32-bit integer were lowered at i64
+        // width — a Cranelift "declared type doesn't match" panic on the JIT and
+        // invalid LLVM IR (xor i64 on an i32 operand). u64/i64 worked; i32/u32 did
+        // not. Now the result keeps the operand width.
+        assert_eq!(jit_ts_i64("function main(): i64 { const a: i32 = ~i32(5); return i64(a); }"), -6);
+        assert_eq!(jit_ts_i64("function main(): i64 { const a: u32 = ~u32(0); return i64(a); }"), 4294967295);
+        assert_eq!(jit_ts_i64("function main(): i64 { const a: i32 = -i32(7); return i64(a); }"), -7);
+        assert_eq!(jit_ts_i64("function main(): i64 { const a: i64 = ~i64(5); return a; }"), -6);
     }
 
     #[test]
