@@ -76,6 +76,16 @@ pub struct Vm<'p> {
     /// exact thrown object/string/number, and survives propagation across
     /// nested `run_loop` invocations (builtin callbacks) until caught.
     pending_throw: Option<Value>,
+    /// Native JIT tier (x86-64 only, `feature = "jit"`). Compiles hot leaf
+    /// integer functions to native code that shares this VM's register window;
+    /// any non-int/heap/call op bails back to the interpreter at the exact ip.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit: crate::codegen::Jit,
+    /// JIT on/off (set from `ZIPP_NOJIT` env var at construction) — lets a
+    /// single binary A/B the JIT against the pure interpreter for honest
+    /// measurement.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_enabled: bool,
 }
 
 /// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
@@ -100,6 +110,10 @@ impl<'p> Vm<'p> {
             frames: Vec::new(),
             output: Vec::new(),
             pending_throw: None,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit: crate::codegen::Jit::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_enabled: std::env::var_os("ZIPP_NOJIT").is_none(),
         }
     }
 
@@ -248,6 +262,34 @@ impl<'p> Vm<'p> {
             // SAFETY: `code` borrows immutable program data that outlives the
             // loop; we never mutate program functions during execution.
             let code: &Vec<Instr> = unsafe { &*code };
+
+            // ── JIT tier ──
+            // On fresh frame entry (ip == 0), if this function has compiled
+            // native code, run it over the frame's register window. The native
+            // code shares `self.regs`, so on a bail the interpreter resumes with
+            // consistent state. Only entered at ip==0: a bail sets `ip` to the
+            // resume point and falls into the interpreter for the rest of this
+            // activation (never re-enters native mid-function). We also count
+            // entries here and compile on crossing the threshold.
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            if ip == 0 && self.jit_enabled {
+                if let Some((result, bail)) = self.try_run_jit(func_id, base) {
+                    if bail == crate::codegen::NO_BAIL {
+                        // Native code returned: behave like a `Return`.
+                        if self.pop_frame_with(result, stop_depth) {
+                            return Ok(result);
+                        }
+                        continue; // re-enter outer loop with caller frame
+                    }
+                    // Bailed: resume the interpreter at the recorded ip.
+                    ip = bail as usize;
+                } else if self.jit.record_and_should_compile(func_id) {
+                    let proto: *const crate::bytecode::FuncProto =
+                        &self.program.functions[func_id as usize];
+                    // SAFETY: program functions are immutable during execution.
+                    self.jit.compile(func_id, unsafe { &*proto });
+                }
+            }
 
             // Inner loop: execute within the current frame until a call pushes
             // a new frame or a return pops this one.
@@ -679,6 +721,25 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+    }
+
+    /// If `func_id` has compiled native code, run it over the register window
+    /// at `base` and return `(result_bits_as_Value, bail_ip)`. `None` if there
+    /// is no compiled code for this function.
+    ///
+    /// The native code reads/writes `self.regs[base..]` directly via a raw
+    /// pointer taken here and used ONLY for the duration of the call — nothing
+    /// in between can resize `self.regs` (the JIT subset issues no calls/allocs).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn try_run_jit(&mut self, func_id: u32, base: usize) -> Option<(Value, u32)> {
+        let jitfn = self.jit.get(func_id)? as *const crate::codegen::JitFn;
+        // SAFETY: `jitfn` points into self.jit.compiled (stable for the call);
+        // `regs_ptr` is valid for the frame's reg_count slots; the native code
+        // touches only [base, base+reg_count) and issues no calls, so it cannot
+        // resize self.regs or invalidate the pointer mid-run.
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
+        let (bits, bail) = unsafe { (*jitfn).run(regs_ptr) };
+        Some((Value::from_bits(bits), bail))
     }
 
     /// Pop the current frame. If this returns control to `stop_depth` (the

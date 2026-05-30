@@ -20,6 +20,8 @@
 
 mod bytecode;
 mod capture;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod codegen;
 mod compile;
 mod heap;
 pub mod value;
@@ -466,6 +468,47 @@ mod tests {
         let out = run("console.log('before'); throw new Error('fail'); console.log('after')").expect("compile");
         assert_eq!(out.output, vec!["before"]);
         assert!(out.error.as_ref().unwrap().contains("fail"), "got {:?}", out.error);
+    }
+
+    // ── Stage 5b: native JIT (correctness — same answers as the interpreter) ──
+
+    #[test]
+    fn jit_hot_int_leaf_function_correct() {
+        // A pure-int leaf function called far past the JIT threshold (8). The
+        // result must equal node regardless of whether it ran native or interp.
+        assert_eq!(
+            run_ok("function sq(x){ return x*x } let s=0; for(let i=0;i<50;i++){ s = s + sq(i) } console.log(s)"),
+            vec!["40425"] // sum of i^2 for i in 0..49
+        );
+    }
+
+    #[test]
+    fn jit_multi_op_int_function_correct() {
+        // f(a,b,c)=max(0, a*a + 2b - c); summed over i in 0..30 → 455 (node).
+        assert_eq!(
+            run_ok("function f(a,b,c){ let r=a*a; r=r+b*2; r=r-c; if(r<0) return 0; return r } let t=0; for(let i=0;i<30;i++){ t=t+f(i%7, i%5, i%3) } console.log(t)"),
+            vec!["455"]
+        );
+    }
+
+    #[test]
+    fn jit_overflow_bails_to_f64_not_wrap() {
+        // i32 multiply that overflows must NOT wrap (the old engine's bug); the
+        // JIT bails and the interpreter computes the f64 result, == node.
+        assert_eq!(
+            run_ok("function big(x){ return x*x } let r=0; for(let i=0;i<20;i++){ r = big(100000) } console.log(r)"),
+            vec!["10000000000"] // 100000^2 = 1e10, exceeds i32 → must be exact, not wrapped
+        );
+    }
+
+    #[test]
+    fn jit_type_change_bails_correctly() {
+        // A function that's int for many calls then gets a non-int arg must
+        // still produce the right answer (the op bails on the non-int operand).
+        assert_eq!(
+            run_ok("function add1(x){ return x + 1 } let out=''; for(let i=0;i<12;i++){ out = '' + add1(i) } out = '' + add1('s'); console.log(out)"),
+            vec!["s1"] // 's' + 1 → 's1' (string concat, via bail)
+        );
     }
 
     #[test]

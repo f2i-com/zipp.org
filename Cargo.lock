@@ -1558,6 +1558,8 @@ dependencies = [
 name = "zipp-vm"
 version = "0.0.1"
 dependencies = [
+ "dynasm",
+ "dynasmrt",
  "oxc_allocator",
  "oxc_ast",
  "oxc_parser",
