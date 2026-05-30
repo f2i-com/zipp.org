@@ -78,20 +78,22 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("jse") => {
-            // Fast engine (zipp-engine, absorbed from FormLogic): NaN-boxed value,
-            // register-bytecode VM, shapes + inline caches, dynasm JIT. Prints
-            // `console.log` output (node-compatible) via eval_with_console.
+            // EXPERIMENTAL fast engine (zipp-engine, absorbed from FormLogic):
+            // NaN-boxed value, register-bytecode VM, shapes + inline caches,
+            // dynasm JIT. It prints the eval RETURN VALUE (its console is not yet
+            // wired to stdout) and enforces a 100M-instruction sandbox cap.
             let path = it.next().ok_or("usage: zipp jse <file.js>")?;
             let src =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
             let engine = zipp_engine::engine::ZippEngine::default();
-            let (console, result) = engine.eval_with_console(&src);
-            // Flush console output first (like node flushes stdout before the error).
-            for line in &console {
-                println!("{line}");
-            }
-            match result {
-                Ok(_) => Ok(()),
+            match engine.eval(&src) {
+                Ok(value) => {
+                    let s = value.inspect();
+                    if !s.is_empty() && s != "undefined" {
+                        println!("{s}");
+                    }
+                    Ok(())
+                }
                 Err(e) => Err(format!("{e}")),
             }
         }

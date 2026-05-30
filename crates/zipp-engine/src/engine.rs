@@ -155,38 +155,6 @@ impl ZippEngine {
         Ok(result)
     }
 
-    /// Like [`Self::eval`], but also returns the lines written by `console.log`
-    /// (and friends) during the run. The VM accumulates them in
-    /// `console_output`; previously `eval` dropped that buffer when it recycled
-    /// the VM, so a host had no way to see script output. The lines produced
-    /// *before* an uncaught throw are returned alongside the error, matching how
-    /// node flushes stdout before reporting the error.
-    pub fn eval_with_console(&self, source: &str) -> (Vec<String>, Result<Object, ZippError>) {
-        let (_cached, mut vm) = match self.prepare_vm(source) {
-            Ok(x) => x,
-            Err(e) => return (Vec::new(), Err(e)),
-        };
-        let run_result = vm.run_register();
-        let drain_result = if run_result.is_ok() {
-            vm.drain_microtasks().map(|_| ())
-        } else {
-            Ok(())
-        };
-        // Capture console output BEFORE recycling the VM (which clears it).
-        let console = std::mem::take(&mut vm.console_output);
-        let last = vm.last_popped.take().unwrap_or(Value::UNDEFINED);
-        let result = val_to_obj(last, &vm.heap);
-        let err = run_result
-            .and(drain_result)
-            .err()
-            .map(|e| ZippError::from_vm_error(&e, &vm.heap));
-        self.recycle_vm(vm);
-        match err {
-            Some(e) => (console, Err(e)),
-            None => (console, Ok(result)),
-        }
-    }
-
     /// Evaluate source code and return the result as a JSON string.
     /// Unlike `eval()` which returns an Object (with potential `[ref]` for nested heap values),
     /// this method serializes the result while the heap is still accessible, producing
