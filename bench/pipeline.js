@@ -10,9 +10,11 @@ function pipeline(reps, n) {
       xs.push((i + r) % 1000);
     }
     const k = r % 7;
-    const mapped = xs.map((x) => (x * 3 + k) % 9973);
-    const evens = mapped.filter((x) => x % 2 === 0);
-    const s = evens.reduce((a, b) => a + b, 0);
+    // A fluent map→filter→reduce chain (no intermediate bindings).
+    const s = xs
+      .map((x) => (x * 3 + k) % 9973)
+      .filter((x) => x % 2 === 0)
+      .reduce((a, b) => a + b, 0);
     acc = (acc + s) % 1000000007;
   }
   return acc;

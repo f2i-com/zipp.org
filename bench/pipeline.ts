@@ -17,9 +17,12 @@ function pipeline(reps: i64, n: i64): i64 {
       i = i + 1;
     }
     const k = r % 7;
-    const mapped = xs.map((x: i64) => (x * 3 + k) % 9973);
-    const evens = mapped.filter((x: i64) => x % 2 === 0);
-    const s = evens.reduce((a: i64, b: i64) => a + b, 0);
+    // A fluent map→filter→reduce chain (no intermediate bindings) — ZIPP fuses
+    // this into a single pass with no intermediate arrays.
+    const s = xs
+      .map((x: i64) => (x * 3 + k) % 9973)
+      .filter((x: i64) => x % 2 === 0)
+      .reduce((a: i64, b: i64) => a + b, 0);
     acc = (acc + s) % 1000000007;
     r = r + 1;
   }

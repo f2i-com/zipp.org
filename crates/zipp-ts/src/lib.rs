@@ -956,6 +956,28 @@ impl Lower<'_> {
         Some((env_id, d.name.clone(), d.fields.iter().map(|(n, _)| n.clone()).collect()))
     }
 
+    /// Classify a lowered callback `cb` (of function type `f_ty`) into a [`Cb`] +
+    /// the argument that carries it (the function value for `Indirect`, the
+    /// reconstructed env struct for `DirectEnv`, `None` for `Direct`). `carrier`
+    /// names the helper parameter it binds to (`"__cb"` for a single-method
+    /// helper, indexed `"__cbK"` per stage in a fused chain).
+    fn classify_cb(&self, cb: &z::Expr, f_ty: z::Type, carrier: &str) -> (Cb, Option<z::Expr>) {
+        match cb {
+            z::Expr::FuncRef(n) => (Cb::Direct(n.clone()), None),
+            z::Expr::MakeClosure { name, captures } => match self.lambda_env_info(name) {
+                Some((env_id, env_name, fields)) => {
+                    let env_lit = z::Expr::StructLit {
+                        name: env_name,
+                        fields: fields.into_iter().zip(captures.iter().cloned()).collect(),
+                    };
+                    (Cb::DirectEnv { name: name.clone(), env_id, carrier: carrier.into() }, Some(env_lit))
+                }
+                None => (Cb::Indirect { f_ty, carrier: carrier.into() }, Some(cb.clone())),
+            },
+            _ => (Cb::Indirect { f_ty, carrier: carrier.into() }, Some(cb.clone())),
+        }
+    }
+
     /// Look up a struct id by name.
     fn struct_id(&self, name: &str) -> Option<u32> {
         self.structs.borrow().get(name).copied()
@@ -2309,24 +2331,11 @@ impl Lower<'_> {
         // else (a function-value variable) → the generic `Indirect` helper.
         // `cb_arg` is the extra argument carrying the callback (the function value
         // for Indirect, the env struct for DirectEnv, nothing for Direct).
-        let (cbk, cb_arg): (Cb, Option<z::Expr>) = match cb {
-            z::Expr::FuncRef(n) => (Cb::Direct(n.clone()), None),
-            z::Expr::MakeClosure { name, captures } => match self.lambda_env_info(name) {
-                Some((env_id, env_name, fields)) => {
-                    let env_lit = z::Expr::StructLit {
-                        name: env_name,
-                        fields: fields.into_iter().zip(captures.iter().cloned()).collect(),
-                    };
-                    (Cb::DirectEnv { name: name.clone(), env_id }, Some(env_lit))
-                }
-                None => (Cb::Indirect(f_ty), Some(cb.clone())),
-            },
-            _ => (Cb::Indirect(f_ty), Some(cb.clone())),
-        };
+        let (cbk, cb_arg): (Cb, Option<z::Expr>) = self.classify_cb(cb, f_ty, "__cb");
         // Helper name suffix — distinct per specialized callback (shared across
         // identical call sites); empty for the generic indirect helper.
         let sfx = match &cbk {
-            Cb::Indirect(_) => String::new(),
+            Cb::Indirect { .. } => String::new(),
             Cb::Direct(n) | Cb::DirectEnv { name: n, .. } => format!("_{n}"),
         };
         // Each arm returns (helper name, trailing args after the callback arg).
@@ -2400,6 +2409,115 @@ impl Lower<'_> {
         call_args.extend(cb_arg);
         call_args.extend(trailing);
         Ok(z::Expr::Call { name, args: call_args })
+    }
+
+    /// FUSION (deforestation): if `top` is the outermost call of a chain of ≥2
+    /// array methods whose middle stages are `map`/`filter` and whose terminal is
+    /// `reduce`, lower the whole chain to ONE synthesized helper that iterates the
+    /// base array a single time with NO intermediate arrays, and return it. `None`
+    /// means "not a fusible chain" — the caller falls back to the per-method path.
+    ///
+    /// Structural checks run BEFORE any lowering (lowering an arrow lifts a lambda,
+    /// a side effect we must not do speculatively): a non-fusible shape — a single
+    /// stage, or a non-`reduce` terminal — bails with nothing lowered.
+    fn try_fuse_chain(&self, top: &CallExpression) -> LResult<Option<z::Expr>> {
+        // 1. Walk the oxc receiver chain (outermost-first), descending only through
+        //    array-producing stages (map/filter); stop at the base expression.
+        let mut raw: Vec<(&str, &CallExpression)> = Vec::new();
+        let mut call = top;
+        let base_oxc: &Expression = loop {
+            let Expression::StaticMemberExpression(m) = &call.callee else {
+                return Ok(None);
+            };
+            raw.push((m.property.name.as_str(), call));
+            match &m.object {
+                Expression::CallExpression(inner)
+                    if matches!(&inner.callee, Expression::StaticMemberExpression(im)
+                        if is_array_producing(im.property.name.as_str())) =>
+                {
+                    call = inner;
+                }
+                other => break other,
+            }
+        };
+        // 2. Structural gates (no lowering yet): ≥2 stages, terminal is reduce.
+        if raw.len() < 2 || raw[0].0 != "reduce" {
+            return Ok(None);
+        }
+        // 3. Base must be an array.
+        let base = self.expr(base_oxc)?;
+        let Some(z::Type::Array(base_elem)) = self.ztype_of(&base) else {
+            return Ok(None);
+        };
+        // 4. Build stages in APPLICATION order (inner→outer): middles (raw[1..]
+        //    reversed, all map/filter), then the reduce terminal (raw[0]).
+        let mut stages: Vec<(Cb, FKind)> = Vec::new();
+        let mut carrier_args: Vec<z::Expr> = Vec::new();
+        let mut cur_elem = base_elem;
+        for &(meth, cl) in raw[1..].iter().rev() {
+            let Some(cb_oxc) = arg_expr(cl, 0) else { return Ok(None) };
+            let cbe = self.expr(cb_oxc)?;
+            let Some(z::Type::Func(fid)) = self.ztype_of(&cbe) else { return Ok(None) };
+            let ft = self.func_types.borrow()[fid as usize].clone();
+            let f_ty = z::Type::Func(fid);
+            let p = stages.len();
+            match meth {
+                "map" => {
+                    let Some(out) = ft.ret.as_elem() else { return Ok(None) };
+                    if ft.params != [cur_elem.to_type()] {
+                        return Ok(None);
+                    }
+                    let (cbk, carr) = self.classify_cb(&cbe, f_ty, &format!("__cb{p}"));
+                    carrier_args.extend(carr);
+                    stages.push((cbk, FKind::Map(out)));
+                    cur_elem = out;
+                }
+                "filter" => {
+                    if ft.params != [cur_elem.to_type()] || ft.ret != z::Type::Bool {
+                        return Ok(None);
+                    }
+                    let (cbk, carr) = self.classify_cb(&cbe, f_ty, &format!("__cb{p}"));
+                    carrier_args.extend(carr);
+                    stages.push((cbk, FKind::Filter));
+                }
+                _ => return Ok(None), // a non-map/filter middle: not fusible
+            }
+        }
+        // terminal reduce: (acc, x) => acc, init
+        let (_, term_call) = raw[0];
+        if term_call.arguments.len() != 2 {
+            return Ok(None);
+        }
+        let (Some(cb_oxc), Some(init_oxc)) = (arg_expr(term_call, 0), arg_expr(term_call, 1)) else {
+            return Ok(None);
+        };
+        let cbe = self.expr(cb_oxc)?;
+        let Some(z::Type::Func(fid)) = self.ztype_of(&cbe) else { return Ok(None) };
+        let ft = self.func_types.borrow()[fid as usize].clone();
+        let Some(acc) = ft.ret.as_elem() else { return Ok(None) };
+        if ft.params != [ft.ret, cur_elem.to_type()] {
+            return Ok(None);
+        }
+        let init = self.expr(init_oxc)?;
+        if self.ztype_of(&init) != Some(ft.ret) {
+            return Ok(None);
+        }
+        let p = stages.len();
+        let (term_cbk, term_carr) = self.classify_cb(&cbe, z::Type::Func(fid), &format!("__cb{p}"));
+        carrier_args.extend(term_carr);
+        stages.push((term_cbk, FKind::Reduce(acc)));
+        // 5. Dedup key: encodes the base element, each stage's method + callback
+        //    identity (a Direct/DirectEnv lambda name → its own helper) + map out
+        //    types, and the reduce acc type. Distinct chains never collide.
+        let key = fuse_key(base_elem, &stages);
+        let ret_ty = acc.to_type();
+        let name = self.ensure_helper(key, ret_ty, |n| build_fused_helper(n, base_elem, &stages));
+        // 6. Emit the call: arr, carriers (stage order, Direct stages contribute
+        //    none), then the reduce init.
+        let mut args = vec![base];
+        args.extend(carrier_args);
+        args.push(init);
+        Ok(Some(z::Expr::Call { name, args }))
     }
 
     /// Generate (once) and register a synthesized array helper, returning its name.
@@ -2519,6 +2637,15 @@ impl Lower<'_> {
         // receiver's class via the type tracker.
         if let Expression::StaticMemberExpression(m) = &c.callee {
             let method = m.property.name.as_str();
+            // FUSION: a map/filter…reduce chain (≥2 stages) lowers to one fused
+            // helper (no intermediate arrays). Checked at the OXC level before
+            // lowering the receiver, since a lowered receiver is already a nested
+            // helper call. Bails cheaply (no lowering) for non-fusible shapes.
+            if method == "reduce" {
+                if let Some(fused) = self.try_fuse_chain(c)? {
+                    return Ok(fused);
+                }
+            }
             let recv = self.expr(&m.object)?;
             // Builtin array methods (push/pop/map/filter/reduce) on an array receiver.
             if let Some(z::Type::Array(elem)) = self.ztype_of(&recv) {
@@ -2857,6 +2984,11 @@ fn expr_has_var(e: &z::Expr) -> bool {
     }
 }
 
+/// The `i`th call argument as an expression (None if absent or a spread).
+fn arg_expr<'e, 'a>(cl: &'e CallExpression<'a>, i: usize) -> Option<&'e Expression<'a>> {
+    cl.arguments.get(i).and_then(|a| a.as_expression())
+}
+
 /// If `e` is an optional member access `base?.field`, return that member.
 fn optional_member<'e, 'a>(e: &'e Expression<'a>) -> Option<&'e StaticMemberExpression<'a>> {
     if let Expression::ChainExpression(c) = e {
@@ -2959,13 +3091,40 @@ fn arr_at_i() -> z::Expr {
         index: Box::new(z::Expr::Var("__i".into())),
     }
 }
-/// `f(args)` — call the callback parameter.
-fn call_f(f_ty: z::Type, args: Vec<z::Expr>) -> z::Expr {
-    let sig = match f_ty {
-        z::Type::Func(id) => id,
-        _ => 0,
-    };
-    z::Expr::CallValue { callee: Box::new(z::Expr::Var("f".into())), args, sig }
+/// A stage of a FUSED array-method chain (application order). `Map` transforms
+/// the element (to its `Elem` output type); `Filter` drops non-matching elements;
+/// `Reduce` (terminal only) folds into an accumulator of its `Elem` type.
+enum FKind {
+    Map(z::Elem),
+    Filter,
+    Reduce(z::Elem),
+}
+
+/// Array methods that produce an array (so they can be a MIDDLE stage of a fused
+/// chain). Terminal-only methods (reduce/some/every/findIndex) are not here.
+fn is_array_producing(method: &str) -> bool {
+    matches!(method, "map" | "filter")
+}
+
+/// The `ensure_helper` dedup key for a fused chain: base element + each stage's
+/// method, callback identity (a Direct/DirectEnv lambda name gets its own helper;
+/// Indirect is keyed only by position since the function value is a parameter),
+/// and map-output / reduce-acc element types. Distinct chains never collide.
+fn fuse_key(base_elem: z::Elem, stages: &[(Cb, FKind)]) -> String {
+    let mut k = format!("__fuse_{}", elem_tag(base_elem));
+    for (i, (cb, kind)) in stages.iter().enumerate() {
+        let id = match cb {
+            Cb::Direct(n) => format!("d{n}"),
+            Cb::DirectEnv { name, .. } => format!("e{name}"),
+            Cb::Indirect { .. } => format!("i{i}"),
+        };
+        match kind {
+            FKind::Map(out) => k.push_str(&format!("_m{}_{id}", elem_tag(*out))),
+            FKind::Filter => k.push_str(&format!("_f{id}")),
+            FKind::Reduce(acc) => k.push_str(&format!("_r{}_{id}", elem_tag(*acc))),
+        }
+    }
+    k
 }
 
 /// How a synthesized array helper invokes its callback. The `Direct`/`DirectEnv`
@@ -2973,25 +3132,44 @@ fn call_f(f_ty: z::Type, args: Vec<z::Expr>) -> z::Expr {
 /// the per-element work (no indirect call), the way V8 specializes after warmup;
 /// `Indirect` is the generic helper that takes `f` as a function value.
 enum Cb {
-    /// Generic: indirect call `f(args)` through an `f: <Func>` parameter (the
-    /// callback is an unknown function value).
-    Indirect(z::Type),
+    /// Generic: indirect call `carrier(args)` through a `carrier: <Func>` parameter
+    /// (the callback is an unknown function value).
+    Indirect { f_ty: z::Type, carrier: String },
     /// Direct call `name(args)` to a known NON-capturing function (a lifted arrow
-    /// or a named function). The helper omits `f`.
+    /// or a named function). No carrier parameter.
     Direct(String),
-    /// Direct call `name(__env, args)` to a known CAPTURING closure's lifted
-    /// function; the helper takes an `__env: Struct(env_id)` parameter (the caller
-    /// passes a reconstructed env struct). The helper omits `f`.
-    DirectEnv { name: String, env_id: u32 },
+    /// Direct call `name(carrier, args)` to a known CAPTURING closure's lifted
+    /// function; the helper takes a `carrier: Struct(env_id)` parameter (the caller
+    /// passes a reconstructed env struct).
+    DirectEnv { name: String, env_id: u32, carrier: String },
+}
+
+impl Cb {
+    /// The carrier parameter (name, type) this callback needs, if any.
+    fn carrier_param(&self) -> Option<z::Param> {
+        match self {
+            Cb::Indirect { f_ty, carrier } => Some(z::Param { name: carrier.clone(), ty: *f_ty }),
+            Cb::Direct(_) => None,
+            Cb::DirectEnv { env_id, carrier, .. } => {
+                Some(z::Param { name: carrier.clone(), ty: z::Type::Struct(*env_id) })
+            }
+        }
+    }
 }
 
 /// Build the callback invocation inside a helper body, per [`Cb`].
 fn call_cb(cb: &Cb, args: Vec<z::Expr>) -> z::Expr {
     match cb {
-        Cb::Indirect(f_ty) => call_f(*f_ty, args),
+        Cb::Indirect { f_ty, carrier } => {
+            let sig = match f_ty {
+                z::Type::Func(id) => *id,
+                _ => 0,
+            };
+            z::Expr::CallValue { callee: Box::new(z::Expr::Var(carrier.clone())), args, sig }
+        }
         Cb::Direct(name) => z::Expr::Call { name: name.clone(), args },
-        Cb::DirectEnv { name, .. } => {
-            let mut a = vec![z::Expr::Var("__env".into())];
+        Cb::DirectEnv { name, carrier, .. } => {
+            let mut a = vec![z::Expr::Var(carrier.clone())];
             a.extend(args);
             z::Expr::Call { name: name.clone(), args: a }
         }
@@ -2999,19 +3177,58 @@ fn call_cb(cb: &Cb, args: Vec<z::Expr>) -> z::Expr {
 }
 
 /// Leading params for a callback helper: `arr: T[]`, then the callback-carrying
-/// param (`f` for `Indirect`, `__env` for `DirectEnv`, none for `Direct`), then
-/// any `extra` trailing params (e.g. `init` for reduce).
+/// param (none for `Direct`), then any `extra` trailing params (`init` for reduce).
 fn cb_params(t: z::Elem, cb: &Cb, extra: Vec<z::Param>) -> Vec<z::Param> {
     let mut p = vec![z::Param { name: "arr".into(), ty: z::Type::Array(t) }];
-    match cb {
-        Cb::Indirect(f_ty) => p.push(z::Param { name: "f".into(), ty: *f_ty }),
-        Cb::Direct(_) => {}
-        Cb::DirectEnv { env_id, .. } => {
-            p.push(z::Param { name: "__env".into(), ty: z::Type::Struct(*env_id) })
-        }
-    }
+    p.extend(cb.carrier_param());
     p.extend(extra);
     p
+}
+
+/// The FUSED-chain helper (v1: `map`/`filter` middles + a `reduce` terminal).
+/// Iterates `arr` ONCE, threading each element through the map/filter stages
+/// (fresh `__vN` per map since the element type changes; `if (!pred) continue`
+/// per filter), folding into `__acc` seeded from the `init` param. No
+/// intermediate arrays. Params: `arr`, each stage's carrier (Direct stages have
+/// none), then `init`.
+fn build_fused_helper(name: &str, base_elem: z::Elem, stages: &[(Cb, FKind)]) -> z::Func {
+    use z::{StmtKind, Type};
+    let (term_cb, term_kind) = stages.last().expect("fused chain has a terminal");
+    let acc = match term_kind {
+        FKind::Reduce(a) => *a,
+        _ => unreachable!("v1 fused terminal is reduce"),
+    };
+    // Per-element loop body.
+    let mut body: Vec<z::Stmt> = vec![let_("__v0", arr_at_i())];
+    let mut cur = "__v0".to_string();
+    let mut vc = 0usize;
+    for (cb, kind) in &stages[..stages.len() - 1] {
+        match kind {
+            FKind::Map(_) => {
+                vc += 1;
+                let nv = format!("__v{vc}");
+                body.push(let_(&nv, call_cb(cb, vec![var(&cur)])));
+                cur = nv;
+            }
+            FKind::Filter => body.push(if_then(
+                z::Expr::Unary { op: z::UnOp::Not, e: Box::new(call_cb(cb, vec![var(&cur)])) },
+                vec![stmt(StmtKind::Continue)],
+            )),
+            FKind::Reduce(_) => unreachable!("reduce is terminal-only"),
+        }
+    }
+    body.push(assign(var("__acc"), call_cb(term_cb, vec![var("__acc"), var(&cur)])));
+    let fn_body = vec![
+        stmt(StmtKind::Let { name: "__acc".into(), ty: Some(acc.to_type()), value: var("init") }),
+        for_i(body),
+        ret(var("__acc")),
+    ];
+    let mut params = vec![z::Param { name: "arr".into(), ty: Type::Array(base_elem) }];
+    for (cb, _) in stages {
+        params.extend(cb.carrier_param());
+    }
+    params.push(z::Param { name: "init".into(), ty: acc.to_type() });
+    z::Func { name: name.into(), params, ret: acc.to_type(), body: fn_body }
 }
 
 /// `function __map_T_U(arr: T[], f: (T)=>U): U[] { let __r: U[] = []; for (…) __r.push(f(arr[__i])); return __r; }`
