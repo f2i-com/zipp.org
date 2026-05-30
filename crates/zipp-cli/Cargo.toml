@@ -28,3 +28,4 @@ zipp-jit = { path = "../zipp-jit", optional = true }
 zipp-llvm = { path = "../zipp-llvm", optional = true }
 zipp-wasm = { path = "../zipp-wasm", optional = true }
 zipp-ts = { path = "../zipp-ts", optional = true }
+zipp-js = { path = "../zipp-js" }

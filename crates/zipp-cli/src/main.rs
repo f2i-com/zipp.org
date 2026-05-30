@@ -58,10 +58,26 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             run_file(&path, prove, jit, llvm, wasm, gas, fast_math)
         }
+        Some("js") => {
+            // Dynamic JavaScript engine (Lane 3): run untyped JS with real JS
+            // semantics (separate from the typed AOT pipeline).
+            let path = it.next().ok_or("usage: zipp js <file.js>")?;
+            let src =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            let outcome = zipp_js::run(&src)?;
+            for line in &outcome.output {
+                println!("{line}");
+            }
+            if let Some(err) = outcome.error {
+                return Err(err);
+            }
+            Ok(())
+        }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
             println!("usage:");
             println!("  zipp run <file.zipp|.ts>        compile + run (.ts uses the oxc TypeScript frontend)");
+            println!("  zipp js <file.js>               run dynamic JavaScript (Lane 3 engine)");
             println!("  zipp run --jit <file.zipp>      Cranelift JIT (fast-compile tier-0)");
             println!("  zipp run --llvm <file.zipp>     clang -O3 release tier");
             println!("  zipp run --wasm <file.zipp>     gas-metered WebAssembly (contract profile; --gas N)");

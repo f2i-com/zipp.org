@@ -1247,6 +1247,7 @@ name = "zipp-cli"
 version = "0.0.1"
 dependencies = [
  "zipp-jit",
+ "zipp-js",
  "zipp-llvm",
  "zipp-ts",
  "zipp-wasm",
