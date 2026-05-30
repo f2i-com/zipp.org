@@ -109,6 +109,12 @@ impl Object {
             self.order.push(key.to_string());
         }
     }
+    /// Set an own property that is *non-enumerable* (kept out of `order`, so
+    /// for-in / Object.keys skip it). Used for spec-non-enumerable props such as
+    /// a prototype's `constructor` back-link.
+    pub fn set_hidden(&mut self, key: &str, v: JsValue) {
+        self.props.insert(key.to_string(), v);
+    }
     /// Install/extend an accessor (getter and/or setter) for `key`.
     pub fn define_accessor(&mut self, key: &str, get: Option<JsValue>, set: Option<JsValue>) {
         if !self.accessors.contains_key(key) && !self.props.contains_key(key) {

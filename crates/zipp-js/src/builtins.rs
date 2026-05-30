@@ -181,6 +181,7 @@ pub fn install(it: &Interp) {
     }
     let error_ctor = Object::native("Error", error_ctor_fn);
     error_ctor.borrow_mut().set("prototype", JsValue::Object(error_proto.clone()));
+    error_proto.borrow_mut().set_hidden("constructor", JsValue::Object(error_ctor.clone()));
     it.error_protos.borrow_mut().insert("Error".into(), error_proto.clone());
     decl("Error", JsValue::Object(error_ctor));
     for sub in ["TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError"] {
@@ -193,6 +194,7 @@ pub fn install(it: &Interp) {
         }
         let ctor = Object::native(sub, error_ctor_fn);
         ctor.borrow_mut().set("prototype", JsValue::Object(proto.clone()));
+        proto.borrow_mut().set_hidden("constructor", JsValue::Object(ctor.clone()));
         it.error_protos.borrow_mut().insert(sub.to_string(), proto.clone());
         decl(sub, JsValue::Object(ctor));
     }

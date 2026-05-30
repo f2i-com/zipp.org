@@ -199,6 +199,27 @@ mod tests {
     }
 
     #[test]
+    fn error_constructor_and_fn_name() {
+        // constructed error: .constructor identity + .name (BUG21)
+        assert_eq!(out("const e=new TypeError('m'); console.log(e.constructor===TypeError, e.constructor.name, e.name, e instanceof Error)"), "true TypeError TypeError true");
+        // engine-thrown error caught: e.constructor.name (the original BUG21 repro)
+        assert_eq!(out("try{null.x}catch(err){console.log(err.constructor.name, err.name)}"), "TypeError TypeError");
+        assert_eq!(out("console.log((new Error()).constructor.name, (new RangeError()).constructor.name)"), "Error RangeError");
+        // native constructor .name (was undefined)
+        assert_eq!(out("console.log(TypeError.name)"), "TypeError");
+        assert_eq!(out("console.log(Error.name)"), "Error");
+        assert_eq!(out("console.log(RangeError.name)"), "RangeError");
+        assert_eq!(out("console.log(Object.is.name)"), "is");
+        // function .name / .length and new X().constructor
+        assert_eq!(out("function Bar(a,b){} var x=new Bar(); console.log(x.constructor===Bar, x.constructor.name, Bar.name, Bar.length)"), "true Bar Bar 2");
+        // class instance .constructor
+        assert_eq!(out("class Foo{} var f=new Foo(); console.log(f.constructor===Foo, f.constructor.name)"), "true Foo");
+        // `constructor` is readable but non-enumerable (not in Object.keys / for-in)
+        assert_eq!(out("console.log(Object.keys(TypeError.prototype).includes('constructor'), TypeError.prototype.constructor===TypeError)"), "false true");
+        assert_eq!(out("class Q{} var k=[]; for(const x in Q.prototype) k.push(x); console.log(JSON.stringify(k))"), "[]");
+    }
+
+    #[test]
     fn object_is() {
         // SameValue: NaN==NaN, +0!=-0, otherwise like ===
         assert_eq!(out("console.log(Object.is(NaN, NaN), Object.is(0, -0), Object.is(-0, -0))"), "true false true");

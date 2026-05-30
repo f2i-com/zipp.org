@@ -795,9 +795,35 @@ impl Interp {
                 // (so `C.prototype.m = …` and `new C()` work)
                 let is_fn = matches!(o.borrow().data, ObjData::Function { .. } | ObjData::Native { .. });
                 if is_fn && key == "prototype" {
-                    let v = JsValue::Object(Object::plain());
+                    // auto-vivify the prototype with a `constructor` back-link so
+                    // `F.prototype.constructor === F` and `new F().constructor === F`.
+                    let p = Object::plain();
+                    p.borrow_mut().set_hidden("constructor", obj.clone());
+                    let v = JsValue::Object(p);
                     o.borrow_mut().set(key, v.clone());
                     return Ok(v);
+                }
+                if is_fn {
+                    // functions expose `name`/`length` as synthesized (non-stored) props
+                    let b = o.borrow();
+                    match key {
+                        "name" => {
+                            let n = match &b.data {
+                                ObjData::Function { def, .. } => def.name.clone().unwrap_or_default(),
+                                ObjData::Native { name, .. } => name.clone(),
+                                _ => String::new(),
+                            };
+                            return Ok(JsValue::str(n));
+                        }
+                        "length" => {
+                            let len = match &b.data {
+                                ObjData::Function { def, .. } => def.params.len() as f64,
+                                _ => 0.0,
+                            };
+                            return Ok(JsValue::Num(len));
+                        }
+                        _ => {}
+                    }
                 }
                 Ok(JsValue::Undefined)
             }
