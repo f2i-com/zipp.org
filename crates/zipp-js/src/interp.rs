@@ -36,7 +36,11 @@ impl Default for Interp {
 
 impl Interp {
     pub fn new() -> Interp {
-        let it = Interp { global: Scope::global(), out: RefCell::new(Vec::new()) };
+        let it = Interp {
+            global: Scope::global(),
+            out: RefCell::new(Vec::new()),
+            error_protos: RefCell::new(std::collections::HashMap::new()),
+        };
         crate::builtins::install(&it);
         it
     }
@@ -944,13 +948,18 @@ impl Interp {
         self.make_error("RangeError", msg)
     }
 
-    /// Build an `Error`-like object `{ name, message }` (the prototype chain +
-    /// real `Error` constructors come in a later tier).
+    /// Build an `Error` object with `message`, linked to the matching built-in
+    /// error prototype (so `name` is inherited and `instanceof Error` works). If
+    /// no prototype is registered (shouldn't happen post-install), `name` is set
+    /// as an own property as a fallback.
     pub fn make_error(&self, name: &str, msg: &str) -> JsValue {
         let o = Object::plain();
         {
             let mut b = o.borrow_mut();
-            b.set("name", JsValue::str(name));
+            match self.error_protos.borrow().get(name) {
+                Some(p) => b.proto = Some(p.clone()),
+                None => b.set("name", JsValue::str(name)),
+            }
             b.set("message", JsValue::str(msg));
             b.set("stack", JsValue::str(format!("{name}: {msg}")));
         }

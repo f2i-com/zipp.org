@@ -129,11 +129,79 @@ pub fn install(it: &Interp) {
     // Boolean (callable)
     decl("Boolean", nf("Boolean", |_, _, a| Ok(JsValue::Bool(a.first().map(|v| v.truthy()).unwrap_or(false)))));
 
+    // Error hierarchy: `Error` plus the standard subclasses, with linked
+    // prototypes so `new TypeError(m) instanceof Error` is true. Each prototype
+    // is registered in `it.error_protos` so engine-thrown errors share it.
+    let error_proto = Object::plain();
+    {
+        let mut b = error_proto.borrow_mut();
+        b.set("name", JsValue::str("Error"));
+        b.set("message", JsValue::str(""));
+        b.set("toString", nf("toString", error_to_string));
+    }
+    let error_ctor = Object::native("Error", error_ctor_fn);
+    error_ctor.borrow_mut().set("prototype", JsValue::Object(error_proto.clone()));
+    it.error_protos.borrow_mut().insert("Error".into(), error_proto.clone());
+    decl("Error", JsValue::Object(error_ctor));
+    for sub in ["TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError"] {
+        let proto = Object::plain();
+        {
+            let mut b = proto.borrow_mut();
+            b.set("name", JsValue::str(sub));
+            b.set("message", JsValue::str(""));
+            b.proto = Some(error_proto.clone()); // subclass.prototype.[[Proto]] = Error.prototype
+        }
+        let ctor = Object::native(sub, error_ctor_fn);
+        ctor.borrow_mut().set("prototype", JsValue::Object(proto.clone()));
+        it.error_protos.borrow_mut().insert(sub.to_string(), proto.clone());
+        decl(sub, JsValue::Object(ctor));
+    }
+
     // global functions
     decl("parseInt", nf("parseInt", global_parse_int));
     decl("parseFloat", nf("parseFloat", global_parse_float));
     decl("isNaN", nf("isNaN", |_, _, a| Ok(JsValue::Bool(n(a, 0).is_nan()))));
     decl("isFinite", nf("isFinite", |_, _, a| Ok(JsValue::Bool(n(a, 0).is_finite()))));
+}
+
+/// `Error(msg)` / `new Error(msg)` (shared by all error subclasses — `name`
+/// comes from the prototype). With `new`, `this` is the fresh object; called
+/// plainly, a fresh `Error`-proto'd object is created.
+fn error_ctor_fn(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
+    let target = if matches!(this, JsValue::Object(_)) {
+        this.clone()
+    } else {
+        let o = Object::plain();
+        if let Some(p) = it.error_protos.borrow().get("Error") {
+            o.borrow_mut().proto = Some(p.clone());
+        }
+        JsValue::Object(o)
+    };
+    if let Some(m) = args.first() {
+        if !matches!(m, JsValue::Undefined) {
+            it.set_member(&target, "message", JsValue::str(m.to_js_string()))?;
+        }
+    }
+    let name = it.get_member(&target, "name")?.to_js_string();
+    let msg = it.get_member(&target, "message")?.to_js_string();
+    let stack = if msg.is_empty() { name } else { format!("{name}: {msg}") };
+    it.set_member(&target, "stack", JsValue::str(stack))?;
+    // `new` ignores a non-object return, so returning `target` is correct for
+    // both `new Error()` (returns target == this) and `Error()` (returns it).
+    Ok(target)
+}
+
+/// `Error.prototype.toString()` → `name`, or `name: message`.
+fn error_to_string(it: &Interp, this: &JsValue, _args: &[JsValue]) -> EvalResult<JsValue> {
+    let name = it.get_member(this, "name")?.to_js_string();
+    let msg = it.get_member(this, "message")?.to_js_string();
+    Ok(JsValue::str(if msg.is_empty() {
+        name
+    } else if name.is_empty() {
+        msg
+    } else {
+        format!("{name}: {msg}")
+    }))
 }
 
 fn console_log(it: &Interp, _this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {

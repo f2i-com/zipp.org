@@ -56,10 +56,24 @@ pub fn run(src: &str) -> Result<Outcome, String> {
 
 fn format_thrown(v: &JsValue) -> String {
     if let JsValue::Object(o) = v {
-        let b = o.borrow();
-        if let Some(name) = b.props.get("name") {
-            let msg = b.props.get("message").map(|m| m.to_js_string()).unwrap_or_default();
-            return format!("Uncaught {}: {}", name.to_js_string(), msg);
+        // `name` is typically inherited from the error prototype; `message` is an
+        // own property. Walk the chain for either.
+        let lookup = |key: &str| -> Option<String> {
+            let mut cur = Some(o.clone());
+            while let Some(c) = cur {
+                if let Some(val) = c.borrow().props.get(key) {
+                    return Some(val.to_js_string());
+                }
+                cur = c.borrow().proto.clone();
+            }
+            None
+        };
+        if let Some(name) = lookup("name") {
+            let msg = lookup("message").unwrap_or_default();
+            if msg.is_empty() {
+                return format!("Uncaught {name}");
+            }
+            return format!("Uncaught {name}: {msg}");
         }
     }
     format!("Uncaught {}", v.display())
@@ -195,6 +209,27 @@ mod tests {
         assert_eq!(out("console.log(JSON.parse('{\"x\": 42}').x)"), "42");
         assert_eq!(out("console.log(parseInt('0xff'))"), "255");
         assert_eq!(out("console.log(typeof 5, typeof 'a', typeof undefined, typeof (() => 1))"), "number string undefined function");
+    }
+
+    #[test]
+    fn error_constructors() {
+        assert_eq!(out("const e=new Error('boom'); console.log(e.message, e.name)"), "boom Error");
+        assert_eq!(out("console.log(new Error('x') instanceof Error)"), "true");
+        assert_eq!(out("console.log(new TypeError('t').name, new TypeError('t') instanceof Error)"), "TypeError true");
+        assert_eq!(out("console.log(new RangeError('r') instanceof Error, new RangeError('r') instanceof RangeError)"), "true true");
+        assert_eq!(out("console.log(new Error('m').toString())"), "Error: m");
+        assert_eq!(out("console.log(new TypeError('z').toString())"), "TypeError: z");
+        assert_eq!(out("console.log(new Error().message === '', new Error().name)"), "true Error");
+        // thrown user error is catchable + carries message/instanceof
+        assert_eq!(
+            out("try { throw new Error('thrown'); } catch (e) { console.log(e.message, e instanceof Error); }"),
+            "thrown true"
+        );
+        // engine-thrown error shares the prototype chain
+        assert_eq!(
+            out("try { null.x; } catch (e) { console.log(e.name, e instanceof TypeError, e instanceof Error); }"),
+            "TypeError true true"
+        );
     }
 
     #[test]
