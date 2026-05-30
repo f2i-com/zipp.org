@@ -152,13 +152,16 @@ fn arr_join(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue
         None | Some(JsValue::Undefined) => ",".to_string(),
         Some(v) => v.to_js_string(),
     };
-    let parts: Vec<String> = snapshot(&o)
-        .iter()
-        .map(|v| match v {
+    // Route each element through ToString so a user-defined toString() runs;
+    // snapshot first so the array borrow is released before re-entering user code.
+    let items = snapshot(&o);
+    let mut parts: Vec<String> = Vec::with_capacity(items.len());
+    for v in &items {
+        parts.push(match v {
             JsValue::Undefined | JsValue::Null => String::new(),
-            other => other.to_js_string(),
-        })
-        .collect();
+            other => it.to_string(other)?,
+        });
+    }
     Ok(JsValue::str(parts.join(&sep)))
 }
 

@@ -166,6 +166,15 @@ mod tests {
     }
 
     #[test]
+    fn array_join_to_string() {
+        assert_eq!(out("var o={toString(){return 'X'}}; console.log([o,o].join('|'))"), "X|X");
+        assert_eq!(out("var p={v:7,toString(){return '<'+this.v+'>'}}; console.log([p,5,p].join(' '))"), "<7> 5 <7>");
+        assert_eq!(out("console.log([{a:1},{b:2}].join(','))"), "[object Object],[object Object]");
+        assert_eq!(out("console.log([1,null,2,undefined,3].join(','))"), "1,,2,,3");
+        assert_eq!(out("console.log([[1,2],[3,4]].join(';'), [1,[2,[3,4]]].join('-'))"), "1,2;3,4 1-2,3,4");
+    }
+
+    #[test]
     fn object_is() {
         // SameValue: NaN==NaN, +0!=-0, otherwise like ===
         assert_eq!(out("console.log(Object.is(NaN, NaN), Object.is(0, -0), Object.is(-0, -0))"), "true false true");
