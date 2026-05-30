@@ -41,6 +41,26 @@ fn stmt(s: &ox::Statement) -> R<Stmt> {
             cond: expr(&d.test)?,
         },
         S::ForStatement(f) => for_stmt(f)?,
+        S::ForOfStatement(f) => {
+            let (decl, name) = for_left(&f.left)?;
+            Stmt::ForOf { decl, name, iterable: expr(&f.right)?, body: Box::new(stmt(&f.body)?) }
+        }
+        S::ForInStatement(f) => {
+            let (decl, name) = for_left(&f.left)?;
+            Stmt::ForIn { decl, name, object: expr(&f.right)?, body: Box::new(stmt(&f.body)?) }
+        }
+        S::SwitchStatement(sw) => {
+            let disc = expr(&sw.discriminant)?;
+            let mut cases = Vec::new();
+            for c in &sw.cases {
+                let test = match &c.test {
+                    Some(e) => Some(expr(e)?),
+                    None => None,
+                };
+                cases.push((test, c.consequent.iter().map(stmt).collect::<R<Vec<_>>>()?));
+            }
+            Stmt::Switch { disc, cases }
+        }
         S::ReturnStatement(r) => Stmt::Return(match &r.argument {
             Some(a) => Some(expr(a)?),
             None => None,
@@ -104,6 +124,21 @@ fn for_stmt(f: &ox::ForStatement) -> R<Stmt> {
         },
         body: Box::new(stmt(&f.body)?),
     })
+}
+
+fn for_left(left: &ox::ForStatementLeft) -> R<(Option<DeclKind>, String)> {
+    match left {
+        ox::ForStatementLeft::VariableDeclaration(d) => {
+            let kind = match d.kind {
+                ox::VariableDeclarationKind::Var => DeclKind::Var,
+                ox::VariableDeclarationKind::Const => DeclKind::Const,
+                _ => DeclKind::Let,
+            };
+            Ok((Some(kind), binding_name(&d.declarations[0].id)?))
+        }
+        ox::ForStatementLeft::AssignmentTargetIdentifier(id) => Ok((None, id.name.to_string())),
+        _ => Err("for-of/for-in needs a simple variable target (v0)".into()),
+    }
 }
 
 fn try_stmt(t: &ox::TryStatement) -> R<Stmt> {
@@ -475,6 +510,16 @@ fn logical(l: &ox::LogicalExpression) -> R<Expr> {
 
 fn assign(a: &ox::AssignmentExpression) -> R<Expr> {
     use ox::AssignmentOperator as Op;
+    let target = Box::new(assign_target(&a.left)?);
+    let value = Box::new(expr(&a.right)?);
+    if let Some(op) = match a.operator {
+        Op::LogicalAnd => Some(LogicalOp::And),
+        Op::LogicalOr => Some(LogicalOp::Or),
+        Op::LogicalNullish => Some(LogicalOp::Nullish),
+        _ => None,
+    } {
+        return Ok(Expr::LogicalAssign { op, target, value });
+    }
     let op = match a.operator {
         Op::Assign => None,
         Op::Addition => Some(BinOp::Add),
@@ -491,11 +536,7 @@ fn assign(a: &ox::AssignmentExpression) -> R<Expr> {
         Op::ShiftRightZeroFill => Some(BinOp::UShr),
         _ => return Err("`&&=`/`||=`/`??=` aren't in the v0 JS engine yet".into()),
     };
-    Ok(Expr::Assign {
-        op,
-        target: Box::new(assign_target(&a.left)?),
-        value: Box::new(expr(&a.right)?),
-    })
+    Ok(Expr::Assign { op, target, value })
 }
 
 fn assign_target(t: &ox::AssignmentTarget) -> R<Expr> {

@@ -196,4 +196,43 @@ mod tests {
         assert_eq!(out("console.log(parseInt('0xff'))"), "255");
         assert_eq!(out("console.log(typeof 5, typeof 'a', typeof undefined, typeof (() => 1))"), "number string undefined function");
     }
+
+    #[test]
+    fn classes_and_inheritance() {
+        assert_eq!(
+            out("class P { constructor(x,y){ this.x=x; this.y=y; } sum(){ return this.x+this.y; } static make(){ return new P(1,2); } } const p = new P(3,4); console.log(p.sum(), P.make().sum(), p instanceof P)"),
+            "7 3 true"
+        );
+        assert_eq!(
+            out("class C { n=0; inc(){ this.n++; return this; } } const c = new C(); c.inc().inc(); console.log(c.n)"),
+            "2"
+        );
+        assert_eq!(
+            out("class A { constructor(n){ this.n=n; } who(){ return 'A'+this.n; } } class B extends A { who(){ return super.who()+'/B'; } } const b = new B(5); console.log(b.who(), b instanceof A, b instanceof B)"),
+            "A5/B true true"
+        );
+        assert_eq!(out("const o={a:1}; console.log('a' in o, 'b' in o)"), "true false");
+    }
+
+    #[test]
+    fn spread_and_params() {
+        assert_eq!(out("function s(...xs){ return xs.reduce((a,b)=>a+b,0); } console.log(s(1,2,3,4))"), "10");
+        assert_eq!(out("const a=[1,2], b=[3,4]; console.log([...a,...b,5].join(','))"), "1,2,3,4,5");
+        assert_eq!(out("function f(x,y,z){ return x+y+z; } console.log(f(...[1,2,3]))"), "6");
+        assert_eq!(out("console.log(Math.max(...[3,7,2]))"), "7");
+        assert_eq!(out("function g(a,b=10){ return a+b; } console.log(g(5), g(5,1))"), "15 6");
+        assert_eq!(out("const m=(a,b=2)=>a*b; console.log(m(5), m(5,3))"), "10 15");
+    }
+
+    #[test]
+    fn loops_switch_logical_assign() {
+        assert_eq!(out("let s=0; for (const x of [1,2,3,4]) s+=x; console.log(s)"), "10");
+        assert_eq!(out("let r=''; for (const c of 'abc') r+=c.toUpperCase(); console.log(r)"), "ABC");
+        assert_eq!(out("const o={a:1,b:2}; let k=[]; for (const x in o) k.push(x); console.log(k.join(','))"), "a,b");
+        assert_eq!(out("function g(n){ switch(n){ case 1: return 'one'; case 2: return 'two'; default: return '?'; } } console.log(g(1),g(2),g(9))"), "one two ?");
+        assert_eq!(out("function d(n){ switch(n){ case 0: case 6: return 'wknd'; default: return 'wk'; } } console.log(d(6),d(3))"), "wknd wk");
+        assert_eq!(out("let a=0; a||=5; let b=2; b||=9; console.log(a,b)"), "5 2");
+        assert_eq!(out("let x; x??='d'; let y=0; y??='e'; console.log(x,y)"), "d 0");
+        assert_eq!(out("let p=1; p&&=7; let q=0; q&&=7; console.log(p,q)"), "7 0");
+    }
 }
