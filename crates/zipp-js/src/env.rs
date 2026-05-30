@@ -6,22 +6,52 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
 use crate::value::JsValue;
 
+/// FxHash — rustc's fast non-cryptographic hash. The default `HashMap` uses
+/// SipHash (DoS-resistant but slow); variable names are short, trusted, and
+/// looked up on every identifier access, so a cheap hash is a big interpreter
+/// win. Byte-wise variant (simple + correct; keys are short).
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const K: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.hash;
+        for &b in bytes {
+            h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(K);
+        }
+        self.hash = h;
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// A variable map keyed by name, using the fast FxHash hasher.
+pub type VarMap = HashMap<String, JsValue, BuildHasherDefault<FxHasher>>;
+
 pub struct Scope {
-    pub vars: HashMap<String, JsValue>,
+    pub vars: VarMap,
     pub parent: Option<Rc<RefCell<Scope>>>,
 }
 
 impl Scope {
     pub fn global() -> Rc<RefCell<Scope>> {
-        Rc::new(RefCell::new(Scope { vars: HashMap::new(), parent: None }))
+        Rc::new(RefCell::new(Scope { vars: VarMap::default(), parent: None }))
     }
 
     pub fn child(parent: &Rc<RefCell<Scope>>) -> Rc<RefCell<Scope>> {
-        Rc::new(RefCell::new(Scope { vars: HashMap::new(), parent: Some(parent.clone()) }))
+        Rc::new(RefCell::new(Scope { vars: VarMap::default(), parent: Some(parent.clone()) }))
     }
 
     /// Declare (or redeclare) a binding in this frame.
@@ -34,11 +64,17 @@ impl Scope {
 pub fn get(scope: &Rc<RefCell<Scope>>, name: &str) -> Option<JsValue> {
     let mut cur = scope.clone();
     loop {
-        if let Some(v) = cur.borrow().vars.get(name) {
-            return Some(v.clone());
-        }
-        let parent = cur.borrow().parent.clone();
-        match parent {
+        // One borrow per frame: read the var (returning if found) and grab the
+        // parent link in the same borrow, so we clone the parent `Rc` at most
+        // once per level (not twice).
+        let next = {
+            let b = cur.borrow();
+            if let Some(v) = b.vars.get(name) {
+                return Some(v.clone());
+            }
+            b.parent.clone()
+        };
+        match next {
             Some(p) => cur = p,
             None => return None,
         }
@@ -51,12 +87,15 @@ pub fn get(scope: &Rc<RefCell<Scope>>, name: &str) -> Option<JsValue> {
 pub fn set(scope: &Rc<RefCell<Scope>>, name: &str, v: JsValue) -> bool {
     let mut cur = scope.clone();
     loop {
-        if cur.borrow().vars.contains_key(name) {
-            cur.borrow_mut().vars.insert(name.to_string(), v);
-            return true;
+        {
+            let mut b = cur.borrow_mut();
+            if let Some(slot) = b.vars.get_mut(name) {
+                *slot = v;
+                return true;
+            }
         }
-        let parent = cur.borrow().parent.clone();
-        match parent {
+        let next = cur.borrow().parent.clone();
+        match next {
             Some(p) => cur = p,
             None => return false,
         }
