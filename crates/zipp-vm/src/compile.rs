@@ -116,6 +116,7 @@ impl Compiler {
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
+            upvalues: Vec::new(), // set by the caller after capture analysis
         })
     }
 
@@ -161,6 +162,7 @@ impl Compiler {
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
+            upvalues: Vec::new(),
         })
     }
 }
@@ -174,6 +176,7 @@ fn placeholder(name: &str) -> FuncProto {
         constants: Vec::new(),
         string_constants: Vec::new(),
         name_global: None,
+        upvalues: Vec::new(),
     }
 }
 

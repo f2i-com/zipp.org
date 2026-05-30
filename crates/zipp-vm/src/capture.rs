@@ -164,7 +164,7 @@ fn stmt_refs(s: &ox::Statement, out: &mut HashSet<String>) {
         S::FunctionDeclaration(f) => {
             // A nested function declaration contributes its OWN free vars
             // (minus what it binds), exactly like a function expression would.
-            fn_node_free(&f.params, f.body.as_ref(), out);
+            fn_node_free(&f.params, f.body.as_deref(), out);
         }
         _ => {}
     }
@@ -239,7 +239,7 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
                 }
             }
         }
-        E::FunctionExpression(f) => fn_node_free(&f.params, f.body.as_ref(), out),
+        E::FunctionExpression(f) => fn_node_free(&f.params, f.body.as_deref(), out),
         E::ArrowFunctionExpression(a) => arrow_free(a, out),
         _ => {}
     }
@@ -313,7 +313,7 @@ fn collect_nested_free(s: &ox::Statement, out: &mut HashSet<String>) {
                 collect_nested_free_expr(a, out);
             }
         }
-        S::FunctionDeclaration(f) => fn_node_free(&f.params, f.body.as_ref(), out),
+        S::FunctionDeclaration(f) => fn_node_free(&f.params, f.body.as_deref(), out),
         _ => {}
     }
 }
@@ -321,7 +321,7 @@ fn collect_nested_free(s: &ox::Statement, out: &mut HashSet<String>) {
 fn collect_nested_free_expr(e: &ox::Expression, out: &mut HashSet<String>) {
     use ox::Expression as E;
     match e {
-        E::FunctionExpression(f) => fn_node_free(&f.params, f.body.as_ref(), out),
+        E::FunctionExpression(f) => fn_node_free(&f.params, f.body.as_deref(), out),
         E::ArrowFunctionExpression(a) => arrow_free(a, out),
         E::ParenthesizedExpression(p) => collect_nested_free_expr(&p.expression, out),
         E::BinaryExpression(b) => {
