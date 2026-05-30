@@ -2550,10 +2550,20 @@ impl VM {
                 let receiver = builtin
                     .receiver
                     .ok_or_else(|| VMError::TypeError("Array.sort missing receiver".to_string()))?;
-                let mut items = match receiver {
-                    Object::Array(items) => unwrap_array(items),
+                // `Array.prototype.sort` sorts IN PLACE and returns the same
+                // array reference. Earlier this built a *new* array and returned
+                // it, leaving the receiver unsorted whenever it was referenced
+                // elsewhere (`unwrap_array` clones when the Rc is shared) — so
+                // `a.sort(); a[i]` read stale, unsorted values. Keep the
+                // receiver's cell, clone the elements out so the comparator
+                // callback can re-enter the VM (and even touch this same array)
+                // without us holding a borrow across the call, then write the
+                // sorted Vec back into the receiver's cell.
+                let items_rc = match receiver {
+                    Object::Array(rc) => rc,
                     _ => return Ok(obj_into_val(make_array(vec![]), &mut self.heap)),
                 };
+                let mut items = items_rc.borrow().clone();
 
                 if let Some(compare_fn) = args.first().copied() {
                     // Aborting `sort_by` is fiddly because the closure
@@ -2595,7 +2605,8 @@ impl VM {
                     items.sort_by_key(|v| val_inspect(*v, &self.heap));
                 }
 
-                Ok(obj_into_val(make_array(items), &mut self.heap))
+                *unsafe { items_rc.borrow_mut() } = items;
+                Ok(obj_into_val(Object::Array(items_rc), &mut self.heap))
             }
             BuiltinFunction::ArrayFilter => {
                 let receiver = builtin.receiver.ok_or_else(|| {

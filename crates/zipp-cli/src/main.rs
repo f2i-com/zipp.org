@@ -59,15 +59,37 @@ fn run(args: &[String]) -> Result<(), String> {
             run_file(&path, prove, jit, llvm, wasm, gas, fast_math)
         }
         Some("js") => {
-            // Dynamic JavaScript engine (fast tier): NaN-boxed value, register-
-            // bytecode VM, shapes + inline caches, optional dynasm JIT — absorbed
-            // from the FormLogic prototype and rebranded as `zipp-engine`.
+            // Dynamic JavaScript: the fast `zipp-engine` (NaN-boxed value,
+            // register-bytecode VM, shapes + inline caches, dynasm JIT — absorbed
+            // from the FormLogic prototype and rebranded). console.log streams to
+            // stdout during eval. Run UNCAPPED so a trusted local file behaves
+            // like `node file.js`; the embedded sandbox's 100M-instruction / 5s
+            // defaults are for untrusted eval, not the CLI. The tree-walker is
+            // `zipp js-tw` (broad-coverage fallback + differential oracle).
             let path = it.next().ok_or("usage: zipp js <file.js>")?;
             let src =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
-            // Default engine = the tree-walker: node-compatible console.log (to
-            // stdout), no instruction cap, broad coverage. The fast zipp-engine
-            // is `zipp jse` (not yet a console-to-stdout drop-in).
+            let cfg = zipp_engine::config::ZippConfig {
+                max_instructions: None,
+                max_wall_time_ms: None,
+                max_heap_objects: None,
+                max_heap_bytes: None,
+                ..Default::default()
+            };
+            // Like `node file.js`, console.log already produced the output; do NOT
+            // echo the program's final value.
+            zipp_engine::engine::ZippEngine::with_config(cfg)
+                .eval(&src)
+                .map(|_| ())
+                .map_err(|e| format!("{e}"))
+        }
+        Some("js-tw") => {
+            // Tree-walker JS (zipp-js): node-compatible console.log, no cap, broad
+            // coverage. Slower than `zipp js` (the JIT engine) but serves as the
+            // differential oracle and the fallback for cases the engine misses.
+            let path = it.next().ok_or("usage: zipp js-tw <file.js>")?;
+            let src =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
             let outcome = zipp_js::run(&src)?;
             for line in &outcome.output {
                 println!("{line}");
@@ -77,31 +99,12 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        Some("jse") => {
-            // EXPERIMENTAL fast engine (zipp-engine, absorbed from FormLogic):
-            // NaN-boxed value, register-bytecode VM, shapes + inline caches,
-            // dynasm JIT. It prints the eval RETURN VALUE (its console is not yet
-            // wired to stdout) and enforces a 100M-instruction sandbox cap.
-            let path = it.next().ok_or("usage: zipp jse <file.js>")?;
-            let src =
-                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
-            let engine = zipp_engine::engine::ZippEngine::default();
-            match engine.eval(&src) {
-                Ok(value) => {
-                    let s = value.inspect();
-                    if !s.is_empty() && s != "undefined" {
-                        println!("{s}");
-                    }
-                    Ok(())
-                }
-                Err(e) => Err(format!("{e}")),
-            }
-        }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
             println!("usage:");
             println!("  zipp run <file.zipp|.ts>        compile + run (.ts uses the oxc TypeScript frontend)");
-            println!("  zipp js <file.js>               run dynamic JavaScript (Lane 3 engine)");
+            println!("  zipp js <file.js>               run dynamic JavaScript (fast JIT engine)");
+            println!("  zipp js-tw <file.js>            run JS via the tree-walker (oracle/fallback)");
             println!("  zipp run --jit <file.zipp>      Cranelift JIT (fast-compile tier-0)");
             println!("  zipp run --llvm <file.zipp>     clang -O3 release tier");
             println!("  zipp run --wasm <file.zipp>     gas-metered WebAssembly (contract profile; --gas N)");
