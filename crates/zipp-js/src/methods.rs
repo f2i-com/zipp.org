@@ -622,9 +622,32 @@ pub fn number_method(name: &str) -> Option<NativeFn> {
 
 fn num_to_fixed(_it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
     let n = this.to_number();
+    if n.is_nan() {
+        return Ok(JsValue::str("NaN"));
+    }
     let digits = arg(args, 0).to_number();
-    let d = if digits.is_finite() && digits >= 0.0 { digits as usize } else { 0 };
-    Ok(JsValue::str(format!("{n:.d$}")))
+    let d = if digits.is_finite() && digits >= 0.0 { (digits as usize).min(100) } else { 0 };
+    // Per spec, |x| >= 1e21 (and non-finite) falls back to Number->string.
+    if n.is_infinite() || n.abs() >= 1e21 {
+        return Ok(JsValue::str(crate::value::num_to_string(n)));
+    }
+    let neg = n < 0.0; // `-0` is not < 0, so it gets no sign (matches node)
+    let scale = 10f64.powi(d as i32);
+    // Rust's round() is half-away-from-zero; on the positive magnitude that's the
+    // spec's "ties toward the larger n" (whereas format!'s {:.N} rounds to even).
+    let scaled = (n.abs() * scale).round();
+    let int_str = format!("{scaled:.0}"); // integer-valued, no decimals
+    let body = if d == 0 {
+        int_str
+    } else {
+        let mut s = int_str;
+        if s.len() <= d {
+            s = format!("{}{}", "0".repeat(d + 1 - s.len()), s); // ensure one int digit
+        }
+        let point = s.len() - d;
+        format!("{}.{}", &s[..point], &s[point..])
+    };
+    Ok(JsValue::str(if neg { format!("-{body}") } else { body }))
 }
 
 fn num_to_string_m(_it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
