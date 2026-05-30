@@ -59,9 +59,25 @@ fn run(args: &[String]) -> Result<(), String> {
             run_file(&path, prove, jit, llvm, wasm, gas, fast_math)
         }
         Some("js") => {
-            // Dynamic JavaScript engine (Lane 3): run untyped JS with real JS
-            // semantics (separate from the typed AOT pipeline).
+            // Dynamic JavaScript engine (fast tier): NaN-boxed value, register-
+            // bytecode VM, shapes + inline caches, optional dynasm JIT — absorbed
+            // from the FormLogic prototype and rebranded as `zipp-engine`.
             let path = it.next().ok_or("usage: zipp js <file.js>")?;
+            let src =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            let result = zipp_engine::ZippEngine::default().eval(&src);
+            for line in &result.console {
+                println!("{line}");
+            }
+            if let Err(e) = result.value {
+                return Err(format!("Uncaught {}", e.message()));
+            }
+            Ok(())
+        }
+        Some("js-tw") => {
+            // Dynamic JavaScript engine (tree-walker): the original Lane-3
+            // interpreter, kept as a fallback + differential-test oracle vs node.
+            let path = it.next().ok_or("usage: zipp js-tw <file.js>")?;
             let src =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
             let outcome = zipp_js::run(&src)?;
