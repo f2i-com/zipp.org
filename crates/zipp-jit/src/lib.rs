@@ -169,11 +169,8 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
     if prog.uses_opt_scalar {
         return Some("nullable scalars (i64 | null)");
     }
-    // Bare function values (FuncRef + CallValue) run natively; capturing closures
-    // still need the env-pointer ABI and fall back.
-    if prog.uses_capturing_closure {
-        return Some("capturing closures");
-    }
+    // Function values — bare (FuncRef) and capturing closures (MakeClosure, via
+    // the env-pointer ABI) — both run natively now.
     // Growable arrays (push/pop) are interpreter-only in v0.
     if prog.uses_growable {
         return Some("growable arrays (push/pop)");
@@ -431,7 +428,9 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
             }
             // A function value is a closure-block pointer (i64); an indirect call
             // yields the callee's return type (from its interned signature).
-            Instr::FuncRef { dst, .. } => t[*dst as usize] = JTy::I64,
+            Instr::FuncRef { dst, .. } | Instr::MakeClosure { dst, .. } => {
+                t[*dst as usize] = JTy::I64
+            }
             Instr::CallValue { dst, sig, .. } => {
                 t[*dst as usize] = jty_of(prog.func_types[*sig as usize].ret);
             }
@@ -881,10 +880,9 @@ fn compile_function(
                 let z = builder.ins().iconst(types::I64, 0);
                 builder.def_var(var(*dst), z);
             }
-            // First-class functions are interpreter-only; `ineligible_reason`
-            // gates them out before codegen, so this is never reached.
-            // A function value is a `[len=2 | code | env]` GC block (env = 0 for a
-            // bare function; capturing closures, which need env, are gated out).
+            // A function value is a `[len=2 | code | env]` GC block. A bare
+            // function (`FuncRef`) stores env = 0; a capturing closure
+            // (`MakeClosure`) stores a pointer to its env struct.
             Instr::FuncRef { dst, func } => {
                 let fref = module.declare_func_in_func(func_ids[*func as usize], builder.func);
                 let code = builder.ins().func_addr(types::I64, fref);
@@ -897,26 +895,82 @@ fn compile_function(
                 builder.ins().store(MemFlags::trusted(), zero, block, 16);
                 builder.def_var(var(*dst), block);
             }
-            // Indirect call: load the code pointer from the closure block and
-            // call it with the explicit args (the plain signature; no env yet).
+            // A capturing closure: build the env struct (`zipp_alloc(ncaps)` →
+            // `[n | slots]`, storing each capture exactly like `NewStruct`), then
+            // the `[len=2 | code | env]` closure block pointing at it. The lifted
+            // function reads its captures out of the env via `GetField`.
+            Instr::MakeClosure { dst, func, captures } => {
+                let alloc = module.declare_func_in_func(rt.alloc, builder.func);
+                let flags = MemFlags::trusted();
+                // 1. env struct
+                let ncaps = builder.ins().iconst(types::I64, captures.len() as i64);
+                let ecall = builder.ins().call(alloc, &[ncaps]);
+                let env = builder.inst_results(ecall)[0];
+                for (i, cr) in captures.iter().enumerate() {
+                    let cv = builder.use_var(var(*cr));
+                    let raw = if matches!(rty[*cr as usize], JTy::F64) {
+                        builder.ins().bitcast(types::I64, MemFlags::new(), cv)
+                    } else {
+                        cv
+                    };
+                    builder.ins().store(flags, raw, env, 8 * (i as i32 + 1));
+                }
+                // 2. closure block { code, env }
+                let fref = module.declare_func_in_func(func_ids[*func as usize], builder.func);
+                let code = builder.ins().func_addr(types::I64, fref);
+                let two = builder.ins().iconst(types::I64, 2);
+                let acall = builder.ins().call(alloc, &[two]);
+                let block = builder.inst_results(acall)[0];
+                builder.ins().store(flags, code, block, 8);
+                builder.ins().store(flags, env, block, 16);
+                builder.def_var(var(*dst), block);
+            }
+            // Indirect call through a function value. The explicit signature is
+            // `sig`; a capturing closure's lifted code wants the env as a leading
+            // argument, a bare function does not — so dispatch on the env slot.
             Instr::CallValue { dst, callee, arg_base, argc, sig } => {
                 let block = builder.use_var(var(*callee));
                 let code = builder.ins().load(types::I64, MemFlags::trusted(), block, 8);
+                let env = builder.ins().load(types::I64, MemFlags::trusted(), block, 16);
                 let ft = &prog.func_types[*sig as usize];
-                let mut s = module.make_signature();
+                // plain sig: (explicit…) -> ret   (bare function, env == 0)
+                let mut plain = module.make_signature();
                 for p in &ft.params {
-                    s.params.push(AbiParam::new(clif_ty(*p)));
+                    plain.params.push(AbiParam::new(clif_ty(*p)));
                 }
-                s.returns.push(AbiParam::new(clif_ty(ft.ret)));
-                let sigref = builder.import_signature(s);
+                plain.returns.push(AbiParam::new(clif_ty(ft.ret)));
+                let plain_ref = builder.import_signature(plain);
+                // env sig: (env_ptr, explicit…) -> ret   (capturing closure)
+                let mut envsig = module.make_signature();
+                envsig.params.push(AbiParam::new(types::I64));
+                for p in &ft.params {
+                    envsig.params.push(AbiParam::new(clif_ty(*p)));
+                }
+                envsig.returns.push(AbiParam::new(clif_ty(ft.ret)));
+                let env_ref = builder.import_signature(envsig);
                 let args: Vec<Value> =
                     (0..*argc).map(|k| builder.use_var(var(*arg_base + k))).collect();
-                let icall = builder.ins().call_indirect(sigref, code, &args);
-                let r = builder.inst_results(icall)[0];
-                builder.def_var(var(*dst), r);
-            }
-            Instr::MakeClosure { .. } => {
-                return Err("internal: capturing closures reached the JIT".into())
+                let plain_blk = builder.create_block();
+                let env_blk = builder.create_block();
+                let merge_blk = builder.create_block();
+                builder.ins().brif(env, env_blk, &[], plain_blk, &[]);
+                // bare-function path
+                builder.switch_to_block(plain_blk);
+                let pcall = builder.ins().call_indirect(plain_ref, code, &args);
+                let pr = builder.inst_results(pcall)[0];
+                builder.def_var(var(*dst), pr);
+                builder.ins().jump(merge_blk, &[]);
+                // capturing-closure path (env first)
+                builder.switch_to_block(env_blk);
+                let mut env_args = Vec::with_capacity(args.len() + 1);
+                env_args.push(env);
+                env_args.extend_from_slice(&args);
+                let ecall2 = builder.ins().call_indirect(env_ref, code, &env_args);
+                let er = builder.inst_results(ecall2)[0];
+                builder.def_var(var(*dst), er);
+                builder.ins().jump(merge_blk, &[]);
+                // merge: `dst` is the phi of both paths
+                builder.switch_to_block(merge_blk);
             }
             // Growable arrays are interpreter-only; gated out before codegen.
             Instr::Push { .. } | Instr::Pop { .. } => {
@@ -1200,6 +1254,62 @@ mod tests {
         .unwrap();
         let prog = zippc::compile_module(&m).unwrap();
         assert!(!prog.uses_capturing_closure);
+    }
+
+    #[test]
+    fn capturing_closures_run_native() {
+        // Stage 2: CAPTURING closures run natively via the env-as-struct ABI.
+        // `jit_ts_i64` runs through `run()`, which errors on an ineligible program
+        // — so these only pass if the capturing closure genuinely compiled.
+
+        // capture a parameter; call the returned closure twice
+        assert_eq!(
+            jit_ts_i64(
+                "function adder(n: i64): (x: i64) => i64 { return (x: i64) => x + n; } \
+                 function main(): i64 { const a = adder(10); return a(5) + a(20); }"
+            ),
+            45 // 15 + 30
+        );
+        // capture a local, pass the closure to a higher-order function
+        assert_eq!(
+            jit_ts_i64(
+                "function applyTwice(f: (n: i64) => i64, x: i64): i64 { return f(f(x)); } \
+                 function main(): i64 { const base = 3; const scale = (x: i64) => x * base; \
+                                        return applyTwice(scale, 2); }"
+            ),
+            18 // scale(scale(2)) = 2*3*3
+        );
+        // f64 capture + f64 param/return (env stores/loads the f64 via bitcast,
+        // and the indirect call's return phi is f64)
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { const k = 1.5; const f = (x: f64) => x + k; \
+                                        return i64(f(2.0) * 2.0); }"
+            ),
+            7 // (2.0 + 1.5) * 2 = 7.0
+        );
+        // mixed captures (i64 + f64) in one env struct
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { const a = 10; const b = 3.0; \
+                                        const g = (x: i64) => x + a + i64(b); return g(5); }"
+            ),
+            18 // 5 + 10 + 3
+        );
+        // THE dispatch test: a bare function value and a capturing closure flow to
+        // the SAME indirect-call site. `f(10)` must branch on the env slot —
+        // env == 0 → plain sig (inc), env != 0 → env-leading sig (add).
+        assert_eq!(
+            jit_ts_i64(
+                "function choose(b: bool, k: i64): i64 { \
+                     const inc = (n: i64) => n + 1; \
+                     const add = (n: i64) => n + k; \
+                     const f = b ? inc : add; \
+                     return f(10); } \
+                 function main(): i64 { return choose(true, 100) + choose(false, 100); }"
+            ),
+            121 // inc(10)=11  +  add(10)=110
+        );
     }
 
     #[test]

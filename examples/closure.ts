@@ -1,9 +1,9 @@
 // Closures: arrow lambdas that capture enclosing variables.
 //
-// A captured variable becomes a hidden leading parameter of the lifted
-// function (keeping its name), and creating the closure snapshots its current
-// value. So `adder(10)` returns a function that remembers `n = 10`. (v0
-// captures by value; like all function values, this runs on the interpreter.)
+// Creating the closure snapshots the captured variable's current value into a
+// small env struct, and the lifted function reads it back out — so `adder(10)`
+// returns a function that remembers `n = 10`. (v0 captures by value.) Closures
+// run natively on --jit via the env-pointer calling convention.
 
 function adder(n: i64): (x: i64) => i64 {
   return (x: i64) => x + n; // captures the parameter `n`
