@@ -149,11 +149,9 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
         return Some("nullable scalars (i64 | null)");
     }
     // Function values — bare (FuncRef) and capturing closures (MakeClosure, via
-    // the env-pointer ABI) — both run natively now.
-    // Growable arrays (push/pop) are interpreter-only in v0.
-    if prog.uses_growable {
-        return Some("growable arrays (push/pop)");
-    }
+    // the env-pointer ABI) — and growable arrays (push/pop, via the Vec-style
+    // {len,cap,data} header) all run natively now. The tier covers the whole
+    // language; `None` means no interpreter fallback.
     None
 }
 
@@ -208,6 +206,15 @@ fn infer(prog: &Program, f: &FuncMeta, end: u32) -> Vec<LTy> {
                 t[*dst as usize] = LTy::Arr(t[*value as usize] == LTy::F64);
             }
             Instr::Index { dst, arr, .. } => {
+                t[*dst as usize] = if arr_f64(t[*arr as usize]) {
+                    LTy::F64
+                } else {
+                    LTy::I64
+                };
+            }
+            // push returns the new length (i64); pop returns the element type.
+            Instr::Push { dst, .. } => t[*dst as usize] = LTy::I64,
+            Instr::Pop { dst, arr } => {
                 t[*dst as usize] = if arr_f64(t[*arr as usize]) {
                     LTy::F64
                 } else {
@@ -861,9 +868,23 @@ fn emit_fn(prog: &Program, fi: usize, end: u32) -> Result<String, String> {
                 ));
                 store(&mut s, &rty, *dst, &res);
             }
-            // Growable arrays are interpreter-only; gated out before codegen.
-            Instr::Push { .. } | Instr::Pop { .. } => {
-                return Err("internal: growable arrays reached the LLVM backend".into())
+            // arr.push(value) — append (growing the data buffer if full), returns
+            // the new length. The value is passed in slot form (f64 → raw bits).
+            Instr::Push { dst, arr, value } => {
+                let hdr = load(&mut s, &mut tmp, &rty, *arr);
+                let vv = load(&mut s, &mut tmp, &rty, *value);
+                let raw = to_slot(&mut s, &mut tmp, rty[*value as usize], &vv);
+                let r = fresh(&mut tmp);
+                s.push_str(&format!("  {r} = call i64 @zipp_arr_push(ptr {hdr}, i64 {raw})\n"));
+                store(&mut s, &rty, *dst, &r);
+            }
+            // arr.pop() — remove + return the last element (aborts if empty).
+            Instr::Pop { dst, arr } => {
+                let hdr = load(&mut s, &mut tmp, &rty, *arr);
+                let raw = fresh(&mut tmp);
+                s.push_str(&format!("  {raw} = call i64 @zipp_arr_pop(ptr {hdr})\n"));
+                let val = from_slot(&mut s, &mut tmp, rty[*dst as usize], &raw);
+                store(&mut s, &rty, *dst, &val);
             }
             // Native string method: call the matching runtime function. Each arg
             // is loaded with its register type (ptr for a string, i64 for an
@@ -984,6 +1005,8 @@ pub fn emit_ir(prog: &Program) -> Result<String, String> {
     out.push_str("declare void @zipp_set_stack_bottom(i64)\n");
     out.push_str("declare ptr @zipp_alloc(i64)\n");
     out.push_str("declare ptr @zipp_arr_new(i64)\n");
+    out.push_str("declare i64 @zipp_arr_push(ptr, i64)\n");
+    out.push_str("declare i64 @zipp_arr_pop(ptr)\n");
     out.push_str("declare ptr @zipp_array_repeat(i64, i64)\n");
     out.push_str("declare void @zipp_oob(i64, i64)\n");
     out.push_str("declare ptr @zipp_str_concat(ptr, ptr)\n");
@@ -1238,6 +1261,25 @@ mod tests {
         assert!(ir.contains("ptrtoint (ptr @zfn")); // code pointer baked in
         assert!(ir.contains("icmp eq i64")); // env-slot dispatch
         assert!(ir.contains("phi")); // result merge of the two call forms
+    }
+
+    #[test]
+    fn emits_ir_for_growable_arrays() {
+        // push/pop + map/filter/reduce compile natively via the Vec-style header
+        // and the zipp_arr_push/pop runtime (no interpreter fallback).
+        let ts = "function main(): i64 { let xs: i64[] = []; let i = 0; \
+                  while (i < 6) { xs.push(i); i = i + 1; } \
+                  const ys = xs.map((x: i64) => x + 1); \
+                  const top = ys.pop()!; \
+                  return ys.reduce((a: i64, b: i64) => a + b, 0) + top; }";
+        let module = zipp_ts::compile_ts(ts).expect("lower");
+        let prog = zippc::compile_module(&module).expect("compile");
+        assert!(prog.uses_growable);
+        assert!(ineligible_reason(&prog).is_none()); // native, no fallback
+        let ir = emit_ir(&prog).unwrap();
+        assert!(ir.contains("@zipp_arr_new")); // header allocation
+        assert!(ir.contains("@zipp_arr_push")); // append
+        assert!(ir.contains("@zipp_arr_pop")); // remove-last
     }
 
     #[test]

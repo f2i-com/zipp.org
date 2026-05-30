@@ -141,6 +141,58 @@ pub extern "C" fn zipp_array_repeat(n: i64, val: i64) -> i64 {
     hdr as i64
 }
 
+/// `arr.push(val)` — append the raw 8-byte payload `val`, growing the data buffer
+/// (cap 0→4, else ×2) if full. Returns the new length. The header is unchanged in
+/// identity (only its len/cap/data words update), so aliases of the array see the
+/// append. `val` is already in slot form (f64 bit-reinterpreted by the caller).
+#[no_mangle]
+pub extern "C" fn zipp_arr_push(hdr: i64, val: i64) -> i64 {
+    let h = hdr as *mut i64;
+    // SAFETY: `hdr` is a valid array header `[len|cap|data]`.
+    unsafe {
+        let len = *h as usize;
+        let cap = *h.add(1) as usize;
+        let mut data = *h.add(2) as *mut i64;
+        if len == cap {
+            let newcap = if cap == 0 { 4 } else { cap * 2 };
+            // Allocate the new buffer FIRST. `hdr` is a live argument across this
+            // call, so a collection it triggers marks the header → follows its
+            // +16 pointer → keeps the OLD buffer alive while we copy from it.
+            let newdata = gc::gc_alloc(newcap * 8) as *mut i64;
+            std::ptr::copy_nonoverlapping(data, newdata, len);
+            // Publish only after the copy (copy-then-publish): the header keeps
+            // pointing at the old buffer until the new one is fully populated.
+            *h.add(1) = newcap as i64;
+            *h.add(2) = newdata as i64;
+            data = newdata;
+        }
+        *data.add(len) = val;
+        *h = (len + 1) as i64;
+        (len + 1) as i64
+    }
+}
+
+/// `arr.pop()` — remove and return the last element's raw 8-byte payload. Aborts
+/// on an empty array (TS returns `undefined`; ZIPP arrays are total over a real
+/// element type, so popping empty is a runtime error like an out-of-bounds read).
+/// The capacity/buffer are kept (no shrink); only `len` decreases.
+#[no_mangle]
+pub extern "C" fn zipp_arr_pop(hdr: i64) -> i64 {
+    let h = hdr as *mut i64;
+    // SAFETY: `hdr` is a valid array header `[len|cap|data]`.
+    unsafe {
+        let len = *h as usize;
+        if len == 0 {
+            eprintln!("zipp: pop from an empty array");
+            std::process::abort();
+        }
+        let data = *h.add(2) as *const i64;
+        let v = *data.add(len - 1);
+        *h = (len - 1) as i64;
+        v
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn zipp_oob(idx: i64, len: i64) {
     eprintln!("zipp: array index {idx} out of bounds (len {len})");

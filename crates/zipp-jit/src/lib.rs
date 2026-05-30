@@ -43,6 +43,8 @@ struct RuntimeIds {
     print_str: FuncId,
     alloc: FuncId,
     arr_new: FuncId,
+    arr_push: FuncId,
+    arr_pop: FuncId,
     array_repeat: FuncId,
     oob: FuncId,
     str_concat: FuncId,
@@ -171,11 +173,9 @@ pub fn ineligible_reason(prog: &Program) -> Option<&'static str> {
         return Some("nullable scalars (i64 | null)");
     }
     // Function values — bare (FuncRef) and capturing closures (MakeClosure, via
-    // the env-pointer ABI) — both run natively now.
-    // Growable arrays (push/pop) are interpreter-only in v0.
-    if prog.uses_growable {
-        return Some("growable arrays (push/pop)");
-    }
+    // the env-pointer ABI) — and growable arrays (push/pop, via the Vec-style
+    // {len,cap,data} header) all run natively now. The JIT covers the whole
+    // language; `None` means no interpreter fallback.
     None
 }
 
@@ -225,6 +225,8 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
     jit.symbol("zipp_print_str", zipp_rt::zipp_print_str as *const u8);
     jit.symbol("zipp_alloc", zipp_rt::zipp_alloc as *const u8);
     jit.symbol("zipp_arr_new", zipp_rt::zipp_arr_new as *const u8);
+    jit.symbol("zipp_arr_push", zipp_rt::zipp_arr_push as *const u8);
+    jit.symbol("zipp_arr_pop", zipp_rt::zipp_arr_pop as *const u8);
     jit.symbol("zipp_array_repeat", zipp_rt::zipp_array_repeat as *const u8);
     jit.symbol("zipp_oob", zipp_rt::zipp_oob as *const u8);
     jit.symbol("zipp_str_concat", zipp_rt::zipp_str_concat as *const u8);
@@ -267,6 +269,8 @@ pub fn run_with(prog: &Program, fast_math: bool) -> Result<JitOutcome, String> {
         print_str: import(&mut module, "zipp_print_str", &[types::I64], None)?,
         alloc: import(&mut module, "zipp_alloc", &[types::I64], Some(types::I64))?,
         arr_new: import(&mut module, "zipp_arr_new", &[types::I64], Some(types::I64))?,
+        arr_push: import(&mut module, "zipp_arr_push", &[types::I64, types::I64], Some(types::I64))?,
+        arr_pop: import(&mut module, "zipp_arr_pop", &[types::I64], Some(types::I64))?,
         array_repeat: import(&mut module, "zipp_array_repeat", &[types::I64, types::I64], Some(types::I64))?,
         oob: import(&mut module, "zipp_oob", &[types::I64, types::I64], None)?,
         str_concat: import(&mut module, "zipp_str_concat", &[types::I64, types::I64], Some(types::I64))?,
@@ -394,6 +398,15 @@ fn infer_reg_types(prog: &Program, f: &FuncMeta, end: u32) -> Vec<JTy> {
                 t[*dst as usize] = JTy::Arr(is_f64(&t, *value));
             }
             Instr::Index { dst, arr, .. } => {
+                t[*dst as usize] = if t[*arr as usize].arr_f64() {
+                    JTy::F64
+                } else {
+                    JTy::I64
+                };
+            }
+            // push returns the new length (i64); pop returns the element type.
+            Instr::Push { dst, .. } => t[*dst as usize] = JTy::I64,
+            Instr::Pop { dst, arr } => {
                 t[*dst as usize] = if t[*arr as usize].arr_f64() {
                     JTy::F64
                 } else {
@@ -978,9 +991,33 @@ fn compile_function(
                 // merge: `dst` is the phi of both paths
                 builder.switch_to_block(merge_blk);
             }
-            // Growable arrays are interpreter-only; gated out before codegen.
-            Instr::Push { .. } | Instr::Pop { .. } => {
-                return Err("internal: growable arrays reached the JIT".into())
+            // arr.push(value) — append (growing the data buffer if full), returns
+            // the new length. The value is stored in slot form (f64 → raw bits).
+            Instr::Push { dst, arr, value } => {
+                let hdr = builder.use_var(var(*arr));
+                let vv = builder.use_var(var(*value));
+                let raw = if rty[*arr as usize].arr_f64() {
+                    builder.ins().bitcast(types::I64, MemFlags::new(), vv)
+                } else {
+                    vv
+                };
+                let push = module.declare_func_in_func(rt.arr_push, builder.func);
+                let call = builder.ins().call(push, &[hdr, raw]);
+                let newlen = builder.inst_results(call)[0];
+                builder.def_var(var(*dst), newlen);
+            }
+            // arr.pop() — remove + return the last element (aborts if empty).
+            Instr::Pop { dst, arr } => {
+                let hdr = builder.use_var(var(*arr));
+                let pop = module.declare_func_in_func(rt.arr_pop, builder.func);
+                let call = builder.ins().call(pop, &[hdr]);
+                let raw = builder.inst_results(call)[0];
+                let val = if rty[*arr as usize].arr_f64() {
+                    builder.ins().bitcast(types::F64, MemFlags::new(), raw)
+                } else {
+                    raw
+                };
+                builder.def_var(var(*dst), val);
             }
             // Native string method: call the matching runtime function. All args
             // are i64 (string pointers are i64 in Cranelift); the result is i64
@@ -1315,6 +1352,64 @@ mod tests {
                  function main(): i64 { return choose(true, 100) + choose(false, 100); }"
             ),
             121 // inc(10)=11  +  add(10)=110
+        );
+    }
+
+    #[test]
+    fn growable_arrays_run_native() {
+        // Stage 6/7: push/pop (Vec-style {len,cap,data} header) run natively; the
+        // synthesized map/filter/reduce helpers (push + indirect closure calls)
+        // come along for free (Stage 8). `run()` errors on an ineligible program,
+        // so these only pass if they genuinely compiled.
+
+        // push across several capacity doublings (0→4→8→16), then sum
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { let xs: i64[] = []; let i = 0; \
+                 while (i < 10) { xs.push(i * i); i = i + 1; } \
+                 let s = 0; let j = 0; while (j < len(xs)) { s = s + xs[j]; j = j + 1; } \
+                 return s; }"
+            ),
+            285 // sum of i*i for i in 0..9
+        );
+        // pop returns the last element and shrinks the length
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { let xs: i64[] = []; xs.push(10); xs.push(20); xs.push(30); \
+                 const a = xs.pop()!; const b = xs.pop()!; return a + b + len(xs); }"
+            ),
+            51 // 30 + 20 + len(1)
+        );
+        // f64 elements push/pop through the buffer (bit-reinterpreted slots)
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { let xs: f64[] = []; xs.push(1.5); xs.push(2.5); xs.push(3.0); \
+                 const top = xs.pop()!; let s = 0.0; let i = 0; \
+                 while (i < len(xs)) { s = s + xs[i]; i = i + 1; } \
+                 return i64((s + top) * 2.0); }"
+            ),
+            14 // ((1.5+2.5) + 3.0) * 2
+        );
+        // map/filter/reduce (synthesized push-based helpers) run native
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { let xs: i64[] = []; let i = 1; \
+                 while (i <= 5) { xs.push(i); i = i + 1; } \
+                 const doubled = xs.map((x: i64) => x * 2); \
+                 const evens = doubled.filter((x: i64) => x % 4 === 0); \
+                 return evens.reduce((a: i64, b: i64) => a + b, 0); }"
+            ),
+            12 // [1..5]→[2,4,6,8,10]→[4,8]→12
+        );
+        // a CAPTURING closure callback over a growable array (both native paths)
+        assert_eq!(
+            jit_ts_i64(
+                "function main(): i64 { const base = 100; let xs: i64[] = []; let i = 0; \
+                 while (i < 4) { xs.push(i); i = i + 1; } \
+                 const shifted = xs.map((x: i64) => x + base); \
+                 return shifted.reduce((a: i64, b: i64) => a + b, 0); }"
+            ),
+            406 // [0,1,2,3]→[100,101,102,103]→406
         );
     }
 
