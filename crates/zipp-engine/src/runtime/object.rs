@@ -805,6 +805,13 @@ pub enum BuiltinFunction {
     EncodeURI,
     DecodeURI,
 
+    // ── console ──
+    /// console.log / .info / .warn / .error / .debug — formats its variadic args
+    /// (space-separated, node-style) and writes a line to stdout. Returns
+    /// undefined. (The level only affects nothing here; all go to stdout, which
+    /// is what a `zipp js file.js` run wants.)
+    ConsoleLog,
+
     // ── Generic host call bridge ──
     /// host.call(kind, argsArray, callback) — queues an async call to the host.
     HostCall,

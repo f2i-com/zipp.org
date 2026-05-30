@@ -1623,6 +1623,22 @@ pub fn builtin_global_object(name: &str) -> Option<Object> {
             Some(make_hash(hash))
         }
 
+        "console" => {
+            // console.{log,info,warn,error,debug,trace} all format their args and
+            // write a line to stdout (node-style). Map every level to ConsoleLog.
+            let mut hash = HashObject::default();
+            for method in ["log", "info", "warn", "error", "debug", "trace"] {
+                hash.insert_pair_obj(
+                    hash_key_string(method),
+                    Object::BuiltinFunction(Box::new(BuiltinFunctionObject {
+                        function: BuiltinFunction::ConsoleLog,
+                        receiver: None,
+                    })),
+                );
+            }
+            Some(make_hash(hash))
+        }
+
         "host" => {
             let mut hash = HashObject::default();
             hash.insert_pair_obj(

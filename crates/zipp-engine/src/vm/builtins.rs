@@ -4848,6 +4848,17 @@ impl VM {
                     Ok(obj_into_val(make_array(vec![]), &mut self.heap))
                 }
             }
+            BuiltinFunction::ConsoleLog => {
+                // console.log(...args): format each arg node-style (space-joined,
+                // strings unquoted) and write a line to stdout.
+                let line = args
+                    .iter()
+                    .map(|v| val_inspect(*v, &self.heap))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!("{line}");
+                Ok(Value::UNDEFINED)
+            }
             BuiltinFunction::EnvLog => {
                 if let Some(ref env) = self.env {
                     let level = args.first().map(|v| val_inspect(*v, &self.heap)).unwrap_or_default();

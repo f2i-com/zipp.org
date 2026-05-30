@@ -311,7 +311,7 @@ impl RCompiler {
         "Number", "String", "Boolean", "RegExp", "Date", "Error", "TypeError",
         "RangeError", "SyntaxError", "ReferenceError", "Map", "Set", "WeakMap",
         "WeakSet", "Promise", "ArrayBuffer", "Int8Array", "Uint8Array",
-        "Float32Array", "Float64Array", "DataView", "Intl",
+        "Float32Array", "Float64Array", "DataView", "Intl", "console",
     ];
 
     fn ensure_binding_slot(&mut self, name: &str) -> Result<BindingSlot, String> {
