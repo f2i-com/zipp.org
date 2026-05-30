@@ -151,7 +151,7 @@ mod tests {
     fn array_methods() {
         assert_eq!(
             out("console.log([1,2,3,4].map(x => x*2).filter(x => x > 4).reduce((a,b) => a+b, 0))"),
-            "12"
+            "14" // [2,4,6,8] -> filter >4 -> [6,8] -> 6+8 = 14
         );
         assert_eq!(out("console.log([1,2,3].join('-'))"), "1-2-3");
         assert_eq!(out("console.log([3,1,2].sort((a,b) => a-b).join(','))"), "1,2,3");

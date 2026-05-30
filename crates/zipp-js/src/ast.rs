@@ -41,6 +41,8 @@ pub enum BinOp {
     Shl,
     Shr,
     UShr,
+    In,
+    InstanceOf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +191,11 @@ pub enum Expr {
         computed: bool,
     },
     Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// `new Callee(args)`.
+    New {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },

@@ -732,6 +732,11 @@ impl Interp {
 
     fn binop(&self, op: BinOp, l: JsValue, r: JsValue) -> EvalResult<JsValue> {
         use BinOp::*;
+        match op {
+            In => return self.in_op(&l, &r),
+            InstanceOf => return self.instance_of(&l, &r),
+            _ => {}
+        }
         Ok(match op {
             Add => {
                 let lp = to_primitive(&l);
@@ -758,7 +763,67 @@ impl Interp {
             Shl => JsValue::Num((to_int32(&l).wrapping_shl(to_uint32(&r) & 31)) as f64),
             Shr => JsValue::Num((to_int32(&l) >> (to_uint32(&r) & 31)) as f64),
             UShr => JsValue::Num((to_uint32(&l) >> (to_uint32(&r) & 31)) as f64),
+            In | InstanceOf => unreachable!("dispatched above"),
         })
+    }
+
+    /// `key in obj` — own-or-inherited property existence (incl. array index/length).
+    fn in_op(&self, key: &JsValue, obj: &JsValue) -> EvalResult<JsValue> {
+        let JsValue::Object(o) = obj else {
+            return Err(self.type_error("cannot use 'in' operator on a non-object"));
+        };
+        let k = key.to_js_string();
+        if let ObjData::Array(items) = &o.borrow().data {
+            if k == "length" {
+                return Ok(JsValue::Bool(true));
+            }
+            if let Ok(i) = k.parse::<usize>() {
+                return Ok(JsValue::Bool(i < items.len()));
+            }
+        }
+        let mut cur = Some(o.clone());
+        while let Some(c) = cur {
+            if c.borrow().props.contains_key(&k) {
+                return Ok(JsValue::Bool(true));
+            }
+            cur = c.borrow().proto.clone();
+        }
+        Ok(JsValue::Bool(false))
+    }
+
+    /// `x instanceof C` — is `C.prototype` on `x`'s prototype chain?
+    fn instance_of(&self, x: &JsValue, c: &JsValue) -> EvalResult<JsValue> {
+        let target = self.get_member(c, "prototype")?;
+        let JsValue::Object(target) = target else {
+            return Ok(JsValue::Bool(false));
+        };
+        let mut cur = match x {
+            JsValue::Object(o) => o.borrow().proto.clone(),
+            _ => None,
+        };
+        while let Some(p) = cur {
+            if Rc::ptr_eq(&p, &target) {
+                return Ok(JsValue::Bool(true));
+            }
+            cur = p.borrow().proto.clone();
+        }
+        Ok(JsValue::Bool(false))
+    }
+
+    /// `new Callee(args)` — make an object whose prototype is `Callee.prototype`,
+    /// run the constructor with `this` bound to it, and return it (unless the
+    /// constructor returns its own object).
+    fn eval_new(&self, callee: &Expr, args: &[Expr], scope: &Rc<RefCell<Scope>>) -> EvalResult<JsValue> {
+        let f = self.eval(callee, scope)?;
+        let proto = self.get_member(&f, "prototype")?;
+        let obj = Object::plain();
+        if let JsValue::Object(p) = &proto {
+            obj.borrow_mut().proto = Some(p.clone());
+        }
+        let this = JsValue::Object(obj);
+        let argv = self.eval_args(args, scope)?;
+        let ret = self.call(&f, &this, &argv)?;
+        Ok(if matches!(ret, JsValue::Object(_)) { ret } else { this })
     }
 
     // ───────────────────────── errors ─────────────────────────

@@ -359,6 +359,10 @@ fn expr(e: &ox::Expression) -> R<Expr> {
             els: Box::new(expr(&c.alternate)?),
         },
         E::CallExpression(c) => call(c)?,
+        E::NewExpression(n) => Expr::New {
+            callee: Box::new(expr(&n.callee)?),
+            args: call_args(&n.arguments)?,
+        },
         E::StaticMemberExpression(m) => Expr::Member {
             obj: Box::new(expr(&m.object)?),
             prop: Box::new(Expr::Str(m.property.name.as_str().into())),
@@ -484,9 +488,8 @@ fn binary(b: &ox::BinaryExpression) -> R<Expr> {
         Op::ShiftLeft => BinOp::Shl,
         Op::ShiftRight => BinOp::Shr,
         Op::ShiftRightZeroFill => BinOp::UShr,
-        Op::In | Op::Instanceof => {
-            return Err("`in`/`instanceof` aren't in the v0 JS engine yet".into())
-        }
+        Op::In => BinOp::In,
+        Op::Instanceof => BinOp::InstanceOf,
     };
     Ok(Expr::Binary {
         op,
@@ -581,19 +584,20 @@ fn member_to_expr(m: &ox::MemberExpression) -> R<Expr> {
     }
 }
 
-fn call(c: &ox::CallExpression) -> R<Expr> {
-    let callee = expr(&c.callee)?;
-    let mut args = Vec::with_capacity(c.arguments.len());
-    for a in &c.arguments {
+fn call_args(args: &oxc_allocator::Vec<ox::Argument>) -> R<Vec<Expr>> {
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
         match a {
-            ox::Argument::SpreadElement(_) => {
-                return Err("spread arguments aren't in the v0 JS engine yet".into())
-            }
-            other => {
-                let e = other.as_expression().ok_or("bad call argument")?;
-                args.push(expr(e)?);
-            }
+            ox::Argument::SpreadElement(s) => out.push(Expr::Spread(Box::new(expr(&s.argument)?))),
+            other => out.push(expr(other.as_expression().ok_or("bad call argument")?)?),
         }
     }
-    Ok(Expr::Call { callee: Box::new(callee), args })
+    Ok(out)
+}
+
+fn call(c: &ox::CallExpression) -> R<Expr> {
+    Ok(Expr::Call {
+        callee: Box::new(expr(&c.callee)?),
+        args: call_args(&c.arguments)?,
+    })
 }
