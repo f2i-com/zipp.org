@@ -322,11 +322,14 @@ fn is_self_call(code: &[Instr], ip: usize, callee: u16, self_slot: Option<u16>) 
 fn writes_reg(i: &Instr) -> Option<u16> {
     match *i {
         Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
         | Instr::Move { dst, .. }
         | Instr::AddInt { dst, .. }
         | Instr::Add { dst, .. }
         | Instr::Sub { dst, .. }
         | Instr::Mul { dst, .. }
+        | Instr::Div { dst, .. }
+        | Instr::Neg { dst, .. }
         | Instr::Lt { dst, .. }
         | Instr::Le { dst, .. }
         | Instr::Gt { dst, .. }
@@ -874,6 +877,11 @@ struct RegionPlan {
     bool_regs: Vec<(u16, u8)>,
     /// All globals touched (flushed to globals memory on exit).
     globs: Vec<(u32, u8)>,
+    /// Loop-invariant constants to materialise ONCE in the prologue: region ips
+    /// of `LoadInt`/`LoadConst` whose dst is defined exactly once and never
+    /// live-in. Their body occurrences are skipped (the home already holds them).
+    hoist_ips: Vec<usize>,
+    hoisted: FxHashSet<u16>,
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops
@@ -1014,6 +1022,34 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
         }
     }
 
+    // Loop-invariant constant detection: a reg defined exactly once, by a
+    // LoadInt/LoadConst, and not live-in, holds the same value every iteration —
+    // materialise it once in the prologue and skip the body op.
+    let mut def_count: FxHashMap<u16, u32> = FxHashMap::default();
+    let mut const_def_ip: FxHashMap<u16, usize> = FxHashMap::default();
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        match *instr {
+            Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } => {
+                *def_count.entry(dst).or_insert(0) += 1;
+                const_def_ip.insert(dst, s + off);
+            }
+            _ => {
+                if let Some(d) = writes_reg(instr) {
+                    *def_count.entry(d).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    let mut hoist_ips: Vec<usize> = Vec::new();
+    let mut hoisted: FxHashSet<u16> = FxHashSet::default();
+    for (&r, &ip) in &const_def_ip {
+        if def_count.get(&r) == Some(&1) && first_seen.get(&r) == Some(&true) {
+            hoist_ips.push(ip);
+            hoisted.insert(r);
+        }
+    }
+    hoist_ips.sort_unstable();
+
     // Allocate homes. Numeric regs + globals share the xmm pool; bools use gprs.
     let mut next_xmm = HOME_XMM_FIRST;
     let mut next_bool = 0usize;
@@ -1075,6 +1111,8 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
         num_regs,
         bool_regs,
         globs,
+        hoist_ips,
+        hoisted,
     })
 }
 
@@ -1159,25 +1197,25 @@ fn compile_region_regalloc(
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_box_to_home(&mut ops, x, entry_bail);
     }
+    // Hoisted loop-invariant constants: materialise once, here.
+    for &hip in &plan.hoist_ips {
+        emit_load_const(&mut ops, &plan, &proto.code[hip], proto);
+    }
     dynasm!(ops ; jmp => lbl(start, &in_region));
 
     // ── body ──
     for ip in s..=e {
         dynasm!(ops ; => lbl(ip as u32, &in_region));
-        match proto.code[ip] {
-            Instr::LoadInt { dst, val } => {
-                let h = xh(&plan, dst);
-                dynasm!(ops ; mov eax, val ; cvtsi2sd Rx(h), eax);
+        // A hoisted constant's home was filled in the prologue; the body op is a
+        // no-op (fall through to the next ip, its label preserved for jumps).
+        if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
+            if plan.hoisted.contains(&dst) {
+                continue;
             }
-            Instr::LoadConst { dst, idx } => {
-                let h = xh(&plan, dst);
-                let v = proto.constants[idx as usize];
-                if v.is_int() {
-                    let payload = v.bits() as u32 as i32; // i32 payload
-                    dynasm!(ops ; mov eax, payload ; cvtsi2sd Rx(h), eax);
-                } else {
-                    dynasm!(ops ; mov rax, QWORD v.bits() as i64 ; movq Rx(h), rax);
-                }
+        }
+        match proto.code[ip] {
+            Instr::LoadInt { .. } | Instr::LoadConst { .. } => {
+                emit_load_const(&mut ops, &plan, &proto.code[ip], proto);
             }
             Instr::Move { dst, src } => match home(&plan, dst) {
                 Home::Xmm(d) => {
@@ -1318,6 +1356,28 @@ fn emit_region_restore(ops: &mut dynasmrt::x64::Assembler) {
         ; pop rbx
         ; ret
     );
+}
+
+/// Materialise a numeric constant (a `LoadInt`/`LoadConst` op) into a value's
+/// xmm home. Shared by the prologue (for hoisted loop-invariants) and the body.
+fn emit_load_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, instr: &Instr, proto: &FuncProto) {
+    match *instr {
+        Instr::LoadInt { dst, val } => {
+            let h = xh(plan, dst);
+            dynasm!(ops ; mov eax, val ; cvtsi2sd Rx(h), eax);
+        }
+        Instr::LoadConst { dst, idx } => {
+            let h = xh(plan, dst);
+            let v = proto.constants[idx as usize];
+            if v.is_int() {
+                let payload = v.bits() as u32 as i32;
+                dynasm!(ops ; mov eax, payload ; cvtsi2sd Rx(h), eax);
+            } else {
+                dynasm!(ops ; mov rax, QWORD v.bits() as i64 ; movq Rx(h), rax);
+            }
+        }
+        _ => unreachable!("emit_load_const on non-constant op"),
+    }
 }
 
 /// Guard that the Value bits already in `rax` are a number and load them into
