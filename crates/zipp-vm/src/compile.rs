@@ -391,6 +391,15 @@ impl<'a> FnCompiler<'a> {
         r
     }
 
+    /// Like `declare_local` but never emits `MakeCell`. For bindings whose
+    /// value is deposited into the register by the runtime (a `catch` param),
+    /// where boxing must happen AFTER the value is present.
+    fn declare_local_no_box(&mut self, name: &str) -> Reg {
+        let r = self.alloc_reg();
+        self.scopes.last_mut().unwrap().push((name.to_string(), r));
+        r
+    }
+
     /// Resolve a name to a local register (plain or cell-backed), an upvalue, or
     /// a global slot. Upvalue resolution lazily threads captures up the chain.
     fn resolve(&mut self, name: &str) -> Binding {
@@ -450,7 +459,10 @@ impl<'a> FnCompiler<'a> {
             }
             S::IfStatement(i) => self.if_stmt(i)?,
             S::WhileStatement(w) => self.while_stmt(w)?,
+            S::DoWhileStatement(d) => self.do_while_statement(d)?,
             S::ForStatement(f) => self.for_stmt(f)?,
+            S::ForOfStatement(f) => self.for_of_statement(f)?,
+            S::ForInStatement(f) => self.for_in_statement(f)?,
             S::ReturnStatement(r) => {
                 if let Some(arg) = &r.argument {
                     let v = self.expr(arg)?;
@@ -460,6 +472,11 @@ impl<'a> FnCompiler<'a> {
                 }
             }
             S::FunctionDeclaration(f) => self.func_decl(f)?,
+            S::ThrowStatement(t) => {
+                let v = self.expr(&t.argument)?;
+                self.emit(Instr::Throw { src: v });
+            }
+            S::TryStatement(t) => self.try_statement(t)?,
             S::EmptyStatement(_) => {}
             _ => return Err("unsupported statement (not in the zipp-vm v1 subset yet)".into()),
         }
@@ -693,6 +710,194 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
+    /// `try { … } catch (e) { … } finally { … }`.
+    ///
+    /// Codegen: `PushHandler(catch, e_reg)` ; try-body ; `PopHandler` ; jump
+    /// past catch. The catch block lands the thrown value in `e_reg` and runs.
+    /// A `finally` block is emitted inline on the normal-completion path after
+    /// both try and catch (covers `try/finally` and `try/catch/finally` for code
+    /// that completes or is caught locally). NOTE/LIMITATION: a `finally` does
+    /// NOT yet run when an exception propagates THROUGH this frame uncaught, nor
+    /// on `return` inside try — documented; full finally semantics is a later
+    /// refinement.
+    fn try_statement(&mut self, t: &ox::TryStatement) -> R<()> {
+        let has_catch = t.handler.is_some();
+
+        let push_at = if has_catch {
+            let at = self.here();
+            // catch_reg/target patched once known.
+            self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
+            Some(at)
+        } else {
+            None
+        };
+
+        // Try block.
+        self.push_scope();
+        for s in &t.block.body {
+            self.stmt(s)?;
+        }
+        self.pop_scope();
+
+        if let (Some(push_at), Some(handler)) = (push_at, &t.handler) {
+            // Normal completion of the try: pop the handler, skip the catch.
+            self.emit(Instr::PopHandler);
+            let skip = self.here();
+            self.emit(Instr::Jump { target: 0 });
+
+            // Catch block: the VM lands here with the thrown value already in
+            // the catch register. Reserve that register WITHOUT auto-boxing
+            // (the value is deposited by the unwind, not by a MakeCell), then
+            // box it explicitly if a nested function captures the binding — at
+            // which point the value is already present, so MakeCell wraps it.
+            let catch_start = self.here();
+            self.push_scope();
+            let (e_reg, e_name) = match &handler.param {
+                Some(p) => match &p.pattern {
+                    ox::BindingPattern::BindingIdentifier(id) => {
+                        (self.declare_local_no_box(id.name.as_str()), Some(id.name.to_string()))
+                    }
+                    _ => return Err("catch destructuring not in the zipp-vm subset yet".into()),
+                },
+                None => (self.declare_local_no_box("<catch.ignored>"), None),
+            };
+            if let Instr::PushHandler { catch_target, catch_reg } = &mut self.code[push_at as usize] {
+                *catch_target = catch_start;
+                *catch_reg = e_reg;
+            }
+            // If the catch binding is captured, box the now-present value.
+            if let Some(n) = &e_name {
+                if self.captured.contains(n) {
+                    self.emit(Instr::MakeCell { reg: e_reg });
+                    self.cell_regs.insert(e_reg);
+                }
+            }
+            for s in &handler.body.body {
+                self.stmt(s)?;
+            }
+            self.pop_scope();
+
+            let after = self.here();
+            self.patch_jump(skip, after);
+        }
+
+        // finally (normal-completion path only — see limitation note).
+        if let Some(finalizer) = &t.finalizer {
+            self.push_scope();
+            for s in &finalizer.body {
+                self.stmt(s)?;
+            }
+            self.pop_scope();
+        }
+        Ok(())
+    }
+
+    fn do_while_statement(&mut self, d: &ox::DoWhileStatement) -> R<()> {
+        let top = self.here();
+        self.stmt(&d.body)?;
+        let cond = self.expr(&d.test)?;
+        // Loop back to top while the condition is truthy.
+        self.emit(Instr::JumpIfTrue { cond, target: top });
+        Ok(())
+    }
+
+    /// `for (const x of iter) body` — desugars to an index loop over an
+    /// array/string: `let i=0; while (i < len(iter)) { x = iter[i]; body; i++ }`.
+    /// (Generic iterables/iterators are not in the subset; arrays and strings
+    /// cover the corpus and common code.)
+    fn for_of_statement(&mut self, f: &ox::ForOfStatement) -> R<()> {
+        self.push_scope();
+        let var_name = for_left_name(&f.left)?;
+
+        // Evaluate the iterable into a stable scratch local.
+        let iter_reg = self.declare_local("<forof.iter>");
+        let v = self.expr_into(&f.right, iter_reg)?;
+        if v != iter_reg {
+            self.emit(Instr::Move { dst: iter_reg, src: v });
+        }
+        // Length and index counter.
+        let len_reg = self.declare_local("<forof.len>");
+        self.emit(Instr::LenOf { dst: len_reg, obj: iter_reg });
+        let idx_reg = self.declare_local("<forof.idx>");
+        self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
+
+        // The loop variable binding (may be cell-boxed if captured).
+        let var_reg = self.declare_local(&var_name);
+        let var_is_cell = self.cell_regs.contains(&var_reg);
+
+        let top = self.here();
+        // while (idx < len)
+        let cond = self.temp();
+        self.emit(Instr::Lt { dst: cond, a: idx_reg, b: len_reg });
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond, target: 0 });
+        self.next_reg -= 1; // reclaim cond temp
+
+        // var = iter[idx]
+        if var_is_cell {
+            let tmp = self.temp();
+            self.emit(Instr::GetIndex { dst: tmp, obj: iter_reg, key: idx_reg });
+            self.emit(Instr::CellSet { cell: var_reg, src: tmp });
+            self.next_reg -= 1;
+        } else {
+            self.emit(Instr::GetIndex { dst: var_reg, obj: iter_reg, key: idx_reg });
+        }
+
+        self.stmt(&f.body)?;
+        self.emit(Instr::AddInt { dst: idx_reg, a: idx_reg, imm: 1 });
+        self.emit(Instr::Jump { target: top });
+        let end = self.here();
+        self.patch_jump(jf, end);
+        self.pop_scope();
+        Ok(())
+    }
+
+    /// `for (const k in obj) body` — iterate the object's own enumerable string
+    /// keys (or an array's index strings), via the ObjectKeys op + an index loop.
+    fn for_in_statement(&mut self, f: &ox::ForInStatement) -> R<()> {
+        self.push_scope();
+        let var_name = for_left_name(&f.left)?;
+
+        let obj_reg = self.declare_local("<forin.obj>");
+        let v = self.expr_into(&f.right, obj_reg)?;
+        if v != obj_reg {
+            self.emit(Instr::Move { dst: obj_reg, src: v });
+        }
+        let keys_reg = self.declare_local("<forin.keys>");
+        self.emit(Instr::ObjectKeys { dst: keys_reg, obj: obj_reg });
+        let len_reg = self.declare_local("<forin.len>");
+        self.emit(Instr::LenOf { dst: len_reg, obj: keys_reg });
+        let idx_reg = self.declare_local("<forin.idx>");
+        self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
+
+        let var_reg = self.declare_local(&var_name);
+        let var_is_cell = self.cell_regs.contains(&var_reg);
+
+        let top = self.here();
+        let cond = self.temp();
+        self.emit(Instr::Lt { dst: cond, a: idx_reg, b: len_reg });
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond, target: 0 });
+        self.next_reg -= 1;
+
+        if var_is_cell {
+            let tmp = self.temp();
+            self.emit(Instr::GetIndex { dst: tmp, obj: keys_reg, key: idx_reg });
+            self.emit(Instr::CellSet { cell: var_reg, src: tmp });
+            self.next_reg -= 1;
+        } else {
+            self.emit(Instr::GetIndex { dst: var_reg, obj: keys_reg, key: idx_reg });
+        }
+
+        self.stmt(&f.body)?;
+        self.emit(Instr::AddInt { dst: idx_reg, a: idx_reg, imm: 1 });
+        self.emit(Instr::Jump { target: top });
+        let end = self.here();
+        self.patch_jump(jf, end);
+        self.pop_scope();
+        Ok(())
+    }
+
     fn patch_jump(&mut self, at: u32, target: u32) {
         match &mut self.code[at as usize] {
             Instr::Jump { target: t }
@@ -779,6 +984,17 @@ impl<'a> FnCompiler<'a> {
             E::AssignmentExpression(a) => self.assign(a, dst),
             E::ConditionalExpression(c) => self.conditional(c, dst),
             E::CallExpression(c) => self.call(c, dst),
+            E::NewExpression(n) => {
+                // `new Error(msg)` / `new TypeError(msg)` / `new RangeError(msg)`
+                // → a plain object {name, message}. Other constructors aren't in
+                // the subset yet.
+                if let ox::Expression::Identifier(id) = &n.callee {
+                    if let Some(kind) = error_ctor(&id.name) {
+                        return self.build_error(kind, n.arguments.first(), dst);
+                    }
+                }
+                Err("`new` (non-Error constructor) is not in the zipp-vm subset yet".into())
+            }
             E::FunctionExpression(f) => {
                 let (id, has_up) =
                     self.compile_func_expr(f.id.as_ref().map(|i| i.name.to_string()), f)?;
@@ -1164,7 +1380,43 @@ impl<'a> FnCompiler<'a> {
         Ok(dst)
     }
 
+    /// Build an Error-like object `{ name, message }` for `Error("msg")` (called
+    /// either with `new` or bare). `arg` is the optional message argument.
+    fn build_error(&mut self, kind: &str, arg: Option<&ox::Argument>, dst: Reg) -> R<Reg> {
+        self.emit(Instr::NewObject { dst });
+        // name = kind
+        let name_const = self.add_string_const(kind);
+        let tmp = self.temp();
+        self.emit(Instr::LoadConst { dst: tmp, idx: name_const });
+        let name_key = self.add_string_const("name");
+        self.emit(Instr::SetProp { obj: dst, name: name_key, val: tmp });
+        // message = arg (coerced to string at use; stored as-is)
+        if let Some(a) = arg {
+            if let Some(e) = a.as_expression() {
+                let mv = self.expr_into(e, tmp)?;
+                if mv != tmp {
+                    self.emit(Instr::Move { dst: tmp, src: mv });
+                }
+            } else {
+                self.emit(Instr::LoadUndefined { dst: tmp });
+            }
+        } else {
+            let empty = self.add_string_const("");
+            self.emit(Instr::LoadConst { dst: tmp, idx: empty });
+        }
+        let msg_key = self.add_string_const("message");
+        self.emit(Instr::SetProp { obj: dst, name: msg_key, val: tmp });
+        self.next_reg -= 1; // reclaim tmp
+        Ok(dst)
+    }
+
     fn call(&mut self, c: &ox::CallExpression, dst: Reg) -> R<Reg> {
+        // Bare `Error("msg")` call (no `new`) → same Error object.
+        if let ox::Expression::Identifier(id) = &c.callee {
+            if let Some(kind) = error_ctor(&id.name) {
+                return self.build_error(kind, c.arguments.first(), dst);
+            }
+        }
         // console.log(...) → Print opcode.
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             if let ox::Expression::Identifier(obj) = &m.object {
@@ -1253,6 +1505,31 @@ enum Binding {
     /// function's upvalue list.
     Upvalue(u16),
     Global(u32),
+}
+
+/// Recognise the built-in Error constructor names the subset supports. Returns
+/// the canonical `name` to store on the error object.
+fn error_ctor(name: &str) -> Option<&'static str> {
+    match name {
+        "Error" => Some("Error"),
+        "TypeError" => Some("TypeError"),
+        "RangeError" => Some("RangeError"),
+        "SyntaxError" => Some("SyntaxError"),
+        _ => None,
+    }
+}
+
+/// Extract the loop-variable name from a `for-of`/`for-in` left-hand side.
+/// Supports `for (let/const/var x of …)` and `for (x of …)`.
+fn for_left_name(left: &ox::ForStatementLeft) -> R<String> {
+    match left {
+        ox::ForStatementLeft::VariableDeclaration(d) => match &d.declarations[0].id {
+            ox::BindingPattern::BindingIdentifier(id) => Ok(id.name.to_string()),
+            _ => Err("for-of/for-in destructuring not in the zipp-vm subset yet".into()),
+        },
+        ox::ForStatementLeft::AssignmentTargetIdentifier(id) => Ok(id.name.to_string()),
+        _ => Err("for-of/for-in needs a simple variable target".into()),
+    }
 }
 
 /// Render a numeric object key the way JS does (`{0: 'a'}` has key `"0"`).

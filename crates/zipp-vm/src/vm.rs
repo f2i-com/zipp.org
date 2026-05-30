@@ -32,6 +32,15 @@ const MAX_FRAMES: usize = 100_000;
 /// function rather than a closure. Real heap indices are always `< u32::MAX`.
 const NO_CLOSURE: u32 = u32::MAX;
 
+/// An active `try` handler within a frame.
+#[derive(Clone, Copy)]
+struct Handler {
+    /// Instruction index of the catch block.
+    catch_target: u32,
+    /// Register (frame-relative) that receives the thrown value.
+    catch_reg: u16,
+}
+
 /// One activation record.
 struct Frame {
     func: u32,
@@ -45,6 +54,10 @@ struct Frame {
     /// `NO_CLOSURE` for a plain function. `UpvalGet`/`UpvalSet` read the
     /// closure's captured cell indices through it.
     closure: u32,
+    /// Active `try` handlers in this frame, innermost last. A `Throw` (or a
+    /// thrown error bubbling up from a builtin call) unwinds to the innermost
+    /// handler here, else propagates to the caller frame.
+    handlers: Vec<Handler>,
 }
 
 pub struct Vm<'p> {
@@ -57,6 +70,12 @@ pub struct Vm<'p> {
     frames: Vec<Frame>,
     /// Lines produced by `Print` (console.log), in order.
     pub output: Vec<String>,
+    /// The JS value currently being thrown, set when a `Throw` (or an internal
+    /// error) begins unwinding and cleared when a `catch` handler receives it.
+    /// Carrying the real `Value` (not just a message) lets `catch (e)` bind the
+    /// exact thrown object/string/number, and survives propagation across
+    /// nested `run_loop` invocations (builtin callbacks) until caught.
+    pending_throw: Option<Value>,
 }
 
 /// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
@@ -80,6 +99,7 @@ impl<'p> Vm<'p> {
             regs: Vec::new(),
             frames: Vec::new(),
             output: Vec::new(),
+            pending_throw: None,
         }
     }
 
@@ -104,7 +124,7 @@ impl<'p> Vm<'p> {
         let top = &self.program.functions[0];
         let base = 0usize;
         self.regs.resize(top.reg_count as usize, Value::UNDEFINED);
-        self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE });
+        self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new() });
         // Run until the top-level frame returns (frames drains back to 0).
         self.run_loop(0)
     }
@@ -137,7 +157,7 @@ impl<'p> Vm<'p> {
         }
 
         let stop_depth = self.frames.len();
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0, closure });
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new() });
         self.run_loop(stop_depth)
     }
 
@@ -155,11 +175,67 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// The core dispatch loop. Drives frames until the frame that was current
-    /// on entry returns — i.e. until `frames.len()` drops to `stop_depth`,
-    /// whereupon that frame's return value is produced. `run()` passes 0 (drain
-    /// everything); `call_value` passes the pre-call depth (run one nested call).
+    /// Drives execution from the current frame until the frame that was current
+    /// on entry returns (frames drops to `stop_depth`), catching thrown values
+    /// at `try` handlers along the way. `run()` passes 0 (drain everything);
+    /// `call_value` passes the pre-call depth (run one nested call).
+    ///
+    /// On a throw, [`Self::dispatch_body`] returns `Err`; we look up the thrown
+    /// value and unwind to the nearest handler at or above `stop_depth`. If one
+    /// exists, execution resumes at its catch target; otherwise the throw
+    /// propagates out (with `pending_throw` left set so an enclosing `run_loop`
+    /// — e.g. the caller of a builtin callback — can still catch it).
     fn run_loop(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
+        loop {
+            match self.dispatch_body(stop_depth) {
+                Ok(v) => return Ok(v),
+                Err(t) => {
+                    let tv = match self.pending_throw {
+                        Some(v) => v,
+                        None => {
+                            // Internal error (TypeError/RangeError/…) with no
+                            // explicit thrown value: synthesise a string so it
+                            // is still catchable as `e`.
+                            let v = self.alloc_str(t.0.clone());
+                            self.pending_throw = Some(v);
+                            v
+                        }
+                    };
+                    if self.unwind_to_handler(tv, stop_depth) {
+                        self.pending_throw = None; // caught — resume at catch
+                        continue;
+                    }
+                    return Err(t); // uncaught here; pending_throw stays set
+                }
+            }
+        }
+    }
+
+    /// Pop frames from the top down to (but not below) `stop_depth`, looking for
+    /// a `try` handler. On finding one, deposit `tv` into its catch register,
+    /// set that frame's ip to the catch target, and return `true` (execution
+    /// resumes there). If the boundary is reached with no handler, return
+    /// `false` (the throw propagates to the caller).
+    fn unwind_to_handler(&mut self, tv: Value, stop_depth: usize) -> bool {
+        while self.frames.len() > stop_depth {
+            let top = self.frames.len() - 1;
+            if let Some(h) = self.frames[top].handlers.pop() {
+                let base = self.frames[top].base;
+                self.regs[base + h.catch_reg as usize] = tv;
+                self.frames[top].ip = h.catch_target as usize;
+                return true;
+            }
+            // No handler in this frame: discard it and its register window.
+            let f = self.frames.pop().unwrap();
+            self.regs.truncate(f.base);
+        }
+        false
+    }
+
+    /// The inner execution loop: runs ops in the current frame until a frame
+    /// transition (a call pushes / a return pops) or a throw. Returns the value
+    /// when the `stop_depth` frame returns, or `Err` to begin unwinding.
+    fn dispatch_body(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
         loop {
             // Snapshot the current frame's coordinates. `ip` is advanced as a
             // local and written back only on frame transitions / loops.
@@ -394,6 +470,41 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::ObjectKeys { dst, obj } => {
+                        let o = self.get(base, obj);
+                        // Collect the raw key strings first (immutable heap
+                        // borrow), then intern them (mutable) — can't hold both.
+                        let key_strs: Vec<String> = if o.is_heap() {
+                            match self.heap.get(o.heap_index()) {
+                                HeapObj::Object(map) => map.keys.clone(),
+                                HeapObj::Array(items) => {
+                                    (0..items.len()).map(|i| i.to_string()).collect()
+                                }
+                                _ => Vec::new(),
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let keys: Vec<Value> =
+                            key_strs.into_iter().map(|k| self.alloc_str(k)).collect();
+                        let v = Value::heap(self.heap.alloc(HeapObj::Array(keys)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::LenOf { dst, obj } => {
+                        let o = self.get(base, obj);
+                        let len = if o.is_heap() {
+                            match self.heap.get(o.heap_index()) {
+                                HeapObj::Array(items) => items.len() as i32,
+                                HeapObj::Str(s) => s.chars().count() as i32,
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
+                        self.set(base, dst, Value::int(len));
+                        ip += 1;
+                    }
                     Instr::MakeClosure { dst, func_id } => {
                         // Capture each upvalue's cell index, resolved in THIS
                         // (defining) frame: a ParentLocal source reads the cell
@@ -532,6 +643,26 @@ impl<'p> Vm<'p> {
                         break;
                     }
 
+                    Instr::Throw { src } => {
+                        let v = self.get(base, src);
+                        let msg = self.throw_message(v);
+                        // Persist ip so the (unused) frame state is coherent,
+                        // then signal unwinding via pending_throw + Err.
+                        let top = self.frames.len() - 1;
+                        self.frames[top].ip = ip;
+                        self.pending_throw = Some(v);
+                        return Err(Thrown(msg));
+                    }
+                    Instr::PushHandler { catch_target, catch_reg } => {
+                        let top = self.frames.len() - 1;
+                        self.frames[top].handlers.push(Handler { catch_target, catch_reg });
+                        ip += 1;
+                    }
+                    Instr::PopHandler => {
+                        let top = self.frames.len() - 1;
+                        self.frames[top].handlers.pop();
+                        ip += 1;
+                    }
                     Instr::Return { src } => {
                         let v = self.regs[base + src as usize];
                         if self.pop_frame_with(v, stop_depth) {
@@ -565,6 +696,25 @@ impl<'p> Vm<'p> {
         let caller_base = self.frames.last().unwrap().base;
         self.regs[caller_base + finished.ret_dst as usize] = ret;
         false
+    }
+
+    /// Render a thrown value for the UNCAUGHT-throw message (the `Outcome.error`
+    /// string). An Error-like object (`{message,…}` or one with a `.message`)
+    /// prints `name: message`; otherwise the value's string form. Catchable
+    /// throws bind the real `Value`, so this is only the top-level report.
+    fn throw_message(&self, v: Value) -> String {
+        if v.is_heap() {
+            if let HeapObj::Object(map) = self.heap.get(v.heap_index()) {
+                let name = map.get("name").map(|n| self.display(n));
+                let msg = map.get("message").map(|m| self.display(m));
+                return match (name, msg) {
+                    (Some(n), Some(m)) => format!("{n}: {m}"),
+                    (None, Some(m)) => format!("Error: {m}"),
+                    _ => self.display(v),
+                };
+            }
+        }
+        format!("Uncaught {}", self.display(v))
     }
 
     // ── register access ──
@@ -642,7 +792,7 @@ impl<'p> Vm<'p> {
 
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure });
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new() });
         Ok(())
     }
 
@@ -726,7 +876,14 @@ impl<'p> Vm<'p> {
 
     fn get_prop(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
         if !obj.is_heap() {
-            // `"abc".length` and the like on primitive strings handled here too.
+            // Reading a property of null/undefined throws a TypeError (matches
+            // JS); other primitives (number/bool) have no own props here → undef.
+            if obj.is_nullish() {
+                return Err(Thrown(format!(
+                    "TypeError: Cannot read properties of {} (reading '{key}')",
+                    if obj.is_null() { "null" } else { "undefined" }
+                )));
+            }
             return Ok(Value::UNDEFINED);
         }
         match self.heap.get(obj.heap_index()) {

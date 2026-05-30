@@ -105,6 +105,12 @@ pub enum Instr {
     NewArray { dst: Reg, arg_base: Reg, argc: u16 },
     /// `dst = {}` — empty object (populated by following SetProp/SetIndex).
     NewObject { dst: Reg },
+    /// `dst = <array of obj's own enumerable string keys>` — drives `for-in`.
+    /// For an array, the keys are the index strings "0".."len-1".
+    ObjectKeys { dst: Reg, obj: Reg },
+    /// `dst = <length of array/string in obj>` (0 for anything else). Used by
+    /// the `for-of` desugaring's bound check.
+    LenOf { dst: Reg, obj: Reg },
     /// `dst = obj[key]` — computed member read (array element or object prop).
     GetIndex { dst: Reg, obj: Reg, key: Reg },
     /// `obj[key] = val` — computed member write.
@@ -122,6 +128,16 @@ pub enum Instr {
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
     CallMethod { dst: Reg, obj: Reg, name: u32, arg_base: Reg, argc: u16 },
+
+    /// Throw the value in `src`. Unwinds to the nearest enclosing catch handler
+    /// (in this or a caller frame), or aborts the program if none.
+    Throw { src: Reg },
+    /// Push a try-handler: on a throw before the matching `PopHandler`, control
+    /// jumps to `catch_target` with the thrown value placed in `catch_reg`.
+    PushHandler { catch_target: u32, catch_reg: Reg },
+    /// Pop the most recent try-handler (reached when the try block completes
+    /// without throwing).
+    PopHandler,
 
     /// Return `src` from the current function.
     Return { src: Reg },

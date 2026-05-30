@@ -399,6 +399,75 @@ mod tests {
         assert_eq!(run_ok("console.log(Infinity > 1e308, -Infinity < 0)"), vec!["true true"]);
     }
 
+    // ── Stage 4: for-of / for-in / do-while / try-catch-throw ──
+
+    #[test]
+    fn for_of_array_and_string() {
+        assert_eq!(run_ok("let s=0; for (const x of [1,2,3,4]) { s += x } console.log(s)"), vec!["10"]);
+        assert_eq!(run_ok("let s=''; for (const c of 'abc') { s = c + s } console.log(s)"), vec!["cba"]);
+    }
+
+    #[test]
+    fn for_in_object_keys_and_values() {
+        assert_eq!(run_ok("let o={a:1,b:2,c:3}; let k=''; for (const key in o) { k += key } console.log(k)"), vec!["abc"]);
+        assert_eq!(run_ok("let o={x:10,y:20,z:5}; let s=0; for (const key in o) { s += o[key] } console.log(s)"), vec!["35"]);
+    }
+
+    #[test]
+    fn do_while_runs_body_first() {
+        assert_eq!(run_ok("let i=0,s=0; do { s+=i; i++ } while (i<5); console.log(s)"), vec!["10"]);
+        // body runs at least once even when the condition is false initially
+        assert_eq!(run_ok("let n=0; do { n++ } while (false); console.log(n)"), vec!["1"]);
+    }
+
+    #[test]
+    fn try_catch_basic() {
+        assert_eq!(run_ok("try { throw 'boom' } catch (e) { console.log('caught', e) }"), vec!["caught boom"]);
+        assert_eq!(run_ok("try { throw 42 } catch (e) { console.log(e + 1) }"), vec!["43"]);
+    }
+
+    #[test]
+    fn try_catch_across_call() {
+        assert_eq!(
+            run_ok("function f(){ throw 'deep' } try { f() } catch(e){ console.log('got', e) }"),
+            vec!["got deep"]
+        );
+    }
+
+    #[test]
+    fn try_catch_finally_order() {
+        assert_eq!(
+            run_ok("let r=''; try { r+='a'; throw 1; r+='b' } catch(e){ r+='c' } finally { r+='d' } console.log(r)"),
+            vec!["acd"]
+        );
+        // finally also runs on normal completion
+        assert_eq!(
+            run_ok("let r=''; try { r+='x' } finally { r+='y' } console.log(r)"),
+            vec!["xy"]
+        );
+    }
+
+    #[test]
+    fn error_object_name_and_message() {
+        assert_eq!(run_ok("try { throw new Error('boom') } catch (e) { console.log(e.message, e.name) }"), vec!["boom Error"]);
+        assert_eq!(run_ok("try { throw new RangeError('neg') } catch (e) { console.log(e.name) }"), vec!["RangeError"]);
+    }
+
+    #[test]
+    fn property_of_undefined_throws_typeerror() {
+        assert_eq!(
+            run_ok("let x; try { x = undefined.foo } catch (e) { x = 'caught' } console.log(x)"),
+            vec!["caught"]
+        );
+    }
+
+    #[test]
+    fn uncaught_throw_reports_error_with_output_preserved() {
+        let out = run("console.log('before'); throw new Error('fail'); console.log('after')").expect("compile");
+        assert_eq!(out.output, vec!["before"]);
+        assert!(out.error.as_ref().unwrap().contains("fail"), "got {:?}", out.error);
+    }
+
     #[test]
     fn known_limitation_per_iteration_let_in_for() {
         // KNOWN GAP vs node: a `let` loop variable captured inside a for-loop
