@@ -685,7 +685,38 @@ impl<'p> Vm<'p> {
                     }
 
                     Instr::Jump { target } => {
-                        ip = target as usize;
+                        let t = target as usize;
+                        // ── OSR tier ── a backward jump is a loop back-edge. After
+                        // the region heats up, compile `[target, ip]` (the loop
+                        // body, headed at `target`) and run it natively; the
+                        // native code returns the ip to resume at (a clean loop
+                        // exit or a guard bail). Gated like the function JIT:
+                        // enabled, and not inside a native self-recursion.
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        if self.jit_enabled && self.jit_recurse_depth == 0 && t < ip {
+                            if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
+                                ip = resume;
+                                continue;
+                            }
+                            if self.jit.record_region(func_id, t as u32) {
+                                let proto: *const crate::bytecode::FuncProto =
+                                    &self.program.functions[func_id as usize];
+                                // SAFETY: program functions are immutable during run.
+                                let proto_ref = unsafe { &*proto };
+                                self.jit.compile_region(
+                                    func_id,
+                                    proto_ref,
+                                    t as u32,
+                                    ip as u32,
+                                    jit_globals_base as usize,
+                                );
+                                if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
+                                    ip = resume;
+                                    continue;
+                                }
+                            }
+                        }
+                        ip = t;
                     }
                     Instr::JumpIfFalse { cond, target } => {
                         let v = self.get(base, cond);
@@ -973,6 +1004,27 @@ impl<'p> Vm<'p> {
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
         Some((Value::from_bits(bits), bail))
+    }
+
+    /// Run the compiled OSR region for the loop headed at `entry_ip` (in
+    /// `func_id`) over the frame's register window at `base`, returning the ip to
+    /// resume interpreting at. `None` if no region is compiled for this header.
+    ///
+    /// The region's native code reads/writes `self.regs[base..]` and
+    /// `self.globals` directly (the latter via a base pointer it fetches in its
+    /// prologue). The numeric region issues NO calls that push frames or grow
+    /// `self.regs`/`self.globals`, so the raw pointers stay valid for the call.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn try_run_osr(&mut self, func_id: u32, entry_ip: u32, base: usize) -> Option<usize> {
+        let region = self.jit.get_region(func_id, entry_ip)? as *const crate::codegen::Region;
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        // SAFETY: `region` is stable for the call (we don't mutate self.jit until
+        // after); regs/globals do not move during a numeric region run.
+        let resume = unsafe { (*region).run(regs_ptr, vm_ptr) };
+        // Bookkeeping: a resume INSIDE the region is a deopt; evict if chronic.
+        self.jit.note_region_resume(func_id, entry_ip, resume);
+        Some(resume as usize)
     }
 
     /// Pop the current frame. If this returns control to `stop_depth` (the
@@ -1896,6 +1948,19 @@ pub(crate) extern "win64" fn jit_load_global(vm: *mut core::ffi::c_void, idx: u3
 pub(crate) extern "win64" fn jit_store_global(vm: *mut core::ffi::c_void, idx: u32, val_bits: u64) {
     let vm = unsafe { &mut *(vm as *mut Vm) };
     vm.globals[idx as usize] = Value::from_bits(val_bits);
+}
+
+/// Win64 helper: the base pointer of `vm.globals`, fetched once by an OSR loop
+/// region's prologue and pinned in a callee-saved register for direct
+/// `LoadGlobal`/`StoreGlobal`. Sound because `globals` is allocated once at VM
+/// construction (`global_count` slots) and never reallocates at runtime.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm` that outlives the region run.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_globals_base(vm: *mut core::ffi::c_void) -> *mut u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.globals.as_mut_ptr() as *mut u64
 }
 
 /// Normalise a (possibly negative) slice index into `[0, len]`. Negative
