@@ -118,6 +118,22 @@ mod tests {
     }
 
     #[test]
+    fn to_number_coercion() {
+        // ToNumber(object) via ToPrimitive (string form), and radix-prefixed /
+        // Infinity / invalid string forms.
+        assert_eq!(out("console.log(Number([]))"), "0");
+        assert_eq!(out("console.log([] - 1)"), "-1");
+        assert_eq!(out("console.log(+[])"), "0");
+        assert_eq!(out("console.log(Number([5]), Number([1,2]), Number({}))"), "5 NaN NaN");
+        assert_eq!(out("console.log(Number('0b101'), Number('0o17'), Number('0xff'))"), "5 15 255");
+        assert_eq!(out("console.log(Number(''), Number('  42  '), Number('3.14'))"), "0 42 3.14");
+        assert_eq!(out("console.log(Number('Infinity'), Number('-Infinity'))"), "Infinity -Infinity");
+        // Rust's f64 parser accepts these; JS does not.
+        assert_eq!(out("console.log(Number('inf'), Number('nan'), Number('abc'))"), "NaN NaN NaN");
+        assert_eq!(out("console.log([10] - 5, +'  7  ')"), "5 7");
+    }
+
+    #[test]
     fn arithmetic_and_coercion() {
         assert_eq!(out("console.log(1 + 2 * 3)"), "7");
         assert_eq!(out("console.log(10 / 4)"), "2.5");

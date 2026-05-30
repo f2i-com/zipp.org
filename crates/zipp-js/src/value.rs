@@ -174,17 +174,11 @@ impl JsValue {
                 }
             }
             JsValue::Num(n) => *n,
-            JsValue::Str(s) => {
-                let t = s.trim();
-                if t.is_empty() {
-                    0.0
-                } else if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-                    i64::from_str_radix(hex, 16).map(|x| x as f64).unwrap_or(f64::NAN)
-                } else {
-                    t.parse::<f64>().unwrap_or(f64::NAN)
-                }
-            }
-            JsValue::Object(_) => self.to_primitive_string().parse::<f64>().unwrap_or(f64::NAN),
+            JsValue::Str(s) => str_to_number(s),
+            // ToNumber(object) = ToNumber(ToPrimitive(object, Number)); v0 has no
+            // valueOf, so ToPrimitive is the string form ([] -> "" -> 0,
+            // [5] -> "5" -> 5, {} -> "[object Object]" -> NaN).
+            JsValue::Object(_) => str_to_number(&self.to_primitive_string()),
         }
     }
 
@@ -324,6 +318,44 @@ impl JsValue {
 }
 
 /// JS number → string (integers without a decimal, `Infinity`/`NaN`, etc.).
+/// ECMAScript StringToNumber: trim, then `""`→0, `0x`/`0o`/`0b` radix prefixes,
+/// `Infinity`, else a decimal float. Rejects Rust-accepted but JS-invalid forms
+/// like `inf`/`nan` (any ASCII letter other than the exponent `e`/`E`).
+pub fn str_to_number(s: &str) -> f64 {
+    let t = s.trim();
+    if t.is_empty() {
+        return 0.0;
+    }
+    let radix = |p1: &str, p2: &str, r: u32| -> Option<f64> {
+        t.strip_prefix(p1).or_else(|| t.strip_prefix(p2)).map(|d| {
+            if d.is_empty() {
+                f64::NAN
+            } else {
+                u128::from_str_radix(d, r).map(|x| x as f64).unwrap_or(f64::NAN)
+            }
+        })
+    };
+    if let Some(v) = radix("0x", "0X", 16) {
+        return v;
+    }
+    if let Some(v) = radix("0o", "0O", 8) {
+        return v;
+    }
+    if let Some(v) = radix("0b", "0B", 2) {
+        return v;
+    }
+    match t {
+        "Infinity" | "+Infinity" => return f64::INFINITY,
+        "-Infinity" => return f64::NEG_INFINITY,
+        _ => {}
+    }
+    // Reject e.g. "inf"/"infinity"/"nan" that Rust's f64 parser would accept.
+    if t.bytes().any(|b| b.is_ascii_alphabetic() && b != b'e' && b != b'E') {
+        return f64::NAN;
+    }
+    t.parse::<f64>().unwrap_or(f64::NAN)
+}
+
 /// JS `Number.prototype.toString()` (base 10) — the ECMAScript Number::toString
 /// algorithm. Rust's `{:e}` gives the shortest round-trip mantissa+exponent
 /// (`d[.ddd]eEXP`, value = mantissa × 10^EXP), which supplies the spec's digit
