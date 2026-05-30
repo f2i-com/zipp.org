@@ -65,21 +65,9 @@ fn run(args: &[String]) -> Result<(), String> {
             let path = it.next().ok_or("usage: zipp js <file.js>")?;
             let src =
                 std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
-            // `console.log` writes straight to stdout inside the engine, so we
-            // just run and propagate any uncaught error. eval returns the final
-            // value (ignored — scripts communicate via console, like node).
-            let engine = zipp_engine::engine::ZippEngine::default();
-            match engine.eval(&src) {
-                Ok(_value) => Ok(()),
-                Err(e) => Err(format!("{e}")),
-            }
-        }
-        Some("js-tw") => {
-            // Dynamic JavaScript engine (tree-walker): the original Lane-3
-            // interpreter, kept as a fallback + differential-test oracle vs node.
-            let path = it.next().ok_or("usage: zipp js-tw <file.js>")?;
-            let src =
-                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            // Default engine = the tree-walker: node-compatible console.log (to
+            // stdout), no instruction cap, broad coverage. The fast zipp-engine
+            // is `zipp jse` (not yet a console-to-stdout drop-in).
             let outcome = zipp_js::run(&src)?;
             for line in &outcome.output {
                 println!("{line}");
@@ -88,6 +76,26 @@ fn run(args: &[String]) -> Result<(), String> {
                 return Err(err);
             }
             Ok(())
+        }
+        Some("jse") => {
+            // EXPERIMENTAL fast engine (zipp-engine, absorbed from FormLogic):
+            // NaN-boxed value, register-bytecode VM, shapes + inline caches,
+            // dynasm JIT. It prints the eval RETURN VALUE (its console is not yet
+            // wired to stdout) and enforces a 100M-instruction sandbox cap.
+            let path = it.next().ok_or("usage: zipp jse <file.js>")?;
+            let src =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            let engine = zipp_engine::engine::ZippEngine::default();
+            match engine.eval(&src) {
+                Ok(value) => {
+                    let s = value.inspect();
+                    if !s.is_empty() && s != "undefined" {
+                        println!("{s}");
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(format!("{e}")),
+            }
         }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
