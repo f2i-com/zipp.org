@@ -16,27 +16,37 @@
 //! `console.log`. Anything else is a clear compile error — coverage grows over
 //! time, the same way the old engine did.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use oxc_ast::ast as ox;
 
 use crate::bytecode::{FuncProto, Instr, Program, Reg, UpvalSource};
+use crate::capture;
 use crate::value::Value;
 use crate::vm::STRING_CONST_BIT;
 
 type R<T> = Result<T, String>;
 
-/// A read-only snapshot of an enclosing function's binding environment, used by
-/// a nested function to resolve free variables to upvalues. The chain is ordered
-/// outermost → innermost-parent; the last entry is the direct parent.
+/// Shared, mutable upvalue list of a function: (name, where-the-cell-comes-from).
+/// Shared via `Rc<RefCell>` so a deeply-nested function can append upvalues to
+/// an ancestor (transitive capture): an intermediate function that only *passes
+/// through* a variable still needs to capture it so its child can re-source it.
+type UpvalList = Rc<RefCell<Vec<(String, UpvalSource)>>>;
+
+/// A snapshot of an enclosing function's binding environment, used by a nested
+/// function to resolve free variables to upvalues. The chain is ordered
+/// outermost → innermost-parent; the last entry is the direct parent. The
+/// `upvalues` handle is SHARED with the live ancestor `FnCompiler`, so resolving
+/// a variable through this snapshot also records the upvalue on the ancestor.
 #[derive(Clone)]
 struct EnclosingFn {
     /// name → register holding that binding's CELL in the parent frame. Only
     /// captured bindings appear here (non-captured locals can't be upvalues).
     cell_locals: Vec<(String, Reg)>,
-    /// Upvalue names the parent itself captured, in upvalue-index order — so a
-    /// grandchild can re-capture through the parent (ParentUpval sourcing).
-    upvalue_names: Vec<String>,
+    /// The ancestor's own upvalue list (shared handle).
+    upvalues: UpvalList,
 }
 
 /// Compile a parsed program into bytecode.
@@ -134,6 +144,8 @@ impl Compiler {
         }
         fc.emit(Instr::ReturnUndefined);
 
+        let upvalues: Vec<UpvalSource> =
+            fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -142,7 +154,7 @@ impl Compiler {
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
-            upvalues: fc.upvalues.iter().map(|(_, s)| *s).collect(),
+            upvalues,
         })
     }
 
@@ -182,6 +194,8 @@ impl Compiler {
             }
             fc.emit(Instr::ReturnUndefined);
         }
+        let upvalues: Vec<UpvalSource> =
+            fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         Ok(FuncProto {
             name: "<arrow>".to_string(),
             code: fc.code,
@@ -190,9 +204,36 @@ impl Compiler {
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
-            upvalues: fc.upvalues.iter().map(|(_, s)| *s).collect(),
+            upvalues,
         })
     }
+}
+
+/// Resolve `name` to an `UpvalSource` for the INNERMOST function whose enclosing
+/// chain is `chain` (outermost → direct parent). The direct parent is
+/// `chain.last()`. If the variable is a cell-local of the direct parent, the
+/// source is `ParentLocal`. Otherwise the parent must itself capture it as one
+/// of its upvalues — found, or recursively created by capturing from the
+/// grandparent — and the source is `ParentUpval(parent's upvalue index)`. This
+/// is the standard Lua "find/create upvalue" walk, threading a capture through
+/// every intermediate level. `None` if no enclosing function binds `name`.
+fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
+    let (parent, outer) = chain.split_last()?;
+    // Direct parent holds the cell as a local.
+    if let Some((_, reg)) = parent.cell_locals.iter().find(|(n, _)| n == name) {
+        return Some(UpvalSource::ParentLocal(*reg));
+    }
+    // Parent already captured it as an upvalue.
+    if let Some(i) = parent.upvalues.borrow().iter().position(|(n, _)| n == name) {
+        return Some(UpvalSource::ParentUpval(i as u16));
+    }
+    // Otherwise make the parent capture it from ITS enclosing chain, then point
+    // at the parent's freshly-added upvalue.
+    let src_for_parent = capture_source(outer, name)?;
+    let mut pups = parent.upvalues.borrow_mut();
+    let idx = pups.len() as u16;
+    pups.push((name.to_string(), src_for_parent));
+    Some(UpvalSource::ParentUpval(idx))
 }
 
 fn placeholder(name: &str) -> FuncProto {
@@ -231,7 +272,8 @@ struct FnCompiler<'a> {
     cell_regs: HashSet<Reg>,
     /// Upvalues this function captures, built lazily as free vars are resolved:
     /// (name, source-in-parent). Index in this Vec is the runtime upvalue index.
-    upvalues: Vec<(String, UpvalSource)>,
+    /// Shared (`Rc<RefCell>`) so nested functions can append transitively.
+    upvalues: UpvalList,
     /// Enclosing functions' binding snapshots (outermost → direct parent).
     enclosing: Vec<EnclosingFn>,
 }
@@ -254,7 +296,7 @@ impl<'a> FnCompiler<'a> {
             is_script: false,
             captured,
             cell_regs: HashSet::new(),
-            upvalues: Vec::new(),
+            upvalues: Rc::new(RefCell::new(Vec::new())),
             enclosing,
         };
         // Register 0 is reserved for `this` in every function (undefined for
@@ -276,8 +318,9 @@ impl<'a> FnCompiler<'a> {
     }
 
     /// Snapshot this function's environment for a nested function to capture
-    /// from: cell-backed locals in scope, plus this function's own upvalue names
-    /// (so a grandchild can re-source through us via ParentUpval).
+    /// from: cell-backed locals in scope, plus a SHARED handle to this
+    /// function's upvalue list (so a grandchild can both read and transitively
+    /// extend it via ParentUpval re-sourcing).
     fn snapshot(&self) -> EnclosingFn {
         let mut cell_locals = Vec::new();
         for scope in &self.scopes {
@@ -287,32 +330,22 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
-        EnclosingFn {
-            cell_locals,
-            upvalue_names: self.upvalues.iter().map(|(n, _)| n.clone()).collect(),
-        }
+        EnclosingFn { cell_locals, upvalues: self.upvalues.clone() }
     }
 
     /// Resolve a free variable to an upvalue index in THIS function, creating
-    /// the upvalue on first use. `None` if not found in any enclosing function.
+    /// the upvalue on first use. `None` if not found in any enclosing function
+    /// (then it's a global). Transitive: if the variable lives in an ancestor
+    /// beyond the direct parent, every intermediate function captures it too.
     fn resolve_upvalue(&mut self, name: &str) -> Option<u16> {
-        if let Some(i) = self.upvalues.iter().position(|(n, _)| n == name) {
+        if let Some(i) = self.upvalues.borrow().iter().position(|(n, _)| n == name) {
             return Some(i as u16);
         }
-        let parent = self.enclosing.last()?.clone();
-        if let Some((_, reg)) = parent.cell_locals.iter().find(|(n, _)| n == name) {
-            return Some(self.add_upvalue(name, UpvalSource::ParentLocal(*reg)));
-        }
-        if let Some(idx) = parent.upvalue_names.iter().position(|n| n == name) {
-            return Some(self.add_upvalue(name, UpvalSource::ParentUpval(idx as u16)));
-        }
-        None
-    }
-
-    fn add_upvalue(&mut self, name: &str, src: UpvalSource) -> u16 {
-        let idx = self.upvalues.len() as u16;
-        self.upvalues.push((name.to_string(), src));
-        idx
+        let src = capture_source(&self.enclosing, name)?;
+        let mut ups = self.upvalues.borrow_mut();
+        let idx = ups.len() as u16;
+        ups.push((name.to_string(), src));
+        Some(idx)
     }
 
     // ── register allocation ──
