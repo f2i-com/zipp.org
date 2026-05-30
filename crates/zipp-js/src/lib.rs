@@ -212,6 +212,22 @@ mod tests {
     }
 
     #[test]
+    fn user_tostring_in_coercion() {
+        // String(obj), template literals, and `+` use a user toString().
+        let p = "class P{constructor(x){this.x=x;} toString(){return 'P'+this.x;}}";
+        assert_eq!(out(&format!("{p} console.log(String(new P(5)))")), "P5");
+        assert_eq!(out(&format!("{p} const o=new P(7); console.log(`v=${{o}}`)")), "v=P7");
+        assert_eq!(out(&format!("{p} console.log('' + new P(9))")), "P9");
+        assert_eq!(out(&format!("{p} console.log(new P(1) + '!')")), "P1!");
+        // object-literal toString
+        assert_eq!(out("const o={toString(){return 'C';}}; console.log(String(o), `${o}`, 'x'+o)"), "C C xC");
+        // Error coerces via its prototype toString → "Error: msg"
+        assert_eq!(out("console.log(String(new Error('oops')))"), "Error: oops");
+        // plain object + primitives keep default coercion
+        assert_eq!(out("console.log(String({}), String(42), String(null), String([1,2]))"), "[object Object] 42 null 1,2");
+    }
+
+    #[test]
     fn error_constructors() {
         assert_eq!(out("const e=new Error('boom'); console.log(e.message, e.name)"), "boom Error");
         assert_eq!(out("console.log(new Error('x') instanceof Error)"), "true");

@@ -329,7 +329,8 @@ impl Interp {
                 for (i, q) in strings.iter().enumerate() {
                     s.push_str(q);
                     if let Some(e) = exprs.get(i) {
-                        s.push_str(&self.eval(e, scope)?.to_js_string());
+                        let v = self.eval(e, scope)?;
+                        s.push_str(&self.to_string(&v)?);
                     }
                 }
                 Ok(JsValue::str(s))
@@ -732,6 +733,22 @@ impl Interp {
         None
     }
 
+    /// Interp-aware string coercion: if `v` is an object with a callable
+    /// `toString` (own or inherited), invoke it (with `this = v`) and use its
+    /// result; otherwise fall back to the lifetime-free `to_js_string`. Used at
+    /// the coercion sites that can run user code — template literals, `+` string
+    /// concatenation, and `String(x)`.
+    pub fn to_string(&self, v: &JsValue) -> EvalResult<String> {
+        if let JsValue::Object(_) = v {
+            let ts = self.get_member(v, "toString")?;
+            if matches!(&ts, JsValue::Object(o) if o.borrow().is_callable()) {
+                let r = self.call(&ts, v, &[])?;
+                return Ok(r.to_js_string());
+            }
+        }
+        Ok(v.to_js_string())
+    }
+
     pub fn get_member(&self, obj: &JsValue, key: &str) -> EvalResult<JsValue> {
         // An accessor (getter) on the object or its chain takes precedence over a
         // data property; invoke it with `this = obj`.
@@ -853,8 +870,19 @@ impl Interp {
         }
         Ok(match op {
             Add => {
-                let lp = to_primitive(&l);
-                let rp = to_primitive(&r);
+                // ToPrimitive(default): for objects this is the user `toString`
+                // result (v0 has no `valueOf`), so `"" + obj` uses a custom
+                // toString. Then the usual string-or-number `+` rule.
+                let lp = if matches!(l, JsValue::Object(_)) {
+                    JsValue::str(self.to_string(&l)?)
+                } else {
+                    l.clone()
+                };
+                let rp = if matches!(r, JsValue::Object(_)) {
+                    JsValue::str(self.to_string(&r)?)
+                } else {
+                    r.clone()
+                };
                 if matches!(lp, JsValue::Str(_)) || matches!(rp, JsValue::Str(_)) {
                     JsValue::str(format!("{}{}", lp.to_js_string(), rp.to_js_string()))
                 } else {
@@ -977,14 +1005,6 @@ fn native(name: &str, f: NativeFn) -> JsValue {
 
 // ───────────────────────── numeric / coercion helpers ─────────────────────────
 
-/// ToPrimitive(default) for the `+` operator — arrays/objects via their string
-/// form (no user `valueOf`/`toString` dispatch yet).
-fn to_primitive(v: &JsValue) -> JsValue {
-    match v {
-        JsValue::Object(_) => JsValue::str(v.to_js_string()),
-        other => other.clone(),
-    }
-}
 
 /// JS `%` (truncated remainder, sign of the dividend; NaN on 0 divisor).
 fn js_mod(a: f64, b: f64) -> f64 {

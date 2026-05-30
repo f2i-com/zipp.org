@@ -122,7 +122,12 @@ pub fn install(it: &Interp) {
     decl("Number", JsValue::Object(number));
 
     // String (callable + fromCharCode)
-    let string = Object::native("String", |_, _, a| Ok(JsValue::str(a.first().map(|v| v.to_js_string()).unwrap_or_default())));
+    let string = Object::native("String", |it, _, a| {
+        Ok(JsValue::str(match a.first() {
+            Some(v) => it.to_string(v)?, // user toString dispatch for objects
+            None => String::new(),
+        }))
+    });
     string.borrow_mut().set("fromCharCode", nf("fromCharCode", str_from_char_code));
     decl("String", JsValue::Object(string));
 
