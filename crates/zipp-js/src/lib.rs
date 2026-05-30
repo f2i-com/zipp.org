@@ -198,6 +198,19 @@ mod tests {
     }
 
     #[test]
+    fn destructuring() {
+        assert_eq!(out("const {a,b}={a:1,b:2,c:3}; console.log(a,b)"), "1 2");
+        assert_eq!(out("const {a:x,c:y}={a:1,b:2,c:3}; console.log(x,y)"), "1 3");
+        assert_eq!(out("const {m=99,a=5}={a:1}; console.log(m,a)"), "99 1");
+        assert_eq!(out("const {n:{x,y}}={n:{x:10,y:20}}; console.log(x,y)"), "10 20");
+        assert_eq!(out("const [p,q]=[10,20,30]; console.log(p,q)"), "10 20");
+        assert_eq!(out("const [,,z]=[10,20,30]; console.log(z)"), "30");
+        assert_eq!(out("const [h,...t]=[1,2,3,4]; console.log(h, t.join(','))"), "1 2,3,4");
+        assert_eq!(out("const [a=1,,c=100]=[7,8]; console.log(a,c)"), "7 100");
+        assert_eq!(out("const [[a,b],[c]]=[[1,2],[3,4]]; console.log(a,b,c)"), "1 2 3");
+    }
+
+    #[test]
     fn optional_chaining() {
         assert_eq!(out("const o={a:{b:{c:42}}}; console.log(o?.a?.b?.c)"), "42");
         assert_eq!(out("const o={a:1}; console.log(o?.x?.y?.z)"), "undefined");

@@ -84,14 +84,120 @@ fn var_decl(d: &ox::VariableDeclaration) -> R<Stmt> {
     };
     let mut decls = Vec::new();
     for decl in &d.declarations {
-        let name = binding_name(&decl.id)?;
-        let init = match &decl.init {
-            Some(e) => Some(expr(e)?),
-            None => None,
-        };
-        decls.push((name, init));
+        match &decl.id {
+            // simple `let x = …`
+            ox::BindingPattern::BindingIdentifier(id) => {
+                let init = match &decl.init {
+                    Some(e) => Some(expr(e)?),
+                    None => None,
+                };
+                decls.push((id.name.to_string(), init));
+            }
+            // destructuring `let {a, b} = …` / `let [x, y] = …`: bind the
+            // initializer to a fresh temp, then expand the pattern into simple
+            // (name, init) pairs that read from it.
+            pattern => {
+                let init = decl
+                    .init
+                    .as_ref()
+                    .ok_or("a destructuring declaration needs an initializer")?;
+                let tmp = fresh_tmp();
+                decls.push((tmp.clone(), Some(expr(init)?)));
+                destructure(pattern, Expr::Ident(tmp), &mut decls)?;
+            }
+        }
     }
     Ok(Stmt::Var { kind, decls })
+}
+
+thread_local! {
+    static DESTRUCT_TMP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A fresh, collision-free temp name for a destructuring source.
+fn fresh_tmp() -> String {
+    DESTRUCT_TMP.with(|c| {
+        let n = c.get();
+        c.set(n + 1);
+        format!("__destr{n}")
+    })
+}
+
+/// `src === undefined ? dflt : src` — apply a destructuring default.
+fn with_default(src: Expr, dflt: Expr) -> Expr {
+    Expr::Cond {
+        cond: Box::new(Expr::Binary {
+            op: BinOp::StrictEq,
+            l: Box::new(src.clone()),
+            r: Box::new(Expr::Undefined),
+        }),
+        then: Box::new(dflt),
+        els: Box::new(src),
+    }
+}
+
+/// The member key (and computed-ness) for an object binding property.
+fn binding_key(key: &ox::PropertyKey, computed: bool) -> R<(Expr, bool)> {
+    if computed {
+        return Ok((expr(key.as_expression().ok_or("bad computed destructuring key")?)?, true));
+    }
+    let name = match key {
+        ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+        ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
+        ox::PropertyKey::NumericLiteral(n) => crate::value::num_to_string(n.value),
+        _ => return Err("unsupported destructuring key".into()),
+    };
+    Ok((Expr::Str(name.into()), false))
+}
+
+/// Expand a binding pattern that reads from `src` into simple (name, init) pairs.
+fn destructure(pat: &ox::BindingPattern, src: Expr, out: &mut Vec<(String, Option<Expr>)>) -> R<()> {
+    match pat {
+        ox::BindingPattern::BindingIdentifier(id) => {
+            out.push((id.name.to_string(), Some(src)));
+            Ok(())
+        }
+        ox::BindingPattern::AssignmentPattern(ap) => {
+            let dflt = expr(&ap.right)?;
+            destructure(&ap.left, with_default(src, dflt), out)
+        }
+        ox::BindingPattern::ObjectPattern(o) => {
+            if o.rest.is_some() {
+                return Err("object rest in destructuring isn't in the v0 JS engine yet".into());
+            }
+            for p in &o.properties {
+                let (key, computed) = binding_key(&p.key, p.computed)?;
+                let sub = Expr::Member { obj: Box::new(src.clone()), prop: Box::new(key), computed };
+                destructure(&p.value, sub, out)?;
+            }
+            Ok(())
+        }
+        ox::BindingPattern::ArrayPattern(a) => {
+            for (i, el) in a.elements.iter().enumerate() {
+                if let Some(elpat) = el {
+                    let sub = Expr::Member {
+                        obj: Box::new(src.clone()),
+                        prop: Box::new(Expr::Num(i as f64)),
+                        computed: true,
+                    };
+                    destructure(elpat, sub, out)?;
+                }
+            }
+            if let Some(rest) = &a.rest {
+                // `...rest` → `src.slice(n)` (arrays only in v0)
+                let slice = Expr::Call {
+                    callee: Box::new(Expr::Member {
+                        obj: Box::new(src.clone()),
+                        prop: Box::new(Expr::Str("slice".into())),
+                        computed: false,
+                    }),
+                    args: vec![Expr::Num(a.elements.len() as f64)],
+                };
+                destructure(&rest.argument, slice, out)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn binding_name(b: &ox::BindingPattern) -> R<String> {
