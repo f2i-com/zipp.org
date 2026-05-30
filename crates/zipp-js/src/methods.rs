@@ -68,6 +68,8 @@ pub fn array_method(name: &str) -> Option<NativeFn> {
         "reverse" => arr_reverse,
         "fill" => arr_fill,
         "flat" => arr_flat,
+        "flatMap" => arr_flat_map,
+        "reduceRight" => arr_reduce_right,
         "at" => arr_at,
         "sort" => arr_sort,
         _ => return None,
@@ -323,6 +325,45 @@ fn arr_flat(it: &Interp, this: &JsValue, _a: &[JsValue]) -> EvalResult<JsValue> 
         }
     }
     Ok(JsValue::Object(Object::array(out)))
+}
+
+// flatMap(cb, [thisArg]) == map(cb).flat(1): map each element, then flatten the
+// results by a single level.
+fn arr_flat_map(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
+    let o = as_array(this).ok_or_else(|| it.type_error("flatMap called on non-array"))?;
+    let cb = arg(args, 0);
+    let items = snapshot(&o);
+    let mut out = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let r = it.call(&cb, &JsValue::Undefined, &[item.clone(), JsValue::Num(i as f64), this.clone()])?;
+        if let Some(inner) = as_array(&r) {
+            out.extend(snapshot(&inner));
+        } else {
+            out.push(r);
+        }
+    }
+    Ok(JsValue::Object(Object::array(out)))
+}
+
+// reduceRight(cb, [init]): like reduce but walks indices from len-1 down to 0.
+fn arr_reduce_right(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
+    let o = as_array(this).ok_or_else(|| it.type_error("reduceRight called on non-array"))?;
+    let cb = arg(args, 0);
+    let items = snapshot(&o);
+    let mut idx = items.len();
+    let mut acc = if args.len() >= 2 {
+        arg(args, 1)
+    } else if items.is_empty() {
+        return Err(it.type_error("Reduce of empty array with no initial value"));
+    } else {
+        idx -= 1;
+        items[idx].clone()
+    };
+    while idx > 0 {
+        idx -= 1;
+        acc = it.call(&cb, &JsValue::Undefined, &[acc, items[idx].clone(), JsValue::Num(idx as f64), this.clone()])?;
+    }
+    Ok(acc)
 }
 
 fn arr_at(it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {

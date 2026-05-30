@@ -153,6 +153,19 @@ mod tests {
     }
 
     #[test]
+    fn flatmap_and_reduceright() {
+        // flatMap == map then flatten one level (and only one level)
+        assert_eq!(out("console.log(JSON.stringify([1,2,3].flatMap(x => [x, x*2])))"), "[1,2,2,4,3,6]");
+        assert_eq!(out("console.log(JSON.stringify([1,2,3].flatMap(x => x*2)))"), "[2,4,6]");
+        assert_eq!(out("console.log(JSON.stringify([1,2,3].flatMap(x => [[x]])))"), "[[1],[2],[3]]");
+        // reduceRight walks right-to-left
+        assert_eq!(out("console.log([1,2,3,4].reduceRight((a,b) => a + '-' + b))"), "4-3-2-1");
+        assert_eq!(out("console.log([1,2,3,4].reduceRight((a,b) => a + b, 100))"), "110");
+        assert_eq!(out("console.log([5].reduceRight((a,b) => a + b))"), "5");
+        assert_eq!(out("console.log([1,2,3].reduceRight((a,b,i) => a + ':' + i + b, 'start'))"), "start:23:12:01");
+    }
+
+    #[test]
     fn arithmetic_and_coercion() {
         assert_eq!(out("console.log(1 + 2 * 3)"), "7");
         assert_eq!(out("console.log(10 / 4)"), "2.5");
