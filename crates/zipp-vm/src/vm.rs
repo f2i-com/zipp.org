@@ -97,7 +97,40 @@ impl<'p> Vm<'p> {
         let base = 0usize;
         self.regs.resize(top.reg_count as usize, Value::UNDEFINED);
         self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0 });
-        self.dispatch()
+        // Run until the top-level frame returns (frames drains back to 0).
+        self.run_loop(0)
+    }
+
+    /// Invoke a callable `Value` with `this` and `args`, running it to
+    /// completion, and return its result. Used by builtin methods that take
+    /// callbacks (`map`/`filter`/`reduce`/`sort`). The callee executes on the
+    /// explicit frame stack like any other call; we run a nested dispatch loop
+    /// that returns when the callee's frame pops back to the current depth.
+    ///
+    /// Note: this re-enters `run_loop` on the native stack, so deeply *nested
+    /// callbacks* use native recursion. Ordinary JS recursion (a function
+    /// calling itself) does NOT — it stays on the frame stack. The frame cap
+    /// still bounds total depth.
+    fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        let func_id = self.resolve_callable(callee)?;
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
+        let proto = &self.program.functions[func_id as usize];
+        let callee_regs = (proto.reg_count as usize).max(1);
+        let callee_params = proto.param_count as usize;
+
+        let new_base = self.regs.len();
+        self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
+        self.regs[new_base] = this; // reg 0 = this
+        let n = args.len().min(callee_params);
+        for i in 0..n {
+            self.regs[new_base + 1 + i] = args[i];
+        }
+
+        let stop_depth = self.frames.len();
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0 });
+        self.run_loop(stop_depth)
     }
 
     /// Bind each named top-level function to its reserved global slot as a
@@ -114,8 +147,11 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// The core dispatch loop. One loop drives all frames.
-    fn dispatch(&mut self) -> Result<Value, Thrown> {
+    /// The core dispatch loop. Drives frames until the frame that was current
+    /// on entry returns — i.e. until `frames.len()` drops to `stop_depth`,
+    /// whereupon that frame's return value is produced. `run()` passes 0 (drain
+    /// everything); `call_value` passes the pre-call depth (run one nested call).
+    fn run_loop(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
         loop {
             // Snapshot the current frame's coordinates. `ip` is advanced as a
             // local and written back only on frame transitions / loops.
@@ -419,13 +455,13 @@ impl<'p> Vm<'p> {
 
                     Instr::Return { src } => {
                         let v = self.regs[base + src as usize];
-                        if self.pop_frame_with(v) {
+                        if self.pop_frame_with(v, stop_depth) {
                             return Ok(v);
                         }
                         break;
                     }
                     Instr::ReturnUndefined => {
-                        if self.pop_frame_with(Value::UNDEFINED) {
+                        if self.pop_frame_with(Value::UNDEFINED, stop_depth) {
                             return Ok(Value::UNDEFINED);
                         }
                         break;
@@ -435,21 +471,21 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Pop the current frame, delivering `ret` into the caller's `ret_dst`.
-    /// Returns `true` if this was the top-level frame (program done).
+    /// Pop the current frame. If this returns control to `stop_depth` (the
+    /// frame the active `run_loop` was asked to run), report `true` so the loop
+    /// returns `ret`. Otherwise deliver `ret` into the caller's `ret_dst` and
+    /// report `false` to keep executing the caller.
     #[inline]
-    fn pop_frame_with(&mut self, ret: Value) -> bool {
+    fn pop_frame_with(&mut self, ret: Value, stop_depth: usize) -> bool {
         let finished = self.frames.pop().expect("frame underflow");
         // Shrink the register file back to the caller's window top.
         self.regs.truncate(finished.base);
-        if let Some(caller) = self.frames.last() {
-            let caller_base = caller.base;
-            let dst = finished.ret_dst as usize;
-            self.regs[caller_base + dst] = ret;
-            false
-        } else {
-            true
+        if self.frames.len() == stop_depth {
+            return true;
         }
+        let caller_base = self.frames.last().unwrap().base;
+        self.regs[caller_base + finished.ret_dst as usize] = ret;
+        false
     }
 
     // ── register access ──
@@ -626,10 +662,15 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
-    /// Try a builtin method (array/string). Returns `Ok(Some(result))` if the
-    /// method was a recognised builtin, `Ok(None)` if not (caller then treats
-    /// it as a user method). Builtins that take callbacks are deferred to a
-    /// later stage; this set covers the non-callback corpus methods.
+    /// Try a builtin method on an array or string receiver. Returns
+    /// `Ok(Some(result))` when `name` is a recognised builtin, `Ok(None)` when
+    /// it isn't (the caller then treats it as a user-defined method/property).
+    ///
+    /// Dispatch is split by receiver type into focused helpers so each stays
+    /// readable. Methods that take a JS callback (`map`/`filter`/`reduce`/
+    /// `sort`) clone the element snapshot out of the heap BEFORE invoking the
+    /// callback, because a callback can mutate the same array (which would
+    /// reallocate its `Vec` and invalidate any borrow held across the call).
     fn try_builtin_method(
         &mut self,
         recv: Value,
@@ -641,48 +682,258 @@ impl<'p> Vm<'p> {
         if !recv.is_heap() {
             return Ok(None);
         }
-        let arg = |this: &Self, i: u16| -> Value {
-            if i < argc {
-                this.regs[base + arg_base as usize + i as usize]
-            } else {
-                Value::UNDEFINED
-            }
-        };
         let idx = recv.heap_index();
+        let args: Vec<Value> = (0..argc)
+            .map(|i| self.regs[base + arg_base as usize + i as usize])
+            .collect();
         match self.heap.get(idx) {
-            HeapObj::Array(_) => match name {
-                "push" => {
-                    let v = arg(self, 0);
-                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        items.push(v);
-                        return Ok(Some(Value::int(items.len() as i32)));
-                    }
-                    Ok(Some(Value::UNDEFINED))
-                }
-                "pop" => {
-                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        return Ok(Some(items.pop().unwrap_or(Value::UNDEFINED)));
-                    }
-                    Ok(Some(Value::UNDEFINED))
-                }
-                "join" => {
-                    let sep = if argc > 0 { self.display(arg(self, 0)) } else { ",".to_string() };
-                    let parts: Vec<String> = match self.heap.get(idx) {
-                        HeapObj::Array(items) => {
-                            items.iter().map(|v| {
-                                if v.is_nullish() { String::new() } else { self.display(*v) }
-                            }).collect()
-                        }
-                        _ => Vec::new(),
-                    };
-                    let s = parts.join(&sep);
-                    Ok(Some(self.alloc_str(s)))
-                }
-                _ => Ok(None),
-            },
-            HeapObj::Str(_) => Ok(None),
+            HeapObj::Array(_) => self.array_method(idx, name, &args),
+            HeapObj::Str(_) => self.string_method(idx, name, &args),
             _ => Ok(None),
         }
+    }
+
+    fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "push" => {
+                let mut last = Value::UNDEFINED;
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    for a in args {
+                        items.push(*a);
+                    }
+                    last = Value::int(items.len() as i32);
+                }
+                Ok(Some(last))
+            }
+            "pop" => {
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    return Ok(Some(items.pop().unwrap_or(Value::UNDEFINED)));
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            "shift" => {
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    if items.is_empty() {
+                        return Ok(Some(Value::UNDEFINED));
+                    }
+                    return Ok(Some(items.remove(0)));
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            "join" => {
+                let sep = if args.is_empty() { ",".to_string() } else { self.display(arg0) };
+                let snapshot = self.array_snapshot(idx);
+                let parts: Vec<String> = snapshot
+                    .iter()
+                    .map(|v| if v.is_nullish() { String::new() } else { self.display(*v) })
+                    .collect();
+                Ok(Some(self.alloc_str(parts.join(&sep))))
+            }
+            "indexOf" => {
+                let snapshot = self.array_snapshot(idx);
+                let pos = snapshot.iter().position(|v| self.values_strict_eq(*v, arg0));
+                Ok(Some(Value::int(pos.map(|p| p as i32).unwrap_or(-1))))
+            }
+            "includes" => {
+                let snapshot = self.array_snapshot(idx);
+                let found = snapshot.iter().any(|v| self.values_strict_eq(*v, arg0));
+                Ok(Some(Value::bool(found)))
+            }
+            "slice" => {
+                let snapshot = self.array_snapshot(idx);
+                let len = snapshot.len() as i32;
+                let start = norm_index(if args.is_empty() { 0 } else { arg0.as_f64() as i32 }, len);
+                let end = if args.len() < 2 {
+                    len
+                } else {
+                    norm_index(args[1].as_f64() as i32, len)
+                };
+                let slice: Vec<Value> = if start < end {
+                    snapshot[start as usize..end as usize].to_vec()
+                } else {
+                    Vec::new()
+                };
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(slice)))))
+            }
+            "map" => {
+                let cb = arg0;
+                let snapshot = self.array_snapshot(idx);
+                let mut out = Vec::with_capacity(snapshot.len());
+                for (i, v) in snapshot.iter().enumerate() {
+                    let r = self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
+                    out.push(r);
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "filter" => {
+                let cb = arg0;
+                let snapshot = self.array_snapshot(idx);
+                let mut out = Vec::new();
+                for (i, v) in snapshot.iter().enumerate() {
+                    let r = self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
+                    if self.truthy(r) {
+                        out.push(*v);
+                    }
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "forEach" => {
+                let cb = arg0;
+                let snapshot = self.array_snapshot(idx);
+                for (i, v) in snapshot.iter().enumerate() {
+                    self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            "reduce" => {
+                let cb = arg0;
+                let snapshot = self.array_snapshot(idx);
+                let mut iter = snapshot.iter().enumerate();
+                let mut acc = if args.len() >= 2 {
+                    args[1]
+                } else {
+                    match iter.next() {
+                        Some((_, v)) => *v,
+                        None => return Err(Thrown("TypeError: Reduce of empty array with no initial value".into())),
+                    }
+                };
+                for (i, v) in iter {
+                    acc = self.call_value(cb, Value::UNDEFINED, &[acc, *v, Value::int(i as i32)])?;
+                }
+                Ok(Some(acc))
+            }
+            "sort" => {
+                let cmp = arg0;
+                let mut snapshot = self.array_snapshot(idx);
+                if cmp.is_heap() && self.heap.as_callable(cmp.heap_index()).is_some() {
+                    // Comparator sort. insertion sort keeps it simple and stable
+                    // and re-enters the VM for each comparison; fine for the
+                    // corpus sizes. A faster merge sort is a later optimisation.
+                    self.comparator_sort(&mut snapshot, cmp)?;
+                } else {
+                    // Default sort: by string coercion (JS spec default).
+                    snapshot.sort_by(|a, b| self.display(*a).cmp(&self.display(*b)));
+                }
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    *items = snapshot;
+                }
+                Ok(Some(Value::heap(idx)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Insertion sort driven by a JS comparator (`cmp(a,b) < 0` ⇒ a before b).
+    fn comparator_sort(&mut self, items: &mut [Value], cmp: Value) -> Result<(), Thrown> {
+        for i in 1..items.len() {
+            let mut j = i;
+            while j > 0 {
+                let r = self.call_value(cmp, Value::UNDEFINED, &[items[j - 1], items[j]])?;
+                if r.as_f64() > 0.0 {
+                    items.swap(j - 1, j);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn string_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let s = match self.heap.get(idx) {
+            HeapObj::Str(s) => s.clone(),
+            _ => return Ok(None),
+        };
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "charAt" => {
+                let i = arg0.as_f64() as i32;
+                let ch = if i >= 0 { s.chars().nth(i as usize) } else { None };
+                Ok(Some(self.alloc_str(ch.map(|c| c.to_string()).unwrap_or_default())))
+            }
+            "charCodeAt" => {
+                let i = arg0.as_f64() as i32;
+                let cc = if i >= 0 { s.chars().nth(i as usize) } else { None };
+                Ok(Some(match cc {
+                    Some(c) => Value::int(c as i32),
+                    None => Value::num(f64::NAN),
+                }))
+            }
+            "indexOf" => {
+                let needle = self.display(arg0);
+                let pos = s.find(&needle).map(|b| s[..b].chars().count() as i32).unwrap_or(-1);
+                Ok(Some(Value::int(pos)))
+            }
+            "includes" => {
+                let needle = self.display(arg0);
+                Ok(Some(Value::bool(s.contains(&needle))))
+            }
+            "toUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
+            "toLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
+            "slice" | "substring" => {
+                let len = s.chars().count() as i32;
+                let start = norm_index(if args.is_empty() { 0 } else { arg0.as_f64() as i32 }, len);
+                let end = if args.len() < 2 { len } else { norm_index(args[1].as_f64() as i32, len) };
+                let out: String = if start < end {
+                    s.chars().skip(start as usize).take((end - start) as usize).collect()
+                } else {
+                    String::new()
+                };
+                Ok(Some(self.alloc_str(out)))
+            }
+            "repeat" => {
+                let n = arg0.as_f64();
+                if n < 0.0 || !n.is_finite() {
+                    return Err(Thrown("RangeError: Invalid count value".into()));
+                }
+                Ok(Some(self.alloc_str(s.repeat(n as usize))))
+            }
+            "split" => {
+                let sep = self.display(arg0);
+                let parts: Vec<Value> = if args.is_empty() {
+                    vec![self.alloc_str(s.clone())]
+                } else if sep.is_empty() {
+                    s.chars().map(|c| self.alloc_str(c.to_string())).collect()
+                } else {
+                    s.split(&sep).map(|p| self.alloc_str(p.to_string())).collect()
+                };
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(parts)))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Clone an array's current elements out of the heap. Used before invoking
+    /// callbacks so a heap reallocation during the call can't dangle a borrow.
+    fn array_snapshot(&self, idx: u32) -> Vec<Value> {
+        match self.heap.get(idx) {
+            HeapObj::Array(items) => items.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Strict equality between two raw values (no register indirection). Mirrors
+    /// `strict_eq` but takes values directly, for builtin use.
+    fn values_strict_eq(&self, a: Value, b: Value) -> bool {
+        if a.bits() == b.bits() {
+            if a.is_double() && a.as_f64().is_nan() {
+                return false;
+            }
+            return true;
+        }
+        if a.is_number() && b.is_number() {
+            return a.as_f64() == b.as_f64();
+        }
+        if a.is_heap() && b.is_heap() {
+            if let (Some(sa), Some(sb)) =
+                (self.heap.as_str(a.heap_index()), self.heap.as_str(b.heap_index()))
+            {
+                return sa == sb;
+            }
+        }
+        false
     }
 
     // ── arithmetic / coercion helpers ──
@@ -890,6 +1141,13 @@ pub const STRING_CONST_BIT: u32 = 0x8000_0000;
 /// through `FuncProto`-adjacent metadata; we read it here.
 fn function_global_slot(f: &crate::bytecode::FuncProto) -> Option<u16> {
     f.name_global
+}
+
+/// Normalise a (possibly negative) slice index into `[0, len]`. Negative
+/// indices count from the end; out-of-range clamps. Matches JS slice/substring.
+fn norm_index(i: i32, len: i32) -> i32 {
+    let v = if i < 0 { len + i } else { i };
+    v.clamp(0, len)
 }
 
 fn fmt_f64(n: f64) -> String {

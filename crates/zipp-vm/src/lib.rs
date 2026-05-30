@@ -240,4 +240,79 @@ mod tests {
             vec!["0,1,4,9"]
         );
     }
+
+    // ── Stage 2: callback builtins + string methods ──
+
+    #[test]
+    fn array_map_filter_reduce() {
+        assert_eq!(
+            run_ok("console.log([1,2,3,4].map(x => x * 2).join(','))"),
+            vec!["2,4,6,8"]
+        );
+        assert_eq!(
+            run_ok("console.log([1,2,3,4,5,6].filter(x => x % 2 === 0).join(','))"),
+            vec!["2,4,6"]
+        );
+        assert_eq!(
+            run_ok("console.log([1,2,3,4].reduce((p, c) => p + c, 0))"),
+            vec!["10"]
+        );
+    }
+
+    #[test]
+    fn array_pipeline_matches_corpus() {
+        // The exact shape of bench/array.js.
+        assert_eq!(
+            run_ok("let a=[]; for(let i=0;i<10;i++) a.push(i); console.log(a.map(x=>x*2).filter(x=>x%3===0).reduce((p,c)=>p+c,0))"),
+            vec!["36"] // map→0,2,4,…,18; filter %3===0→0,6,12,18; sum→36
+        );
+    }
+
+    #[test]
+    fn array_sort_comparator() {
+        assert_eq!(
+            run_ok("let a = [3, 1, 4, 1, 5, 9, 2, 6]; a.sort((x, y) => x - y); console.log(a.join(','))"),
+            vec!["1,1,2,3,4,5,6,9"]
+        );
+        // sort returns the same array reference and mutates in place.
+        assert_eq!(
+            run_ok("let a = [3,1,2]; let b = a.sort((x,y)=>x-y); console.log(a.join(','), a === b)"),
+            vec!["1,2,3 true"]
+        );
+    }
+
+    #[test]
+    fn array_sort_default_lexicographic() {
+        assert_eq!(
+            run_ok("console.log([10, 1, 2, 20].sort().join(','))"),
+            vec!["1,10,2,20"]
+        );
+    }
+
+    #[test]
+    fn array_misc_methods() {
+        assert_eq!(run_ok("console.log([1,2,3].indexOf(2))"), vec!["1"]);
+        assert_eq!(run_ok("console.log([1,2,3].includes(5))"), vec!["false"]);
+        assert_eq!(run_ok("console.log([1,2,3,4].slice(1,3).join(','))"), vec!["2,3"]);
+        assert_eq!(run_ok("let a=[1,2,3]; console.log(a.shift(), a.join(','))"), vec!["1 2,3"]);
+    }
+
+    #[test]
+    fn string_indexing_and_methods() {
+        assert_eq!(run_ok("let s = 'hello'; console.log(s[0], s[4], s.length)"), vec!["h o 5"]);
+        assert_eq!(run_ok("console.log('hello'.toUpperCase())"), vec!["HELLO"]);
+        assert_eq!(run_ok("console.log('Hello World'.indexOf('World'))"), vec!["6"]);
+        assert_eq!(run_ok("console.log('a,b,c'.split(',').join('-'))"), vec!["a-b-c"]);
+        assert_eq!(run_ok("console.log('ab'.repeat(3))"), vec!["ababab"]);
+        assert_eq!(run_ok("console.log('hello'.slice(1, 4))"), vec!["ell"]);
+    }
+
+    #[test]
+    fn string_char_counting_matches_corpus() {
+        // The shape of bench/string.js's counting loop.
+        assert_eq!(
+            run_ok("let s='0123456789'; let c=0; for(let i=0;i<s.length;i++){ if(s[i]==='7') c++; } console.log(c)"),
+            vec!["1"]
+        );
+    }
 }
