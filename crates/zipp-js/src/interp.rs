@@ -39,6 +39,9 @@ pub struct Interp {
     /// Bytecode-chunk cache, keyed by FuncDef identity: `Some` = compiled (run on
     /// the VM), `None` = unsupported (stay on the tree-walker). See `crate::vm`.
     pub(crate) compiled: crate::vm::CompileCache,
+    /// Freelist of reusable VM frame buffers (locals + operand stacks), so a hot
+    /// call does no per-frame heap allocation. See `crate::vm`.
+    pub(crate) buf_pool: crate::vm::BufPool,
 }
 
 impl Default for Interp {
@@ -56,6 +59,7 @@ impl Interp {
             object_proto: RefCell::new(None),
             array_proto: RefCell::new(None),
             compiled: RefCell::new(std::collections::HashMap::new()),
+            buf_pool: RefCell::new(Vec::new()),
         };
         crate::builtins::install(&it);
         it

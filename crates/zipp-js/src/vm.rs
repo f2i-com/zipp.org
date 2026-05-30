@@ -4,14 +4,19 @@
 //! resolved through the function's closure scope, exactly as the tree-walker
 //! does, so semantics match. Anything the compiler couldn't handle never reaches
 //! here (those functions stay on the tree-walker).
+//!
+//! The `locals` and operand `stack` buffers are recycled through a per-interp
+//! freelist ([`Interp::buf_pool`]) so a steady-state call (e.g. deep recursion)
+//! does ZERO heap allocation per frame — the buffers are taken on entry and
+//! returned on exit.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::ast::FuncDef;
 use crate::bytecode::{Chunk, Op};
 use crate::compile::compile_fn;
-use crate::ast::FuncDef;
 use crate::env::{self, Scope};
 use crate::interp::{EvalResult, Interp};
 use crate::value::JsValue;
@@ -20,6 +25,9 @@ use crate::value::JsValue;
 /// `None` = compilation was attempted and the function is unsupported (stay on
 /// the tree-walker); `Some` = a compiled chunk to run.
 pub type CompileCache = RefCell<HashMap<usize, Option<Rc<Chunk>>>>;
+
+/// A freelist of reusable value buffers (for VM frames' locals + operand stacks).
+pub type BufPool = RefCell<Vec<Vec<JsValue>>>;
 
 impl Interp {
     /// Look up (or compute and memoize) the compiled chunk for `def`. Returns
@@ -34,19 +42,50 @@ impl Interp {
         compiled
     }
 
+    #[inline]
+    fn take_buf(&self) -> Vec<JsValue> {
+        self.buf_pool.borrow_mut().pop().unwrap_or_default()
+    }
+    #[inline]
+    fn give_buf(&self, mut b: Vec<JsValue>) {
+        b.clear();
+        // Cap retained capacity so a one-off huge frame doesn't pin memory.
+        let mut pool = self.buf_pool.borrow_mut();
+        if pool.len() < 256 {
+            pool.push(b);
+        }
+    }
+
     /// Run a compiled `chunk`: `closure` is the function's captured scope (for
-    /// free-variable resolution), `args` fills the leading local slots.
+    /// free-variable resolution), `args` fills the leading local slots. Buffers
+    /// come from the pool and are returned on every exit path.
     pub(crate) fn run_chunk(
         &self,
         chunk: &Chunk,
         closure: &Rc<RefCell<Scope>>,
         args: &[JsValue],
     ) -> EvalResult<JsValue> {
-        let mut locals: Vec<JsValue> = vec![JsValue::Undefined; chunk.nlocals];
+        let mut locals = self.take_buf();
+        locals.resize(chunk.nlocals, JsValue::Undefined);
         for i in 0..chunk.nparams.min(args.len()) {
             locals[i] = args[i].clone();
         }
-        let mut stack: Vec<JsValue> = Vec::with_capacity(16);
+        let mut stack = self.take_buf();
+        let result = self.exec_chunk(chunk, closure, &mut locals, &mut stack);
+        self.give_buf(locals);
+        self.give_buf(stack);
+        result
+    }
+
+    /// The instruction loop. Kept separate from buffer management so `run_chunk`
+    /// can return the buffers to the pool no matter how this exits.
+    fn exec_chunk(
+        &self,
+        chunk: &Chunk,
+        closure: &Rc<RefCell<Scope>>,
+        locals: &mut [JsValue],
+        stack: &mut Vec<JsValue>,
+    ) -> EvalResult<JsValue> {
         let mut pc = 0usize;
         let code = &chunk.code;
         while pc < code.len() {
