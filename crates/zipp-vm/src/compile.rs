@@ -562,11 +562,17 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn array_literal(&mut self, a: &ox::ArrayExpression, dst: Reg) -> R<Reg> {
-        // Elements must occupy a contiguous register run for NewArray.
+        // Elements must occupy a contiguous register run for NewArray. Reserve
+        // the block first (same contiguity discipline as call args) so an
+        // element expression's scratch temps allocate above the block.
+        let count = a.elements.len() as u16;
         let base = self.next_reg;
-        let mut count = 0u16;
-        for el in &a.elements {
-            let slot = self.alloc_reg();
+        for _ in &a.elements {
+            self.alloc_reg();
+        }
+        let block_top = self.next_reg;
+        for (i, el) in a.elements.iter().enumerate() {
+            let slot = base + i as Reg;
             match el {
                 ox::ArrayExpressionElement::Elision(_) => {
                     self.emit(Instr::LoadUndefined { dst: slot });
@@ -575,16 +581,14 @@ impl<'a> FnCompiler<'a> {
                     return Err("array spread is not in the zipp-vm subset yet".into());
                 }
                 other => {
-                    let e = other
-                        .as_expression()
-                        .ok_or("unsupported array element")?;
+                    let e = other.as_expression().ok_or("unsupported array element")?;
                     let v = self.expr_into(e, slot)?;
                     if v != slot {
                         self.emit(Instr::Move { dst: slot, src: v });
                     }
                 }
             }
-            count += 1;
+            self.next_reg = block_top;
         }
         self.emit(Instr::NewArray { dst, arg_base: base, argc: count });
         Ok(dst)
@@ -901,27 +905,50 @@ impl<'a> FnCompiler<'a> {
         Ok(dst)
     }
 
-    /// Evaluate call arguments into a contiguous run of fresh registers and
-    /// return (first register, count). The run must be contiguous because the
-    /// `Call`/`Print` opcodes address args as `[arg_base, arg_base+argc)`.
+    /// Evaluate call arguments into a contiguous run of registers and return
+    /// (first register, count). The run MUST be contiguous because the
+    /// `Call`/`Print`/`NewArray` opcodes address args as
+    /// `[arg_base, arg_base+argc)`.
+    ///
+    /// Correctness subtlety: evaluating one argument may itself allocate scratch
+    /// temps (e.g. `a[i]` evaluates `a` and `i` into temps). Those temps must
+    /// NOT land inside the still-unfilled argument slots. So we reserve the
+    /// whole block first (bumping `next_reg` past it), which forces per-arg
+    /// temps to allocate ABOVE the block; we then reclaim them after each arg.
     fn eval_args_contiguous(
         &mut self,
         args: &oxc_allocator::Vec<ox::Argument>,
     ) -> R<(Reg, u16)> {
+        let exprs: Vec<&ox::Expression> = args
+            .iter()
+            .map(|a| {
+                a.as_expression()
+                    .ok_or_else(|| "spread arguments are not in the zipp-vm subset yet".to_string())
+            })
+            .collect::<R<Vec<_>>>()?;
+        let base = self.eval_contiguous(&exprs)?;
+        Ok((base, exprs.len() as u16))
+    }
+
+    /// Evaluate `exprs` into the contiguous register block `[base, base+len)`,
+    /// reclaiming each expression's scratch temps. Returns `base`.
+    fn eval_contiguous(&mut self, exprs: &[&ox::Expression]) -> R<Reg> {
         let base = self.next_reg;
-        let mut count = 0u16;
-        for a in args {
-            let slot = self.alloc_reg();
-            let e = a
-                .as_expression()
-                .ok_or("spread arguments are not in the zipp-vm v1 subset yet")?;
+        // Reserve the block up front so arg-evaluation temps allocate above it.
+        for _ in exprs {
+            self.alloc_reg();
+        }
+        let block_top = self.next_reg;
+        for (i, e) in exprs.iter().enumerate() {
+            let slot = base + i as Reg;
             let v = self.expr_into(e, slot)?;
             if v != slot {
                 self.emit(Instr::Move { dst: slot, src: v });
             }
-            count += 1;
+            // Reclaim temps this argument used (everything above the block).
+            self.next_reg = block_top;
         }
-        Ok((base, count))
+        Ok(base)
     }
 }
 
