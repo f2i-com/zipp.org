@@ -109,6 +109,19 @@ impl Object {
             self.order.push(key.to_string());
         }
     }
+    /// Install/extend an accessor (getter and/or setter) for `key`.
+    pub fn define_accessor(&mut self, key: &str, get: Option<JsValue>, set: Option<JsValue>) {
+        if !self.accessors.contains_key(key) && !self.props.contains_key(key) {
+            self.order.push(key.to_string());
+        }
+        let a = self.accessors.entry(key.to_string()).or_default();
+        if get.is_some() {
+            a.get = get;
+        }
+        if set.is_some() {
+            a.set = set;
+        }
+    }
     pub fn is_callable(&self) -> bool {
         matches!(self.data, ObjData::Function { .. } | ObjData::Native { .. })
     }

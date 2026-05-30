@@ -361,6 +361,18 @@ impl Interp {
                                 o.borrow_mut().set(&k, v);
                             }
                         }
+                        Prop::Accessor { key, kind, func } => {
+                            let k = match key {
+                                PropKey::Static(s) => s.clone(),
+                                PropKey::Computed(e) => self.eval(e, scope)?.to_js_string(),
+                            };
+                            let f = JsValue::Object(Object::function(func.clone(), scope.clone()));
+                            let (get, set) = match kind {
+                                AccessorKind::Get => (Some(f), None),
+                                AccessorKind::Set => (None, Some(f)),
+                            };
+                            o.borrow_mut().define_accessor(&k, get, set);
+                        }
                     }
                 }
                 Ok(JsValue::Object(o))
