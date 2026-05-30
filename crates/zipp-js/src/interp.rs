@@ -179,6 +179,65 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::ForOf { decl, name, iterable, body } => {
+                let iter_val = self.eval(iterable, scope)?;
+                for item in self.iterable_values(&iter_val)? {
+                    let s = Scope::child(scope);
+                    self.bind_loop_var(decl, name, item, scope, &s);
+                    match self.exec(body, &s)? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        _ => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            Stmt::ForIn { decl, name, object, body } => {
+                let obj = self.eval(object, scope)?;
+                for key in self.enum_keys(&obj) {
+                    let s = Scope::child(scope);
+                    self.bind_loop_var(decl, name, JsValue::str(key), scope, &s);
+                    match self.exec(body, &s)? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        _ => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            Stmt::Switch { disc, cases } => {
+                let d = self.eval(disc, scope)?;
+                let s = Scope::child(scope);
+                for (_, body) in cases {
+                    self.hoist(body, &s);
+                }
+                // first strictly-equal `case`, else `default`
+                let mut start = None;
+                for (i, (test, _)) in cases.iter().enumerate() {
+                    if let Some(t) = test {
+                        if self.eval(t, &s)?.strict_eq(&d) {
+                            start = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if start.is_none() {
+                    start = cases.iter().position(|(t, _)| t.is_none());
+                }
+                if let Some(start) = start {
+                    'sw: for (_, body) in &cases[start..] {
+                        for st in body {
+                            match self.exec(st, &s)? {
+                                Flow::Break => break 'sw, // `break` exits the switch
+                                Flow::Return(v) => return Ok(Flow::Return(v)),
+                                Flow::Continue => return Ok(Flow::Continue), // to an enclosing loop
+                                Flow::Normal => {}
+                            }
+                        }
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Return(e) => {
                 let v = match e {
                     Some(e) => self.eval(e, scope)?,
@@ -319,6 +378,21 @@ impl Interp {
                 }
             }
             Expr::Assign { op, target, value } => self.assign(*op, target, value, scope),
+            Expr::LogicalAssign { op, target, value } => {
+                let cur = self.eval(target, scope)?;
+                let do_assign = match op {
+                    LogicalOp::And => cur.truthy(),
+                    LogicalOp::Or => !cur.truthy(),
+                    LogicalOp::Nullish => matches!(cur, JsValue::Undefined | JsValue::Null),
+                };
+                if do_assign {
+                    let v = self.eval(value, scope)?;
+                    self.store(target, v.clone(), scope)?;
+                    Ok(v)
+                } else {
+                    Ok(cur)
+                }
+            }
             Expr::Member { obj, prop, computed } => {
                 let ov = self.eval(obj, scope)?;
                 let key = self.member_key(prop, *computed, scope)?;

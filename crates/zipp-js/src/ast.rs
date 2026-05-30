@@ -94,6 +94,27 @@ pub enum Stmt {
         step: Option<Expr>,
         body: Box<Stmt>,
     },
+    /// `for (x of iterable) …` — iterates array elements / string chars. `decl`
+    /// is the binding's declaration kind, or `None` to assign an existing var.
+    ForOf {
+        decl: Option<DeclKind>,
+        name: String,
+        iterable: Expr,
+        body: Box<Stmt>,
+    },
+    /// `for (k in obj) …` — iterates own enumerable keys.
+    ForIn {
+        decl: Option<DeclKind>,
+        name: String,
+        object: Expr,
+        body: Box<Stmt>,
+    },
+    /// `switch (disc) { case … : … ; default: … }` — `None` test = `default`.
+    /// Fall-through preserved (a `case` runs into the next until `break`).
+    Switch {
+        disc: Expr,
+        cases: Vec<(Option<Expr>, Vec<Stmt>)>,
+    },
     Return(Option<Expr>),
     Break,
     Continue,
@@ -152,6 +173,12 @@ pub enum Expr {
     /// `target` is an `Ident` or `Member`.
     Assign {
         op: Option<BinOp>,
+        target: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// `target &&= value` / `||=` / `??=` — guarded short-circuit assignment.
+    LogicalAssign {
+        op: LogicalOp,
         target: Box<Expr>,
         value: Box<Expr>,
     },
