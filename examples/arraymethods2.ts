@@ -1,10 +1,10 @@
 // More array methods: searching (indexOf/includes/findIndex), predicates
 // (some/every), copying (slice/concat), and in-place ops (reverse/fill).
 //
-// indexOf/includes/reverse/fill use neither a closure nor push, so a program
-// built only from them stays native (jit/llvm). some/every/findIndex (closures)
-// and slice/concat (push) are interpreter-tier — this whole program uses them,
-// so the native backends fall back.
+// All of these run natively on --jit and --llvm: the closure-based ones
+// (some/every/findIndex) and the push-based ones (slice/concat) lower to
+// per-element-type loop helpers over native push + indirect closure calls,
+// while indexOf/includes/reverse/fill are plain native loops.
 
 function main(): i64 {
   const xs = [5, 3, 8, 1, 9, 2];

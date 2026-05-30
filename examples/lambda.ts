@@ -1,8 +1,9 @@
 // First-class functions: pass functions as values, call them indirectly, and
 // take function-typed parameters. Arrow lambdas `(x: T) => expr` are supported.
 //
-// v0 runs function values on the interpreter (the native JIT/LLVM tiers fall
-// back for programs that use them); arrows can't yet capture enclosing locals.
+// Function values run natively on --jit and --llvm (a function value is a
+// {code, env} block; bare functions have no env). Closures that capture
+// enclosing locals are also native — see closure.ts.
 
 function applyTwice(f: (n: i64) => i64, x: i64): i64 {
   return f(f(x));

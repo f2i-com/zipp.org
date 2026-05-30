@@ -1,7 +1,7 @@
 // A data-analysis pipeline — exercises growable arrays (push), the full
 // array-method stdlib (map/filter/reduce/some/every/findIndex), method chaining,
-// and closures (including one that captures a local). This is interpreter-tier
-// (closures + push), so the native backends fall back to the interpreter.
+// and closures (including one that captures a local). Runs natively on --jit
+// and --llvm: closures, push, and the method helpers all compile to native code.
 
 // Build a deterministic dataset via push.
 function build(n: i64): i64[] {

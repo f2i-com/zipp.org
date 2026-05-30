@@ -1,6 +1,7 @@
 // Growable arrays + array methods. `push`/`pop` mutate; `map`/`filter`/`reduce`
-// take callbacks (closures welcome) and build/fold arrays. Interpreter-tier in
-// v0 — the native backends fall back, like closures.
+// take callbacks (closures welcome) and build/fold arrays. Runs natively on
+// --jit and --llvm: arrays use a Vec-style {len,cap,data} header, and the
+// method helpers lower to push + indirect closure calls (both native).
 
 function isEven(n: i64): bool {
   return n % 2 === 0;

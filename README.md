@@ -417,12 +417,17 @@ function reads back, and each indirect call dispatches on the env slot (a bare
 function and a closure can even reach the same call site). A closure captures
 **by value** (snapshotting the variable at creation; reassigning it afterward
 doesn't change the closure); `--wasm` still falls back (no heap). **Growable
-arrays (`push`/`pop`) and the closure-based array methods** (`map`/`filter`/
-`reduce`, which lower to synthesized per-element-type loop helpers built on
-growable arrays) still **run on the interpreter** in v0 — the native tiers fall
-back. The **pure array methods**
-(`indexOf`/`includes`/`reverse`/`fill` — no closure, no `push`) stay **native** on
-`--jit`/`--llvm`. **String methods run natively too** — each is a `zipp_str_*`
+arrays (`push`/`pop`) run natively on `--jit` and `--llvm`** too: an array is a
+stable Vec-style header `[len | cap | data]` plus a separate data buffer, so
+`push` reallocs the buffer (cap ×2) without moving the handle — aliases see the
+append. **The closure-based array methods** (`map`/`filter`/`reduce`/`some`/
+`every`/`findIndex`/`slice`/`concat`, which lower to synthesized per-element-
+type loop helpers built on `push` + indirect closure calls) and the pure ones
+(`indexOf`/`includes`/`reverse`/`fill`) **all run native** on `--jit`/`--llvm`
+now that both closures and growable arrays do. The only feature still on the
+interpreter is **nullable *scalars*** (`i64 | null` — they'd need boxing);
+everything else compiles to native code on both backends. **String methods run
+natively too** — each is a `zipp_str_*`
 runtime call shared by the interpreter and both native backends. They are
 **byte-level (UTF-8)**: `len`, indices, and `charCodeAt` are byte offsets,
 ASCII-exact vs TypeScript; on non-ASCII, indices are byte (not UTF-16-code-unit)
