@@ -95,8 +95,8 @@ fn var_decl(d: &ox::VariableDeclaration) -> R<Stmt> {
 }
 
 fn binding_name(b: &ox::BindingPattern) -> R<String> {
-    match b {
-        ox::BindingPattern::BindingIdentifier(id) => Ok(id.name.to_string()),
+    match &b.kind {
+        ox::BindingPatternKind::BindingIdentifier(id) => Ok(id.name.to_string()),
         _ => Err("destructuring/parameter patterns aren't in the v0 JS engine yet".into()),
     }
 }
@@ -163,13 +163,13 @@ fn try_stmt(t: &ox::TryStatement) -> R<Stmt> {
 // ───────────────────────── functions ─────────────────────────
 
 fn one_param(item: &ox::FormalParameter) -> R<Param> {
-    match &item.pattern {
-        ox::BindingPattern::BindingIdentifier(id) => {
+    match &item.pattern.kind {
+        ox::BindingPatternKind::BindingIdentifier(id) => {
             Ok(Param { name: id.name.to_string(), default: None })
         }
-        ox::BindingPattern::AssignmentPattern(ap) => {
-            let name = match &ap.left {
-                ox::BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+        ox::BindingPatternKind::AssignmentPattern(ap) => {
+            let name = match &ap.left.kind {
+                ox::BindingPatternKind::BindingIdentifier(id) => id.name.to_string(),
                 _ => return Err("destructuring parameters aren't in the v0 JS engine yet".into()),
             };
             Ok(Param { name, default: Some(expr(&ap.right)?) })
