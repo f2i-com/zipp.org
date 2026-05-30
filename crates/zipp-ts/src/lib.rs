@@ -3505,6 +3505,26 @@ mod tests {
     }
 
     #[test]
+    fn sort_and_bsearch() {
+        // In-place insertion sort + recursive binary search (the examples/sort.ts
+        // shape) — an imperative native algorithm: nested loops, array index/write,
+        // recursion.
+        let prelude = "function sort(a: i64[]): i64 { const n = len(a); \
+            for (let i = 1; i < n; i = i + 1) { const key = a[i]; let j = i - 1; \
+              while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j = j - 1; } a[j + 1] = key; } \
+            return n; } \
+            function bs(a: i64[], lo: i64, hi: i64, t: i64): i64 { if (lo > hi) { return -1; } \
+              const m = (lo + hi) / 2; if (a[m] === t) { return m; } \
+              if (a[m] < t) { return bs(a, m + 1, hi, t); } return bs(a, lo, m - 1, t); } ";
+        let p = format!(
+            "{prelude} function main(): i64 {{ const a = [9, 3, 7, 1, 8, 2, 6, 5, 4, 0]; sort(a); \
+             return a[0] * 1000 + a[9] * 100 + bs(a, 0, 9, 7) * 10 + (bs(a, 0, 9, 99) + 1); }}"
+        );
+        // sorted → a[0]=0, a[9]=9, bs(7)=7, bs(99)=-1  ⇒ 0 + 900 + 70 + 0 = 970
+        assert_eq!(run_i64(&p), 970);
+    }
+
+    #[test]
     fn calculator_demo() {
         // A compact recursive-descent calculator (the examples/calculator.ts shape)
         // — exercises classes/this, recursion, charCodeAt, and precedence/parens
