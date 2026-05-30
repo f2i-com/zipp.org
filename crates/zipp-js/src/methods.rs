@@ -748,21 +748,78 @@ fn num_to_string_m(_it: &Interp, this: &JsValue, args: &[JsValue]) -> EvalResult
     }
 }
 
+// Number->string in an arbitrary radix (2..=36), fractional part included.
+// Faithful port of V8's DoubleToRadixCString: fraction digits use a delta-based
+// stop (emit just enough to round-trip) with a carry that can ripple back
+// through the emitted digits and into the integer part.
 fn int_to_radix(n: f64, radix: u32) -> String {
     if n == 0.0 {
         return "0".into();
     }
-    let neg = n < 0.0;
-    let mut x = n.abs().trunc() as u64;
-    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut out = Vec::new();
-    while x > 0 {
-        out.push(digits[(x % radix as u64) as usize]);
-        x /= radix as u64;
+    let chars = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let radix_f = radix as f64;
+    let negative = n < 0.0;
+    let value = n.abs();
+
+    let mut integer = value.floor();
+    let mut fraction = value - integer;
+    // delta = half a ULP of `value`, never below the tiniest denormal.
+    let next = f64::from_bits(value.to_bits() + 1);
+    let mut delta = (0.5 * (next - value)).max(f64::from_bits(1));
+
+    // --- fractional digits ---
+    let mut frac: Vec<u8> = Vec::new();
+    if fraction >= delta {
+        frac.push(b'.');
+        loop {
+            fraction *= radix_f;
+            delta *= radix_f;
+            let digit = fraction as usize; // fraction in [0, radix)
+            frac.push(chars[digit]);
+            fraction -= digit as f64;
+            if fraction > 0.5 || (fraction == 0.5 && (digit & 1) == 1) {
+                if fraction + delta > 1.0 {
+                    // Round up: propagate the carry back through the digits.
+                    loop {
+                        let c = frac.pop().unwrap();
+                        if c == b'.' {
+                            integer += 1.0; // carry rolled into the integer part
+                            break;
+                        }
+                        let d = if c >= b'a' { (c - b'a' + 10) as u32 } else { (c - b'0') as u32 };
+                        if d + 1 < radix {
+                            frac.push(chars[(d + 1) as usize]);
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            if fraction < delta {
+                break;
+            }
+        }
     }
-    if neg {
-        out.push(b'-');
+
+    // --- integer digits (in f64 so values above 2^53 match V8) ---
+    let mut int_buf: Vec<u8> = Vec::new();
+    if integer < 1.0 {
+        int_buf.push(b'0');
+    } else {
+        let mut ip = integer;
+        while ip >= 1.0 {
+            let rem = ip % radix_f;
+            int_buf.push(chars[rem as usize]);
+            ip = ((ip - rem) / radix_f).floor();
+        }
+        int_buf.reverse();
     }
-    out.reverse();
-    String::from_utf8(out).unwrap()
+
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    out.extend(int_buf.iter().map(|&b| b as char));
+    out.extend(frac.iter().map(|&b| b as char));
+    out
 }

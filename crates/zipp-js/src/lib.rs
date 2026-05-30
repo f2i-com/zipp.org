@@ -166,6 +166,17 @@ mod tests {
     }
 
     #[test]
+    fn number_to_radix() {
+        // fractional parts now render (used to be dropped)
+        assert_eq!(out("console.log((10.5).toString(2), (255.5).toString(16), (-10.5).toString(2))"), "1010.1 ff.8 -1010.1");
+        assert_eq!(out("console.log((0.25).toString(4), (0.5).toString(2))"), "0.1 0.1");
+        // repeating fraction, terminated + rounded to round-trip (matches V8)
+        assert_eq!(out("console.log((0.1).toString(2))"), "0.0001100110011001100110011001100110011001100110011001101");
+        // integer-only paths unchanged
+        assert_eq!(out("console.log((255).toString(16), (1000000).toString(36), (3735928559).toString(16))"), "ff lfls deadbeef");
+    }
+
+    #[test]
     fn array_search_from_index() {
         assert_eq!(out("var a=[1,2,3,2,1]; console.log(a.indexOf(2), a.indexOf(2,2), a.indexOf(2,-2))"), "1 3 3");
         assert_eq!(out("var a=[1,2,3,2,1]; console.log(a.indexOf(2,100), a.indexOf(2,-100), a.indexOf(1,3))"), "-1 1 4");
