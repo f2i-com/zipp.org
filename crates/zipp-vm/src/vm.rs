@@ -1871,9 +1871,13 @@ pub(crate) extern "win64" fn jit_self_call(
 /// the property Value bits, or `SELF_CALL_DEOPT` to make the native code bail
 /// (non-object receiver, or a throw — e.g. property of null/undefined).
 ///
+/// Scaffolding for the next milestone (heap-op OSR regions: GetProp/SetProp);
+/// not wired into codegen yet.
+///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[allow(dead_code)]
 pub(crate) extern "win64" fn jit_get_prop(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
@@ -1900,9 +1904,12 @@ pub(crate) extern "win64" fn jit_get_prop(
 /// Win64 helper: `obj.<string_constants[name_idx]> = val` for JIT'd code.
 /// Returns `0` on success or `SELF_CALL_DEOPT` to bail (non-object / throw).
 ///
+/// Scaffolding for the next milestone (heap-op OSR regions); not wired in yet.
+///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[allow(dead_code)]
 pub(crate) extern "win64" fn jit_set_prop(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
@@ -1926,28 +1933,6 @@ pub(crate) extern "win64" fn jit_set_prop(
         }
     }));
     r.unwrap_or(crate::codegen::SELF_CALL_DEOPT)
-}
-
-/// Win64 helper: read `globals[idx]` for JIT'd code. Globals live in a Vec the
-/// asm can't easily reach, so a thin helper returns the Value bits.
-///
-/// # Safety
-/// `vm` is a valid `*mut Vm`; `idx` is a valid global slot (the compiler only
-/// emits in-range slots).
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_load_global(vm: *mut core::ffi::c_void, idx: u32) -> u64 {
-    let vm = unsafe { &*(vm as *const Vm) };
-    vm.globals[idx as usize].bits()
-}
-
-/// Win64 helper: `globals[idx] = val` for JIT'd code.
-///
-/// # Safety
-/// `vm` is a valid `*mut Vm`; `idx` is a valid global slot.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_store_global(vm: *mut core::ffi::c_void, idx: u32, val_bits: u64) {
-    let vm = unsafe { &mut *(vm as *mut Vm) };
-    vm.globals[idx as usize] = Value::from_bits(val_bits);
 }
 
 /// Win64 helper: the base pointer of `vm.globals`, fetched once by an OSR loop

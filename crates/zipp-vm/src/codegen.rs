@@ -904,7 +904,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
 
     // Record a use (operand) of reg `r` with required type `req`.
     // Returns false on a type conflict (caller declines).
-    let mut note_def = |r: u16, t: VTy, ty: &mut FxHashMap<u16, VTy>, first_seen: &mut FxHashMap<u16, bool>, reg_order: &mut Vec<u16>| -> bool {
+    let note_def = |r: u16, t: VTy, ty: &mut FxHashMap<u16, VTy>, first_seen: &mut FxHashMap<u16, bool>, reg_order: &mut Vec<u16>| -> bool {
         if let Some(prev) = ty.get(&r) {
             if *prev != t {
                 return false;
