@@ -936,6 +936,26 @@ impl Lower<'_> {
         self.struct_decls.borrow().get(id as usize).map(|d| d.name.clone())
     }
 
+    /// For a lifted CAPTURING closure named `name`, its env struct as
+    /// `(env_id, env_struct_name, field_names)`. A capturing lambda's first
+    /// parameter is always its `__env` struct (see `lower_arrow`); `None` if
+    /// `name` isn't such a lambda. (Array-method callbacks take a scalar element,
+    /// so a non-capturing callback's first param is never a struct — no false
+    /// positives.)
+    fn lambda_env_info(&self, name: &str) -> Option<(u32, String, Vec<String>)> {
+        let env_id = {
+            let lambdas = self.lambdas.borrow();
+            let f = lambdas.iter().find(|f| f.name == name)?;
+            match f.params.first().map(|p| p.ty) {
+                Some(z::Type::Struct(id)) => id,
+                _ => return None,
+            }
+        };
+        let decls = self.struct_decls.borrow();
+        let d = decls.get(env_id as usize)?;
+        Some((env_id, d.name.clone(), d.fields.iter().map(|(n, _)| n.clone()).collect()))
+    }
+
     /// Look up a struct id by name.
     fn struct_id(&self, name: &str) -> Option<u32> {
         self.structs.borrow().get(name).copied()
@@ -2281,20 +2301,36 @@ impl Lower<'_> {
         let t = elem.to_type();
         let f_ty = z::Type::Func(fid);
         let tag = elem_tag(elem);
-        // A statically-known callback (a lifted arrow or a named function, lowered
-        // to `FuncRef`) is direct-called by a helper SPECIALIZED to it, so the LLVM
-        // tier can inline the per-element work (no indirect call) — the way V8
-        // specializes after warmup. An unknown function value (a function-typed
-        // variable, or a capturing closure → `MakeClosure`) uses the generic
-        // indirect helper. The helper name is suffixed with the callback so each
-        // specialization is distinct (and shared across identical call sites).
-        let direct: Option<String> = match cb {
-            z::Expr::FuncRef(n) => Some(n.clone()),
-            _ => None,
+        // Classify the callback so the helper can be SPECIALIZED to direct-call it
+        // (letting the LLVM tier inline the per-element work, the way V8 does after
+        // warmup): a non-capturing arrow / named function (FuncRef) → `Direct`; a
+        // capturing closure (MakeClosure) → `DirectEnv`, reconstructing its env
+        // struct at the call site so the lifted body can be direct-called; anything
+        // else (a function-value variable) → the generic `Indirect` helper.
+        // `cb_arg` is the extra argument carrying the callback (the function value
+        // for Indirect, the env struct for DirectEnv, nothing for Direct).
+        let (cbk, cb_arg): (Cb, Option<z::Expr>) = match cb {
+            z::Expr::FuncRef(n) => (Cb::Direct(n.clone()), None),
+            z::Expr::MakeClosure { name, captures } => match self.lambda_env_info(name) {
+                Some((env_id, env_name, fields)) => {
+                    let env_lit = z::Expr::StructLit {
+                        name: env_name,
+                        fields: fields.into_iter().zip(captures.iter().cloned()).collect(),
+                    };
+                    (Cb::DirectEnv { name: name.clone(), env_id }, Some(env_lit))
+                }
+                None => (Cb::Indirect(f_ty), Some(cb.clone())),
+            },
+            _ => (Cb::Indirect(f_ty), Some(cb.clone())),
         };
-        let d = direct.as_deref();
-        let sfx = d.map(|n| format!("_{n}")).unwrap_or_default();
-        let (name, call_args) = match method {
+        // Helper name suffix — distinct per specialized callback (shared across
+        // identical call sites); empty for the generic indirect helper.
+        let sfx = match &cbk {
+            Cb::Indirect(_) => String::new(),
+            Cb::Direct(n) | Cb::DirectEnv { name: n, .. } => format!("_{n}"),
+        };
+        // Each arm returns (helper name, trailing args after the callback arg).
+        let (name, trailing): (String, Vec<z::Expr>) = match method {
             "map" => {
                 if args.len() != 1 || ft.params != [t] {
                     return Err(self.err(span, "map((x: T) => U) takes one callback of one element"));
@@ -2305,18 +2341,18 @@ impl Lower<'_> {
                 let name = self.ensure_helper(
                     format!("__map_{tag}_{}{sfx}", elem_tag(u)),
                     z::Type::Array(u),
-                    |n| build_map_helper(n, elem, u, f_ty, d),
+                    |n| build_map_helper(n, elem, u, &cbk),
                 );
-                (name, if direct.is_some() { vec![recv] } else { prepend(recv, args) })
+                (name, vec![])
             }
             "filter" => {
                 if args.len() != 1 || ft.params != [t] || ft.ret != z::Type::Bool {
                     return Err(self.err(span, "filter((x: T) => bool) takes one boolean predicate"));
                 }
                 let name = self.ensure_helper(format!("__filter_{tag}{sfx}"), z::Type::Array(elem), |n| {
-                    build_filter_helper(n, elem, f_ty, d)
+                    build_filter_helper(n, elem, &cbk)
                 });
-                (name, if direct.is_some() { vec![recv] } else { prepend(recv, args) })
+                (name, vec![])
             }
             "reduce" => {
                 if args.len() != 2 {
@@ -2337,15 +2373,9 @@ impl Lower<'_> {
                 let name = self.ensure_helper(
                     format!("__reduce_{tag}_{}{sfx}", elem_tag(u)),
                     u.to_type(),
-                    |n| build_reduce_helper(n, elem, u, f_ty, d),
+                    |n| build_reduce_helper(n, elem, u, &cbk),
                 );
-                // generic: (arr, f, init); specialized: (arr, init).
-                let call_args = if direct.is_some() {
-                    vec![recv, args[1].clone()]
-                } else {
-                    prepend(recv, args)
-                };
-                (name, call_args)
+                (name, vec![args[1].clone()]) // init is the trailing arg
             }
             // predicate scans: some/every → bool, findIndex → i64
             "some" | "every" | "findIndex" => {
@@ -2358,12 +2388,17 @@ impl Lower<'_> {
                 let ret = if method == "findIndex" { z::Type::I64 } else { z::Type::Bool };
                 let m = method.to_string();
                 let name = self.ensure_helper(format!("__{method}_{tag}{sfx}"), ret, |n| {
-                    build_predicate_helper(n, elem, f_ty, &m, d)
+                    build_predicate_helper(n, elem, &cbk, &m)
                 });
-                (name, if direct.is_some() { vec![recv] } else { prepend(recv, args) })
+                (name, vec![])
             }
             _ => unreachable!(),
         };
+        // call_args = arr, then the callback-carrying arg (f / env / none), then
+        // any trailing args (reduce's init).
+        let mut call_args = vec![recv];
+        call_args.extend(cb_arg);
+        call_args.extend(trailing);
         Ok(z::Expr::Call { name, args: call_args })
     }
 
@@ -2933,35 +2968,55 @@ fn call_f(f_ty: z::Type, args: Vec<z::Expr>) -> z::Expr {
     z::Expr::CallValue { callee: Box::new(z::Expr::Var("f".into())), args, sig }
 }
 
-/// How a synthesized helper invokes its callback. `Some(name)` → a DIRECT call to
-/// the concrete (lifted-arrow or named) function — the helper is specialized to
-/// that callback and omits the `f` parameter; this lets the LLVM tier inline the
-/// per-element work (no indirect call), the way V8 does after warmup. `None` →
-/// the generic helper that takes `f` as a function-value parameter and calls it
-/// indirectly (`CallValue`), used when the callback isn't a statically-known
-/// function (e.g. a function-typed variable).
-fn call_cb(direct: Option<&str>, f_ty: z::Type, args: Vec<z::Expr>) -> z::Expr {
-    match direct {
-        Some(name) => z::Expr::Call { name: name.to_string(), args },
-        None => call_f(f_ty, args),
+/// How a synthesized array helper invokes its callback. The `Direct`/`DirectEnv`
+/// forms specialize the helper to a concrete function so the LLVM tier can inline
+/// the per-element work (no indirect call), the way V8 specializes after warmup;
+/// `Indirect` is the generic helper that takes `f` as a function value.
+enum Cb {
+    /// Generic: indirect call `f(args)` through an `f: <Func>` parameter (the
+    /// callback is an unknown function value).
+    Indirect(z::Type),
+    /// Direct call `name(args)` to a known NON-capturing function (a lifted arrow
+    /// or a named function). The helper omits `f`.
+    Direct(String),
+    /// Direct call `name(__env, args)` to a known CAPTURING closure's lifted
+    /// function; the helper takes an `__env: Struct(env_id)` parameter (the caller
+    /// passes a reconstructed env struct). The helper omits `f`.
+    DirectEnv { name: String, env_id: u32 },
+}
+
+/// Build the callback invocation inside a helper body, per [`Cb`].
+fn call_cb(cb: &Cb, args: Vec<z::Expr>) -> z::Expr {
+    match cb {
+        Cb::Indirect(f_ty) => call_f(*f_ty, args),
+        Cb::Direct(name) => z::Expr::Call { name: name.clone(), args },
+        Cb::DirectEnv { name, .. } => {
+            let mut a = vec![z::Expr::Var("__env".into())];
+            a.extend(args);
+            z::Expr::Call { name: name.clone(), args: a }
+        }
     }
 }
 
-/// Leading params for a callback helper: `arr: T[]`, then the `f: <Func>` param
-/// only when the callback is invoked indirectly (`direct` is `None`), then any
-/// `extra` trailing params (e.g. `init` for reduce).
-fn cb_params(t: z::Elem, f_ty: z::Type, direct: Option<&str>, extra: Vec<z::Param>) -> Vec<z::Param> {
+/// Leading params for a callback helper: `arr: T[]`, then the callback-carrying
+/// param (`f` for `Indirect`, `__env` for `DirectEnv`, none for `Direct`), then
+/// any `extra` trailing params (e.g. `init` for reduce).
+fn cb_params(t: z::Elem, cb: &Cb, extra: Vec<z::Param>) -> Vec<z::Param> {
     let mut p = vec![z::Param { name: "arr".into(), ty: z::Type::Array(t) }];
-    if direct.is_none() {
-        p.push(z::Param { name: "f".into(), ty: f_ty });
+    match cb {
+        Cb::Indirect(f_ty) => p.push(z::Param { name: "f".into(), ty: *f_ty }),
+        Cb::Direct(_) => {}
+        Cb::DirectEnv { env_id, .. } => {
+            p.push(z::Param { name: "__env".into(), ty: z::Type::Struct(*env_id) })
+        }
     }
     p.extend(extra);
     p
 }
 
 /// `function __map_T_U(arr: T[], f: (T)=>U): U[] { let __r: U[] = []; for (…) __r.push(f(arr[__i])); return __r; }`
-/// (`direct = Some(name)` direct-calls `name` and drops the `f` param.)
-fn build_map_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type, direct: Option<&str>) -> z::Func {
+/// (a `Direct`/`DirectEnv` `cb` direct-calls the callback and drops the `f` param.)
+fn build_map_helper(name: &str, t: z::Elem, u: z::Elem, cb: &Cb) -> z::Func {
     use z::{Expr, StmtKind, Type};
     let body = vec![
         stmt(StmtKind::Let {
@@ -2975,22 +3030,22 @@ fn build_map_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type, direct: O
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::ExprStmt(Expr::Push {
                 arr: Box::new(Expr::Var("__r".into())),
-                value: Box::new(call_cb(direct, f_ty, vec![arr_at_i()])),
+                value: Box::new(call_cb(cb, vec![arr_at_i()])),
             }))],
         }),
         stmt(StmtKind::Return(Some(Expr::Var("__r".into())))),
     ];
     z::Func {
         name: name.into(),
-        params: cb_params(t, f_ty, direct, vec![]),
+        params: cb_params(t, cb, vec![]),
         ret: Type::Array(u),
         body,
     }
 }
 
 /// `function __filter_T(arr: T[], f: (T)=>bool): T[] { … if (f(arr[__i])) __r.push(arr[__i]); … }`
-/// (`direct = Some(name)` direct-calls `name` and drops the `f` param.)
-fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type, direct: Option<&str>) -> z::Func {
+/// (a `Direct`/`DirectEnv` `cb` direct-calls the callback and drops the `f` param.)
+fn build_filter_helper(name: &str, t: z::Elem, cb: &Cb) -> z::Func {
     use z::{Expr, StmtKind, Type};
     let body = vec![
         stmt(StmtKind::Let {
@@ -3003,7 +3058,7 @@ fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type, direct: Option<&st
             cond: lt_len(),
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::If {
-                cond: call_cb(direct, f_ty, vec![arr_at_i()]),
+                cond: call_cb(cb, vec![arr_at_i()]),
                 then_b: vec![stmt(StmtKind::ExprStmt(Expr::Push {
                     arr: Box::new(Expr::Var("__r".into())),
                     value: Box::new(arr_at_i()),
@@ -3015,15 +3070,15 @@ fn build_filter_helper(name: &str, t: z::Elem, f_ty: z::Type, direct: Option<&st
     ];
     z::Func {
         name: name.into(),
-        params: cb_params(t, f_ty, direct, vec![]),
+        params: cb_params(t, cb, vec![]),
         ret: Type::Array(t),
         body,
     }
 }
 
 /// `function __reduce_T_U(arr: T[], f: (U,T)=>U, init: U): U { let __acc = init; for (…) __acc = f(__acc, arr[__i]); return __acc; }`
-/// (`direct = Some(name)` direct-calls `name` and drops the `f` param.)
-fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type, direct: Option<&str>) -> z::Func {
+/// (a `Direct`/`DirectEnv` `cb` direct-calls the callback and drops the `f` param.)
+fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, cb: &Cb) -> z::Func {
     use z::{Expr, Param, StmtKind};
     let body = vec![
         stmt(StmtKind::Let {
@@ -3037,14 +3092,14 @@ fn build_reduce_helper(name: &str, t: z::Elem, u: z::Elem, f_ty: z::Type, direct
             step: Some(Box::new(loop_step())),
             body: vec![stmt(StmtKind::Assign {
                 target: Expr::Var("__acc".into()),
-                value: call_cb(direct, f_ty, vec![Expr::Var("__acc".into()), arr_at_i()]),
+                value: call_cb(cb, vec![Expr::Var("__acc".into()), arr_at_i()]),
             })],
         }),
         stmt(StmtKind::Return(Some(Expr::Var("__acc".into())))),
     ];
     z::Func {
         name: name.into(),
-        params: cb_params(t, f_ty, direct, vec![Param { name: "init".into(), ty: u.to_type() }]),
+        params: cb_params(t, cb, vec![Param { name: "init".into(), ty: u.to_type() }]),
         ret: u.to_type(),
         body,
     }
@@ -3156,9 +3211,9 @@ fn build_find_helper(name: &str, t: z::Elem, includes: bool) -> z::Func {
 /// A callback array helper that scans with `pred` and returns on the first match:
 /// `some` (→ true/false), `every` (→ false on first !pred / true), `findIndex`
 /// (→ index / -1).
-fn build_predicate_helper(name: &str, t: z::Elem, f_ty: z::Type, kind: &str, direct: Option<&str>) -> z::Func {
+fn build_predicate_helper(name: &str, t: z::Elem, cb: &Cb, kind: &str) -> z::Func {
     use z::Type;
-    let test = call_cb(direct, f_ty, vec![arr_at_i()]);
+    let test = call_cb(cb, vec![arr_at_i()]);
     let (loop_body, tail, ret_ty) = match kind {
         "some" => (
             vec![if_then(test, vec![ret(z::Expr::Bool(true))])],
@@ -3182,7 +3237,7 @@ fn build_predicate_helper(name: &str, t: z::Elem, f_ty: z::Type, kind: &str, dir
     };
     z::Func {
         name: name.into(),
-        params: cb_params(t, f_ty, direct, vec![]),
+        params: cb_params(t, cb, vec![]),
         ret: ret_ty,
         body: vec![for_i(loop_body), tail],
     }
