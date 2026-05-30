@@ -163,19 +163,14 @@ fn try_stmt(t: &ox::TryStatement) -> R<Stmt> {
 // ───────────────────────── functions ─────────────────────────
 
 fn one_param(item: &ox::FormalParameter) -> R<Param> {
-    match &item.pattern {
-        ox::BindingPattern::BindingIdentifier(id) => {
-            Ok(Param { name: id.name.to_string(), default: None })
-        }
-        ox::BindingPattern::AssignmentPattern(ap) => {
-            let name = match &ap.left {
-                ox::BindingPattern::BindingIdentifier(id) => id.name.to_string(),
-                _ => return Err("destructuring parameters aren't in the v0 JS engine yet".into()),
-            };
-            Ok(Param { name, default: Some(expr(&ap.right)?) })
-        }
-        _ => Err("destructuring parameters aren't in the v0 JS engine yet".into()),
-    }
+    // In oxc, a default value lives in `FormalParameter.initializer` (NOT as an
+    // `AssignmentPattern` inside `pattern`); `pattern` is the plain binding.
+    let name = binding_name(&item.pattern)?;
+    let default = match &item.initializer {
+        Some(e) => Some(expr(e)?),
+        None => None,
+    };
+    Ok(Param { name, default })
 }
 
 fn params_of(p: &ox::FormalParameters) -> R<(Vec<Param>, Option<String>)> {
