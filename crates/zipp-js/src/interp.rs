@@ -635,6 +635,22 @@ impl Interp {
         Ok(v)
     }
 
+    /// Evaluate `args` and invoke `f` with the given `this`. Fast path: a call
+    /// with no spread and at most 4 arguments fills a stack buffer instead of
+    /// heap-allocating the argument `Vec` (the common case at hot call sites).
+    fn call_with_args(&self, f: &JsValue, this: &JsValue, args: &[Expr], scope: &Rc<RefCell<Scope>>) -> EvalResult<JsValue> {
+        if args.len() <= 4 && !args.iter().any(|a| matches!(a, Expr::Spread(_))) {
+            let mut buf = [JsValue::Undefined, JsValue::Undefined, JsValue::Undefined, JsValue::Undefined];
+            for (i, a) in args.iter().enumerate() {
+                buf[i] = self.eval(a, scope)?;
+            }
+            self.call(f, this, &buf[..args.len()])
+        } else {
+            let argv = self.eval_args(args, scope)?;
+            self.call(f, this, &argv)
+        }
+    }
+
     fn eval_call(&self, callee: &Expr, args: &[Expr], scope: &Rc<RefCell<Scope>>) -> EvalResult<JsValue> {
         // `super(...)` — invoke the parent constructor with the current `this`.
         if matches!(callee, Expr::Super) {
