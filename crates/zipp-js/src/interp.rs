@@ -4,7 +4,7 @@
 //! channel of [`EvalResult`] carries a *thrown* JS value (so `throw`/`try` and
 //! engine errors share one mechanism). Expressions evaluate to a [`JsValue`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::ast::*;
@@ -42,7 +42,16 @@ pub struct Interp {
     /// Freelist of reusable VM frame buffers (locals + operand stacks), so a hot
     /// call does no per-frame heap allocation. See `crate::vm`.
     pub(crate) buf_pool: crate::vm::BufPool,
+    /// Current JS call-stack depth. Guards against unbounded recursion blowing
+    /// the Rust stack (which would ABORT the process, uncatchable); at the limit
+    /// `call` throws a catchable RangeError instead, like V8.
+    call_depth: Cell<usize>,
 }
+
+/// Max JS call depth before throwing RangeError. Tuned to stay within the large
+/// worker-thread stack `lib::run` provides (the tree-walker uses several Rust
+/// frames per JS call, so this is well below a 1-frame-per-call estimate).
+const MAX_CALL_DEPTH: usize = 12000;
 
 impl Default for Interp {
     fn default() -> Self {
@@ -60,6 +69,7 @@ impl Interp {
             array_proto: RefCell::new(None),
             compiled: RefCell::new(std::collections::HashMap::new()),
             buf_pool: RefCell::new(Vec::new()),
+            call_depth: Cell::new(0),
         };
         crate::builtins::install(&it);
         it
@@ -699,6 +709,20 @@ impl Interp {
 
     /// Call a function value with `this` and arguments.
     pub fn call(&self, func: &JsValue, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
+        // Recursion-depth guard: throw a catchable RangeError before the native
+        // stack overflows (which would crash the whole process). Decrement on
+        // every exit path by wrapping the real work in `call_inner`.
+        let depth = self.call_depth.get();
+        if depth >= MAX_CALL_DEPTH {
+            return Err(self.range_error("Maximum call stack size exceeded"));
+        }
+        self.call_depth.set(depth + 1);
+        let r = self.call_inner(func, this, args);
+        self.call_depth.set(depth);
+        r
+    }
+
+    fn call_inner(&self, func: &JsValue, this: &JsValue, args: &[JsValue]) -> EvalResult<JsValue> {
         let JsValue::Object(o) = func else {
             return Err(self.type_error(&format!("{} is not a function", func.display())));
         };

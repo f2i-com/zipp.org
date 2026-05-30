@@ -43,6 +43,28 @@ pub struct Outcome {
 /// (parse or unsupported-syntax error); a runtime uncaught throw is reported via
 /// [`Outcome::error`] alongside any output produced before it.
 pub fn run(src: &str) -> Result<Outcome, String> {
+    // Run everything on a worker thread with a large (lazily-committed) stack so
+    // deep JS recursion has headroom comparable to a real engine; the depth
+    // counter in `interp::call` is the hard backstop that throws a catchable
+    // RangeError before even this stack is exhausted. The interpreter is full of
+    // `Rc`/`RefCell` (not `Send`), so ALL work — parse, lower, interp — happens
+    // on this thread; only the `Send` `Outcome`/`String` crosses back.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024 * 1024)
+            .spawn_scoped(scope, || run_inner(src))
+            .expect("spawn interpreter thread")
+            .join()
+            .unwrap_or_else(|_| {
+                Ok(Outcome {
+                    output: Vec::new(),
+                    error: Some("Uncaught RangeError: Maximum call stack size exceeded".into()),
+                })
+            })
+    })
+}
+
+fn run_inner(src: &str) -> Result<Outcome, String> {
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, src, SourceType::default()).parse();
     if !ret.errors.is_empty() {
