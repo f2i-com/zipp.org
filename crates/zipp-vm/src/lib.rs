@@ -1463,6 +1463,19 @@ mod tests {
     }
 
     #[test]
+    fn string_relational_comparison() {
+        // `<`/`>`/`<=`/`>=` on two strings compare lexicographically (not numeric).
+        assert_eq!(run_ok("console.log('apple'<'banana', 'cherry'<'apple', 'a'<='a', 'b'>'a', 'Z'<'a')"), vec!["true false true true true"]);
+        // String vs number falls back to numeric coercion.
+        assert_eq!(run_ok("console.log('10'<'9', 10<9, '10'<9)"), vec!["true false false"]);
+        // sort with a string comparator, and the default (stringify) sort.
+        assert_eq!(run_ok("let s=['banana','apple','cherry','date']; s.sort((x,y)=>x<y?-1:x>y?1:0); console.log(s.join(','))"), vec!["apple,banana,cherry,date"]);
+        assert_eq!(run_ok("console.log(['banana','apple','cherry'].sort().join(','))"), vec!["apple,banana,cherry"]);
+        // Numeric comparator still goes through the (now native) fast path.
+        assert_eq!(run_ok("console.log([5,3,8,1,9,2].sort((a,b)=>a-b).join(','))"), vec!["1,2,3,5,8,9"]);
+    }
+
+    #[test]
     fn array_destructure_iterables() {
         // Array destructuring drives the iterator protocol for generators and
         // custom iterables (positional fast path still used for arrays/strings).

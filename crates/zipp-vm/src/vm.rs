@@ -4988,12 +4988,25 @@ impl<'p> Vm<'p> {
         if n < 2 {
             return Ok(());
         }
+        // Native-callback fast path: a compiled non-capturing comparator is called
+        // directly over one reused register window (skipping a per-comparison frame
+        // build + run_loop re-entry). `native = None` falls back to call_value.
+        let mut native = self.native_cb_entry(cmp);
+        let win = self.regs.len();
+        if let Some((_, callee_regs, _)) = native {
+            if self.regs_would_overflow(win + callee_regs) {
+                native = None;
+            } else {
+                self.regs.resize(win + callee_regs, Value::UNDEFINED);
+            }
+        }
         // Ping-pong between two local buffers (not self.regs/heap, so a comparator
         // that re-enters the VM and allocates can't invalidate them).
         let mut a: Vec<Value> = items.to_vec();
         let mut b: Vec<Value> = vec![Value::UNDEFINED; n];
         let mut width = 1;
-        while width < n {
+        let mut err: Option<Thrown> = None;
+        'outer: while width < n {
             let mut lo = 0;
             while lo < n {
                 let mid = (lo + width).min(n);
@@ -5001,7 +5014,13 @@ impl<'p> Vm<'p> {
                 // Merge a[lo..mid] and a[mid..hi] into b[lo..hi], stably.
                 let (mut l, mut r, mut k) = (lo, mid, lo);
                 while l < mid && r < hi {
-                    let c = self.call_value(cmp, Value::UNDEFINED, &[a[l], a[r]])?;
+                    let c = match self.run_cb_elem(native, win, cmp, &[a[l], a[r]]) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                    };
                     if c.as_f64() <= 0.0 {
                         b[k] = a[l];
                         l += 1;
@@ -5025,6 +5044,12 @@ impl<'p> Vm<'p> {
             }
             std::mem::swap(&mut a, &mut b);
             width *= 2;
+        }
+        if native.is_some() {
+            self.regs.truncate(win); // release the reused window (success or error)
+        }
+        if let Some(e) = err {
+            return Err(e);
         }
         items.copy_from_slice(&a);
         Ok(())
@@ -5320,6 +5345,9 @@ impl<'p> Vm<'p> {
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() < vb.as_int());
         }
+        if let Some(o) = self.str_relational(va, vb) {
+            return Ok(o.is_lt());
+        }
         Ok(self.to_number(va)? < self.to_number(vb)?)
     }
     #[inline]
@@ -5329,7 +5357,27 @@ impl<'p> Vm<'p> {
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() <= vb.as_int());
         }
+        if let Some(o) = self.str_relational(va, vb) {
+            return Ok(o.is_le());
+        }
         Ok(self.to_number(va)? <= self.to_number(vb)?)
+    }
+
+    /// JS relational comparison of two STRING operands is lexicographic (by code
+    /// unit) — not numeric. Returns the `Ordering` when both are string-like, else
+    /// `None` (the caller falls back to numeric comparison). Mirrors the engine's
+    /// code-point ordering (≈ UTF-16 for the BMP; astral chars are a known edge).
+    fn str_relational(&self, va: Value, vb: Value) -> Option<std::cmp::Ordering> {
+        if va.is_heap()
+            && vb.is_heap()
+            && self.heap.is_str_like(va.heap_index())
+            && self.heap.is_str_like(vb.heap_index())
+        {
+            let sa = self.heap.str_cow(va.heap_index())?;
+            let sb = self.heap.str_cow(vb.heap_index())?;
+            return Some(sa.as_ref().cmp(sb.as_ref()));
+        }
+        None
     }
 
     fn strict_eq(&self, base: usize, a: u16, b: u16) -> bool {
