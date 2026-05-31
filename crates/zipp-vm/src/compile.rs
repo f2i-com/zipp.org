@@ -1153,7 +1153,15 @@ impl<'a> FnCompiler<'a> {
     /// cover the corpus and common code.)
     fn for_of_statement(&mut self, f: &ox::ForOfStatement) -> R<()> {
         self.push_scope();
-        let var_name = for_left_name(&f.left)?;
+
+        // A `for (let [a,b] of …)` / `for (let {x} of …)` head destructures each
+        // element; a plain `for (let x of …)` binds it to one variable.
+        let decl_pat = match &f.left {
+            ox::ForStatementLeft::VariableDeclaration(d) => Some(&d.declarations[0].id),
+            _ => None,
+        };
+        let pattern =
+            decl_pat.filter(|p| !matches!(p, ox::BindingPattern::BindingIdentifier(_)));
 
         // Evaluate the iterable into a stable scratch local.
         let iter_reg = self.declare_local("<forof.iter>");
@@ -1167,9 +1175,19 @@ impl<'a> FnCompiler<'a> {
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
-        // The loop variable binding (may be cell-boxed if captured).
-        let var_reg = self.declare_local(&var_name);
-        let var_is_cell = self.cell_regs.contains(&var_reg);
+        // The loop binding: either a destructuring pattern's leaves, or a single
+        // (possibly cell-boxed) variable.
+        let (var_reg, var_is_cell) = match pattern {
+            Some(p) => {
+                self.declare_pattern(p)?;
+                (0, false)
+            }
+            None => {
+                let var_name = for_left_name(&f.left)?;
+                let r = self.declare_local(&var_name);
+                (r, self.cell_regs.contains(&r))
+            }
+        };
 
         let top = self.here();
         // while (idx < len)
@@ -1179,8 +1197,14 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::JumpIfFalse { cond, target: 0 });
         self.next_reg -= 1; // reclaim cond temp
 
-        // var = iter[idx]
-        if var_is_cell {
+        // <binding> = iter[idx]
+        if let Some(p) = pattern {
+            let save = self.next_reg;
+            let elem = self.alloc_reg();
+            self.emit(Instr::GetIndex { dst: elem, obj: iter_reg, key: idx_reg });
+            self.extract_pattern(p, elem)?;
+            self.next_reg = save;
+        } else if var_is_cell {
             let tmp = self.temp();
             self.emit(Instr::GetIndex { dst: tmp, obj: iter_reg, key: idx_reg });
             self.emit(Instr::CellSet { cell: var_reg, src: tmp });

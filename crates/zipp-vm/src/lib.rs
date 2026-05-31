@@ -1031,6 +1031,19 @@ mod tests {
     }
 
     #[test]
+    fn for_of_destructuring() {
+        assert_eq!(run_ok("let r=[]; for(let [a,b] of [[1,2],[3,4]]) r.push(a+b); console.log(r.join(','))"), vec!["3,7"]);
+        // The canonical Object.entries idiom.
+        assert_eq!(run_ok("let o={x:1,y:2}; let r=[]; for(let [k,v] of Object.entries(o)) r.push(k+'='+v); console.log(r.join(' '))"), vec!["x=1 y=2"]);
+        assert_eq!(run_ok("let r=[]; for(let {n} of [{n:'a'},{n:'b'}]) r.push(n); console.log(r.join(''))"), vec!["ab"]);
+        // Rest and defaults in the head.
+        assert_eq!(run_ok("let r=[]; for(let [a,...t] of [[1,2,3]]) r.push(a+':'+t.join(',')); console.log(r[0])"), vec!["1:2,3"]);
+        assert_eq!(run_ok("let r=[]; for(let {a,b=9} of [{a:1,b:2},{a:3}]) r.push(a+''+b); console.log(r.join(' '))"), vec!["12 39"]);
+        // Captured destructured loop var.
+        assert_eq!(run_ok("let f; for(let [a,b] of [[1,2]]) f=()=>a+b; console.log(f())"), vec!["3"]);
+    }
+
+    #[test]
     fn instanceof_operator() {
         // Built-in collections / functions.
         assert_eq!(run_ok("console.log([] instanceof Array, [] instanceof Object)"), vec!["true true"]);
