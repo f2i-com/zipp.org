@@ -193,6 +193,10 @@ pub struct Jit {
     /// function's mmap'd `ExecutableBuffer`, which never moves, and a function's
     /// entry is immutable once compiled.
     self_cache: Option<(u32, *const u8)>,
+    /// Compiled fused `map` kernels, keyed by callback `func_id`. `None` =
+    /// tried and ineligible (so we don't recompile every `map` call). Keyed by
+    /// `func_id` alone: a given callback proto has fixed param_count/body.
+    map_kernels: FxHashMap<u32, Option<JitFn>>,
 }
 
 impl Jit {
@@ -254,6 +258,20 @@ impl Jit {
                 self.blacklist.insert(func_id);
             }
         }
+    }
+
+    /// Native entry for the fused `map` kernel of callback `func_id`, compiling
+    /// (and caching) it on first request. Returns `None` if the callback isn't
+    /// kernel-eligible. The entry pointer is into the kernel's mmap'd buffer
+    /// (stable; the cache `Option` owns the buffer for the VM's lifetime).
+    pub fn map_kernel(&mut self, func_id: u32, proto: &FuncProto) -> Option<*const u8> {
+        if let Some(slot) = self.map_kernels.get(&func_id) {
+            return slot.as_ref().map(|f| f.entry());
+        }
+        let compiled = compile_map_kernel(proto);
+        let entry = compiled.as_ref().map(|f| f.entry());
+        self.map_kernels.insert(func_id, compiled);
+        entry
     }
 
     // ── OSR loop regions ──
@@ -948,6 +966,202 @@ fn emit_self_call(
         ; mov [rbx + dreg(dst)], rax
     );
     emit_bail(ops, ip, bail);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Fused map-kernel JIT
+//
+// `arr.map(cb)` normally compiles `cb` once (the leaf JIT) and calls it per
+// element through a reused register window (`invoke_cb_windowed`). Correct, and
+// the per-element setup is call-free, but each element still pays a win64
+// call + the callback's prologue/epilogue — V8 INLINES the callback body into
+// the loop and pays zero. This kernel closes that gap: it emits a native loop
+// that iterates the array snapshot and inlines the callback body per element,
+// writing each result straight into the output buffer. No per-element call.
+//
+// SAFETY MODEL — same correctness-first stance as the leaf JIT:
+// * `can_compile_map_kernel` accepts ONLY pure-integer callbacks with no calls,
+//   globals, heap ops, or non-int constants — so the kernel is CALL-FREE and
+//   `self.regs`/the snapshot/the output buffer can't reallocate under the live
+//   pointers during a run.
+// * Every arithmetic/compare guards its operands are `Int` and bails on a
+//   non-int (a double element, etc.) or on overflow — never wrong, never wraps.
+// * A bail does NOT abort the whole map: the kernel returns the element index
+//   `i` it bailed at, having written results `[0, i)`. The Rust driver finishes
+//   `[i, len)` through the ordinary per-element path (which handles doubles,
+//   strings, etc. correctly). So an int array gets the full inlined win, and a
+//   mixed/double array merely runs the tail the slow way — same answer as node.
+//
+// ABI: `extern "win64" fn(window: *mut u64, snapshot: *const u64, len: usize,
+// out: *mut u64) -> usize` returning the count processed (`len` = complete,
+// `< len` = bailed at that index). `window` is the callback's register frame
+// (reg 0 = this, reg 1 = element, reg 2 = index). `out` capacity must be ≥ len.
+
+/// True if `proto` is simple enough to inline into a native map kernel: pure
+/// NUMERIC arithmetic, 1 or 2 params, NO calls / globals / heap ops / branches
+/// / `%` / non-int (`LoadConst`) constants. The kernel computes in f64 (like
+/// the OSR loop regions), so it handles BOTH int-tagged and double elements —
+/// loop-built numeric arrays hold doubles (the building loop ran in the SSE
+/// region). Stricter than `can_compile` because the kernel must be call-free
+/// (no `regs` realloc under the live window pointer).
+fn can_compile_map_kernel(proto: &FuncProto) -> bool {
+    if proto.param_count == 0 || proto.param_count > 2 {
+        return false;
+    }
+    proto.code.iter().all(|instr| {
+        matches!(
+            instr,
+            Instr::LoadInt { .. }
+                | Instr::Move { .. }
+                | Instr::AddInt { .. }
+                | Instr::Add { .. }
+                | Instr::Sub { .. }
+                | Instr::Mul { .. }
+                | Instr::Div { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined
+        )
+    })
+}
+
+/// f64 binop for the map kernel (`regs[dst] = regs[a] <op> regs[b]`). Reuses the
+/// region's number-load/store helpers; a non-number operand jumps to the shared
+/// `bail` (the element falls to the interpreter tail). No overflow concept — JS
+/// numbers are f64, so this never wraps or deopts on magnitude.
+fn kmap_dbinop(
+    ops: &mut dynasmrt::x64::Assembler,
+    bail: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+    op: DOp,
+) {
+    load_num_xmm(ops, a, 0, bail);
+    load_num_xmm(ops, b, 1, bail);
+    match op {
+        DOp::Add => dynasm!(ops ; addsd xmm0, xmm1),
+        DOp::Sub => dynasm!(ops ; subsd xmm0, xmm1),
+        DOp::Mul => dynasm!(ops ; mulsd xmm0, xmm1),
+        DOp::Div => dynasm!(ops ; divsd xmm0, xmm1),
+    }
+    store_xmm(ops, dst);
+}
+
+/// Compile a fused native `map` kernel for callback `proto` (see the module
+/// comment above for the ABI and safety model). `None` if the callback isn't
+/// kernel-eligible (the caller then uses the ordinary per-element path).
+fn compile_map_kernel(proto: &FuncProto) -> Option<JitFn> {
+    if !can_compile_map_kernel(proto) {
+        return None;
+    }
+    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let n = proto.code.len();
+    // A label per cb bytecode index (internal jumps) + a fall-off-the-end label.
+    let labels: Vec<_> = (0..=n).map(|_| ops.new_dynamic_label()).collect();
+    let loop_top = ops.new_dynamic_label();
+    let loop_continue = ops.new_dynamic_label();
+    let loop_done = ops.new_dynamic_label();
+    let kernel_bail = ops.new_dynamic_label();
+    let epilogue = ops.new_dynamic_label();
+    let want_index = proto.param_count >= 2;
+
+    // ── prologue ── pin window=rbx, snapshot=r13, len=r14, out=r15, i=r12.
+    // 5 callee-saved pushes (40B) from an 8-mod-16 entry ⇒ rsp 16-aligned; the
+    // kernel makes NO calls, so it needs no shadow space (no `sub rsp`).
+    dynasm!(ops
+        ; push rbx
+        ; push r12
+        ; push r13
+        ; push r14
+        ; push r15
+        ; mov rbx, rcx                          // window base (cb register frame)
+        ; mov r13, rdx                          // snapshot ptr
+        ; mov r14, r8                           // len
+        ; mov r15, r9                           // out ptr
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; mov [rbx], rax                        // window[0] = this = undefined (once)
+        ; xor r12, r12                          // i = 0
+        ; => loop_top
+        ; cmp r12, r14
+        ; jae => loop_done                      // i >= len ⇒ done (unsigned)
+        ; mov rax, [r13 + r12*8]
+        ; mov [rbx + 8], rax                    // window[1] = snapshot[i] (element)
+    );
+    if want_index {
+        // window[2] = Int(i). i < 2^31 (caller gates len ≤ i32::MAX), so the
+        // low 32 bits are the exact non-negative payload.
+        dynasm!(ops
+            ; mov eax, r12d
+            ; mov rcx, QWORD INT_TAG as i64
+            ; or rax, rcx
+            ; mov [rbx + 16], rax
+        );
+    }
+
+    for (ip, instr) in proto.code.iter().enumerate() {
+        dynasm!(ops ; => labels[ip]);
+        match *instr {
+            Instr::LoadInt { dst, val } => {
+                // A small integer constant; load_num_xmm will cvtsi2sd it.
+                let boxed = INT_TAG | (val as u32 as u64);
+                dynasm!(ops ; mov rax, QWORD boxed as i64 ; mov [rbx + dreg(dst)], rax);
+            }
+            Instr::Move { dst, src } => {
+                dynasm!(ops ; mov rax, [rbx + dreg(src)] ; mov [rbx + dreg(dst)], rax);
+            }
+            Instr::AddInt { dst, a, imm } => {
+                load_num_xmm(&mut ops, a, 0, kernel_bail);
+                dynasm!(ops ; mov eax, imm ; cvtsi2sd xmm1, eax ; addsd xmm0, xmm1);
+                store_xmm(&mut ops, dst);
+            }
+            Instr::Add { dst, a, b } => kmap_dbinop(&mut ops, kernel_bail, dst, a, b, DOp::Add),
+            Instr::Sub { dst, a, b } => kmap_dbinop(&mut ops, kernel_bail, dst, a, b, DOp::Sub),
+            Instr::Mul { dst, a, b } => kmap_dbinop(&mut ops, kernel_bail, dst, a, b, DOp::Mul),
+            Instr::Div { dst, a, b } => kmap_dbinop(&mut ops, kernel_bail, dst, a, b, DOp::Div),
+            Instr::Return { src } => {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov [r15 + r12*8], rax        // out[i] = result
+                    ; jmp => loop_continue
+                );
+            }
+            Instr::ReturnUndefined => {
+                dynasm!(ops
+                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                    ; mov [r15 + r12*8], rax
+                    ; jmp => loop_continue
+                );
+            }
+            _ => return None, // can_compile_map_kernel already filtered; defensive
+        }
+    }
+    // Falling off the end behaves like `ReturnUndefined` (store undefined).
+    dynasm!(ops
+        ; => labels[n]
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; mov [r15 + r12*8], rax
+        // fall through into the loop step
+        ; => loop_continue
+        ; inc r12
+        ; jmp => loop_top
+        ; => loop_done
+        ; mov rax, r14                          // processed = len (ran to completion)
+        ; jmp => epilogue
+        ; => kernel_bail
+        ; mov rax, r12                          // processed = i (the tail runs [i,len))
+        ; jmp => epilogue
+        ; => epilogue
+        ; pop r15
+        ; pop r14
+        ; pop r13
+        ; pop r12
+        ; pop rbx
+        ; ret
+    );
+
+    let buf = ops.finalize().ok()?;
+    let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    Some(JitFn { _buf: buf, entry: entry_ptr })
 }
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -4649,7 +4649,65 @@ impl<'p> Vm<'p> {
         let mut out: Vec<Value> =
             if collect { Vec::with_capacity(snapshot.len()) } else { Vec::new() };
 
-        let mut native = self.native_cb_entry(cb);
+        // Fused native map kernel: inline the callback into a native loop over
+        // the snapshot for the leading run of integer elements — eliminating the
+        // per-element call boundary (the gap to V8, which inlines callbacks). Map
+        // only (dense, ordered store). On a type-guard bail the kernel returns
+        // the index it reached, having written results `[0, start)`; the
+        // per-element loop below finishes `[start, len)` correctly (handling
+        // doubles/strings/etc.), so a mixed array can never give a wrong answer.
+        let mut start = 0usize;
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if matches!(mode, EachMode::Map)
+            && self.jit_enabled
+            && self.jit_recurse_depth == 0
+            && cb.is_heap()
+            && snapshot.len() <= i32::MAX as usize
+        {
+            if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
+                if ups.is_empty() {
+                    let proto: *const crate::bytecode::FuncProto =
+                        &self.program.functions[fid as usize];
+                    // SAFETY: program functions are immutable during execution;
+                    // the raw ptr dodges the self.jit (&mut) vs self.program (&)
+                    // borrow conflict (same pattern as native_cb_entry).
+                    let proto_ref = unsafe { &*proto };
+                    let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
+                    let reg_count = (proto_ref.reg_count as usize).max(min_window);
+                    if let Some(entry) = self.jit.map_kernel(fid, proto_ref) {
+                        let win = self.regs.len();
+                        if !self.regs_would_overflow(win + reg_count) {
+                            self.regs.resize(win + reg_count, Value::UNDEFINED);
+                            let len = snapshot.len();
+                            let window_ptr =
+                                unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+                            let snap_ptr = snapshot.as_ptr() as *const u64;
+                            let out_ptr = out.as_mut_ptr() as *mut u64;
+                            // SAFETY: `entry` is a valid win64 map kernel; the
+                            // window holds `reg_count` slots; `out` has capacity
+                            // `len` ≥ the returned count; the kernel is call-free
+                            // so none of these pointers move during the call.
+                            let kernel: extern "win64" fn(
+                                *mut u64,
+                                *const u64,
+                                usize,
+                                *mut u64,
+                            ) -> usize = unsafe { core::mem::transmute(entry) };
+                            let processed = kernel(window_ptr, snap_ptr, len, out_ptr);
+                            // The kernel wrote `out[0..processed]` densely.
+                            unsafe { out.set_len(processed) };
+                            self.regs.truncate(win);
+                            start = processed;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Per-element path for `[start, len)` — the whole array when no kernel
+        // ran, or just the tail after a kernel bail (or nothing if it completed).
+        let run_tail = start < snapshot.len();
+        let mut native = if run_tail { self.native_cb_entry(cb) } else { None };
         let win = self.regs.len();
         if let Some((_, callee_regs, _)) = native {
             if self.regs_would_overflow(win + callee_regs) {
@@ -4660,14 +4718,15 @@ impl<'p> Vm<'p> {
         }
 
         let mut err = None;
-        for (i, v) in snapshot.iter().enumerate() {
-            let args = [*v, Value::int(i as i32)];
+        for i in start..snapshot.len() {
+            let v = snapshot[i];
+            let args = [v, Value::int(i as i32)];
             match self.run_cb_elem(native, win, cb, &args) {
                 Ok(r) => match mode {
                     EachMode::Map => out.push(r),
                     EachMode::Filter => {
                         if self.truthy(r) {
-                            out.push(*v);
+                            out.push(v);
                         }
                     }
                     EachMode::ForEach => {}

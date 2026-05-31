@@ -487,6 +487,36 @@ mod tests {
     }
 
     #[test]
+    fn map_kernel_matches_interpreter() {
+        // The fused native map kernel must agree with the interpreter (JIT-off)
+        // and node on int-tagged AND double elements, with index, mixed types,
+        // overflow, and a tail after a guard bail.
+        // Loop-built arrays hold DOUBLES (the build loop ran in the SSE region) —
+        // the kernel must process them, not bail at element 0.
+        assert_jit_matches(
+            "let a=[]; for(let i=0;i<50;i++) a[i]=i; console.log(a.map(x=>x*2).reduce((s,x)=>s+x,0))",
+            &["2450"], // 2*(0+..+49) = 2*1225
+        );
+        // Literal int array (int-tagged elements): full native run.
+        assert_jit_matches("console.log([1,2,3,4].map(x=>x*2).join(','))", &["2,4,6,8"]);
+        // Two-param callback (element, index).
+        assert_jit_matches("console.log([10,20,30].map((x,i)=>x+i).join(','))", &["10,21,32"]);
+        // Division (f64).
+        assert_jit_matches("console.log([4,6,9].map(x=>x/2).join(','))", &["2,3,4.5"]);
+        // Mixed int/double: kernel runs the int prefix, bails at 3.5, the tail
+        // (interpreter) finishes — same answer as a full interpreter run.
+        assert_jit_matches("console.log([1,2,3.5,4].map(x=>x*2).join(','))", &["2,4,7,8"]);
+        // Non-numeric element → bail to the tail, which yields NaN (== node).
+        assert_jit_matches("console.log([1,2,'x',4].map(x=>x*2).join(','))", &["2,4,NaN,8"]);
+        // Overflow past i32: f64 stays exact (no wrap).
+        assert_jit_matches("console.log([2,1000000000,3].map(x=>x*3).join(','))", &["6,3000000000,9"]);
+        // Empty array.
+        assert_jit_matches("console.log([].map(x=>x*2).length)", &["0"]);
+        // Compound arithmetic body.
+        assert_jit_matches("console.log([1,2,3,4].map(x=>x*2+1).join(','))", &["3,5,7,9"]);
+    }
+
+    #[test]
     fn array_sort_comparator() {
         assert_eq!(
             run_ok("let a = [3, 1, 4, 1, 5, 9, 2, 6]; a.sort((x, y) => x - y); console.log(a.join(','))"),
