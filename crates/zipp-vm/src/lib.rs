@@ -853,6 +853,27 @@ mod tests {
     }
 
     #[test]
+    fn math_functions() {
+        assert_eq!(
+            run_ok("console.log(Math.sqrt(16), Math.floor(3.7), Math.ceil(3.2), Math.abs(-5), Math.trunc(-4.7))"),
+            vec!["4 3 4 5 -4"],
+        );
+        // JS Math.round is half-up (≠ Rust's half-away-from-zero for negatives).
+        assert_eq!(run_ok("console.log(Math.round(2.5), Math.round(-2.5), Math.round(-2.6))"), vec!["3 -2 -3"]);
+        assert_eq!(
+            run_ok("console.log(Math.min(3,1,2), Math.max(1,9,2), Math.pow(2,10), Math.hypot(3,4))"),
+            vec!["1 9 1024 5"],
+        );
+        // sign preserves 0 / maps NaN→NaN; min/max are NaN-sticky; empty → ±Infinity.
+        assert_eq!(
+            run_ok("console.log(Math.sign(-3), Math.sign(0), Math.sign(NaN), Math.max(1,NaN), Math.max(), Math.min())"),
+            vec!["-1 0 NaN NaN -Infinity Infinity"],
+        );
+        // Argument coercion (string → number).
+        assert_eq!(run_ok("console.log(Math.sqrt('9'))"), vec!["3"]);
+    }
+
+    #[test]
     fn template_literals() {
         assert_eq!(run_ok("let x=5; console.log(`val=${x+1}`)"), vec!["val=6"]);
         assert_eq!(run_ok("let a='A',b=2; console.log(`${a}-${b}-${a+b}`)"), vec!["A-2-A2"]);

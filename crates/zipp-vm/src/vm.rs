@@ -756,6 +756,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::MathOp { dst, op, arg_base, argc } => {
+                        let r = self.eval_math(op, base, arg_base, argc)?;
+                        self.set(base, dst, Value::num(r));
+                        ip += 1;
+                    }
 
                     Instr::Jump { target } => {
                         let t = target as usize;
@@ -1413,6 +1418,80 @@ impl<'p> Vm<'p> {
             HeapObj::Object(map) => Ok(map.get(key).unwrap_or(Value::UNDEFINED)),
             _ => Ok(Value::UNDEFINED),
         }
+    }
+
+    /// Evaluate a `Math.<fn>` call over `argc` argument registers (coerced to
+    /// numbers). Mirrors JS semantics where they differ from Rust's f64 methods:
+    /// `round` is half-up (so −2.5 → −2, not −3); `sign` preserves ±0 and maps
+    /// NaN→NaN; `min`/`max` are NaN-sticky (any NaN arg ⇒ NaN).
+    fn eval_math(&self, op: crate::bytecode::MathFn, base: usize, arg_base: u16, argc: u16) -> Result<f64, Thrown> {
+        use crate::bytecode::MathFn as M;
+        let arg = |i: u16| -> Result<f64, Thrown> {
+            if i < argc {
+                self.to_number(self.get(base, arg_base + i))
+            } else {
+                Ok(f64::NAN)
+            }
+        };
+        Ok(match op {
+            M::Min | M::Max | M::Hypot => {
+                let mut acc = match op {
+                    M::Min => f64::INFINITY,
+                    M::Max => f64::NEG_INFINITY,
+                    _ => 0.0, // Hypot: sum of squares
+                };
+                for i in 0..argc {
+                    let v = arg(i)?;
+                    acc = match op {
+                        M::Min => {
+                            if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.min(v) }
+                        }
+                        M::Max => {
+                            if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.max(v) }
+                        }
+                        _ => acc + v * v,
+                    };
+                }
+                if matches!(op, M::Hypot) { acc.sqrt() } else { acc }
+            }
+            M::Pow => arg(0)?.powf(arg(1)?),
+            M::Atan2 => arg(0)?.atan2(arg(1)?),
+            _ => {
+                let x = arg(0)?;
+                match op {
+                    M::Abs => x.abs(),
+                    M::Floor => x.floor(),
+                    M::Ceil => x.ceil(),
+                    M::Round => (x + 0.5).floor(), // JS half-up, ≠ Rust's half-away-from-zero
+                    M::Trunc => x.trunc(),
+                    M::Sign => {
+                        if x.is_nan() {
+                            f64::NAN
+                        } else if x > 0.0 {
+                            1.0
+                        } else if x < 0.0 {
+                            -1.0
+                        } else {
+                            x // preserve +0 / -0
+                        }
+                    }
+                    M::Sqrt => x.sqrt(),
+                    M::Cbrt => x.cbrt(),
+                    M::Exp => x.exp(),
+                    M::Log => x.ln(),
+                    M::Log2 => x.log2(),
+                    M::Log10 => x.log10(),
+                    M::Sin => x.sin(),
+                    M::Cos => x.cos(),
+                    M::Tan => x.tan(),
+                    M::Asin => x.asin(),
+                    M::Acos => x.acos(),
+                    M::Atan => x.atan(),
+                    // Pow/Atan2/Min/Max/Hypot handled above.
+                    _ => unreachable!(),
+                }
+            }
+        })
     }
 
     /// JS `typeof` type-name. `null` is `"object"` (a historic quirk); functions

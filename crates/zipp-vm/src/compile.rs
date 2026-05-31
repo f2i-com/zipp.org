@@ -1476,6 +1476,20 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // `Math.<fn>(args…)` → MathOp. Math has no real global object in the
+        // subset, so recognise the call shape (like console.log / Date.now).
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            if let ox::Expression::Identifier(obj) = &m.object {
+                if obj.name == "Math" {
+                    if let Some(op) = crate::bytecode::MathFn::from_name(m.property.name.as_str()) {
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                        self.emit(Instr::MathOp { dst, op, arg_base, argc });
+                        return Ok(dst);
+                    }
+                }
+            }
+        }
+
         // Method call `obj.name(args…)` → CallMethod, binding `this` to obj.
         // (Computed-member calls `obj[k](…)` fall through to the generic path.)
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {

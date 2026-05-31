@@ -73,6 +73,9 @@ pub enum Instr {
     Not { dst: Reg, a: Reg },
     /// `dst = typeof a` (a JS type-name string).
     TypeOf { dst: Reg, a: Reg },
+    /// `dst = Math.<op>(args…)` — a builtin Math function over `argc` contiguous
+    /// argument registers starting at `arg_base`.
+    MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },
@@ -182,6 +185,33 @@ pub struct FuncProto {
 }
 
 /// Where a closure's upvalue is sourced from, evaluated in the defining frame.
+/// A builtin `Math` function, resolved at compile time from `Math.<name>(…)`.
+#[derive(Clone, Copy, Debug)]
+pub enum MathFn {
+    Abs, Floor, Ceil, Round, Trunc, Sign, Sqrt, Cbrt,
+    Exp, Log, Log2, Log10,
+    Sin, Cos, Tan, Asin, Acos, Atan,
+    Pow, Atan2,
+    Min, Max, Hypot,
+}
+
+impl MathFn {
+    /// Map a `Math.<name>` method to its function, if supported.
+    pub fn from_name(name: &str) -> Option<MathFn> {
+        use MathFn::*;
+        Some(match name {
+            "abs" => Abs, "floor" => Floor, "ceil" => Ceil, "round" => Round,
+            "trunc" => Trunc, "sign" => Sign, "sqrt" => Sqrt, "cbrt" => Cbrt,
+            "exp" => Exp, "log" => Log, "log2" => Log2, "log10" => Log10,
+            "sin" => Sin, "cos" => Cos, "tan" => Tan,
+            "asin" => Asin, "acos" => Acos, "atan" => Atan,
+            "pow" => Pow, "atan2" => Atan2,
+            "min" => Min, "max" => Max, "hypot" => Hypot,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum UpvalSource {
     /// Capture the cell currently in the defining frame's register `reg`.
