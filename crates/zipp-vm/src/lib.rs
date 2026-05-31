@@ -1149,6 +1149,14 @@ mod tests {
     }
 
     #[test]
+    fn function_inspect_label() {
+        // Named functions / methods show their name; truly anonymous ones don't.
+        assert_eq!(run_ok("function foo(){} console.log(foo)"), vec!["[Function: foo]"]);
+        assert_eq!(run_ok("console.log([function named(){}, x=>x])"), vec!["[ [Function: named], [Function (anonymous)] ]"]);
+        assert_eq!(run_ok("class A{m(){}} console.log(new A().m)"), vec!["[Function: m]"]);
+    }
+
+    #[test]
     fn map_basics() {
         assert_eq!(run_ok("let m=new Map(); m.set('a',1).set('b',2); console.log(m.get('a'),m.get('b'),m.size,m.has('a'),m.has('z'))"), vec!["1 2 2 true false"]);
         assert_eq!(run_ok("let m=new Map([['x',10],['y',20]]); console.log(m.get('x'),m.get('y'),m.size)"), vec!["10 20 2"]);

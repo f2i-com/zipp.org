@@ -3666,6 +3666,20 @@ impl<'p> Vm<'p> {
         self.display(v)
     }
 
+    /// `console.log` label for a function value: `[Function: name]`, or
+    /// `[Function (anonymous)]` for an arrow / unnamed expression (synthetic
+    /// names start with `<`). Class methods are stored as `Class.method`; show
+    /// just the method part, as node does.
+    fn func_label(&self, fid: u32) -> String {
+        let name = &self.program.functions[fid as usize].name;
+        if name.starts_with('<') {
+            "[Function (anonymous)]".into()
+        } else {
+            let short = name.rsplit('.').next().unwrap_or(name);
+            format!("[Function: {short}]")
+        }
+    }
+
     fn inspect_nested(&self, v: Value) -> String {
         if !v.is_heap() {
             return self.display(v);
@@ -3677,7 +3691,8 @@ impl<'p> Vm<'p> {
                 self.heap.write_str(v.heap_index(), &mut out);
                 format!("'{out}'")
             }
-            HeapObj::Func(_) | HeapObj::Closure { .. } => "[Function]".into(),
+            HeapObj::Func(id) => self.func_label(*id),
+            HeapObj::Closure { func, .. } => self.func_label(*func),
             HeapObj::Cell(inner) => self.inspect_nested(*inner),
             HeapObj::Array(items) => {
                 if items.is_empty() {
