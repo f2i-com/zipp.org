@@ -374,6 +374,9 @@ struct FnCompiler<'a> {
     super_class: Option<u32>,
     /// True while compiling a `function*` body, so `yield` is allowed.
     in_generator: bool,
+    /// A label seen on a `LabeledStatement`, consumed by the immediately-following
+    /// loop/switch so `break label` / `continue label` can target it.
+    pending_label: Option<String>,
     /// True for the top-level script body: declarations (functions AND
     /// let/const/var) bind to globals rather than registers, so only genuinely
     /// nested functions ever capture.
@@ -407,14 +410,17 @@ struct LoopCtx {
     break_jumps: Vec<u32>,
     continue_jumps: Vec<u32>,
     is_loop: bool,
+    /// The label attached to this loop/switch (`outer: for …`), for labeled
+    /// `break outer` / `continue outer`.
+    label: Option<String>,
 }
 
 impl LoopCtx {
-    fn loop_frame() -> LoopCtx {
-        LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new(), is_loop: true }
+    fn loop_frame(label: Option<String>) -> LoopCtx {
+        LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new(), is_loop: true, label }
     }
-    fn switch_frame() -> LoopCtx {
-        LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new(), is_loop: false }
+    fn switch_frame(label: Option<String>) -> LoopCtx {
+        LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new(), is_loop: false, label }
     }
 }
 
@@ -437,6 +443,7 @@ impl<'a> FnCompiler<'a> {
             rest_reg: None,
             super_class: None,
             in_generator: false,
+            pending_label: None,
             is_script: false,
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
@@ -636,26 +643,63 @@ impl<'a> FnCompiler<'a> {
             S::ForOfStatement(f) => self.for_of_statement(f)?,
             S::ForInStatement(f) => self.for_in_statement(f)?,
             S::BreakStatement(b) => {
-                if b.label.is_some() {
-                    return Err("labeled break is not in the zipp-vm subset yet".into());
-                }
                 let j = self.here();
                 self.emit(Instr::Jump { target: 0 });
-                match self.loop_ctx.last_mut() {
+                // `break label` targets the labeled loop/switch; bare `break` the
+                // innermost.
+                let target = match &b.label {
+                    Some(lbl) => self
+                        .loop_ctx
+                        .iter_mut()
+                        .rev()
+                        .find(|c| c.label.as_deref() == Some(lbl.name.as_str())),
+                    None => self.loop_ctx.last_mut(),
+                };
+                match target {
                     Some(ctx) => ctx.break_jumps.push(j),
-                    None => return Err("`break` outside a loop is not supported".into()),
+                    None => return Err("`break` target not found (outside a loop / unknown label)".into()),
                 }
             }
             S::ContinueStatement(c) => {
-                if c.label.is_some() {
-                    return Err("labeled continue is not in the zipp-vm subset yet".into());
-                }
                 let j = self.here();
                 self.emit(Instr::Jump { target: 0 });
-                // `continue` targets the innermost LOOP, skipping switch frames.
-                match self.loop_ctx.iter_mut().rev().find(|c| c.is_loop) {
+                // `continue [label]` targets the (labeled) enclosing LOOP, skipping
+                // switch frames.
+                let target = match &c.label {
+                    Some(lbl) => self
+                        .loop_ctx
+                        .iter_mut()
+                        .rev()
+                        .find(|c| c.is_loop && c.label.as_deref() == Some(lbl.name.as_str())),
+                    None => self.loop_ctx.iter_mut().rev().find(|c| c.is_loop),
+                };
+                match target {
                     Some(ctx) => ctx.continue_jumps.push(j),
-                    None => return Err("`continue` outside a loop is not supported".into()),
+                    None => return Err("`continue` target not found (outside a loop / unknown label)".into()),
+                }
+            }
+            S::LabeledStatement(l) => {
+                if let S::BlockStatement(b) = &l.body {
+                    // `label: { … break label … }` — a break-only target around a
+                    // block (continue to a block label is invalid, and naturally
+                    // won't match: the frame is not a loop).
+                    self.loop_ctx.push(LoopCtx::switch_frame(Some(l.label.name.to_string())));
+                    self.push_scope();
+                    for s in &b.body {
+                        self.stmt(s)?;
+                    }
+                    self.pop_scope();
+                    let ctx = self.loop_ctx.pop().unwrap();
+                    let end = self.here();
+                    for j in ctx.break_jumps {
+                        self.patch_jump(j, end);
+                    }
+                } else {
+                    // A loop/switch consumes the label for break/continue;
+                    // cleared afterwards if the body was something else.
+                    self.pending_label = Some(l.label.name.to_string());
+                    self.stmt(&l.body)?;
+                    self.pending_label = None;
                 }
             }
             S::SwitchStatement(s) => self.switch_stmt(s)?,
@@ -1277,7 +1321,7 @@ impl<'a> FnCompiler<'a> {
         let cond = self.expr(&w.test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 });
-        self.loop_ctx.push(LoopCtx::loop_frame());
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
         self.stmt(&w.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         for c in ctx.continue_jumps {
@@ -1316,7 +1360,7 @@ impl<'a> FnCompiler<'a> {
             }
             None => None,
         };
-        self.loop_ctx.push(LoopCtx::loop_frame());
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -1422,7 +1466,7 @@ impl<'a> FnCompiler<'a> {
 
     fn do_while_statement(&mut self, d: &ox::DoWhileStatement) -> R<()> {
         let top = self.here();
-        self.loop_ctx.push(LoopCtx::loop_frame());
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
         self.stmt(&d.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -1471,7 +1515,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::Jump { target: 0 });
 
         // Pass 2: case bodies, in source order (fall-through is natural).
-        self.loop_ctx.push(LoopCtx::switch_frame());
+        self.loop_ctx.push(LoopCtx::switch_frame(self.pending_label.take()));
         let mut body_start: Vec<u32> = Vec::with_capacity(s.cases.len());
         for c in &s.cases {
             body_start.push(self.here());
@@ -1551,7 +1595,7 @@ impl<'a> FnCompiler<'a> {
         }
         self.next_reg = save; // reclaim done + elem temps
 
-        self.loop_ctx.push(LoopCtx::loop_frame());
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         for c in ctx.continue_jumps {
@@ -1604,7 +1648,7 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::GetIndex { dst: var_reg, obj: keys_reg, key: idx_reg });
         }
 
-        self.loop_ctx.push(LoopCtx::loop_frame());
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();

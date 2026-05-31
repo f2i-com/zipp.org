@@ -1136,6 +1136,19 @@ mod tests {
     }
 
     #[test]
+    fn labeled_break_continue() {
+        // continue label skips to the next iteration of the labeled outer loop.
+        assert_eq!(run_ok("let r=[]; outer: for(let i=0;i<3;i++){ for(let j=0;j<3;j++){ if(j===1) continue outer; r.push(i+''+j); } } console.log(r.join(','))"), vec!["00,10,20"]);
+        // break label exits the labeled outer loop entirely.
+        assert_eq!(run_ok("let r=[]; outer: for(let i=0;i<3;i++){ for(let j=0;j<3;j++){ if(i===1&&j===1) break outer; r.push(i+''+j); } } console.log(r.join(','))"), vec!["00,01,02,10"]);
+        // Works over for-of, and with a labeled break inside nested labels.
+        assert_eq!(run_ok("let r=[]; loop: for(let x of [1,2,3]){ for(let y of [10,20]){ if(y===20) continue loop; r.push(x*y); } } console.log(r.join(','))"), vec!["10,20,30"]);
+        assert_eq!(run_ok("let r=[]; a: for(let i=0;i<2;i++) b: for(let j=0;j<3;j++){ if(j===2) break a; r.push(j); } console.log(r.join(','))"), vec!["0,1"]);
+        // A label on a block makes `break label` exit the block.
+        assert_eq!(run_ok("let r=[]; blk:{ r.push(1); break blk; r.push(2); } console.log(r.join(','))"), vec!["1"]);
+    }
+
+    #[test]
     fn for_of_for_in_capture() {
         // A closure capturing a for-of / for-in loop variable resolves it (was a
         // pre-existing bug: the loop var wasn't detected as captured → not boxed).
