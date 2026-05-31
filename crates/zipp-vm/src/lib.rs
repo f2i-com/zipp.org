@@ -1192,6 +1192,20 @@ mod tests {
     }
 
     #[test]
+    fn generator_methods_and_yield_star() {
+        // Object and class generator methods (incl. using `this` and static).
+        assert_eq!(run_ok("let o={*gen(){yield 1;yield 2}}; console.log([...o.gen()].join(','))"), vec!["1,2"]);
+        assert_eq!(run_ok("class C{*vals(){yield 1;yield 2}} console.log([...new C().vals()].join(','))"), vec!["1,2"]);
+        assert_eq!(run_ok("class C{constructor(){this.xs=[10,20,30]} *each(){for(let x of this.xs) yield x}} console.log([...new C().each()].join(','))"), vec!["10,20,30"]);
+        assert_eq!(run_ok("class C{static *make(){yield 1;yield 2}} console.log([...C.make()].join(','))"), vec!["1,2"]);
+        // yield* delegation over a generator, array, string, and nested.
+        assert_eq!(run_ok("function* inner(){yield 1;yield 2} function* outer(){yield* inner(); yield 3} console.log([...outer()].join(','))"), vec!["1,2,3"]);
+        assert_eq!(run_ok("function* g(){yield* [1,2,3]; yield* 'ab'} console.log([...g()].join(','))"), vec!["1,2,3,a,b"]);
+        assert_eq!(run_ok("function* g(){yield 0; yield* [1,2]; yield 3} console.log([...g()].join(','))"), vec!["0,1,2,3"]);
+        assert_eq!(run_ok("function* nest(){yield* (function*(){yield* [1,2]})()} console.log([...nest()].join(','))"), vec!["1,2"]);
+    }
+
+    #[test]
     fn map_basics() {
         assert_eq!(run_ok("let m=new Map(); m.set('a',1).set('b',2); console.log(m.get('a'),m.get('b'),m.size,m.has('a'),m.has('z'))"), vec!["1 2 2 true false"]);
         assert_eq!(run_ok("let m=new Map([['x',10],['y',20]]); console.log(m.get('x'),m.get('y'),m.size)"), vec!["10 20 2"]);

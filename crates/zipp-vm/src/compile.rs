@@ -200,6 +200,7 @@ impl Compiler {
     /// (a) non-capturing (empty enclosing → free vars resolve to globals) and
     /// (b) it first emits instance-field initializers `this.field = expr` (only
     /// for the constructor; `fields` is empty for plain methods). `this` is reg 0.
+    #[allow(clippy::too_many_arguments)]
     fn compile_class_fn(
         &mut self,
         name: &str,
@@ -209,9 +210,11 @@ impl Compiler {
         fields: &[(String, Option<&ox::Expression>)],
         body: &[ox::Statement],
         super_class: Option<u32>,
+        is_generator: bool,
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params, rest, HashSet::new(), Vec::new());
         fc.super_class = super_class;
+        fc.in_generator = is_generator;
         if let Some(pa) = params_ast {
             fc.emit_param_defaults(pa)?;
         }
@@ -248,7 +251,7 @@ impl Compiler {
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
-            is_generator: false,
+            is_generator,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -1059,9 +1062,6 @@ impl<'a> FnCompiler<'a> {
         let mut static_fields: Vec<(String, Option<&'b ox::Expression<'b>>)> = Vec::new();
         for el in &class.body.body {
             match el {
-                ox::ClassElement::MethodDefinition(m) if m.value.generator => {
-                    return Err("generator methods are not in the zipp-vm subset yet".into());
-                }
                 ox::ClassElement::MethodDefinition(m) => match (m.r#static, m.kind) {
                     (true, ox::MethodDefinitionKind::Method) => {
                         statics.push((class_key_name(&m.key)?, &m.value));
@@ -1105,6 +1105,7 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 body,
                 super_class_id,
+                func.generator,
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1122,6 +1123,7 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 body,
                 super_class_id,
+                false, // getters are never generators
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1139,6 +1141,7 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 body,
                 None, // statics: `super` would refer to the parent class, not handled
+                func.generator,
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1163,6 +1166,7 @@ impl<'a> FnCompiler<'a> {
                 &fields,
                 body,
                 super_class_id,
+                false, // a constructor is never a generator
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -2590,7 +2594,33 @@ impl<'a> FnCompiler<'a> {
             return Err("`yield` is only valid inside a generator (function*)".into());
         }
         if y.delegate {
-            return Err("yield* (delegation) is not in the zipp-vm subset yet".into());
+            // `yield* expr`: lazily delegate to the iterable, yielding each of its
+            // elements (drives any iterable via IterNext — generator, array,
+            // string, Map, Set). Sent values aren't forwarded and the delegate's
+            // own return value is approximated as undefined (both rare).
+            let arg = y.argument.as_ref().ok_or("yield* requires an operand")?;
+            let save = self.next_reg;
+            let iter = self.alloc_reg();
+            let v = self.expr_into(arg, iter)?;
+            if v != iter {
+                self.emit(Instr::Move { dst: iter, src: v });
+            }
+            let idx = self.alloc_reg();
+            self.emit(Instr::LoadInt { dst: idx, val: 0 });
+            let elem = self.alloc_reg();
+            let done = self.alloc_reg();
+            let sink = self.alloc_reg(); // discards the value sent to next()
+            let top = self.here();
+            self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter, idx });
+            let jdone = self.here();
+            self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+            self.emit(Instr::Yield { dst: sink, val: elem });
+            self.emit(Instr::Jump { target: top });
+            let end = self.here();
+            self.patch_jump(jdone, end);
+            self.next_reg = save;
+            self.emit(Instr::LoadUndefined { dst });
+            return Ok(dst);
         }
         // Evaluate the yielded value (undefined for a bare `yield`); on resume
         // the value passed to `.next(v)` lands in `dst`.
