@@ -763,6 +763,17 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(is_arr));
                         ip += 1;
                     }
+                    Instr::JsonStringify { dst, val, space } => {
+                        let v = self.get(base, val);
+                        let indent = self.json_indent(self.get(base, space));
+                        // `JSON.stringify(undefined)` (and of a function) is undefined.
+                        let result = match self.json_value(v, &indent, 0) {
+                            Some(s) => self.alloc_str(s),
+                            None => Value::UNDEFINED,
+                        };
+                        self.set(base, dst, result);
+                        ip += 1;
+                    }
                     Instr::MathOp { dst, op, arg_base, argc } => {
                         let r = self.eval_math(op, base, arg_base, argc)?;
                         self.set(base, dst, Value::num(r));
@@ -1562,6 +1573,83 @@ impl<'p> Vm<'p> {
                 }
             }
         })
+    }
+
+    /// The per-level indent string for `JSON.stringify`'s `space` argument: a
+    /// number → that many spaces (clamped 0..10); a string → its first 10 chars;
+    /// anything else → empty (compact output).
+    fn json_indent(&self, space: Value) -> String {
+        if space.is_number() {
+            let n = space.as_f64();
+            let n = if n.is_finite() && n > 0.0 { (n as usize).min(10) } else { 0 };
+            " ".repeat(n)
+        } else if space.is_heap() {
+            match self.heap.str_cow(space.heap_index()) {
+                Some(s) => s.chars().take(10).collect(),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        }
+    }
+
+    /// Serialize `v` to JSON (`None` ⇒ omit: undefined / function). `indent` is
+    /// the per-level pad (empty ⇒ compact); `depth` is the current nesting.
+    fn json_value(&self, v: Value, indent: &str, depth: usize) -> Option<String> {
+        if depth > 512 {
+            return None; // guard against pathological / circular structures
+        }
+        if v.is_undefined() {
+            return None;
+        }
+        if v.is_null() {
+            return Some("null".to_string());
+        }
+        if v.is_bool() {
+            return Some(if v.as_bool() { "true" } else { "false" }.to_string());
+        }
+        if v.is_number() {
+            let n = v.as_f64();
+            return Some(if n.is_finite() { fmt_f64(n) } else { "null".to_string() });
+        }
+        if !v.is_heap() {
+            return None;
+        }
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                let s = self.heap.str_cow(v.heap_index()).unwrap();
+                Some(json_quote(&s))
+            }
+            HeapObj::Func(_) | HeapObj::Closure { .. } => None, // functions are omitted
+            HeapObj::Array(items) => {
+                let items = items.clone(); // release the heap borrow before recursing
+                if items.is_empty() {
+                    return Some("[]".to_string());
+                }
+                // A missing element value serializes as null inside an array.
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|e| self.json_value(*e, indent, depth + 1).unwrap_or_else(|| "null".to_string()))
+                    .collect();
+                Some(wrap_json(&parts, '[', ']', indent, depth))
+            }
+            HeapObj::Object(map) => {
+                let keys = map.keys.clone();
+                let vals = map.vals.clone();
+                let sep = if indent.is_empty() { ":" } else { ": " };
+                let mut parts = Vec::new();
+                for (k, val) in keys.iter().zip(vals.iter()) {
+                    if let Some(vs) = self.json_value(*val, indent, depth + 1) {
+                        parts.push(format!("{}{}{}", json_quote(k), sep, vs));
+                    }
+                }
+                if parts.is_empty() {
+                    return Some("{}".to_string());
+                }
+                Some(wrap_json(&parts, '{', '}', indent, depth))
+            }
+            _ => None,
+        }
     }
 
     /// JS `typeof` type-name. `null` is `"object"` (a historic quirk); functions
@@ -2939,6 +3027,39 @@ fn array_index(key: Value) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// Quote a string as a JSON string literal (escaping per the JSON spec).
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Wrap JSON `parts` in `open`/`close`, compact when `indent` is empty, else
+/// one element per line indented `depth+1` deep with the closing bracket at `depth`.
+fn wrap_json(parts: &[String], open: char, close: char, indent: &str, depth: usize) -> String {
+    if indent.is_empty() {
+        return format!("{}{}{}", open, parts.join(","), close);
+    }
+    let pad = indent.repeat(depth + 1);
+    let pad_close = indent.repeat(depth);
+    let sep = format!(",\n{pad}");
+    format!("{open}\n{pad}{}\n{pad_close}{close}", parts.join(&sep))
 }
 
 fn fmt_f64(n: f64) -> String {

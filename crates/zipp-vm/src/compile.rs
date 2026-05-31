@@ -1795,6 +1795,34 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // `JSON.stringify(value, replacer, space)` → JsonStringify op (the
+        // replacer arg is ignored; `space` controls indentation).
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            if let ox::Expression::Identifier(obj) = &m.object {
+                if obj.name == "JSON" && m.property.name == "stringify" && !c.arguments.is_empty() {
+                    if let Some(ve) = c.arguments[0].as_expression() {
+                        let val = self.expr(ve)?;
+                        let space = if c.arguments.len() >= 3 {
+                            match c.arguments[2].as_expression() {
+                                Some(se) => self.expr(se)?,
+                                None => {
+                                    let r = self.temp();
+                                    self.emit(Instr::LoadUndefined { dst: r });
+                                    r
+                                }
+                            }
+                        } else {
+                            let r = self.temp();
+                            self.emit(Instr::LoadUndefined { dst: r });
+                            r
+                        };
+                        self.emit(Instr::JsonStringify { dst, val, space });
+                        return Ok(dst);
+                    }
+                }
+            }
+        }
+
         // `Array.isArray(x)` → IsArray op.
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             if let ox::Expression::Identifier(obj) = &m.object {

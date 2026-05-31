@@ -957,6 +957,18 @@ mod tests {
     }
 
     #[test]
+    fn json_stringify() {
+        assert_eq!(run_ok("console.log(JSON.stringify({a:1,b:[2,3]}))"), vec![r#"{"a":1,"b":[2,3]}"#]);
+        // undefined/function are omitted in objects but become null in arrays.
+        assert_eq!(run_ok("console.log(JSON.stringify([1,undefined,null]))"), vec!["[1,null,null]"]);
+        assert_eq!(run_ok("console.log(JSON.stringify({x:undefined,y:1}))"), vec![r#"{"y":1}"#]);
+        // Primitives; NaN/Infinity → null; top-level undefined → undefined.
+        assert_eq!(run_ok("console.log(JSON.stringify(42), JSON.stringify(NaN), JSON.stringify(undefined))"), vec!["42 null undefined"]);
+        // Pretty-print with a numeric `space`.
+        assert_eq!(run_ok("console.log(JSON.stringify({a:1}, null, 2))"), vec!["{\n  \"a\": 1\n}"]);
+    }
+
+    #[test]
     fn array_methods_more() {
         assert_eq!(run_ok("let a=[1,2,3]; a.reverse(); console.log(a.join(','))"), vec!["3,2,1"]);
         assert_eq!(run_ok("console.log([1,2].concat([3,4],5,[6]).join(','))"), vec!["1,2,3,4,5,6"]);
