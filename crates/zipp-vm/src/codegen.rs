@@ -1192,11 +1192,15 @@ fn compile_region_regalloc(
     // nonvolatile xmm6..15 (we may use them as homes), load live-in homes, jump
     // to the loop header. No call occurs after the globals-base fetch, so stack
     // alignment past that point is irrelevant and movdqu (unaligned) is fine.
+    // r13/r14 are pushed (unused by the double path) to share the one restore
+    // sequence with the int path, which uses them for guard constants.
     dynasm!(ops
         ; push rbx
         ; push rsi
         ; push rdi
         ; push r12
+        ; push r13
+        ; push r14
         ; mov rbx, rcx
         ; mov rsi, rdx
         ; mov rdi, r8
@@ -1371,6 +1375,8 @@ fn compile_region_regalloc(
 /// diverge: the int path bails to the interpreter when a result leaves
 /// `[-2^53, 2^53]`. (Too large for a `cmp r64, imm32`, so it goes via a register.)
 const TWO_POW_53: i64 = 9_007_199_254_740_992;
+/// `2^54` — the unsigned upper bound for the shifted range check `(x + 2^53) ≤ 2^54`.
+const TWO_POW_54: i64 = 18_014_398_509_481_984;
 
 /// Can the loop region `[start, end]` run on the INTEGER path? Stricter than
 /// `region_can_compile`: every op must be integer-valued (no Mul/Div/Mod — i64
@@ -1450,12 +1456,15 @@ fn compile_region_int(
     let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
 
     // ── prologue ── identical to the double path (save callee-saved, fetch
-    // globals base, save xmm6..15) — only the live-in loads + body differ.
+    // globals base, save xmm6..15) — only the live-in loads + body differ. r13/r14
+    // additionally hold the 2^53/2^54 guard constants (pre-loaded once).
     dynasm!(ops
         ; push rbx
         ; push rsi
         ; push rdi
         ; push r12
+        ; push r13
+        ; push r14
         ; mov rbx, rcx
         ; mov rsi, rdx
         ; mov rdi, r8
@@ -1465,6 +1474,8 @@ fn compile_region_int(
         ; call rax
         ; mov r12, rax
         ; add rsp, 40
+        ; mov r13, QWORD TWO_POW_53           // guard: + 2^53
+        ; mov r14, QWORD TWO_POW_54           // guard: unsigned upper bound 2^54
         ; sub rsp, 160
     );
     for k in 0..10u32 {
@@ -1643,17 +1654,17 @@ fn emit_int_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, instr: 
 /// flush all homes and resume the interpreter at the NEXT ip (the overflowed
 /// value flushes via cvtsi2sd to exactly JS's rounded result, so ip+1 is sound).
 fn emit_i53_guard(ops: &mut dynasmrt::x64::Assembler, h: u8, ip: usize, flush_exit: dynasmrt::DynamicLabel) {
+    // Range trick: x ∈ [-2^53, 2^53] ⟺ (x + 2^53) ≤ 2^54 as UNSIGNED (a value
+    // below -2^53 wraps to a huge unsigned and fails too). The two constants are
+    // pre-loaded once in the prologue (r13 = 2^53, r14 = 2^54) — avoiding two
+    // 10-byte `movabs` per guard, which profiling showed dominated the loop.
     let ovf = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
         ; movq rax, Rx(h)
-        ; mov rdx, QWORD TWO_POW_53          // +2^53 (too big for a cmp immediate)
-        ; cmp rax, rdx
-        ; jg => ovf
-        ; mov rdx, QWORD -TWO_POW_53         // -2^53
-        ; cmp rax, rdx
-        ; jl => ovf
-        ; jmp => done
+        ; add rax, r13           // + 2^53 (no i64 overflow: |x| ≤ 2^54 here)
+        ; cmp rax, r14           // 2^54
+        ; jbe => done            // in range → continue
         ; => ovf
         ; mov DWORD [rsi], (ip + 1) as i32   // resume AFTER this op (result flushed)
         ; jmp => flush_exit
@@ -1733,6 +1744,8 @@ fn emit_region_restore(ops: &mut dynasmrt::x64::Assembler) {
     }
     dynasm!(ops
         ; add rsp, 160
+        ; pop r14
+        ; pop r13
         ; pop r12
         ; pop rdi
         ; pop rsi
