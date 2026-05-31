@@ -1889,6 +1889,61 @@ impl<'p> Vm<'p> {
                 let found = snapshot.iter().any(|v| self.values_strict_eq(*v, arg0));
                 Ok(Some(Value::bool(found)))
             }
+            "lastIndexOf" => {
+                let snapshot = self.array_snapshot(idx);
+                let pos = snapshot.iter().rposition(|v| self.values_strict_eq(*v, arg0));
+                Ok(Some(Value::int(pos.map(|p| p as i32).unwrap_or(-1))))
+            }
+            "reverse" => {
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    items.reverse();
+                }
+                Ok(Some(Value::heap(idx))) // reverses in place, returns the array
+            }
+            "concat" => {
+                // New array = this ++ each arg, spreading array args one level.
+                let mut out = self.array_snapshot(idx);
+                for a in args {
+                    if a.is_heap() && matches!(self.heap.get(a.heap_index()), HeapObj::Array(_)) {
+                        out.extend(self.array_snapshot(a.heap_index()));
+                    } else {
+                        out.push(*a);
+                    }
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "flat" => {
+                let depth = if args.is_empty() {
+                    1
+                } else {
+                    let d = arg0.as_f64();
+                    if d.is_infinite() && d > 0.0 {
+                        i32::MAX
+                    } else if d.is_finite() && d >= 0.0 {
+                        d as i32
+                    } else {
+                        0
+                    }
+                };
+                let snapshot = self.array_snapshot(idx);
+                let out = self.flatten_array(&snapshot, depth);
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "fill" => {
+                let val = arg0;
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len() as i32,
+                    _ => 0,
+                };
+                let start = norm_index(if args.len() >= 2 { args[1].as_f64() as i32 } else { 0 }, len);
+                let end = norm_index(if args.len() >= 3 { args[2].as_f64() as i32 } else { len }, len);
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    for i in start..end {
+                        items[i as usize] = val;
+                    }
+                }
+                Ok(Some(Value::heap(idx)))
+            }
             "slice" => {
                 let snapshot = self.array_snapshot(idx);
                 let len = snapshot.len() as i32;
@@ -2167,6 +2222,27 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => items.clone(),
             _ => Vec::new(),
         }
+    }
+
+    /// Recursively flatten nested arrays up to `depth` levels (for `Array.flat`).
+    /// Each nested array is cloned out before recursing (releases the heap borrow).
+    fn flatten_array(&self, items: &[Value], depth: i32) -> Vec<Value> {
+        let mut out = Vec::new();
+        for v in items {
+            let nested: Option<Vec<Value>> = if depth > 0 && v.is_heap() {
+                match self.heap.get(v.heap_index()) {
+                    HeapObj::Array(a) => Some(a.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match nested {
+                Some(a) => out.extend(self.flatten_array(&a, depth - 1)),
+                None => out.push(*v),
+            }
+        }
+        out
     }
 
     /// Strict equality between two raw values (no register indirection). Mirrors

@@ -957,6 +957,14 @@ mod tests {
     }
 
     #[test]
+    fn array_methods_more() {
+        assert_eq!(run_ok("let a=[1,2,3]; a.reverse(); console.log(a.join(','))"), vec!["3,2,1"]);
+        assert_eq!(run_ok("console.log([1,2].concat([3,4],5,[6]).join(','))"), vec!["1,2,3,4,5,6"]);
+        assert_eq!(run_ok("console.log([1,[2,[3]]].flat().length, [1,[2,[3]]].flat(2).join(','))"), vec!["3 1,2,3"]);
+        assert_eq!(run_ok("console.log([1,2,3,4].fill(9,1,3).join(','), [1,2,1].lastIndexOf(1))"), vec!["1,9,9,4 2"]);
+    }
+
+    #[test]
     fn array_callback_search_methods() {
         assert_eq!(
             run_ok("let a=[1,2,3,4]; console.log(a.find(x=>x>2), a.findIndex(x=>x>2), a.some(x=>x>3), a.every(x=>x>0))"),
