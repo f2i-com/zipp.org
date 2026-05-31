@@ -246,6 +246,19 @@ pub enum Instr {
     /// Pop the most recent try-handler (reached when the try block completes
     /// without throwing).
     PopHandler,
+    /// Push a `finally` handler. It is visited on EVERY exit from the protected
+    /// region — throw (via unwind), `return` (via the Return op), or normal
+    /// completion — running the finally block at `target` with a completion record
+    /// deposited into `kind_reg` (0 normal, 1 return, 2 throw) and `val_reg` (the
+    /// return value / thrown reason).
+    PushFinally { target: u32, kind_reg: Reg, val_reg: Reg },
+    /// Pop the most recent `finally` handler (the normal-completion path, just
+    /// before falling into the finally block).
+    PopFinally,
+    /// End of a `finally` block: resume the completion in `kind_reg`/`val_reg` —
+    /// re-leave a pending `return` (chaining through any outer finally), re-raise a
+    /// pending throw, or fall through on normal completion.
+    EndFinally { kind_reg: Reg, val_reg: Reg },
 
     /// Return `src` from the current function.
     Return { src: Reg },

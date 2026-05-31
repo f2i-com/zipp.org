@@ -20,7 +20,7 @@
 //! later make faster.
 
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
-use crate::heap::{GenState, Heap, HeapObj, ObjMap, PromiseState, Reaction};
+use crate::heap::{GenState, Handler, Heap, HeapObj, ObjMap, PromiseState, Reaction};
 use crate::value::Value;
 
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
@@ -39,14 +39,6 @@ const FIELD_POOL: usize = 64;
 const NO_CLOSURE: u32 = u32::MAX;
 
 /// An active `try` handler within a frame.
-#[derive(Clone, Copy)]
-struct Handler {
-    /// Instruction index of the catch block.
-    catch_target: u32,
-    /// Register (frame-relative) that receives the thrown value.
-    catch_reg: u16,
-}
-
 /// One activation record.
 struct Frame {
     func: u32,
@@ -540,17 +532,27 @@ impl<'p> Vm<'p> {
     }
 
     /// Pop frames from the top down to (but not below) `stop_depth`, looking for
-    /// a `try` handler. On finding one, deposit `tv` into its catch register,
-    /// set that frame's ip to the catch target, and return `true` (execution
-    /// resumes there). If the boundary is reached with no handler, return
-    /// `false` (the throw propagates to the caller).
+    /// a `try` handler. A `Catch` deposits `tv` in its register and resumes at the
+    /// catch target. A `Finally` deposits a throw completion (kind 2 + the reason)
+    /// into its registers and resumes at the finally target — `EndFinally`
+    /// re-throws after the finally runs. Either way execution resumes (`true`). If
+    /// the boundary is reached with no handler, return `false` (propagate).
     fn unwind_to_handler(&mut self, tv: Value, stop_depth: usize) -> bool {
         while self.frames.len() > stop_depth {
             let top = self.frames.len() - 1;
             if let Some(h) = self.frames[top].handlers.pop() {
                 let base = self.frames[top].base;
-                self.regs[base + h.catch_reg as usize] = tv;
-                self.frames[top].ip = h.catch_target as usize;
+                match h {
+                    Handler::Catch { target, reg } => {
+                        self.regs[base + reg as usize] = tv;
+                        self.frames[top].ip = target as usize;
+                    }
+                    Handler::Finally { target, kind_reg, val_reg } => {
+                        self.regs[base + kind_reg as usize] = Value::int(2); // throw
+                        self.regs[base + val_reg as usize] = tv;
+                        self.frames[top].ip = target as usize;
+                    }
+                }
                 return true;
             }
             // No handler in this frame: discard it and its register window.
@@ -558,6 +560,31 @@ impl<'p> Vm<'p> {
             self.regs.truncate(f.base);
         }
         false
+    }
+
+    /// On a non-throw leave of the top frame (`return`, and later break/continue),
+    /// run any pending `finally` first. Discards `Catch` handlers we are exiting;
+    /// on the innermost `Finally`, deposits the completion (`kind` 1=return + the
+    /// `value`) into its registers and returns its target so the caller resumes
+    /// there (`EndFinally` later re-leaves). Returns `None` when no finally is
+    /// pending — the caller performs the real leave (pop the frame).
+    fn route_through_finally(&mut self, kind: i32, value: Value) -> Option<u32> {
+        let top = self.frames.len() - 1;
+        let base = self.frames[top].base;
+        while let Some(h) = self.frames[top].handlers.last().copied() {
+            match h {
+                Handler::Finally { target, kind_reg, val_reg } => {
+                    self.frames[top].handlers.pop();
+                    self.regs[base + kind_reg as usize] = Value::int(kind);
+                    self.regs[base + val_reg as usize] = value;
+                    return Some(target);
+                }
+                Handler::Catch { .. } => {
+                    self.frames[top].handlers.pop();
+                }
+            }
+        }
+        None
     }
 
     /// The inner execution loop: runs ops in the current frame until a frame
@@ -1741,7 +1768,9 @@ impl<'p> Vm<'p> {
                     }
                     Instr::PushHandler { catch_target, catch_reg } => {
                         let top = self.frames.len() - 1;
-                        self.frames[top].handlers.push(Handler { catch_target, catch_reg });
+                        self.frames[top]
+                            .handlers
+                            .push(Handler::Catch { target: catch_target, reg: catch_reg });
                         ip += 1;
                     }
                     Instr::PopHandler => {
@@ -1749,14 +1778,63 @@ impl<'p> Vm<'p> {
                         self.frames[top].handlers.pop();
                         ip += 1;
                     }
+                    Instr::PushFinally { target, kind_reg, val_reg } => {
+                        let top = self.frames.len() - 1;
+                        self.frames[top]
+                            .handlers
+                            .push(Handler::Finally { target, kind_reg, val_reg });
+                        ip += 1;
+                    }
+                    Instr::PopFinally => {
+                        let top = self.frames.len() - 1;
+                        self.frames[top].handlers.pop();
+                        ip += 1;
+                    }
+                    Instr::EndFinally { kind_reg, val_reg } => {
+                        // Resume the completion deposited when this finally was
+                        // entered: 1 = return (re-leave through any outer finally,
+                        // else return), 2 = throw (re-raise), else 0 = normal.
+                        match self.regs[base + kind_reg as usize].as_int() {
+                            1 => {
+                                let v = self.regs[base + val_reg as usize];
+                                if let Some(target) = self.route_through_finally(1, v) {
+                                    ip = target as usize;
+                                    continue;
+                                }
+                                if self.pop_frame_with(v, stop_depth) {
+                                    return Ok(v);
+                                }
+                                break;
+                            }
+                            2 => {
+                                let v = self.regs[base + val_reg as usize];
+                                let top = self.frames.len() - 1;
+                                self.frames[top].ip = ip;
+                                self.pending_throw = Some(v);
+                                return Err(Thrown(self.throw_message(v)));
+                            }
+                            _ => {
+                                ip += 1;
+                            }
+                        }
+                    }
                     Instr::Return { src } => {
                         let v = self.regs[base + src as usize];
+                        // Run any pending `finally` in this frame first.
+                        if let Some(target) = self.route_through_finally(1, v) {
+                            ip = target as usize;
+                            continue;
+                        }
                         if self.pop_frame_with(v, stop_depth) {
                             return Ok(v);
                         }
                         break;
                     }
                     Instr::ReturnUndefined => {
+                        if let Some(target) = self.route_through_finally(1, Value::UNDEFINED) {
+                            ip = target as usize;
+                            continue;
+                        }
                         if self.pop_frame_with(Value::UNDEFINED, stop_depth) {
                             return Ok(Value::UNDEFINED);
                         }
@@ -2507,19 +2585,13 @@ impl<'p> Vm<'p> {
             self.regs_hw = new_base + reg_count;
         }
         let stop = self.frames.len();
-        // AsyncState stores handlers as bare (target, reg) pairs (heap.rs can't
-        // name the private `Handler` type); rebuild `Handler`s for the frame.
-        let restored: Vec<Handler> = saved_handlers
-            .iter()
-            .map(|&(catch_target, catch_reg)| Handler { catch_target, catch_reg })
-            .collect();
         self.frames.push(Frame {
             func: fid,
             base: new_base,
             ip: 0,
             ret_dst: 0,
             closure,
-            handlers: restored,
+            handlers: saved_handlers,
         });
         // Position the resume point and deliver the awaited value / rejection.
         let outcome = if resume_ip == 0 {
@@ -2554,12 +2626,10 @@ impl<'p> Vm<'p> {
         // Suspended again at an await?
         if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
             let back = self.regs.split_off(new_base);
-            let parked: Vec<(u32, u16)> =
-                handlers.iter().map(|h| (h.catch_target, h.catch_reg)).collect();
             if let HeapObj::AsyncState { state, regs, handlers: h, .. } = self.heap.get_mut(idx) {
                 *state = GenState::Suspended(await_ip);
                 *regs = back;
-                *h = parked;
+                *h = handlers;
             }
             let p = self.to_promise(awaited);
             self.settle_subscribe(p, idx);

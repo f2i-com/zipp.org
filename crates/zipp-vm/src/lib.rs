@@ -665,6 +665,28 @@ mod tests {
     }
 
     #[test]
+    fn try_finally_runs_on_all_exits() {
+        // `return` inside try runs the finally first (sync function).
+        assert_eq!(run_ok("function f(){try{return 'A'}finally{console.log('fin')}} console.log(f())"), vec!["fin", "A"]);
+        // Plain `return` in try/finally, no catch.
+        assert_eq!(run_ok("function f(){try{return 1}finally{console.log('f')}} console.log(f())"), vec!["f", "1"]);
+        // Nested try/finally: both finallys run, innermost first.
+        assert_eq!(run_ok("function f(){try{try{return 'v'}finally{console.log('in')}}finally{console.log('out')}} console.log(f())"), vec!["in", "out", "v"]);
+        // finally overrides the try's return.
+        assert_eq!(run_ok("function f(){try{return 'try'}finally{return 'fin'}} console.log(f())"), vec!["fin"]);
+        // finally overrides a throw with a return.
+        assert_eq!(run_ok("function f(){try{throw 'x'}finally{return 'saved'}} console.log(f())"), vec!["saved"]);
+        // A throw in finally overrides the try's return; caught one level out.
+        assert_eq!(run_ok("function f(){try{try{return 'x'}finally{throw 'ft'}}catch(e){return 'caught '+e}} console.log(f())"), vec!["caught ft"]);
+        // Throw propagates THROUGH a finally (uncaught locally) across a call.
+        assert_eq!(run_ok("function g(){try{throw 'd'}finally{console.log('gfin')}} function f(){try{g()}catch(e){return 'c '+e}} console.log(f())"), vec!["gfin", "c d"]);
+        // finally runs every loop iteration; value passes through on normal exit.
+        assert_eq!(run_ok("function f(){let s=0; for(let i=0;i<3;i++){try{s+=i}finally{s+=100}} return s} console.log(f())"), vec!["303"]);
+        // return in catch, with finally still running.
+        assert_eq!(run_ok("function f(){try{throw 'e'}catch(x){return 'c'}finally{console.log('fin')}} console.log(f())"), vec!["fin", "c"]);
+    }
+
+    #[test]
     fn error_object_name_and_message() {
         assert_eq!(run_ok("try { throw new Error('boom') } catch (e) { console.log(e.message, e.name) }"), vec!["boom Error"]);
         assert_eq!(run_ok("try { throw new RangeError('neg') } catch (e) { console.log(e.name) }"), vec!["RangeError"]);
@@ -1276,6 +1298,16 @@ mod tests {
         assert_eq!(run_ok("const f=async()=>(await Promise.resolve(7))+1; f().then(v=>console.log(v))"), vec!["8"]);
         // typeof of an async call is the Promise object.
         assert_eq!(run_ok("async function f(){} console.log(typeof f())"), vec!["object"]);
+        // try/finally around `return await` runs the finally before fulfilling.
+        assert_eq!(
+            run_ok("async function f(){try{return await Promise.resolve('ok')}finally{console.log('fin')}} f().then(v=>console.log(v))"),
+            vec!["fin", "ok"]
+        );
+        // A rejection thrown in at the await still runs the finally on the way out.
+        assert_eq!(
+            run_ok("async function f(){try{await Promise.reject('e')}finally{console.log('fin')}} f().catch(e=>console.log('c',e))"),
+            vec!["fin", "c e"]
+        );
     }
 
     #[test]

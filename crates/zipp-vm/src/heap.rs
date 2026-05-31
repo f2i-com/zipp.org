@@ -86,6 +86,18 @@ pub enum GenState {
     Completed,
 }
 
+/// An active `try` handler in a frame, innermost last. A `Catch` lands a thrown
+/// value in `reg` and jumps to `target`. A `Finally` is visited on EVERY exit
+/// from its protected region — throw, `return`, or normal completion — running
+/// the finally block (at `target`) with a completion record deposited into
+/// `kind_reg` (0 normal, 1 return, 2 throw) and `val_reg` (the return value /
+/// thrown reason), which `EndFinally` then resumes.
+#[derive(Clone, Copy, Debug)]
+pub enum Handler {
+    Catch { target: u32, reg: u16 },
+    Finally { target: u32, kind_reg: u16, val_reg: u16 },
+}
+
 /// A Promise's settlement state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromiseState {
@@ -170,7 +182,7 @@ pub enum HeapObj {
         state: GenState,
         regs: Vec<Value>,
         result: u32,
-        handlers: Vec<(u32, u16)>,
+        handlers: Vec<Handler>,
     },
     /// A JS `Map`: insertion-ordered (key, value) entries with SameValueZero key
     /// equality. Parallel `keys`/`vals` Vecs (small Maps dominate; linear scan).

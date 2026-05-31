@@ -1423,83 +1423,161 @@ impl<'a> FnCompiler<'a> {
 
     /// `try { … } catch (e) { … } finally { … }`.
     ///
-    /// Codegen: `PushHandler(catch, e_reg)` ; try-body ; `PopHandler` ; jump
-    /// past catch. The catch block lands the thrown value in `e_reg` and runs.
-    /// A `finally` block is emitted inline on the normal-completion path after
-    /// both try and catch (covers `try/finally` and `try/catch/finally` for code
-    /// that completes or is caught locally). NOTE/LIMITATION: a `finally` does
-    /// NOT yet run when an exception propagates THROUGH this frame uncaught, nor
-    /// on `return` inside try — documented; full finally semantics is a later
-    /// refinement.
+    /// Without a `finally`: `PushHandler(catch, e_reg)` ; try-body ; `PopHandler` ;
+    /// jump past catch. The catch lands the thrown value in `e_reg` and runs.
+    ///
+    /// With a `finally`: a `PushFinally` wraps the whole construct. Every exit from
+    /// the try/catch — normal completion, `return`, or a throw (caught here or
+    /// propagating) — routes through the single finally block, which `EndFinally`
+    /// closes by resuming the recorded completion (continue / re-return / re-throw,
+    /// chaining through any outer finally). NOTE: `break`/`continue` that exit a
+    /// `try/finally` still skip the finally (a remaining gap); return/throw/normal
+    /// are handled.
     fn try_statement(&mut self, t: &ox::TryStatement) -> R<()> {
-        let has_catch = t.handler.is_some();
+        match &t.finalizer {
+            Some(finalizer) => self.try_with_finally(t, finalizer),
+            None => self.try_catch_only(t),
+        }
+    }
 
-        let push_at = if has_catch {
-            let at = self.here();
-            // catch_reg/target patched once known.
-            self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
-            Some(at)
-        } else {
-            None
-        };
+    /// `try { … } catch (e) { … }` (no finalizer).
+    fn try_catch_only(&mut self, t: &ox::TryStatement) -> R<()> {
+        let push_at = self.here();
+        // catch_reg/target patched once known.
+        self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
 
-        // Try block.
         self.push_scope();
         for s in &t.block.body {
             self.stmt(s)?;
         }
         self.pop_scope();
 
-        if let (Some(push_at), Some(handler)) = (push_at, &t.handler) {
-            // Normal completion of the try: pop the handler, skip the catch.
+        let handler = t.handler.as_ref().ok_or("try requires catch or finally")?;
+        // Normal completion of the try: pop the handler, skip the catch.
+        self.emit(Instr::PopHandler);
+        let skip = self.here();
+        self.emit(Instr::Jump { target: 0 });
+
+        let catch_start = self.here();
+        self.compile_catch_body(handler, push_at)?;
+
+        let after = self.here();
+        self.patch_jump(skip, after);
+        let _ = catch_start;
+        Ok(())
+    }
+
+    /// `try … finally { F }` (with or without a catch). The finally runs on every
+    /// exit path via a `PushFinally` handler + `EndFinally` epilogue.
+    fn try_with_finally(
+        &mut self,
+        t: &ox::TryStatement,
+        finalizer: &ox::BlockStatement,
+    ) -> R<()> {
+        // Two persistent registers carry the completion record (kind + value)
+        // from each exit path into the shared finally block. Allocated for the
+        // whole construct; reclaimed after `EndFinally`.
+        let kind_reg = self.alloc_reg();
+        let val_reg = self.alloc_reg();
+
+        let fin_push = self.here();
+        self.emit(Instr::PushFinally { target: 0, kind_reg, val_reg });
+
+        let has_catch = t.handler.is_some();
+        let catch_push = if has_catch {
+            let at = self.here();
+            self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
+            Some(at)
+        } else {
+            None
+        };
+
+        // Try body.
+        self.push_scope();
+        for s in &t.block.body {
+            self.stmt(s)?;
+        }
+        self.pop_scope();
+
+        // Normal-completion jumps (from the try body and, if present, the catch
+        // body) land at the finally entry below.
+        let mut normal_jumps: Vec<u32> = Vec::new();
+        if has_catch {
             self.emit(Instr::PopHandler);
-            let skip = self.here();
+        }
+        self.emit_leave_finally_normal(kind_reg);
+        normal_jumps.push(self.here());
+        self.emit(Instr::Jump { target: 0 });
+
+        // Catch body (entered by the unwind, which already popped the Catch
+        // handler; the Finally handler is still active for throws inside it).
+        if let (Some(catch_push), Some(handler)) = (catch_push, &t.handler) {
+            self.compile_catch_body(handler, catch_push)?;
+            self.emit_leave_finally_normal(kind_reg);
+            normal_jumps.push(self.here());
             self.emit(Instr::Jump { target: 0 });
+        }
 
-            // Catch block: the VM lands here with the thrown value already in
-            // the catch register. Reserve that register WITHOUT auto-boxing
-            // (the value is deposited by the unwind, not by a MakeCell), then
-            // box it explicitly if a nested function captures the binding — at
-            // which point the value is already present, so MakeCell wraps it.
-            let catch_start = self.here();
-            self.push_scope();
-            let (e_reg, e_name) = match &handler.param {
-                Some(p) => match &p.pattern {
-                    ox::BindingPattern::BindingIdentifier(id) => {
-                        (self.declare_local_no_box(id.name.as_str()), Some(id.name.to_string()))
-                    }
-                    _ => return Err("catch destructuring not in the zipp-vm subset yet".into()),
-                },
-                None => (self.declare_local_no_box("<catch.ignored>"), None),
-            };
-            if let Instr::PushHandler { catch_target, catch_reg } = &mut self.code[push_at as usize] {
-                *catch_target = catch_start;
-                *catch_reg = e_reg;
-            }
-            // If the catch binding is captured, box the now-present value.
-            if let Some(n) = &e_name {
-                if self.captured.contains(n) {
-                    self.emit(Instr::MakeCell { reg: e_reg });
-                    self.cell_regs.insert(e_reg);
+        // Finally entry.
+        let fin_start = self.here();
+        if let Instr::PushFinally { target, .. } = &mut self.code[fin_push as usize] {
+            *target = fin_start;
+        }
+        for j in normal_jumps {
+            self.patch_jump(j, fin_start);
+        }
+
+        // Finally body, then resume whatever completion brought us here.
+        self.push_scope();
+        for s in &finalizer.body {
+            self.stmt(s)?;
+        }
+        self.pop_scope();
+        self.emit(Instr::EndFinally { kind_reg, val_reg });
+
+        self.next_reg -= 2; // reclaim kind_reg / val_reg
+        Ok(())
+    }
+
+    /// Emit the normal-completion prologue to a finally: record kind 0 (normal)
+    /// and pop the still-active `Finally` handler (abnormal paths pop it via the
+    /// unwind / Return op instead).
+    fn emit_leave_finally_normal(&mut self, kind_reg: Reg) {
+        self.emit(Instr::LoadInt { dst: kind_reg, val: 0 });
+        self.emit(Instr::PopFinally);
+    }
+
+    /// Compile a `catch (e) { … }` body and patch its `PushHandler` (at `push_at`)
+    /// to land here with the thrown value in the catch register.
+    fn compile_catch_body(&mut self, handler: &ox::CatchClause, push_at: u32) -> R<()> {
+        // The VM deposits the thrown value into the catch register directly, so
+        // reserve it WITHOUT auto-boxing; box it after if a nested closure
+        // captures the binding (the value is present by then).
+        let catch_start = self.here();
+        self.push_scope();
+        let (e_reg, e_name) = match &handler.param {
+            Some(p) => match &p.pattern {
+                ox::BindingPattern::BindingIdentifier(id) => {
+                    (self.declare_local_no_box(id.name.as_str()), Some(id.name.to_string()))
                 }
-            }
-            for s in &handler.body.body {
-                self.stmt(s)?;
-            }
-            self.pop_scope();
-
-            let after = self.here();
-            self.patch_jump(skip, after);
+                _ => return Err("catch destructuring not in the zipp-vm subset yet".into()),
+            },
+            None => (self.declare_local_no_box("<catch.ignored>"), None),
+        };
+        if let Instr::PushHandler { catch_target, catch_reg } = &mut self.code[push_at as usize] {
+            *catch_target = catch_start;
+            *catch_reg = e_reg;
         }
-
-        // finally (normal-completion path only — see limitation note).
-        if let Some(finalizer) = &t.finalizer {
-            self.push_scope();
-            for s in &finalizer.body {
-                self.stmt(s)?;
+        if let Some(n) = &e_name {
+            if self.captured.contains(n) {
+                self.emit(Instr::MakeCell { reg: e_reg });
+                self.cell_regs.insert(e_reg);
             }
-            self.pop_scope();
         }
+        for s in &handler.body.body {
+            self.stmt(s)?;
+        }
+        self.pop_scope();
         Ok(())
     }
 
