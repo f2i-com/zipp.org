@@ -930,6 +930,35 @@ impl<'p> Vm<'p> {
                         self.object_assign(&[t, s])?; // mutates target in place
                         ip += 1;
                     }
+                    Instr::ObjectRest { dst, src, exclude_start, exclude_count } => {
+                        let s = self.get(base, src);
+                        let prog: &'p Program = self.program;
+                        let consts = &prog.functions[func_id as usize].string_constants;
+                        let excluded =
+                            &consts[exclude_start as usize..exclude_start as usize + exclude_count as usize];
+                        // Copy src's own keys except the destructured siblings.
+                        let pairs: Vec<(String, Value)> = if s.is_heap() {
+                            match self.heap.get(s.heap_index()) {
+                                HeapObj::Object(map) => map
+                                    .keys
+                                    .iter()
+                                    .cloned()
+                                    .zip(map.vals.iter().copied())
+                                    .filter(|(k, _)| !excluded.iter().any(|e| e == k))
+                                    .collect(),
+                                _ => Vec::new(),
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let mut m = ObjMap::new();
+                        for (k, v) in pairs {
+                            m.set(&k, v);
+                        }
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::MakeClass { dst, class_id, parent } => {
                         let cd = self.program.classes[class_id as usize].clone();
                         let parent_idx = parent.and_then(|p| {

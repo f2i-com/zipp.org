@@ -814,11 +814,11 @@ impl<'a> FnCompiler<'a> {
             }
             P::AssignmentPattern(ap) => self.declare_pattern(&ap.left),
             P::ObjectPattern(op) => {
-                if op.rest.is_some() {
-                    return Err("object rest in destructuring is not in the zipp-vm subset yet".into());
-                }
                 for prop in &op.properties {
                     self.declare_pattern(&prop.value)?;
+                }
+                if let Some(rest) = &op.rest {
+                    self.declare_pattern(&rest.argument)?;
                 }
                 Ok(())
             }
@@ -857,6 +857,24 @@ impl<'a> FnCompiler<'a> {
                     let val = self.alloc_reg();
                     self.extract_member(src, &prop.key, prop.computed, val)?;
                     self.extract_pattern(&prop.value, val)?;
+                    self.next_reg = save;
+                }
+                // `...rest` — a new object of `src`'s own keys minus the siblings.
+                if let Some(rest) = &op.rest {
+                    // Lay the excluded (sibling) names out contiguously so the op
+                    // can reference them by index range.
+                    let exclude_start = self.string_constants.len() as u32;
+                    let mut exclude_count = 0u16;
+                    for prop in &op.properties {
+                        let key = class_key_name(&prop.key)
+                            .map_err(|_| "object-rest with a computed sibling key is not in the subset")?;
+                        self.string_name(&key);
+                        exclude_count += 1;
+                    }
+                    let save = self.next_reg;
+                    let val = self.alloc_reg();
+                    self.emit(Instr::ObjectRest { dst: val, src, exclude_start, exclude_count });
+                    self.extract_pattern(&rest.argument, val)?;
                     self.next_reg = save;
                 }
                 Ok(())

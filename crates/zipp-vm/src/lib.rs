@@ -1025,6 +1025,10 @@ mod tests {
         assert_eq!(run_ok("let {p:[m,n]}={p:[7,8]}; console.log(m,n)"), vec!["7 8"]);
         // Computed key.
         assert_eq!(run_ok("let k='x'; let {[k]:v}={x:99}; console.log(v)"), vec!["99"]);
+        // Object rest: collects the remaining own keys into a new object.
+        assert_eq!(run_ok("let {a,...rest}={a:1,b:2,c:3}; console.log(a, JSON.stringify(rest))"), vec![r#"1 {"b":2,"c":3}"#]);
+        assert_eq!(run_ok("let {a:x,...rest}={a:1,b:2}; console.log(x, JSON.stringify(rest))"), vec![r#"1 {"b":2}"#]);
+        assert_eq!(run_ok("let f=({id,...opts})=>id+':'+JSON.stringify(opts); console.log(f({id:1,a:2,b:3}))"), vec![r#"1:{"a":2,"b":3}"#]);
         // Inside a function; a destructured local captured by a closure.
         assert_eq!(run_ok("function f(o){let {a,b}=o; return a+b} console.log(f({a:3,b:4}))"), vec!["7"]);
         assert_eq!(run_ok("function mk(){let [a,b]=[1,2]; return ()=>a+b} console.log(mk()())"), vec!["3"]);

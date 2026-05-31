@@ -97,6 +97,10 @@ pub enum Instr {
     /// Copy `src`'s own enumerable keys onto `target` (object literal `{...src}`).
     /// `src` may be an object, array, or string; null/undefined contribute none.
     ObjectSpread { target: Reg, src: Reg },
+    /// `dst = { ...src } minus the keys` — object rest in destructuring
+    /// (`let {a, ...rest} = src`). The excluded keys are `string_constants
+    /// [exclude_start .. exclude_start+exclude_count]` (the sibling properties).
+    ObjectRest { dst: Reg, src: Reg, exclude_start: u32, exclude_count: u16 },
     /// `dst = <the class value for classes[class_id]>` — materialize a class.
     /// `parent` is the register holding the superclass value (`extends P`), or
     /// `None`; the new class links to it for inherited lookup + instanceof.
