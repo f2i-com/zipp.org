@@ -199,6 +199,7 @@ impl Jit {
     /// `start`). `globals_base_helper` is the address of the win64 helper that
     /// returns `vm.globals.as_mut_ptr()` (the region pins it for direct global
     /// access). On failure the region is blacklisted and never retried.
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_region(
         &mut self,
         func_id: u32,
@@ -206,6 +207,8 @@ impl Jit {
         start: u32,
         end: u32,
         globals_base_helper: usize,
+        get_prop_helper: usize,
+        set_prop_helper: usize,
     ) {
         let key = (func_id, start);
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
@@ -220,7 +223,8 @@ impl Jit {
                 return;
             }
         }
-        match compile_region(proto, start, end, globals_base_helper) {
+        let helpers = HeapHelpers { func_id, get_prop: get_prop_helper, set_prop: set_prop_helper };
+        match compile_region(proto, start, end, globals_base_helper, helpers) {
             Some(code) => {
                 self.regions.insert(key, Region { code, start, end, deopts: 0, is_int: false });
             }
@@ -837,6 +841,11 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::JumpIfTrue { .. }
             | Instr::JumpIfNotLt { .. }
             | Instr::JumpIfNotLe { .. }
+            // Heap property ops — handled by the MEMORY path via win64 helper
+            // calls (the int/regalloc paths decline, so heap regions take the
+            // mem path). A `Print`/`Call`/etc. anywhere still rejects the region.
+            | Instr::GetProp { .. }
+            | Instr::SetProp { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
             Instr::LoadConst { idx, .. } => {
@@ -852,21 +861,32 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
     true
 }
 
+/// Addresses of the win64 heap-access helpers (vm.rs) and the COMPILING
+/// function's id, threaded to the memory path for `GetProp`/`SetProp` calls.
+#[derive(Clone, Copy)]
+struct HeapHelpers {
+    func_id: u32,
+    get_prop: usize,
+    set_prop: usize,
+}
+
 /// Compile the loop region `[start, end]` (entered at `start`). Tries the
 /// register-promoting path first (values live in xmm/gpr across the loop, no
 /// per-op memory traffic — competitive with V8) and falls back to the simpler
 /// memory-based path if the region's shape is outside the register allocator's
-/// subset. Returns `None` only if even the fallback can't handle it.
+/// subset (e.g. it contains heap property ops). Returns `None` only if even the
+/// fallback can't handle it.
 fn compile_region(
     proto: &FuncProto,
     start: u32,
     end: u32,
     globals_base_helper: usize,
+    heap: HeapHelpers,
 ) -> Option<JitFn> {
     if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper) {
         return Some(f);
     }
-    compile_region_mem(proto, start, end, globals_base_helper)
+    compile_region_mem(proto, start, end, globals_base_helper, heap)
 }
 
 /// Inferred type of a region value. The allocator places numbers in xmm
@@ -1882,6 +1902,7 @@ fn compile_region_mem(
     start: u32,
     end: u32,
     globals_base_helper: usize,
+    heap: HeapHelpers,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end) {
         return None;
@@ -2013,6 +2034,41 @@ fn compile_region_mem(
             Instr::JumpIfNotLe { a, b, target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
                 djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Le, t);
+            }
+            Instr::GetProp { dst, obj, name } => {
+                // dst = obj.<name> via the win64 helper. rbx/rsi/rdi/r12 are
+                // callee-saved (survive the call); the prologue's `sub rsp,40`
+                // keeps rsp 16-aligned with 32B shadow. On a non-fast-path
+                // (DEOPT) bail to the interpreter AT THIS ip so it re-executes.
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(obj)]         // obj_bits
+                    ; mov r8d, heap.func_id as i32       // func_id
+                    ; mov r9d, name as i32               // name_idx
+                    ; mov rax, QWORD heap.get_prop as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::SetProp { obj, name, val } => {
+                // obj.<name> = val. packed_ids = (func_id << 32) | name_idx.
+                let packed = ((heap.func_id as u64) << 32) | name as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(obj)]         // obj_bits
+                    ; mov r8, [rbx + dreg(val)]          // val_bits
+                    ; mov r9, QWORD packed as i64        // (func_id<<32)|name_idx
+                    ; mov rax, QWORD heap.set_prop as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 // Resume interpreting at this ip so the interpreter performs the

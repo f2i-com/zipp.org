@@ -230,6 +230,36 @@ mod tests {
     }
 
     #[test]
+    fn heap_region_object_prop_get_set() {
+        // GetProp/SetProp in a hot loop (the object.js shape): o.a=i; o.b=o.a+1;
+        // s+=o.b. sum of (i+1) for i in 0..999 = sum 1..1000 = 500500.
+        assert_jit_matches(
+            "let o={a:0,b:0}; let s=0; for(let i=0;i<1000;i++){ o.a=i; o.b=o.a+1; s+=o.b; } console.log(s)",
+            &["500500"],
+        );
+    }
+
+    #[test]
+    fn heap_region_object_read_only_and_mul() {
+        // Read a stable property each iteration + Mul (forces the double/mem path,
+        // not int64). o.k*3 summed: 3*7*2000 = 42000.
+        assert_jit_matches(
+            "let o={k:7}; let s=0; for(let i=0;i<2000;i++){ s += o.k*3; } console.log(s)",
+            &["42000"],
+        );
+    }
+
+    #[test]
+    fn heap_region_object_full_chain() {
+        // The exact object.js chain at smaller scale: o.a=i; o.b=o.a+1; o.c=o.b*2;
+        // s+=o.c. s = sum 2*(i+1) for i in 0..999 = 2*(1+..+1000) = 1001000.
+        assert_jit_matches(
+            "let o={a:0,b:0,c:0}; let s=0; for(let i=0;i<1000;i++){ o.a=i; o.b=o.a+1; o.c=o.b*2; s+=o.c; } console.log(s)",
+            &["1001000"],
+        );
+    }
+
+    #[test]
     fn large_whole_double_uses_shortest_roundtrip() {
         // JS Number→String prints the shortest decimal that round-trips, and a
         // whole double above i64::MAX must not overflow `as i64`.

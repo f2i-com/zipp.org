@@ -716,6 +716,8 @@ impl<'p> Vm<'p> {
                                     t as u32,
                                     ip as u32,
                                     jit_globals_base as usize,
+                                    jit_get_prop as usize,
+                                    jit_set_prop as usize,
                                 );
                                 if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                     ip = resume;
@@ -1872,74 +1874,76 @@ pub(crate) extern "win64" fn jit_self_call(
     }
 }
 
-/// Win64 helper: `obj.<string_constants[name_idx]>` for JIT'd code. `obj_bits`
-/// is the receiver Value; `name_idx` indexes the COMPILING function's
-/// string_constants (passed because the property key text lives there). Returns
-/// the property Value bits, or `SELF_CALL_DEOPT` to make the native code bail
-/// (non-object receiver, or a throw — e.g. property of null/undefined).
+/// Win64 helper for a JIT'd `GetProp`: `obj.<string_constants[name_idx]>`.
+/// `obj_bits` is the receiver Value; `name_idx` indexes the COMPILING function's
+/// (`func_id`) string_constants (the key text lives there).
 ///
-/// Scaffolding for the next milestone (heap-op OSR regions: GetProp/SetProp);
-/// not wired into codegen yet.
+/// FAST PATH ONLY: returns the property Value bits when `obj` is a plain heap
+/// Object (a missing key → `undefined`, matching the interpreter). For anything
+/// else (array/string/`.length`, null/undefined → throw) it returns
+/// `SELF_CALL_DEOPT`, and the native code bails to the interpreter AT THIS ip so
+/// the interpreter re-executes the op through the full (correct) path. No key
+/// clone and no `pending_throw` — the read borrows `vm` immutably only.
 ///
 /// # Safety
-/// `vm` is a valid `*mut Vm`.
+/// `vm` is a valid `*mut Vm` (treated as `&Vm`); `func_id`/`name_idx` are valid.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[allow(dead_code)]
 pub(crate) extern "win64" fn jit_get_prop(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
     func_id: u32,
     name_idx: u32,
 ) -> u64 {
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        let vm = &mut *(vm as *mut Vm);
-        let key = vm.program.functions[func_id as usize].string_constants[name_idx as usize].clone();
-        match vm.get_prop(Value::from_bits(obj_bits), &key) {
-            Ok(v) => v.bits(),
-            // A throw (e.g. prop of null): set pending_throw so the native bail
-            // unwinds correctly, and signal deopt.
-            Err(t) => {
-                let tv = vm.alloc_str(t.0);
-                vm.pending_throw = Some(tv);
-                crate::codegen::SELF_CALL_DEOPT
-            }
+    let obj = Value::from_bits(obj_bits);
+    if !obj.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: read-only view; the caller (a region) holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    match vm.heap.get(obj.heap_index()) {
+        HeapObj::Object(map) => {
+            // `program` is a `&'p Program` (Copy) independent of `vm`'s borrow.
+            let key = &vm.program.functions[func_id as usize].string_constants[name_idx as usize];
+            map.get(key).unwrap_or(Value::UNDEFINED).bits()
         }
-    }));
-    r.unwrap_or(crate::codegen::SELF_CALL_DEOPT)
+        _ => crate::codegen::SELF_CALL_DEOPT, // arrays/strings/.length → interpreter
+    }
 }
 
-/// Win64 helper: `obj.<string_constants[name_idx]> = val` for JIT'd code.
-/// Returns `0` on success or `SELF_CALL_DEOPT` to bail (non-object / throw).
-///
-/// Scaffolding for the next milestone (heap-op OSR regions); not wired in yet.
+/// Win64 helper for a JIT'd `SetProp`: `obj.<key> = val`. Returns `0` on success
+/// (plain Object receiver) or `SELF_CALL_DEOPT` to bail to the interpreter AT
+/// THIS ip (non-object receiver → the interpreter throws the TypeError).
+/// `packed_ids = (func_id << 32) | name_idx` (win64 passes only 4 register args).
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[allow(dead_code)]
 pub(crate) extern "win64" fn jit_set_prop(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
     val_bits: u64,
     packed_ids: u64,
 ) -> u64 {
-    // packed_ids = (func_id as u64) << 32 | name_idx; avoids a 5th arg (win64
-    // passes only 4 in registers).
+    let obj = Value::from_bits(obj_bits);
+    if !obj.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     let func_id = (packed_ids >> 32) as u32;
     let name_idx = packed_ids as u32;
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        let vm = &mut *(vm as *mut Vm);
-        let key = vm.program.functions[func_id as usize].string_constants[name_idx as usize].clone();
-        match vm.set_prop(Value::from_bits(obj_bits), &key, Value::from_bits(val_bits)) {
-            Ok(()) => 0u64,
-            Err(t) => {
-                let tv = vm.alloc_str(t.0);
-                vm.pending_throw = Some(tv);
-                crate::codegen::SELF_CALL_DEOPT
-            }
+    // SAFETY: exclusive view for the set; the region holds no conflicting borrow.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    // Copy the `&'p Program` reference out FIRST so the key borrow does not
+    // conflict with the mutable heap borrow below.
+    let prog = vm.program;
+    let idx = obj.heap_index();
+    match vm.heap.get_mut(idx) {
+        HeapObj::Object(map) => {
+            let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
+            map.set(key, Value::from_bits(val_bits));
+            0
         }
-    }));
-    r.unwrap_or(crate::codegen::SELF_CALL_DEOPT)
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
 }
 
 /// Win64 helper: the base pointer of `vm.globals`, fetched once by an OSR loop
