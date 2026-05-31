@@ -1972,9 +1972,13 @@ fn fmt_f64(n: f64) -> String {
     if n == 0.0 {
         return "0".into();
     }
-    // Integer-valued doubles print without a decimal point (JS semantics).
+    // Integer-valued doubles print without a decimal point (JS semantics). Use
+    // Rust's shortest-round-trip f64 Display (matches JS Number→String, which
+    // prints the shortest decimal that round-trips, e.g. 4660046610375530000 not
+    // ...496) — NOT `n as i64`, which prints excess digits the f64 can't
+    // distinguish and overflows for whole doubles above i64::MAX.
     if n.fract() == 0.0 && n.abs() < 1e21 {
-        return format!("{}", n as i64);
+        return format!("{n}");
     }
     let mut s = format!("{n}");
     if s.contains('e') {

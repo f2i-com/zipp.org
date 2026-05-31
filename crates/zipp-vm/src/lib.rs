@@ -177,10 +177,10 @@ mod tests {
     fn int_region_overflow_bail_powers_of_two() {
         // Doubling: s reaches 2^53 then the per-op 2^53 guard bails to the
         // interpreter; results stay exact (powers of two are representable in f64),
-        // so JIT-on must equal JIT-off. 2^60 = 1152921504606846976.
+        // so JIT-on must equal JIT-off. 2^60's shortest-round-trip form (== node).
         assert_jit_matches(
             "let s=1; for(let i=0;i<60;i++){ s=s+s; } console.log(s)",
-            &["1152921504606846976"],
+            &["1152921504606847000"],
         );
     }
 
@@ -213,6 +213,29 @@ mod tests {
             "let a=0; let b=1000000; for(let i=0;i<500000;i++){ a=a+2; b=b-1; } console.log(a, b)",
             &["1000000 500000"],
         );
+    }
+
+    #[test]
+    fn int_region_overflow_nonrepresentable_fibonacci() {
+        // Fibonacci grows past 2^53 into integers NOT exactly representable in f64
+        // (unlike powers of two), so the int path MUST bail at 2^53 and let the
+        // interpreter continue in rounded f64 — JIT-on must equal JIT-off, and
+        // both must equal node's value (4660046610375530000 = fib(91) as f64,
+        // shortest-round-trip). This is the case the verifier flagged: a value is
+        // written, overflows, and must still be flushed correctly.
+        assert_jit_matches(
+            "let a=0; let b=1; let t=0; for(let i=0;i<90;i++){ t=a+b; a=b; b=t; } console.log(b)",
+            &["4660046610375530000"],
+        );
+    }
+
+    #[test]
+    fn large_whole_double_uses_shortest_roundtrip() {
+        // JS Number→String prints the shortest decimal that round-trips, and a
+        // whole double above i64::MAX must not overflow `as i64`.
+        assert_eq!(run_ok("console.log(4660046610375530496)"), vec!["4660046610375530000"]);
+        assert_eq!(run_ok("console.log(1e20)"), vec!["100000000000000000000"]);
+        assert_eq!(run_ok("console.log(1e19)"), vec!["10000000000000000000"]);
     }
 
     #[test]
