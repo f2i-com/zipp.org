@@ -365,6 +365,7 @@ fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::Eq { dst, .. }
         | Instr::Ne { dst, .. }
         | Instr::LoadGlobal { dst, .. }
+        | Instr::GetProp { dst, .. }
         | Instr::Call { dst, .. } => Some(dst),
         _ => None,
     }
@@ -1179,6 +1180,8 @@ fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::JumpIfNotLt { a, b, .. }
         | Instr::JumpIfNotLe { a, b, .. } => vec![a, b],
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => vec![cond],
+        Instr::GetProp { obj, .. } => vec![obj],
+        Instr::SetProp { obj, val, .. } => vec![obj, val],
         Instr::Return { src } => vec![src],
         _ => vec![],
     }

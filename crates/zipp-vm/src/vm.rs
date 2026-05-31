@@ -1942,7 +1942,12 @@ pub(crate) extern "win64" fn jit_set_prop(
             map.set(key, Value::from_bits(val_bits));
             0
         }
-        _ => crate::codegen::SELF_CALL_DEOPT,
+        // A heap non-Object (Array/String/…) silently no-ops, EXACTLY matching the
+        // interpreter's set_prop (which only mutates `HeapObj::Object`). Returning
+        // 0 (success) here — rather than DEOPT — avoids needless region eviction
+        // for array-property writes. (null/undefined was already DEOPT'd above so
+        // the interpreter throws the TypeError.)
+        _ => 0,
     }
 }
 

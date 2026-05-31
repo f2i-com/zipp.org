@@ -250,6 +250,17 @@ mod tests {
     }
 
     #[test]
+    fn heap_region_setprop_on_array_noops() {
+        // Setting a property on an ARRAY is a silent no-op in this engine (only
+        // plain Objects store props) — the JIT must match the interpreter (return
+        // success, NOT deopt-churn). The loop stays JIT'd; s = sum 0..999 = 499500.
+        assert_jit_matches(
+            "let a=[]; let s=0; for(let i=0;i<1000;i++){ a.x=i; s+=i; } console.log(s)",
+            &["499500"],
+        );
+    }
+
+    #[test]
     fn heap_region_object_full_chain() {
         // The exact object.js chain at smaller scale: o.a=i; o.b=o.a+1; o.c=o.b*2;
         // s+=o.c. s = sum 2*(i+1) for i in 0..999 = 2*(1+..+1000) = 1001000.
