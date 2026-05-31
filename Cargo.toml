@@ -37,3 +37,8 @@ opt-level = 3
 # debug_assert, and selector-gated AIR constraints look like degree-0 polys on
 # traces that don't exercise every opcode. Release also makes proving fast.
 lto = false
+# Panics are internal bugs, never normal control flow (JS errors propagate as
+# `Result`/`Thrown`). Aborting lets the JIT's per-self-call `catch_unwind` at the
+# native↔Rust boundary compile to ~nothing (no landing pads on the hot recursive
+# path), which speeds up deep recursion.
+panic = "abort"
