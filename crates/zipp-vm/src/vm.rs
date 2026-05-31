@@ -1513,9 +1513,8 @@ impl<'p> Vm<'p> {
                 let cmp = arg0;
                 let mut snapshot = self.array_snapshot(idx);
                 if cmp.is_heap() && self.heap.as_callable(cmp.heap_index()).is_some() {
-                    // Comparator sort. insertion sort keeps it simple and stable
-                    // and re-enters the VM for each comparison; fine for the
-                    // corpus sizes. A faster merge sort is a later optimisation.
+                    // Comparator sort: stable O(n log n) bottom-up merge sort,
+                    // re-entering the VM for each comparison.
                     self.comparator_sort(&mut snapshot, cmp)?;
                 } else {
                     // Default sort: by string coercion (JS spec default).
@@ -1530,20 +1529,55 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Insertion sort driven by a JS comparator (`cmp(a,b) < 0` ⇒ a before b).
+    /// Stable bottom-up merge sort driven by a JS comparator (`cmp(a,b) < 0` ⇒
+    /// `a` before `b`). O(n log n) comparisons — vs the old insertion sort's
+    /// O(n²), which dominated `Array.sort` for non-trivial sizes. Stable: on a tie
+    /// (and on `<= 0`) the LEFT run's element wins, preserving original order. The
+    /// comparator re-enters the VM (`call_value`) and may throw (propagated).
     fn comparator_sort(&mut self, items: &mut [Value], cmp: Value) -> Result<(), Thrown> {
-        for i in 1..items.len() {
-            let mut j = i;
-            while j > 0 {
-                let r = self.call_value(cmp, Value::UNDEFINED, &[items[j - 1], items[j]])?;
-                if r.as_f64() > 0.0 {
-                    items.swap(j - 1, j);
-                    j -= 1;
-                } else {
-                    break;
-                }
-            }
+        let n = items.len();
+        if n < 2 {
+            return Ok(());
         }
+        // Ping-pong between two local buffers (not self.regs/heap, so a comparator
+        // that re-enters the VM and allocates can't invalidate them).
+        let mut a: Vec<Value> = items.to_vec();
+        let mut b: Vec<Value> = vec![Value::UNDEFINED; n];
+        let mut width = 1;
+        while width < n {
+            let mut lo = 0;
+            while lo < n {
+                let mid = (lo + width).min(n);
+                let hi = (lo + 2 * width).min(n);
+                // Merge a[lo..mid] and a[mid..hi] into b[lo..hi], stably.
+                let (mut l, mut r, mut k) = (lo, mid, lo);
+                while l < mid && r < hi {
+                    let c = self.call_value(cmp, Value::UNDEFINED, &[a[l], a[r]])?;
+                    if c.as_f64() <= 0.0 {
+                        b[k] = a[l];
+                        l += 1;
+                    } else {
+                        b[k] = a[r];
+                        r += 1;
+                    }
+                    k += 1;
+                }
+                while l < mid {
+                    b[k] = a[l];
+                    l += 1;
+                    k += 1;
+                }
+                while r < hi {
+                    b[k] = a[r];
+                    r += 1;
+                    k += 1;
+                }
+                lo += 2 * width;
+            }
+            std::mem::swap(&mut a, &mut b);
+            width *= 2;
+        }
+        items.copy_from_slice(&a);
         Ok(())
     }
 
