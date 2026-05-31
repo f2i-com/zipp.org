@@ -175,6 +175,14 @@ pub struct Jit {
     /// native run), so a base pointer fetched in a region prologue stays valid
     /// for that run; a `*_miss` helper only UPDATES an existing entry (no growth).
     ic_table: Vec<IcEntry>,
+    /// One-entry cache of the most recent self-call target `(func_id, native
+    /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
+    /// SAME `func_id`, so this hits on every call and skips the `compiled`
+    /// HashMap lookup that otherwise runs ~30M times for `fib(35)`. The cached
+    /// entry pointer stays valid even if `compiled` rehashes: it points into the
+    /// function's mmap'd `ExecutableBuffer`, which never moves, and a function's
+    /// entry is immutable once compiled.
+    self_cache: Option<(u32, *const u8)>,
 }
 
 impl Jit {
@@ -185,6 +193,21 @@ impl Jit {
     /// Look up compiled native code for `func_id`, if any.
     pub fn get(&self, func_id: u32) -> Option<&JitFn> {
         self.compiled.get(&func_id)
+    }
+
+    /// Native entry pointer for a SELF-CALL target, via a one-entry cache that
+    /// the hot recursive path hits every time (skipping the `compiled` HashMap
+    /// lookup). See `self_cache`. Returns `None` if `func_id` isn't compiled.
+    #[inline]
+    pub fn self_call_entry(&mut self, func_id: u32) -> Option<*const u8> {
+        if let Some((id, entry)) = self.self_cache {
+            if id == func_id {
+                return Some(entry);
+            }
+        }
+        let entry = self.compiled.get(&func_id)?.entry();
+        self.self_cache = Some((func_id, entry));
+        Some(entry)
     }
 
     /// Record an interpreter entry into `func_id`. Returns `true` once it

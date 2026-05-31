@@ -116,6 +116,15 @@ pub struct Vm<'p> {
     /// it). Exceeding it throws RangeError — a tighter bound than MAX_FRAMES.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     reg_capacity: usize,
+    /// High-water mark: the largest `regs.len()` ever reached (and thus
+    /// initialized). A native self-call window at or below this can be exposed
+    /// with `set_len` instead of a zero-filling `resize` — its slots already hold
+    /// valid `Value` bits (stale, but the compiled code defs-before-use). This
+    /// avoids re-zeroing the callee window on every recursive call once the
+    /// recursion has reached its deepest native level. Backing buffer is pinned
+    /// (`reserve_jit_regs`) so initialized slots stay valid for the VM's life.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    regs_hw: usize,
 }
 
 /// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
@@ -156,6 +165,8 @@ impl<'p> Vm<'p> {
             jit_recurse_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            regs_hw: 0,
         }
     }
 
@@ -197,8 +208,10 @@ impl<'p> Vm<'p> {
         if self.jit_recurse_depth >= JIT_SELF_RECURSE_MAX {
             return crate::codegen::SELF_CALL_DEOPT;
         }
-        let jitfn = match self.jit.get(func_id) {
-            Some(f) => f as *const crate::codegen::JitFn,
+        // Native entry via the one-entry self-call cache (skips the HashMap
+        // lookup on the hot recursive path — it always targets the same func_id).
+        let entry = match self.jit.self_call_entry(func_id) {
+            Some(e) => e,
             None => return crate::codegen::SELF_CALL_DEOPT,
         };
         let proto = &self.program.functions[func_id as usize];
@@ -207,12 +220,28 @@ impl<'p> Vm<'p> {
 
         // Fresh window appended to regs. Reserved capacity guarantees no realloc.
         let new_base = self.regs.len();
-        if new_base + reg_count > self.regs.capacity() {
+        let needed = new_base + reg_count;
+        if needed > self.regs.capacity() {
             // Out of reserved headroom — deopt rather than risk a realloc that
             // would invalidate the caller's live `rbx`.
             return crate::codegen::SELF_CALL_DEOPT;
         }
-        self.regs.resize(new_base + reg_count, Value::UNDEFINED);
+        if needed > self.regs_hw {
+            // New ground: zero-fill the freshly exposed slots and advance the mark.
+            self.regs.resize(needed, Value::UNDEFINED);
+            self.regs_hw = needed;
+        } else {
+            // Window lies within already-initialized memory (a previous recursion
+            // reached at least this deep). Slots hold valid Value bits (stale, but
+            // the compiled code writes before it reads), so skip the zero-fill —
+            // this is the hot path for all but the deepest recursive call.
+            // SAFETY: needed ≤ regs_hw ≤ a prior len ≤ capacity; [0..regs_hw] was
+            // initialized by an earlier resize and the buffer is pinned, so these
+            // slots are live, valid `Value`s.
+            unsafe {
+                self.regs.set_len(needed);
+            }
+        }
         // reg 0 = `this` (undefined for a plain self-call); params at 1..
         self.regs[new_base] = Value::UNDEFINED;
         let n = argc.min(params);
@@ -225,7 +254,16 @@ impl<'p> Vm<'p> {
         self.jit_recurse_depth += 1;
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(new_base) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
-        let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
+        // Call the cached native entry directly (same win64 ABI as JitFn::run).
+        // SAFETY: `entry` is this function's compiled win64 code (stable across
+        // HashMap rehashes); the window has `reg_count` valid slots; vm is valid.
+        let (bits, bail) = unsafe {
+            let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+                core::mem::transmute(entry);
+            let mut bail: u32 = crate::codegen::NO_BAIL;
+            let r = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+            (r, bail)
+        };
 
         let result_bits = if bail == crate::codegen::NO_BAIL {
             bits
