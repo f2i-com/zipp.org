@@ -1417,6 +1417,20 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
         let idx = obj.heap_index();
+        // `arr.length = n` truncates (n < len) or extends-with-holes (n > len) a
+        // dense array — a very common idiom (`arr.length = 0` clears it). Per JS,
+        // n must be a non-negative integer < 2^32, else a RangeError.
+        if key == "length" && matches!(self.heap.get(idx), HeapObj::Array(_)) {
+            let n = self.to_number(val)?;
+            if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
+                return Err(Thrown("RangeError: Invalid array length".into()));
+            }
+            if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                items.resize(n as usize, Value::UNDEFINED);
+            }
+            self.heap.bump_version(idx);
+            return Ok(());
+        }
         let mut added = false;
         if let HeapObj::Object(map) = self.heap.get_mut(idx) {
             added = map.set(key, val);
@@ -2366,7 +2380,10 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             let s = map.keys.iter().position(|k| k == key).unwrap() as u32;
             (added, map.vals.as_ptr() as u64, s)
         }
-        _ => return 0, // heap non-Object: silent no-op (matches interpreter)
+        // `arr.length = n` truncates/grows — deopt so the interpreter's set_prop
+        // applies it (no-op here would diverge from the interpreter).
+        HeapObj::Array(_) if key == "length" => return crate::codegen::SELF_CALL_DEOPT,
+        _ => return 0, // other heap non-Object props: silent no-op (matches interpreter)
     };
     if added {
         vm.heap.bump_version(idx);

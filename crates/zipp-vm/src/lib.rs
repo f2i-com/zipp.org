@@ -853,6 +853,28 @@ mod tests {
     }
 
     #[test]
+    fn array_length_assignment_in_region() {
+        // `a.length = n` truncates a dense array; in a hot loop the result must
+        // agree JIT-on == JIT-off == JS. Requires SROA to NOT scalar-promote the
+        // special `length` property, and the write to deopt to the truncating
+        // interpreter path rather than silently no-op.
+        assert_jit_matches(
+            "let a=[1,2,3,4,5]; let s=0; for(let i=0;i<20000;i++){ a.length=2; s+=a.length; } console.log(s)",
+            &["40000"],
+        );
+    }
+
+    #[test]
+    fn array_length_clear_grow_invalid() {
+        // arr.length = 0 clears (a very common idiom); larger extends with holes;
+        // a non-integer / negative length throws RangeError.
+        assert_eq!(run_ok("let a=[1,2,3]; a.length=0; console.log(a.length, a[0])"), vec!["0 undefined"]);
+        assert_eq!(run_ok("let a=[1,2]; a.length=4; console.log(a.length, a[3], a[1])"), vec!["4 undefined 2"]);
+        let out = run("let a=[1,2,3]; a.length=-1;").expect("compile");
+        assert!(out.error.as_deref().unwrap_or("").contains("Invalid array length"));
+    }
+
+    #[test]
     fn array_double_and_oob_index() {
         // Integral double keys coerce (a[1.0]==a[1]); negative / fractional /
         // out-of-range keys are undefined — matching JS and the JIT helper.

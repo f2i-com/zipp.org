@@ -1643,6 +1643,14 @@ fn plan_field_promotion(proto: &FuncProto, start: u32, end: u32) -> Option<Field
         // index would give them separate pool slots (the read wouldn't see the
         // write). Keep one representative index per distinct field string.
         let fname = &proto.string_constants[name as usize];
+        // `length` is a SPECIAL property (an array's element count / a string's
+        // length), not a plain stored slot. Scalar-replacing it diverges from the
+        // interpreter — e.g. `arr.length = n` truncates the array, but a promoted
+        // scalar would just track a dead pool slot. Decline; the inline-cache /
+        // helper path handles `.length` correctly (read) and deopts the write.
+        if fname == "length" {
+            return None;
+        }
         if !fields
             .iter()
             .any(|&n| proto.string_constants[n as usize] == *fname)
