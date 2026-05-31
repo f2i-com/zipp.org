@@ -250,6 +250,37 @@ mod tests {
     }
 
     #[test]
+    fn int_region_multiply() {
+        // i*i in the int64 path (imul). sum_{i<10000} i^2 = (n-1)n(2n-1)/6, n=10000.
+        assert_jit_matches(
+            "let s=0; for(let i=0;i<10000;i++){ s += i*i; } console.log(s)",
+            &["333283335000"],
+        );
+    }
+
+    #[test]
+    fn int_region_multiply_overflow_bails() {
+        // Repeated doubling via multiply crosses 2^53 → the per-op guard bails to
+        // the interpreter; powers of two stay exact, so JIT-on == JIT-off == node.
+        // 2^60 = 1152921504606847000 (shortest round-trip).
+        assert_jit_matches(
+            "let p=1; for(let i=0;i<60;i++){ p=p*2; } console.log(p)",
+            &["1152921504606847000"],
+        );
+    }
+
+    #[test]
+    fn object_sroa_full_chain_int_mul() {
+        // The object.js chain — exercises object scalar-replacement + int64 Mul
+        // (o.c = o.b*2). s = sum 2*(i+1) for i in 0..999 = 1001000. (Also covered by
+        // heap_region_object_full_chain, but at the scale that triggers SROA.)
+        assert_jit_matches(
+            "let o={a:0,b:0,c:0}; let s=0; for(let i=0;i<5000;i++){ o.a=i; o.b=o.a+1; o.c=o.b*2; s+=o.c; } console.log(s)",
+            &["25005000"],
+        );
+    }
+
+    #[test]
     fn regalloc_linear_scan_reuse_many_values() {
         // A loop with far more numeric values (~33) than the 14-home pool, forcing
         // linear-scan home REUSE. Hoisted constants (1..16) must keep permanent

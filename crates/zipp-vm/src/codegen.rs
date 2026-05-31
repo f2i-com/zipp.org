@@ -121,6 +121,22 @@ pub struct Region {
     /// True if compiled by the integer path. On eviction an int region falls
     /// back to the double path (rather than full-blacklisting the loop).
     is_int: bool,
+    /// Set when this region was object-scalar-replaced (SROA): its GetProp/SetProp
+    /// were rewritten to scratch field-globals. The interpreter must sync the
+    /// object's fields ↔ the pool slots around each native run.
+    field_plan: Option<FieldSyncPlan>,
+}
+
+/// How the interpreter syncs a scalar-replaced object around a native region run:
+/// for each accessed field, the pool global slot holding it during the run.
+#[derive(Clone)]
+pub struct FieldSyncPlan {
+    /// The global slot holding the promoted object.
+    pub obj_global: u32,
+    /// `(field name-constant index, pool global slot)` for each accessed field.
+    pub fields: Vec<(u32, u32)>,
+    /// The function id whose `string_constants` the name indices belong to.
+    pub func_id: u32,
 }
 
 /// One monomorphic inline-cache slot for a JIT'd `GetProp`/`SetProp` site.
@@ -240,17 +256,55 @@ impl Jit {
         end: u32,
         globals_base_helper: usize,
         heap_helpers: HeapHelperAddrs,
+        field_pool_base: u32,
+        field_pool_size: u32,
     ) {
         let key = (func_id, start);
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
             return;
         }
+
+        // ── object scalar-replacement (SROA) ── if the region's heap ops all
+        // target one non-escaping global object, rewrite them to scratch
+        // field-globals and compile the (now purely numeric) region — the loop
+        // becomes register-only, like V8. Tried FIRST (beats the IC mem path).
+        if !self.region_int_blacklist.contains(&key) {
+            if let Some(fp) = plan_field_promotion(proto, start, end) {
+                if (fp.fields.len() as u32) <= field_pool_size {
+                    let sync_fields: Vec<(u32, u32)> = fp
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &name)| (name, field_pool_base + i as u32))
+                        .collect();
+                    let rewritten = rewrite_for_field_promotion(proto, start, end, &fp, field_pool_base);
+                    let compiled = compile_region_numeric(&rewritten, start, end, globals_base_helper);
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!(
+                            "[jit] SROA region fn{func_id} [{start},{end}] fields={} -> {}",
+                            fp.fields.len(),
+                            if compiled.is_some() { "compiled" } else { "DECLINED (numeric path)" }
+                        );
+                    }
+                    if let Some((code, is_int)) = compiled {
+                        let plan = FieldSyncPlan { obj_global: fp.obj_global, fields: sync_fields, func_id };
+                        self.regions.insert(
+                            key,
+                            Region { code, start, end, deopts: 0, is_int, field_plan: Some(plan) },
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
         // Prefer the integer path (i64/paddq — beats the double path on integer
         // loops) unless it already deoptimised for this loop. Fall back to the
         // double/memory path.
         if !self.region_int_blacklist.contains(&key) {
             if let Some(code) = compile_region_int(proto, start, end, globals_base_helper) {
-                self.regions.insert(key, Region { code, start, end, deopts: 0, is_int: true });
+                self.regions
+                    .insert(key, Region { code, start, end, deopts: 0, is_int: true, field_plan: None });
                 return;
             }
         }
@@ -271,7 +325,8 @@ impl Jit {
         };
         match compile_region(proto, start, end, globals_base_helper, helpers) {
             Some(code) => {
-                self.regions.insert(key, Region { code, start, end, deopts: 0, is_int: false });
+                self.regions
+                    .insert(key, Region { code, start, end, deopts: 0, is_int: false, field_plan: None });
             }
             None => {
                 self.region_blacklist.insert(key);
@@ -285,10 +340,13 @@ impl Jit {
     /// failing). Returns whether the region remains installed.
     pub fn note_region_resume(&mut self, func_id: u32, entry_ip: u32, resume_ip: u32) {
         let key = (func_id, entry_ip);
-        let (evict, was_int) = if let Some(r) = self.regions.get_mut(&key) {
+        let (evict, retry) = if let Some(r) = self.regions.get_mut(&key) {
             if resume_ip >= r.start && resume_ip <= r.end {
                 r.deopts += 1;
-                (r.deopts >= OSR_DEOPT_LIMIT, r.is_int)
+                // Retry on a SIMPLER path if this was an int region (value grew
+                // past 2^53 → double handles it) or a SROA region (a field turned
+                // non-numeric → the inline-cache mem path handles any type).
+                (r.deopts >= OSR_DEOPT_LIMIT, r.is_int || r.field_plan.is_some())
             } else {
                 (false, false)
             }
@@ -297,11 +355,10 @@ impl Jit {
         };
         if evict {
             self.regions.remove(&key);
-            if was_int {
-                // An int region that keeps bailing (e.g. a value grew past 2^53):
-                // don't blacklist the loop — let it recompile on the double path,
-                // which handles large/fractional values without bailing. Reset
-                // the back-edge counter so the next iterations re-trigger compile.
+            if retry {
+                // Don't blacklist the loop — let it recompile on a more general
+                // path (region_int_blacklist also gates the SROA + int attempts).
+                // Reset the back-edge counter so iterations re-trigger compile.
                 self.region_int_blacklist.insert(key);
                 self.region_counts.remove(&key);
             } else {
@@ -343,6 +400,12 @@ impl Region {
     pub unsafe fn run(&self, regs: *mut u64, vm: *mut core::ffi::c_void) -> u32 {
         let (_result, resume) = self.code.run(regs, vm);
         resume
+    }
+
+    /// The object scalar-replacement sync plan, if this region was field-promoted.
+    /// The interpreter syncs the object's fields ↔ the pool globals around `run`.
+    pub fn field_plan(&self) -> Option<&FieldSyncPlan> {
+        self.field_plan.as_ref()
     }
 }
 
@@ -966,6 +1029,64 @@ fn compile_region(
     compile_region_mem(proto, start, end, globals_base_helper, heap)
 }
 
+/// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
+/// double register path; returns `(code, is_int)`. Deliberately NOT the memory
+/// path — the rewrite removed all heap ops, so if the register paths decline
+/// (e.g. register pressure even with reuse), SROA is abandoned and the caller
+/// falls back to the inline-cache mem path on the ORIGINAL bytecode.
+fn compile_region_numeric(proto: &FuncProto, start: u32, end: u32, gh: usize) -> Option<(JitFn, bool)> {
+    if let Some(f) = compile_region_int(proto, start, end, gh) {
+        return Some((f, true));
+    }
+    compile_region_regalloc(proto, start, end, gh).map(|f| (f, false))
+}
+
+/// Clone `proto` and rewrite the region's heap ops to scratch field-globals so
+/// the register paths can compile it: `GetProp(o.name) → LoadGlobal(dst, slot)`,
+/// `SetProp(o.name, val) → StoreGlobal(slot, val)`, where `slot = pool_base + i`
+/// and `i` is the field's index in `fp.fields`. The interpreter syncs each pool
+/// slot ↔ the object's field around the native run (see `FieldSyncPlan`).
+fn rewrite_for_field_promotion(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    fp: &FieldPromotePlan,
+    pool_base: u32,
+) -> FuncProto {
+    let mut p = proto.clone();
+    // Map a name-constant index to its pool slot BY FIELD STRING (fp.fields holds
+    // one representative index per distinct field string).
+    let slot_of = |name: u32| -> u32 {
+        let s = &proto.string_constants[name as usize];
+        let i = fp
+            .fields
+            .iter()
+            .position(|&n| proto.string_constants[n as usize] == *s)
+            .unwrap();
+        pool_base + i as u32
+    };
+    for ip in start as usize..=end as usize {
+        match p.code[ip] {
+            Instr::GetProp { dst, name, .. } => {
+                p.code[ip] = Instr::LoadGlobal { dst, idx: slot_of(name) };
+            }
+            Instr::SetProp { name, val, .. } => {
+                p.code[ip] = Instr::StoreGlobal { idx: slot_of(name), src: val };
+            }
+            // The object-ref loads (`LoadGlobal o → r`) are now DEAD — their only
+            // consumers (the heap ops above) no longer use `r`. Neutralise them to
+            // `LoadInt 0` so the numeric path doesn't try to promote the object
+            // global itself (a heap ref would fail its is-number entry guard, and
+            // the whole region would bail). `r` stays dead/unread.
+            Instr::LoadGlobal { dst, idx } if idx == fp.obj_global => {
+                p.code[ip] = Instr::LoadInt { dst, val: 0 };
+            }
+            _ => {}
+        }
+    }
+    p
+}
+
 /// Inferred type of a region value. The allocator places numbers in xmm
 /// registers and booleans (compare results) in gprs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1208,10 +1329,20 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
             }
         }
     }
+    // Registers that are actually USED as an operand somewhere in the region.
+    // A defined-but-unused reg is DEAD (e.g. an object-ref load neutralised to
+    // `LoadInt 0` by the field-promotion rewrite) — it must NOT be hoisted, or it
+    // would consume a permanent xmm home for a value that's never read.
+    let mut used: FxHashSet<u16> = FxHashSet::default();
+    for instr in &code[s..=e] {
+        for u in instr_uses(instr) {
+            used.insert(u);
+        }
+    }
     let mut hoist_ips: Vec<usize> = Vec::new();
     let mut hoisted: FxHashSet<u16> = FxHashSet::default();
     for (&r, &ip) in &const_def_ip {
-        if def_count.get(&r) == Some(&1) && first_seen.get(&r) == Some(&true) {
+        if def_count.get(&r) == Some(&1) && first_seen.get(&r) == Some(&true) && used.contains(&r) {
             hoist_ips.push(ip);
             hoisted.insert(r);
         }
@@ -1448,7 +1579,16 @@ fn plan_field_promotion(proto: &FuncProto, start: u32, end: u32) -> Option<Field
             Some(_) => return None, // two different objects at the site set
         }
         obj_ref_regs.insert(obj_reg);
-        if !fields.contains(&name) {
+        // Dedup by the field STRING, not the name-constant INDEX: the compiler
+        // emits a distinct string-constant per occurrence, so `o.a` read and
+        // `o.a` write have DIFFERENT name indices for the SAME field. Keying by
+        // index would give them separate pool slots (the read wouldn't see the
+        // write). Keep one representative index per distinct field string.
+        let fname = &proto.string_constants[name as usize];
+        if !fields
+            .iter()
+            .any(|&n| proto.string_constants[n as usize] == *fname)
+        {
             fields.push(name);
         }
     }
@@ -1705,6 +1845,7 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::StoreGlobal { .. }
             | Instr::Add { .. }
             | Instr::Sub { .. }
+            | Instr::Mul { .. }
             | Instr::AddInt { .. }
             | Instr::Neg { .. }
             | Instr::Lt { .. }
@@ -1727,7 +1868,7 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
                     _ => return false,
                 }
             }
-            _ => return false, // Mul / Div / Mod / anything else
+            _ => return false, // Div / Mod / anything else
         }
     }
     true
@@ -1840,6 +1981,29 @@ fn compile_region_int(
             }
             Instr::Add { dst, a, b } => emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, true),
             Instr::Sub { dst, a, b } => emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, false),
+            Instr::Mul { dst, a, b } => {
+                // i64 multiply via imul (gpr). On i64 OVERFLOW (product ≥ 2^63)
+                // the result wrapped → bail at THIS ip WITHOUT storing dst, so the
+                // interpreter redoes it in f64 (reading the flushed operands). On a
+                // representable-but-large product the 2^53 guard handles it (like
+                // add): flush via cvtsi2sd (== JS's rounded product) + resume ip+1.
+                let (d, ax, bx) = (xh(&plan, dst), xh(&plan, a), xh(&plan, b));
+                let ovf = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; movq rax, Rx(ax)
+                    ; movq rcx, Rx(bx)
+                    ; imul rax, rcx
+                    ; jo => ovf            // i64 overflow → can't represent; redo in interp
+                    ; movq Rx(d), rax
+                    ; jmp => done
+                    ; => ovf
+                    ; mov DWORD [rsi], ip as i32 // resume at THIS op (dst not written)
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                emit_i53_guard(&mut ops, d, ip, flush_exit);
+            }
             Instr::AddInt { dst, a, imm } => {
                 let d = xh(&plan, dst);
                 let ax = xh(&plan, a);

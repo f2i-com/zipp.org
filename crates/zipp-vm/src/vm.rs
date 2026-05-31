@@ -28,6 +28,12 @@ use crate::value::Value;
 /// and the flat register file makes each frame cheap.
 const MAX_FRAMES: usize = 100_000;
 
+/// Extra global slots reserved past `global_count` as JIT scratch "field globals"
+/// for object scalar-replacement (SROA). A field-promoted region uses pool slots
+/// `[global_count, global_count + n_fields)`; regions reuse the pool (synced per
+/// native run, never concurrent), so this caps fields-per-region, not total.
+const FIELD_POOL: usize = 64;
+
 /// Sentinel `closure` value for a frame whose callee is a plain (capture-free)
 /// function rather than a closure. Real heap indices are always `< u32::MAX`.
 const NO_CLOSURE: u32 = u32::MAX;
@@ -115,7 +121,13 @@ impl<'p> Vm<'p> {
         // string-constant slots to carry their heap index as an Int payload
         // marker is avoided — instead the compiler emits heap Values directly
         // (see `intern_strings`).
-        let globals = vec![Value::UNDEFINED; program.global_count as usize];
+        // `global_count` real slots, plus a fixed POOL of extra slots the JIT uses
+        // as scratch "field globals" for object scalar-replacement (SROA): a
+        // field-promoted region's GetProp/SetProp are rewritten to Load/StoreGlobal
+        // on pool slots, and the interpreter syncs object.field ↔ pool slot around
+        // the native run. Sized once here so the globals Vec never reallocates at
+        // runtime (the JIT pins its base pointer).
+        let globals = vec![Value::UNDEFINED; program.global_count as usize + FIELD_POOL];
         let _ = &mut heap;
         Vm {
             program,
@@ -722,6 +734,8 @@ impl<'p> Vm<'p> {
                                         versions_base: jit_heap_versions_base as usize,
                                         ic_base: jit_ic_base as usize,
                                     },
+                                    self.program.global_count, // field-global pool base
+                                    FIELD_POOL as u32,
                                 );
                                 if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                     ip = resume;
@@ -1030,11 +1044,42 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn try_run_osr(&mut self, func_id: u32, entry_ip: u32, base: usize) -> Option<usize> {
         let region = self.jit.get_region(func_id, entry_ip)? as *const crate::codegen::Region;
+        // Object scalar-replacement (SROA): clone the sync plan so no region
+        // borrow is held while the sync mutates globals/heap below.
+        let field_plan = unsafe { (*region).field_plan().cloned() };
+
+        // ── pre-run sync ── load the promoted object's fields into the scratch
+        // pool globals the native code reads as ordinary globals.
+        if let Some(ref p) = field_plan {
+            let obj = self.globals[p.obj_global as usize];
+            for &(name_idx, slot) in &p.fields {
+                let key = self.program.functions[p.func_id as usize].string_constants
+                    [name_idx as usize]
+                    .clone();
+                let v = self.get_prop(obj, &key).unwrap_or(Value::UNDEFINED);
+                self.globals[slot as usize] = v;
+            }
+        }
+
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `region` is stable for the call (we don't mutate self.jit until
-        // after); regs/globals do not move during a numeric region run.
+        // after); regs/globals do not move during a region run.
         let resume = unsafe { (*region).run(regs_ptr, vm_ptr) };
+
+        // ── post-run sync ── flush the pool globals back to the object's fields,
+        // so the interpreter (which resumes on the ORIGINAL bytecode, reading the
+        // object) sees consistent values. Runs on EVERY exit (clean or bail).
+        if let Some(ref p) = field_plan {
+            let obj = self.globals[p.obj_global as usize];
+            for &(name_idx, slot) in &p.fields {
+                let key = self.program.functions[p.func_id as usize].string_constants
+                    [name_idx as usize]
+                    .clone();
+                let v = self.globals[slot as usize];
+                let _ = self.set_prop(obj, &key, v);
+            }
+        }
         // Bookkeeping: a resume INSIDE the region is a deopt; evict if chronic.
         self.jit.note_region_resume(func_id, entry_ip, resume);
         Some(resume as usize)
