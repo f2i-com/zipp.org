@@ -433,12 +433,26 @@ impl<'a> FnCompiler<'a> {
         self.constants.push(v);
         i
     }
+    /// Intern a string LITERAL and return its CONSTANT-POOL index (for
+    /// `LoadConst`). The VM interns the pending-string Value on first load.
     fn add_string_const(&mut self, s: &str) -> u32 {
         let si = self.string_constants.len() as u32;
         self.string_constants.push(s.to_string());
         // Encode as a "pending string" heap Value the VM interns on first load.
         let v = Value::heap(STRING_CONST_BIT | si);
         self.add_const(v)
+    }
+
+    /// Intern a property/method NAME and return its `string_constants` INDEX —
+    /// which is what `GetProp`/`SetProp`/`CallMethod` use to look the name up at
+    /// runtime. This must NOT be `add_string_const`'s value: that returns the
+    /// constant-POOL index, which diverges from the string_constants index as
+    /// soon as any non-string constant is added (e.g. a numeric literal), making
+    /// `string_constants[name]` go out of bounds (e.g. `(3.5).toFixed(2)`).
+    fn string_name(&mut self, s: &str) -> u32 {
+        let si = self.string_constants.len() as u32;
+        self.string_constants.push(s.to_string());
+        si
     }
 
     // ── statements ──
@@ -1031,8 +1045,29 @@ impl<'a> FnCompiler<'a> {
             E::ArrayExpression(a) => self.array_literal(a, dst),
             E::ObjectExpression(o) => self.object_literal(o, dst),
             E::StaticMemberExpression(m) => {
+                // Math constants (Math.PI, Math.E, …) — Math has no real global
+                // object, so recognise the member-access shape.
+                if let ox::Expression::Identifier(o) = &m.object {
+                    if o.name == "Math" {
+                        let c = match m.property.name.as_str() {
+                            "PI" => Some(std::f64::consts::PI),
+                            "E" => Some(std::f64::consts::E),
+                            "LN2" => Some(std::f64::consts::LN_2),
+                            "LN10" => Some(std::f64::consts::LN_10),
+                            "LOG2E" => Some(std::f64::consts::LOG2_E),
+                            "LOG10E" => Some(std::f64::consts::LOG10_E),
+                            "SQRT2" => Some(std::f64::consts::SQRT_2),
+                            "SQRT1_2" => Some(std::f64::consts::FRAC_1_SQRT_2),
+                            _ => None,
+                        };
+                        if let Some(v) = c {
+                            self.load_number(dst, v);
+                            return Ok(dst);
+                        }
+                    }
+                }
                 let obj = self.expr(&m.object)?;
-                let name = self.add_string_const(m.property.name.as_str());
+                let name = self.string_name(m.property.name.as_str());
                 self.emit(Instr::GetProp { dst, obj, name });
                 Ok(dst)
             }
@@ -1091,7 +1126,7 @@ impl<'a> FnCompiler<'a> {
                         ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
                         _ => return Err("computed object keys not in the zipp-vm subset yet".into()),
                     };
-                    let name = self.add_string_const(&key);
+                    let name = self.string_name(&key);
                     let v = self.expr(&p.value)?;
                     self.emit(Instr::SetProp { obj: dst, name, val: v });
                 }
@@ -1307,7 +1342,7 @@ impl<'a> FnCompiler<'a> {
                 if val != dst {
                     self.emit(Instr::Move { dst, src: val });
                 }
-                let name = self.add_string_const(m.property.name.as_str());
+                let name = self.string_name(m.property.name.as_str());
                 self.emit(Instr::SetProp { obj, name, val: dst });
                 return Ok(dst);
             }
@@ -1415,7 +1450,7 @@ impl<'a> FnCompiler<'a> {
         let name_const = self.add_string_const(kind);
         let tmp = self.temp();
         self.emit(Instr::LoadConst { dst: tmp, idx: name_const });
-        let name_key = self.add_string_const("name");
+        let name_key = self.string_name("name");
         self.emit(Instr::SetProp { obj: dst, name: name_key, val: tmp });
         // message = arg (coerced to string at use; stored as-is)
         if let Some(a) = arg {
@@ -1431,7 +1466,7 @@ impl<'a> FnCompiler<'a> {
             let empty = self.add_string_const("");
             self.emit(Instr::LoadConst { dst: tmp, idx: empty });
         }
-        let msg_key = self.add_string_const("message");
+        let msg_key = self.string_name("message");
         self.emit(Instr::SetProp { obj: dst, name: msg_key, val: tmp });
         self.next_reg -= 1; // reclaim tmp
         Ok(dst)
@@ -1476,6 +1511,32 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // `Object.keys/values/entries(o)` → dedicated ops (Object has no real
+        // global object in the subset).
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            if let ox::Expression::Identifier(obj) = &m.object {
+                if obj.name == "Object" && c.arguments.len() == 1 {
+                    let mk = match m.property.name.as_str() {
+                        "keys" => Some(0u8),
+                        "values" => Some(1u8),
+                        "entries" => Some(2u8),
+                        _ => None,
+                    };
+                    if let Some(kind) = mk {
+                        if let Some(arg_expr) = c.arguments[0].as_expression() {
+                            let o = self.expr(arg_expr)?;
+                            self.emit(match kind {
+                                0 => Instr::ObjectKeys { dst, obj: o },
+                                1 => Instr::ObjectValues { dst, obj: o },
+                                _ => Instr::ObjectEntries { dst, obj: o },
+                            });
+                            return Ok(dst);
+                        }
+                    }
+                }
+            }
+        }
+
         // `Math.<fn>(args…)` → MathOp. Math has no real global object in the
         // subset, so recognise the call shape (like console.log / Date.now).
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
@@ -1494,7 +1555,7 @@ impl<'a> FnCompiler<'a> {
         // (Computed-member calls `obj[k](…)` fall through to the generic path.)
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             let obj = self.expr(&m.object)?;
-            let name = self.add_string_const(m.property.name.as_str());
+            let name = self.string_name(m.property.name.as_str());
             let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
             self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc });
             return Ok(dst);

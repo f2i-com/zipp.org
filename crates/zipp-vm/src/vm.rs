@@ -880,6 +880,48 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::ObjectValues { dst, obj } => {
+                        let o = self.get(base, obj);
+                        let vals: Vec<Value> = if o.is_heap() {
+                            match self.heap.get(o.heap_index()) {
+                                HeapObj::Object(map) => map.vals.clone(),
+                                HeapObj::Array(items) => items.clone(),
+                                _ => Vec::new(),
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let v = Value::heap(self.heap.alloc(HeapObj::Array(vals)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::ObjectEntries { dst, obj } => {
+                        let o = self.get(base, obj);
+                        // Snapshot (key string, value) pairs under the immutable
+                        // borrow, then build `[key, value]` arrays (which allocate).
+                        let pairs: Vec<(String, Value)> = if o.is_heap() {
+                            match self.heap.get(o.heap_index()) {
+                                HeapObj::Object(map) => {
+                                    map.keys.iter().cloned().zip(map.vals.iter().copied()).collect()
+                                }
+                                HeapObj::Array(items) => {
+                                    items.iter().enumerate().map(|(i, v)| (i.to_string(), *v)).collect()
+                                }
+                                _ => Vec::new(),
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let mut entries = Vec::with_capacity(pairs.len());
+                        for (k, val) in pairs {
+                            let ks = self.alloc_str(k);
+                            let inner = self.heap.alloc(HeapObj::Array(vec![ks, val]));
+                            entries.push(Value::heap(inner));
+                        }
+                        let v = Value::heap(self.heap.alloc(HeapObj::Array(entries)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::LenOf { dst, obj } => {
                         let o = self.get(base, obj);
                         let v = if o.is_heap() {

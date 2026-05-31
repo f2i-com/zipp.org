@@ -119,6 +119,11 @@ pub enum Instr {
     /// `dst = <array of obj's own enumerable string keys>` — drives `for-in`.
     /// For an array, the keys are the index strings "0".."len-1".
     ObjectKeys { dst: Reg, obj: Reg },
+    /// `dst = Object.values(obj)` — array of the object's own values (or array
+    /// elements).
+    ObjectValues { dst: Reg, obj: Reg },
+    /// `dst = Object.entries(obj)` — array of `[key, value]` pair arrays.
+    ObjectEntries { dst: Reg, obj: Reg },
     /// `dst = <length of array/string in obj>` (0 for anything else). Used by
     /// the `for-of` desugaring's bound check.
     LenOf { dst: Reg, obj: Reg },

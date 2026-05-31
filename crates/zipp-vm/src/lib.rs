@@ -853,6 +853,31 @@ mod tests {
     }
 
     #[test]
+    fn method_name_after_numeric_constant() {
+        // REGRESSION: a method/property name's index must be into string_constants,
+        // not the constant pool — a preceding non-string constant (e.g. 3.5) used
+        // to push the name's pool index past string_constants and panic (OOB).
+        assert_eq!(run_ok("console.log((3.5).toFixed(2))"), vec!["3.50"]);
+        assert_eq!(run_ok("let x=3.14159; console.log(x.toFixed(2))"), vec!["3.14"]);
+        assert_eq!(run_ok("let n=9.5; let o={prop:7}; console.log(o.prop, n)"), vec!["7 9.5"]);
+        assert_eq!(run_ok("let a=[1.5]; console.log(a[0].toFixed(1))"), vec!["1.5"]);
+    }
+
+    #[test]
+    fn object_statics_and_math_constants() {
+        assert_eq!(
+            run_ok("let o={a:1,b:2,c:3}; console.log(Object.keys(o).join(','), Object.values(o).join(','))"),
+            vec!["a,b,c 1,2,3"],
+        );
+        assert_eq!(
+            run_ok("let o={x:10,y:20}; console.log(Object.entries(o).map(e=>e[0]+'='+e[1]).join(','))"),
+            vec!["x=10,y=20"],
+        );
+        assert_eq!(run_ok("console.log(Object.keys([7,8]).join(','), Object.values([7,8]).join(','))"), vec!["0,1 7,8"]);
+        assert_eq!(run_ok("console.log(Math.PI.toFixed(4), Math.E.toFixed(4), Math.SQRT2.toFixed(4))"), vec!["3.1416 2.7183 1.4142"]);
+    }
+
+    #[test]
     fn array_callback_search_methods() {
         assert_eq!(
             run_ok("let a=[1,2,3,4]; console.log(a.find(x=>x>2), a.findIndex(x=>x>2), a.some(x=>x>3), a.every(x=>x>0))"),
