@@ -3018,6 +3018,32 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The `(name, length)` of a callable value (function, closure, or class) for
+    /// its `.name`/`.length` properties — `None` for non-callables. A synthetic
+    /// proto name (`<arrow>`, `<script>`, …) reads as the empty string (anonymous).
+    fn callable_name_length(&self, obj: Value) -> Option<(String, i32)> {
+        let clean = |n: &str| -> String {
+            if n.starts_with('<') { String::new() } else { n.to_string() }
+        };
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Func(fid) => {
+                let p = &self.program.functions[*fid as usize];
+                Some((clean(&p.name), p.param_count as i32))
+            }
+            HeapObj::Closure { func, .. } => {
+                let p = &self.program.functions[*func as usize];
+                Some((clean(&p.name), p.param_count as i32))
+            }
+            HeapObj::Class { name, ctor, .. } => {
+                let len = ctor
+                    .map(|c| self.program.functions[c as usize].param_count as i32)
+                    .unwrap_or(0);
+                Some((name.clone(), len))
+            }
+            _ => None,
+        }
+    }
+
     fn get_prop(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
         if !obj.is_heap() {
             // Reading a property of null/undefined throws a TypeError (matches
@@ -3029,6 +3055,12 @@ impl<'p> Vm<'p> {
                 )));
             }
             return Ok(Value::UNDEFINED);
+        }
+        // A function's / class's `.name` and `.length` (read from its proto).
+        if key == "name" || key == "length" {
+            if let Some((nm, len)) = self.callable_name_length(obj) {
+                return Ok(if key == "name" { self.alloc_str(nm) } else { Value::int(len) });
+            }
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Array(items) => {
@@ -5061,7 +5093,7 @@ impl<'p> Vm<'p> {
     /// just the method part, as node does.
     fn func_label(&self, fid: u32) -> String {
         let name = &self.program.functions[fid as usize].name;
-        if name.starts_with('<') {
+        if name.is_empty() || name.starts_with('<') {
             "[Function (anonymous)]".into()
         } else {
             let short = name.rsplit('.').next().unwrap_or(name);

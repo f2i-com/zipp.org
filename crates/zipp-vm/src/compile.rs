@@ -743,6 +743,25 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
+    /// Evaluate an initializer into `dst`, inferring a name for an anonymous
+    /// function/arrow assigned to a binding (`const f = () => {}` ⇒ `f.name`
+    /// === "f"). A named function expression keeps its own name.
+    fn compile_named_init(&mut self, dst: Reg, init: &ox::Expression, name: &str) -> R<Reg> {
+        match init {
+            ox::Expression::ArrowFunctionExpression(a) => {
+                let (id, has_up) = self.compile_arrow(a, name)?;
+                self.emit_make_callable(dst, id, has_up);
+                Ok(dst)
+            }
+            ox::Expression::FunctionExpression(f) if f.id.is_none() => {
+                let (id, has_up) = self.compile_func_expr(Some(name.to_string()), f)?;
+                self.emit_make_callable(dst, id, has_up);
+                Ok(dst)
+            }
+            _ => self.expr_into(init, dst),
+        }
+    }
+
     fn var_decl(&mut self, d: &ox::VariableDeclaration) -> R<()> {
         for decl in &d.declarations {
             // Destructuring declaration (`let {a,b} = o`, `let [x,...r] = arr`):
@@ -777,7 +796,7 @@ impl<'a> FnCompiler<'a> {
                 let slot = self.cx.global_slot(name) as u32;
                 let tmp = self.temp();
                 let v = if let Some(init) = &decl.init {
-                    self.expr_into(init, tmp)?
+                    self.compile_named_init(tmp, init, name)?
                 } else {
                     self.emit(Instr::LoadUndefined { dst: tmp });
                     tmp
@@ -796,11 +815,11 @@ impl<'a> FnCompiler<'a> {
                 if is_cell {
                     // The init value must be written THROUGH the cell.
                     let tmp = self.temp();
-                    let v = self.expr_into(init, tmp)?;
+                    let v = self.compile_named_init(tmp, init, name)?;
                     self.emit(Instr::CellSet { cell: reg, src: v });
                     self.next_reg -= 1; // reclaim tmp
                 } else {
-                    let v = self.expr_into(init, reg)?;
+                    let v = self.compile_named_init(reg, init, name)?;
                     if v != reg {
                         self.emit(Instr::Move { dst: reg, src: v });
                     }
@@ -1333,14 +1352,15 @@ impl<'a> FnCompiler<'a> {
     /// Compile an arrow function, returning `(func_id, has_upvalues)`. An
     /// expression-bodied arrow (`x => x + 1`) is a function whose single
     /// statement returns the expression.
-    fn compile_arrow(&mut self, a: &ox::ArrowFunctionExpression) -> R<(u32, bool)> {
+    fn compile_arrow(&mut self, a: &ox::ArrowFunctionExpression, name: &str) -> R<(u32, bool)> {
         let params = param_slot_names(&a.params)?;
         let rest = rest_name(&a.params)?;
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&a.params));
         let captured = capture::captured_locals(&names, &a.body.statements);
         let enclosing = self.child_enclosing();
-        let proto = self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing)?;
+        let mut proto = self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing)?;
+        proto.name = name.to_string();
         let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);
@@ -2050,7 +2070,7 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             E::ArrowFunctionExpression(a) => {
-                let (id, has_up) = self.compile_arrow(a)?;
+                let (id, has_up) = self.compile_arrow(a, "")?;
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }

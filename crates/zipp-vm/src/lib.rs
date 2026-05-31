@@ -1236,6 +1236,23 @@ mod tests {
     }
 
     #[test]
+    fn function_name_and_length() {
+        // .name: declaration, named expression, class, and inference for an
+        // anonymous arrow / function expression bound to a variable.
+        assert_eq!(run_ok("function foo(){} console.log(foo.name)"), vec!["foo"]);
+        assert_eq!(run_ok("let q=function named(){}; console.log(q.name)"), vec!["named"]);
+        assert_eq!(run_ok("const baz=()=>{}; console.log(baz.name)"), vec!["baz"]);
+        assert_eq!(run_ok("const bar=function(){}; console.log(bar.name)"), vec!["bar"]);
+        assert_eq!(run_ok("class C{} console.log(C.name)"), vec!["C"]);
+        // A truly anonymous function (in an array) has an empty name.
+        assert_eq!(run_ok("console.log([x=>x][0].name === '')"), vec!["true"]);
+        // .length: declared parameter count (rest excluded).
+        assert_eq!(run_ok("function f(a,b,c){} console.log(f.length, ((x,y)=>{}).length, (()=>{}).length)"), vec!["3 2 0"]);
+        assert_eq!(run_ok("function r(a,...rest){} console.log(r.length)"), vec!["1"]);
+        assert_eq!(run_ok("class C{constructor(a,b){}} console.log(C.length)"), vec!["2"]);
+    }
+
+    #[test]
     fn promises() {
         // resolve/reject + then/catch; chaining; a throw in then routes to catch.
         assert_eq!(run_ok("Promise.resolve(5).then(v=>console.log('got',v))"), vec!["got 5"]);
