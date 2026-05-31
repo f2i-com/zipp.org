@@ -824,7 +824,8 @@ impl<'p> Vm<'p> {
                         let len = if o.is_heap() {
                             match self.heap.get(o.heap_index()) {
                                 HeapObj::Array(items) => items.len() as i32,
-                                HeapObj::Str(s) => s.chars().count() as i32,
+                                HeapObj::Str(s) => s.char_len as i32,
+                                HeapObj::Cons { len, .. } => *len as i32,
                                 _ => 0,
                             }
                         } else {
@@ -1221,6 +1222,11 @@ impl<'p> Vm<'p> {
     // ── property / index access ──
 
     fn get_index(&mut self, obj: Value, key: Value) -> Result<Value, Thrown> {
+        // A rope must be materialized before random access; no-op (one tag
+        // check) for arrays, objects, and already-flat strings.
+        if obj.is_heap() {
+            self.heap.flatten(obj.heap_index());
+        }
         if !obj.is_heap() {
             return Err(Thrown(format!(
                 "TypeError: cannot read property of {}",
@@ -1251,7 +1257,15 @@ impl<'p> Vm<'p> {
                 if key.is_int() {
                     let i = key.as_int();
                     if i >= 0 {
-                        if let Some(ch) = s.chars().nth(i as usize) {
+                        let i = i as usize;
+                        // O(1) for ASCII (i-th char == i-th byte); otherwise walk
+                        // scalars (O(i), correct for multi-byte UTF-8).
+                        let ch = if s.ascii {
+                            s.bytes.as_bytes().get(i).map(|&b| b as char)
+                        } else {
+                            s.bytes.chars().nth(i)
+                        };
+                        if let Some(ch) = ch {
                             let cs = ch.to_string();
                             return Ok(self.alloc_str(cs));
                         }
@@ -1322,7 +1336,14 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Str(s) => {
                 if key == "length" {
-                    Ok(Value::int(s.chars().count() as i32))
+                    Ok(Value::int(s.char_len as i32))
+                } else {
+                    Ok(Value::UNDEFINED)
+                }
+            }
+            HeapObj::Cons { len, .. } => {
+                if key == "length" {
+                    Ok(Value::int(*len as i32))
                 } else {
                     Ok(Value::UNDEFINED)
                 }
@@ -1377,7 +1398,7 @@ impl<'p> Vm<'p> {
         let idx = recv.heap_index();
         match self.heap.get(idx) {
             HeapObj::Array(_) => self.array_method(idx, name, &args),
-            HeapObj::Str(_) => self.string_method(idx, name, &args),
+            HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, &args),
             _ => Ok(None),
         }
     }
@@ -1582,8 +1603,9 @@ impl<'p> Vm<'p> {
     }
 
     fn string_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        self.heap.flatten(idx); // materialize a rope receiver before reading it
         let s = match self.heap.get(idx) {
-            HeapObj::Str(s) => s.clone(),
+            HeapObj::Str(s) => s.bytes.clone(),
             _ => return Ok(None),
         };
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -1667,10 +1689,9 @@ impl<'p> Vm<'p> {
             return a.as_f64() == b.as_f64();
         }
         if a.is_heap() && b.is_heap() {
-            if let (Some(sa), Some(sb)) =
-                (self.heap.as_str(a.heap_index()), self.heap.as_str(b.heap_index()))
-            {
-                return sa == sb;
+            let (ai, bi) = (a.heap_index(), b.heap_index());
+            if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
+                return self.heap.str_eq(ai, bi);
             }
         }
         false
@@ -1725,16 +1746,30 @@ impl<'p> Vm<'p> {
                 None => Value::num(va.as_int() as f64 + vb.as_int() as f64),
             });
         }
-        // String concatenation if either side is a heap string.
+        // If either side is a heap value, JS `+` is string concatenation (arrays
+        // and objects coerce to a string primitive, and string+anything joins).
+        // Build a rope (cons-string) in O(1) — children point at existing flat
+        // strings / ropes, so a `s += x` loop is O(n) overall, not O(n²).
         if va.is_heap() || vb.is_heap() {
-            let sa = self.display(va);
-            let sb = self.display(vb);
-            let mut s = String::with_capacity(sa.len() + sb.len());
-            s.push_str(&sa);
-            s.push_str(&sb);
-            return Ok(self.alloc_str(s));
+            let li = self.to_str_idx(va);
+            let ri = self.to_str_idx(vb);
+            let llen = self.heap.str_char_len(li).unwrap_or(0);
+            let rlen = self.heap.str_char_len(ri).unwrap_or(0);
+            return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
         }
         Ok(Value::num(self.to_number(va)? + self.to_number(vb)?))
+    }
+
+    /// Heap index of a string-like object representing `v`: `v`'s own index when
+    /// it is already a string (flat or rope), else a freshly allocated flat
+    /// string from `v`'s string coercion. Used to build rope children.
+    fn to_str_idx(&mut self, v: Value) -> u32 {
+        if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
+            v.heap_index()
+        } else {
+            let s = self.display(v);
+            self.heap.alloc_str(s)
+        }
     }
 
     #[inline]
@@ -1773,10 +1808,9 @@ impl<'p> Vm<'p> {
         }
         // Distinct heap strings with equal contents are `===` equal.
         if va.is_heap() && vb.is_heap() {
-            if let (Some(sa), Some(sb)) =
-                (self.heap.as_str(va.heap_index()), self.heap.as_str(vb.heap_index()))
-            {
-                return sa == sb;
+            let (ai, bi) = (va.heap_index(), vb.heap_index());
+            if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
+                return self.heap.str_eq(ai, bi);
             }
         }
         false
@@ -1788,8 +1822,8 @@ impl<'p> Vm<'p> {
             return t;
         }
         // Heap: empty string is falsy; everything else truthy.
-        if let Some(s) = self.heap.as_str(v.heap_index()) {
-            return !s.is_empty();
+        if let Some(empty) = self.heap.str_is_empty(v.heap_index()) {
+            return !empty;
         }
         true
     }
@@ -1807,7 +1841,7 @@ impl<'p> Vm<'p> {
         if v.is_undefined() {
             return Ok(f64::NAN);
         }
-        if let Some(s) = self.heap.as_str(v.heap_index()) {
+        if let Some(s) = self.heap.str_cow(v.heap_index()) {
             let t = s.trim();
             if t.is_empty() {
                 return Ok(0.0);
@@ -1832,7 +1866,12 @@ impl<'p> Vm<'p> {
             "undefined".into()
         } else if v.is_heap() {
             match self.heap.get(v.heap_index()) {
-                HeapObj::Str(s) => s.clone(),
+                HeapObj::Str(s) => s.bytes.clone(),
+                HeapObj::Cons { .. } => {
+                    let mut out = String::new();
+                    self.heap.write_str(v.heap_index(), &mut out);
+                    out
+                }
                 HeapObj::Func(_) | HeapObj::Closure { .. } => "function".into(),
                 HeapObj::Cell(inner) => self.display(*inner),
                 HeapObj::Array(items) => items
@@ -1853,7 +1892,12 @@ impl<'p> Vm<'p> {
     fn inspect(&self, v: Value) -> String {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
-                HeapObj::Str(s) => return s.clone(), // top-level strings unquoted
+                HeapObj::Str(s) => return s.bytes.clone(), // top-level strings unquoted
+                HeapObj::Cons { .. } => {
+                    let mut out = String::new();
+                    self.heap.write_str(v.heap_index(), &mut out);
+                    return out;
+                }
                 _ => return self.inspect_nested(v),
             }
         }
@@ -1865,7 +1909,12 @@ impl<'p> Vm<'p> {
             return self.display(v);
         }
         match self.heap.get(v.heap_index()) {
-            HeapObj::Str(s) => format!("'{s}'"),
+            HeapObj::Str(s) => format!("'{}'", s.bytes),
+            HeapObj::Cons { .. } => {
+                let mut out = String::new();
+                self.heap.write_str(v.heap_index(), &mut out);
+                format!("'{out}'")
+            }
             HeapObj::Func(_) | HeapObj::Closure { .. } => "[Function]".into(),
             HeapObj::Cell(inner) => self.inspect_nested(*inner),
             HeapObj::Array(items) => {

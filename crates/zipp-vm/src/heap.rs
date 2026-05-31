@@ -12,6 +12,7 @@
 //! a later tier).
 
 use crate::value::Value;
+use std::borrow::Cow;
 
 /// A JS object: insertion-ordered string-keyed properties.
 #[derive(Clone, Debug, Default)]
@@ -49,11 +50,39 @@ impl ObjMap {
     }
 }
 
+/// A flat (contiguous) JS string with cached metadata so `.length` and indexing
+/// are O(1). `char_len` is the Unicode-scalar count (the engine measures
+/// `.length` in scalars throughout); `ascii` flags the common all-ASCII case,
+/// where the i-th character is the i-th byte — O(1) random access. Non-ASCII
+/// strings fall back to an O(i) `chars().nth(i)` walk (correct, just slower).
+#[derive(Clone, Debug)]
+pub struct JsStr {
+    pub bytes: String,
+    pub char_len: usize,
+    pub ascii: bool,
+}
+
+impl JsStr {
+    pub fn new(bytes: String) -> JsStr {
+        let ascii = bytes.is_ascii();
+        let char_len = if ascii { bytes.len() } else { bytes.chars().count() };
+        JsStr { bytes, char_len, ascii }
+    }
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
-    /// An owned JS string.
-    Str(String),
+    /// An owned, contiguous JS string (with cached length / ASCII metadata).
+    Str(JsStr),
+    /// A lazily-concatenated string ("rope" / cons-string, as in V8). `left` and
+    /// `right` are heap indices of string-like objects (flat `Str` or nested
+    /// `Cons`); `len` is the total character count, so `.length` is O(1) without
+    /// materializing. `+` builds one in O(1) instead of copying both operands;
+    /// it is flattened to a contiguous `Str` in place on first content access
+    /// (indexing, methods, comparison). JS strings are immutable here
+    /// (`set_index` no-ops on them), so the structural sharing is sound.
+    Cons { left: u32, right: u32, len: usize },
     /// A plain function: index into `Program::functions`. No captured state.
     Func(u32),
     /// A closure: a function id plus captured upvalue cells (indices of `Cell`
@@ -129,16 +158,119 @@ impl Heap {
 
     #[inline]
     pub fn alloc_str(&mut self, s: String) -> u32 {
-        self.alloc(HeapObj::Str(s))
+        self.alloc(HeapObj::Str(JsStr::new(s)))
     }
 
-    /// Borrow a string by heap index, or `None` if the object isn't a string.
+    /// Borrow a FLAT string by heap index, or `None` if the object isn't a flat
+    /// string (a rope returns `None` — use [`Heap::str_cow`] to materialize one).
     #[inline]
     pub fn as_str(&self, idx: u32) -> Option<&str> {
         match self.get(idx) {
-            HeapObj::Str(s) => Some(s.as_str()),
+            HeapObj::Str(s) => Some(s.bytes.as_str()),
             _ => None,
         }
+    }
+
+    /// Allocate a rope node over two string-like children (O(1) concatenation).
+    #[inline]
+    pub fn alloc_cons(&mut self, left: u32, right: u32, len: usize) -> u32 {
+        self.alloc(HeapObj::Cons { left, right, len })
+    }
+
+    /// Is this heap object a string — flat `Str` or rope `Cons`?
+    #[inline]
+    pub fn is_str_like(&self, idx: u32) -> bool {
+        matches!(self.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. })
+    }
+
+    /// Character length of a string-like object: O(1) for a rope, O(n) for a
+    /// flat string. `None` if `idx` isn't a string.
+    pub fn str_char_len(&self, idx: u32) -> Option<usize> {
+        match self.get(idx) {
+            HeapObj::Str(s) => Some(s.char_len),
+            HeapObj::Cons { len, .. } => Some(*len),
+            _ => None,
+        }
+    }
+
+    /// `Some(true)` if the string-like object is empty (O(1)); `None` if not a
+    /// string. Avoids the O(n) `chars().count()` of [`Heap::str_char_len`].
+    #[inline]
+    pub fn str_is_empty(&self, idx: u32) -> Option<bool> {
+        match self.get(idx) {
+            HeapObj::Str(s) => Some(s.char_len == 0),
+            HeapObj::Cons { len, .. } => Some(*len == 0),
+            _ => None,
+        }
+    }
+
+    /// Append the full character content of a (possibly rope) string to `out`.
+    /// Iterative, not recursive: a `s += x` loop builds a left-leaning rope that
+    /// can be thousands of nodes deep, which would overflow the stack.
+    pub fn write_str(&self, idx: u32, out: &mut String) {
+        // Explicit stack; push the right child then the left so the left is
+        // popped (appended) first — preserving left-to-right concatenation.
+        let mut stack = vec![idx];
+        while let Some(n) = stack.pop() {
+            match self.get(n) {
+                HeapObj::Str(s) => out.push_str(&s.bytes),
+                HeapObj::Cons { left, right, .. } => {
+                    stack.push(*right);
+                    stack.push(*left);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Borrow a string-like as `&str` without allocating when it is already flat
+    /// (the common case); materialize a rope into an owned `String` otherwise.
+    /// `None` if `idx` isn't a string.
+    pub fn str_cow(&self, idx: u32) -> Option<Cow<'_, str>> {
+        match self.get(idx) {
+            HeapObj::Str(s) => Some(Cow::Borrowed(s.bytes.as_str())),
+            HeapObj::Cons { len, .. } => {
+                let mut out = String::with_capacity(*len);
+                self.write_str(idx, &mut out);
+                Some(Cow::Owned(out))
+            }
+            _ => None,
+        }
+    }
+
+    /// Content equality of two string-like objects. Fast (no allocation) when
+    /// both are already flat — the common case for a hot `a === b` comparison.
+    pub fn str_eq(&self, a: u32, b: u32) -> bool {
+        match (self.get(a), self.get(b)) {
+            (HeapObj::Str(x), HeapObj::Str(y)) => x.bytes == y.bytes,
+            _ => {
+                let (mut sa, mut sb) = (String::new(), String::new());
+                self.write_str(a, &mut sa);
+                self.write_str(b, &mut sb);
+                sa == sb
+            }
+        }
+    }
+
+    /// Flatten the rope at `idx` into a contiguous `Str` in place. No-op if it is
+    /// already flat (or not a string). The already-flat fast path is a single tag
+    /// check, so this is cheap to call unconditionally before content access.
+    #[inline]
+    pub fn flatten(&mut self, idx: u32) {
+        if matches!(self.objs[idx as usize], HeapObj::Cons { .. }) {
+            self.flatten_cold(idx);
+        }
+    }
+
+    #[cold]
+    fn flatten_cold(&mut self, idx: u32) {
+        let len = match &self.objs[idx as usize] {
+            HeapObj::Cons { len, .. } => *len,
+            _ => return,
+        };
+        let mut out = String::with_capacity(len);
+        self.write_str(idx, &mut out);
+        self.objs[idx as usize] = HeapObj::Str(JsStr::new(out));
     }
 
     /// Resolve a callable (plain function or closure) to its function id and
