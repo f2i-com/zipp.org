@@ -3444,6 +3444,27 @@ impl<'a> FnCompiler<'a> {
             return Ok(dst);
         }
 
+        // Computed method call `obj[key](args…)` → bind `this` to obj. Evaluate
+        // obj and the key into stable registers (below the contiguous arg block).
+        if let ox::Expression::ComputedMemberExpression(m) = &c.callee {
+            let obj = self.expr(&m.object)?;
+            let obj_reg = self.alloc_reg();
+            if obj != obj_reg {
+                self.emit(Instr::Move { dst: obj_reg, src: obj });
+            }
+            if m.optional {
+                self.emit_optional_check(obj_reg);
+            }
+            let key = self.expr(&m.expression)?;
+            let key_reg = self.alloc_reg();
+            if key != key_reg {
+                self.emit(Instr::Move { dst: key_reg, src: key });
+            }
+            let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+            self.emit(Instr::CallMethodComputed { dst, obj: obj_reg, key: key_reg, arg_base, argc });
+            return Ok(dst);
+        }
+
         // General call: evaluate callee, then contiguous args.
         let callee = self.expr(&c.callee)?;
         let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;

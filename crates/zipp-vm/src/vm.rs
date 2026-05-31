@@ -1778,6 +1778,42 @@ impl<'p> Vm<'p> {
                         break;
                     }
 
+                    Instr::CallMethodComputed { dst, obj, key, arg_base, argc } => {
+                        let recv = self.get(base, obj);
+                        let k = self.get(base, key);
+                        // `obj["push"](x)` etc: a builtin array/string method first.
+                        let kstr = self.display(k);
+                        if let Some(result) =
+                            self.try_builtin_method(recv, &kstr, base, arg_base, argc)?
+                        {
+                            self.set(base, dst, result);
+                            ip += 1;
+                            continue;
+                        }
+                        // Else resolve the method off the receiver (own/inherited)
+                        // and call it with `this = recv`.
+                        let method = self.get_index(recv, k)?;
+                        let (fid, closure) = self.resolve_callable(method)?;
+                        if self.program.functions[fid as usize].is_generator {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let g = self.alloc_generator(fid, closure, recv, &argv);
+                            self.set(base, dst, g);
+                            ip += 1;
+                            continue;
+                        }
+                        if self.program.functions[fid as usize].is_async {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let p = self.alloc_async(fid, closure, recv, &argv);
+                            self.set(base, dst, p);
+                            ip += 1;
+                            continue;
+                        }
+                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1)?;
+                        break;
+                    }
+
                     Instr::Throw { src } => {
                         let v = self.get(base, src);
                         let msg = self.throw_message(v);

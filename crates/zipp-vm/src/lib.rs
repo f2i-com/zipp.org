@@ -1378,6 +1378,18 @@ mod tests {
     }
 
     #[test]
+    fn computed_method_call_binds_this() {
+        // `obj[key](args)` binds `this` to obj (dynamic method dispatch).
+        assert_eq!(run_ok("let o={x:10,getX(){return this.x},add(a,b){return this.x+a+b}}; let m='getX'; console.log(o[m](), o['add'](1,2))"), vec!["10 13"]);
+        // A dispatch table iterated by name.
+        assert_eq!(run_ok("let ops={inc(n){return n+1},dbl(n){return n*2}}; let r=[]; for(let k of ['inc','dbl']) r.push(ops[k](10)); console.log(r.join(','))"), vec!["11,20"]);
+        // Computed builtin method on an array.
+        assert_eq!(run_ok("let a=[3,1,2]; console.log(a['join']('-'))"), vec!["3-1-2"]);
+        // Class instance dynamic method.
+        assert_eq!(run_ok("class C{constructor(){this.v=5} double(){return this.v*2}} let c=new C(),n='double'; console.log(c[n]())"), vec!["10"]);
+    }
+
+    #[test]
     fn symbol_iterator_custom_iterables() {
         // A custom-iterable object: for-of, spread, and Array.from all drive its
         // `[Symbol.iterator]()`.

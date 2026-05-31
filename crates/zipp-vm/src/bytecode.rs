@@ -236,6 +236,9 @@ pub enum Instr {
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
     CallMethod { dst: Reg, obj: Reg, name: u32, arg_base: Reg, argc: u16 },
+    /// `dst = obj[key](args…)` — computed method call: resolve the method by the
+    /// runtime `key`, then call it with `this` bound to `obj`.
+    CallMethodComputed { dst: Reg, obj: Reg, key: Reg, arg_base: Reg, argc: u16 },
 
     /// Throw the value in `src`. Unwinds to the nearest enclosing catch handler
     /// (in this or a caller frame), or aborts the program if none.
