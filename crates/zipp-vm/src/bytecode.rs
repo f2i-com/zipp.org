@@ -96,6 +96,9 @@ pub enum Instr {
     MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },
     /// `dst = <Number|parseInt|parseFloat>(args…)` — a builtin global function.
     GlobalFn { dst: Reg, op: GlobalFn, arg_base: Reg, argc: u16 },
+    /// `dst = (val instanceof <ctor>)` for a built-in constructor (Array, Object,
+    /// Function, Error and its subclasses). User constructors are out of scope.
+    InstanceOf { dst: Reg, val: Reg, ctor: InstanceCtor },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },
@@ -247,6 +250,8 @@ pub enum GlobalFn {
     Number,
     ParseInt,
     ParseFloat,
+    IsNaN,
+    IsFinite,
 }
 
 impl GlobalFn {
@@ -255,6 +260,38 @@ impl GlobalFn {
             "Number" => GlobalFn::Number,
             "parseInt" => GlobalFn::ParseInt,
             "parseFloat" => GlobalFn::ParseFloat,
+            "isNaN" => GlobalFn::IsNaN,
+            "isFinite" => GlobalFn::IsFinite,
+            _ => return None,
+        })
+    }
+}
+
+/// A built-in constructor recognised on the right of `instanceof`. The engine
+/// has no user-level prototype chain, so `x instanceof C` is decided
+/// structurally: by the heap kind of `x`, and (for errors) its `name` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceCtor {
+    Array,
+    Object,
+    Function,
+    /// The `Error` base — matches any error subtype.
+    Error,
+    TypeError,
+    RangeError,
+    SyntaxError,
+}
+
+impl InstanceCtor {
+    pub fn from_name(name: &str) -> Option<InstanceCtor> {
+        Some(match name {
+            "Array" => InstanceCtor::Array,
+            "Object" => InstanceCtor::Object,
+            "Function" => InstanceCtor::Function,
+            "Error" => InstanceCtor::Error,
+            "TypeError" => InstanceCtor::TypeError,
+            "RangeError" => InstanceCtor::RangeError,
+            "SyntaxError" => InstanceCtor::SyntaxError,
             _ => return None,
         })
     }

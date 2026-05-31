@@ -1006,6 +1006,27 @@ mod tests {
     }
 
     #[test]
+    fn instanceof_operator() {
+        // Built-in collections / functions.
+        assert_eq!(run_ok("console.log([] instanceof Array, [] instanceof Object)"), vec!["true true"]);
+        assert_eq!(run_ok("console.log(({}) instanceof Object, ({}) instanceof Array)"), vec!["true false"]);
+        assert_eq!(run_ok("let f=x=>x; console.log(f instanceof Function, f instanceof Object)"), vec!["true true"]);
+        // Primitives are never instances.
+        assert_eq!(run_ok("console.log(5 instanceof Object, 's' instanceof Object, null instanceof Object)"), vec!["false false false"]);
+        // Error hierarchy: a subtype is also an Error; siblings don't match.
+        assert_eq!(run_ok("let e=new TypeError('x'); console.log(e instanceof TypeError, e instanceof Error, e instanceof RangeError)"), vec!["true true false"]);
+        // Engine-thrown errors are real Error objects (name/message/instanceof).
+        assert_eq!(run_ok("try{null.x}catch(e){console.log(e instanceof TypeError, e.name)}"), vec!["true TypeError"]);
+        assert_eq!(run_ok("try{let a=[];a.length=-1}catch(e){console.log(e instanceof RangeError)}"), vec!["true"]);
+    }
+
+    #[test]
+    fn is_nan_is_finite() {
+        assert_eq!(run_ok("console.log(isNaN(NaN), isNaN(5), isNaN('x'), isNaN('12'))"), vec!["true false true false"]);
+        assert_eq!(run_ok("console.log(isFinite(5), isFinite(Infinity), isFinite(NaN), isFinite('3'))"), vec!["true false false true"]);
+    }
+
+    #[test]
     fn rest_parameters() {
         // Pure rest, rest after fixed params, empty rest.
         assert_eq!(run_ok("function f(...a){return a.length} console.log(f(1,2,3))"), vec!["3"]);

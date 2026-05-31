@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use oxc_ast::ast as ox;
 
-use crate::bytecode::{FuncProto, Instr, Program, Reg, UpvalSource};
+use crate::bytecode::{FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource};
 use crate::capture;
 use crate::value::Value;
 use crate::vm::STRING_CONST_BIT;
@@ -1424,6 +1424,20 @@ impl<'a> FnCompiler<'a> {
 
     fn binary(&mut self, b: &ox::BinaryExpression, dst: Reg) -> R<Reg> {
         use ox::BinaryOperator as Op;
+        // `x instanceof Ctor`: only built-in constructors are recognised (the
+        // engine has no user prototype chain). Decided structurally in the VM.
+        if matches!(b.operator, Op::Instanceof) {
+            let ctor = match &b.right {
+                ox::Expression::Identifier(id) => InstanceCtor::from_name(&id.name).ok_or(
+                    "instanceof only supports built-in constructors \
+                     (Array, Object, Function, Error, TypeError, RangeError, SyntaxError)",
+                )?,
+                _ => return Err("instanceof right-hand side must be a built-in constructor name".into()),
+            };
+            let val = self.expr(&b.left)?;
+            self.emit(Instr::InstanceOf { dst, val, ctor });
+            return Ok(dst);
+        }
         // `a - <int literal>` and `a + <int literal>` → AddInt fast path, but
         // ONLY when the left operand is provably numeric. `+` is overloaded for
         // string concatenation, so `'n=' + 42` must NOT take the integer path

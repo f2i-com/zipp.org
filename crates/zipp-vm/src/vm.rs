@@ -19,7 +19,7 @@
 //! JIT'd engine and than V8; the point is a clean substrate that a JIT can
 //! later make faster.
 
-use crate::bytecode::{Instr, Program, UpvalSource};
+use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{Heap, HeapObj, ObjMap};
 use crate::value::Value;
 
@@ -443,9 +443,10 @@ impl<'p> Vm<'p> {
                         Some(v) => v,
                         None => {
                             // Internal error (TypeError/RangeError/…) with no
-                            // explicit thrown value: synthesise a string so it
-                            // is still catchable as `e`.
-                            let v = self.alloc_str(t.0.clone());
+                            // explicit thrown value: synthesise a real Error
+                            // object so `catch (e)` sees `e.name`/`e.message` and
+                            // `e instanceof TypeError`, matching JS.
+                            let v = self.alloc_error_from_message(&t.0);
                             self.pending_throw = Some(v);
                             v
                         }
@@ -871,8 +872,22 @@ impl<'p> Vm<'p> {
                                 Value::num(parse_int(&s, radix))
                             }
                             G::ParseFloat => Value::num(parse_float(&self.display(a0))),
+                            // isNaN/isFinite coerce and never throw for the values
+                            // in this subset; treat any coercion failure as NaN.
+                            G::IsNaN => {
+                                Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan())
+                            }
+                            G::IsFinite => {
+                                Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite())
+                            }
                         };
                         self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::InstanceOf { dst, val, ctor } => {
+                        let v = self.get(base, val);
+                        let r = self.eval_instanceof(v, ctor);
+                        self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
 
@@ -1948,6 +1963,68 @@ impl<'p> Vm<'p> {
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
             _ => Ok(None),
         }
+    }
+
+    /// `val instanceof <built-in ctor>`. With no user prototype chain the result
+    /// is structural: by heap kind for Array/Object/Function, and by the `name`
+    /// field for the Error family (any error subtype satisfies `instanceof
+    /// Error`). Primitives are never an instance of anything.
+    fn eval_instanceof(&self, val: Value, ctor: InstanceCtor) -> bool {
+        use InstanceCtor as C;
+        if !val.is_heap() {
+            return false;
+        }
+        let idx = val.heap_index();
+        match ctor {
+            C::Array => matches!(self.heap.get(idx), HeapObj::Array(_)),
+            C::Function => {
+                matches!(self.heap.get(idx), HeapObj::Func(_) | HeapObj::Closure { .. })
+            }
+            // Every non-primitive (array, object, function, error) is an Object.
+            C::Object => matches!(
+                self.heap.get(idx),
+                HeapObj::Array(_) | HeapObj::Object(_) | HeapObj::Func(_) | HeapObj::Closure { .. }
+            ),
+            C::Error => self.error_name(idx).is_some(),
+            C::TypeError => self.error_name(idx).as_deref() == Some("TypeError"),
+            C::RangeError => self.error_name(idx).as_deref() == Some("RangeError"),
+            C::SyntaxError => self.error_name(idx).as_deref() == Some("SyntaxError"),
+        }
+    }
+
+    /// Build an Error object from an internal throw message. A message like
+    /// `"TypeError: cannot read …"` splits into `name="TypeError"` and
+    /// `message="cannot read …"`; anything else becomes a generic `Error` whose
+    /// message is the whole text. Mirrors the `{name, message}` shape the
+    /// compiler emits for `new TypeError(…)`, so both catch paths are uniform.
+    fn alloc_error_from_message(&mut self, raw: &str) -> Value {
+        let (name, message) = match raw.split_once(": ") {
+            Some((pre, rest))
+                if matches!(pre, "Error" | "TypeError" | "RangeError" | "SyntaxError") =>
+            {
+                (pre.to_string(), rest.to_string())
+            }
+            _ => ("Error".to_string(), raw.to_string()),
+        };
+        let name_v = self.alloc_str(name);
+        let msg_v = self.alloc_str(message);
+        let mut map = ObjMap::new();
+        map.set("name", name_v);
+        map.set("message", msg_v);
+        Value::heap(self.heap.alloc(HeapObj::Object(map)))
+    }
+
+    /// If `idx` is an Error-like object — an object whose `name` is one of the
+    /// engine's error kinds — return that name, else `None`.
+    fn error_name(&self, idx: u32) -> Option<String> {
+        let map = match self.heap.get(idx) {
+            HeapObj::Object(m) => m,
+            _ => return None,
+        };
+        let nv = map.get("name")?;
+        let name = self.display(nv);
+        matches!(name.as_str(), "Error" | "TypeError" | "RangeError" | "SyntaxError")
+            .then_some(name)
     }
 
     /// Methods on a number receiver: `toFixed`, `toString`. Returns `Ok(None)`
