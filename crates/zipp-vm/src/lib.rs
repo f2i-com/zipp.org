@@ -957,6 +957,23 @@ mod tests {
     }
 
     #[test]
+    fn json_parse() {
+        assert_eq!(
+            run_ok("let o=JSON.parse('{\"a\":1,\"b\":[2,3],\"c\":\"hi\"}'); console.log(o.a, o.b[1], o.c)"),
+            vec!["1 3 hi"],
+        );
+        assert_eq!(
+            run_ok("console.log(JSON.parse('[1,2.5,-3,1e2,true,false,null]').join(','))"),
+            vec!["1,2.5,-3,100,true,false,"],
+        );
+        // Round-trips with stringify.
+        assert_eq!(run_ok("let r=JSON.parse(JSON.stringify({x:[1,{y:2}],z:'a'})); console.log(r.x[1].y, r.z)"), vec!["2 a"]);
+        // Invalid JSON throws a (catchable) SyntaxError.
+        assert_eq!(run_ok("let e='ok'; try{ JSON.parse('{bad}'); }catch(x){ e='threw'; } console.log(e)"), vec!["threw"]);
+        assert_eq!(run_ok("let e='ok'; try{ JSON.parse('[1,2'); }catch(x){ e='threw'; } console.log(e)"), vec!["threw"]);
+    }
+
+    #[test]
     fn json_stringify() {
         assert_eq!(run_ok("console.log(JSON.stringify({a:1,b:[2,3]}))"), vec![r#"{"a":1,"b":[2,3]}"#]);
         // undefined/function are omitted in objects but become null in arrays.

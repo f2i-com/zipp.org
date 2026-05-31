@@ -774,6 +774,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
+                    Instr::JsonParse { dst, a } => {
+                        let s = self.display(self.get(base, a)); // ToString of the arg
+                        let v = self.json_parse(&s)?; // propagates SyntaxError as a throw
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::MathOp { dst, op, arg_base, argc } => {
                         let r = self.eval_math(op, base, arg_base, argc)?;
                         self.set(base, dst, Value::num(r));
@@ -1650,6 +1656,108 @@ impl<'p> Vm<'p> {
             }
             _ => None,
         }
+    }
+
+    /// Parse a JSON string into a Value, or throw SyntaxError. Recursive-descent
+    /// over the byte string (structure tokens are ASCII; string content is
+    /// flushed as UTF-8 slices). Allocates heap objects/arrays/strings.
+    fn json_parse(&mut self, src: &str) -> Result<Value, Thrown> {
+        let mut i = 0;
+        json_skip_ws(src.as_bytes(), &mut i);
+        let v = self.json_parse_value(src, &mut i)?;
+        json_skip_ws(src.as_bytes(), &mut i);
+        if i != src.len() {
+            return Err(Thrown("SyntaxError: Unexpected non-whitespace character after JSON".into()));
+        }
+        Ok(v)
+    }
+
+    fn json_parse_value(&mut self, src: &str, i: &mut usize) -> Result<Value, Thrown> {
+        let b = src.as_bytes();
+        match b.get(*i).copied() {
+            Some(b'{') => self.json_parse_object(src, i),
+            Some(b'[') => self.json_parse_array(src, i),
+            Some(b'"') => {
+                let s = json_parse_string(src, i)?;
+                Ok(self.alloc_str(s))
+            }
+            Some(b't') => {
+                json_expect(b, i, "true")?;
+                Ok(Value::bool(true))
+            }
+            Some(b'f') => {
+                json_expect(b, i, "false")?;
+                Ok(Value::bool(false))
+            }
+            Some(b'n') => {
+                json_expect(b, i, "null")?;
+                Ok(Value::NULL)
+            }
+            Some(c) if c == b'-' || c.is_ascii_digit() => json_parse_number(b, i),
+            _ => Err(Thrown("SyntaxError: Unexpected token in JSON".into())),
+        }
+    }
+
+    fn json_parse_array(&mut self, src: &str, i: &mut usize) -> Result<Value, Thrown> {
+        let b = src.as_bytes();
+        *i += 1; // '['
+        let mut items = Vec::new();
+        json_skip_ws(b, i);
+        if b.get(*i) == Some(&b']') {
+            *i += 1;
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(items))));
+        }
+        loop {
+            json_skip_ws(b, i);
+            let v = self.json_parse_value(src, i)?;
+            items.push(v);
+            json_skip_ws(b, i);
+            match b.get(*i) {
+                Some(b',') => *i += 1,
+                Some(b']') => {
+                    *i += 1;
+                    break;
+                }
+                _ => return Err(Thrown("SyntaxError: Expected ',' or ']' in JSON array".into())),
+            }
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(items))))
+    }
+
+    fn json_parse_object(&mut self, src: &str, i: &mut usize) -> Result<Value, Thrown> {
+        let b = src.as_bytes();
+        *i += 1; // '{'
+        let mut pairs: Vec<(String, Value)> = Vec::new();
+        json_skip_ws(b, i);
+        if b.get(*i) != Some(&b'}') {
+            loop {
+                json_skip_ws(b, i);
+                if b.get(*i) != Some(&b'"') {
+                    return Err(Thrown("SyntaxError: Expected property name string in JSON".into()));
+                }
+                let key = json_parse_string(src, i)?;
+                json_skip_ws(b, i);
+                if b.get(*i) != Some(&b':') {
+                    return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
+                }
+                *i += 1;
+                json_skip_ws(b, i);
+                let val = self.json_parse_value(src, i)?;
+                pairs.push((key, val));
+                json_skip_ws(b, i);
+                match b.get(*i) {
+                    Some(b',') => *i += 1,
+                    Some(b'}') => break,
+                    _ => return Err(Thrown("SyntaxError: Expected ',' or '}' in JSON object".into())),
+                }
+            }
+        }
+        *i += 1; // '}'
+        let mut map = crate::heap::ObjMap::new();
+        for (k, v) in pairs {
+            map.set(&k, v);
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Object(map))))
     }
 
     /// JS `typeof` type-name. `null` is `"object"` (a historic quirk); functions
@@ -3048,6 +3156,135 @@ fn json_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn json_skip_ws(b: &[u8], i: &mut usize) {
+    while matches!(b.get(*i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        *i += 1;
+    }
+}
+
+/// Match a literal `word` (true/false/null) at `*i`, advancing past it.
+fn json_expect(b: &[u8], i: &mut usize, word: &str) -> Result<(), Thrown> {
+    if b[*i..].starts_with(word.as_bytes()) {
+        *i += word.len();
+        Ok(())
+    } else {
+        Err(Thrown("SyntaxError: Unexpected token in JSON".into()))
+    }
+}
+
+/// Read exactly 4 hex digits at `pos` as a code unit.
+fn json_hex4(b: &[u8], pos: usize) -> Result<u32, Thrown> {
+    if pos + 4 > b.len() {
+        return Err(Thrown("SyntaxError: Bad unicode escape in JSON".into()));
+    }
+    let mut v = 0u32;
+    for k in 0..4 {
+        let d = match b[pos + k] {
+            c @ b'0'..=b'9' => (c - b'0') as u32,
+            c @ b'a'..=b'f' => (c - b'a' + 10) as u32,
+            c @ b'A'..=b'F' => (c - b'A' + 10) as u32,
+            _ => return Err(Thrown("SyntaxError: Bad unicode escape in JSON".into())),
+        };
+        v = v * 16 + d;
+    }
+    Ok(v)
+}
+
+/// Parse a JSON string literal starting at the opening `"` (index `*i`), applying
+/// escapes (incl. `\uXXXX` and surrogate pairs). Plain content is flushed as UTF-8
+/// slices so multi-byte characters survive intact.
+fn json_parse_string(src: &str, i: &mut usize) -> Result<String, Thrown> {
+    let b = src.as_bytes();
+    *i += 1; // opening quote
+    let mut out = String::new();
+    let mut run = *i;
+    loop {
+        match b.get(*i).copied() {
+            None => return Err(Thrown("SyntaxError: Unterminated string in JSON".into())),
+            Some(b'"') => {
+                out.push_str(&src[run..*i]);
+                *i += 1;
+                return Ok(out);
+            }
+            Some(b'\\') => {
+                out.push_str(&src[run..*i]); // flush the plain run before the escape
+                *i += 1;
+                match b.get(*i).copied() {
+                    Some(b'"') => out.push('"'),
+                    Some(b'\\') => out.push('\\'),
+                    Some(b'/') => out.push('/'),
+                    Some(b'n') => out.push('\n'),
+                    Some(b'r') => out.push('\r'),
+                    Some(b't') => out.push('\t'),
+                    Some(b'b') => out.push('\u{0008}'),
+                    Some(b'f') => out.push('\u{000c}'),
+                    Some(b'u') => {
+                        let cp = json_hex4(b, *i + 1)?;
+                        *i += 4; // past the 4 hex (now at the last one)
+                        let ch = if (0xD800..=0xDBFF).contains(&cp) {
+                            // High surrogate: combine with a following \uXXXX low.
+                            if b.get(*i + 1) == Some(&b'\\') && b.get(*i + 2) == Some(&b'u') {
+                                let lo = json_hex4(b, *i + 3)?;
+                                if (0xDC00..=0xDFFF).contains(&lo) {
+                                    *i += 6;
+                                    let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                    char::from_u32(c).unwrap_or('\u{FFFD}')
+                                } else {
+                                    '\u{FFFD}'
+                                }
+                            } else {
+                                '\u{FFFD}'
+                            }
+                        } else {
+                            char::from_u32(cp).unwrap_or('\u{FFFD}')
+                        };
+                        out.push(ch);
+                    }
+                    _ => return Err(Thrown("SyntaxError: Invalid escape in JSON string".into())),
+                }
+                *i += 1;
+                run = *i;
+            }
+            // A raw control character (< 0x20) is invalid in a JSON string — it
+            // must be escaped (`\n`, `	`, …). (Matches the spec / node.)
+            Some(c) if c < 0x20 => {
+                return Err(Thrown("SyntaxError: Bad control character in string literal in JSON".into()));
+            }
+            Some(_) => *i += 1, // plain byte (ASCII or UTF-8 continuation) — sliced later
+        }
+    }
+}
+
+/// Parse a JSON number token at `*i`.
+fn json_parse_number(b: &[u8], i: &mut usize) -> Result<Value, Thrown> {
+    let start = *i;
+    if b.get(*i) == Some(&b'-') {
+        *i += 1;
+    }
+    while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
+        *i += 1;
+    }
+    if b.get(*i) == Some(&b'.') {
+        *i += 1;
+        while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
+            *i += 1;
+        }
+    }
+    if matches!(b.get(*i), Some(b'e' | b'E')) {
+        *i += 1;
+        if matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+        }
+        while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
+            *i += 1;
+        }
+    }
+    match std::str::from_utf8(&b[start..*i]).unwrap_or("").parse::<f64>() {
+        Ok(n) => Ok(Value::num(n)),
+        Err(_) => Err(Thrown("SyntaxError: Invalid number in JSON".into())),
+    }
 }
 
 /// Wrap JSON `parts` in `open`/`close`, compact when `indent` is empty, else

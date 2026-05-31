@@ -1799,6 +1799,13 @@ impl<'a> FnCompiler<'a> {
         // replacer arg is ignored; `space` controls indentation).
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             if let ox::Expression::Identifier(obj) = &m.object {
+                if obj.name == "JSON" && m.property.name == "parse" && c.arguments.len() == 1 {
+                    if let Some(ae) = c.arguments[0].as_expression() {
+                        let a = self.expr(ae)?;
+                        self.emit(Instr::JsonParse { dst, a });
+                        return Ok(dst);
+                    }
+                }
                 if obj.name == "JSON" && m.property.name == "stringify" && !c.arguments.is_empty() {
                     if let Some(ve) = c.arguments[0].as_expression() {
                         let val = self.expr(ve)?;

@@ -78,6 +78,8 @@ pub enum Instr {
     /// `dst = JSON.stringify(val, _, space)` — `space` is the indentation arg
     /// (a number → that many spaces, a string → that string, else compact).
     JsonStringify { dst: Reg, val: Reg, space: Reg },
+    /// `dst = JSON.parse(a)` — parse a JSON string; throws SyntaxError on invalid.
+    JsonParse { dst: Reg, a: Reg },
     /// `dst = Math.<op>(args…)` — a builtin Math function over `argc` contiguous
     /// argument registers starting at `arg_base`.
     MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },
