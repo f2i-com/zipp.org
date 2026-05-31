@@ -3075,18 +3075,25 @@ impl<'p> Vm<'p> {
                 // Numeric key (incl. an integral double — a JIT region produces
                 // f64 indices, and a deopted string index must agree): char at i.
                 if let Some(i) = array_index(key) {
-                    // O(1) for ASCII (i-th char == i-th byte); otherwise walk
-                    // scalars (O(i), correct for multi-byte UTF-8).
-                    let ch = if s.ascii {
-                        s.bytes.as_bytes().get(i).map(|&b| b as char)
-                    } else {
-                        s.bytes.chars().nth(i)
-                    };
-                    if let Some(ch) = ch {
-                        let cs = ch.to_string();
-                        return Ok(self.alloc_str(cs));
+                    // A single ASCII char is interned at heap index == its byte
+                    // (see Heap::new), so return that slot DIRECTLY — no temporary
+                    // 1-char String + re-intern per access (that alloc dominated
+                    // `s[i]` scans). O(1) for ASCII (i-th char == i-th byte); a
+                    // multi-byte string walks scalars (O(i), correct).
+                    if s.ascii {
+                        return Ok(match s.bytes.as_bytes().get(i) {
+                            Some(&b) => Value::heap(b as u32),
+                            None => Value::UNDEFINED,
+                        });
                     }
-                    return Ok(Value::UNDEFINED);
+                    match s.bytes.chars().nth(i) {
+                        Some(ch) if (ch as u32) < 128 => return Ok(Value::heap(ch as u32)),
+                        Some(ch) => {
+                            let cs = ch.to_string();
+                            return Ok(self.alloc_str(cs));
+                        }
+                        None => return Ok(Value::UNDEFINED),
+                    }
                 }
                 // Non-numeric key: only `s["length"]` is meaningful — mirror the
                 // array and `s.length` paths.
