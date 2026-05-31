@@ -1069,7 +1069,7 @@ impl<'a> FnCompiler<'a> {
     /// Compile a `class C { … }` declaration: build the method + constructor
     /// protos, register a ClassDef, and bind `C` to the materialized class value.
     fn class_decl(&mut self, class: &ox::Class) -> R<()> {
-        let (class_id, static_fields) = self.compile_class(class)?;
+        let (class_id, static_fields, computed) = self.compile_class(class)?;
         let name = class.id.as_ref().map(|i| i.name.to_string());
         let Some(n) = name else { return Ok(()) };
 
@@ -1126,6 +1126,13 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
             self.next_reg = save;
         }
+        // Computed-key methods: evaluate each key now and install it on the class.
+        for (key, func, kind) in &computed {
+            let save = self.next_reg;
+            let kr = self.expr(key)?;
+            self.emit(Instr::ClassAddMember { class: cls, key: kr, func: *func, kind: *kind });
+            self.next_reg = save;
+        }
         match &dest {
             Dest::Reg(_) => {}
             Dest::Cell(cell, t) => {
@@ -1146,10 +1153,15 @@ impl<'a> FnCompiler<'a> {
     /// as non-capturing functions (free vars resolve to globals), so a class at
     /// module scope works fully; `extends`/`super`, static members, and
     /// get/set accessors are out of this subset.
+    #[allow(clippy::type_complexity)]
     fn compile_class<'b>(
         &mut self,
         class: &'b ox::Class,
-    ) -> R<(u32, Vec<(String, Option<&'b ox::Expression<'b>>)>)> {
+    ) -> R<(
+        u32,
+        Vec<(String, Option<&'b ox::Expression<'b>>)>,
+        Vec<(&'b ox::Expression<'b>, u32, u8)>,
+    )> {
         // `extends P`: P must be a class declared earlier (resolved to its id);
         // arbitrary superclass expressions / built-ins are out of the subset.
         let super_class_id = match &class.super_class {
@@ -1188,31 +1200,57 @@ impl<'a> FnCompiler<'a> {
         let mut statics: Vec<(String, &ox::Function)> = Vec::new();
         let mut fields: Vec<(String, Option<&ox::Expression>)> = Vec::new();
         let mut static_fields: Vec<(String, Option<&'b ox::Expression<'b>>)> = Vec::new();
+        // Members with a runtime-computed key (`[expr]() {}`) — the key is
+        // evaluated and the member installed at class-creation time (see
+        // class_decl). kind: 0=method 1=getter 2=setter 3=static method.
+        let mut computed: Vec<(&'b ox::Expression<'b>, &'b ox::Function<'b>, u8)> = Vec::new();
         for el in &class.body.body {
             match el {
-                ox::ClassElement::MethodDefinition(m) => match (m.r#static, m.kind) {
-                    (true, ox::MethodDefinitionKind::Method) => {
-                        statics.push((class_key_name(&m.key)?, &m.value));
+                ox::ClassElement::MethodDefinition(m) => {
+                    // A constructor is never computed; otherwise a key that
+                    // class_key_name can't name statically (and is `computed`) is a
+                    // runtime-keyed member.
+                    let kind = match m.kind {
+                        ox::MethodDefinitionKind::Constructor => {
+                            ctor_fn = Some(&m.value);
+                            continue;
+                        }
+                        ox::MethodDefinitionKind::Get => 1u8,
+                        ox::MethodDefinitionKind::Set => 2u8,
+                        ox::MethodDefinitionKind::Method if m.r#static => 3u8,
+                        ox::MethodDefinitionKind::Method => 0u8,
+                    };
+                    match class_key_name(&m.key) {
+                        Ok(name) => match (m.r#static, m.kind) {
+                            (true, ox::MethodDefinitionKind::Method) => statics.push((name, &m.value)),
+                            (true, _) => {
+                                return Err("static getters/setters are not in the zipp-vm subset yet".into())
+                            }
+                            (false, ox::MethodDefinitionKind::Method) => methods.push((name, &m.value)),
+                            (false, ox::MethodDefinitionKind::Get) => getters.push((name, &m.value)),
+                            (false, ox::MethodDefinitionKind::Set) => setters.push((name, &m.value)),
+                            (false, ox::MethodDefinitionKind::Constructor) => unreachable!(),
+                        },
+                        Err(e) if m.computed => {
+                            if m.r#static && m.kind != ox::MethodDefinitionKind::Method {
+                                return Err("static computed getters/setters are not in the zipp-vm subset yet".into());
+                            }
+                            let key = m.key.as_expression().ok_or(e)?;
+                            computed.push((key, &m.value, kind));
+                        }
+                        Err(e) => return Err(e),
                     }
-                    (true, _) => {
-                        return Err("static getters/setters are not in the zipp-vm subset yet".into());
-                    }
-                    (false, ox::MethodDefinitionKind::Constructor) => ctor_fn = Some(&m.value),
-                    (false, ox::MethodDefinitionKind::Method) => {
-                        methods.push((class_key_name(&m.key)?, &m.value));
-                    }
-                    (false, ox::MethodDefinitionKind::Get) => {
-                        getters.push((class_key_name(&m.key)?, &m.value));
-                    }
-                    (false, ox::MethodDefinitionKind::Set) => {
-                        setters.push((class_key_name(&m.key)?, &m.value));
-                    }
-                },
+                }
                 ox::ClassElement::PropertyDefinition(p) => {
+                    // Computed FIELD names (`[k] = v`) aren't supported yet (would
+                    // need per-instance ctor init); static/instance string-keyed
+                    // fields work.
+                    let name = class_key_name(&p.key)
+                        .map_err(|_| "computed class field names are not in the zipp-vm subset yet")?;
                     if p.r#static {
-                        static_fields.push((class_key_name(&p.key)?, p.value.as_ref()));
+                        static_fields.push((name, p.value.as_ref()));
                     } else {
-                        fields.push((class_key_name(&p.key)?, p.value.as_ref()));
+                        fields.push((name, p.value.as_ref()));
                     }
                 }
                 ox::ClassElement::StaticBlock(_) => {
@@ -1325,6 +1363,27 @@ impl<'a> FnCompiler<'a> {
         } else {
             None
         };
+        // Computed-key method protos. They carry no static name, so they're
+        // installed at runtime by class_decl (which evaluates each key) via
+        // ClassAddMember; here we just compile each proto and pair it with its key.
+        let mut computed_defs: Vec<(&'b ox::Expression<'b>, u32, u8)> = Vec::new();
+        for (key, func, kind) in &computed {
+            let (params, rest, body) = function_parts(func)?;
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.[computed]"),
+                &params,
+                rest.as_deref(),
+                Some(&*func.params),
+                &[],
+                body,
+                if *kind == 3 { None } else { super_class_id }, // statics get no super
+                func.generator,
+                func.r#async,
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            computed_defs.push((key, fid, *kind));
+        }
         self.cx.classes[class_id as usize] = ClassDef {
             name: cname,
             ctor,
@@ -1334,7 +1393,7 @@ impl<'a> FnCompiler<'a> {
             setters: setter_defs,
             statics: static_defs,
         };
-        Ok((class_id, static_fields))
+        Ok((class_id, static_fields, computed_defs))
     }
 
     /// The enclosing-function chain to hand a function nested in THIS one: our

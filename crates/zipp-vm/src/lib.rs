@@ -1408,6 +1408,15 @@ mod tests {
     }
 
     #[test]
+    fn computed_class_member_keys() {
+        // Runtime-computed method / getter / setter / static keys.
+        assert_eq!(run_ok("let m='m'+1; class C{[m](){return 7}} console.log(new C().m1())"), vec!["7"]);
+        assert_eq!(run_ok("class C{constructor(){this.x=3} ['a'+'b'](){return this.x}} console.log(new C().ab())"), vec!["3"]);
+        assert_eq!(run_ok("class C{get [('v'+'al')](){return 42} set [('v'+'al')](z){this.x=z*2} ['get'+'X'](){return this.x}} let c=new C(); c.val=10; console.log(c.val, c.getX())"), vec!["42 20"]);
+        assert_eq!(run_ok("class C{static ['s'+'q'](n){return n*n}} console.log(C.sq(5))"), vec!["25"]);
+    }
+
+    #[test]
     fn private_class_members() {
         // Private fields read/write/update, a private method, and a private getter.
         assert_eq!(run_ok("class C{#n=0; #step; constructor(s){this.#step=s} inc(){this.#n+=this.#step; return this} get value(){return this.#n} #secret(){return this.#n*2} reveal(){return this.#secret()}} let c=new C(5); c.inc().inc(); console.log(c.value, c.reveal())"), vec!["10 20"]);

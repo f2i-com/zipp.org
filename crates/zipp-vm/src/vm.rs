@@ -1100,6 +1100,32 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::ClassAddMember { class, key, func, kind } => {
+                        let cv = self.get(base, class);
+                        let k = self.get(base, key);
+                        let kstr = self.display(k);
+                        let fv = Value::heap(self.heap.alloc(HeapObj::Func(func)));
+                        if let HeapObj::Class { methods, getters, setters, statics, .. } =
+                            self.heap.get_mut(cv.heap_index())
+                        {
+                            if kind == 3 {
+                                statics.set(&kstr, fv); // static method
+                            } else {
+                                let list = match kind {
+                                    1 => getters,
+                                    2 => setters,
+                                    _ => methods,
+                                };
+                                // Replace a same-key member, else append.
+                                if let Some(slot) = list.iter_mut().find(|(n, _)| *n == kstr) {
+                                    slot.1 = fv;
+                                } else {
+                                    list.push((kstr, fv));
+                                }
+                            }
+                        }
+                        ip += 1;
+                    }
                     Instr::New { dst, callee, arg_base, argc } => {
                         let cv = self.get(base, callee);
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
