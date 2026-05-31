@@ -912,17 +912,20 @@ impl<'p> Vm<'p> {
                         let cd = self.program.classes[class_id as usize].clone();
                         // Materialize each method as a Func value once; instances
                         // share these (no per-access alloc, no per-instance copy).
-                        let methods: Vec<(String, Value)> = cd
-                            .methods
-                            .iter()
-                            .map(|(n, fid)| {
-                                (n.clone(), Value::heap(self.heap.alloc(HeapObj::Func(*fid))))
-                            })
-                            .collect();
+                        let mk = |heap: &mut Heap, defs: &[(String, u32)]| -> Vec<(String, Value)> {
+                            defs.iter()
+                                .map(|(n, fid)| {
+                                    (n.clone(), Value::heap(heap.alloc(HeapObj::Func(*fid))))
+                                })
+                                .collect()
+                        };
+                        let methods = mk(&mut self.heap, &cd.methods);
+                        let getters = mk(&mut self.heap, &cd.getters);
                         let v = Value::heap(self.heap.alloc(HeapObj::Class {
                             name: cd.name,
                             ctor: cd.ctor,
                             methods,
+                            getters,
                         }));
                         self.set(base, dst, v);
                         ip += 1;
@@ -1783,12 +1786,21 @@ impl<'p> Vm<'p> {
                 if let Some(v) = map.get(key) {
                     return Ok(v);
                 }
-                // Own-property miss: resolve a method through the instance's class.
+                // Own-property miss: resolve a method or getter through the class.
                 if let Some(cidx) = map.class {
-                    if let HeapObj::Class { methods, .. } = self.heap.get(cidx) {
+                    let (mut method, mut getter) = (None, None);
+                    if let HeapObj::Class { methods, getters, .. } = self.heap.get(cidx) {
                         if let Some((_, v)) = methods.iter().find(|(k, _)| k == key) {
-                            return Ok(*v);
+                            method = Some(*v);
+                        } else if let Some((_, v)) = getters.iter().find(|(k, _)| k == key) {
+                            getter = Some(*v);
                         }
+                    }
+                    if let Some(m) = method {
+                        return Ok(m);
+                    }
+                    if let Some(g) = getter {
+                        return self.call_value(g, obj, &[]); // run the getter, this = obj
                     }
                 }
                 Ok(Value::UNDEFINED)

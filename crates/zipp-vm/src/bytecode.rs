@@ -399,4 +399,6 @@ pub struct ClassDef {
     pub name: String,
     pub ctor: Option<u32>,
     pub methods: Vec<(String, u32)>,
+    /// `get name()` accessors: invoked (with `this` = instance) on property read.
+    pub getters: Vec<(String, u32)>,
 }

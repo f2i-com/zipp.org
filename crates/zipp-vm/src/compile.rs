@@ -949,6 +949,7 @@ impl<'a> FnCompiler<'a> {
         let cname = class.id.as_ref().map(|i| i.name.to_string()).unwrap_or_else(|| "<class>".into());
         let mut ctor_fn: Option<&ox::Function> = None;
         let mut methods: Vec<(String, &ox::Function)> = Vec::new();
+        let mut getters: Vec<(String, &ox::Function)> = Vec::new();
         let mut fields: Vec<(String, Option<&ox::Expression>)> = Vec::new();
         for el in &class.body.body {
             match el {
@@ -961,7 +962,12 @@ impl<'a> FnCompiler<'a> {
                         ox::MethodDefinitionKind::Method => {
                             methods.push((class_key_name(&m.key)?, &m.value));
                         }
-                        _ => return Err("class get/set accessors are not in the zipp-vm subset yet".into()),
+                        ox::MethodDefinitionKind::Get => {
+                            getters.push((class_key_name(&m.key)?, &m.value));
+                        }
+                        ox::MethodDefinitionKind::Set => {
+                            return Err("class set accessors are not in the zipp-vm subset yet".into());
+                        }
                     }
                 }
                 ox::ClassElement::PropertyDefinition(p) => {
@@ -992,6 +998,22 @@ impl<'a> FnCompiler<'a> {
             self.cx.functions.push(proto);
             method_defs.push((mname.clone(), fid));
         }
+        // Getter protos (compiled identically to a no-arg method).
+        let mut getter_defs: Vec<(String, u32)> = Vec::new();
+        for (gname, func) in &getters {
+            let (params, rest, body) = function_parts(func)?;
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.get {gname}"),
+                &params,
+                rest.as_deref(),
+                Some(&*func.params),
+                &[],
+                body,
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            getter_defs.push((gname.clone(), fid));
+        }
         // Constructor proto (only needed when there's a ctor or any field init).
         let ctor = if ctor_fn.is_some() || !fields.is_empty() {
             let (params, rest, body) = match ctor_fn {
@@ -1014,7 +1036,12 @@ impl<'a> FnCompiler<'a> {
             None
         };
         let class_id = self.cx.classes.len() as u32;
-        self.cx.classes.push(ClassDef { name: cname, ctor, methods: method_defs });
+        self.cx.classes.push(ClassDef {
+            name: cname,
+            ctor,
+            methods: method_defs,
+            getters: getter_defs,
+        });
         Ok(class_id)
     }
 

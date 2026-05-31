@@ -106,7 +106,13 @@ pub enum HeapObj {
     /// object, installs the methods as own properties, and runs the ctor with
     /// `this` = the new object. No prototype chain (methods are own props) and no
     /// inheritance in this subset.
-    Class { name: String, ctor: Option<u32>, methods: Vec<(String, Value)> },
+    Class {
+        name: String,
+        ctor: Option<u32>,
+        methods: Vec<(String, Value)>,
+        /// `get x()` accessors, invoked with `this` = instance on property read.
+        getters: Vec<(String, Value)>,
+    },
 }
 
 /// Heap index of the interned empty string. The 128 single-ASCII-char strings

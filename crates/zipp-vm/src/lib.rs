@@ -1133,6 +1133,9 @@ mod tests {
         // Arrays of instances; console.log prints the constructor name.
         assert_eq!(run_ok("class Pt{constructor(x){this.x=x}} console.log([new Pt(1),new Pt(2)].map(p=>p.x).join(','))"), vec!["1,2"]);
         assert_eq!(run_ok("class Pt{constructor(x,y){this.x=x;this.y=y}} console.log(new Pt(3,4))"), vec!["Pt { x: 3, y: 4 }"]);
+        // Getters: invoked on read (this = instance), not enumerable.
+        assert_eq!(run_ok("class C{constructor(){this.items=[1,2,3]} get size(){return this.items.length}} console.log(new C().size)"), vec!["3"]);
+        assert_eq!(run_ok("class C{constructor(){this.n=1} get d(){return this.n*2}} let c=new C(); console.log(c.d, Object.keys(c).join(','))"), vec!["2 n"]);
     }
 
     #[test]
