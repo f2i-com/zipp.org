@@ -1031,6 +1031,27 @@ mod tests {
     }
 
     #[test]
+    fn static_builtins() {
+        // Array.from over array / string / array-like, with and without a map fn.
+        assert_eq!(run_ok("console.log(Array.from([1,2,3],x=>x*2).join(','))"), vec!["2,4,6"]);
+        assert_eq!(run_ok("console.log(Array.from({length:3},(_, i)=>i).join(','))"), vec!["0,1,2"]);
+        assert_eq!(run_ok("console.log(Array.from('abc').join('-'))"), vec!["a-b-c"]);
+        assert_eq!(run_ok("console.log(Array.of(1,2,3).join(','), Array.of(7).length)"), vec!["1,2,3 1"]);
+        // Object.assign mutates + returns the target.
+        assert_eq!(run_ok("let t={a:1}; let r=Object.assign(t,{a:9,b:2}); console.log(r===t, t.a, t.b)"), vec!["true 9 2"]);
+        // String.fromCharCode.
+        assert_eq!(run_ok("console.log(String.fromCharCode(72,73,33))"), vec!["HI!"]);
+        // Number.isX (no coercion).
+        assert_eq!(run_ok("console.log(Number.isInteger(5), Number.isInteger(5.5), Number.isInteger('5'))"), vec!["true false false"]);
+        assert_eq!(run_ok("console.log(Number.isSafeInteger(2**53-1), Number.isSafeInteger(2**53))"), vec!["true false"]);
+        // Math.max/min spread (incl. mixed plain + spread args).
+        assert_eq!(run_ok("let a=[4,2,8,1]; console.log(Math.max(...a), Math.min(...a), Math.max(1,...[5,3],10))"), vec!["8 1 10"]);
+        // .at() with negative indexing on arrays and strings.
+        assert_eq!(run_ok("console.log([10,20,30].at(-1), [1,2].at(5))"), vec!["30 undefined"]);
+        assert_eq!(run_ok("console.log('hello'.at(-1), 'hi'.at(10))"), vec!["o undefined"]);
+    }
+
+    #[test]
     fn bitwise_and_exponent() {
         assert_eq!(run_ok("console.log(5 & 3, 5 | 2, 5 ^ 1, ~5)"), vec!["1 7 4 -6"]);
         assert_eq!(run_ok("console.log(1<<4, 256>>2, -8>>1)"), vec!["16 64 -4"]);

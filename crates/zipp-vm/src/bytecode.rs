@@ -106,6 +106,16 @@ pub enum Instr {
     MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },
     /// `dst = <Number|parseInt|parseFloat>(args…)` — a builtin global function.
     GlobalFn { dst: Reg, op: GlobalFn, arg_base: Reg, argc: u16 },
+    /// `dst = <static builtin>(args…)` — a constructor-namespace static method
+    /// over `argc` contiguous arg registers (Object.assign, Array.of,
+    /// String.fromCharCode, Number.isInteger/isNaN/isFinite/isSafeInteger).
+    StaticFn { dst: Reg, op: StaticFn, arg_base: Reg, argc: u16 },
+    /// `dst = Array.from(src[, mapfn])`. `mapfn` is a function value, or
+    /// undefined-in-register when absent (the compiler loads undefined there).
+    ArrayFrom { dst: Reg, src: Reg, mapfn: Reg },
+    /// `dst = Math.<op>(...arr)` — a variadic Math reduction (max/min/hypot)
+    /// applied to the elements of the array in `args`.
+    MathSpread { dst: Reg, op: MathFn, args: Reg },
     /// `dst = (val instanceof <ctor>)` for a built-in constructor (Array, Object,
     /// Function, Error and its subclasses). User constructors are out of scope.
     InstanceOf { dst: Reg, val: Reg, ctor: InstanceCtor },
@@ -272,6 +282,41 @@ impl GlobalFn {
             "parseFloat" => GlobalFn::ParseFloat,
             "isNaN" => GlobalFn::IsNaN,
             "isFinite" => GlobalFn::IsFinite,
+            _ => return None,
+        })
+    }
+}
+
+/// Constructor-namespace static methods that take a flat argument list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticFn {
+    /// `Object.assign(target, ...sources)` — copy own keys; returns target.
+    ObjectAssign,
+    /// `Array.of(...items)` — a new array of the arguments.
+    ArrayOf,
+    /// `String.fromCharCode(...codes)` — string from UTF-16 code units.
+    StringFromCharCode,
+    /// `Number.isInteger(x)` — no coercion.
+    NumberIsInteger,
+    /// `Number.isNaN(x)` — no coercion.
+    NumberIsNaN,
+    /// `Number.isFinite(x)` — no coercion.
+    NumberIsFinite,
+    /// `Number.isSafeInteger(x)` — integer within ±(2^53 − 1).
+    NumberIsSafeInteger,
+}
+
+impl StaticFn {
+    /// Map `Namespace.method` to its static function, if supported.
+    pub fn from_name(ns: &str, method: &str) -> Option<StaticFn> {
+        Some(match (ns, method) {
+            ("Object", "assign") => StaticFn::ObjectAssign,
+            ("Array", "of") => StaticFn::ArrayOf,
+            ("String", "fromCharCode") => StaticFn::StringFromCharCode,
+            ("Number", "isInteger") => StaticFn::NumberIsInteger,
+            ("Number", "isNaN") => StaticFn::NumberIsNaN,
+            ("Number", "isFinite") => StaticFn::NumberIsFinite,
+            ("Number", "isSafeInteger") => StaticFn::NumberIsSafeInteger,
             _ => return None,
         })
     }

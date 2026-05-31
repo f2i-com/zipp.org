@@ -969,6 +969,62 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
+                    Instr::StaticFn { dst, op, arg_base, argc } => {
+                        use crate::bytecode::StaticFn as S;
+                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                        for i in 0..argc {
+                            args.push(self.get(base, arg_base + i));
+                        }
+                        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                        let v = match op {
+                            S::ArrayOf => Value::heap(self.heap.alloc(HeapObj::Array(args))),
+                            S::NumberIsInteger => Value::bool(num_is_integer(a0)),
+                            S::NumberIsNaN => Value::bool(a0.is_double() && a0.as_f64().is_nan()),
+                            S::NumberIsFinite => Value::bool(num_is_finite(a0)),
+                            S::NumberIsSafeInteger => Value::bool(num_is_safe_integer(a0)),
+                            S::StringFromCharCode => {
+                                let s: String = args
+                                    .iter()
+                                    .map(|&v| {
+                                        // ToUint16 of each code unit.
+                                        let u = to_uint32(self.to_number(v).unwrap_or(0.0)) as u16;
+                                        char::from_u32(u as u32).unwrap_or('\u{FFFD}')
+                                    })
+                                    .collect();
+                                self.alloc_str(s)
+                            }
+                            S::ObjectAssign => self.object_assign(&args)?,
+                        };
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::ArrayFrom { dst, src, mapfn } => {
+                        let sv = self.get(base, src);
+                        let fnv = self.get(base, mapfn);
+                        let out = self.array_from(sv, fnv)?;
+                        self.set(base, dst, out);
+                        ip += 1;
+                    }
+                    Instr::MathSpread { dst, op, args } => {
+                        use crate::bytecode::MathFn as M;
+                        let av = self.get(base, args);
+                        let elems = self.array_snapshot(av.heap_index());
+                        let nums: Vec<f64> =
+                            elems.iter().map(|&v| self.to_number(v)).collect::<Result<_, _>>()?;
+                        let r = match op {
+                            M::Max => nums.iter().fold(f64::NEG_INFINITY, |a, &b| {
+                                if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
+                            }),
+                            M::Min => nums.iter().fold(f64::INFINITY, |a, &b| {
+                                if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) }
+                            }),
+                            M::Hypot => nums.iter().map(|&v| v * v).sum::<f64>().sqrt(),
+                            // A non-variadic Math fn spread is unusual; apply to elem 0.
+                            _ => self.eval_math_one(op, nums.first().copied().unwrap_or(f64::NAN)),
+                        };
+                        self.set(base, dst, Value::num(r));
+                        ip += 1;
+                    }
 
                     Instr::Jump { target } => {
                         let t = target as usize;
@@ -1715,42 +1771,14 @@ impl<'p> Vm<'p> {
             }
             M::Pow => arg(0)?.powf(arg(1)?),
             M::Atan2 => arg(0)?.atan2(arg(1)?),
-            _ => {
-                let x = arg(0)?;
-                match op {
-                    M::Abs => x.abs(),
-                    M::Floor => x.floor(),
-                    M::Ceil => x.ceil(),
-                    M::Round => (x + 0.5).floor(), // JS half-up, ≠ Rust's half-away-from-zero
-                    M::Trunc => x.trunc(),
-                    M::Sign => {
-                        if x.is_nan() {
-                            f64::NAN
-                        } else if x > 0.0 {
-                            1.0
-                        } else if x < 0.0 {
-                            -1.0
-                        } else {
-                            x // preserve +0 / -0
-                        }
-                    }
-                    M::Sqrt => x.sqrt(),
-                    M::Cbrt => x.cbrt(),
-                    M::Exp => x.exp(),
-                    M::Log => x.ln(),
-                    M::Log2 => x.log2(),
-                    M::Log10 => x.log10(),
-                    M::Sin => x.sin(),
-                    M::Cos => x.cos(),
-                    M::Tan => x.tan(),
-                    M::Asin => x.asin(),
-                    M::Acos => x.acos(),
-                    M::Atan => x.atan(),
-                    // Pow/Atan2/Min/Max/Hypot handled above.
-                    _ => unreachable!(),
-                }
-            }
+            _ => math_unary(op, arg(0)?),
         })
+    }
+
+    /// `Math.<op>` reduced to a single f64 result (used by the `MathSpread`
+    /// fallback for an unusual non-variadic spread like `Math.abs(...arr)`).
+    fn eval_math_one(&self, op: crate::bytecode::MathFn, x: f64) -> f64 {
+        math_unary(op, x)
     }
 
     /// The per-level indent string for `JSON.stringify`'s `space` argument: a
@@ -2093,6 +2121,105 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::Object(map)))
     }
 
+    /// `Object.assign(target, ...sources)`: copy each source's own enumerable
+    /// keys (object keys, or an array's index strings) onto `target`; returns
+    /// `target`. Primitive (incl. null/undefined) sources contribute nothing.
+    fn object_assign(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+        if !target.is_heap() || !matches!(self.heap.get(target.heap_index()), HeapObj::Object(_)) {
+            return Err(Thrown("TypeError: Object.assign target must be an object".into()));
+        }
+        let tidx = target.heap_index();
+        let mut added_any = false;
+        for &src in &args[1..] {
+            if !src.is_heap() {
+                continue;
+            }
+            // Gather (key, val) pairs under the immutable borrow, then write.
+            let pairs: Vec<(String, Value)> = match self.heap.get(src.heap_index()) {
+                HeapObj::Object(map) => {
+                    map.keys.iter().cloned().zip(map.vals.iter().copied()).collect()
+                }
+                HeapObj::Array(items) => {
+                    items.iter().enumerate().map(|(i, &v)| (i.to_string(), v)).collect()
+                }
+                _ => Vec::new(),
+            };
+            for (k, v) in pairs {
+                if let HeapObj::Object(map) = self.heap.get_mut(tidx) {
+                    added_any |= map.set(&k, v);
+                }
+            }
+        }
+        if added_any {
+            self.heap.bump_version(tidx);
+        }
+        Ok(target)
+    }
+
+    /// `Array.from(src[, mapFn])`: build an array from an array, a string's
+    /// chars, or an array-like (`{length, 0:…}`), applying `mapFn(value, index)`
+    /// when it is a function.
+    fn array_from(&mut self, src: Value, mapfn: Value) -> Result<Value, Thrown> {
+        // Classify the source under a short-lived borrow, then materialize its
+        // elements (the object/array-like path needs &mut self for get_prop).
+        enum Kind {
+            Arr,
+            Str,
+            Obj,
+            Other,
+        }
+        let mut elems: Vec<Value> = Vec::new();
+        let kind = if src.is_heap() {
+            match self.heap.get(src.heap_index()) {
+                HeapObj::Array(_) => Kind::Arr,
+                HeapObj::Str(_) | HeapObj::Cons { .. } => Kind::Str,
+                HeapObj::Object(_) => Kind::Obj,
+                _ => Kind::Other,
+            }
+        } else {
+            Kind::Other
+        };
+        match kind {
+            Kind::Arr => {
+                if let HeapObj::Array(items) = self.heap.get(src.heap_index()) {
+                    elems = items.clone();
+                }
+            }
+            Kind::Str => {
+                let chars: Vec<char> =
+                    self.heap.str_cow(src.heap_index()).unwrap().chars().collect();
+                elems = chars.into_iter().map(|c| self.alloc_str(c.to_string())).collect();
+            }
+            Kind::Obj => {
+                // Array-like: read its `length`, then indices 0..length.
+                let len = self.get_prop(src, "length")?;
+                let n = if len.is_number() && len.as_f64() >= 0.0 {
+                    len.as_f64() as usize
+                } else {
+                    0
+                };
+                for i in 0..n {
+                    elems.push(self.get_index(src, Value::int(i as i32))?);
+                }
+            }
+            Kind::Other => {}
+        }
+        // Apply the map callback, if given.
+        let has_map = mapfn.is_heap()
+            && matches!(
+                self.heap.get(mapfn.heap_index()),
+                HeapObj::Func(_) | HeapObj::Closure { .. }
+            );
+        if has_map {
+            for (i, slot) in elems.iter_mut().enumerate() {
+                let args = [*slot, Value::int(i as i32)];
+                *slot = self.call_value(mapfn, Value::UNDEFINED, &args)?;
+            }
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))))
+    }
+
     /// If `idx` is an Error-like object — an object whose `name` is one of the
     /// engine's error kinds — return that name, else `None`.
     fn error_name(&self, idx: u32) -> Option<String> {
@@ -2321,6 +2448,24 @@ impl<'p> Vm<'p> {
                     .map(|v| if v.is_nullish() { String::new() } else { self.display(*v) })
                     .collect();
                 Ok(Some(self.alloc_str(parts.join(&sep))))
+            }
+            "at" => {
+                // Negative index counts from the end; out of range → undefined.
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
+                let i = arg0.is_number().then(|| arg0.as_f64()).unwrap_or(0.0) as i64;
+                let abs = if i < 0 { i + len as i64 } else { i };
+                let v = if abs >= 0 && (abs as usize) < len {
+                    match self.heap.get(idx) {
+                        HeapObj::Array(items) => items[abs as usize],
+                        _ => Value::UNDEFINED,
+                    }
+                } else {
+                    Value::UNDEFINED
+                };
+                Ok(Some(v))
             }
             "indexOf" => {
                 let snapshot = self.array_snapshot(idx);
@@ -2563,6 +2708,17 @@ impl<'p> Vm<'p> {
                 Ok(Some(match cc {
                     Some(c) => Value::int(c as i32),
                     None => Value::num(f64::NAN),
+                }))
+            }
+            "at" => {
+                // Negative index counts from the end; out of range → undefined.
+                let len = s.chars().count() as i64;
+                let i = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
+                let abs = if i < 0 { i + len } else { i };
+                let ch = if abs >= 0 && abs < len { s.chars().nth(abs as usize) } else { None };
+                Ok(Some(match ch {
+                    Some(c) => self.alloc_str(c.to_string()),
+                    None => Value::UNDEFINED,
                 }))
             }
             "indexOf" => {
@@ -3544,6 +3700,73 @@ fn wrap_json(parts: &[String], open: char, close: char, indent: &str, depth: usi
     let pad_close = indent.repeat(depth);
     let sep = format!(",\n{pad}");
     format!("{open}\n{pad}{}\n{pad_close}{close}", parts.join(&sep))
+}
+
+/// A single-argument `Math.<op>` computation, matching JS where it diverges
+/// from Rust (`round` half-up; `sign` preserves ±0 and maps NaN→NaN). The
+/// variadic/binary ops never reach here with the real call paths; they fall
+/// back to operating on the one value provided.
+fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
+    use crate::bytecode::MathFn as M;
+    match op {
+        M::Abs => x.abs(),
+        M::Floor => x.floor(),
+        M::Ceil => x.ceil(),
+        M::Round => (x + 0.5).floor(),
+        M::Trunc => x.trunc(),
+        M::Sign => {
+            if x.is_nan() {
+                f64::NAN
+            } else if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                x
+            }
+        }
+        M::Sqrt => x.sqrt(),
+        M::Cbrt => x.cbrt(),
+        M::Exp => x.exp(),
+        M::Log => x.ln(),
+        M::Log2 => x.log2(),
+        M::Log10 => x.log10(),
+        M::Sin => x.sin(),
+        M::Cos => x.cos(),
+        M::Tan => x.tan(),
+        M::Asin => x.asin(),
+        M::Acos => x.acos(),
+        M::Atan => x.atan(),
+        // Pow/Atan2/Min/Max/Hypot aren't unary; degrade gracefully.
+        M::Min | M::Max => x,
+        M::Hypot => x.abs(),
+        M::Pow | M::Atan2 => f64::NAN,
+    }
+}
+
+/// `Number.isInteger`: a number with no fractional part (no coercion).
+fn num_is_integer(v: Value) -> bool {
+    if v.is_int() {
+        true
+    } else if v.is_double() {
+        let n = v.as_f64();
+        n.is_finite() && n.fract() == 0.0
+    } else {
+        false
+    }
+}
+
+/// `Number.isFinite`: a finite number (no coercion).
+fn num_is_finite(v: Value) -> bool {
+    v.is_int() || (v.is_double() && v.as_f64().is_finite())
+}
+
+/// `Number.isSafeInteger`: an integer within ±(2^53 − 1).
+fn num_is_safe_integer(v: Value) -> bool {
+    num_is_integer(v) && {
+        let n = if v.is_int() { v.as_int() as f64 } else { v.as_f64() };
+        n.abs() <= 9_007_199_254_740_991.0
+    }
 }
 
 /// JS `ToInt32`: truncate toward zero, take modulo 2^32, interpret as signed.

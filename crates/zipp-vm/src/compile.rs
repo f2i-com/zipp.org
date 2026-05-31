@@ -2011,6 +2011,19 @@ impl<'a> FnCompiler<'a> {
         // (plain function value). Spread on a builtin like Math.max(...arr) that
         // isn't a method call is out of scope.
         if c.arguments.iter().any(|a| matches!(a, ox::Argument::SpreadElement(_))) {
+            // `Math.max(...arr)` / `Math.min(...arr)` / `Math.hypot(...arr)` —
+            // a variadic Math reduction over the spread array.
+            if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+                if let ox::Expression::Identifier(obj) = &m.object {
+                    if obj.name == "Math" {
+                        if let Some(op) = crate::bytecode::MathFn::from_name(m.property.name.as_str()) {
+                            let args_arr = self.build_spread_args(&c.arguments)?;
+                            self.emit(Instr::MathSpread { dst, op, args: args_arr });
+                            return Ok(dst);
+                        }
+                    }
+                }
+            }
             // Method call `obj.m(...)` — evaluate the receiver first so `this`
             // binds correctly, then build args, then CallMethodSpread.
             if let ox::Expression::StaticMemberExpression(m) = &c.callee {
@@ -2158,6 +2171,40 @@ impl<'a> FnCompiler<'a> {
                     if let Some(op) = crate::bytecode::MathFn::from_name(m.property.name.as_str()) {
                         let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
                         self.emit(Instr::MathOp { dst, op, arg_base, argc });
+                        return Ok(dst);
+                    }
+                }
+            }
+        }
+
+        // Constructor-namespace static methods with a flat arg list:
+        // Object.assign, Array.of, String.fromCharCode, Number.isInteger/… .
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            if let ox::Expression::Identifier(obj) = &m.object {
+                if let Some(op) =
+                    crate::bytecode::StaticFn::from_name(&obj.name, m.property.name.as_str())
+                {
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    self.emit(Instr::StaticFn { dst, op, arg_base, argc });
+                    return Ok(dst);
+                }
+                // `Array.from(src[, mapFn])` — needs iteration + optional callback.
+                if obj.name == "Array" && m.property.name == "from" && !c.arguments.is_empty() {
+                    if let Some(se) = c.arguments[0].as_expression() {
+                        let save = self.next_reg;
+                        let src = self.expr(se)?;
+                        let mapfn = self.temp();
+                        match c.arguments.get(1).and_then(|a| a.as_expression()) {
+                            Some(fe) => {
+                                let f = self.expr_into(fe, mapfn)?;
+                                if f != mapfn {
+                                    self.emit(Instr::Move { dst: mapfn, src: f });
+                                }
+                            }
+                            None => self.emit(Instr::LoadUndefined { dst: mapfn }),
+                        }
+                        self.emit(Instr::ArrayFrom { dst, src, mapfn });
+                        self.next_reg = save.max(dst + 1);
                         return Ok(dst);
                     }
                 }
