@@ -853,6 +853,18 @@ mod tests {
     }
 
     #[test]
+    fn optional_chaining() {
+        // Member chains short-circuit to undefined at the first nullish base.
+        assert_eq!(run_ok("let o={a:{b:7}}; console.log(o?.a?.b, o?.x?.y, o?.a?.b?.c)"), vec!["7 undefined undefined"]);
+        assert_eq!(run_ok("let o=null; console.log(o?.a?.b)"), vec!["undefined"]);
+        // Optional computed access and optional calls.
+        assert_eq!(run_ok("let o={arr:[10,20]}; console.log(o?.arr?.[1], o?.no?.[0])"), vec!["20 undefined"]);
+        assert_eq!(run_ok("let o={f:()=>42}; console.log(o?.f(), o?.g?.())"), vec!["42 undefined"]);
+        // The short-circuited value is genuine undefined (NaN in arithmetic).
+        assert_eq!(run_ok("let u=undefined; console.log(u?.x, (u?.x)+1)"), vec!["undefined NaN"]);
+    }
+
+    #[test]
     fn default_parameters() {
         // Applied only when the arg is missing/undefined (null does NOT trigger it).
         assert_eq!(run_ok("function f(x=5){return x} console.log(f(), f(9), f(undefined))"), vec!["5 9 5"]);

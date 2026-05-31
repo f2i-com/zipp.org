@@ -285,6 +285,10 @@ struct FnCompiler<'a> {
     upvalues: UpvalList,
     /// Enclosing functions' binding snapshots (outermost → direct parent).
     enclosing: Vec<EnclosingFn>,
+    /// Active optional-chain short-circuit targets: a stack (chains can nest),
+    /// each entry collecting the ip of every `?.` nullish-bail jump in that chain.
+    /// On exit the chain patches them to a "load undefined" block.
+    chain_bails: Vec<Vec<u32>>,
 }
 
 impl<'a> FnCompiler<'a> {
@@ -303,6 +307,7 @@ impl<'a> FnCompiler<'a> {
             next_reg: 0,
             max_reg: 0,
             is_script: false,
+            chain_bails: Vec::new(),
             captured,
             cell_regs: HashSet::new(),
             upvalues: Rc::new(RefCell::new(Vec::new())),
@@ -1059,41 +1064,100 @@ impl<'a> FnCompiler<'a> {
             }
             E::ArrayExpression(a) => self.array_literal(a, dst),
             E::ObjectExpression(o) => self.object_literal(o, dst),
-            E::StaticMemberExpression(m) => {
-                // Math constants (Math.PI, Math.E, …) — Math has no real global
-                // object, so recognise the member-access shape.
-                if let ox::Expression::Identifier(o) = &m.object {
-                    if o.name == "Math" {
-                        let c = match m.property.name.as_str() {
-                            "PI" => Some(std::f64::consts::PI),
-                            "E" => Some(std::f64::consts::E),
-                            "LN2" => Some(std::f64::consts::LN_2),
-                            "LN10" => Some(std::f64::consts::LN_10),
-                            "LOG2E" => Some(std::f64::consts::LOG2_E),
-                            "LOG10E" => Some(std::f64::consts::LOG10_E),
-                            "SQRT2" => Some(std::f64::consts::SQRT_2),
-                            "SQRT1_2" => Some(std::f64::consts::FRAC_1_SQRT_2),
-                            _ => None,
-                        };
-                        if let Some(v) = c {
-                            self.load_number(dst, v);
-                            return Ok(dst);
-                        }
-                    }
-                }
-                let obj = self.expr(&m.object)?;
-                let name = self.string_name(m.property.name.as_str());
-                self.emit(Instr::GetProp { dst, obj, name });
-                Ok(dst)
-            }
-            E::ComputedMemberExpression(m) => {
-                let obj = self.expr(&m.object)?;
-                let key = self.expr(&m.expression)?;
-                self.emit(Instr::GetIndex { dst, obj, key });
-                Ok(dst)
-            }
+            E::StaticMemberExpression(m) => self.static_member(m, dst),
+            E::ComputedMemberExpression(m) => self.computed_member(m, dst),
+            E::ChainExpression(ce) => self.chain_expr(ce, dst),
             _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
         }
+    }
+
+    fn static_member(&mut self, m: &ox::StaticMemberExpression, dst: Reg) -> R<Reg> {
+        // Math constants (Math.PI, Math.E, …) — Math has no real global object.
+        if let ox::Expression::Identifier(o) = &m.object {
+            if o.name == "Math" {
+                let c = match m.property.name.as_str() {
+                    "PI" => Some(std::f64::consts::PI),
+                    "E" => Some(std::f64::consts::E),
+                    "LN2" => Some(std::f64::consts::LN_2),
+                    "LN10" => Some(std::f64::consts::LN_10),
+                    "LOG2E" => Some(std::f64::consts::LOG2_E),
+                    "LOG10E" => Some(std::f64::consts::LOG10_E),
+                    "SQRT2" => Some(std::f64::consts::SQRT_2),
+                    "SQRT1_2" => Some(std::f64::consts::FRAC_1_SQRT_2),
+                    _ => None,
+                };
+                if let Some(v) = c {
+                    self.load_number(dst, v);
+                    return Ok(dst);
+                }
+            }
+        }
+        let obj = self.expr(&m.object)?;
+        if m.optional {
+            self.emit_optional_check(obj);
+        }
+        let name = self.string_name(m.property.name.as_str());
+        self.emit(Instr::GetProp { dst, obj, name });
+        Ok(dst)
+    }
+
+    fn computed_member(&mut self, m: &ox::ComputedMemberExpression, dst: Reg) -> R<Reg> {
+        let obj = self.expr(&m.object)?;
+        if m.optional {
+            self.emit_optional_check(obj);
+        }
+        let key = self.expr(&m.expression)?;
+        self.emit(Instr::GetIndex { dst, obj, key });
+        Ok(dst)
+    }
+
+    /// `?.` short-circuit: if `obj` is null/undefined (loose `== null`), jump to
+    /// the enclosing chain's "undefined" block, recorded for patching at chain
+    /// exit. No-op outside a chain (an `optional` flag can only appear in one).
+    fn emit_optional_check(&mut self, obj: Reg) {
+        if self.chain_bails.is_empty() {
+            return;
+        }
+        let save = self.next_reg;
+        let nreg = self.alloc_reg();
+        self.emit(Instr::LoadNull { dst: nreg });
+        let cond = self.alloc_reg();
+        self.emit(Instr::LooseEq { dst: cond, a: obj, b: nreg }); // true iff null OR undefined
+        let jt = self.here();
+        self.emit(Instr::JumpIfTrue { cond, target: 0 });
+        self.chain_bails.last_mut().unwrap().push(jt);
+        self.next_reg = save; // scratch temps dead after the check
+    }
+
+    /// Compile an optional chain `a?.b…`: open a short-circuit boundary, compile
+    /// the chain element (its `?.` links record bail jumps), then route any
+    /// short-circuit to a single `undefined` result.
+    fn chain_expr(&mut self, ce: &ox::ChainExpression, dst: Reg) -> R<Reg> {
+        self.chain_bails.push(Vec::new());
+        let res = match &ce.expression {
+            ox::ChainElement::StaticMemberExpression(m) => self.static_member(m, dst),
+            ox::ChainElement::ComputedMemberExpression(m) => self.computed_member(m, dst),
+            ox::ChainElement::CallExpression(c) => self.call(c, dst),
+            _ => Err("this optional-chain form is not in the zipp-vm subset yet".into()),
+        };
+        let bails = self.chain_bails.pop().unwrap();
+        let v = res?;
+        if bails.is_empty() {
+            return Ok(v);
+        }
+        if v != dst {
+            self.emit(Instr::Move { dst, src: v });
+        }
+        let jmp = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let undef_at = self.here();
+        self.emit(Instr::LoadUndefined { dst });
+        let end = self.here();
+        self.patch_jump(jmp, end);
+        for b in bails {
+            self.patch_jump(b, undef_at);
+        }
+        Ok(dst)
     }
 
     fn array_literal(&mut self, a: &ox::ArrayExpression, dst: Reg) -> R<Reg> {
@@ -1526,6 +1590,17 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn call(&mut self, c: &ox::CallExpression, dst: Reg) -> R<Reg> {
+        // Optional call `f?.(args)`: evaluate the callee as a VALUE (its own `?.`
+        // links short-circuit inside the chain), bail to undefined if it's
+        // nullish, else call it. (Uses the general value-call, so `o?.m?.()` calls
+        // with `this = undefined` — a rare edge.)
+        if c.optional {
+            let callee = self.expr(&c.callee)?;
+            self.emit_optional_check(callee);
+            let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+            self.emit(Instr::Call { dst, callee, arg_base, argc });
+            return Ok(dst);
+        }
         // Bare `Error("msg")` call (no `new`) → same Error object.
         if let ox::Expression::Identifier(id) = &c.callee {
             if let Some(kind) = error_ctor(&id.name) {
@@ -1630,6 +1705,9 @@ impl<'a> FnCompiler<'a> {
         // (Computed-member calls `obj[k](…)` fall through to the generic path.)
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             let obj = self.expr(&m.object)?;
+            if m.optional {
+                self.emit_optional_check(obj); // `obj?.method()` — short-circuit if obj nullish
+            }
             let name = self.string_name(m.property.name.as_str());
             let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
             self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc });
