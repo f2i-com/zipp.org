@@ -295,11 +295,22 @@ struct FnCompiler<'a> {
     loop_ctx: Vec<LoopCtx>,
 }
 
-/// Pending `break`/`continue` jumps for one enclosing loop.
-#[derive(Default)]
+/// Pending `break`/`continue` jumps for one enclosing breakable construct. A
+/// `switch` is a break target but NOT a continue target, so `continue` skips
+/// switch frames to the innermost loop (`is_loop`).
 struct LoopCtx {
     break_jumps: Vec<u32>,
     continue_jumps: Vec<u32>,
+    is_loop: bool,
+}
+
+impl LoopCtx {
+    fn loop_frame() -> LoopCtx {
+        LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new(), is_loop: true }
+    }
+    fn switch_frame() -> LoopCtx {
+        LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new(), is_loop: false }
+    }
 }
 
 impl<'a> FnCompiler<'a> {
@@ -520,11 +531,13 @@ impl<'a> FnCompiler<'a> {
                 }
                 let j = self.here();
                 self.emit(Instr::Jump { target: 0 });
-                match self.loop_ctx.last_mut() {
+                // `continue` targets the innermost LOOP, skipping switch frames.
+                match self.loop_ctx.iter_mut().rev().find(|c| c.is_loop) {
                     Some(ctx) => ctx.continue_jumps.push(j),
                     None => return Err("`continue` outside a loop is not supported".into()),
                 }
             }
+            S::SwitchStatement(s) => self.switch_stmt(s)?,
             S::ReturnStatement(r) => {
                 if let Some(arg) = &r.argument {
                     let v = self.expr(arg)?;
@@ -734,7 +747,7 @@ impl<'a> FnCompiler<'a> {
         let cond = self.expr(&w.test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 });
-        self.loop_ctx.push(LoopCtx::default());
+        self.loop_ctx.push(LoopCtx::loop_frame());
         self.stmt(&w.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         for c in ctx.continue_jumps {
@@ -773,7 +786,7 @@ impl<'a> FnCompiler<'a> {
             }
             None => None,
         };
-        self.loop_ctx.push(LoopCtx::default());
+        self.loop_ctx.push(LoopCtx::loop_frame());
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -879,7 +892,7 @@ impl<'a> FnCompiler<'a> {
 
     fn do_while_statement(&mut self, d: &ox::DoWhileStatement) -> R<()> {
         let top = self.here();
-        self.loop_ctx.push(LoopCtx::default());
+        self.loop_ctx.push(LoopCtx::loop_frame());
         self.stmt(&d.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -893,6 +906,61 @@ impl<'a> FnCompiler<'a> {
         for b in ctx.break_jumps {
             self.patch_jump(b, end);
         }
+        Ok(())
+    }
+
+    /// `switch (disc) { case A: …; default: …; … }`. Two passes: emit the
+    /// `disc === testᵢ` comparison jumps in order (and remember `default`), then
+    /// emit the case bodies consecutively so fall-through is natural; `break`
+    /// (collected in a non-loop frame) jumps to the end.
+    fn switch_stmt(&mut self, s: &ox::SwitchStatement) -> R<()> {
+        self.push_scope();
+        let disc = self.expr(&s.discriminant)?;
+
+        // Pass 1: comparison jumps (strict `===`, like JS). `default` is recorded
+        // and dispatched after the others fail.
+        let mut case_jumps: Vec<(usize, u32)> = Vec::new();
+        let mut default_index: Option<usize> = None;
+        for (i, c) in s.cases.iter().enumerate() {
+            match &c.test {
+                Some(t) => {
+                    let save = self.next_reg;
+                    let tv = self.expr(t)?;
+                    let cond = self.temp();
+                    self.emit(Instr::Eq { dst: cond, a: disc, b: tv });
+                    let j = self.here();
+                    self.emit(Instr::JumpIfTrue { cond, target: 0 });
+                    self.next_reg = save; // reclaim test/cond temps (disc survives)
+                    case_jumps.push((i, j));
+                }
+                None => default_index = Some(i),
+            }
+        }
+        // No case matched → default body (if present) else the end.
+        let dispatch_default = self.here();
+        self.emit(Instr::Jump { target: 0 });
+
+        // Pass 2: case bodies, in source order (fall-through is natural).
+        self.loop_ctx.push(LoopCtx::switch_frame());
+        let mut body_start: Vec<u32> = Vec::with_capacity(s.cases.len());
+        for c in &s.cases {
+            body_start.push(self.here());
+            for st in &c.consequent {
+                self.stmt(st)?;
+            }
+        }
+        let ctx = self.loop_ctx.pop().unwrap();
+        let end = self.here();
+
+        for (i, j) in case_jumps {
+            self.patch_jump(j, body_start[i]);
+        }
+        let default_target = default_index.map(|i| body_start[i]).unwrap_or(end);
+        self.patch_jump(dispatch_default, default_target);
+        for b in ctx.break_jumps {
+            self.patch_jump(b, end);
+        }
+        self.pop_scope();
         Ok(())
     }
 
@@ -938,7 +1006,7 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::GetIndex { dst: var_reg, obj: iter_reg, key: idx_reg });
         }
 
-        self.loop_ctx.push(LoopCtx::default());
+        self.loop_ctx.push(LoopCtx::loop_frame());
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -993,7 +1061,7 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::GetIndex { dst: var_reg, obj: keys_reg, key: idx_reg });
         }
 
-        self.loop_ctx.push(LoopCtx::default());
+        self.loop_ctx.push(LoopCtx::loop_frame());
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();

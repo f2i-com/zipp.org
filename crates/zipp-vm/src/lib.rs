@@ -853,6 +853,17 @@ mod tests {
     }
 
     #[test]
+    fn switch_statement() {
+        assert_eq!(run_ok("let x=2,r=''; switch(x){case 1:r='a';break;case 2:r='b';break;default:r='d';} console.log(r)"), vec!["b"]);
+        assert_eq!(run_ok("let x=9,r=''; switch(x){case 1:r='a';break;default:r='d';} console.log(r)"), vec!["d"]);
+        // Fall-through (no break) runs subsequent case bodies.
+        assert_eq!(run_ok("let r='',x=2; switch(x){case 1:r+='1';case 2:r+='2';case 3:r+='3';break;case 4:r+='4';} console.log(r)"), vec!["23"]);
+        assert_eq!(run_ok("function f(x){switch(x){case 1:return 'one';default:return 'other'}} console.log(f(1),f(5))"), vec!["one other"]);
+        // `continue` in a switch targets the enclosing LOOP; `break` targets the switch.
+        assert_eq!(run_ok("let r=[]; for(let i=0;i<4;i++){ switch(i){case 1:continue;case 3:break;} r.push(i); } console.log(r.join(','))"), vec!["0,2,3"]);
+    }
+
+    #[test]
     fn break_and_continue() {
         assert_eq!(run_ok("let s=0; for(let i=0;i<10;i++){ if(i===5) break; s+=i; } console.log(s)"), vec!["10"]);
         assert_eq!(run_ok("let s=0; for(let i=0;i<5;i++){ if(i===2) continue; s+=i; } console.log(s)"), vec!["8"]);
