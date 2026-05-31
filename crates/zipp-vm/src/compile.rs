@@ -2092,6 +2092,16 @@ impl<'a> FnCompiler<'a> {
             E::ObjectExpression(o) => self.object_literal(o, dst),
             E::StaticMemberExpression(m) => self.static_member(m, dst),
             E::ComputedMemberExpression(m) => self.computed_member(m, dst),
+            E::PrivateFieldExpression(p) => {
+                // `obj.#field` → read the reserved "#field" property.
+                let obj = self.expr(&p.object)?;
+                if p.optional {
+                    self.emit_optional_check(obj);
+                }
+                let name = self.string_name(&private_key(&p.field.name));
+                self.emit(Instr::GetProp { dst, obj, name });
+                Ok(dst)
+            }
             E::ChainExpression(ce) => self.chain_expr(ce, dst),
             _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
         }
@@ -2610,6 +2620,18 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::Move { dst, src: if u.prefix { nw } else { cur } });
                 return Ok(dst);
             }
+            // `obj.#x++` — like a static member, keyed "#x".
+            ox::SimpleAssignmentTarget::PrivateFieldExpression(p) => {
+                let obj = self.expr(&p.object)?;
+                let name = self.string_name(&private_key(&p.field.name));
+                let cur = self.temp();
+                self.emit(Instr::GetProp { dst: cur, obj, name });
+                let nw = self.temp();
+                self.emit(Instr::AddInt { dst: nw, a: cur, imm: delta });
+                self.emit(Instr::SetProp { obj, name, val: nw });
+                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { cur } });
+                return Ok(dst);
+            }
             _ => {}
         }
         // `x++` / `++x` / `x--` / `--x` on a simple identifier.
@@ -2944,6 +2966,37 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::SetProp { obj, name, val: dst });
                 } else {
                     // Compound `obj.x op= v`: read obj.x, combine, write back.
+                    let cur = self.temp();
+                    self.emit(Instr::GetProp { dst: cur, obj, name });
+                    let rhs = self.expr(&a.right)?;
+                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
+                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                    self.emit(instr);
+                    self.emit(Instr::SetProp { obj, name, val: dst });
+                }
+                return Ok(dst);
+            }
+            // `obj.#x = v` / `obj.#x op= v` — same as a static member, keyed "#x".
+            ox::AssignmentTarget::PrivateFieldExpression(p) => {
+                let obj = self.expr(&p.object)?;
+                let name = self.string_name(&private_key(&p.field.name));
+                if is_logical {
+                    self.emit(Instr::GetProp { dst, obj, name });
+                    let j = self.emit_logical_skip(a.operator, dst);
+                    let v = self.expr_into(&a.right, dst)?;
+                    if v != dst {
+                        self.emit(Instr::Move { dst, src: v });
+                    }
+                    self.emit(Instr::SetProp { obj, name, val: dst });
+                    let end = self.here();
+                    self.patch_jump(j, end);
+                } else if matches!(a.operator, Op::Assign) {
+                    let val = self.expr_into(&a.right, dst)?;
+                    if val != dst {
+                        self.emit(Instr::Move { dst, src: val });
+                    }
+                    self.emit(Instr::SetProp { obj, name, val: dst });
+                } else {
                     let cur = self.temp();
                     self.emit(Instr::GetProp { dst: cur, obj, name });
                     let rhs = self.expr(&a.right)?;
@@ -3443,6 +3496,14 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc });
             return Ok(dst);
         }
+        // Private method call `obj.#m(args…)` → CallMethod on the "#m" key.
+        if let ox::Expression::PrivateFieldExpression(p) = &c.callee {
+            let obj = self.expr(&p.object)?;
+            let name = self.string_name(&private_key(&p.field.name));
+            let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+            self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc });
+            return Ok(dst);
+        }
 
         // Computed method call `obj[key](args…)` → bind `this` to obj. Evaluate
         // obj and the key into stable registers (below the contiguous arg block).
@@ -3584,6 +3645,9 @@ fn class_key_name(key: &ox::PropertyKey) -> R<String> {
         ox::PropertyKey::StaticIdentifier(id) => Ok(id.name.to_string()),
         ox::PropertyKey::StringLiteral(s) => Ok(s.value.to_string()),
         ox::PropertyKey::NumericLiteral(n) => Ok(fmt_key_num(n.value)),
+        // A private member `#x`: keyed by "#x" (a reserved property name; the
+        // engine does not enforce true hard privacy, but `this.#x` works).
+        ox::PropertyKey::PrivateIdentifier(id) => Ok(private_key(&id.name)),
         // A computed well-known-symbol key, e.g. `[Symbol.iterator]() {}`, maps to
         // the reserved string key (so a class can define the iteration method).
         ox::PropertyKey::StaticMemberExpression(m) => {
@@ -3599,6 +3663,16 @@ fn class_key_name(key: &ox::PropertyKey) -> R<String> {
             Err("computed or private class member names are not in the zipp-vm subset yet".into())
         }
         _ => Err("computed or private class member names are not in the zipp-vm subset yet".into()),
+    }
+}
+
+/// The property key for a private member `#name` — keyed by "#name" (the leading
+/// `#` makes it un-spellable as a normal property, our soft-privacy stand-in).
+fn private_key(name: &str) -> String {
+    if name.starts_with('#') {
+        name.to_string()
+    } else {
+        format!("#{name}")
     }
 }
 

@@ -294,6 +294,7 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
             }
         }
         E::StaticMemberExpression(m) => expr_refs(&m.object, out),
+        E::PrivateFieldExpression(p) => expr_refs(&p.object, out),
         E::ComputedMemberExpression(m) => {
             expr_refs(&m.object, out);
             expr_refs(&m.expression, out);
@@ -459,6 +460,7 @@ fn collect_nested_free_expr(e: &ox::Expression, out: &mut HashSet<String>) {
             }
         }
         E::StaticMemberExpression(m) => collect_nested_free_expr(&m.object, out),
+        E::PrivateFieldExpression(p) => collect_nested_free_expr(&p.object, out),
         E::ComputedMemberExpression(m) => {
             collect_nested_free_expr(&m.object, out);
             collect_nested_free_expr(&m.expression, out);

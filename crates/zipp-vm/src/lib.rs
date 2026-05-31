@@ -1378,6 +1378,18 @@ mod tests {
     }
 
     #[test]
+    fn private_class_members() {
+        // Private fields read/write/update, a private method, and a private getter.
+        assert_eq!(run_ok("class C{#n=0; #step; constructor(s){this.#step=s} inc(){this.#n+=this.#step; return this} get value(){return this.#n} #secret(){return this.#n*2} reveal(){return this.#secret()}} let c=new C(5); c.inc().inc(); console.log(c.value, c.reveal())"), vec!["10 20"]);
+        // `this.#n++` update.
+        assert_eq!(run_ok("class C{#n=0; bump(){this.#n++; return this.#n}} let c=new C(); console.log(c.bump(), c.bump())"), vec!["1 2"]);
+        // A closure capturing `this`/a local that reads a private field.
+        assert_eq!(run_ok("class E{#v=7; make(){let s=this; return ()=>s.#v}} console.log(new E().make()())"), vec!["7"]);
+        // A private field used inside a method-local closure (map).
+        assert_eq!(run_ok("class D{#xs=[1,2,3]; doubled(){return this.#xs.map(x=>x*2)}} console.log(new D().doubled().join(','))"), vec!["2,4,6"]);
+    }
+
+    #[test]
     fn computed_method_call_binds_this() {
         // `obj[key](args)` binds `this` to obj (dynamic method dispatch).
         assert_eq!(run_ok("let o={x:10,getX(){return this.x},add(a,b){return this.x+a+b}}; let m='getX'; console.log(o[m](), o['add'](1,2))"), vec!["10 13"]);
