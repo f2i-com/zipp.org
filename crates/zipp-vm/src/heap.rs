@@ -179,6 +179,10 @@ pub enum HeapObj {
     /// A native `resolve`/`reject` function bound to a promise — the pair handed
     /// to a `new Promise(executor)`. Calling it settles `promise`.
     BoundResolver { promise: u32, is_reject: bool },
+    /// A `Date`: milliseconds since the Unix epoch (NaN = Invalid Date). The
+    /// engine treats all component getters/setters as UTC (a documented
+    /// simplification — node uses the host time zone for the non-UTC ones).
+    Date(f64),
     /// Shared state for a Promise combinator (`all`/`allSettled`/`race`/`any`).
     /// `results` collects per-input outcomes (sized to the input count);
     /// `remaining` counts inputs still outstanding; `result` is the combinator's

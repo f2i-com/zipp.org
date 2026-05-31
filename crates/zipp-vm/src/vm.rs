@@ -791,6 +791,13 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    Instr::ToNum { dst, a } => {
+                        let va = self.get(base, a);
+                        // `+x`: numbers pass through (keep Int tag); else ToNumber.
+                        let r = if va.is_number() { va } else { Value::num(self.to_number(va)?) };
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::Neg { dst, a } => {
                         let va = self.get(base, a);
                         let r = if va.is_int() {
@@ -1262,6 +1269,15 @@ impl<'p> Vm<'p> {
                             G::Number => {
                                 if argc == 0 { Value::num(0.0) } else { Value::num(self.to_number(a0)?) }
                             }
+                            G::String => {
+                                if argc == 0 {
+                                    self.alloc_str(String::new())
+                                } else {
+                                    let s = self.display(a0);
+                                    self.alloc_str(s)
+                                }
+                            }
+                            G::Boolean => Value::bool(argc >= 1 && self.truthy(a0)),
                             G::ParseInt => {
                                 let s = self.display(a0);
                                 let radix = if argc >= 2 {
@@ -1900,6 +1916,27 @@ impl<'p> Vm<'p> {
                         let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
                         let f = (r >> 11) as f64 / (1u64 << 53) as f64;
                         self.set(base, dst, Value::num(f));
+                        ip += 1;
+                    }
+                    Instr::DateNew { dst, arg_base, argc } => {
+                        let args: Vec<Value> =
+                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                        let ms = self.date_new_ms(&args)?;
+                        let v = Value::heap(self.heap.alloc(HeapObj::Date(ms)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::DateUTC { dst, arg_base, argc } => {
+                        let args: Vec<Value> =
+                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                        let ms = self.date_utc_ms(&args)?;
+                        self.set(base, dst, Value::num(ms));
+                        ip += 1;
+                    }
+                    Instr::DateParse { dst, src } => {
+                        let s = self.get(base, src);
+                        let str = self.display(s);
+                        self.set(base, dst, Value::num(parse_date(&str)));
                         ip += 1;
                     }
                     Instr::Return { src } => {
@@ -3087,6 +3124,155 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `new Date(...)` → epoch ms. 0 args = now; 1 number = ms (time-clipped);
+    /// 1 Date = copy; 1 string = parsed; ≥2 = UTC components (month0-based).
+    fn date_new_ms(&self, args: &[Value]) -> Result<f64, Thrown> {
+        match args.len() {
+            0 => Ok(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as f64)
+                .unwrap_or(0.0)),
+            1 => {
+                let a = args[0];
+                if a.is_heap() {
+                    if let HeapObj::Date(ms) = self.heap.get(a.heap_index()) {
+                        return Ok(*ms);
+                    }
+                    if matches!(self.heap.get(a.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+                        let s = self.heap.str_cow(a.heap_index()).unwrap().into_owned();
+                        return Ok(parse_date(&s));
+                    }
+                }
+                Ok(time_clip(self.to_number(a)?))
+            }
+            _ => {
+                let mut comp = [0i64, 0, 1, 0, 0, 0, 0]; // y, mo0, day, h, mi, s, ms
+                for (i, &v) in args.iter().enumerate().take(7) {
+                    let n = self.to_number(v)?;
+                    if n.is_nan() {
+                        return Ok(f64::NAN);
+                    }
+                    comp[i] = n as i64;
+                }
+                comp[0] = legacy_year(comp[0]);
+                Ok(time_clip(ms_from_utc(comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6])))
+            }
+        }
+    }
+
+    /// `Date.UTC(year, month0, …)` → epoch ms (NaN with no args / a NaN field).
+    fn date_utc_ms(&self, args: &[Value]) -> Result<f64, Thrown> {
+        if args.is_empty() {
+            return Ok(f64::NAN);
+        }
+        let mut comp = [0i64, 0, 1, 0, 0, 0, 0];
+        for (i, &v) in args.iter().enumerate().take(7) {
+            let n = self.to_number(v)?;
+            if n.is_nan() {
+                return Ok(f64::NAN);
+            }
+            comp[i] = n as i64;
+        }
+        comp[0] = legacy_year(comp[0]);
+        Ok(time_clip(ms_from_utc(comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6])))
+    }
+
+    /// Dispatch a method on a `Date` receiver (`idx` is its heap index). All
+    /// getters/setters are UTC. Returns `Ok(None)` if `name` isn't a Date method.
+    fn date_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let ms = match self.heap.get(idx) {
+            HeapObj::Date(m) => *m,
+            _ => return Ok(None),
+        };
+        let p = date_parts(ms); // (year, month0, day, hour, min, sec, ms, weekday)
+        let field = |v: i64| if ms.is_nan() { Value::num(f64::NAN) } else { Value::num(v as f64) };
+        let r = match name {
+            "getTime" | "valueOf" => Value::num(ms),
+            "getFullYear" | "getUTCFullYear" => field(p.0),
+            "getMonth" | "getUTCMonth" => field(p.1),
+            "getDate" | "getUTCDate" => field(p.2),
+            "getHours" | "getUTCHours" => field(p.3),
+            "getMinutes" | "getUTCMinutes" => field(p.4),
+            "getSeconds" | "getUTCSeconds" => field(p.5),
+            "getMilliseconds" | "getUTCMilliseconds" => field(p.6),
+            "getDay" | "getUTCDay" => field(p.7),
+            "getTimezoneOffset" => Value::num(if ms.is_nan() { f64::NAN } else { 0.0 }),
+            "toISOString" => {
+                if ms.is_nan() {
+                    return Err(Thrown("RangeError: Invalid time value".into()));
+                }
+                self.alloc_str(date_to_iso(ms))
+            }
+            "toJSON" => {
+                if ms.is_nan() {
+                    Value::NULL
+                } else {
+                    self.alloc_str(date_to_iso(ms))
+                }
+            }
+            // Simplified: ISO (node's local/tz-formatted strings aren't matched).
+            "toString" | "toUTCString" | "toDateString" | "toTimeString"
+            | "toLocaleString" | "toLocaleDateString" | "toLocaleTimeString" => {
+                if ms.is_nan() {
+                    self.alloc_str("Invalid Date".to_string())
+                } else {
+                    self.alloc_str(date_to_iso(ms))
+                }
+            }
+            "setTime" => {
+                let n = match args.first() {
+                    Some(&v) => time_clip(self.to_number(v)?),
+                    None => f64::NAN,
+                };
+                if let HeapObj::Date(m) = self.heap.get_mut(idx) {
+                    *m = n;
+                }
+                Value::num(n)
+            }
+            "setFullYear" | "setUTCFullYear" => self.date_set(idx, &p, args, 0)?,
+            "setMonth" | "setUTCMonth" => self.date_set(idx, &p, args, 1)?,
+            "setDate" | "setUTCDate" => self.date_set(idx, &p, args, 2)?,
+            "setHours" | "setUTCHours" => self.date_set(idx, &p, args, 3)?,
+            "setMinutes" | "setUTCMinutes" => self.date_set(idx, &p, args, 4)?,
+            "setSeconds" | "setUTCSeconds" => self.date_set(idx, &p, args, 5)?,
+            "setMilliseconds" | "setUTCMilliseconds" => self.date_set(idx, &p, args, 6)?,
+            _ => return Ok(None),
+        };
+        Ok(Some(r))
+    }
+
+    /// A Date setter starting at component `start` (0=year … 6=ms): overwrite that
+    /// field and the following ones from `args`, recompute, store, return the new ms.
+    fn date_set(
+        &mut self,
+        idx: u32,
+        p: &(i64, i64, i64, i64, i64, i64, i64, i64),
+        args: &[Value],
+        start: usize,
+    ) -> Result<Value, Thrown> {
+        let mut comp = [p.0, p.1, p.2, p.3, p.4, p.5, p.6];
+        let mut any_nan = false;
+        for (i, &v) in args.iter().enumerate() {
+            if start + i >= 7 {
+                break;
+            }
+            let n = self.to_number(v)?;
+            if n.is_nan() {
+                any_nan = true;
+            }
+            comp[start + i] = n as i64;
+        }
+        let ms = if any_nan {
+            f64::NAN
+        } else {
+            time_clip(ms_from_utc(comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6]))
+        };
+        if let HeapObj::Date(m) = self.heap.get_mut(idx) {
+            *m = ms;
+        }
+        Ok(Value::num(ms))
+    }
+
     /// The `(name, length)` of a callable value (function, closure, or class) for
     /// its `.name`/`.length` properties — `None` for non-callables. A synthetic
     /// proto name (`<arrow>`, `<script>`, …) reads as the empty string (anonymous).
@@ -3592,6 +3778,7 @@ impl<'p> Vm<'p> {
             HeapObj::Set(_) => self.set_method(idx, name, args),
             HeapObj::Generator { .. } => self.generator_method(idx, name, args),
             HeapObj::Promise { .. } => self.promise_method(idx, name, args),
+            HeapObj::Date(_) => self.date_method(idx, name, args),
             _ => Ok(None),
         }
     }
@@ -5124,6 +5311,10 @@ impl<'p> Vm<'p> {
         if v.is_undefined() {
             return Ok(f64::NAN);
         }
+        // A Date coerces to its epoch ms (so `d2 - d1`, `+d`, `d1 < d2` work).
+        if let HeapObj::Date(ms) = self.heap.get(v.heap_index()) {
+            return Ok(*ms);
+        }
         if let Some(s) = self.heap.str_cow(v.heap_index()) {
             let t = s.trim();
             if t.is_empty() {
@@ -5173,6 +5364,14 @@ impl<'p> Vm<'p> {
                 HeapObj::AsyncState { .. } => "[object Promise]".into(),
                 HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
                     "[object Object]".into()
+                }
+                // `String(date)` / `"" + date` → the date string (ISO here).
+                HeapObj::Date(ms) => {
+                    if ms.is_nan() {
+                        "Invalid Date".into()
+                    } else {
+                        date_to_iso(*ms)
+                    }
                 }
             }
         } else {
@@ -5286,6 +5485,14 @@ impl<'p> Vm<'p> {
             // Internal: never user-visible (an async call yields its Promise).
             HeapObj::AsyncState { .. } => "Promise { <pending> }".into(),
             HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => "[object Object]".into(),
+            // node renders a Date in console.log as its ISO string (unquoted).
+            HeapObj::Date(ms) => {
+                if ms.is_nan() {
+                    "Invalid Date".into()
+                } else {
+                    date_to_iso(*ms)
+                }
+            }
         }
     }
 
@@ -5958,6 +6165,145 @@ fn num_is_safe_integer(v: Value) -> bool {
 /// part in the given base (matching JS for whole numbers; a fractional part is
 /// truncated — full fractional-radix rendering is out of the subset). NaN and
 /// ±Infinity render via the canonical path (handled by the caller for radix 10).
+// ── Date helpers (proleptic Gregorian, UTC; Howard Hinnant's algorithms) ──
+
+/// Days since 1970-01-01 for (year, month 1..=12, day) — `day` may be out of
+/// [1,31] and is carried linearly (so day 0 = the prior day), matching JS's
+/// field normalization.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// (year, month 1..=12, day) from days since 1970-01-01.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Break epoch ms into UTC parts: (year, month0, day, hour, min, sec, ms,
+/// weekday 0=Sun..6=Sat). Uses floored division so negative ms work.
+fn date_parts(ms: f64) -> (i64, i64, i64, i64, i64, i64, i64, i64) {
+    let total = ms.floor() as i64;
+    let day = total.div_euclid(86_400_000);
+    let rem = total.rem_euclid(86_400_000);
+    let (y, m, d) = civil_from_days(day);
+    let h = rem / 3_600_000;
+    let mi = (rem / 60_000) % 60;
+    let s = (rem / 1000) % 60;
+    let mss = rem % 1000;
+    let wd = (day.rem_euclid(7) + 4) % 7; // 1970-01-01 was a Thursday (4)
+    (y, m - 1, d, h, mi, s, mss, wd)
+}
+
+/// Epoch ms from UTC components (month0-based; out-of-range fields normalized
+/// like JS). NOTE: the legacy 2-digit-year→19xx mapping is applied by the numeric
+/// CONSTRUCTORS (`Date.UTC`, `new Date(y,m,…)`), NOT here — ISO string parsing
+/// must take the year literally (year 1 = 1, not 1901).
+fn ms_from_utc(y: i64, mo0: i64, d: i64, h: i64, mi: i64, s: i64, ms: i64) -> f64 {
+    let year = y + mo0.div_euclid(12);
+    let month = mo0.rem_euclid(12); // 0-based → 1-based below
+    let days = days_from_civil(year, month + 1, d);
+    days as f64 * 86_400_000.0
+        + h as f64 * 3_600_000.0
+        + mi as f64 * 60_000.0
+        + s as f64 * 1000.0
+        + ms as f64
+}
+
+/// The legacy 2-digit-year mapping for the numeric Date constructors: 0..=99 →
+/// 1900+y (so `Date.UTC(99,…)` is 1999). Years ≥100 (and negative) pass through.
+fn legacy_year(y: i64) -> i64 {
+    if (0..=99).contains(&y) {
+        1900 + y
+    } else {
+        y
+    }
+}
+
+/// JS TimeClip: NaN if non-finite or |t| > 8.64e15 (±100M days); else truncate
+/// toward zero to an integer millisecond.
+fn time_clip(n: f64) -> f64 {
+    if !n.is_finite() || n.abs() > 8.64e15 {
+        f64::NAN
+    } else {
+        n.trunc()
+    }
+}
+
+/// `toISOString` form: `YYYY-MM-DDTHH:mm:ss.sssZ` (±YYYYYY outside 0..=9999).
+fn date_to_iso(ms: f64) -> String {
+    let (y, mo0, d, h, mi, s, mss, _) = date_parts(ms);
+    if (0..=9999).contains(&y) {
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, mo0 + 1, d, h, mi, s, mss)
+    } else {
+        let sign = if y < 0 { '-' } else { '+' };
+        format!("{}{:06}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", sign, y.abs(), mo0 + 1, d, h, mi, s, mss)
+    }
+}
+
+/// Parse the ISO-8601 subset JS accepts (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`,
+/// optionally `THH:mm[:ss[.sss]]` and a trailing `Z`). Treated as UTC. Returns
+/// NaN if unrecognised.
+fn parse_date(s: &str) -> f64 {
+    let s = s.trim();
+    let (date, time) = match s.split_once(['T', ' ']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let dp: Vec<&str> = date.split('-').collect();
+    // A leading '-' (negative year) splits into an empty first field; reject.
+    if dp.is_empty() || dp[0].is_empty() {
+        return f64::NAN;
+    }
+    let parse = |x: &str| x.parse::<i64>().ok();
+    let year = match parse(dp[0]) {
+        Some(y) => y,
+        None => return f64::NAN,
+    };
+    let mo = if dp.len() > 1 { match parse(dp[1]) { Some(v) => v, None => return f64::NAN } } else { 1 };
+    let day = if dp.len() > 2 { match parse(dp[2]) { Some(v) => v, None => return f64::NAN } } else { 1 };
+    let (mut h, mut mi, mut sec, mut msec) = (0i64, 0i64, 0i64, 0i64);
+    if let Some(t) = time {
+        let t = t.trim_end_matches('Z');
+        // Drop a timezone offset (we treat everything as UTC).
+        let t = t.split(['+']).next().unwrap_or(t);
+        let (hms, frac) = match t.split_once('.') {
+            Some((a, b)) => (a, Some(b)),
+            None => (t, None),
+        };
+        let tp: Vec<&str> = hms.split(':').collect();
+        if !tp.is_empty() {
+            h = parse(tp[0]).unwrap_or(0);
+        }
+        if tp.len() > 1 {
+            mi = parse(tp[1]).unwrap_or(0);
+        }
+        if tp.len() > 2 {
+            sec = parse(tp[2]).unwrap_or(0);
+        }
+        if let Some(f) = frac {
+            // First 3 digits = milliseconds.
+            let f3: String = f.chars().take(3).chain(std::iter::repeat('0')).take(3).collect();
+            msec = f3.parse::<i64>().unwrap_or(0);
+        }
+    }
+    // mo here is 1-based from the string; ms_from_utc wants 0-based.
+    ms_from_utc(year, mo - 1, day, h, mi, sec, msec)
+}
+
 fn num_to_radix(n: f64, radix: u32) -> String {
     if n.is_nan() {
         return "NaN".into();

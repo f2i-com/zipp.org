@@ -2069,6 +2069,12 @@ impl<'a> FnCompiler<'a> {
                         }
                         return Ok(dst);
                     }
+                    // `new Date(...)`.
+                    if id.name == "Date" {
+                        let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
+                        self.emit(Instr::DateNew { dst, arg_base, argc });
+                        return Ok(dst);
+                    }
                 }
                 // General `new C(args)`: evaluate the constructor value, then the
                 // args (contiguous), and let the VM build the instance.
@@ -2568,8 +2574,9 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             Op::UnaryPlus => {
-                let a = self.expr_into(&u.argument, dst)?;
-                Ok(a)
+                let a = self.expr(&u.argument)?;
+                self.emit(Instr::ToNum { dst, a });
+                Ok(dst)
             }
             Op::LogicalNot => {
                 let a = self.expr(&u.argument)?;
@@ -3354,6 +3361,19 @@ impl<'a> FnCompiler<'a> {
                 if let Some(epoch) = epoch {
                     self.emit(Instr::Now { dst, epoch });
                     return Ok(dst);
+                }
+                // `Date.UTC(y, m0, …)` → ms; `Date.parse(str)` → ms.
+                if obj.name == "Date" && m.property.name == "UTC" {
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    self.emit(Instr::DateUTC { dst, arg_base, argc });
+                    return Ok(dst);
+                }
+                if obj.name == "Date" && m.property.name == "parse" && c.arguments.len() == 1 {
+                    if let Some(ae) = c.arguments[0].as_expression() {
+                        let src = self.expr(ae)?;
+                        self.emit(Instr::DateParse { dst, src });
+                        return Ok(dst);
+                    }
                 }
             }
         }

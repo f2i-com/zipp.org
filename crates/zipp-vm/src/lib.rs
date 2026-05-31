@@ -1378,6 +1378,30 @@ mod tests {
     }
 
     #[test]
+    fn date_basics() {
+        // Construct from ms; getTime / toISOString / UTC getters.
+        assert_eq!(run_ok("let d=new Date(1577836800000); console.log(d.getTime(), d.toISOString())"), vec!["1577836800000 2020-01-01T00:00:00.000Z"]);
+        assert_eq!(run_ok("let d=new Date(Date.UTC(2021,5,15,10,30,45,123)); console.log(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate(),d.getUTCHours(),d.getUTCMinutes(),d.getUTCSeconds(),d.getUTCMilliseconds())"), vec!["2021 5 15 10 30 45 123"]);
+        // Date.UTC / Date.parse / new Date(string).
+        assert_eq!(run_ok("console.log(Date.UTC(2000,0,1))"), vec!["946684800000"]);
+        assert_eq!(run_ok("console.log(Date.parse('2020-01-01T00:00:00.000Z'), Date.parse('1970-01-02'))"), vec!["1577836800000 86400000"]);
+        assert_eq!(run_ok("console.log(new Date('2020-06-15').toISOString())"), vec!["2020-06-15T00:00:00.000Z"]);
+        // Arithmetic (ms diff), comparison, unary + coercion.
+        assert_eq!(run_ok("let a=new Date(1000),b=new Date(5000); console.log(b-a, a<b, +a)"), vec!["4000 true 1000"]);
+        // Leap day, month overflow, pre-epoch, getUTCDay (2020-01-01 = Wednesday).
+        assert_eq!(run_ok("console.log(new Date(Date.UTC(2020,1,29)).toISOString())"), vec!["2020-02-29T00:00:00.000Z"]);
+        assert_eq!(run_ok("console.log(new Date(Date.UTC(2020,12,1)).toISOString())"), vec!["2021-01-01T00:00:00.000Z"]);
+        assert_eq!(run_ok("console.log(new Date(-86400000).toISOString())"), vec!["1969-12-31T00:00:00.000Z"]);
+        assert_eq!(run_ok("console.log(new Date(Date.UTC(2020,0,1)).getUTCDay())"), vec!["3"]);
+        // Invalid date; the legacy 2-digit year (constructor only); setFullYear (literal year).
+        assert_eq!(run_ok("console.log(new Date('nope').getTime(), String(new Date(NaN)))"), vec!["NaN Invalid Date"]);
+        assert_eq!(run_ok("console.log(new Date(Date.UTC(99,0,1)).getUTCFullYear(), Date.parse('0001-01-01T00:00:00.000Z'))"), vec!["1999 -62135596800000"]);
+        assert_eq!(run_ok("let d=new Date(0); d.setUTCFullYear(99); console.log(d.getUTCFullYear())"), vec!["99"]);
+        // console.log renders a Date as its ISO string (unquoted).
+        assert_eq!(run_ok("console.log(new Date(0))"), vec!["1970-01-01T00:00:00.000Z"]);
+    }
+
+    #[test]
     fn private_class_members() {
         // Private fields read/write/update, a private method, and a private getter.
         assert_eq!(run_ok("class C{#n=0; #step; constructor(s){this.#step=s} inc(){this.#n+=this.#step; return this} get value(){return this.#n} #secret(){return this.#n*2} reveal(){return this.#secret()}} let c=new C(5); c.inc().inc(); console.log(c.value, c.reveal())"), vec!["10 20"]);

@@ -52,6 +52,8 @@ pub enum Instr {
     Div { dst: Reg, a: Reg, b: Reg },
     Mod { dst: Reg, a: Reg, b: Reg },
     Neg { dst: Reg, a: Reg },
+    /// `dst = +a` — unary plus: coerce `a` to a number (ToNumber).
+    ToNum { dst: Reg, a: Reg },
     /// `dst = a <bitop> b` — bitwise/shift with JS int32 coercion of the operands
     /// (`>>>` coerces to uint32 and may yield a value above i32::MAX).
     Bitwise { dst: Reg, a: Reg, b: Reg, op: BitwiseOp },
@@ -268,6 +270,13 @@ pub enum Instr {
     SetRaw { arr: Reg, raw: Reg },
     /// `Math.random()` → a float in [0, 1) from the VM's PRNG.
     Random { dst: Reg },
+    /// `new Date(...)` → a Date. 0 args = now; 1 number = epoch ms; 1 string =
+    /// parsed; ≥2 = (year, month0, day, h, m, s, ms) interpreted as UTC.
+    DateNew { dst: Reg, arg_base: Reg, argc: u16 },
+    /// `Date.UTC(year, month0, …)` → epoch ms (a number, not a Date).
+    DateUTC { dst: Reg, arg_base: Reg, argc: u16 },
+    /// `Date.parse(str)` → epoch ms (NaN if unparseable).
+    DateParse { dst: Reg, src: Reg },
     /// Resolve the iterator of `src` for a `for-of`: if `src` has a `@@iterator`
     /// method (a custom iterable) call it (this = src) → the iterator object; else
     /// pass `src` through (arrays/strings/Map/Set/generators iterate directly).
@@ -349,6 +358,8 @@ impl MathFn {
 #[derive(Clone, Copy, Debug)]
 pub enum GlobalFn {
     Number,
+    String,
+    Boolean,
     ParseInt,
     ParseFloat,
     IsNaN,
@@ -359,6 +370,8 @@ impl GlobalFn {
     pub fn from_name(name: &str) -> Option<GlobalFn> {
         Some(match name {
             "Number" => GlobalFn::Number,
+            "String" => GlobalFn::String,
+            "Boolean" => GlobalFn::Boolean,
             "parseInt" => GlobalFn::ParseInt,
             "parseFloat" => GlobalFn::ParseFloat,
             "isNaN" => GlobalFn::IsNaN,
