@@ -853,6 +853,28 @@ mod tests {
     }
 
     #[test]
+    fn string_index_double_key_region() {
+        // s[k] where k is a region-computed integral double (k = i*0+2) must
+        // return the char, not undefined — the get_index Str arm coerces integral
+        // doubles like the Array arm. JIT-on must equal JIT-off across the window.
+        assert_jit_matches(
+            "let s='ABCD'; let k=0; let c=0; for(let i=0;i<2000;i++){ k=i*0+2; if(s[k]==='C') c=c+1; } console.log(c)",
+            &["2000"],
+        );
+    }
+
+    #[test]
+    fn array_setindex_sparse_grow_deopts() {
+        // A sparse write past the end inside a hot loop deopts the (potentially
+        // huge) resize to the interpreter rather than reallocating from native
+        // code; the result still matches. a starts len 3; a[10]=i grows it to 11.
+        assert_jit_matches(
+            "let a=[1,2,3]; let n=0; for(let i=0;i<2000;i++){ a[10]=i; n=n+1; } console.log(a.length, n)",
+            &["11 2000"],
+        );
+    }
+
+    #[test]
     fn array_setindex_region_transform() {
         // In-place transform a[i] = a[i]*2 (GetIndex + SetIndex in one region).
         // JIT-on == JIT-off == 2*(0+..+999) = 999000.

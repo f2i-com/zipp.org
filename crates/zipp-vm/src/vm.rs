@@ -1308,26 +1308,24 @@ impl<'p> Vm<'p> {
                 Ok(map.get(&k).unwrap_or(Value::UNDEFINED))
             }
             HeapObj::Str(s) => {
-                if key.is_int() {
-                    let i = key.as_int();
-                    if i >= 0 {
-                        let i = i as usize;
-                        // O(1) for ASCII (i-th char == i-th byte); otherwise walk
-                        // scalars (O(i), correct for multi-byte UTF-8).
-                        let ch = if s.ascii {
-                            s.bytes.as_bytes().get(i).map(|&b| b as char)
-                        } else {
-                            s.bytes.chars().nth(i)
-                        };
-                        if let Some(ch) = ch {
-                            let cs = ch.to_string();
-                            return Ok(self.alloc_str(cs));
-                        }
+                // Numeric key (incl. an integral double — a JIT region produces
+                // f64 indices, and a deopted string index must agree): char at i.
+                if let Some(i) = array_index(key) {
+                    // O(1) for ASCII (i-th char == i-th byte); otherwise walk
+                    // scalars (O(i), correct for multi-byte UTF-8).
+                    let ch = if s.ascii {
+                        s.bytes.as_bytes().get(i).map(|&b| b as char)
+                    } else {
+                        s.bytes.chars().nth(i)
+                    };
+                    if let Some(ch) = ch {
+                        let cs = ch.to_string();
+                        return Ok(self.alloc_str(cs));
                     }
                     return Ok(Value::UNDEFINED);
                 }
-                // Non-int key: only `s["length"]` is meaningful — mirror the array
-                // and `s.length` paths (was returning undefined, inconsistently).
+                // Non-numeric key: only `s["length"]` is meaningful — mirror the
+                // array and `s.length` paths.
                 let char_len = s.char_len;
                 if self.display(key) == "length" {
                     return Ok(len_value(char_len));
@@ -2335,10 +2333,18 @@ pub(crate) extern "win64" fn jit_set_index(
     let vm = unsafe { &mut *(vm as *mut Vm) };
     match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
-            if i >= items.len() {
-                items.resize(i + 1, Value::UNDEFINED);
+            let len = items.len();
+            if i < len {
+                items[i] = Value::from_bits(val_bits); // in-range store
+            } else if i == len {
+                items.push(Value::from_bits(val_bits)); // append (grow by one)
+            } else {
+                // A sparse write (i > len) would resize-with-holes — possibly a
+                // huge allocation. Deopt so the INTERPRETER does the resize: its
+                // panic on a giant/failed allocation unwinds through normal Rust,
+                // not across this `extern "win64"` boundary (which would be UB).
+                return crate::codegen::SELF_CALL_DEOPT;
             }
-            items[i] = Value::from_bits(val_bits);
             0
         }
         _ => crate::codegen::SELF_CALL_DEOPT, // non-array → interpreter
