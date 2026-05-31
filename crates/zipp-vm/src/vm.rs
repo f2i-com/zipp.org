@@ -5400,11 +5400,19 @@ impl<'p> Vm<'p> {
     /// string from `v`'s string coercion. Used to build rope children.
     fn to_str_idx(&mut self, v: Value) -> u32 {
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
-            v.heap_index()
-        } else {
-            let s = self.display(v);
-            self.heap.alloc_str(s)
+            return v.heap_index();
         }
+        // A single-digit int is a 1-char ASCII string, already interned at its
+        // byte — return that slot directly (no temporary `String` alloc). This is
+        // the hot `s += (i % 10)` digit-concat case.
+        if v.is_int() {
+            let n = v.as_int();
+            if (0..=9).contains(&n) {
+                return (b'0' as i32 + n) as u32;
+            }
+        }
+        let s = self.display(v);
+        self.heap.alloc_str(s)
     }
 
     #[inline]
