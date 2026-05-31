@@ -5467,6 +5467,13 @@ impl<'p> Vm<'p> {
         // Distinct heap strings with equal contents are `===` equal.
         if va.is_heap() && vb.is_heap() {
             let (ai, bi) = (va.heap_index(), vb.heap_index());
+            // Two DISTINCT interned single-ASCII-char slots (idx < INTERN_EMPTY,
+            // see Heap::new) are different chars — bits already differ here, so
+            // they can't be equal; skip the content compare. This is the hot
+            // `s[i] === 'x'` char-check in scanners/lexers.
+            if ai < crate::heap::INTERN_EMPTY && bi < crate::heap::INTERN_EMPTY {
+                return false;
+            }
             if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
                 return self.heap.str_eq(ai, bi);
             }
