@@ -913,24 +913,58 @@ impl<'a> FnCompiler<'a> {
     /// Compile a `class C { … }` declaration: build the method + constructor
     /// protos, register a ClassDef, and bind `C` to the materialized class value.
     fn class_decl(&mut self, class: &ox::Class) -> R<()> {
-        let class_id = self.compile_class(class)?;
+        let (class_id, static_fields) = self.compile_class(class)?;
         let name = class.id.as_ref().map(|i| i.name.to_string());
         let Some(n) = name else { return Ok(()) };
-        if self.is_script {
+
+        // Resolve where the class value will live. A plain register local builds
+        // in place; a cell/global builds in a temp then stores through.
+        enum Dest {
+            Reg(Reg),
+            Cell(Reg, Reg),   // (cell, temp)
+            Global(u32, Reg), // (slot, temp)
+        }
+        let dest = if self.is_script {
             let slot = self.cx.global_slot(&n) as u32;
-            let tmp = self.temp();
-            self.emit(Instr::MakeClass { dst: tmp, class_id });
-            self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
-            self.next_reg -= 1;
+            Dest::Global(slot, self.temp())
         } else {
             let reg = self.declare_local(&n);
             if self.cell_regs.contains(&reg) {
-                let tmp = self.temp();
-                self.emit(Instr::MakeClass { dst: tmp, class_id });
-                self.emit(Instr::CellSet { cell: reg, src: tmp });
-                self.next_reg -= 1;
+                Dest::Cell(reg, self.temp())
             } else {
-                self.emit(Instr::MakeClass { dst: reg, class_id });
+                Dest::Reg(reg)
+            }
+        };
+        let cls = match &dest {
+            Dest::Reg(r) => *r,
+            Dest::Cell(_, t) | Dest::Global(_, t) => *t,
+        };
+        self.emit(Instr::MakeClass { dst: cls, class_id });
+        // Static fields are own properties of the class value, initialized here
+        // (in the enclosing scope) right after the class is created.
+        for (fname, finit) in &static_fields {
+            let save = self.next_reg;
+            let v = match finit {
+                Some(e) => self.expr(e)?,
+                None => {
+                    let t = self.temp();
+                    self.emit(Instr::LoadUndefined { dst: t });
+                    t
+                }
+            };
+            let name_idx = self.string_name(fname);
+            self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
+            self.next_reg = save;
+        }
+        match &dest {
+            Dest::Reg(_) => {}
+            Dest::Cell(cell, t) => {
+                self.emit(Instr::CellSet { cell: *cell, src: *t });
+                self.next_reg -= 1; // reclaim the temp
+            }
+            Dest::Global(slot, t) => {
+                self.emit(Instr::StoreGlobal { idx: *slot, src: *t });
+                self.next_reg -= 1;
             }
         }
         Ok(())
@@ -942,7 +976,10 @@ impl<'a> FnCompiler<'a> {
     /// as non-capturing functions (free vars resolve to globals), so a class at
     /// module scope works fully; `extends`/`super`, static members, and
     /// get/set accessors are out of this subset.
-    fn compile_class(&mut self, class: &ox::Class) -> R<u32> {
+    fn compile_class<'b>(
+        &mut self,
+        class: &'b ox::Class,
+    ) -> R<(u32, Vec<(String, Option<&'b ox::Expression<'b>>)>)> {
         if class.super_class.is_some() {
             return Err("class extends/super is not in the zipp-vm subset yet".into());
         }
@@ -950,31 +987,35 @@ impl<'a> FnCompiler<'a> {
         let mut ctor_fn: Option<&ox::Function> = None;
         let mut methods: Vec<(String, &ox::Function)> = Vec::new();
         let mut getters: Vec<(String, &ox::Function)> = Vec::new();
+        let mut statics: Vec<(String, &ox::Function)> = Vec::new();
         let mut fields: Vec<(String, Option<&ox::Expression>)> = Vec::new();
+        let mut static_fields: Vec<(String, Option<&'b ox::Expression<'b>>)> = Vec::new();
         for el in &class.body.body {
             match el {
-                ox::ClassElement::MethodDefinition(m) => {
-                    if m.r#static {
-                        return Err("static class members are not in the zipp-vm subset yet".into());
+                ox::ClassElement::MethodDefinition(m) => match (m.r#static, m.kind) {
+                    (true, ox::MethodDefinitionKind::Method) => {
+                        statics.push((class_key_name(&m.key)?, &m.value));
                     }
-                    match m.kind {
-                        ox::MethodDefinitionKind::Constructor => ctor_fn = Some(&m.value),
-                        ox::MethodDefinitionKind::Method => {
-                            methods.push((class_key_name(&m.key)?, &m.value));
-                        }
-                        ox::MethodDefinitionKind::Get => {
-                            getters.push((class_key_name(&m.key)?, &m.value));
-                        }
-                        ox::MethodDefinitionKind::Set => {
-                            return Err("class set accessors are not in the zipp-vm subset yet".into());
-                        }
+                    (true, _) => {
+                        return Err("static getters/setters are not in the zipp-vm subset yet".into());
                     }
-                }
+                    (false, ox::MethodDefinitionKind::Constructor) => ctor_fn = Some(&m.value),
+                    (false, ox::MethodDefinitionKind::Method) => {
+                        methods.push((class_key_name(&m.key)?, &m.value));
+                    }
+                    (false, ox::MethodDefinitionKind::Get) => {
+                        getters.push((class_key_name(&m.key)?, &m.value));
+                    }
+                    (false, ox::MethodDefinitionKind::Set) => {
+                        return Err("class set accessors are not in the zipp-vm subset yet".into());
+                    }
+                },
                 ox::ClassElement::PropertyDefinition(p) => {
                     if p.r#static {
-                        return Err("static class members are not in the zipp-vm subset yet".into());
+                        static_fields.push((class_key_name(&p.key)?, p.value.as_ref()));
+                    } else {
+                        fields.push((class_key_name(&p.key)?, p.value.as_ref()));
                     }
-                    fields.push((class_key_name(&p.key)?, p.value.as_ref()));
                 }
                 ox::ClassElement::StaticBlock(_) => {
                     return Err("static blocks are not in the zipp-vm subset yet".into());
@@ -1014,6 +1055,22 @@ impl<'a> FnCompiler<'a> {
             self.cx.functions.push(proto);
             getter_defs.push((gname.clone(), fid));
         }
+        // Static method protos (this = the class value when called as `C.m()`).
+        let mut static_defs: Vec<(String, u32)> = Vec::new();
+        for (sname, func) in &statics {
+            let (params, rest, body) = function_parts(func)?;
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.{sname}"),
+                &params,
+                rest.as_deref(),
+                Some(&*func.params),
+                &[],
+                body,
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            static_defs.push((sname.clone(), fid));
+        }
         // Constructor proto (only needed when there's a ctor or any field init).
         let ctor = if ctor_fn.is_some() || !fields.is_empty() {
             let (params, rest, body) = match ctor_fn {
@@ -1041,8 +1098,9 @@ impl<'a> FnCompiler<'a> {
             ctor,
             methods: method_defs,
             getters: getter_defs,
+            statics: static_defs,
         });
-        Ok(class_id)
+        Ok((class_id, static_fields))
     }
 
     /// The enclosing-function chain to hand a function nested in THIS one: our

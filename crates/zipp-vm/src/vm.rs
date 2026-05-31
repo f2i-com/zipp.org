@@ -921,11 +921,17 @@ impl<'p> Vm<'p> {
                         };
                         let methods = mk(&mut self.heap, &cd.methods);
                         let getters = mk(&mut self.heap, &cd.getters);
+                        let mut statics = ObjMap::new();
+                        for (n, fid) in &cd.statics {
+                            let fv = Value::heap(self.heap.alloc(HeapObj::Func(*fid)));
+                            statics.set(n, fv);
+                        }
                         let v = Value::heap(self.heap.alloc(HeapObj::Class {
                             name: cd.name,
                             ctor: cd.ctor,
                             methods,
                             getters,
+                            statics,
                         }));
                         self.set(base, dst, v);
                         ip += 1;
@@ -1820,6 +1826,10 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Value::UNDEFINED)
             }
+            // Static members are own properties of the class value (`C.method`).
+            HeapObj::Class { statics, .. } => {
+                Ok(statics.get(key).unwrap_or(Value::UNDEFINED))
+            }
             _ => Ok(Value::UNDEFINED),
         }
     }
@@ -2093,8 +2103,13 @@ impl<'p> Vm<'p> {
             return Ok(());
         }
         let mut added = false;
-        if let HeapObj::Object(map) = self.heap.get_mut(idx) {
-            added = map.set(key, val);
+        match self.heap.get_mut(idx) {
+            HeapObj::Object(map) => added = map.set(key, val),
+            // Static-member assignment on a class value (`C.x = …`).
+            HeapObj::Class { statics, .. } => {
+                statics.set(key, val);
+            }
+            _ => {}
         }
         if added {
             self.heap.bump_version(idx); // invalidate any JIT inline cache (vals realloc)

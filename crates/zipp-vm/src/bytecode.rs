@@ -404,4 +404,6 @@ pub struct ClassDef {
     pub methods: Vec<(String, u32)>,
     /// `get name()` accessors: invoked (with `this` = instance) on property read.
     pub getters: Vec<(String, u32)>,
+    /// `static name()` methods: own properties of the class value itself.
+    pub statics: Vec<(String, u32)>,
 }

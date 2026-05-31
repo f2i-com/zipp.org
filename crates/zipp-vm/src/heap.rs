@@ -112,6 +112,9 @@ pub enum HeapObj {
         methods: Vec<(String, Value)>,
         /// `get x()` accessors, invoked with `this` = instance on property read.
         getters: Vec<(String, Value)>,
+        /// Static members — own properties of the class value (`C.method`,
+        /// `C.field`). Methods start here; static fields are added by SetProp.
+        statics: ObjMap,
     },
 }
 

@@ -1169,6 +1169,11 @@ mod tests {
         // Getters: invoked on read (this = instance), not enumerable.
         assert_eq!(run_ok("class C{constructor(){this.items=[1,2,3]} get size(){return this.items.length}} console.log(new C().size)"), vec!["3"]);
         assert_eq!(run_ok("class C{constructor(){this.n=1} get d(){return this.n*2}} let c=new C(); console.log(c.d, Object.keys(c).join(','))"), vec!["2 n"]);
+        // Static methods + fields; instances don't see statics.
+        assert_eq!(run_ok("class M{static sq(n){return n*n}} console.log(M.sq(5))"), vec!["25"]);
+        assert_eq!(run_ok("class Cfg{static V='1.0'; static MAX=100} console.log(Cfg.V, Cfg.MAX)"), vec!["1.0 100"]);
+        assert_eq!(run_ok("class C{static n=0; constructor(){C.n++; this.id=C.n}} let a=new C(),b=new C(); console.log(a.id,b.id,C.n)"), vec!["1 2 2"]);
+        assert_eq!(run_ok("class A{static s(){return 1}} let a=new A(); console.log(typeof a.s, typeof A.s)"), vec!["undefined function"]);
     }
 
     #[test]
