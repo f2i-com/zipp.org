@@ -52,6 +52,13 @@ pub enum Instr {
     Div { dst: Reg, a: Reg, b: Reg },
     Mod { dst: Reg, a: Reg, b: Reg },
     Neg { dst: Reg, a: Reg },
+    /// `dst = a <bitop> b` — bitwise/shift with JS int32 coercion of the operands
+    /// (`>>>` coerces to uint32 and may yield a value above i32::MAX).
+    Bitwise { dst: Reg, a: Reg, b: Reg, op: BitwiseOp },
+    /// `dst = a ** b` — exponentiation (f64 semantics).
+    Pow { dst: Reg, a: Reg, b: Reg },
+    /// `dst = ~a` — bitwise NOT (int32 coercion).
+    BitNot { dst: Reg, a: Reg },
 
     /// `dst = a + <int immediate>` — the canonical `i + 1`, `n - 1` shape.
     AddInt { dst: Reg, a: Reg, imm: i32 },
@@ -268,6 +275,17 @@ impl GlobalFn {
             _ => return None,
         })
     }
+}
+
+/// Bitwise/shift operators (operands coerced to int32, or uint32 for `Ushr`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitwiseOp {
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Ushr,
 }
 
 /// A built-in constructor recognised on the right of `instanceof`. The engine

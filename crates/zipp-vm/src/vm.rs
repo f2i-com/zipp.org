@@ -692,6 +692,51 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    Instr::Bitwise { dst, a, b, op } => {
+                        use crate::bytecode::BitwiseOp as B;
+                        let va = self.get(base, a);
+                        let vb = self.get(base, b);
+                        let x = to_int32(self.to_number(va)?);
+                        // Shift counts use the low 5 bits per the JS spec.
+                        let r = match op {
+                            B::And => Value::int(x & to_int32(self.to_number(vb)?)),
+                            B::Or => Value::int(x | to_int32(self.to_number(vb)?)),
+                            B::Xor => Value::int(x ^ to_int32(self.to_number(vb)?)),
+                            B::Shl => {
+                                let s = to_uint32(self.to_number(vb)?) & 31;
+                                Value::int(x.wrapping_shl(s))
+                            }
+                            B::Shr => {
+                                let s = to_uint32(self.to_number(vb)?) & 31;
+                                Value::int(x >> s)
+                            }
+                            B::Ushr => {
+                                let s = to_uint32(self.to_number(vb)?) & 31;
+                                let u = to_uint32(self.to_number(va)?) >> s;
+                                // u32 may exceed i32::MAX → keep numeric range.
+                                if u <= i32::MAX as u32 {
+                                    Value::int(u as i32)
+                                } else {
+                                    Value::num(u as f64)
+                                }
+                            }
+                        };
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::Pow { dst, a, b } => {
+                        let va = self.get(base, a);
+                        let vb = self.get(base, b);
+                        let r = self.to_number(va)?.powf(self.to_number(vb)?);
+                        self.set(base, dst, Value::num(r));
+                        ip += 1;
+                    }
+                    Instr::BitNot { dst, a } => {
+                        let va = self.get(base, a);
+                        let r = !to_int32(self.to_number(va)?);
+                        self.set(base, dst, Value::int(r));
+                        ip += 1;
+                    }
                     Instr::AddInt { dst, a, imm } => {
                         let va = self.get(base, a);
                         let r = if va.is_int() {
@@ -3499,6 +3544,22 @@ fn wrap_json(parts: &[String], open: char, close: char, indent: &str, depth: usi
     let pad_close = indent.repeat(depth);
     let sep = format!(",\n{pad}");
     format!("{open}\n{pad}{}\n{pad_close}{close}", parts.join(&sep))
+}
+
+/// JS `ToInt32`: truncate toward zero, take modulo 2^32, interpret as signed.
+/// NaN/±Infinity → 0. Used by the bitwise operators.
+fn to_int32(n: f64) -> i32 {
+    to_uint32(n) as i32
+}
+
+/// JS `ToUint32`: truncate toward zero, take modulo 2^32 as an unsigned value.
+fn to_uint32(n: f64) -> u32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    // rem_euclid keeps the result in [0, 2^32); `as u32` then wraps exactly.
+    let m = n.trunc().rem_euclid(4_294_967_296.0);
+    m as u32
 }
 
 fn fmt_f64(n: f64) -> String {

@@ -22,7 +22,7 @@ use std::rc::Rc;
 
 use oxc_ast::ast as ox;
 
-use crate::bytecode::{FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource};
+use crate::bytecode::{BitwiseOp, FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource};
 use crate::capture;
 use crate::value::Value;
 use crate::vm::STRING_CONST_BIT;
@@ -1660,6 +1660,13 @@ impl<'a> FnCompiler<'a> {
             Op::StrictInequality => Instr::Ne { dst, a, b: r },
             Op::Equality => Instr::LooseEq { dst, a, b: r },
             Op::Inequality => Instr::LooseNe { dst, a, b: r },
+            Op::BitwiseAnd => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::And },
+            Op::BitwiseOR => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Or },
+            Op::BitwiseXOR => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Xor },
+            Op::ShiftLeft => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Shl },
+            Op::ShiftRight => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Shr },
+            Op::ShiftRightZeroFill => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Ushr },
+            Op::Exponential => Instr::Pow { dst, a, b: r },
             _ => return Err("unsupported binary operator (zipp-vm v1)".into()),
         };
         self.emit(instr);
@@ -1719,6 +1726,11 @@ impl<'a> FnCompiler<'a> {
             Op::Typeof => {
                 let a = self.expr(&u.argument)?;
                 self.emit(Instr::TypeOf { dst, a });
+                Ok(dst)
+            }
+            Op::BitwiseNot => {
+                let a = self.expr(&u.argument)?;
+                self.emit(Instr::BitNot { dst, a });
                 Ok(dst)
             }
             _ => Err("unsupported unary operator (zipp-vm v1)".into()),

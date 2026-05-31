@@ -1031,6 +1031,20 @@ mod tests {
     }
 
     #[test]
+    fn bitwise_and_exponent() {
+        assert_eq!(run_ok("console.log(5 & 3, 5 | 2, 5 ^ 1, ~5)"), vec!["1 7 4 -6"]);
+        assert_eq!(run_ok("console.log(1<<4, 256>>2, -8>>1)"), vec!["16 64 -4"]);
+        // Unsigned right shift yields a uint32 (can exceed i32::MAX).
+        assert_eq!(run_ok("console.log(-1>>>0, (1<<31)>>>0, -1>>>28)"), vec!["4294967295 2147483648 15"]);
+        // The canonical (x*31+c)|0 hash idiom.
+        assert_eq!(run_ok("let h=0; for(let i=0;i<5;i++) h=(h*31 + i)|0; console.log(h)"), vec!["31810"]);
+        // Exponentiation, right-associative.
+        assert_eq!(run_ok("console.log(2**10, (-2)**3, 2**3**2, 10**-2)"), vec!["1024 -8 512 0.01"]);
+        // Operands coerce via ToInt32 (bool/string/null/undefined/NaN/float).
+        assert_eq!(run_ok("console.log(true & 1, '5'|0, null|0, undefined|0, 3.9|0, NaN|0)"), vec!["1 5 0 0 3 0"]);
+    }
+
+    #[test]
     fn for_of_destructuring() {
         assert_eq!(run_ok("let r=[]; for(let [a,b] of [[1,2],[3,4]]) r.push(a+b); console.log(r.join(','))"), vec!["3,7"]);
         // The canonical Object.entries idiom.
