@@ -2316,7 +2316,16 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             Some(s) => (map.vals[s], map.vals.as_ptr() as u64, s as u32),
             None => return Value::UNDEFINED.bits(), // missing key: undefined, don't cache
         },
-        _ => return crate::codegen::SELF_CALL_DEOPT, // array/string/etc → interpreter
+        // `arr.length` / `str.length` in a region: return the length WITHOUT
+        // caching — it's derived from the container's element count, not a fixed
+        // slot, so a stale cache would be wrong after the container grows. The IC
+        // entry stays unset, so this site simply misses (helper call) each time —
+        // cheap, and it lets a `for (i < a.length) a[i]` loop run as a region
+        // instead of bailing on the first `.length` access.
+        HeapObj::Array(items) if key == "length" => return len_value(items.len()).bits(),
+        HeapObj::Str(s) if key == "length" => return len_value(s.char_len).bits(),
+        HeapObj::Cons { len, .. } if key == "length" => return len_value(*len).bits(),
+        _ => return crate::codegen::SELF_CALL_DEOPT, // other array/string props → interpreter
     };
     let version = vm.heap.version_of(idx);
     vm.jit.set_ic(site_idx, obj_bits, vals_ptr, version, slot);

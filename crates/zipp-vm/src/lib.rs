@@ -832,6 +832,27 @@ mod tests {
     }
 
     #[test]
+    fn array_length_bound_index_region() {
+        // `for (i < a.length) s += a[i]` — the common array-scan shape. a.length
+        // is a GetProp the miss-helper now answers for arrays (uncached), so the
+        // whole loop JITs instead of bailing on the first .length access.
+        assert_jit_matches(
+            "let a=[]; for(let i=0;i<100;i++) a.push(i*2); let s=0; for(let i=0;i<a.length;i++){ s+=a[i]; } console.log(s)",
+            &["9900"],
+        );
+    }
+
+    #[test]
+    fn object_length_property_not_confused_with_array_length() {
+        // An object with its own `length` property reads that property via the
+        // inline-cache slot, never the array element-count path.
+        assert_jit_matches(
+            "let o={length:7}; let s=0; for(let i=0;i<20000;i++){ s+=o.length; } console.log(s)",
+            &["140000"],
+        );
+    }
+
+    #[test]
     fn array_double_and_oob_index() {
         // Integral double keys coerce (a[1.0]==a[1]); negative / fractional /
         // out-of-range keys are undefined — matching JS and the JIT helper.
