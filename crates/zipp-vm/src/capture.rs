@@ -90,6 +90,24 @@ fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
             }
             collect_bound_stmt(&f.body, out);
         }
+        // for-of / for-in declare their loop variable too, so a closure that
+        // captures it must see it boxed.
+        S::ForOfStatement(f) => {
+            if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                for decl in &d.declarations {
+                    collect_pattern_names(&decl.id, out);
+                }
+            }
+            collect_bound_stmt(&f.body, out);
+        }
+        S::ForInStatement(f) => {
+            if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                for decl in &d.declarations {
+                    collect_pattern_names(&decl.id, out);
+                }
+            }
+            collect_bound_stmt(&f.body, out);
+        }
         _ => {}
     }
 }
@@ -331,6 +349,14 @@ fn collect_nested_free(s: &ox::Statement, out: &mut HashSet<String>) {
             if let Some(u) = &f.update {
                 collect_nested_free_expr(u, out);
             }
+            collect_nested_free(&f.body, out);
+        }
+        S::ForOfStatement(f) => {
+            collect_nested_free_expr(&f.right, out);
+            collect_nested_free(&f.body, out);
+        }
+        S::ForInStatement(f) => {
+            collect_nested_free_expr(&f.right, out);
             collect_nested_free(&f.body, out);
         }
         S::ReturnStatement(r) => {

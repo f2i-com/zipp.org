@@ -1136,6 +1136,18 @@ mod tests {
     }
 
     #[test]
+    fn for_of_for_in_capture() {
+        // A closure capturing a for-of / for-in loop variable resolves it (was a
+        // pre-existing bug: the loop var wasn't detected as captured → not boxed).
+        // Within-iteration capture+use matches node exactly.
+        assert_eq!(run_ok("let out=[]; for(let x of [1,2,3]){ let g=()=>x*10; out.push(g()); } console.log(out.join(','))"), vec!["10,20,30"]);
+        assert_eq!(run_ok("let out=[]; for(let k in {a:1,b:2}){ out.push((()=>k)()); } console.log(out.join(','))"), vec!["a,b"]);
+        assert_eq!(run_ok("function f(){let r=[]; for(let v of [10,20]){ r.push((()=>v)()); } return r} console.log(f().join(','))"), vec!["10,20"]);
+        // Generator loop var captured within the iteration.
+        assert_eq!(run_ok("function* g(){yield 1;yield 2} let o=[]; for(let n of g()){ o.push((()=>n+100)()); } console.log(o.join(','))"), vec!["101,102"]);
+    }
+
+    #[test]
     fn for_of_destructuring() {
         assert_eq!(run_ok("let r=[]; for(let [a,b] of [[1,2],[3,4]]) r.push(a+b); console.log(r.join(','))"), vec!["3,7"]);
         // The canonical Object.entries idiom.

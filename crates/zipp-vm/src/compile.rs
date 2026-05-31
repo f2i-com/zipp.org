@@ -113,9 +113,11 @@ impl Compiler {
             }
         }
 
-        // Compile the top-level body as function 0. The script has no enclosing
-        // scope and binds everything to globals, so nothing it declares is a
-        // captured cell.
+        // Compile the top-level body as function 0. The script binds its
+        // `let`/`var`/function declarations to GLOBALS, but for-of/for-in loop
+        // variables and catch params are true locals — so it still needs a
+        // captured set, or a closure over such a local can't box it.
+        let captured = capture::captured_locals(&[], &prog.body);
         let top = self.compile_function_body(
             None,
             &[],
@@ -124,7 +126,7 @@ impl Compiler {
             &prog.body,
             true,
             false, // top-level script is not a generator
-            HashSet::new(),
+            captured,
             Vec::new(),
         )?;
         self.functions[0] = top;
