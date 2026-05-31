@@ -1413,6 +1413,12 @@ mod tests {
         // Getters: invoked on read (this = instance), not enumerable.
         assert_eq!(run_ok("class C{constructor(){this.items=[1,2,3]} get size(){return this.items.length}} console.log(new C().size)"), vec!["3"]);
         assert_eq!(run_ok("class C{constructor(){this.n=1} get d(){return this.n*2}} let c=new C(); console.log(c.d, Object.keys(c).join(','))"), vec!["2 n"]);
+        // Setters: invoked on write; get/set pair; setter-only; inherited; own
+        // data property still shadows.
+        assert_eq!(run_ok("class T{constructor(c){this._c=c} get c(){return this._c} set c(v){this._c=v*2}} let t=new T(5); console.log(t.c); t.c=10; console.log(t.c)"), vec!["5", "20"]);
+        assert_eq!(run_ok("class L{set m(v){this.last='['+v+']'}} let l=new L(); l.m='hi'; console.log(l.last)"), vec!["[hi]"]);
+        assert_eq!(run_ok("class B{set v(x){this._v=x*2} get v(){return this._v}} class D extends B{} let d=new D(); d.v=21; console.log(d.v)"), vec!["42"]);
+        assert_eq!(run_ok("class P{constructor(){this.x=1}} let p=new P(); p.x=5; p.y=9; console.log(p.x,p.y)"), vec!["5 9"]);
         // Static methods + fields; instances don't see statics.
         assert_eq!(run_ok("class M{static sq(n){return n*n}} console.log(M.sq(5))"), vec!["25"]);
         assert_eq!(run_ok("class Cfg{static V='1.0'; static MAX=100} console.log(Cfg.V, Cfg.MAX)"), vec!["1.0 100"]);

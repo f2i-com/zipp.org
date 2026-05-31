@@ -1135,12 +1135,14 @@ impl<'a> FnCompiler<'a> {
             has_explicit_ctor: false,
             methods: Vec::new(),
             getters: Vec::new(),
+            setters: Vec::new(),
             statics: Vec::new(),
         });
         self.cx.class_names.push((cname.clone(), class_id));
         let mut ctor_fn: Option<&ox::Function> = None;
         let mut methods: Vec<(String, &ox::Function)> = Vec::new();
         let mut getters: Vec<(String, &ox::Function)> = Vec::new();
+        let mut setters: Vec<(String, &ox::Function)> = Vec::new();
         let mut statics: Vec<(String, &ox::Function)> = Vec::new();
         let mut fields: Vec<(String, Option<&ox::Expression>)> = Vec::new();
         let mut static_fields: Vec<(String, Option<&'b ox::Expression<'b>>)> = Vec::new();
@@ -1161,7 +1163,7 @@ impl<'a> FnCompiler<'a> {
                         getters.push((class_key_name(&m.key)?, &m.value));
                     }
                     (false, ox::MethodDefinitionKind::Set) => {
-                        return Err("class set accessors are not in the zipp-vm subset yet".into());
+                        setters.push((class_key_name(&m.key)?, &m.value));
                     }
                 },
                 ox::ClassElement::PropertyDefinition(p) => {
@@ -1214,6 +1216,25 @@ impl<'a> FnCompiler<'a> {
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             getter_defs.push((gname.clone(), fid));
+        }
+        // Setter protos (a one-parameter method invoked on property write).
+        let mut setter_defs: Vec<(String, u32)> = Vec::new();
+        for (sname, func) in &setters {
+            let (params, rest, body) = function_parts(func)?;
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.set {sname}"),
+                &params,
+                rest.as_deref(),
+                Some(&*func.params),
+                &[],
+                body,
+                super_class_id,
+                false, // setters are never generators
+                false, // setters are never async
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            setter_defs.push((sname.clone(), fid));
         }
         // Static method protos (this = the class value when called as `C.m()`).
         let mut static_defs: Vec<(String, u32)> = Vec::new();
@@ -1268,6 +1289,7 @@ impl<'a> FnCompiler<'a> {
             has_explicit_ctor,
             methods: method_defs,
             getters: getter_defs,
+            setters: setter_defs,
             statics: static_defs,
         };
         Ok((class_id, static_fields))

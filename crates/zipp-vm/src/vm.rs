@@ -1062,6 +1062,7 @@ impl<'p> Vm<'p> {
                         };
                         let methods = mk(&mut self.heap, &cd.methods);
                         let getters = mk(&mut self.heap, &cd.getters);
+                        let setters = mk(&mut self.heap, &cd.setters);
                         let mut statics = ObjMap::new();
                         for (n, fid) in &cd.statics {
                             let fv = Value::heap(self.heap.alloc(HeapObj::Func(*fid)));
@@ -1073,6 +1074,7 @@ impl<'p> Vm<'p> {
                             has_explicit_ctor: cd.has_explicit_ctor,
                             methods,
                             getters,
+                            setters,
                             statics,
                             parent: parent_idx,
                         }));
@@ -3354,6 +3356,17 @@ impl<'p> Vm<'p> {
             self.heap.bump_version(idx);
             return Ok(());
         }
+        // A class instance with an inherited `set x(v)` accessor: assigning a
+        // property that is NOT an own data property invokes the setter (own data
+        // properties shadow an inherited accessor, per JS [[Set]]).
+        if let HeapObj::Object(map) = self.heap.get(idx) {
+            if map.class.is_some() && map.get(key).is_none() {
+                if let Some(setter) = self.lookup_setter(map.class, key) {
+                    self.call_value(setter, obj, &[val])?;
+                    return Ok(());
+                }
+            }
+        }
         let mut added = false;
         match self.heap.get_mut(idx) {
             HeapObj::Object(map) => added = map.set(key, val),
@@ -3367,6 +3380,23 @@ impl<'p> Vm<'p> {
             self.heap.bump_version(idx); // invalidate any JIT inline cache (vals realloc)
         }
         Ok(())
+    }
+
+    /// Walk a class chain for a `set key(v)` accessor, returning the setter fn.
+    fn lookup_setter(&self, class: Option<u32>, key: &str) -> Option<Value> {
+        let mut cur = class;
+        while let Some(cidx) = cur {
+            match self.heap.get(cidx) {
+                HeapObj::Class { setters, parent, .. } => {
+                    if let Some((_, v)) = setters.iter().find(|(k, _)| k == key) {
+                        return Some(*v);
+                    }
+                    cur = *parent;
+                }
+                _ => break,
+            }
+        }
+        None
     }
 
     /// Try a builtin method on an array or string receiver. Returns
