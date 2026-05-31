@@ -1838,6 +1838,30 @@ impl<'p> Vm<'p> {
             "map" => self.array_each(idx, arg0, EachMode::Map),
             "filter" => self.array_each(idx, arg0, EachMode::Filter),
             "forEach" => self.array_each(idx, arg0, EachMode::ForEach),
+            // Short-circuiting callback searches. They stop at the first match, so
+            // they use call_value directly (the all-elements array_each driver
+            // doesn't fit); the callback receives (element, index).
+            "find" | "findIndex" | "some" | "every" => {
+                let cb = arg0;
+                let snapshot = self.array_snapshot(idx);
+                for (i, v) in snapshot.iter().enumerate() {
+                    let r = self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
+                    let t = self.truthy(r);
+                    match name {
+                        "find" if t => return Ok(Some(*v)),
+                        "findIndex" if t => return Ok(Some(Value::int(i as i32))),
+                        "some" if t => return Ok(Some(Value::bool(true))),
+                        "every" if !t => return Ok(Some(Value::bool(false))),
+                        _ => {}
+                    }
+                }
+                Ok(Some(match name {
+                    "find" => Value::UNDEFINED,
+                    "findIndex" => Value::int(-1),
+                    "some" => Value::bool(false),
+                    _ => Value::bool(true), // every: all matched (or empty)
+                }))
+            }
             "reduce" => {
                 let cb = arg0;
                 let snapshot = self.array_snapshot(idx);
@@ -2012,6 +2036,55 @@ impl<'p> Vm<'p> {
                     s.split(&sep).map(|p| self.alloc_str(p.to_string())).collect()
                 };
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(parts)))))
+            }
+            "trim" => Ok(Some(self.alloc_str(s.trim().to_string()))),
+            "trimStart" => Ok(Some(self.alloc_str(s.trim_start().to_string()))),
+            "trimEnd" => Ok(Some(self.alloc_str(s.trim_end().to_string()))),
+            "startsWith" => Ok(Some(Value::bool(s.starts_with(&self.display(arg0))))),
+            "endsWith" => Ok(Some(Value::bool(s.ends_with(&self.display(arg0))))),
+            "padStart" | "padEnd" => {
+                let cur = s.chars().count();
+                let t = arg0.as_f64();
+                let target = if t.is_finite() && t > 0.0 { t as usize } else { 0 };
+                if cur >= target {
+                    return Ok(Some(self.alloc_str(s.clone())));
+                }
+                let pad = if args.len() >= 2 { self.display(args[1]) } else { " ".to_string() };
+                let padchars: Vec<char> = pad.chars().collect();
+                if padchars.is_empty() {
+                    return Ok(Some(self.alloc_str(s.clone())));
+                }
+                let mut padding = String::new();
+                for k in 0..(target - cur) {
+                    padding.push(padchars[k % padchars.len()]);
+                }
+                let out = if name == "padStart" {
+                    format!("{padding}{s}")
+                } else {
+                    format!("{s}{padding}")
+                };
+                Ok(Some(self.alloc_str(out)))
+            }
+            "replace" => {
+                // String search: replaces only the FIRST occurrence (JS semantics).
+                let search = self.display(arg0);
+                let repl = if args.len() >= 2 { self.display(args[1]) } else { "undefined".to_string() };
+                let out = match s.find(&search) {
+                    Some(pos) => {
+                        let mut r = String::with_capacity(s.len() + repl.len());
+                        r.push_str(&s[..pos]);
+                        r.push_str(&repl);
+                        r.push_str(&s[pos + search.len()..]);
+                        r
+                    }
+                    None => s.clone(),
+                };
+                Ok(Some(self.alloc_str(out)))
+            }
+            "replaceAll" => {
+                let search = self.display(arg0);
+                let repl = if args.len() >= 2 { self.display(args[1]) } else { "undefined".to_string() };
+                Ok(Some(self.alloc_str(s.replace(&search, &repl))))
             }
             _ => Ok(None),
         }

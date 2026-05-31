@@ -853,6 +853,28 @@ mod tests {
     }
 
     #[test]
+    fn array_callback_search_methods() {
+        assert_eq!(
+            run_ok("let a=[1,2,3,4]; console.log(a.find(x=>x>2), a.findIndex(x=>x>2), a.some(x=>x>3), a.every(x=>x>0))"),
+            vec!["3 2 true true"],
+        );
+        assert_eq!(
+            run_ok("let a=[1,2,3]; console.log(a.find(x=>x>9), a.findIndex(x=>x>9), a.some(x=>x>9), a.every(x=>x>1))"),
+            vec!["undefined -1 false false"],
+        );
+        // Empty array: some→false, every→true (vacuous truth).
+        assert_eq!(run_ok("console.log([].some(x=>x), [].every(x=>x))"), vec!["false true"]);
+    }
+
+    #[test]
+    fn string_methods_extra() {
+        assert_eq!(run_ok("console.log('  hi  '.trim(), 'abc'.startsWith('ab'), 'abc'.endsWith('bc'))"), vec!["hi true true"]);
+        assert_eq!(run_ok("console.log('5'.padStart(3,'0'), '5'.padEnd(3,'-'), 'abc'.padStart(2))"), vec!["005 5-- abc"]);
+        // replace = first occurrence; replaceAll = all.
+        assert_eq!(run_ok("console.log('aXbXc'.replace('X','-'), 'aXbXc'.replaceAll('X','-'))"), vec!["a-bXc a-b-c"]);
+    }
+
+    #[test]
     fn math_functions() {
         assert_eq!(
             run_ok("console.log(Math.sqrt(16), Math.floor(3.7), Math.ceil(3.2), Math.abs(-5), Math.trunc(-4.7))"),
