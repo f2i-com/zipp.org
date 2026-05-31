@@ -1006,6 +1006,31 @@ mod tests {
     }
 
     #[test]
+    fn destructuring() {
+        // Object: shorthand, subset, rename, defaults.
+        assert_eq!(run_ok("let {x,y}={x:1,y:2}; console.log(x+y)"), vec!["3"]);
+        assert_eq!(run_ok("let {a:p,b:q}={a:10,b:20}; console.log(p,q)"), vec!["10 20"]);
+        assert_eq!(run_ok("let {x=5,y=9}={x:1}; console.log(x,y)"), vec!["1 9"]);
+        // Array: positional, holes, defaults, rest (incl. shorter-than-pattern).
+        assert_eq!(run_ok("let [a,b,c]=[10,20,30]; console.log(a+b+c)"), vec!["60"]);
+        assert_eq!(run_ok("let [,b,,d]=[1,2,3,4]; console.log(b,d)"), vec!["2 4"]);
+        assert_eq!(run_ok("let [a=1,b=2,c=3]=[10]; console.log(a,b,c)"), vec!["10 2 3"]);
+        assert_eq!(run_ok("let [first,...rest]=[1,2,3,4]; console.log(first, rest.join(','))"), vec!["1 2,3,4"]);
+        assert_eq!(run_ok("let [a,b,...rest]=[1]; console.log(a,b,rest.length)"), vec!["1 undefined 0"]);
+        // A string is iterable for array destructuring.
+        assert_eq!(run_ok("let [h,...t]='hello'; console.log(h, t.join(''))"), vec!["h ello"]);
+        // Nested patterns, arbitrary depth.
+        assert_eq!(run_ok("let {a:{b}}={a:{b:42}}; console.log(b)"), vec!["42"]);
+        assert_eq!(run_ok("let [[a,b],[c]]=[[1,2],[3]]; console.log(a,b,c)"), vec!["1 2 3"]);
+        assert_eq!(run_ok("let {p:[m,n]}={p:[7,8]}; console.log(m,n)"), vec!["7 8"]);
+        // Computed key.
+        assert_eq!(run_ok("let k='x'; let {[k]:v}={x:99}; console.log(v)"), vec!["99"]);
+        // Inside a function; a destructured local captured by a closure.
+        assert_eq!(run_ok("function f(o){let {a,b}=o; return a+b} console.log(f({a:3,b:4}))"), vec!["7"]);
+        assert_eq!(run_ok("function mk(){let [a,b]=[1,2]; return ()=>a+b} console.log(mk()())"), vec!["3"]);
+    }
+
+    #[test]
     fn instanceof_operator() {
         // Built-in collections / functions.
         assert_eq!(run_ok("console.log([] instanceof Array, [] instanceof Object)"), vec!["true true"]);

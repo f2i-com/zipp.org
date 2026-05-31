@@ -823,6 +823,40 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    Instr::ArrayRest { dst, src, start } => {
+                        let sv = self.get(base, src);
+                        let start = start as usize;
+                        let not_iter =
+                            || Thrown("TypeError: value is not iterable for array destructuring".into());
+                        if !sv.is_heap() {
+                            return Err(not_iter());
+                        }
+                        // Two phases: gather under the immutable heap borrow, then
+                        // allocate (chars need fresh strings) after it ends.
+                        let mut vals: Option<Vec<Value>> = None;
+                        let mut chars: Option<Vec<char>> = None;
+                        match self.heap.get(sv.heap_index()) {
+                            HeapObj::Array(items) => {
+                                vals = Some(items.get(start..).map(|s| s.to_vec()).unwrap_or_default());
+                            }
+                            HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                                chars = Some(
+                                    self.heap.str_cow(sv.heap_index()).unwrap().chars().skip(start).collect(),
+                                );
+                            }
+                            _ => return Err(not_iter()),
+                        }
+                        let rest: Vec<Value> = match (vals, chars) {
+                            (Some(v), _) => v,
+                            (_, Some(cs)) => {
+                                cs.into_iter().map(|c| self.alloc_str(c.to_string())).collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        let arr = Value::heap(self.heap.alloc(HeapObj::Array(rest)));
+                        self.set(base, dst, arr);
+                        ip += 1;
+                    }
                     Instr::CallSpread { dst, callee, args } => {
                         let callee_v = self.get(base, callee);
                         let args_v = self.get(base, args);

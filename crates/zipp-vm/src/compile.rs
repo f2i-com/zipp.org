@@ -582,9 +582,28 @@ impl<'a> FnCompiler<'a> {
 
     fn var_decl(&mut self, d: &ox::VariableDeclaration) -> R<()> {
         for decl in &d.declarations {
+            // Destructuring declaration (`let {a,b} = o`, `let [x,...r] = arr`):
+            // declare every leaf binding, evaluate the initializer once into a
+            // scratch register, then extract each target from it.
+            if !matches!(decl.id, ox::BindingPattern::BindingIdentifier(_)) {
+                let init = decl
+                    .init
+                    .as_ref()
+                    .ok_or("a destructuring declaration requires an initializer")?;
+                self.declare_pattern(&decl.id)?;
+                let save = self.next_reg;
+                let src = self.alloc_reg();
+                let sv = self.expr_into(init, src)?;
+                if sv != src {
+                    self.emit(Instr::Move { dst: src, src: sv });
+                }
+                self.extract_pattern(&decl.id, src)?;
+                self.next_reg = save; // reclaim the source + extraction temps
+                continue;
+            }
             let name = match &decl.id {
                 ox::BindingPattern::BindingIdentifier(id) => id.name.as_str(),
-                _ => return Err("destructuring is not in the zipp-vm v1 subset yet".into()),
+                _ => unreachable!("handled above"),
             };
 
             // Top-level `let`/`const`/`var` bind to GLOBAL slots, so that a
@@ -629,6 +648,145 @@ impl<'a> FnCompiler<'a> {
             // A captured local with no initializer keeps the cell's default
             // (undefined), set when MakeCell boxed the freshly-undefined reg.
         }
+        Ok(())
+    }
+
+    /// Phase 1 of a destructuring declaration: declare every leaf binding the
+    /// pattern introduces, so they occupy stable (low) registers / global slots
+    /// and any captured ones are boxed before extraction writes to them.
+    fn declare_pattern(&mut self, pat: &ox::BindingPattern) -> R<()> {
+        use ox::BindingPattern as P;
+        match pat {
+            P::BindingIdentifier(id) => {
+                if self.is_script {
+                    self.cx.global_slot(&id.name);
+                } else {
+                    self.declare_local(&id.name);
+                }
+                Ok(())
+            }
+            P::AssignmentPattern(ap) => self.declare_pattern(&ap.left),
+            P::ObjectPattern(op) => {
+                if op.rest.is_some() {
+                    return Err("object rest in destructuring is not in the zipp-vm subset yet".into());
+                }
+                for prop in &op.properties {
+                    self.declare_pattern(&prop.value)?;
+                }
+                Ok(())
+            }
+            P::ArrayPattern(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    self.declare_pattern(el)?;
+                }
+                if let Some(rest) = &arr.rest {
+                    self.declare_pattern(&rest.argument)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Phase 2: extract values from `src` (the initializer's value) into the
+    /// already-declared bindings. Every temp this allocates sits above the
+    /// declared locals, so callers reclaim them with a single `next_reg` reset.
+    fn extract_pattern(&mut self, pat: &ox::BindingPattern, src: Reg) -> R<()> {
+        use ox::BindingPattern as P;
+        match pat {
+            P::BindingIdentifier(id) => {
+                let b = self.resolve(&id.name);
+                self.store_binding(&b, src);
+                Ok(())
+            }
+            // `target = default`: `src` is our scratch temp, so patch the default
+            // into it in place when it came out undefined, then bind the target.
+            P::AssignmentPattern(ap) => {
+                self.apply_default_in_place(src, &ap.right)?;
+                self.extract_pattern(&ap.left, src)
+            }
+            P::ObjectPattern(op) => {
+                for prop in &op.properties {
+                    let save = self.next_reg;
+                    let val = self.alloc_reg();
+                    self.extract_member(src, &prop.key, prop.computed, val)?;
+                    self.extract_pattern(&prop.value, val)?;
+                    self.next_reg = save;
+                }
+                Ok(())
+            }
+            P::ArrayPattern(arr) => {
+                for (i, el) in arr.elements.iter().enumerate() {
+                    if let Some(p) = el {
+                        let save = self.next_reg;
+                        let val = self.alloc_reg();
+                        let idx = self.alloc_reg();
+                        self.emit(Instr::LoadInt { dst: idx, val: i as i32 });
+                        self.emit(Instr::GetIndex { dst: val, obj: src, key: idx });
+                        self.extract_pattern(p, val)?;
+                        self.next_reg = save;
+                    }
+                    // a hole (`[, x]`) binds nothing
+                }
+                if let Some(rest) = &arr.rest {
+                    let save = self.next_reg;
+                    let val = self.alloc_reg();
+                    self.emit(Instr::ArrayRest { dst: val, src, start: arr.elements.len() as u32 });
+                    self.extract_pattern(&rest.argument, val)?;
+                    self.next_reg = save;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Read `obj[key]` into `dst` for a destructuring property. A static key
+    /// (identifier / string / number) uses GetProp; a computed `[expr]` key is
+    /// evaluated and read with GetIndex.
+    fn extract_member(
+        &mut self,
+        obj: Reg,
+        key: &ox::PropertyKey,
+        computed: bool,
+        dst: Reg,
+    ) -> R<()> {
+        if computed {
+            let e = key
+                .as_expression()
+                .ok_or("unsupported computed destructuring key")?;
+            let save = self.next_reg; // `dst` was allocated below this
+            let k = self.expr(e)?;
+            self.emit(Instr::GetIndex { dst, obj, key: k });
+            self.next_reg = save; // reclaim the key-expression temps
+            return Ok(());
+        }
+        let name = match key {
+            ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+            ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
+            ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
+            _ => return Err("unsupported destructuring property key".into()),
+        };
+        let nidx = self.string_name(&name);
+        self.emit(Instr::GetProp { dst, obj, name: nidx });
+        Ok(())
+    }
+
+    /// `if (reg === undefined) reg = default` — apply a destructuring/parameter
+    /// default to a scratch register in place.
+    fn apply_default_in_place(&mut self, reg: Reg, default: &ox::Expression) -> R<()> {
+        let save = self.next_reg;
+        let undef = self.alloc_reg();
+        self.emit(Instr::LoadUndefined { dst: undef });
+        let cond = self.alloc_reg();
+        self.emit(Instr::Eq { dst: cond, a: reg, b: undef });
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond, target: 0 }); // skip default when defined
+        let dv = self.expr_into(default, reg)?;
+        if dv != reg {
+            self.emit(Instr::Move { dst: reg, src: dv });
+        }
+        let end = self.here();
+        self.patch_jump(jf, end);
+        self.next_reg = save;
         Ok(())
     }
 

@@ -63,9 +63,7 @@ fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
     match s {
         S::VariableDeclaration(d) => {
             for decl in &d.declarations {
-                if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
-                    out.insert(id.name.to_string());
-                }
+                collect_pattern_names(&decl.id, out);
             }
         }
         S::FunctionDeclaration(f) => {
@@ -87,14 +85,41 @@ fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
         S::ForStatement(f) => {
             if let Some(ox::ForStatementInit::VariableDeclaration(d)) = &f.init {
                 for decl in &d.declarations {
-                    if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
-                        out.insert(id.name.to_string());
-                    }
+                    collect_pattern_names(&decl.id, out);
                 }
             }
             collect_bound_stmt(&f.body, out);
         }
         _ => {}
+    }
+}
+
+/// Insert every name a binding pattern introduces — recursing through object/
+/// array destructuring, defaults (`= d`), and rest elements — so a destructured
+/// local captured by a nested closure is detected and boxed.
+fn collect_pattern_names(pat: &ox::BindingPattern, out: &mut HashSet<String>) {
+    use ox::BindingPattern as P;
+    match pat {
+        P::BindingIdentifier(id) => {
+            out.insert(id.name.to_string());
+        }
+        P::AssignmentPattern(ap) => collect_pattern_names(&ap.left, out),
+        P::ObjectPattern(op) => {
+            for prop in &op.properties {
+                collect_pattern_names(&prop.value, out);
+            }
+            if let Some(rest) = &op.rest {
+                collect_pattern_names(&rest.argument, out);
+            }
+        }
+        P::ArrayPattern(arr) => {
+            for el in arr.elements.iter().flatten() {
+                collect_pattern_names(el, out);
+            }
+            if let Some(rest) = &arr.rest {
+                collect_pattern_names(&rest.argument, out);
+            }
+        }
     }
 }
 

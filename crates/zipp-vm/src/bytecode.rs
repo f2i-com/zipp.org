@@ -84,6 +84,9 @@ pub enum Instr {
     /// array, or a string's chars); otherwise push `val` as one element. Used to
     /// build array literals / call-arg lists containing `...spread`.
     ArrayAppend { arr: Reg, val: Reg, spread: bool },
+    /// `dst = [...src.slice(start)]` — the rest of an array (or a string's chars)
+    /// from index `start`. Used by array destructuring's `[a, ...rest]`.
+    ArrayRest { dst: Reg, src: Reg, start: u32 },
     /// `dst = callee(...args_array)` — call `callee` (a function value) spreading
     /// the elements of the array in `args` as the arguments (`this` = undefined).
     CallSpread { dst: Reg, callee: Reg, args: Reg },
