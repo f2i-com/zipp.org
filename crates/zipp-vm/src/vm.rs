@@ -1782,6 +1782,26 @@ impl<'p> Vm<'p> {
                         let prog: &'p Program = self.program;
                         let key: &'p str =
                             &prog.functions[func_id as usize].string_constants[name as usize];
+                        // Hot fast path: `arr.push(x)` — the most common
+                        // per-element array idiom. Append directly, skipping the
+                        // try_builtin_method → dispatch_builtin_method → array_method
+                        // layering (and the args-gather), then return the new length.
+                        if argc == 1 && key == "push" && recv.is_heap() {
+                            let v = self.get(base, arg_base);
+                            let len = if let HeapObj::Array(items) =
+                                self.heap.get_mut(recv.heap_index())
+                            {
+                                items.push(v);
+                                Some(items.len() as i32)
+                            } else {
+                                None
+                            };
+                            if let Some(len) = len {
+                                self.set(base, dst, Value::int(len));
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // Builtin methods (array/string) execute inline and
                         // produce a result without pushing a frame.
                         if let Some(result) = self.try_builtin_method(recv, key, base, arg_base, argc)? {
