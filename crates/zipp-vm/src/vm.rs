@@ -4915,18 +4915,73 @@ impl<'p> Vm<'p> {
             "reduce" => {
                 let cb = arg0;
                 let snapshot = self.array_snapshot(idx);
-                let mut iter = snapshot.iter().enumerate();
-                let mut acc = if args.len() >= 2 {
+                let has_init = args.len() >= 2;
+                // Seed + first index to process: with an initial value, start at
+                // element 0; otherwise the first element seeds and we start at 1.
+                let mut start = if has_init { 0 } else { 1 };
+                let mut acc = if has_init {
                     args[1]
+                } else if !snapshot.is_empty() {
+                    snapshot[0]
                 } else {
-                    match iter.next() {
-                        Some((_, v)) => *v,
-                        None => return Err(Thrown("TypeError: Reduce of empty array with no initial value".into())),
-                    }
+                    return Err(Thrown(
+                        "TypeError: Reduce of empty array with no initial value".into(),
+                    ));
                 };
-                // Native callback fast path over a single reused window (the
-                // accumulator + element + index are the callback args).
-                let mut native = self.native_cb_entry(cb);
+
+                // Fused native reduce kernel: inline the `(acc, element)`
+                // callback into a native loop over the leading numeric run — no
+                // per-element call. On a guard bail it returns the index reached
+                // and the accumulated value (via the in/out acc pointer); the
+                // per-element tail below finishes `[start, len)` correctly.
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                if self.jit_enabled
+                    && self.jit_recurse_depth == 0
+                    && cb.is_heap()
+                    && start < snapshot.len()
+                {
+                    if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
+                        if ups.is_empty() {
+                            let proto: *const crate::bytecode::FuncProto =
+                                &self.program.functions[fid as usize];
+                            // SAFETY: immutable program functions; raw ptr dodges
+                            // the jit-vs-program borrow conflict (as elsewhere).
+                            let proto_ref = unsafe { &*proto };
+                            let reg_count = (proto_ref.reg_count as usize).max(3);
+                            if let Some(entry) = self.jit.reduce_kernel(fid, proto_ref) {
+                                let win = self.regs.len();
+                                if !self.regs_would_overflow(win + reg_count) {
+                                    self.regs.resize(win + reg_count, Value::UNDEFINED);
+                                    let count = snapshot.len() - start;
+                                    let window_ptr =
+                                        unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+                                    let snap_ptr =
+                                        unsafe { snapshot.as_ptr().add(start) } as *const u64;
+                                    let mut acc_bits = acc.bits();
+                                    // SAFETY: valid win64 reduce kernel; window has
+                                    // reg_count slots; acc_bits is a live u64;
+                                    // call-free ⇒ none of these pointers move.
+                                    let kernel: extern "win64" fn(
+                                        *mut u64,
+                                        *const u64,
+                                        usize,
+                                        *mut u64,
+                                    ) -> usize = unsafe { core::mem::transmute(entry) };
+                                    let processed =
+                                        kernel(window_ptr, snap_ptr, count, &mut acc_bits as *mut u64);
+                                    acc = Value::from_bits(acc_bits);
+                                    self.regs.truncate(win);
+                                    start += processed;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Per-element tail: the whole array if no kernel ran, or just the
+                // remainder after a kernel bail (nothing if it completed).
+                let run_tail = start < snapshot.len();
+                let mut native = if run_tail { self.native_cb_entry(cb) } else { None };
                 let win = self.regs.len();
                 if let Some((_, callee_regs, _)) = native {
                     if self.regs_would_overflow(win + callee_regs) {
@@ -4936,8 +4991,8 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let mut err = None;
-                for (i, v) in iter {
-                    let cbargs = [acc, *v, Value::int(i as i32)];
+                for i in start..snapshot.len() {
+                    let cbargs = [acc, snapshot[i], Value::int(i as i32)];
                     match self.run_cb_elem(native, win, cb, &cbargs) {
                         Ok(r) => acc = r,
                         Err(e) => {

@@ -517,6 +517,33 @@ mod tests {
     }
 
     #[test]
+    fn reduce_kernel_matches_interpreter() {
+        // The fused native reduce kernel must agree with the interpreter and node
+        // on int/double elements, with/without an initial value, mixed-type and
+        // string tails, and 3-param (index) reduces (which fall back).
+        assert_jit_matches("console.log([1,2,3,4].reduce((s,x)=>s+x,0))", &["10"]);
+        // No initial value: the first element seeds, kernel runs from index 1.
+        assert_jit_matches("console.log([1,2,3,4].reduce((s,x)=>s+x))", &["10"]);
+        // Single element, no initial value.
+        assert_jit_matches("console.log([7].reduce((s,x)=>s+x))", &["7"]);
+        // Product (multiplicative accumulator).
+        assert_jit_matches("console.log([1,2,3,4,5].reduce((s,x)=>s*x,1))", &["120"]);
+        // Loop-built (double) array — the kernel must process doubles.
+        assert_jit_matches(
+            "let a=[]; for(let i=0;i<100;i++) a[i]=i; console.log(a.reduce((s,x)=>s+x,0))",
+            &["4950"],
+        );
+        // Mixed: kernel runs the numeric prefix, bails at 3.5, tail finishes.
+        assert_jit_matches("console.log([1,2,3.5,4].reduce((s,x)=>s+x,0))", &["10.5"]);
+        // Non-numeric element → string concatenation in the tail (== node).
+        assert_jit_matches("console.log([1,2,'x',4].reduce((s,x)=>s+x,0))", &["3x4"]);
+        // Empty array WITH an initial value returns it untouched.
+        assert_jit_matches("console.log([].reduce((s,x)=>s+x,42))", &["42"]);
+        // 3-param (index) reduce isn't kernel-eligible — must still be correct.
+        assert_jit_matches("console.log([5,6,7].reduce((s,x,i)=>s+x*i,0))", &["20"]);
+    }
+
+    #[test]
     fn array_sort_comparator() {
         assert_eq!(
             run_ok("let a = [3, 1, 4, 1, 5, 9, 2, 6]; a.sort((x, y) => x - y); console.log(a.join(','))"),
