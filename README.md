@@ -513,21 +513,21 @@ byte-identical to node):
 
 | workload | V8 | zipp | ratio |
 |---|---|---|---|
-| 100k comparator sort | 10.4 ms | 10.1 ms | **0.97× (beats V8)** |
+| 100k comparator sort | 10.3 ms | 9.8 ms | **0.95× (beats V8)** |
 | 100M integer loop | 50 ms | 53 ms | **1.06× (parity)** |
-| 2M array map→filter→reduce | 56 ms | 87 ms | 1.55× |
-| 4M object field read/write | 3.9 ms | 7.8 ms | 2.0× |
-| fib(37) recursion | 139 ms | 383 ms | 2.75× |
-| 100k string concat + scan | 5.5 ms | 21 ms | 3.9× |
+| 2M array map→filter→reduce + push | 55 ms | 71 ms | 1.29× |
+| 4M object field read/write | 3.8 ms | 7.8 ms | 2.05× |
+| fib(37) recursion | 139 ms | 381 ms | 2.74× |
+| 100k string concat + scan | 5.4 ms | 15 ms | 2.80× |
 
 zipp **beats V8 on the comparator sort** (native-callback comparator + O(n log n)
 merge sort) and **ties on the integer loop** (native int64 OSR JIT); it's within
-~2× on array/object work. It still trails on deep recursion (a per-call
-native↔interpreter round-trip — a fully native call frame is future work) and
-string-heavy loops (which still run interpreted; a string-aware JIT is future
-work). **Startup is ~10× faster** (≈22 ms vs ≈216 ms — no V8 snapshot/warmup),
-so end-to-end (incl. startup) zipp finishes every benchmark first. Run
-`bench/run.sh` to reproduce.
+~1.3× on array work and ~2× on object work. It still trails on deep recursion (a
+per-call native↔interpreter round-trip — a fully native call frame is future
+work) and string-scan loops (`s[i]`/`===` still run interpreted; a string-aware
+JIT region is future work). **Startup is ~10× faster** (≈22 ms vs ≈216 ms — no V8
+snapshot/warmup), so end-to-end (incl. startup) zipp finishes every benchmark
+first. Run `bench/run.sh` to reproduce.
 
 ## License
 
