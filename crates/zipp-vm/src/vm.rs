@@ -1469,6 +1469,8 @@ impl<'p> Vm<'p> {
                                         ic_base: jit_ic_base as usize,
                                         get_index: jit_get_index as usize,
                                         set_index: jit_set_index as usize,
+                                        array_push: jit_array_push as usize,
+                                        char_code_at: jit_char_code_at as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
@@ -5867,6 +5869,74 @@ pub(crate) extern "win64" fn jit_set_index(
             0
         }
         _ => crate::codegen::SELF_CALL_DEOPT, // non-array → interpreter
+    }
+}
+
+/// Win64 helper for a JIT'd `arr.push(x)` in a region. Appends and returns the
+/// new length (Int bits), or `SELF_CALL_DEOPT` for a non-array receiver (the
+/// interpreter then resolves the real method). Pins only the register file; the
+/// array's Vec may reallocate — safe, no cached pointer.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_array_push(
+    vm: *mut core::ffi::c_void,
+    arr_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    let arr = Value::from_bits(arr_bits);
+    if !arr.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: exclusive view; pins only the register file, not the array's Vec.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.heap.get_mut(arr.heap_index()) {
+        HeapObj::Array(items) => {
+            items.push(Value::from_bits(val_bits));
+            Value::int(items.len() as i32).bits()
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Win64 helper for a JIT'd `str.charCodeAt(i)` in a region. Returns the UTF
+/// scalar value (Int bits), NaN bits for an out-of-range index, or
+/// `SELF_CALL_DEOPT` for a non-int index / non-flat-string receiver (a rope or
+/// non-string → the interpreter, which flattens). O(1) for ASCII.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_char_code_at(
+    vm: *mut core::ffi::c_void,
+    str_bits: u64,
+    i_bits: u64,
+) -> u64 {
+    let sv = Value::from_bits(str_bits);
+    let iv = Value::from_bits(i_bits);
+    if !sv.is_heap() || !iv.is_number() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let i = match array_index(iv) {
+        Some(i) => i,
+        None => return crate::codegen::SELF_CALL_DEOPT, // negative/fractional
+    };
+    // SAFETY: read-only view; the running region holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    match vm.heap.get(sv.heap_index()) {
+        HeapObj::Str(js) => {
+            let ch = if js.ascii {
+                js.bytes.as_bytes().get(i).map(|&b| b as char)
+            } else {
+                js.bytes.chars().nth(i)
+            };
+            match ch {
+                Some(c) => Value::int(c as i32).bits(),
+                None => Value::num(f64::NAN).bits(),
+            }
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT, // rope/non-string → interpreter
     }
 }
 

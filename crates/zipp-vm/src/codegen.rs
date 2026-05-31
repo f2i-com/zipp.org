@@ -82,6 +82,10 @@ pub struct HeapHelperAddrs {
     /// Helper for a dense-array element write `a[i] = v` (`SetIndex`); returns 0
     /// on success (storing/growing) or the deopt sentinel.
     pub set_index: usize,
+    /// Helper for `arr.push(x)` — returns the new length, or the deopt sentinel.
+    pub array_push: usize,
+    /// Helper for `str.charCodeAt(i)` — returns the char code / NaN, or deopt.
+    pub char_code_at: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -352,6 +356,8 @@ impl Jit {
             ic_base: heap_helpers.ic_base,
             get_index: heap_helpers.get_index,
             set_index: heap_helpers.set_index,
+            array_push: heap_helpers.array_push,
+            char_code_at: heap_helpers.char_code_at,
             ic_base_idx,
         };
         match compile_region(proto, start, end, globals_base_helper, helpers) {
@@ -1040,6 +1046,16 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::SetIndex { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
+            // A whitelist of cheap, fixed-arity builtin method calls — handled by
+            // the MEMORY path via a dedicated win64 helper (jit_array_push /
+            // jit_char_code_at). Anything else (a user method, an unlisted builtin,
+            // wrong arity) rejects the region.
+            Instr::CallMethod { name, argc, .. } => {
+                let key = proto.string_constants.get(name as usize).map(|s| s.as_str());
+                if !(argc == 1 && matches!(key, Some("push") | Some("charCodeAt"))) {
+                    return false;
+                }
+            }
             Instr::LoadConst { idx, .. } => {
                 // Only numeric constants are representable in the f64 region.
                 match proto.constants.get(idx as usize) {
@@ -1069,6 +1085,10 @@ struct HeapHelpers {
     get_index: usize,
     /// Helper for a dense-array `SetIndex` (`a[i] = v`).
     set_index: usize,
+    /// Helper for `arr.push(x)`.
+    array_push: usize,
+    /// Helper for `str.charCodeAt(i)`.
+    char_code_at: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -1274,10 +1294,14 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
     // type (from defs) and first-occurrence (def vs use). Operand type
     // requirements are validated in a second loop once types are known.
     for instr in &code[s..=e] {
-        // A dense-array element access can't be register-allocated (its operands/
-        // result are boxed Values handled by a helper, not known-type scalars) —
-        // decline so the region takes the memory path that emits the helper call.
-        if matches!(instr, Instr::GetIndex { .. } | Instr::SetIndex { .. }) {
+        // A dense-array element access or a builtin method call can't be
+        // register-allocated (their operands/result are boxed Values handled by a
+        // helper, not known-type scalars) — decline so the region takes the memory
+        // path that emits the helper call.
+        if matches!(
+            instr,
+            Instr::GetIndex { .. } | Instr::SetIndex { .. } | Instr::CallMethod { .. }
+        ) {
             return None;
         }
         let (def, dty): (Option<u16>, VTy) = match *instr {
@@ -2709,6 +2733,28 @@ fn compile_region_mem(
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::CallMethod { dst, obj, name, arg_base, .. } => {
+                // A whitelisted 1-arg builtin (`arr.push(x)` / `str.charCodeAt(i)`)
+                // via a dedicated win64 helper: receiver + arg0 bits in, result
+                // bits out, deopt sentinel → bail. region_can_compile gated this.
+                let helper = match proto.string_constants[name as usize].as_str() {
+                    "push" => heap.array_push,
+                    "charCodeAt" => heap.char_code_at,
+                    _ => return None, // defensive (gated)
+                };
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                    ; mov r8, [rbx + dreg(arg_base)]      // arg0 bits
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
