@@ -756,6 +756,13 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::IsArray { dst, a } => {
+                        let v = self.get(base, a);
+                        let is_arr = v.is_heap()
+                            && matches!(self.heap.get(v.heap_index()), HeapObj::Array(_));
+                        self.set(base, dst, Value::bool(is_arr));
+                        ip += 1;
+                    }
                     Instr::MathOp { dst, op, arg_base, argc } => {
                         let r = self.eval_math(op, base, arg_base, argc)?;
                         self.set(base, dst, Value::num(r));

@@ -853,6 +853,14 @@ mod tests {
     }
 
     #[test]
+    fn array_is_array() {
+        assert_eq!(
+            run_ok("console.log(Array.isArray([]), Array.isArray([1]), Array.isArray(1), Array.isArray('x'), Array.isArray({}), Array.isArray(null))"),
+            vec!["true true false false false false"],
+        );
+    }
+
+    #[test]
     fn number_parse_globals() {
         assert_eq!(
             run_ok("console.log(Number('42')+1, Number(''), Number(true), Number('abc'), Number())"),

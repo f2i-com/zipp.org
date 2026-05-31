@@ -73,6 +73,8 @@ pub enum Instr {
     Not { dst: Reg, a: Reg },
     /// `dst = typeof a` (a JS type-name string).
     TypeOf { dst: Reg, a: Reg },
+    /// `dst = Array.isArray(a)` — true iff `a` is a heap array.
+    IsArray { dst: Reg, a: Reg },
     /// `dst = Math.<op>(args…)` — a builtin Math function over `argc` contiguous
     /// argument registers starting at `arg_base`.
     MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },

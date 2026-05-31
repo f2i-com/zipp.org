@@ -1520,6 +1520,19 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // `Array.isArray(x)` → IsArray op.
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            if let ox::Expression::Identifier(obj) = &m.object {
+                if obj.name == "Array" && m.property.name == "isArray" && c.arguments.len() == 1 {
+                    if let Some(arg_expr) = c.arguments[0].as_expression() {
+                        let a = self.expr(arg_expr)?;
+                        self.emit(Instr::IsArray { dst, a });
+                        return Ok(dst);
+                    }
+                }
+            }
+        }
+
         // `Object.keys/values/entries(o)` → dedicated ops (Object has no real
         // global object in the subset).
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
