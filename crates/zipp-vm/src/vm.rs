@@ -902,6 +902,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, arr);
                         ip += 1;
                     }
+                    Instr::ObjectSpread { target, src } => {
+                        let t = self.get(base, target);
+                        let s = self.get(base, src);
+                        self.object_assign(&[t, s])?; // mutates target in place
+                        ip += 1;
+                    }
                     Instr::CallSpread { dst, callee, args } => {
                         let callee_v = self.get(base, callee);
                         let args_v = self.get(base, args);
@@ -2136,14 +2142,29 @@ impl<'p> Vm<'p> {
                 continue;
             }
             // Gather (key, val) pairs under the immutable borrow, then write.
-            let pairs: Vec<(String, Value)> = match self.heap.get(src.heap_index()) {
-                HeapObj::Object(map) => {
-                    map.keys.iter().cloned().zip(map.vals.iter().copied()).collect()
+            // (A string source spreads as index→char, like an array.)
+            let str_chars: Option<Vec<char>> = match self.heap.get(src.heap_index()) {
+                HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                    Some(self.heap.str_cow(src.heap_index()).unwrap().chars().collect())
                 }
-                HeapObj::Array(items) => {
-                    items.iter().enumerate().map(|(i, &v)| (i.to_string(), v)).collect()
+                _ => None,
+            };
+            let pairs: Vec<(String, Value)> = if let Some(chars) = str_chars {
+                chars
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| (i.to_string(), self.alloc_str(c.to_string())))
+                    .collect()
+            } else {
+                match self.heap.get(src.heap_index()) {
+                    HeapObj::Object(map) => {
+                        map.keys.iter().cloned().zip(map.vals.iter().copied()).collect()
+                    }
+                    HeapObj::Array(items) => {
+                        items.iter().enumerate().map(|(i, &v)| (i.to_string(), v)).collect()
+                    }
+                    _ => Vec::new(),
                 }
-                _ => Vec::new(),
             };
             for (k, v) in pairs {
                 if let HeapObj::Object(map) = self.heap.get_mut(tidx) {

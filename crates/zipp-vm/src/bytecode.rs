@@ -94,6 +94,9 @@ pub enum Instr {
     /// `dst = [...src.slice(start)]` — the rest of an array (or a string's chars)
     /// from index `start`. Used by array destructuring's `[a, ...rest]`.
     ArrayRest { dst: Reg, src: Reg, start: u32 },
+    /// Copy `src`'s own enumerable keys onto `target` (object literal `{...src}`).
+    /// `src` may be an object, array, or string; null/undefined contribute none.
+    ObjectSpread { target: Reg, src: Reg },
     /// `dst = callee(...args_array)` — call `callee` (a function value) spreading
     /// the elements of the array in `args` as the arguments (`this` = undefined).
     CallSpread { dst: Reg, callee: Reg, args: Reg },

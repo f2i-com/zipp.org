@@ -1574,23 +1574,34 @@ impl<'a> FnCompiler<'a> {
     fn object_literal(&mut self, o: &ox::ObjectExpression, dst: Reg) -> R<Reg> {
         self.emit(Instr::NewObject { dst });
         for prop in &o.properties {
+            let save = self.next_reg;
             match prop {
                 ox::ObjectPropertyKind::ObjectProperty(p) => {
-                    // Key: a plain identifier or string/number literal key.
-                    let key = match &p.key {
-                        ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                        ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
-                        ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
-                        _ => return Err("computed object keys not in the zipp-vm subset yet".into()),
-                    };
-                    let name = self.string_name(&key);
-                    let v = self.expr(&p.value)?;
-                    self.emit(Instr::SetProp { obj: dst, name, val: v });
+                    if p.computed {
+                        // Computed key `{[expr]: v}` → SetIndex.
+                        let ke = p.key.as_expression().ok_or("unsupported computed object key")?;
+                        let key = self.expr(ke)?;
+                        let v = self.expr(&p.value)?;
+                        self.emit(Instr::SetIndex { obj: dst, key, val: v });
+                    } else {
+                        // Static identifier / string / number literal key.
+                        let key = match &p.key {
+                            ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                            ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                            ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
+                            _ => return Err("unsupported object key in the zipp-vm subset".into()),
+                        };
+                        let name = self.string_name(&key);
+                        let v = self.expr(&p.value)?;
+                        self.emit(Instr::SetProp { obj: dst, name, val: v });
+                    }
                 }
-                ox::ObjectPropertyKind::SpreadProperty(_) => {
-                    return Err("object spread is not in the zipp-vm subset yet".into());
+                ox::ObjectPropertyKind::SpreadProperty(s) => {
+                    let src = self.expr(&s.argument)?;
+                    self.emit(Instr::ObjectSpread { target: dst, src });
                 }
             }
+            self.next_reg = save; // reclaim this property's scratch temps
         }
         Ok(dst)
     }
@@ -1701,7 +1712,24 @@ impl<'a> FnCompiler<'a> {
                 let end = self.here();
                 self.patch_jump(j, end);
             }
-            Op::Coalesce => return Err("?? is not in the zipp-vm v1 subset yet".into()),
+            Op::Coalesce => {
+                // `a ?? b`: keep `a` unless it is null/undefined. `== undefined`
+                // (loose) is true for both null and undefined.
+                let save = self.next_reg;
+                let undef = self.alloc_reg();
+                self.emit(Instr::LoadUndefined { dst: undef });
+                let isnull = self.alloc_reg();
+                self.emit(Instr::LooseEq { dst: isnull, a: dst, b: undef });
+                let j = self.here();
+                self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 }); // non-nullish → keep dst
+                self.next_reg = save; // the nullish-test temps are dead now
+                let b = self.expr_into(&l.right, dst)?;
+                if b != dst {
+                    self.emit(Instr::Move { dst, src: b });
+                }
+                let end = self.here();
+                self.patch_jump(j, end);
+            }
         }
         Ok(dst)
     }
@@ -1738,16 +1766,43 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn update(&mut self, u: &ox::UpdateExpression, dst: Reg) -> R<Reg> {
-        // `x++` / `++x` / `x--` / `--x` on a simple identifier.
-        let name = match &u.argument {
-            ox::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
-            _ => return Err("update on non-identifier not in zipp-vm v1".into()),
-        };
-        let binding = self.resolve(&name);
         let delta = match u.operator {
             ox::UpdateOperator::Increment => 1,
             ox::UpdateOperator::Decrement => -1,
         };
+        // `obj.x++` / `arr[i]--` etc — read the member, yield old (postfix) or
+        // new (prefix), write the incremented value back to the same slot.
+        match &u.argument {
+            ox::SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                let obj = self.expr(&m.object)?;
+                let name = self.string_name(m.property.name.as_str());
+                let cur = self.temp();
+                self.emit(Instr::GetProp { dst: cur, obj, name });
+                let nw = self.temp();
+                self.emit(Instr::AddInt { dst: nw, a: cur, imm: delta });
+                self.emit(Instr::SetProp { obj, name, val: nw });
+                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { cur } });
+                return Ok(dst);
+            }
+            ox::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                let obj = self.expr(&m.object)?;
+                let key = self.expr(&m.expression)?;
+                let cur = self.temp();
+                self.emit(Instr::GetIndex { dst: cur, obj, key });
+                let nw = self.temp();
+                self.emit(Instr::AddInt { dst: nw, a: cur, imm: delta });
+                self.emit(Instr::SetIndex { obj, key, val: nw });
+                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { cur } });
+                return Ok(dst);
+            }
+            _ => {}
+        }
+        // `x++` / `++x` / `x--` / `--x` on a simple identifier.
+        let name = match &u.argument {
+            ox::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
+            _ => return Err("update on this target not in zipp-vm v1".into()),
+        };
+        let binding = self.resolve(&name);
         if let Binding::Local(r) = binding {
             // Plain register local: mutate in place.
             if u.prefix {
@@ -1849,35 +1904,104 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
+    /// For a logical assignment (`||= &&= ??=`), emit the short-circuit test on
+    /// `val` (which already holds the target's current value) and return the ip
+    /// of the jump that, when taken, SKIPS the assignment (keeping `val`).
+    fn emit_logical_skip(&mut self, op: ox::AssignmentOperator, val: Reg) -> u32 {
+        use ox::AssignmentOperator as Op;
+        match op {
+            Op::LogicalOr => {
+                let j = self.here();
+                self.emit(Instr::JumpIfTrue { cond: val, target: 0 }); // truthy → skip
+                j
+            }
+            Op::LogicalAnd => {
+                let j = self.here();
+                self.emit(Instr::JumpIfFalse { cond: val, target: 0 }); // falsy → skip
+                j
+            }
+            _ => {
+                // ??= : skip when `val` is NOT null/undefined.
+                let save = self.next_reg;
+                let undef = self.alloc_reg();
+                self.emit(Instr::LoadUndefined { dst: undef });
+                let isnull = self.alloc_reg();
+                self.emit(Instr::LooseEq { dst: isnull, a: val, b: undef });
+                let j = self.here();
+                self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 });
+                self.next_reg = save;
+                j
+            }
+        }
+    }
+
     fn assign(&mut self, a: &ox::AssignmentExpression, dst: Reg) -> R<Reg> {
         use ox::AssignmentOperator as Op;
+        let is_logical =
+            matches!(a.operator, Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish);
         // Member-target assignment: `obj.x = v` / `arr[i] = v`. Only plain
         // `=` is supported for members in this subset.
         match &a.left {
             ox::AssignmentTarget::StaticMemberExpression(m) => {
-                if !matches!(a.operator, Op::Assign) {
-                    return Err("compound assignment to a property not in the zipp-vm subset yet".into());
-                }
-                let obj = self.expr(&m.object)?;
-                let val = self.expr_into(&a.right, dst)?;
-                if val != dst {
-                    self.emit(Instr::Move { dst, src: val });
-                }
+                let obj = self.expr(&m.object)?; // evaluate the receiver once
                 let name = self.string_name(m.property.name.as_str());
-                self.emit(Instr::SetProp { obj, name, val: dst });
+                if is_logical {
+                    // `obj.x ??= v` etc: read current; skip the store on short-circuit.
+                    self.emit(Instr::GetProp { dst, obj, name });
+                    let j = self.emit_logical_skip(a.operator, dst);
+                    let v = self.expr_into(&a.right, dst)?;
+                    if v != dst {
+                        self.emit(Instr::Move { dst, src: v });
+                    }
+                    self.emit(Instr::SetProp { obj, name, val: dst });
+                    let end = self.here();
+                    self.patch_jump(j, end);
+                } else if matches!(a.operator, Op::Assign) {
+                    let val = self.expr_into(&a.right, dst)?;
+                    if val != dst {
+                        self.emit(Instr::Move { dst, src: val });
+                    }
+                    self.emit(Instr::SetProp { obj, name, val: dst });
+                } else {
+                    // Compound `obj.x op= v`: read obj.x, combine, write back.
+                    let cur = self.temp();
+                    self.emit(Instr::GetProp { dst: cur, obj, name });
+                    let rhs = self.expr(&a.right)?;
+                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
+                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                    self.emit(instr);
+                    self.emit(Instr::SetProp { obj, name, val: dst });
+                }
                 return Ok(dst);
             }
             ox::AssignmentTarget::ComputedMemberExpression(m) => {
-                if !matches!(a.operator, Op::Assign) {
-                    return Err("compound assignment to an index not in the zipp-vm subset yet".into());
-                }
-                let obj = self.expr(&m.object)?;
+                let obj = self.expr(&m.object)?; // evaluate receiver + key once
                 let key = self.expr(&m.expression)?;
-                let val = self.expr_into(&a.right, dst)?;
-                if val != dst {
-                    self.emit(Instr::Move { dst, src: val });
+                if is_logical {
+                    self.emit(Instr::GetIndex { dst, obj, key });
+                    let j = self.emit_logical_skip(a.operator, dst);
+                    let v = self.expr_into(&a.right, dst)?;
+                    if v != dst {
+                        self.emit(Instr::Move { dst, src: v });
+                    }
+                    self.emit(Instr::SetIndex { obj, key, val: dst });
+                    let end = self.here();
+                    self.patch_jump(j, end);
+                } else if matches!(a.operator, Op::Assign) {
+                    let val = self.expr_into(&a.right, dst)?;
+                    if val != dst {
+                        self.emit(Instr::Move { dst, src: val });
+                    }
+                    self.emit(Instr::SetIndex { obj, key, val: dst });
+                } else {
+                    let cur = self.temp();
+                    self.emit(Instr::GetIndex { dst: cur, obj, key });
+                    let rhs = self.expr(&a.right)?;
+                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
+                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                    self.emit(instr);
+                    self.emit(Instr::SetIndex { obj, key, val: dst });
                 }
-                self.emit(Instr::SetIndex { obj, key, val: dst });
                 return Ok(dst);
             }
             _ => {}
@@ -1908,16 +2032,32 @@ impl<'a> FnCompiler<'a> {
                 }
                 Ok(dst)
             }
-            Op::Addition | Op::Subtraction | Op::Multiplication => {
+            // Logical assignment: `x ||= y` / `x &&= y` / `x ??= y` only assign
+            // `y` when the short-circuit condition holds (truthy-skip for ||=,
+            // falsy-skip for &&=, non-nullish-skip for ??=).
+            Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish => {
+                let cur = self.load_binding(&binding, dst);
+                if cur != dst {
+                    self.emit(Instr::Move { dst, src: cur });
+                }
+                let j = self.emit_logical_skip(a.operator, dst);
+                let v = self.expr_into(&a.right, dst)?;
+                if v != dst {
+                    self.emit(Instr::Move { dst, src: v });
+                }
+                self.store_binding(&binding, dst);
+                let end = self.here();
+                self.patch_jump(j, end);
+                Ok(dst)
+            }
+            // Arithmetic / bitwise compound assignment (`+= -= *= /= %= **= <<=
+            // >>= >>>= |= ^= &=`).
+            other => {
                 if let Binding::Local(r) = binding {
                     // Plain local: compute in place.
                     let rhs = self.expr(&a.right)?;
-                    let instr = match a.operator {
-                        Op::Addition => Instr::Add { dst: r, a: r, b: rhs },
-                        Op::Subtraction => Instr::Sub { dst: r, a: r, b: rhs },
-                        Op::Multiplication => Instr::Mul { dst: r, a: r, b: rhs },
-                        _ => unreachable!(),
-                    };
+                    let instr = compound_assign_instr(other, r, r, rhs)
+                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                     self.emit(instr);
                     if r != dst {
                         self.emit(Instr::Move { dst, src: r });
@@ -1928,17 +2068,12 @@ impl<'a> FnCompiler<'a> {
                 // store back through the binding.
                 let cur = self.load_binding(&binding, dst); // == dst
                 let rhs = self.expr(&a.right)?;
-                let instr = match a.operator {
-                    Op::Addition => Instr::Add { dst, a: cur, b: rhs },
-                    Op::Subtraction => Instr::Sub { dst, a: cur, b: rhs },
-                    Op::Multiplication => Instr::Mul { dst, a: cur, b: rhs },
-                    _ => unreachable!(),
-                };
+                let instr = compound_assign_instr(other, dst, cur, rhs)
+                    .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                 self.emit(instr);
                 self.store_binding(&binding, dst);
                 Ok(dst)
             }
-            _ => Err("unsupported assignment operator (zipp-vm v1)".into()),
         }
     }
 
@@ -2313,6 +2448,27 @@ enum Binding {
     /// function's upvalue list.
     Upvalue(u16),
     Global(u32),
+}
+
+/// The instruction for an arithmetic/bitwise compound assignment (`dst = a <op>
+/// b`). `None` for `=` and the logical-assignment operators (handled separately).
+fn compound_assign_instr(op: ox::AssignmentOperator, dst: Reg, a: Reg, b: Reg) -> Option<Instr> {
+    use ox::AssignmentOperator as Op;
+    Some(match op {
+        Op::Addition => Instr::Add { dst, a, b },
+        Op::Subtraction => Instr::Sub { dst, a, b },
+        Op::Multiplication => Instr::Mul { dst, a, b },
+        Op::Division => Instr::Div { dst, a, b },
+        Op::Remainder => Instr::Mod { dst, a, b },
+        Op::Exponential => Instr::Pow { dst, a, b },
+        Op::ShiftLeft => Instr::Bitwise { dst, a, b, op: BitwiseOp::Shl },
+        Op::ShiftRight => Instr::Bitwise { dst, a, b, op: BitwiseOp::Shr },
+        Op::ShiftRightZeroFill => Instr::Bitwise { dst, a, b, op: BitwiseOp::Ushr },
+        Op::BitwiseOR => Instr::Bitwise { dst, a, b, op: BitwiseOp::Or },
+        Op::BitwiseXOR => Instr::Bitwise { dst, a, b, op: BitwiseOp::Xor },
+        Op::BitwiseAnd => Instr::Bitwise { dst, a, b, op: BitwiseOp::And },
+        _ => return None,
+    })
 }
 
 /// Recognise the built-in Error constructor names the subset supports. Returns

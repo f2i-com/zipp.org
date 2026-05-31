@@ -1052,6 +1052,43 @@ mod tests {
     }
 
     #[test]
+    fn nullish_and_logical_assign() {
+        // ?? keeps the left unless null/undefined (0 and "" are kept).
+        assert_eq!(run_ok("console.log(null ?? 5, 0 ?? 9, undefined ?? 'x', '' ?? 'y')"), vec!["5 0 x "]);
+        // Logical assignment, short-circuit (RHS not evaluated when skipped).
+        assert_eq!(run_ok("let a=0; a||=7; let b=1; b&&=9; console.log(a,b)"), vec!["7 9"]);
+        assert_eq!(run_ok("let x=5; x??=10; let y=null; y??=20; console.log(x,y)"), vec!["5 20"]);
+        assert_eq!(run_ok("let cnt=0; function f(){cnt++;return 5} let v=1; v||=f(); console.log(v,cnt)"), vec!["1 0"]);
+        // Member logical assignment + the counter idiom.
+        assert_eq!(run_ok("let o={}; o.a ??= 1; o.a ??= 2; console.log(o.a)"), vec!["1"]);
+        assert_eq!(run_ok("let c={}; for(let k of ['a','b','a']){ c[k] ??= 0; c[k]++; } console.log(c.a, c.b)"), vec!["2 1"]);
+    }
+
+    #[test]
+    fn compound_and_update_assignment() {
+        // All arithmetic/bitwise compound operators on a local.
+        assert_eq!(run_ok("let a=10; a/=2; a%=3; a**=3; console.log(a)"), vec!["8"]);
+        assert_eq!(run_ok("let f=1; f<<=4; f|=1; f&=0xF; f^=2; console.log(f)"), vec!["3"]);
+        // Compound + update on members (property and index).
+        assert_eq!(run_ok("let o={n:10}; o.n+=5; o.n*=2; console.log(o.n)"), vec!["30"]);
+        assert_eq!(run_ok("let a=[1,2,3]; a[0]+=10; a[1]*=3; console.log(a.join(','))"), vec!["11,6,3"]);
+        assert_eq!(run_ok("let o={n:5}; let r=[o.n++, o.n, ++o.n]; console.log(r.join(','))"), vec!["5,6,7"]);
+        assert_eq!(run_ok("let a=[10,20]; let r=[a[0]++, a[0], --a[1]]; console.log(r.join(','))"), vec!["10,11,19"]);
+    }
+
+    #[test]
+    fn object_spread_and_computed_keys() {
+        assert_eq!(run_ok("let o={a:1,...{b:2,c:3}}; console.log(o.a,o.b,o.c)"), vec!["1 2 3"]);
+        // Later properties win over a spread; array source spreads as index keys.
+        assert_eq!(run_ok("let base={x:1,y:2}; let o={...base, y:9, z:3}; console.log(o.x,o.y,o.z)"), vec!["1 9 3"]);
+        assert_eq!(run_ok("let o={...[10,20]}; console.log(o[0],o[1])"), vec!["10 20"]);
+        // null/undefined spread is a no-op.
+        assert_eq!(run_ok("let o={...null,...undefined,a:1}; console.log(o.a, Object.keys(o).length)"), vec!["1 1"]);
+        // Computed keys, including a template-literal key.
+        assert_eq!(run_ok("let k='dyn'; let o={[k]:42,[`a${1}`]:7}; console.log(o.dyn,o.a1)"), vec!["42 7"]);
+    }
+
+    #[test]
     fn bitwise_and_exponent() {
         assert_eq!(run_ok("console.log(5 & 3, 5 | 2, 5 ^ 1, ~5)"), vec!["1 7 4 -6"]);
         assert_eq!(run_ok("console.log(1<<4, 256>>2, -8>>1)"), vec!["16 64 -4"]);
