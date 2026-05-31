@@ -908,6 +908,35 @@ impl<'p> Vm<'p> {
                         self.object_assign(&[t, s])?; // mutates target in place
                         ip += 1;
                     }
+                    Instr::MakeClass { dst, class_id } => {
+                        let cd = self.program.classes[class_id as usize].clone();
+                        // Materialize each method as a Func value once; instances
+                        // share these (no per-access alloc, no per-instance copy).
+                        let methods: Vec<(String, Value)> = cd
+                            .methods
+                            .iter()
+                            .map(|(n, fid)| {
+                                (n.clone(), Value::heap(self.heap.alloc(HeapObj::Func(*fid))))
+                            })
+                            .collect();
+                        let v = Value::heap(self.heap.alloc(HeapObj::Class {
+                            name: cd.name,
+                            ctor: cd.ctor,
+                            methods,
+                        }));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::New { dst, callee, arg_base, argc } => {
+                        let cv = self.get(base, callee);
+                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                        for i in 0..argc {
+                            args.push(self.get(base, arg_base + i));
+                        }
+                        let result = self.construct(cv, &args)?;
+                        self.set(base, dst, result);
+                        ip += 1;
+                    }
                     Instr::CallSpread { dst, callee, args } => {
                         let callee_v = self.get(base, callee);
                         let args_v = self.get(base, args);
@@ -972,6 +1001,20 @@ impl<'p> Vm<'p> {
                     Instr::InstanceOf { dst, val, ctor } => {
                         let v = self.get(base, val);
                         let r = self.eval_instanceof(v, ctor);
+                        self.set(base, dst, Value::bool(r));
+                        ip += 1;
+                    }
+                    Instr::InstanceOfDyn { dst, val, ctor } => {
+                        let v = self.get(base, val);
+                        let c = self.get(base, ctor);
+                        // True iff `v` is an instance whose class link is `c`.
+                        let r = c.is_heap()
+                            && matches!(self.heap.get(c.heap_index()), HeapObj::Class { .. })
+                            && v.is_heap()
+                            && matches!(
+                                self.heap.get(v.heap_index()),
+                                HeapObj::Object(m) if m.class == Some(c.heap_index())
+                            );
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
@@ -1736,7 +1779,20 @@ impl<'p> Vm<'p> {
                     Ok(Value::UNDEFINED)
                 }
             }
-            HeapObj::Object(map) => Ok(map.get(key).unwrap_or(Value::UNDEFINED)),
+            HeapObj::Object(map) => {
+                if let Some(v) = map.get(key) {
+                    return Ok(v);
+                }
+                // Own-property miss: resolve a method through the instance's class.
+                if let Some(cidx) = map.class {
+                    if let HeapObj::Class { methods, .. } = self.heap.get(cidx) {
+                        if let Some((_, v)) = methods.iter().find(|(k, _)| k == key) {
+                            return Ok(*v);
+                        }
+                    }
+                }
+                Ok(Value::UNDEFINED)
+            }
             _ => Ok(Value::UNDEFINED),
         }
     }
@@ -1980,7 +2036,8 @@ impl<'p> Vm<'p> {
         } else if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "string",
-                HeapObj::Func(_) | HeapObj::Closure { .. } => "function",
+                // A class is callable (with `new`), so `typeof C === "function"`.
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
                 _ => "object", // Array, Object
             }
@@ -2125,6 +2182,35 @@ impl<'p> Vm<'p> {
         map.set("name", name_v);
         map.set("message", msg_v);
         Value::heap(self.heap.alloc(HeapObj::Object(map)))
+    }
+
+    /// `new <class>(args)`: build a plain object, install the class's methods as
+    /// own Func properties, then run the constructor (if any) with `this` = the
+    /// new object. A constructor that returns an object/array replaces the
+    /// instance (JS semantics); otherwise the instance is returned.
+    fn construct(&mut self, cv: Value, args: &[Value]) -> Result<Value, Thrown> {
+        if !cv.is_heap() {
+            return Err(Thrown("TypeError: value is not a constructor".into()));
+        }
+        let ctor = match self.heap.get(cv.heap_index()) {
+            HeapObj::Class { ctor, .. } => *ctor,
+            _ => return Err(Thrown("TypeError: value is not a constructor".into())),
+        };
+        // The instance links to its class for method lookup + instanceof; its own
+        // keys hold only the fields (so enumeration / JSON stay method-free).
+        let mut map = ObjMap::new();
+        map.class = Some(cv.heap_index());
+        let obj = Value::heap(self.heap.alloc(HeapObj::Object(map)));
+        if let Some(fid) = ctor {
+            let cval = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+            let ret = self.call_value(cval, obj, args)?;
+            if ret.is_heap()
+                && matches!(self.heap.get(ret.heap_index()), HeapObj::Object(_) | HeapObj::Array(_))
+            {
+                return Ok(ret);
+            }
+        }
+        Ok(obj)
     }
 
     /// `Object.assign(target, ...sources)`: copy each source's own enumerable
@@ -3069,6 +3155,7 @@ impl<'p> Vm<'p> {
                     .collect::<Vec<_>>()
                     .join(","),
                 HeapObj::Object(_) => "[object Object]".into(),
+                HeapObj::Class { name, .. } => format!("class {name} {{ }}"),
             }
         } else {
             "undefined".into()
@@ -3114,8 +3201,16 @@ impl<'p> Vm<'p> {
                 format!("[ {} ]", parts.join(", "))
             }
             HeapObj::Object(map) => {
+                // A class instance prints with its constructor name (`Pt { … }`).
+                let prefix = match map.class {
+                    Some(cidx) => match self.heap.get(cidx) {
+                        HeapObj::Class { name, .. } => format!("{name} "),
+                        _ => String::new(),
+                    },
+                    None => String::new(),
+                };
                 if map.keys.is_empty() {
-                    return "{}".into();
+                    return format!("{prefix}{{}}");
                 }
                 let parts: Vec<String> = map
                     .keys
@@ -3123,8 +3218,9 @@ impl<'p> Vm<'p> {
                     .zip(map.vals.iter())
                     .map(|(k, val)| format!("{k}: {}", self.inspect_nested(*val)))
                     .collect();
-                format!("{{ {} }}", parts.join(", "))
+                format!("{prefix}{{ {} }}", parts.join(", "))
             }
+            HeapObj::Class { name, .. } => format!("[class {name}]"),
         }
     }
 
@@ -3321,7 +3417,10 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     let (val, vals_ptr, slot) = match vm.heap.get(idx) {
         HeapObj::Object(map) => match map.keys.iter().position(|k| k == key) {
             Some(s) => (map.vals[s], map.vals.as_ptr() as u64, s as u32),
-            None => return Value::UNDEFINED.bits(), // missing key: undefined, don't cache
+            // Missing own key: a class instance may resolve it as a method, so
+            // defer to the interpreter; a plain object yields undefined.
+            None if map.class.is_some() => return crate::codegen::SELF_CALL_DEOPT,
+            None => return Value::UNDEFINED.bits(),
         },
         // `arr.length` / `str.length` in a region: return the length WITHOUT
         // caching — it's derived from the container's element count, not a fixed

@@ -22,7 +22,9 @@ use std::rc::Rc;
 
 use oxc_ast::ast as ox;
 
-use crate::bytecode::{BitwiseOp, FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource};
+use crate::bytecode::{
+    BitwiseOp, ClassDef, FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource,
+};
 use crate::capture;
 use crate::value::Value;
 use crate::vm::STRING_CONST_BIT;
@@ -56,6 +58,7 @@ pub fn compile_program(prog: &ox::Program) -> R<Program> {
     Ok(Program {
         functions: c.functions,
         global_count: c.globals.len() as u32,
+        classes: c.classes,
     })
 }
 
@@ -63,11 +66,13 @@ struct Compiler {
     functions: Vec<FuncProto>,
     /// Global name → slot.
     globals: Vec<String>,
+    /// Compiled class descriptors, indexed by the `MakeClass` class_id.
+    classes: Vec<ClassDef>,
 }
 
 impl Compiler {
     fn new() -> Compiler {
-        Compiler { functions: Vec::new(), globals: Vec::new() }
+        Compiler { functions: Vec::new(), globals: Vec::new(), classes: Vec::new() }
     }
 
     fn global_slot(&mut self, name: &str) -> u16 {
@@ -84,12 +89,20 @@ impl Compiler {
         // nested function ids are stable as we discover them.
         self.functions.push(placeholder("<script>"));
 
-        // Pass 1: hoist top-level function declaration names to globals.
+        // Pass 1: hoist top-level function (and class) declaration names to globals.
         for s in &prog.body {
-            if let ox::Statement::FunctionDeclaration(f) = s {
-                if let Some(id) = &f.id {
-                    self.global_slot(id.name.as_str());
+            match s {
+                ox::Statement::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        self.global_slot(id.name.as_str());
+                    }
                 }
+                ox::Statement::ClassDeclaration(c) => {
+                    if let Some(id) = &c.id {
+                        self.global_slot(id.name.as_str());
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -165,6 +178,63 @@ impl Compiler {
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
+            upvalues,
+        })
+    }
+
+    /// Compile a class method or constructor. Like `compile_function_body` but
+    /// (a) non-capturing (empty enclosing → free vars resolve to globals) and
+    /// (b) it first emits instance-field initializers `this.field = expr` (only
+    /// for the constructor; `fields` is empty for plain methods). `this` is reg 0.
+    fn compile_class_fn(
+        &mut self,
+        name: &str,
+        params: &[String],
+        rest: Option<&str>,
+        params_ast: Option<&ox::FormalParameters>,
+        fields: &[(String, Option<&ox::Expression>)],
+        body: &[ox::Statement],
+    ) -> R<FuncProto> {
+        let mut fc = FnCompiler::new(self, params, rest, HashSet::new(), Vec::new());
+        if let Some(pa) = params_ast {
+            fc.emit_param_defaults(pa)?;
+        }
+        // Instance field initializers: `this.field = expr` (this = reg 0).
+        for (fname, finit) in fields {
+            let save = fc.next_reg;
+            let v = match finit {
+                Some(e) => fc.expr(e)?,
+                None => {
+                    let t = fc.temp();
+                    fc.emit(Instr::LoadUndefined { dst: t });
+                    t
+                }
+            };
+            let name_idx = fc.string_name(fname);
+            fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v });
+            fc.next_reg = save;
+        }
+        for s in body {
+            if let ox::Statement::FunctionDeclaration(f) = s {
+                if let Some(id) = &f.id {
+                    fc.declare_local(id.name.as_str());
+                }
+            }
+        }
+        for s in body {
+            fc.stmt(s)?;
+        }
+        fc.emit(Instr::ReturnUndefined);
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        Ok(FuncProto {
+            name: name.to_string(),
+            code: fc.code,
+            reg_count: fc.max_reg,
+            param_count: params.len() as u16,
+            rest_reg: fc.rest_reg,
+            constants: fc.constants,
+            string_constants: fc.string_constants,
+            name_global: None,
             upvalues,
         })
     }
@@ -574,6 +644,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::Throw { src: v });
             }
             S::TryStatement(t) => self.try_statement(t)?,
+            S::ClassDeclaration(c) => self.class_decl(c)?,
             S::EmptyStatement(_) => {}
             _ => return Err("unsupported statement (not in the zipp-vm v1 subset yet)".into()),
         }
@@ -837,6 +908,114 @@ impl<'a> FnCompiler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Compile a `class C { … }` declaration: build the method + constructor
+    /// protos, register a ClassDef, and bind `C` to the materialized class value.
+    fn class_decl(&mut self, class: &ox::Class) -> R<()> {
+        let class_id = self.compile_class(class)?;
+        let name = class.id.as_ref().map(|i| i.name.to_string());
+        let Some(n) = name else { return Ok(()) };
+        if self.is_script {
+            let slot = self.cx.global_slot(&n) as u32;
+            let tmp = self.temp();
+            self.emit(Instr::MakeClass { dst: tmp, class_id });
+            self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+            self.next_reg -= 1;
+        } else {
+            let reg = self.declare_local(&n);
+            if self.cell_regs.contains(&reg) {
+                let tmp = self.temp();
+                self.emit(Instr::MakeClass { dst: tmp, class_id });
+                self.emit(Instr::CellSet { cell: reg, src: tmp });
+                self.next_reg -= 1;
+            } else {
+                self.emit(Instr::MakeClass { dst: reg, class_id });
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a class body into protos (methods get `this` at reg 0; the
+    /// constructor proto runs instance-field initializers then the user ctor
+    /// body) and register a ClassDef. Returns its class_id. Methods are compiled
+    /// as non-capturing functions (free vars resolve to globals), so a class at
+    /// module scope works fully; `extends`/`super`, static members, and
+    /// get/set accessors are out of this subset.
+    fn compile_class(&mut self, class: &ox::Class) -> R<u32> {
+        if class.super_class.is_some() {
+            return Err("class extends/super is not in the zipp-vm subset yet".into());
+        }
+        let cname = class.id.as_ref().map(|i| i.name.to_string()).unwrap_or_else(|| "<class>".into());
+        let mut ctor_fn: Option<&ox::Function> = None;
+        let mut methods: Vec<(String, &ox::Function)> = Vec::new();
+        let mut fields: Vec<(String, Option<&ox::Expression>)> = Vec::new();
+        for el in &class.body.body {
+            match el {
+                ox::ClassElement::MethodDefinition(m) => {
+                    if m.r#static {
+                        return Err("static class members are not in the zipp-vm subset yet".into());
+                    }
+                    match m.kind {
+                        ox::MethodDefinitionKind::Constructor => ctor_fn = Some(&m.value),
+                        ox::MethodDefinitionKind::Method => {
+                            methods.push((class_key_name(&m.key)?, &m.value));
+                        }
+                        _ => return Err("class get/set accessors are not in the zipp-vm subset yet".into()),
+                    }
+                }
+                ox::ClassElement::PropertyDefinition(p) => {
+                    if p.r#static {
+                        return Err("static class members are not in the zipp-vm subset yet".into());
+                    }
+                    fields.push((class_key_name(&p.key)?, p.value.as_ref()));
+                }
+                ox::ClassElement::StaticBlock(_) => {
+                    return Err("static blocks are not in the zipp-vm subset yet".into());
+                }
+                _ => return Err("unsupported class member in the zipp-vm subset".into()),
+            }
+        }
+        // Method protos.
+        let mut method_defs: Vec<(String, u32)> = Vec::new();
+        for (mname, func) in &methods {
+            let (params, rest, body) = function_parts(func)?;
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.{mname}"),
+                &params,
+                rest.as_deref(),
+                Some(&*func.params),
+                &[],
+                body,
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            method_defs.push((mname.clone(), fid));
+        }
+        // Constructor proto (only needed when there's a ctor or any field init).
+        let ctor = if ctor_fn.is_some() || !fields.is_empty() {
+            let (params, rest, body) = match ctor_fn {
+                Some(f) => function_parts(f)?,
+                None => (Vec::new(), None, &[][..]),
+            };
+            let params_ast = ctor_fn.map(|f| &*f.params);
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.constructor"),
+                &params,
+                rest.as_deref(),
+                params_ast,
+                &fields,
+                body,
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            Some(fid)
+        } else {
+            None
+        };
+        let class_id = self.cx.classes.len() as u32;
+        self.cx.classes.push(ClassDef { name: cname, ctor, methods: method_defs });
+        Ok(class_id)
     }
 
     /// The enclosing-function chain to hand a function nested in THIS one: our
@@ -1403,7 +1582,12 @@ impl<'a> FnCompiler<'a> {
                         return self.build_error(kind, n.arguments.first(), dst);
                     }
                 }
-                Err("`new` (non-Error constructor) is not in the zipp-vm subset yet".into())
+                // General `new C(args)`: evaluate the constructor value, then the
+                // args (contiguous), and let the VM build the instance.
+                let callee = self.expr(&n.callee)?;
+                let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
+                self.emit(Instr::New { dst, callee, arg_base, argc });
+                Ok(dst)
             }
             E::FunctionExpression(f) => {
                 let (id, has_up) =
@@ -1620,15 +1804,18 @@ impl<'a> FnCompiler<'a> {
         // `x instanceof Ctor`: only built-in constructors are recognised (the
         // engine has no user prototype chain). Decided structurally in the VM.
         if matches!(b.operator, Op::Instanceof) {
-            let ctor = match &b.right {
-                ox::Expression::Identifier(id) => InstanceCtor::from_name(&id.name).ok_or(
-                    "instanceof only supports built-in constructors \
-                     (Array, Object, Function, Error, TypeError, RangeError, SyntaxError)",
-                )?,
-                _ => return Err("instanceof right-hand side must be a built-in constructor name".into()),
-            };
+            // A built-in constructor name → structural InstanceOf; anything else
+            // (a user class value) → runtime InstanceOfDyn against its class link.
+            if let ox::Expression::Identifier(id) = &b.right {
+                if let Some(ctor) = InstanceCtor::from_name(&id.name) {
+                    let val = self.expr(&b.left)?;
+                    self.emit(Instr::InstanceOf { dst, val, ctor });
+                    return Ok(dst);
+                }
+            }
             let val = self.expr(&b.left)?;
-            self.emit(Instr::InstanceOf { dst, val, ctor });
+            let ctor = self.expr(&b.right)?;
+            self.emit(Instr::InstanceOfDyn { dst, val, ctor });
             return Ok(dst);
         }
         // `a - <int literal>` and `a + <int literal>` → AddInt fast path, but
@@ -2469,6 +2656,17 @@ fn compound_assign_instr(op: ox::AssignmentOperator, dst: Reg, a: Reg, b: Reg) -
         Op::BitwiseAnd => Instr::Bitwise { dst, a, b, op: BitwiseOp::And },
         _ => return None,
     })
+}
+
+/// A class member's (non-computed) name. Computed `[expr]` and `#private` names
+/// are out of the subset.
+fn class_key_name(key: &ox::PropertyKey) -> R<String> {
+    match key {
+        ox::PropertyKey::StaticIdentifier(id) => Ok(id.name.to_string()),
+        ox::PropertyKey::StringLiteral(s) => Ok(s.value.to_string()),
+        ox::PropertyKey::NumericLiteral(n) => Ok(fmt_key_num(n.value)),
+        _ => Err("computed or private class member names are not in the zipp-vm subset yet".into()),
+    }
 }
 
 /// Recognise the built-in Error constructor names the subset supports. Returns

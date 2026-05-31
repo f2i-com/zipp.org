@@ -97,6 +97,11 @@ pub enum Instr {
     /// Copy `src`'s own enumerable keys onto `target` (object literal `{...src}`).
     /// `src` may be an object, array, or string; null/undefined contribute none.
     ObjectSpread { target: Reg, src: Reg },
+    /// `dst = <the class value for classes[class_id]>` — materialize a class.
+    MakeClass { dst: Reg, class_id: u32 },
+    /// `dst = new callee(args…)` — construct an instance. `callee` must be a
+    /// class value; builds an object, installs the methods, runs the ctor.
+    New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
     /// `dst = callee(...args_array)` — call `callee` (a function value) spreading
     /// the elements of the array in `args` as the arguments (`this` = undefined).
     CallSpread { dst: Reg, callee: Reg, args: Reg },
@@ -122,6 +127,9 @@ pub enum Instr {
     /// `dst = (val instanceof <ctor>)` for a built-in constructor (Array, Object,
     /// Function, Error and its subclasses). User constructors are out of scope.
     InstanceOf { dst: Reg, val: Reg, ctor: InstanceCtor },
+    /// `dst = (val instanceof ctor)` where `ctor` is a runtime class value: true
+    /// when `val` is an instance whose class is `ctor`.
+    InstanceOfDyn { dst: Reg, val: Reg, ctor: Reg },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },
@@ -380,4 +388,15 @@ pub enum UpvalSource {
 pub struct Program {
     pub functions: Vec<FuncProto>,
     pub global_count: u32,
+    pub classes: Vec<ClassDef>,
+}
+
+/// A compiled class: the constructor func id (runs field inits + user ctor body),
+/// and each instance method's name + func id. Materialized into a `HeapObj::Class`
+/// by the `MakeClass` op.
+#[derive(Clone, Debug)]
+pub struct ClassDef {
+    pub name: String,
+    pub ctor: Option<u32>,
+    pub methods: Vec<(String, u32)>,
 }

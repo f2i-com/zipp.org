@@ -1116,6 +1116,26 @@ mod tests {
     }
 
     #[test]
+    fn classes() {
+        // Constructor + method + this.
+        assert_eq!(run_ok("class A{constructor(x){this.x=x} get(){return this.x}} console.log(new A(5).get())"), vec!["5"]);
+        // Class fields (with and without initializers) + field mutation.
+        assert_eq!(run_ok("class C{count=0; inc(){this.count++; return this.count}} let c=new C(); console.log(c.inc(), c.inc())"), vec!["1 2"]);
+        // Method chaining via `return this`; method calling another method.
+        assert_eq!(run_ok("class K{constructor(){this.v=0} add(n){this.v+=n;return this} val(){return this.v}} console.log(new K().add(3).add(4).val())"), vec!["7"]);
+        assert_eq!(run_ok("class A{constructor(n){this.n=n} d(){return this.n*2} q(){return this.d()*2}} console.log(new A(5).q())"), vec!["20"]);
+        // A constructor returning an object replaces the instance.
+        assert_eq!(run_ok("class W{constructor(){return {custom:true}}} console.log(new W().custom)"), vec!["true"]);
+        // Methods are non-enumerable: keys/JSON show only fields.
+        assert_eq!(run_ok("class A{constructor(){this.k=1;this.j=2} m(){}} let a=new A(); console.log(Object.keys(a).join(','), JSON.stringify(a))"), vec![r#"k,j {"k":1,"j":2}"#]);
+        // instanceof for user classes; typeof a class is "function".
+        assert_eq!(run_ok("class A{} class B{} let a=new A(); console.log(a instanceof A, a instanceof B, typeof A)"), vec!["true false function"]);
+        // Arrays of instances; console.log prints the constructor name.
+        assert_eq!(run_ok("class Pt{constructor(x){this.x=x}} console.log([new Pt(1),new Pt(2)].map(p=>p.x).join(','))"), vec!["1,2"]);
+        assert_eq!(run_ok("class Pt{constructor(x,y){this.x=x;this.y=y}} console.log(new Pt(3,4))"), vec!["Pt { x: 3, y: 4 }"]);
+    }
+
+    #[test]
     fn instanceof_operator() {
         // Built-in collections / functions.
         assert_eq!(run_ok("console.log([] instanceof Array, [] instanceof Object)"), vec!["true true"]);

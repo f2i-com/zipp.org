@@ -19,11 +19,16 @@ use std::borrow::Cow;
 pub struct ObjMap {
     pub keys: Vec<String>,
     pub vals: Vec<Value>,
+    /// Heap index of the class this object is an instance of (`new C()`), used
+    /// for prototype-style method lookup and `instanceof`. `None` for a plain
+    /// object literal. Own properties (the fields) live in `keys`/`vals`;
+    /// methods are resolved through the class, so they stay non-enumerable.
+    pub class: Option<u32>,
 }
 
 impl ObjMap {
     pub fn new() -> ObjMap {
-        ObjMap { keys: Vec::new(), vals: Vec::new() }
+        ObjMap { keys: Vec::new(), vals: Vec::new(), class: None }
     }
 
     pub fn get(&self, key: &str) -> Option<Value> {
@@ -95,6 +100,13 @@ pub enum HeapObj {
     Array(Vec<Value>),
     /// A plain object.
     Object(ObjMap),
+    /// A class value (`class C {…}`). `ctor` is the func id that runs instance
+    /// field initializers then the user constructor (or `None`); `methods` maps
+    /// each instance method name to its func id. `new C(args)` builds a plain
+    /// object, installs the methods as own properties, and runs the ctor with
+    /// `this` = the new object. No prototype chain (methods are own props) and no
+    /// inheritance in this subset.
+    Class { name: String, ctor: Option<u32>, methods: Vec<(String, Value)> },
 }
 
 /// Heap index of the interned empty string. The 128 single-ASCII-char strings
