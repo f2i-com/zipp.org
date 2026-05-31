@@ -737,4 +737,86 @@ mod tests {
             .expect("compile");
         assert_eq!(out.output, vec!["3 3 3"]); // NOT node's "0 1 2" — see comment
     }
+
+    // ── rope strings (cons-strings) + JsStr cached length/index + interning ──
+
+    #[test]
+    fn rope_concat_loop_content_and_length() {
+        // `s += digit` builds a deep rope; flattening on display + the O(1)
+        // cached length must reproduce the eager-concat result exactly.
+        assert_jit_matches(
+            "let s=''; for(let i=0;i<5;i++){ s += i; } console.log(s, s.length)",
+            &["01234 5"],
+        );
+    }
+
+    #[test]
+    fn rope_index_and_methods_after_flatten() {
+        // First s[i] flattens the rope; charAt / indexOf / split / toUpperCase
+        // must then operate on the flat string correctly.
+        assert_eq!(
+            run_ok("let s=''; for(let i=0;i<5;i++){ s+=i; } console.log(s.charAt(2), s.indexOf('3'), s.split('').length, s.toUpperCase())"),
+            vec!["2 3 5 01234"],
+        );
+    }
+
+    #[test]
+    fn rope_aliasing_is_immutable() {
+        // `let t=s; s+=x` must NOT mutate t — ropes share children structurally,
+        // and flattening s in place must not corrupt the aliased value t.
+        assert_eq!(
+            run_ok("let s=''; for(let i=0;i<3;i++){ s+='ab'; } let t=s; s+='Z'; console.log(s, t, s.length, t.length)"),
+            vec!["abababZ ababab 7 6"],
+        );
+    }
+
+    #[test]
+    fn rope_strict_eq_against_flat() {
+        // A rope and a flat literal with equal content are === equal (str_eq
+        // materializes the rope side; flat-vs-flat stays the fast no-alloc path).
+        assert_eq!(
+            run_ok("let a='he'+'llo'; console.log(a==='hello', a==='hell', ('x'+'y')===('xy'))"),
+            vec!["true false true"],
+        );
+    }
+
+    #[test]
+    fn empty_rope_length_and_truthiness() {
+        // An empty rope ("" + "") has length 0 and is falsy (str_is_empty is O(1)
+        // on Cons via len, and the interned empty string round-trips).
+        assert_eq!(
+            run_ok("let e=''+''; console.log(e.length, e?1:0, (''+'')==='')"),
+            vec!["0 0 true"],
+        );
+    }
+
+    #[test]
+    fn concat_coerces_array_and_object() {
+        // Either side heap ⇒ string concatenation; arrays join, objects become
+        // [object Object] — coerced to a flat string child of the rope.
+        assert_eq!(
+            run_ok("console.log([1,2]+[3], {}+'x', 'n='+(1+2))"),
+            vec!["1,23 [object Object]x n=3"],
+        );
+    }
+
+    #[test]
+    fn interned_single_chars_index_correctly() {
+        // Indexing returns interned single-char strings (shared slots); content
+        // and per-index correctness must hold across many accesses.
+        assert_jit_matches(
+            "let s='abcdefghij'; let c=0; for(let i=0;i<s.length;i++){ if(s[i]==='e'){ c++; } } console.log(c, s[0], s[9])",
+            &["1 a j"],
+        );
+    }
+
+    #[test]
+    fn nonascii_length_and_index_scalar_count() {
+        // Non-ASCII falls back to chars().nth (scalar indexing); .length is the
+        // cached scalar count. 'café' is 4 scalars; index 3 is 'é'.
+        assert_eq!(
+            run_ok("let s='caf\u{00e9}'; console.log(s.length, s[3], s.charAt(3), (s+s).length)"),
+            vec!["4 \u{00e9} \u{00e9} 8"],
+        );
+    }
 }
