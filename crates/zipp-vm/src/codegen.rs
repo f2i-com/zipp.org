@@ -431,6 +431,7 @@ fn can_compile(proto: &FuncProto, self_slot: Option<u16>) -> bool {
             | Instr::Add { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
+            | Instr::Mod { .. }
             | Instr::Lt { .. }
             | Instr::Le { .. }
             | Instr::Gt { .. }
@@ -488,6 +489,7 @@ fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::Sub { dst, .. }
         | Instr::Mul { dst, .. }
         | Instr::Div { dst, .. }
+        | Instr::Mod { dst, .. }
         | Instr::Neg { dst, .. }
         | Instr::Lt { dst, .. }
         | Instr::Le { dst, .. }
@@ -587,6 +589,7 @@ fn compile_proto(
             Instr::Add { dst, a, b } => int_binop(&mut ops, ip, bail, dst, a, b, BinOp::Add),
             Instr::Sub { dst, a, b } => int_binop(&mut ops, ip, bail, dst, a, b, BinOp::Sub),
             Instr::Mul { dst, a, b } => int_binop(&mut ops, ip, bail, dst, a, b, BinOp::Mul),
+            Instr::Mod { dst, a, b } => int_binop(&mut ops, ip, bail, dst, a, b, BinOp::Mod),
             Instr::Lt { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Lt),
             Instr::Le { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Le),
             Instr::Gt { dst, a, b } => int_cmp(&mut ops, ip, bail, dst, a, b, Cmp::Gt),
@@ -688,6 +691,7 @@ enum BinOp {
     Add,
     Sub,
     Mul,
+    Mod,
 }
 #[derive(Clone, Copy)]
 enum Cmp {
@@ -780,6 +784,22 @@ fn int_binop(
         BinOp::Add => dynasm!(ops ; add eax, r9d ; jo => bail),
         BinOp::Sub => dynasm!(ops ; sub eax, r9d ; jo => bail),
         BinOp::Mul => dynasm!(ops ; imul eax, r9d ; jo => bail),
+        // Signed integer remainder (JS `%` on integers; truncated, sign of the
+        // dividend = idiv's remainder). `% 0` is NaN (not an Int) → bail; bail on
+        // divisor -1 too, which sidesteps the INT_MIN/-1 idiv #DE (and `% -1` is
+        // always 0, so the interpreter handles that rare case correctly).
+        // `cdq` sign-extends eax into edx:eax; `idiv r9d` puts the remainder in
+        // edx, which we move into eax for `box_eax`. (Division `/` is NOT done
+        // here — JS `/` is float division, e.g. 7/2 == 3.5, not an integer.)
+        BinOp::Mod => dynasm!(ops
+            ; test r9d, r9d
+            ; jz => bail
+            ; cmp r9d, -1
+            ; je => bail
+            ; cdq
+            ; idiv r9d
+            ; mov eax, edx
+        ),
     }
     box_eax(ops, dst);
     emit_bail(ops, ip, bail);

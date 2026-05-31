@@ -821,6 +821,27 @@ mod tests {
     }
 
     #[test]
+    fn int_function_modulo_jit() {
+        // A hot function using `%` compiles via the whole-function JIT (idiv).
+        // Negative dividends keep the dividend's sign (JS / interpreter
+        // semantics); JIT-on must equal JIT-off and the expected string.
+        assert_jit_matches(
+            "function f(x){ return x%3; } let o=''; for(let i=-5;i<6;i++){ o += f(i)+','; } console.log(o)",
+            &["-2,-1,0,-2,-1,0,1,2,0,1,2,"],
+        );
+    }
+
+    #[test]
+    fn modulo_zero_and_negone_bail() {
+        // `% 0` is NaN and `% -1` is 0 — the JIT bails on both (div-by-zero, and
+        // the INT_MIN/-1 #DE), so the interpreter produces them; JIT-on==JIT-off.
+        assert_jit_matches(
+            "function g(x,m){ return x%m; } let o=''; for(let i=0;i<10;i++){ o += g(i,0)+'|'+g(i,-1)+';'; } console.log(o)",
+            &["NaN|0;NaN|0;NaN|0;NaN|0;NaN|0;NaN|0;NaN|0;NaN|0;NaN|0;NaN|0;"],
+        );
+    }
+
+    #[test]
     fn string_bracket_length_matches_dot_length() {
         // s['length'] (computed member) must equal s.length and arr['length'] —
         // the get_index Str arm used to drop non-int keys to undefined.
