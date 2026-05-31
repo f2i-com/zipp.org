@@ -1479,6 +1479,15 @@ impl<'a> FnCompiler<'a> {
                 return self.build_error(kind, c.arguments.first(), dst);
             }
         }
+        // Number(x) / parseInt(s,radix) / parseFloat(s) → GlobalFn op.
+        if let ox::Expression::Identifier(id) = &c.callee {
+            if let Some(op) = crate::bytecode::GlobalFn::from_name(&id.name) {
+                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                self.emit(Instr::GlobalFn { dst, op, arg_base, argc });
+                return Ok(dst);
+            }
+        }
+
         // console.log(...) → Print opcode.
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             if let ox::Expression::Identifier(obj) = &m.object {

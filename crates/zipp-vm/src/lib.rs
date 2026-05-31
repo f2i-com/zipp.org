@@ -853,6 +853,22 @@ mod tests {
     }
 
     #[test]
+    fn number_parse_globals() {
+        assert_eq!(
+            run_ok("console.log(Number('42')+1, Number(''), Number(true), Number('abc'), Number())"),
+            vec!["43 0 1 NaN 0"],
+        );
+        assert_eq!(
+            run_ok("console.log(parseInt('10px'), parseInt('0xff'), parseInt('11',2), parseInt('-7'), parseInt('abc'))"),
+            vec!["10 255 3 -7 NaN"],
+        );
+        assert_eq!(
+            run_ok("console.log(parseFloat('3.14x'), parseFloat('1e3'), parseFloat('-2.5e-1'), parseFloat('abc'))"),
+            vec!["3.14 1000 -0.25 NaN"],
+        );
+    }
+
+    #[test]
     fn method_name_after_numeric_constant() {
         // REGRESSION: a method/property name's index must be into string_constants,
         // not the constant pool — a preceding non-string constant (e.g. 3.5) used

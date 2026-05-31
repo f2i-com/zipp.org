@@ -761,6 +761,27 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::num(r));
                         ip += 1;
                     }
+                    Instr::GlobalFn { dst, op, arg_base, argc } => {
+                        use crate::bytecode::GlobalFn as G;
+                        let a0 = if argc >= 1 { self.get(base, arg_base) } else { Value::UNDEFINED };
+                        let v = match op {
+                            G::Number => {
+                                if argc == 0 { Value::num(0.0) } else { Value::num(self.to_number(a0)?) }
+                            }
+                            G::ParseInt => {
+                                let s = self.display(a0);
+                                let radix = if argc >= 2 {
+                                    self.to_number(self.get(base, arg_base + 1))? as i32
+                                } else {
+                                    0
+                                };
+                                Value::num(parse_int(&s, radix))
+                            }
+                            G::ParseFloat => Value::num(parse_float(&self.display(a0))),
+                        };
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
 
                     Instr::Jump { target } => {
                         let t = target as usize;
@@ -2718,6 +2739,101 @@ fn len_value(n: usize) -> Value {
     } else {
         Value::num(n as f64)
     }
+}
+
+/// JS `parseInt(s, radix)`: skip leading whitespace, an optional sign, an
+/// optional `0x` prefix (radix 16), then digits in `radix` (default 10); stop at
+/// the first invalid digit. `NaN` if no digits parse. `radix == 0` means "auto".
+fn parse_int(s: &str, radix: i32) -> f64 {
+    let b = s.trim_start().as_bytes();
+    let mut i = 0;
+    let mut sign = 1.0;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        if b[i] == b'-' {
+            sign = -1.0;
+        }
+        i += 1;
+    }
+    let mut radix = radix;
+    if (radix == 16 || radix == 0)
+        && i + 1 < b.len()
+        && b[i] == b'0'
+        && (b[i + 1] == b'x' || b[i + 1] == b'X')
+    {
+        i += 2;
+        radix = 16;
+    }
+    if radix == 0 {
+        radix = 10;
+    }
+    if !(2..=36).contains(&radix) {
+        return f64::NAN;
+    }
+    let start = i;
+    let mut val = 0.0;
+    while i < b.len() {
+        let d = match b[i] {
+            c @ b'0'..=b'9' => (c - b'0') as i32,
+            c @ b'a'..=b'z' => (c - b'a' + 10) as i32,
+            c @ b'A'..=b'Z' => (c - b'A' + 10) as i32,
+            _ => break,
+        };
+        if d >= radix {
+            break;
+        }
+        val = val * radix as f64 + d as f64;
+        i += 1;
+    }
+    if i == start {
+        f64::NAN
+    } else {
+        sign * val
+    }
+}
+
+/// JS `parseFloat(s)`: skip leading whitespace, then parse the longest leading
+/// decimal-float prefix (sign, digits, `.`, exponent, or `Infinity`). `NaN` if
+/// none.
+fn parse_float(s: &str) -> f64 {
+    let t = s.trim_start();
+    let b = t.as_bytes();
+    let mut end = 0;
+    if end < b.len() && (b[end] == b'+' || b[end] == b'-') {
+        end += 1;
+    }
+    if t[end..].starts_with("Infinity") {
+        return if t.starts_with('-') { f64::NEG_INFINITY } else { f64::INFINITY };
+    }
+    let mut saw_digit = false;
+    while end < b.len() && b[end].is_ascii_digit() {
+        end += 1;
+        saw_digit = true;
+    }
+    if end < b.len() && b[end] == b'.' {
+        end += 1;
+        while end < b.len() && b[end].is_ascii_digit() {
+            end += 1;
+            saw_digit = true;
+        }
+    }
+    if !saw_digit {
+        return f64::NAN;
+    }
+    // Optional exponent — only consumed if it has at least one digit.
+    if end < b.len() && (b[end] == b'e' || b[end] == b'E') {
+        let mut e = end + 1;
+        if e < b.len() && (b[e] == b'+' || b[e] == b'-') {
+            e += 1;
+        }
+        let exp_start = e;
+        while e < b.len() && b[e].is_ascii_digit() {
+            e += 1;
+        }
+        if e > exp_start {
+            end = e;
+        }
+    }
+    t[..end].parse::<f64>().unwrap_or(f64::NAN)
 }
 
 /// A non-negative array index from a numeric key, coercing an integral double

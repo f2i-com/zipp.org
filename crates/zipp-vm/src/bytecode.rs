@@ -76,6 +76,8 @@ pub enum Instr {
     /// `dst = Math.<op>(args…)` — a builtin Math function over `argc` contiguous
     /// argument registers starting at `arg_base`.
     MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },
+    /// `dst = <Number|parseInt|parseFloat>(args…)` — a builtin global function.
+    GlobalFn { dst: Reg, op: GlobalFn, arg_base: Reg, argc: u16 },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },
@@ -212,6 +214,25 @@ impl MathFn {
             "asin" => Asin, "acos" => Acos, "atan" => Atan,
             "pow" => Pow, "atan2" => Atan2,
             "min" => Min, "max" => Max, "hypot" => Hypot,
+            _ => return None,
+        })
+    }
+}
+
+/// A builtin global function, resolved at compile time from a bare call.
+#[derive(Clone, Copy, Debug)]
+pub enum GlobalFn {
+    Number,
+    ParseInt,
+    ParseFloat,
+}
+
+impl GlobalFn {
+    pub fn from_name(name: &str) -> Option<GlobalFn> {
+        Some(match name {
+            "Number" => GlobalFn::Number,
+            "parseInt" => GlobalFn::ParseInt,
+            "parseFloat" => GlobalFn::ParseFloat,
             _ => return None,
         })
     }
