@@ -840,29 +840,48 @@ impl<'p> Vm<'p> {
                         let aidx = self.get(base, arr).heap_index();
                         let vv = self.get(base, val);
                         if spread {
-                            // Materialize the spread source's elements (array →
-                            // elements; string → chars) WITHOUT holding a heap
-                            // borrow across the char allocations.
-                            let chars: Option<Vec<char>> = if vv.is_heap() {
+                            // Materialize the spread source's elements (array/set →
+                            // elements; string → chars; map → [k,v] entries) WITHOUT
+                            // holding a heap borrow across the fresh allocations.
+                            let mut chars: Option<Vec<char>> = None;
+                            let mut map_pairs: Option<Vec<(Value, Value)>> = None;
+                            if vv.is_heap() {
                                 match self.heap.get(vv.heap_index()) {
                                     HeapObj::Array(items) => {
                                         let elems = items.clone();
-                                        if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                                            dst_items.extend(elems);
+                                        if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
+                                            d.extend(elems);
                                         }
-                                        None
+                                    }
+                                    HeapObj::Set(items) => {
+                                        let elems = items.clone();
+                                        if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
+                                            d.extend(elems);
+                                        }
                                     }
                                     HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                                        Some(self.heap.str_cow(vv.heap_index()).unwrap().chars().collect())
+                                        chars = Some(self.heap.str_cow(vv.heap_index()).unwrap().chars().collect());
+                                    }
+                                    HeapObj::Map { keys, vals } => {
+                                        map_pairs = Some(keys.iter().copied().zip(vals.iter().copied()).collect());
                                     }
                                     _ => return Err(Thrown("TypeError: spread value is not iterable".into())),
                                 }
                             } else {
                                 return Err(Thrown("TypeError: spread value is not iterable".into()));
-                            };
+                            }
                             if let Some(chars) = chars {
                                 let elems: Vec<Value> =
                                     chars.into_iter().map(|c| self.alloc_str(c.to_string())).collect();
+                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                                    dst_items.extend(elems);
+                                }
+                            }
+                            if let Some(pairs) = map_pairs {
+                                let elems: Vec<Value> = pairs
+                                    .into_iter()
+                                    .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))
+                                    .collect();
                                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                     dst_items.extend(elems);
                                 }
@@ -874,34 +893,9 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ArrayRest { dst, src, start } => {
                         let sv = self.get(base, src);
-                        let start = start as usize;
-                        let not_iter =
-                            || Thrown("TypeError: value is not iterable for array destructuring".into());
-                        if !sv.is_heap() {
-                            return Err(not_iter());
-                        }
-                        // Two phases: gather under the immutable heap borrow, then
-                        // allocate (chars need fresh strings) after it ends.
-                        let mut vals: Option<Vec<Value>> = None;
-                        let mut chars: Option<Vec<char>> = None;
-                        match self.heap.get(sv.heap_index()) {
-                            HeapObj::Array(items) => {
-                                vals = Some(items.get(start..).map(|s| s.to_vec()).unwrap_or_default());
-                            }
-                            HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                                chars = Some(
-                                    self.heap.str_cow(sv.heap_index()).unwrap().chars().skip(start).collect(),
-                                );
-                            }
-                            _ => return Err(not_iter()),
-                        }
-                        let rest: Vec<Value> = match (vals, chars) {
-                            (Some(v), _) => v,
-                            (_, Some(cs)) => {
-                                cs.into_iter().map(|c| self.alloc_str(c.to_string())).collect()
-                            }
-                            _ => Vec::new(),
-                        };
+                        let mut elems = self.iterate_to_vec(sv)?;
+                        let start = (start as usize).min(elems.len());
+                        let rest = elems.split_off(start);
                         let arr = Value::heap(self.heap.alloc(HeapObj::Array(rest)));
                         self.set(base, dst, arr);
                         ip += 1;
@@ -1015,6 +1009,46 @@ impl<'p> Vm<'p> {
                         };
                         let v = Value::heap(self.heap.alloc(HeapObj::Array(arr)));
                         self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::NewMap { dst, src } => {
+                        let (mut keys, mut vals): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+                        if let Some(s) = src {
+                            let sv = self.get(base, s);
+                            if !sv.is_nullish() {
+                                // Each iterated entry is a [key, value]-indexable.
+                                for e in self.iterate_to_vec(sv)? {
+                                    let k = normalize_zero(self.get_index(e, Value::int(0))?);
+                                    let v = self.get_index(e, Value::int(1))?;
+                                    match keys.iter().position(|kk| self.same_value_zero(*kk, k)) {
+                                        Some(i) => vals[i] = v,
+                                        None => {
+                                            keys.push(k);
+                                            vals.push(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let m = Value::heap(self.heap.alloc(HeapObj::Map { keys, vals }));
+                        self.set(base, dst, m);
+                        ip += 1;
+                    }
+                    Instr::NewSet { dst, src } => {
+                        let mut items: Vec<Value> = Vec::new();
+                        if let Some(s) = src {
+                            let sv = self.get(base, s);
+                            if !sv.is_nullish() {
+                                for e in self.iterate_to_vec(sv)? {
+                                    let v = normalize_zero(e);
+                                    if !items.iter().any(|x| self.same_value_zero(*x, v)) {
+                                        items.push(v);
+                                    }
+                                }
+                            }
+                        }
+                        let s = Value::heap(self.heap.alloc(HeapObj::Set(items)));
+                        self.set(base, dst, s);
                         ip += 1;
                     }
                     Instr::CallSpread { dst, callee, args } => {
@@ -1319,6 +1353,9 @@ impl<'p> Vm<'p> {
                                 HeapObj::Array(items) => len_value(items.len()),
                                 HeapObj::Str(s) => len_value(s.char_len),
                                 HeapObj::Cons { len, .. } => len_value(*len),
+                                // for-of over a Map/Set iterates `size` slots.
+                                HeapObj::Map { keys, .. } => len_value(keys.len()),
+                                HeapObj::Set(items) => len_value(items.len()),
                                 _ => Value::int(0),
                             }
                         } else {
@@ -1785,6 +1822,25 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Value::UNDEFINED)
             }
+            // Positional access drives for-of / spread over a Map (the i-th
+            // [key, value] entry) and a Set (the i-th value). Insertion order.
+            HeapObj::Map { keys, vals } => {
+                if let Some(i) = array_index(key) {
+                    if i < keys.len() {
+                        let (k, v) = (keys[i], vals[i]);
+                        return Ok(Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))));
+                    }
+                }
+                Ok(Value::UNDEFINED)
+            }
+            HeapObj::Set(items) => {
+                if let Some(i) = array_index(key) {
+                    if i < items.len() {
+                        return Ok(items[i]);
+                    }
+                }
+                Ok(Value::UNDEFINED)
+            }
             _ => Ok(Value::UNDEFINED),
         }
     }
@@ -1908,6 +1964,9 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Value::UNDEFINED)
             }
+            // `map.size` / `set.size` — an accessor property, not a method.
+            HeapObj::Map { keys, .. } if key == "size" => Ok(len_value(keys.len())),
+            HeapObj::Set(items) if key == "size" => Ok(len_value(items.len())),
             _ => Ok(Value::UNDEFINED),
         }
     }
@@ -2031,6 +2090,9 @@ impl<'p> Vm<'p> {
                 }
                 Some(wrap_json(&parts, '{', '}', indent, depth))
             }
+            // A Map/Set has no enumerable own properties, so JSON.stringify
+            // renders it as an empty object (not omitted, unlike a function).
+            HeapObj::Map { .. } | HeapObj::Set(_) => Some("{}".into()),
             _ => None,
         }
     }
@@ -2251,6 +2313,193 @@ impl<'p> Vm<'p> {
         match self.heap.get(idx) {
             HeapObj::Array(_) => self.array_method(idx, name, args),
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
+            HeapObj::Map { .. } => self.map_method(idx, name, args),
+            HeapObj::Set(_) => self.set_method(idx, name, args),
+            _ => Ok(None),
+        }
+    }
+
+    /// `Map.prototype.*`. `idx` is the Map's heap index. Returns `Ok(None)` for an
+    /// unknown method (→ TypeError at the call site). `forEach` snapshots the
+    /// entries before invoking the callback (which may mutate the map).
+    fn map_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let recv = Value::heap(idx);
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "get" => {
+                let v = match self.heap.get(idx) {
+                    HeapObj::Map { keys, vals } => keys
+                        .iter()
+                        .position(|k| self.same_value_zero(*k, a0))
+                        .map(|i| vals[i]),
+                    _ => None,
+                };
+                Ok(Some(v.unwrap_or(Value::UNDEFINED)))
+            }
+            "has" => {
+                let found = match self.heap.get(idx) {
+                    HeapObj::Map { keys, .. } => keys.iter().any(|k| self.same_value_zero(*k, a0)),
+                    _ => false,
+                };
+                Ok(Some(Value::bool(found)))
+            }
+            "set" => {
+                let key = normalize_zero(a0);
+                let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let pos = match self.heap.get(idx) {
+                    HeapObj::Map { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, key)),
+                    _ => None,
+                };
+                if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                    match pos {
+                        Some(i) => vals[i] = val, // update in place, keep position
+                        None => {
+                            keys.push(key);
+                            vals.push(val);
+                        }
+                    }
+                }
+                Ok(Some(recv)) // chainable
+            }
+            "delete" => {
+                let pos = match self.heap.get(idx) {
+                    HeapObj::Map { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),
+                    _ => None,
+                };
+                if let (Some(i), HeapObj::Map { keys, vals }) = (pos, self.heap.get_mut(idx)) {
+                    keys.remove(i);
+                    vals.remove(i);
+                    return Ok(Some(Value::bool(true)));
+                }
+                Ok(Some(Value::bool(false)))
+            }
+            "clear" => {
+                if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                    keys.clear();
+                    vals.clear();
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            "forEach" => {
+                let cb = a0;
+                let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (ks, vs) = match self.heap.get(idx) {
+                    HeapObj::Map { keys, vals } => (keys.clone(), vals.clone()),
+                    _ => (Vec::new(), Vec::new()),
+                };
+                for (k, v) in ks.into_iter().zip(vs) {
+                    // callback(value, key, map)
+                    self.call_value(cb, this_arg, &[v, k, recv])?;
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            // Iterators are approximated as arrays (iterable / spreadable alike).
+            "keys" => {
+                let v = match self.heap.get(idx) {
+                    HeapObj::Map { keys, .. } => keys.clone(),
+                    _ => Vec::new(),
+                };
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(v)))))
+            }
+            "values" => {
+                let v = match self.heap.get(idx) {
+                    HeapObj::Map { vals, .. } => vals.clone(),
+                    _ => Vec::new(),
+                };
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(v)))))
+            }
+            "entries" => {
+                let pairs: Vec<(Value, Value)> = match self.heap.get(idx) {
+                    HeapObj::Map { keys, vals } => {
+                        keys.iter().copied().zip(vals.iter().copied()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let entries: Vec<Value> = pairs
+                    .into_iter()
+                    .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))
+                    .collect();
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(entries)))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `Set.prototype.*`. `idx` is the Set's heap index. `keys`/`values`/`entries`
+    /// return arrays (the iterator approximation).
+    fn set_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let recv = Value::heap(idx);
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "has" => {
+                let found = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.iter().any(|v| self.same_value_zero(*v, a0)),
+                    _ => false,
+                };
+                Ok(Some(Value::bool(found)))
+            }
+            "add" => {
+                let val = normalize_zero(a0);
+                let present = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.iter().any(|v| self.same_value_zero(*v, val)),
+                    _ => true,
+                };
+                if !present {
+                    if let HeapObj::Set(items) = self.heap.get_mut(idx) {
+                        items.push(val);
+                    }
+                }
+                Ok(Some(recv)) // chainable
+            }
+            "delete" => {
+                let pos = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.iter().position(|v| self.same_value_zero(*v, a0)),
+                    _ => None,
+                };
+                if let (Some(i), HeapObj::Set(items)) = (pos, self.heap.get_mut(idx)) {
+                    items.remove(i);
+                    return Ok(Some(Value::bool(true)));
+                }
+                Ok(Some(Value::bool(false)))
+            }
+            "clear" => {
+                if let HeapObj::Set(items) = self.heap.get_mut(idx) {
+                    items.clear();
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            "forEach" => {
+                let cb = a0;
+                let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let items = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.clone(),
+                    _ => Vec::new(),
+                };
+                for v in items {
+                    // callback(value, value, set) — value passed twice, mirroring Map.
+                    self.call_value(cb, this_arg, &[v, v, recv])?;
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            // keys() === values() for a Set; both yield the values.
+            "keys" | "values" => {
+                let v = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.clone(),
+                    _ => Vec::new(),
+                };
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(v)))))
+            }
+            "entries" => {
+                let items = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.clone(),
+                    _ => Vec::new(),
+                };
+                let entries: Vec<Value> = items
+                    .into_iter()
+                    .map(|v| Value::heap(self.heap.alloc(HeapObj::Array(vec![v, v]))))
+                    .collect();
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(entries)))))
+            }
             _ => Ok(None),
         }
     }
@@ -2455,20 +2704,57 @@ impl<'p> Vm<'p> {
     /// `Array.from(src[, mapFn])`: build an array from an array, a string's
     /// chars, or an array-like (`{length, 0:…}`), applying `mapFn(value, index)`
     /// when it is a function.
+    /// Materialize a value's iteration elements: an array or set → its items, a
+    /// string → its chars (as 1-char strings), a map → fresh `[key, value]` entry
+    /// arrays. Throws a TypeError for a non-iterable. Allocations happen after the
+    /// heap borrow is released (two phases).
+    fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        enum Plan {
+            Vals(Vec<Value>),
+            Chars(Vec<char>),
+            Pairs(Vec<(Value, Value)>),
+        }
+        let plan = if v.is_heap() {
+            match self.heap.get(v.heap_index()) {
+                HeapObj::Array(items) => Plan::Vals(items.clone()),
+                HeapObj::Set(items) => Plan::Vals(items.clone()),
+                HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                    Plan::Chars(self.heap.str_cow(v.heap_index()).unwrap().chars().collect())
+                }
+                HeapObj::Map { keys, vals } => {
+                    Plan::Pairs(keys.iter().copied().zip(vals.iter().copied()).collect())
+                }
+                _ => return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v)))),
+            }
+        } else {
+            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+        };
+        Ok(match plan {
+            Plan::Vals(v) => v,
+            Plan::Chars(cs) => cs.into_iter().map(|c| self.alloc_str(c.to_string())).collect(),
+            Plan::Pairs(ps) => ps
+                .into_iter()
+                .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))
+                .collect(),
+        })
+    }
+
     fn array_from(&mut self, src: Value, mapfn: Value) -> Result<Value, Thrown> {
         // Classify the source under a short-lived borrow, then materialize its
         // elements (the object/array-like path needs &mut self for get_prop).
         enum Kind {
-            Arr,
-            Str,
+            Iterable,
             Obj,
             Other,
         }
         let mut elems: Vec<Value> = Vec::new();
         let kind = if src.is_heap() {
             match self.heap.get(src.heap_index()) {
-                HeapObj::Array(_) => Kind::Arr,
-                HeapObj::Str(_) | HeapObj::Cons { .. } => Kind::Str,
+                HeapObj::Array(_)
+                | HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::Set(_)
+                | HeapObj::Map { .. } => Kind::Iterable,
                 HeapObj::Object(_) => Kind::Obj,
                 _ => Kind::Other,
             }
@@ -2476,16 +2762,7 @@ impl<'p> Vm<'p> {
             Kind::Other
         };
         match kind {
-            Kind::Arr => {
-                if let HeapObj::Array(items) = self.heap.get(src.heap_index()) {
-                    elems = items.clone();
-                }
-            }
-            Kind::Str => {
-                let chars: Vec<char> =
-                    self.heap.str_cow(src.heap_index()).unwrap().chars().collect();
-                elems = chars.into_iter().map(|c| self.alloc_str(c.to_string())).collect();
-            }
+            Kind::Iterable => elems = self.iterate_to_vec(src)?,
             Kind::Obj => {
                 // Array-like: read its `length`, then indices 0..length.
                 let len = self.get_prop(src, "length")?;
@@ -3148,6 +3425,18 @@ impl<'p> Vm<'p> {
 
     /// Strict equality between two raw values (no register indirection). Mirrors
     /// `strict_eq` but takes values directly, for builtin use.
+    /// SameValueZero — Map/Set key & element equality. Like `===` but NaN equals
+    /// NaN (so NaN is a usable key and all NaNs dedupe). +0/-0 are equal here too
+    /// (matching `===`); the store side normalizes -0 → +0. Strings compare by
+    /// value, objects by reference identity, and there is no type coercion.
+    fn same_value_zero(&self, a: Value, b: Value) -> bool {
+        if a.is_number() && b.is_number() {
+            let (na, nb) = (a.as_f64(), b.as_f64());
+            return na == nb || (na.is_nan() && nb.is_nan());
+        }
+        self.values_strict_eq(a, b)
+    }
+
     fn values_strict_eq(&self, a: Value, b: Value) -> bool {
         if a.bits() == b.bits() {
             if a.is_double() && a.as_f64().is_nan() {
@@ -3351,6 +3640,8 @@ impl<'p> Vm<'p> {
                     .join(","),
                 HeapObj::Object(_) => "[object Object]".into(),
                 HeapObj::Class { name, .. } => format!("class {name} {{ }}"),
+                HeapObj::Map { .. } => "[object Map]".into(),
+                HeapObj::Set(_) => "[object Set]".into(),
             }
         } else {
             "undefined".into()
@@ -3416,6 +3707,24 @@ impl<'p> Vm<'p> {
                 format!("{prefix}{{ {} }}", parts.join(", "))
             }
             HeapObj::Class { name, .. } => format!("[class {name}]"),
+            HeapObj::Map { keys, vals } => {
+                if keys.is_empty() {
+                    return "Map(0) {}".into();
+                }
+                let parts: Vec<String> = keys
+                    .iter()
+                    .zip(vals.iter())
+                    .map(|(k, v)| format!("{} => {}", self.inspect_nested(*k), self.inspect_nested(*v)))
+                    .collect();
+                format!("Map({}) {{ {} }}", keys.len(), parts.join(", "))
+            }
+            HeapObj::Set(items) => {
+                if items.is_empty() {
+                    return "Set(0) {}".into();
+                }
+                let parts: Vec<String> = items.iter().map(|v| self.inspect_nested(*v)).collect();
+                format!("Set({}) {{ {} }}", items.len(), parts.join(", "))
+            }
         }
     }
 
@@ -4111,6 +4420,16 @@ fn num_to_radix(n: f64, radix: u32) -> String {
     }
     buf.reverse();
     String::from_utf8(buf).unwrap()
+}
+
+/// Normalize a Map key / Set element: `-0` becomes `+0` (SameValueZero treats
+/// them equal, and iteration must yield `+0`). Everything else is unchanged.
+fn normalize_zero(v: Value) -> Value {
+    if v.is_double() && v.as_f64() == 0.0 {
+        Value::num(0.0)
+    } else {
+        v
+    }
 }
 
 /// JS `ToInt32`: truncate toward zero, take modulo 2^32, interpret as signed.

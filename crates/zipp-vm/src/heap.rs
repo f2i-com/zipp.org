@@ -106,6 +106,11 @@ pub enum HeapObj {
     /// object, installs the methods as own properties, and runs the ctor with
     /// `this` = the new object. No prototype chain (methods are own props) and no
     /// inheritance in this subset.
+    /// A JS `Map`: insertion-ordered (key, value) entries with SameValueZero key
+    /// equality. Parallel `keys`/`vals` Vecs (small Maps dominate; linear scan).
+    Map { keys: Vec<Value>, vals: Vec<Value> },
+    /// A JS `Set`: insertion-ordered unique values (SameValueZero equality).
+    Set(Vec<Value>),
     Class {
         name: String,
         ctor: Option<u32>,

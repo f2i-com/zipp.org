@@ -1149,6 +1149,42 @@ mod tests {
     }
 
     #[test]
+    fn map_basics() {
+        assert_eq!(run_ok("let m=new Map(); m.set('a',1).set('b',2); console.log(m.get('a'),m.get('b'),m.size,m.has('a'),m.has('z'))"), vec!["1 2 2 true false"]);
+        assert_eq!(run_ok("let m=new Map([['x',10],['y',20]]); console.log(m.get('x'),m.get('y'),m.size)"), vec!["10 20 2"]);
+        // set on an existing key updates in place (one entry); delete returns bool.
+        assert_eq!(run_ok("let m=new Map(); m.set(1,'a'); m.set(1,'b'); console.log(m.get(1),m.size)"), vec!["b 1"]);
+        assert_eq!(run_ok("let m=new Map([[1,1]]); console.log(m.delete(1),m.delete(1),m.size)"), vec!["true false 0"]);
+        // Iteration: for-of entries, keys/values, forEach(value,key), spread.
+        assert_eq!(run_ok("let m=new Map([['a',1],['b',2]]); let r=[]; for(let [k,v] of m) r.push(k+v); console.log(r.join(','))"), vec!["a1,b2"]);
+        assert_eq!(run_ok("let m=new Map([['a',1],['b',2]]); console.log([...m.keys()].join(','), [...m.values()].join(','))"), vec!["a,b 1,2"]);
+        assert_eq!(run_ok("let m=new Map([['a',1]]); let r=[]; m.forEach((v,k)=>r.push(k+'='+v)); console.log(r.join(','))"), vec!["a=1"]);
+        // SameValueZero keys: NaN dedupes, -0/+0 collapse, objects by identity, no coercion.
+        assert_eq!(run_ok("let m=new Map(); m.set(NaN,1).set(NaN,2); console.log(m.size,m.get(NaN))"), vec!["1 2"]);
+        assert_eq!(run_ok("let m=new Map(); m.set(-0,'z'); console.log(m.get(0), m.has(0))"), vec!["z true"]);
+        assert_eq!(run_ok("let m=new Map(); m.set(1,'n'); console.log(m.get('1'))"), vec!["undefined"]);
+        // console.log + JSON shape.
+        assert_eq!(run_ok("console.log(new Map([['a',1],['b',2]]))"), vec!["Map(2) { 'a' => 1, 'b' => 2 }"]);
+        assert_eq!(run_ok("console.log(JSON.stringify({m:new Map([[1,2]])}))"), vec![r#"{"m":{}}"#]);
+    }
+
+    #[test]
+    fn set_basics() {
+        assert_eq!(run_ok("let s=new Set([1,2,2,3]); console.log(s.size, s.has(2), s.has(9))"), vec!["3 true false"]);
+        assert_eq!(run_ok("let s=new Set(); s.add(1).add(2).add(1); console.log(s.size, [...s].join(','))"), vec!["2 1,2"]);
+        assert_eq!(run_ok("let s=new Set([1,2,3]); console.log(s.delete(2), s.size, [...s].join(','))"), vec!["true 2 1,3"]);
+        // Set from a string iterates chars (deduped).
+        assert_eq!(run_ok("let s=new Set('aabbc'); console.log(s.size, [...s].join(''))"), vec!["3 abc"]);
+        // for-of yields values; forEach; NaN dedupe.
+        assert_eq!(run_ok("let r=[]; for(let v of new Set([10,20])) r.push(v); console.log(r.join(','))"), vec!["10,20"]);
+        assert_eq!(run_ok("let s=new Set([1,2,3]); let t=0; s.forEach(v=>t+=v); console.log(t)"), vec!["6"]);
+        assert_eq!(run_ok("console.log(new Set([NaN,NaN]).size)"), vec!["1"]);
+        // The canonical dedupe idiom + console.log.
+        assert_eq!(run_ok("console.log([...new Set([3,1,3,2,1])].join(','))"), vec!["3,1,2"]);
+        assert_eq!(run_ok("console.log(new Set([1,2]))"), vec!["Set(2) { 1, 2 }"]);
+    }
+
+    #[test]
     fn classes() {
         // Constructor + method + this.
         assert_eq!(run_ok("class A{constructor(x){this.x=x} get(){return this.x}} console.log(new A(5).get())"), vec!["5"]);

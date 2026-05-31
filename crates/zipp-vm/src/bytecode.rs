@@ -113,6 +113,11 @@ pub enum Instr {
     /// `dst = Array(args…)` / `new Array(args…)`: a single numeric arg makes an
     /// array of that length (holes → undefined); otherwise an array of the args.
     ArrayCtor { dst: Reg, arg_base: Reg, argc: u16 },
+    /// `dst = new Map(src?)` — build a Map from an optional iterable of [k,v]
+    /// entries (`src` register, or `None` for an empty map).
+    NewMap { dst: Reg, src: Option<Reg> },
+    /// `dst = new Set(src?)` — build a Set from an optional iterable of values.
+    NewSet { dst: Reg, src: Option<Reg> },
     /// `dst = callee(...args_array)` — call `callee` (a function value) spreading
     /// the elements of the array in `args` as the arguments (`this` = undefined).
     CallSpread { dst: Reg, callee: Reg, args: Reg },
