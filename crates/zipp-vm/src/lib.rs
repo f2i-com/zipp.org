@@ -1186,6 +1186,26 @@ mod tests {
     }
 
     #[test]
+    fn promises() {
+        // resolve/reject + then/catch; chaining; a throw in then routes to catch.
+        assert_eq!(run_ok("Promise.resolve(5).then(v=>console.log('got',v))"), vec!["got 5"]);
+        assert_eq!(run_ok("Promise.reject('e').catch(e=>console.log('caught',e))"), vec!["caught e"]);
+        assert_eq!(run_ok("Promise.resolve(1).then(v=>v+1).then(v=>console.log(v))"), vec!["2"]);
+        assert_eq!(run_ok("Promise.resolve(1).then(v=>{throw 'x'}).catch(e=>console.log('c:'+e))"), vec!["c:x"]);
+        // The defining ordering property: reactions run as microtasks AFTER sync.
+        assert_eq!(run_ok("console.log('A'); Promise.resolve().then(()=>console.log('C')); console.log('B')"), vec!["A", "B", "C"]);
+        // new Promise: resolve, reject, chaining, and adopting a returned promise.
+        assert_eq!(run_ok("new Promise(res=>res(42)).then(v=>console.log(v))"), vec!["42"]);
+        assert_eq!(run_ok("new Promise((res,rej)=>rej('bad')).catch(e=>console.log('err',e))"), vec!["err bad"]);
+        assert_eq!(run_ok("new Promise(r=>r(Promise.resolve(99))).then(v=>console.log(v))"), vec!["99"]);
+        // A promise resolved later by a stored resolver.
+        assert_eq!(run_ok("let r; let p=new Promise(res=>{r=res}); p.then(v=>console.log('late',v)); r(7)"), vec!["late 7"]);
+        // finally runs on both paths and passes the value/reason through.
+        assert_eq!(run_ok("Promise.resolve(1).finally(()=>console.log('cleanup')).then(v=>console.log('v',v))"), vec!["cleanup", "v 1"]);
+        assert_eq!(run_ok("console.log(typeof Promise.resolve(1))"), vec!["object"]);
+    }
+
+    #[test]
     fn generators() {
         // Manual next(): values then done; return value reported once.
         assert_eq!(run_ok("function* g(){yield 1;yield 2} let it=g(); console.log(it.next().value,it.next().value,it.next().done)"), vec!["1 2 true"]);

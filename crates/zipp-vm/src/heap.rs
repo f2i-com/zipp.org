@@ -86,6 +86,26 @@ pub enum GenState {
     Completed,
 }
 
+/// A Promise's settlement state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromiseState {
+    Pending,
+    Fulfilled,
+    Rejected,
+}
+
+/// A registered reaction on a pending promise: when it settles, `callback` runs
+/// (as a microtask) and its outcome settles `dependent`. A `callback` of
+/// `undefined` is a pass-through (the value/reason forwards to `dependent`).
+#[derive(Clone, Debug)]
+pub struct Reaction {
+    pub callback: Value,
+    pub dependent: u32,
+    /// A `.finally(cb)` reaction: run `callback` (no args) for its side effect,
+    /// then forward the ORIGINAL value/reason (a throw in `callback` overrides).
+    pub finally: bool,
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -117,6 +137,20 @@ pub enum HeapObj {
     /// object, installs the methods as own properties, and runs the ctor with
     /// `this` = the new object. No prototype chain (methods are own props) and no
     /// inheritance in this subset.
+    /// A JS Promise. `result` holds the fulfillment value / rejection reason
+    /// (undefined while Pending); `fulfill`/`reject` are reactions registered
+    /// while Pending (drained as microtasks on settle). `handled` tracks whether
+    /// a rejection handler was attached (for optional unhandled-rejection report).
+    Promise {
+        state: PromiseState,
+        result: Value,
+        fulfill: Vec<Reaction>,
+        reject: Vec<Reaction>,
+        handled: bool,
+    },
+    /// A native `resolve`/`reject` function bound to a promise — the pair handed
+    /// to a `new Promise(executor)`. Calling it settles `promise`.
+    BoundResolver { promise: u32, is_reject: bool },
     /// A suspended generator (`function*`). Owns a DETACHED register window (off
     /// the contiguous live `regs` Vec, so the JIT's pinned-capacity invariant
     /// holds while parked); `func`/`closure` re-create the frame on resume, and

@@ -130,6 +130,9 @@ pub enum Instr {
     NewMap { dst: Reg, src: Option<Reg> },
     /// `dst = new Set(src?)` — build a Set from an optional iterable of values.
     NewSet { dst: Reg, src: Option<Reg> },
+    /// `dst = new Promise(executor)` — alloc a pending promise, call `executor`
+    /// with its (resolve, reject) functions; a throwing executor rejects it.
+    NewPromise { dst: Reg, executor: Reg },
     /// `dst = callee(...args_array)` — call `callee` (a function value) spreading
     /// the elements of the array in `args` as the arguments (`this` = undefined).
     CallSpread { dst: Reg, callee: Reg, args: Reg },
@@ -339,6 +342,9 @@ pub enum StaticFn {
     ObjectAssign,
     /// `Object.fromEntries(iterable)` — build an object from [k,v] entries.
     ObjectFromEntries,
+    /// `Promise.resolve(v)` / `Promise.reject(r)`.
+    PromiseResolve,
+    PromiseReject,
     /// `Array.of(...items)` — a new array of the arguments.
     ArrayOf,
     /// `String.fromCharCode(...codes)` — string from UTF-16 code units.
@@ -359,6 +365,8 @@ impl StaticFn {
         Some(match (ns, method) {
             ("Object", "assign") => StaticFn::ObjectAssign,
             ("Object", "fromEntries") => StaticFn::ObjectFromEntries,
+            ("Promise", "resolve") => StaticFn::PromiseResolve,
+            ("Promise", "reject") => StaticFn::PromiseReject,
             ("Array", "of") => StaticFn::ArrayOf,
             ("String", "fromCharCode") => StaticFn::StringFromCharCode,
             ("Number", "isInteger") => StaticFn::NumberIsInteger,

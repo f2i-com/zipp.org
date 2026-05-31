@@ -20,7 +20,7 @@
 //! later make faster.
 
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
-use crate::heap::{GenState, Heap, HeapObj, ObjMap};
+use crate::heap::{GenState, Heap, HeapObj, ObjMap, PromiseState, Reaction};
 use crate::value::Value;
 
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
@@ -75,6 +75,30 @@ enum EachMode {
     ForEach,
 }
 
+/// Whether a promise reaction is the fulfill or reject handler.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReactionKind {
+    Fulfill,
+    Reject,
+}
+
+/// How a suspended async activation is resumed: with an awaited value, or by
+/// throwing a rejection into it at the await point.
+#[derive(Clone, Copy)]
+enum Resume {
+    Value(Value),
+    Throw(Value),
+}
+
+/// A queued microtask (the whole event loop). `Reaction` runs a promise reaction
+/// — `callback` (a JS fn, a native BoundResolver, or undefined for pass-through)
+/// applied to the settled `arg`, settling `dependent`. `AsyncResume` resumes a
+/// suspended async activation.
+enum Microtask {
+    Reaction { callback: Value, arg: Value, dependent: u32, kind: ReactionKind, finally: bool },
+    AsyncResume { activation: u32, input: Resume },
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
@@ -103,6 +127,13 @@ pub struct Vm<'p> {
     /// bytecode ip, for the resume point) back to `generator_method`, which
     /// `.take()`s it to distinguish a suspension from a normal return.
     pending_yield: Option<(Value, usize)>,
+    /// Set by an `Await` op (the awaited value + the Await's ip); `drive_async`
+    /// `.take()`s it to suspend the async activation, mirroring `pending_yield`.
+    pending_await: Option<(Value, usize)>,
+    /// FIFO microtask queue — the entire event loop (no timers/IO exist). Drained
+    /// to empty by `drain_microtasks` after the main script returns; a microtask
+    /// may enqueue more, which run in the same drain.
+    microtasks: std::collections::VecDeque<Microtask>,
     /// Native JIT tier (x86-64 only, `feature = "jit"`). Compiles hot leaf
     /// integer functions to native code that shares this VM's register window;
     /// any non-int/heap/call op bails back to the interpreter at the exact ip.
@@ -166,6 +197,8 @@ impl<'p> Vm<'p> {
             start: std::time::Instant::now(),
             pending_throw: None,
             pending_yield: None,
+            pending_await: None,
+            microtasks: std::collections::VecDeque::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -372,8 +405,13 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.reserve_jit_regs();
         self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new() });
-        // Run until the top-level frame returns (frames drains back to 0).
-        self.run_loop(0)
+        // Run until the top-level frame returns (frames drains back to 0), then
+        // run the event loop: drain queued microtasks (promise reactions, async
+        // resumes) to empty. Drains even on a main throw (matches node ordering),
+        // then returns the original result.
+        let main = self.run_loop(0);
+        self.drain_microtasks();
+        main
     }
 
     /// Invoke a callable `Value` with `this` and `args`, running it to
@@ -387,6 +425,19 @@ impl<'p> Vm<'p> {
     /// calling itself) does NOT — it stays on the frame stack. The frame cap
     /// still bounds total depth.
     fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        // A native resolve/reject function settles its bound promise.
+        if callee.is_heap() {
+            if let HeapObj::BoundResolver { promise, is_reject } = self.heap.get(callee.heap_index()) {
+                let (p, isr) = (*promise, *is_reject);
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if isr {
+                    self.reject(p, arg);
+                } else {
+                    self.resolve(p, arg);
+                }
+                return Ok(Value::UNDEFINED);
+            }
+        }
         let (func_id, closure) = self.resolve_callable(callee)?;
         // Calling a generator function builds a suspended Generator, not a frame.
         if self.program.functions[func_id as usize].is_generator {
@@ -1104,6 +1155,23 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, s);
                         ip += 1;
                     }
+                    Instr::NewPromise { dst, executor } => {
+                        let exec = self.get(base, executor);
+                        let p = self.alloc_promise();
+                        let res = Value::heap(
+                            self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
+                        );
+                        let rej = Value::heap(
+                            self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true }),
+                        );
+                        // A throwing executor rejects the promise.
+                        if self.call_value(exec, Value::UNDEFINED, &[res, rej]).is_err() {
+                            let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                            self.reject(p, reason);
+                        }
+                        self.set(base, dst, Value::heap(p));
+                        ip += 1;
+                    }
                     Instr::CallSpread { dst, callee, args } => {
                         let callee_v = self.get(base, callee);
                         let args_v = self.get(base, args);
@@ -1224,6 +1292,23 @@ impl<'p> Vm<'p> {
                                     map.set(&k, v);
                                 }
                                 Value::heap(self.heap.alloc(HeapObj::Object(map)))
+                            }
+                            S::PromiseResolve => {
+                                // Promise.resolve(p) of an existing Promise is identity.
+                                if a0.is_heap()
+                                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Promise { .. })
+                                {
+                                    a0
+                                } else {
+                                    let p = self.alloc_promise();
+                                    self.resolve(p, a0);
+                                    Value::heap(p)
+                                }
+                            }
+                            S::PromiseReject => {
+                                let p = self.alloc_promise();
+                                self.reject(p, a0);
+                                Value::heap(p)
                             }
                         };
                         self.set(base, dst, v);
@@ -1539,6 +1624,27 @@ impl<'p> Vm<'p> {
 
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
+                        // A native resolve/reject function (from `new Promise`).
+                        if callee_v.is_heap() {
+                            if let HeapObj::BoundResolver { promise, is_reject } =
+                                self.heap.get(callee_v.heap_index())
+                            {
+                                let (p, isr) = (*promise, *is_reject);
+                                let arg = if argc >= 1 {
+                                    self.get(base, arg_base)
+                                } else {
+                                    Value::UNDEFINED
+                                };
+                                if isr {
+                                    self.reject(p, arg);
+                                } else {
+                                    self.resolve(p, arg);
+                                }
+                                self.set(base, dst, Value::UNDEFINED);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         let (fid, closure) = self.resolve_callable(callee_v)?;
                         // A generator function returns a Generator object, unrun.
                         if self.program.functions[fid as usize].is_generator {
@@ -2060,6 +2166,217 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::Object(map)))
     }
 
+    // ── promises / microtasks ──
+
+    fn alloc_promise(&mut self) -> u32 {
+        self.heap.alloc(HeapObj::Promise {
+            state: PromiseState::Pending,
+            result: Value::UNDEFINED,
+            fulfill: Vec::new(),
+            reject: Vec::new(),
+            handled: false,
+        })
+    }
+
+    /// Settle a pending promise (no-op if already settled — the one-shot guard
+    /// covers double-resolve / resolve-then-reject / race losers), scheduling its
+    /// matching reactions as microtasks.
+    fn settle(&mut self, p: u32, state: PromiseState, val: Value) {
+        let reactions = match self.heap.get_mut(p) {
+            HeapObj::Promise { state: s, result, fulfill, reject, .. } => {
+                if *s != PromiseState::Pending {
+                    return;
+                }
+                *s = state;
+                *result = val;
+                match state {
+                    PromiseState::Fulfilled => std::mem::take(fulfill),
+                    PromiseState::Rejected => std::mem::take(reject),
+                    PromiseState::Pending => return,
+                }
+            }
+            _ => return,
+        };
+        let kind = if state == PromiseState::Fulfilled {
+            ReactionKind::Fulfill
+        } else {
+            ReactionKind::Reject
+        };
+        for r in reactions {
+            self.microtasks.push_back(Microtask::Reaction {
+                callback: r.callback,
+                arg: val,
+                dependent: r.dependent,
+                kind,
+                finally: r.finally,
+            });
+        }
+    }
+
+    /// JS `[[Resolve]]`: a thenable/Promise value is ADOPTED (p forwards when it
+    /// settles); a self-resolution rejects with a TypeError; else fulfill.
+    fn resolve(&mut self, p: u32, value: Value) {
+        if value.is_heap() {
+            if value.heap_index() == p {
+                let e = self.alloc_error_from_message("TypeError: Chaining cycle detected for promise");
+                self.reject(p, e);
+                return;
+            }
+            if matches!(self.heap.get(value.heap_index()), HeapObj::Promise { .. }) {
+                let inner = value.heap_index();
+                self.then_internal(inner, Value::UNDEFINED, Value::UNDEFINED, Some(p));
+                return;
+            }
+        }
+        self.settle(p, PromiseState::Fulfilled, value);
+    }
+
+    fn reject(&mut self, p: u32, reason: Value) {
+        self.settle(p, PromiseState::Rejected, reason);
+    }
+
+    /// Register reactions on `p` (creating/reusing the dependent promise `into`),
+    /// or schedule a microtask immediately if `p` is already settled. Returns the
+    /// dependent promise's heap index. The basis of `.then`/`.catch`/`.finally`
+    /// and of internal promise adoption.
+    fn then_internal(&mut self, p: u32, on_f: Value, on_r: Value, into: Option<u32>) -> u32 {
+        let dep = into.unwrap_or_else(|| self.alloc_promise());
+        let (state, result) = match self.heap.get(p) {
+            HeapObj::Promise { state, result, .. } => (*state, *result),
+            _ => return dep,
+        };
+        match state {
+            PromiseState::Pending => {
+                if let HeapObj::Promise { fulfill, reject, handled, .. } = self.heap.get_mut(p) {
+                    fulfill.push(Reaction { callback: on_f, dependent: dep, finally: false });
+                    reject.push(Reaction { callback: on_r, dependent: dep, finally: false });
+                    if !on_r.is_undefined() {
+                        *handled = true;
+                    }
+                }
+            }
+            PromiseState::Fulfilled => {
+                self.microtasks.push_back(Microtask::Reaction {
+                    callback: on_f,
+                    arg: result,
+                    dependent: dep,
+                    kind: ReactionKind::Fulfill,
+                    finally: false,
+                });
+            }
+            PromiseState::Rejected => {
+                if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
+                    *handled = true;
+                }
+                self.microtasks.push_back(Microtask::Reaction {
+                    callback: on_r,
+                    arg: result,
+                    dependent: dep,
+                    kind: ReactionKind::Reject,
+                    finally: false,
+                });
+            }
+        }
+        dep
+    }
+
+    /// `p.finally(cb)`: register a finally reaction on both settle paths (or
+    /// schedule immediately if already settled). Returns the dependent promise.
+    fn finally_internal(&mut self, p: u32, cb: Value) -> u32 {
+        let dep = self.alloc_promise();
+        let (state, result) = match self.heap.get(p) {
+            HeapObj::Promise { state, result, .. } => (*state, *result),
+            _ => return dep,
+        };
+        match state {
+            PromiseState::Pending => {
+                if let HeapObj::Promise { fulfill, reject, .. } = self.heap.get_mut(p) {
+                    fulfill.push(Reaction { callback: cb, dependent: dep, finally: true });
+                    reject.push(Reaction { callback: cb, dependent: dep, finally: true });
+                }
+            }
+            PromiseState::Fulfilled => self.microtasks.push_back(Microtask::Reaction {
+                callback: cb,
+                arg: result,
+                dependent: dep,
+                kind: ReactionKind::Fulfill,
+                finally: true,
+            }),
+            PromiseState::Rejected => self.microtasks.push_back(Microtask::Reaction {
+                callback: cb,
+                arg: result,
+                dependent: dep,
+                kind: ReactionKind::Reject,
+                finally: true,
+            }),
+        }
+        dep
+    }
+
+    /// Run one microtask. A reaction's callback may be a JS function (re-enters
+    /// the VM; a throw REJECTS the dependent, never unwinds the drain), a native
+    /// BoundResolver, or undefined (pass-through). `AsyncResume` resumes an async
+    /// activation (Stage 2).
+    fn run_microtask(&mut self, t: Microtask) {
+        match t {
+            Microtask::Reaction { callback, arg, dependent, kind, finally } => {
+                if finally {
+                    // Run cb (no args) for its side effect, then forward the
+                    // original value/reason — unless cb itself throws.
+                    if !callback.is_undefined() {
+                        if let Err(_) = self.call_value(callback, Value::UNDEFINED, &[]) {
+                            let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                            self.reject(dependent, r);
+                            return;
+                        }
+                    }
+                    match kind {
+                        ReactionKind::Fulfill => self.resolve(dependent, arg),
+                        ReactionKind::Reject => self.reject(dependent, arg),
+                    }
+                    return;
+                }
+                if callback.is_undefined() {
+                    match kind {
+                        ReactionKind::Fulfill => self.resolve(dependent, arg),
+                        ReactionKind::Reject => self.reject(dependent, arg),
+                    }
+                    return;
+                }
+                if callback.is_heap() {
+                    if let HeapObj::BoundResolver { promise, is_reject } =
+                        self.heap.get(callback.heap_index())
+                    {
+                        let (pr, isr) = (*promise, *is_reject);
+                        if isr {
+                            self.reject(pr, arg);
+                        } else {
+                            self.resolve(pr, arg);
+                        }
+                        return;
+                    }
+                }
+                match self.call_value(callback, Value::UNDEFINED, &[arg]) {
+                    Ok(ret) => self.resolve(dependent, ret),
+                    Err(_) => {
+                        let r = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                        self.reject(dependent, r);
+                    }
+                }
+            }
+            // Resumes a suspended async activation — wired in Stage 2.
+            Microtask::AsyncResume { .. } => {}
+        }
+    }
+
+    /// Drain the microtask queue to empty (FIFO; tasks enqueued during the drain
+    /// run in the same drain). The whole event loop.
+    fn drain_microtasks(&mut self) {
+        while let Some(t) = self.microtasks.pop_front() {
+            self.run_microtask(t);
+        }
+    }
+
     // ── property / index access ──
 
     fn get_index(&mut self, obj: Value, key: Value) -> Result<Value, Thrown> {
@@ -2512,7 +2829,10 @@ impl<'p> Vm<'p> {
             match self.heap.get(v.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "string",
                 // A class is callable (with `new`), so `typeof C === "function"`.
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class { .. } => "function",
+                HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Class { .. }
+                | HeapObj::BoundResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
                 _ => "object", // Array, Object
             }
@@ -2614,6 +2934,32 @@ impl<'p> Vm<'p> {
             HeapObj::Map { .. } => self.map_method(idx, name, args),
             HeapObj::Set(_) => self.set_method(idx, name, args),
             HeapObj::Generator { .. } => self.generator_method(idx, name, args),
+            HeapObj::Promise { .. } => self.promise_method(idx, name, args),
+            _ => Ok(None),
+        }
+    }
+
+    /// `Promise.prototype.then/catch/finally`. Returns a NEW dependent promise.
+    /// All handlers run as microtasks (never synchronously). `idx` is the
+    /// receiver promise's heap index.
+    fn promise_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "then" => {
+                let on_r = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let dep = self.then_internal(idx, a0, on_r, None);
+                Ok(Some(Value::heap(dep)))
+            }
+            "catch" => {
+                let dep = self.then_internal(idx, Value::UNDEFINED, a0, None);
+                Ok(Some(Value::heap(dep)))
+            }
+            "finally" => {
+                // `cb` runs (no args) on both settle paths; the original value /
+                // reason forwards (FinallyReaction handles the value pass-through).
+                let dep = self.finally_internal(idx, a0);
+                Ok(Some(Value::heap(dep)))
+            }
             _ => Ok(None),
         }
     }
@@ -4122,6 +4468,8 @@ impl<'p> Vm<'p> {
                 HeapObj::Map { .. } => "[object Map]".into(),
                 HeapObj::Set(_) => "[object Set]".into(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
+                HeapObj::Promise { .. } => "[object Promise]".into(),
+                HeapObj::BoundResolver { .. } => "function".into(),
             }
         } else {
             "undefined".into()
@@ -4221,6 +4569,16 @@ impl<'p> Vm<'p> {
                 format!("Set({}) {{ {} }}", items.len(), parts.join(", "))
             }
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
+            HeapObj::Promise { state, result, .. } => match state {
+                crate::heap::PromiseState::Pending => "Promise { <pending> }".into(),
+                crate::heap::PromiseState::Fulfilled => {
+                    format!("Promise {{ {} }}", self.inspect_nested(*result))
+                }
+                crate::heap::PromiseState::Rejected => {
+                    format!("Promise {{ <rejected> {} }}", self.inspect_nested(*result))
+                }
+            },
+            HeapObj::BoundResolver { .. } => "[Function (anonymous)]".into(),
         }
     }
 

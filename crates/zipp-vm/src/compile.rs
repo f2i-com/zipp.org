@@ -1810,6 +1810,23 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::NewObject { dst });
                         return Ok(dst);
                     }
+                    // `new Promise(executor)`.
+                    if id.name == "Promise" {
+                        let executor = match n.arguments.first().and_then(|a| a.as_expression()) {
+                            Some(e) => {
+                                let t = self.temp();
+                                let v = self.expr_into(e, t)?;
+                                if v != t {
+                                    self.emit(Instr::Move { dst: t, src: v });
+                                }
+                                t
+                            }
+                            None => return Err("new Promise requires an executor function".into()),
+                        };
+                        self.emit(Instr::NewPromise { dst, executor });
+                        self.next_reg -= 1; // reclaim executor temp
+                        return Ok(dst);
+                    }
                     // `new Map(iter?)` / `new Set(iter?)`.
                     if id.name == "Map" || id.name == "Set" {
                         let src = match n.arguments.first().and_then(|a| a.as_expression()) {
