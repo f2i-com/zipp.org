@@ -71,6 +71,8 @@ pub enum Instr {
     LooseNe { dst: Reg, a: Reg, b: Reg },
 
     Not { dst: Reg, a: Reg },
+    /// `dst = typeof a` (a JS type-name string).
+    TypeOf { dst: Reg, a: Reg },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },

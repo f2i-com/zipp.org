@@ -749,6 +749,13 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(!t));
                         ip += 1;
                     }
+                    Instr::TypeOf { dst, a } => {
+                        let va = self.get(base, a);
+                        let t = self.type_of(va);
+                        let v = self.alloc_str(t.to_string());
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
 
                     Instr::Jump { target } => {
                         let t = target as usize;
@@ -1405,6 +1412,29 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Object(map) => Ok(map.get(key).unwrap_or(Value::UNDEFINED)),
             _ => Ok(Value::UNDEFINED),
+        }
+    }
+
+    /// JS `typeof` type-name. `null` is `"object"` (a historic quirk); functions
+    /// and closures are `"function"`; arrays and objects are `"object"`.
+    fn type_of(&self, v: Value) -> &'static str {
+        if v.is_int() || v.is_double() {
+            "number"
+        } else if v.is_bool() {
+            "boolean"
+        } else if v.is_undefined() {
+            "undefined"
+        } else if v.is_null() {
+            "object"
+        } else if v.is_heap() {
+            match self.heap.get(v.heap_index()) {
+                HeapObj::Str(_) | HeapObj::Cons { .. } => "string",
+                HeapObj::Func(_) | HeapObj::Closure { .. } => "function",
+                HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
+                _ => "object", // Array, Object
+            }
+        } else {
+            "undefined"
         }
     }
 

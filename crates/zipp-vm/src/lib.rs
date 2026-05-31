@@ -853,6 +853,21 @@ mod tests {
     }
 
     #[test]
+    fn typeof_operator() {
+        // null is "object" (the historic quirk); arrays/objects "object";
+        // functions/arrows "function"; primitives their type.
+        assert_eq!(
+            run_ok("let f=()=>1; console.log(typeof 1, typeof 1.5, typeof 'a', typeof true, typeof undefined, typeof null, typeof [], typeof {}, typeof f)"),
+            vec!["number number string boolean undefined object object object function"],
+        );
+        // typeof sees through a captured (cell) variable to its value.
+        assert_eq!(
+            run_ok("let n=5; let g=()=>typeof n; console.log(g())"),
+            vec!["number"],
+        );
+    }
+
+    #[test]
     fn string_index_double_key_region() {
         // s[k] where k is a region-computed integral double (k = i*0+2) must
         // return the char, not undefined — the get_index Str arm coerces integral

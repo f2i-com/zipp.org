@@ -1188,6 +1188,11 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::Not { dst, a });
                 Ok(dst)
             }
+            Op::Typeof => {
+                let a = self.expr(&u.argument)?;
+                self.emit(Instr::TypeOf { dst, a });
+                Ok(dst)
+            }
             _ => Err("unsupported unary operator (zipp-vm v1)".into()),
         }
     }
