@@ -2132,6 +2132,16 @@ fn compile_region_mem(
                 // directly. Miss ⇒ a lean helper that re-fills the cache. r14 =
                 // IC table base, r13 = heap version-array base. IcEntry layout:
                 // obj_bits@0, vals_ptr@8, version@16, slot@20 (stride 24).
+                //
+                // SAFETY (versions[heap_idx] read is in-bounds): the read at
+                // `[r13 + heap_idx*4]` is reached ONLY after `jne miss` fails —
+                // i.e. only when obj_bits == the CACHED obj_bits. `set_ic` only
+                // ever caches a validated heap Object's bits, so a match implies
+                // obj is that same valid object ⇒ heap_idx < heap.versions.len()
+                // (== objs.len()). Likewise vals[slot]: slots are append-only so
+                // a once-valid slot stays valid, and a version match proves vals
+                // hasn't reallocated. (Verifier lenses that flagged an OOB here
+                // analysed the read in isolation, missing the identity gate.)
                 let o = (ic_site * 24) as i32;
                 let packed = ((heap.func_id as u64) << 32) | name as u64;
                 let miss = ops.new_dynamic_label();

@@ -93,6 +93,11 @@ impl Heap {
     }
 
     /// Bump object `idx`'s version (call after a key-add reallocates its `vals`).
+    ///
+    /// The counter is `u32`. A false inline-cache hit would require it to wrap
+    /// (2^32 key-adds to a SINGLE object); that is ~36 GB of keys on one object
+    /// (OOM long before), and the cache is re-filled on every miss, so it is
+    /// practically unreachable. A `u64` would remove even the theoretical edge.
     #[inline]
     pub fn bump_version(&mut self, idx: u32) {
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
