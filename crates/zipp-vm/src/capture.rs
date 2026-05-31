@@ -115,7 +115,7 @@ fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
 /// Insert every name a binding pattern introduces — recursing through object/
 /// array destructuring, defaults (`= d`), and rest elements — so a destructured
 /// local captured by a nested closure is detected and boxed.
-fn collect_pattern_names(pat: &ox::BindingPattern, out: &mut HashSet<String>) {
+pub(crate) fn collect_pattern_names(pat: &ox::BindingPattern, out: &mut HashSet<String>) {
     use ox::BindingPattern as P;
     match pat {
         P::BindingIdentifier(id) => {
@@ -422,11 +422,15 @@ fn collect_nested_free_expr(e: &ox::Expression, out: &mut HashSet<String>) {
 }
 
 fn param_names(p: &ox::FormalParameters) -> Vec<String> {
-    p.items
-        .iter()
-        .filter_map(|item| match &item.pattern {
-            ox::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
-            _ => None,
-        })
-        .collect()
+    // Every name a parameter list binds — plain identifiers, destructuring-pattern
+    // leaves, and the rest parameter — so a nested function's own params shadow
+    // outer bindings (they must NOT be reported as free / captured).
+    let mut set = HashSet::new();
+    for item in &p.items {
+        collect_pattern_names(&item.pattern, &mut set);
+    }
+    if let Some(r) = &p.rest {
+        collect_pattern_names(&r.rest.argument, &mut set);
+    }
+    set.into_iter().collect()
 }

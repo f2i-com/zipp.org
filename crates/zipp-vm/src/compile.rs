@@ -156,6 +156,7 @@ impl Compiler {
         // for each defaulted param, `if (x === undefined) x = expr`.
         if let Some(pa) = params_ast {
             fc.emit_param_defaults(pa)?;
+            fc.bind_pattern_params(pa)?;
         }
 
         // Hoist function declarations in this body so calls resolve before the
@@ -217,6 +218,7 @@ impl Compiler {
         fc.in_generator = is_generator;
         if let Some(pa) = params_ast {
             fc.emit_param_defaults(pa)?;
+            fc.bind_pattern_params(pa)?;
         }
         // Instance field initializers: `this.field = expr` (this = reg 0).
         for (fname, finit) in fields {
@@ -270,6 +272,7 @@ impl Compiler {
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.emit_param_defaults(&a.params)?;
+        fc.bind_pattern_params(&a.params)?;
         if a.expression {
             // `x => expr`: the body is a single ExpressionStatement to return.
             let mut returned = false;
@@ -937,7 +940,9 @@ impl<'a> FnCompiler<'a> {
     fn func_decl(&mut self, f: &ox::Function) -> R<()> {
         let name = f.id.as_ref().map(|i| i.name.to_string());
         let (params, rest, body) = function_parts(f)?;
-        let captured = capture::captured_locals(&with_rest(&params, &rest), body);
+        let mut names = with_rest(&params, &rest);
+        names.extend(param_pattern_leaves(&f.params));
+        let captured = capture::captured_locals(&names, body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
             name.as_deref(),
@@ -1242,7 +1247,9 @@ impl<'a> FnCompiler<'a> {
     /// `MakeFunc`/`MakeClosure` at the use site.
     fn compile_func_expr(&mut self, name: Option<String>, f: &ox::Function) -> R<(u32, bool)> {
         let (params, rest, body) = function_parts(f)?;
-        let captured = capture::captured_locals(&with_rest(&params, &rest), body);
+        let mut names = with_rest(&params, &rest);
+        names.extend(param_pattern_leaves(&f.params));
+        let captured = capture::captured_locals(&names, body);
         let enclosing = self.child_enclosing();
         let proto = self.cx.compile_function_body(
             name.as_deref(),
@@ -1265,19 +1272,11 @@ impl<'a> FnCompiler<'a> {
     /// expression-bodied arrow (`x => x + 1`) is a function whose single
     /// statement returns the expression.
     fn compile_arrow(&mut self, a: &ox::ArrowFunctionExpression) -> R<(u32, bool)> {
-        let mut params = Vec::new();
-        for item in &a.params.items {
-            match &item.pattern {
-                ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
-                ox::BindingPattern::AssignmentPattern(ap) => match &ap.left {
-                    ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
-                    _ => return Err("destructuring parameters are not in the zipp-vm subset yet".into()),
-                },
-                _ => return Err("arrow parameter patterns not in the zipp-vm subset yet".into()),
-            }
-        }
+        let params = param_slot_names(&a.params)?;
         let rest = rest_name(&a.params)?;
-        let captured = capture::captured_locals(&with_rest(&params, &rest), &a.body.statements);
+        let mut names = with_rest(&params, &rest);
+        names.extend(param_pattern_leaves(&a.params));
+        let captured = capture::captured_locals(&names, &a.body.statements);
         let enclosing = self.child_enclosing();
         let proto = self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing)?;
         let has_upvalues = !proto.upvalues.is_empty();
@@ -2333,6 +2332,25 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
+    /// Destructure any pattern parameters (`function f({a}, [b]) {…}`) at function
+    /// entry: the i-th argument sits in register i+1, so declare the pattern's
+    /// leaves and extract them from that register. Runs after emit_param_defaults.
+    fn bind_pattern_params(&mut self, params: &ox::FormalParameters) -> R<()> {
+        for (i, item) in params.items.iter().enumerate() {
+            if !matches!(
+                &item.pattern,
+                ox::BindingPattern::ObjectPattern(_) | ox::BindingPattern::ArrayPattern(_)
+            ) {
+                continue;
+            }
+            self.declare_pattern(&item.pattern)?;
+            let save = self.next_reg;
+            self.extract_pattern(&item.pattern, (i + 1) as Reg)?;
+            self.next_reg = save;
+        }
+        Ok(())
+    }
+
     /// Assign `src` to a destructuring-assignment target (existing binding or
     /// member, or a nested array/object pattern). Counterpart to `extract_pattern`
     /// for `=` targets that aren't declarations.
@@ -3187,25 +3205,49 @@ fn is_numeric_expr(e: &ox::Expression) -> bool {
 fn function_parts<'a>(
     f: &'a ox::Function,
 ) -> R<(Vec<String>, Option<String>, &'a [ox::Statement<'a>])> {
-    let mut params = Vec::new();
-    for item in &f.params.items {
-        match &item.pattern {
-            ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
-            // `x = default` — bind the name here; the default is applied at the
-            // function entry by compile_function_body's emit_param_defaults.
-            ox::BindingPattern::AssignmentPattern(ap) => match &ap.left {
-                ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
-                _ => return Err("destructuring parameters are not in the zipp-vm subset yet".into()),
-            },
-            _ => return Err("parameter patterns are not in the zipp-vm v1 subset yet".into()),
-        }
-    }
+    let params = param_slot_names(&f.params)?;
     let rest = rest_name(&f.params)?;
     let body = match &f.body {
         Some(b) => b.statements.as_slice(),
         None => &[],
     };
     Ok((params, rest, body))
+}
+
+/// One name per parameter SLOT (reg 1..). A plain identifier (or `x = default`)
+/// uses its name; a destructuring pattern (`{a}` / `[a,b]`) gets a synthetic
+/// slot name and is destructured into its leaves at function entry by
+/// `bind_pattern_params`.
+fn param_slot_names(params: &ox::FormalParameters) -> R<Vec<String>> {
+    let mut out = Vec::new();
+    for (i, item) in params.items.iter().enumerate() {
+        match &item.pattern {
+            ox::BindingPattern::BindingIdentifier(id) => out.push(id.name.to_string()),
+            ox::BindingPattern::AssignmentPattern(ap) => match &ap.left {
+                ox::BindingPattern::BindingIdentifier(id) => out.push(id.name.to_string()),
+                _ => return Err("a default on a destructuring parameter is not in the subset yet".into()),
+            },
+            ox::BindingPattern::ObjectPattern(_) | ox::BindingPattern::ArrayPattern(_) => {
+                out.push(format!("<arg{i}>"))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Leaf binding names introduced by destructuring parameters (for capture
+/// analysis — a closure may capture a destructured parameter's leaf).
+fn param_pattern_leaves(params: &ox::FormalParameters) -> Vec<String> {
+    let mut set = HashSet::new();
+    for item in &params.items {
+        if matches!(
+            &item.pattern,
+            ox::BindingPattern::ObjectPattern(_) | ox::BindingPattern::ArrayPattern(_)
+        ) {
+            capture::collect_pattern_names(&item.pattern, &mut set);
+        }
+    }
+    set.into_iter().collect()
 }
 
 /// All bindable parameter names (fixed params plus the rest name, if any) — the

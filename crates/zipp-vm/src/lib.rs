@@ -1322,6 +1322,21 @@ mod tests {
     }
 
     #[test]
+    fn destructuring_parameters() {
+        // The common .map(([k,v])=>…) over entries; arrow object-pattern param.
+        assert_eq!(run_ok("console.log(Object.entries({a:1,b:2}).map(([k,v])=>k+v).join(','))"), vec!["a1,b2"]);
+        assert_eq!(run_ok("let f=({x,y})=>x+y; console.log(f({x:3,y:4}))"), vec!["7"]);
+        // Function with mixed array + object pattern params.
+        assert_eq!(run_ok("function f([a,b],{c}){return a+b+c} console.log(f([1,2],{c:3}))"), vec!["6"]);
+        // Defaults and rest inside a pattern parameter.
+        assert_eq!(run_ok("let f=({a,b=10})=>a+b; console.log(f({a:1}), f({a:1,b:2}))"), vec!["11 3"]);
+        assert_eq!(run_ok("let f=([a,...rest])=>a+':'+rest.join(','); console.log(f([1,2,3,4]))"), vec!["1:2,3,4"]);
+        // forEach with a pattern param; pattern param captured by a closure.
+        assert_eq!(run_ok("let r=[]; [[1,2],[3,4]].forEach(([a,b])=>r.push(a+b)); console.log(r.join(','))"), vec!["3,7"]);
+        assert_eq!(run_ok("let fns=[[1,2],[3,4]].map(([a,b])=>()=>a+b); console.log(fns[0](),fns[1]())"), vec!["3 7"]);
+    }
+
+    #[test]
     fn rest_parameters() {
         // Pure rest, rest after fixed params, empty rest.
         assert_eq!(run_ok("function f(...a){return a.length} console.log(f(1,2,3))"), vec!["3"]);
