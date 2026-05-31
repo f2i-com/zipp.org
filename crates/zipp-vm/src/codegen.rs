@@ -1602,6 +1602,15 @@ fn plan_field_promotion(proto: &FuncProto, start: u32, end: u32) -> Option<Field
                 return None;
             }
         }
+        // EVERY load of the promoted object must feed a heap op only — if `g` is
+        // also loaded into a register that is NOT a heap-op receiver, that ref
+        // could escape (be stored, or used numerically), so the object isn't
+        // provably confined to the rewritten accesses. Decline (→ inline cache).
+        if let Instr::LoadGlobal { dst, idx } = *instr {
+            if idx == g && !obj_ref_regs.contains(&dst) {
+                return None;
+            }
+        }
         if matches!(instr, Instr::GetProp { .. } | Instr::SetProp { .. }) {
             continue;
         }
