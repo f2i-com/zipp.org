@@ -79,6 +79,9 @@ pub struct HeapHelperAddrs {
     /// Helper for a dense-array element read `a[i]` (`GetIndex`); returns the
     /// element bits, `undefined` for out-of-range, or the deopt sentinel.
     pub get_index: usize,
+    /// Helper for a dense-array element write `a[i] = v` (`SetIndex`); returns 0
+    /// on success (storing/growing) or the deopt sentinel.
+    pub set_index: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -348,6 +351,7 @@ impl Jit {
             versions_base: heap_helpers.versions_base,
             ic_base: heap_helpers.ic_base,
             get_index: heap_helpers.get_index,
+            set_index: heap_helpers.set_index,
             ic_base_idx,
         };
         match compile_region(proto, start, end, globals_base_helper, helpers) {
@@ -1025,9 +1029,10 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             // mem path). A `Print`/`Call`/etc. anywhere still rejects the region.
             | Instr::GetProp { .. }
             | Instr::SetProp { .. }
-            // Dense-array element read `a[i]` — handled by the MEMORY path via a
-            // win64 helper (the int/regalloc paths decline → mem path).
+            // Dense-array element read/write `a[i]` / `a[i]=v` — handled by the
+            // MEMORY path via win64 helpers (the int/regalloc paths decline).
             | Instr::GetIndex { .. }
+            | Instr::SetIndex { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
             Instr::LoadConst { idx, .. } => {
@@ -1057,6 +1062,8 @@ struct HeapHelpers {
     ic_base: usize,
     /// Helper for a dense-array `GetIndex` (`a[i]`).
     get_index: usize,
+    /// Helper for a dense-array `SetIndex` (`a[i] = v`).
+    set_index: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -1262,10 +1269,10 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
     // type (from defs) and first-occurrence (def vs use). Operand type
     // requirements are validated in a second loop once types are known.
     for instr in &code[s..=e] {
-        // A dense-array element read can't be register-allocated (its result is a
-        // boxed Value from a helper, not a known-type scalar) — decline so the
-        // region takes the memory path that can emit the helper call.
-        if matches!(instr, Instr::GetIndex { .. }) {
+        // A dense-array element access can't be register-allocated (its operands/
+        // result are boxed Values handled by a helper, not known-type scalars) —
+        // decline so the region takes the memory path that emits the helper call.
+        if matches!(instr, Instr::GetIndex { .. } | Instr::SetIndex { .. }) {
             return None;
         }
         let (def, dty): (Option<u16>, VTy) = match *instr {
@@ -1570,6 +1577,8 @@ fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => vec![cond],
         Instr::GetProp { obj, .. } => vec![obj],
         Instr::SetProp { obj, val, .. } => vec![obj, val],
+        Instr::GetIndex { obj, key, .. } => vec![obj, key],
+        Instr::SetIndex { obj, key, val } => vec![obj, key, val],
         Instr::Return { src } => vec![src],
         _ => vec![],
     }
@@ -2677,6 +2686,24 @@ fn compile_region_mem(
                     ; cmp rax, r10
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::SetIndex { obj, key, val } => {
+                // Dense-array element write `a[i] = v` via a win64 helper, which
+                // stores in place or grows (matching the interpreter). Returns 0
+                // (ok) or the deopt sentinel (non-array / negative / fractional /
+                // non-numeric key → interpreter applies the no-op fallback).
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(obj)]          // array bits
+                    ; mov r8, [rbx + dreg(key)]           // index bits
+                    ; mov r9, [rbx + dreg(val)]           // value bits
+                    ; mov rax, QWORD heap.set_index as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }

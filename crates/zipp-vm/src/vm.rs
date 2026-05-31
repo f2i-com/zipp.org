@@ -781,6 +781,7 @@ impl<'p> Vm<'p> {
                                         versions_base: jit_heap_versions_base as usize,
                                         ic_base: jit_ic_base as usize,
                                         get_index: jit_get_index as usize,
+                                        set_index: jit_set_index as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
@@ -1344,18 +1345,15 @@ impl<'p> Vm<'p> {
         let idx = obj.heap_index();
         match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
-                if key.is_int() {
-                    let i = key.as_int();
-                    if i >= 0 {
-                        let i = i as usize;
-                        if i >= items.len() {
-                            items.resize(i + 1, Value::UNDEFINED);
-                        }
-                        items[i] = val;
-                        return Ok(());
+                // Numeric key (incl. an integral double — the JIT region produces
+                // f64 indices): store, growing with `undefined` holes past the end.
+                if let Some(i) = array_index(key) {
+                    if i >= items.len() {
+                        items.resize(i + 1, Value::UNDEFINED);
                     }
+                    items[i] = val;
                 }
-                // Non-int / negative key falls back to nothing in this subset.
+                // Non-numeric / negative / fractional key: no-op in this subset.
                 Ok(())
             }
             HeapObj::Object(_) => {
@@ -2303,6 +2301,47 @@ pub(crate) extern "win64" fn jit_get_index(
             _ => Value::UNDEFINED.bits(),
         },
         _ => crate::codegen::SELF_CALL_DEOPT, // strings etc → interpreter
+    }
+}
+
+/// Win64 helper for a JIT'd dense-array element write `a[i] = v` (`SetIndex`).
+/// Stores in place when `i < len`, grows the array with `undefined` holes when
+/// `i >= len` (matching JS and the interpreter's set_index). Returns `0` on
+/// success, or `SELF_CALL_DEOPT` for a non-array receiver / negative / fractional
+/// / non-numeric key (the interpreter then applies its no-op fallback). Reads the
+/// live array fresh each call — no cached pointer, so a grow that reallocates is
+/// safe (the region pins only the register file, never array storage).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_set_index(
+    vm: *mut core::ffi::c_void,
+    arr_bits: u64,
+    key_bits: u64,
+    val_bits: u64,
+) -> u64 {
+    let arr = Value::from_bits(arr_bits);
+    let key = Value::from_bits(key_bits);
+    if !arr.is_heap() || !key.is_number() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let i = match array_index(key) {
+        Some(i) => i,
+        None => return crate::codegen::SELF_CALL_DEOPT, // negative/fractional → interpreter
+    };
+    // SAFETY: exclusive view; the running region holds no conflicting borrow and
+    // pins only the register file (not the array's Vec, which may reallocate).
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.heap.get_mut(arr.heap_index()) {
+        HeapObj::Array(items) => {
+            if i >= items.len() {
+                items.resize(i + 1, Value::UNDEFINED);
+            }
+            items[i] = Value::from_bits(val_bits);
+            0
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT, // non-array → interpreter
     }
 }
 

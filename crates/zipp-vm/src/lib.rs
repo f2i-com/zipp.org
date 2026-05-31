@@ -853,6 +853,27 @@ mod tests {
     }
 
     #[test]
+    fn array_setindex_region_transform() {
+        // In-place transform a[i] = a[i]*2 (GetIndex + SetIndex in one region).
+        // JIT-on == JIT-off == 2*(0+..+999) = 999000.
+        assert_jit_matches(
+            "let a=[]; for(let i=0;i<1000;i++) a.push(i); for(let i=0;i<a.length;i++){ a[i]=a[i]*2; } let s=0; for(let i=0;i<a.length;i++) s+=a[i]; console.log(s)",
+            &["999000"],
+        );
+    }
+
+    #[test]
+    fn array_setindex_build_and_grow() {
+        // Build loop a[i]=i*i where every write GROWS the array (the helper grows
+        // it, like the interpreter); plus a sparse write past the end with holes.
+        assert_jit_matches(
+            "let a=[]; for(let i=0;i<1000;i++){ a[i]=i*i; } let s=0; for(let i=0;i<1000;i++) s+=a[i]; console.log(a.length, s)",
+            &["1000 332833500"],
+        );
+        assert_eq!(run_ok("let a=[]; a[5]=99; console.log(a.length, a[0], a[5])"), vec!["6 undefined 99"]);
+    }
+
+    #[test]
     fn array_length_assignment_in_region() {
         // `a.length = n` truncates a dense array; in a hot loop the result must
         // agree JIT-on == JIT-off == JS. Requires SROA to NOT scalar-promote the
