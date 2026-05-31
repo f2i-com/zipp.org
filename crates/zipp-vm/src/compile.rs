@@ -289,6 +289,17 @@ struct FnCompiler<'a> {
     /// each entry collecting the ip of every `?.` nullish-bail jump in that chain.
     /// On exit the chain patches them to a "load undefined" block.
     chain_bails: Vec<Vec<u32>>,
+    /// Enclosing loop contexts (innermost last) for `break`/`continue`: each
+    /// collects the jump ips to patch to the loop's end (break) and continue
+    /// point (continue).
+    loop_ctx: Vec<LoopCtx>,
+}
+
+/// Pending `break`/`continue` jumps for one enclosing loop.
+#[derive(Default)]
+struct LoopCtx {
+    break_jumps: Vec<u32>,
+    continue_jumps: Vec<u32>,
 }
 
 impl<'a> FnCompiler<'a> {
@@ -308,6 +319,7 @@ impl<'a> FnCompiler<'a> {
             max_reg: 0,
             is_script: false,
             chain_bails: Vec::new(),
+            loop_ctx: Vec::new(),
             captured,
             cell_regs: HashSet::new(),
             upvalues: Rc::new(RefCell::new(Vec::new())),
@@ -491,6 +503,28 @@ impl<'a> FnCompiler<'a> {
             S::ForStatement(f) => self.for_stmt(f)?,
             S::ForOfStatement(f) => self.for_of_statement(f)?,
             S::ForInStatement(f) => self.for_in_statement(f)?,
+            S::BreakStatement(b) => {
+                if b.label.is_some() {
+                    return Err("labeled break is not in the zipp-vm subset yet".into());
+                }
+                let j = self.here();
+                self.emit(Instr::Jump { target: 0 });
+                match self.loop_ctx.last_mut() {
+                    Some(ctx) => ctx.break_jumps.push(j),
+                    None => return Err("`break` outside a loop is not supported".into()),
+                }
+            }
+            S::ContinueStatement(c) => {
+                if c.label.is_some() {
+                    return Err("labeled continue is not in the zipp-vm subset yet".into());
+                }
+                let j = self.here();
+                self.emit(Instr::Jump { target: 0 });
+                match self.loop_ctx.last_mut() {
+                    Some(ctx) => ctx.continue_jumps.push(j),
+                    None => return Err("`continue` outside a loop is not supported".into()),
+                }
+            }
             S::ReturnStatement(r) => {
                 if let Some(arg) = &r.argument {
                     let v = self.expr(arg)?;
@@ -700,10 +734,18 @@ impl<'a> FnCompiler<'a> {
         let cond = self.expr(&w.test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 });
+        self.loop_ctx.push(LoopCtx::default());
         self.stmt(&w.body)?;
+        let ctx = self.loop_ctx.pop().unwrap();
+        for c in ctx.continue_jumps {
+            self.patch_jump(c, top); // continue → re-test
+        }
         self.emit(Instr::Jump { target: top });
         let end = self.here();
         self.patch_jump(jf, end);
+        for b in ctx.break_jumps {
+            self.patch_jump(b, end);
+        }
         Ok(())
     }
 
@@ -731,7 +773,13 @@ impl<'a> FnCompiler<'a> {
             }
             None => None,
         };
+        self.loop_ctx.push(LoopCtx::default());
         self.stmt(&f.body)?;
+        let ctx = self.loop_ctx.pop().unwrap();
+        let cont = self.here();
+        for c in ctx.continue_jumps {
+            self.patch_jump(c, cont); // continue → run the update, then re-test
+        }
         if let Some(update) = &f.update {
             self.expr(update)?;
         }
@@ -739,6 +787,9 @@ impl<'a> FnCompiler<'a> {
         let end = self.here();
         if let Some(j) = jf {
             self.patch_jump(j, end);
+        }
+        for b in ctx.break_jumps {
+            self.patch_jump(b, end);
         }
         self.pop_scope();
         Ok(())
@@ -828,10 +879,20 @@ impl<'a> FnCompiler<'a> {
 
     fn do_while_statement(&mut self, d: &ox::DoWhileStatement) -> R<()> {
         let top = self.here();
+        self.loop_ctx.push(LoopCtx::default());
         self.stmt(&d.body)?;
+        let ctx = self.loop_ctx.pop().unwrap();
+        let cont = self.here();
+        for c in ctx.continue_jumps {
+            self.patch_jump(c, cont); // continue → re-evaluate the condition
+        }
         let cond = self.expr(&d.test)?;
         // Loop back to top while the condition is truthy.
         self.emit(Instr::JumpIfTrue { cond, target: top });
+        let end = self.here();
+        for b in ctx.break_jumps {
+            self.patch_jump(b, end);
+        }
         Ok(())
     }
 
@@ -877,11 +938,20 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::GetIndex { dst: var_reg, obj: iter_reg, key: idx_reg });
         }
 
+        self.loop_ctx.push(LoopCtx::default());
         self.stmt(&f.body)?;
+        let ctx = self.loop_ctx.pop().unwrap();
+        let cont = self.here();
+        for c in ctx.continue_jumps {
+            self.patch_jump(c, cont); // continue → increment + re-test
+        }
         self.emit(Instr::AddInt { dst: idx_reg, a: idx_reg, imm: 1 });
         self.emit(Instr::Jump { target: top });
         let end = self.here();
         self.patch_jump(jf, end);
+        for b in ctx.break_jumps {
+            self.patch_jump(b, end);
+        }
         self.pop_scope();
         Ok(())
     }
@@ -923,11 +993,20 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::GetIndex { dst: var_reg, obj: keys_reg, key: idx_reg });
         }
 
+        self.loop_ctx.push(LoopCtx::default());
         self.stmt(&f.body)?;
+        let ctx = self.loop_ctx.pop().unwrap();
+        let cont = self.here();
+        for c in ctx.continue_jumps {
+            self.patch_jump(c, cont); // continue → increment + re-test
+        }
         self.emit(Instr::AddInt { dst: idx_reg, a: idx_reg, imm: 1 });
         self.emit(Instr::Jump { target: top });
         let end = self.here();
         self.patch_jump(jf, end);
+        for b in ctx.break_jumps {
+            self.patch_jump(b, end);
+        }
         self.pop_scope();
         Ok(())
     }

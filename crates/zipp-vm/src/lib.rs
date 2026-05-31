@@ -853,6 +853,26 @@ mod tests {
     }
 
     #[test]
+    fn break_and_continue() {
+        assert_eq!(run_ok("let s=0; for(let i=0;i<10;i++){ if(i===5) break; s+=i; } console.log(s)"), vec!["10"]);
+        assert_eq!(run_ok("let s=0; for(let i=0;i<5;i++){ if(i===2) continue; s+=i; } console.log(s)"), vec!["8"]);
+        assert_eq!(run_ok("let s=0,i=0; while(i<100){ i++; if(i>5) break; s+=i; } console.log(s)"), vec!["15"]);
+        assert_eq!(run_ok("let s=0; for(const x of [1,2,3,4]){ if(x===3) break; s+=x; } console.log(s)"), vec!["3"]);
+        // do-while with both; and a nested loop where the inner break stays inner.
+        assert_eq!(run_ok("let s=0,i=0; do{ i++; if(i===3) continue; if(i>5) break; s+=i; }while(i<100); console.log(s)"), vec!["12"]);
+        assert_eq!(run_ok("let s=0; for(let i=0;i<5;i++){ for(let j=0;j<5;j++){ if(j===2) break; s+=1; } } console.log(s)"), vec!["10"]);
+    }
+
+    #[test]
+    fn break_in_hot_loop_jit() {
+        // A `break` in a JIT'd loop is a region exit; JIT-on must equal JIT-off.
+        assert_jit_matches(
+            "let c=0; for(let i=0;i<100000;i++){ if(i>=50000) break; c++; } console.log(c)",
+            &["50000"],
+        );
+    }
+
+    #[test]
     fn optional_chaining() {
         // Member chains short-circuit to undefined at the first nullish base.
         assert_eq!(run_ok("let o={a:{b:7}}; console.log(o?.a?.b, o?.x?.y, o?.a?.b?.c)"), vec!["7 undefined undefined"]);
