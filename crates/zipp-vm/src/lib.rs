@@ -1692,6 +1692,12 @@ mod tests {
         assert_eq!(run_ok("console.log('5'.padStart(3,'0'), '5'.padEnd(3,'-'), 'abc'.padStart(2))"), vec!["005 5-- abc"]);
         // replace = first occurrence; replaceAll = all.
         assert_eq!(run_ok("console.log('aXbXc'.replace('X','-'), 'aXbXc'.replaceAll('X','-'))"), vec!["a-bXc a-b-c"]);
+        // charCodeAt/charAt/at/codePointAt — O(1) byte access (no per-call clone),
+        // correct for ASCII and multi-byte; out-of-range → NaN/''/undefined.
+        assert_eq!(run_ok("let s='hello'; console.log(s.charCodeAt(0), s.charCodeAt(4), s.charCodeAt(9), s.charAt(1), s.charAt(9), s.at(-1), s.codePointAt(2))"), vec!["104 111 NaN e  o 108"]);
+        assert_eq!(run_ok("let u='héllo→'; console.log(u.charCodeAt(1), u.charAt(1), u.codePointAt(5), u.at(-1), u.length)"), vec!["233 é 8594 → 6"]);
+        // A charCodeAt scan over a built-up string (regression: was O(n²)).
+        assert_eq!(run_ok("let s=''; for(let i=0;i<500;i++) s+=(i%10); let c=0; for(let i=0;i<s.length;i++) if(s.charCodeAt(i)===55) c++; console.log(c)"), vec!["50"]);
     }
 
     #[test]

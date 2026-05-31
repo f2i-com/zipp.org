@@ -5055,38 +5055,90 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// The i-th char of a flat string by heap index, WITHOUT cloning the string —
+    /// O(1) for ASCII (i-th byte), else an O(i) scalar scan. `None` if out of range
+    /// or not a flat string. (A full-string clone here would make `charCodeAt(i)`
+    /// in a loop O(n²) in the string length — the real cost of these methods.)
+    fn heap_char_at(&self, idx: u32, i: usize) -> Option<char> {
+        match self.heap.get(idx) {
+            HeapObj::Str(js) => {
+                if js.ascii {
+                    js.bytes.as_bytes().get(i).map(|&b| b as char)
+                } else {
+                    js.bytes.chars().nth(i)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Char length of a flat string by heap index — O(1) for ASCII.
+    fn heap_char_len(&self, idx: u32) -> usize {
+        match self.heap.get(idx) {
+            HeapObj::Str(js) => {
+                if js.ascii {
+                    js.bytes.len()
+                } else {
+                    js.bytes.chars().count()
+                }
+            }
+            _ => 0,
+        }
+    }
+
     fn string_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         self.heap.flatten(idx); // materialize a rope receiver before reading it
-        let s = match self.heap.get(idx) {
-            HeapObj::Str(s) => s.bytes.clone(),
-            _ => return Ok(None),
-        };
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        // Single-char index methods: read one char directly from the heap with NO
+        // full-string clone (the clone below is O(n), so these would be O(n²) in a
+        // per-char loop — `s.charCodeAt(i)` scanning is a very common idiom).
         match name {
-            "charAt" => {
-                let i = arg0.as_f64() as i32;
-                let ch = if i >= 0 { s.chars().nth(i as usize) } else { None };
-                Ok(Some(self.alloc_str(ch.map(|c| c.to_string()).unwrap_or_default())))
-            }
             "charCodeAt" => {
                 let i = arg0.as_f64() as i32;
-                let cc = if i >= 0 { s.chars().nth(i as usize) } else { None };
-                Ok(Some(match cc {
+                let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
+                return Ok(Some(match c {
                     Some(c) => Value::int(c as i32),
                     None => Value::num(f64::NAN),
-                }))
+                }));
+            }
+            "codePointAt" => {
+                let i = arg0.as_f64() as i32;
+                let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
+                return Ok(Some(match c {
+                    Some(c) => Value::int(c as i32),
+                    None => Value::UNDEFINED,
+                }));
+            }
+            "charAt" => {
+                let i = arg0.as_f64() as i32;
+                let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
+                return Ok(Some(self.alloc_str(c.map(|c| c.to_string()).unwrap_or_default())));
             }
             "at" => {
-                // Negative index counts from the end; out of range → undefined.
-                let len = s.chars().count() as i64;
+                let len = self.heap_char_len(idx) as i64;
                 let i = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
                 let abs = if i < 0 { i + len } else { i };
-                let ch = if abs >= 0 && abs < len { s.chars().nth(abs as usize) } else { None };
-                Ok(Some(match ch {
+                let c = if abs >= 0 && abs < len { self.heap_char_at(idx, abs as usize) } else { None };
+                return Ok(Some(match c {
                     Some(c) => self.alloc_str(c.to_string()),
                     None => Value::UNDEFINED,
-                }))
+                }));
             }
+            _ => {}
+        }
+        // Other methods need an owned String (slice/replace/split/…).
+        let (s, ascii) = match self.heap.get(idx) {
+            HeapObj::Str(js) => (js.bytes.clone(), js.ascii),
+            _ => return Ok(None),
+        };
+        let char_len = |s: &str| -> usize {
+            if ascii {
+                s.len()
+            } else {
+                s.chars().count()
+            }
+        };
+        match name {
             "indexOf" => {
                 let needle = self.display(arg0);
                 // Optional fromIndex (a char position) to start searching at.
@@ -5102,16 +5154,6 @@ impl<'p> Vm<'p> {
                     .unwrap_or(-1);
                 Ok(Some(Value::int(pos)))
             }
-            "codePointAt" => {
-                // Engine strings are Unicode scalars, so the code point at index i
-                // is just the i-th char's value; out of range → undefined.
-                let i = arg0.as_f64() as i32;
-                let cp = if i >= 0 { s.chars().nth(i as usize) } else { None };
-                Ok(Some(match cp {
-                    Some(c) => Value::int(c as i32),
-                    None => Value::UNDEFINED,
-                }))
-            }
             "includes" => {
                 let needle = self.display(arg0);
                 Ok(Some(Value::bool(s.contains(&needle))))
@@ -5119,7 +5161,7 @@ impl<'p> Vm<'p> {
             "toUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
             "toLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
             "slice" | "substring" => {
-                let len = s.chars().count() as i32;
+                let len = char_len(&s) as i32;
                 let start = norm_index(if args.is_empty() { 0 } else { arg0.as_f64() as i32 }, len);
                 let end = if args.len() < 2 { len } else { norm_index(args[1].as_f64() as i32, len) };
                 let out: String = if start < end {
@@ -5153,7 +5195,7 @@ impl<'p> Vm<'p> {
             "startsWith" => Ok(Some(Value::bool(s.starts_with(&self.display(arg0))))),
             "endsWith" => Ok(Some(Value::bool(s.ends_with(&self.display(arg0))))),
             "padStart" | "padEnd" => {
-                let cur = s.chars().count();
+                let cur = char_len(&s);
                 let t = arg0.as_f64();
                 let target = if t.is_finite() && t > 0.0 { t as usize } else { 0 };
                 if cur >= target {
