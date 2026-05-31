@@ -66,6 +66,15 @@ struct Frame {
     handlers: Vec<Handler>,
 }
 
+/// Which array higher-order method `array_each` is driving (callback args are
+/// `[element, index]` for all three; only the result handling differs).
+#[derive(Clone, Copy)]
+enum EachMode {
+    Map,
+    Filter,
+    ForEach,
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     heap: Heap,
@@ -1442,6 +1451,159 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Resolve `cb` to the native entry of a COMPILED, non-capturing JIT function
+    /// for the array-builtin fast path (`map`/`filter`/`forEach`/`reduce`).
+    /// Returns `(entry, callee_reg_count, param_count)` or `None` if `cb` must go
+    /// through the interpreter `call_value` (not a plain function, a capturing
+    /// closure, JIT disabled, inside a deopted self-call continuation, or not
+    /// JIT-compilable). Compiles `cb` on first use if eligible — array builtins
+    /// call the same callback many times, so we don't wait for the call-count
+    /// threshold; an ineligible proto is blacklisted by `compile` and returns
+    /// `None` cheaply thereafter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn native_cb_entry(&mut self, cb: Value) -> Option<(*const u8, usize, usize)> {
+        // Mirror the interpreter's JIT-entry guard: respect ZIPP_NOJIT and never
+        // enter native code from a deopted self-call continuation (livelock).
+        if !self.jit_enabled || self.jit_recurse_depth != 0 || !cb.is_heap() {
+            return None;
+        }
+        let (fid, ups) = self.heap.as_callable(cb.heap_index())?;
+        // A capturing closure reads upvalue cells (heap) — outside the leaf-int JIT.
+        if !ups.is_empty() {
+            return None;
+        }
+        if self.jit.get(fid).is_none() {
+            let proto: *const crate::bytecode::FuncProto =
+                &self.program.functions[fid as usize];
+            // SAFETY: program functions are immutable during execution; the raw
+            // ptr dodges the self.jit (&mut) vs self.program (&) borrow conflict.
+            let proto_ref = unsafe { &*proto };
+            let self_val = proto_ref
+                .name_global
+                .and_then(|s| self.globals.get(s as usize).copied())
+                .unwrap_or(Value::UNDEFINED)
+                .bits();
+            self.jit.compile(fid, proto_ref, jit_self_call as usize, self_val);
+        }
+        let entry = self.jit.get(fid)?.entry();
+        let proto = &self.program.functions[fid as usize];
+        Some((entry, (proto.reg_count as usize).max(1), proto.param_count as usize))
+    }
+
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    fn native_cb_entry(&mut self, _cb: Value) -> Option<(*const u8, usize, usize)> {
+        None
+    }
+
+    /// Invoke a compiled callback natively over the reused window at `win`
+    /// (`regs[win..win+callee_regs]`), writing `this`=undefined + the first
+    /// `param_count` args. On a native deopt (bail), re-runs the element through
+    /// the interpreter `call_value` — which nests its frame ABOVE this window
+    /// (base = `regs.len()`) and pops back, leaving the window intact for the
+    /// next element. This is the fast path that skips the per-element frame push
+    /// + `run_loop` re-entry + callee re-resolution that `call_value` incurs.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn invoke_cb_windowed(
+        &mut self,
+        entry: *const u8,
+        win: usize,
+        param_count: usize,
+        cb: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        self.regs[win] = Value::UNDEFINED; // reg 0 = this
+        let n = args.len().min(param_count);
+        for i in 0..n {
+            self.regs[win + 1 + i] = args[i];
+        }
+        let regs_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+        let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
+        // SAFETY: `entry` is a valid compiled win64 fn (regs, bail_out, vm)->bits
+        // (from JitFn::entry); the window has callee_regs ≥ param_count+1 valid
+        // slots; `vm_ptr` is valid for the call. A self-recursive callee routes
+        // through `jit_self_call` which is capacity-pinned (no regs realloc).
+        let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+            unsafe { core::mem::transmute(entry) };
+        let mut bail: u32 = crate::codegen::NO_BAIL;
+        let bits = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
+        if bail == crate::codegen::NO_BAIL {
+            Ok(Value::from_bits(bits))
+        } else {
+            self.call_value(cb, Value::UNDEFINED, args)
+        }
+    }
+
+    /// One per-element callback invocation: native fast path when `native` is
+    /// set, else the interpreter `call_value`.
+    #[inline]
+    fn run_cb_elem(
+        &mut self,
+        native: Option<(*const u8, usize, usize)>,
+        win: usize,
+        cb: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if let Some((entry, _callee_regs, param_count)) = native {
+            return self.invoke_cb_windowed(entry, win, param_count, cb, args);
+        }
+        let _ = (native, win);
+        self.call_value(cb, Value::UNDEFINED, args)
+    }
+
+    /// Shared driver for `map`/`filter`/`forEach` (callback args = [element,
+    /// index]). Uses the native callback fast path when the callback is a
+    /// compiled non-capturing function: a single reused register window, a direct
+    /// native call per element. Falls back to `call_value` per element otherwise.
+    /// The window is always released (truncate) before returning — including on a
+    /// callback error — so a thrown callback never leaks register slots.
+    fn array_each(&mut self, idx: u32, cb: Value, mode: EachMode) -> Result<Option<Value>, Thrown> {
+        let snapshot = self.array_snapshot(idx);
+        let collect = matches!(mode, EachMode::Map | EachMode::Filter);
+        let mut out: Vec<Value> =
+            if collect { Vec::with_capacity(snapshot.len()) } else { Vec::new() };
+
+        let mut native = self.native_cb_entry(cb);
+        let win = self.regs.len();
+        if let Some((_, callee_regs, _)) = native {
+            if self.regs_would_overflow(win + callee_regs) {
+                native = None; // can't fit a window → interpreter path
+            } else {
+                self.regs.resize(win + callee_regs, Value::UNDEFINED);
+            }
+        }
+
+        let mut err = None;
+        for (i, v) in snapshot.iter().enumerate() {
+            let args = [*v, Value::int(i as i32)];
+            match self.run_cb_elem(native, win, cb, &args) {
+                Ok(r) => match mode {
+                    EachMode::Map => out.push(r),
+                    EachMode::Filter => {
+                        if self.truthy(r) {
+                            out.push(*v);
+                        }
+                    }
+                    EachMode::ForEach => {}
+                },
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        if native.is_some() {
+            self.regs.truncate(win); // release the reused window (success or error)
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
+        match mode {
+            EachMode::ForEach => Ok(Some(Value::UNDEFINED)),
+            _ => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out))))),
+        }
+    }
+
     fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
@@ -1505,36 +1667,9 @@ impl<'p> Vm<'p> {
                 };
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(slice)))))
             }
-            "map" => {
-                let cb = arg0;
-                let snapshot = self.array_snapshot(idx);
-                let mut out = Vec::with_capacity(snapshot.len());
-                for (i, v) in snapshot.iter().enumerate() {
-                    let r = self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
-                    out.push(r);
-                }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
-            }
-            "filter" => {
-                let cb = arg0;
-                let snapshot = self.array_snapshot(idx);
-                let mut out = Vec::new();
-                for (i, v) in snapshot.iter().enumerate() {
-                    let r = self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
-                    if self.truthy(r) {
-                        out.push(*v);
-                    }
-                }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
-            }
-            "forEach" => {
-                let cb = arg0;
-                let snapshot = self.array_snapshot(idx);
-                for (i, v) in snapshot.iter().enumerate() {
-                    self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
-                }
-                Ok(Some(Value::UNDEFINED))
-            }
+            "map" => self.array_each(idx, arg0, EachMode::Map),
+            "filter" => self.array_each(idx, arg0, EachMode::Filter),
+            "forEach" => self.array_each(idx, arg0, EachMode::ForEach),
             "reduce" => {
                 let cb = arg0;
                 let snapshot = self.array_snapshot(idx);
@@ -1547,8 +1682,33 @@ impl<'p> Vm<'p> {
                         None => return Err(Thrown("TypeError: Reduce of empty array with no initial value".into())),
                     }
                 };
+                // Native callback fast path over a single reused window (the
+                // accumulator + element + index are the callback args).
+                let mut native = self.native_cb_entry(cb);
+                let win = self.regs.len();
+                if let Some((_, callee_regs, _)) = native {
+                    if self.regs_would_overflow(win + callee_regs) {
+                        native = None;
+                    } else {
+                        self.regs.resize(win + callee_regs, Value::UNDEFINED);
+                    }
+                }
+                let mut err = None;
                 for (i, v) in iter {
-                    acc = self.call_value(cb, Value::UNDEFINED, &[acc, *v, Value::int(i as i32)])?;
+                    let cbargs = [acc, *v, Value::int(i as i32)];
+                    match self.run_cb_elem(native, win, cb, &cbargs) {
+                        Ok(r) => acc = r,
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if native.is_some() {
+                    self.regs.truncate(win);
+                }
+                if let Some(e) = err {
+                    return Err(e);
                 }
                 Ok(Some(acc))
             }
