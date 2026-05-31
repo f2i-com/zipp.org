@@ -398,6 +398,12 @@ impl<'p> Vm<'p> {
         for i in 0..n {
             self.regs[new_base + 1 + i] = args[i];
         }
+        // Rest parameter: gather any args beyond the fixed params into an array.
+        if let Some(rreg) = proto.rest_reg {
+            let extra: Vec<Value> = args.get(callee_params..).unwrap_or(&[]).to_vec();
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            self.regs[new_base + rreg as usize] = arr;
+        }
 
         let stop_depth = self.frames.len();
         self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new() });
@@ -1426,6 +1432,15 @@ impl<'p> Vm<'p> {
         for i in 0..n {
             let v = self.regs[caller_base + arg_base as usize + i];
             self.regs[new_base + 1 + i] = v;
+        }
+        // Rest parameter: collect args beyond the fixed params into a fresh array.
+        if let Some(rreg) = self.program.functions[func_id as usize].rest_reg {
+            let extra: Vec<Value> = ((arg_base as usize + callee_params)
+                ..(arg_base as usize + argc as usize))
+                .map(|i| self.regs[caller_base + i])
+                .collect();
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            self.regs[new_base + rreg as usize] = arr;
         }
 
         let last = self.frames.len() - 1;

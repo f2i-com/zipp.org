@@ -100,6 +100,7 @@ impl Compiler {
             None,
             &[],
             None,
+            None,
             &prog.body,
             true,
             HashSet::new(),
@@ -115,13 +116,14 @@ impl Compiler {
         &mut self,
         name: Option<&str>,
         params: &[String],
+        rest: Option<&str>,
         params_ast: Option<&ox::FormalParameters>,
         body: &[ox::Statement],
         is_script: bool,
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
-        let mut fc = FnCompiler::new(self, params, captured, enclosing);
+        let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.is_script = is_script;
 
         // Apply default parameter values (`function f(x = expr)`) before the body:
@@ -159,6 +161,7 @@ impl Compiler {
             code: fc.code,
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
+            rest_reg: fc.rest_reg,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
@@ -170,11 +173,12 @@ impl Compiler {
     fn compile_arrow_body(
         &mut self,
         params: &[String],
+        rest: Option<&str>,
         a: &ox::ArrowFunctionExpression,
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
-        let mut fc = FnCompiler::new(self, params, captured, enclosing);
+        let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.emit_param_defaults(&a.params)?;
         if a.expression {
             // `x => expr`: the body is a single ExpressionStatement to return.
@@ -210,6 +214,7 @@ impl Compiler {
             code: fc.code,
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
+            rest_reg: fc.rest_reg,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -251,6 +256,7 @@ fn placeholder(name: &str) -> FuncProto {
         code: Vec::new(),
         reg_count: 0,
         param_count: 0,
+        rest_reg: None,
         constants: Vec::new(),
         string_constants: Vec::new(),
         name_global: None,
@@ -269,6 +275,8 @@ struct FnCompiler<'a> {
     /// Next free register / high-water mark.
     next_reg: Reg,
     max_reg: Reg,
+    /// Register holding the rest-parameter array, if this function has one.
+    rest_reg: Option<Reg>,
     /// True for the top-level script body: declarations (functions AND
     /// let/const/var) bind to globals rather than registers, so only genuinely
     /// nested functions ever capture.
@@ -317,6 +325,7 @@ impl<'a> FnCompiler<'a> {
     fn new(
         cx: &'a mut Compiler,
         params: &[String],
+        rest: Option<&str>,
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> FnCompiler<'a> {
@@ -328,6 +337,7 @@ impl<'a> FnCompiler<'a> {
             scopes: vec![Vec::new()],
             next_reg: 0,
             max_reg: 0,
+            rest_reg: None,
             is_script: false,
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
@@ -347,6 +357,18 @@ impl<'a> FnCompiler<'a> {
             // A captured parameter is boxed into a cell immediately so a nested
             // closure shares the live slot (mutations visible both ways).
             if fc.captured.contains(p) {
+                fc.emit(Instr::MakeCell { reg: r });
+                fc.cell_regs.insert(r);
+            }
+        }
+        // Rest parameter (`...rest`) takes the slot right after the fixed params;
+        // the VM fills it with an array of the overflow args at call setup. As
+        // with a fixed param, box it if a nested closure captures it.
+        if let Some(name) = rest {
+            let r = fc.alloc_reg();
+            fc.rest_reg = Some(r);
+            fc.scopes[0].push((name.to_string(), r));
+            if fc.captured.contains(name) {
                 fc.emit(Instr::MakeCell { reg: r });
                 fc.cell_regs.insert(r);
             }
@@ -612,12 +634,13 @@ impl<'a> FnCompiler<'a> {
 
     fn func_decl(&mut self, f: &ox::Function) -> R<()> {
         let name = f.id.as_ref().map(|i| i.name.to_string());
-        let (params, body) = function_parts(f)?;
-        let captured = capture::captured_locals(&params, body);
+        let (params, rest, body) = function_parts(f)?;
+        let captured = capture::captured_locals(&with_rest(&params, &rest), body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
             name.as_deref(),
             &params,
+            rest.as_deref(),
             Some(&f.params),
             body,
             false,
@@ -670,12 +693,13 @@ impl<'a> FnCompiler<'a> {
     /// name (if any) is not hoisted — the value is produced explicitly by a
     /// `MakeFunc`/`MakeClosure` at the use site.
     fn compile_func_expr(&mut self, name: Option<String>, f: &ox::Function) -> R<(u32, bool)> {
-        let (params, body) = function_parts(f)?;
-        let captured = capture::captured_locals(&params, body);
+        let (params, rest, body) = function_parts(f)?;
+        let captured = capture::captured_locals(&with_rest(&params, &rest), body);
         let enclosing = self.child_enclosing();
         let proto = self.cx.compile_function_body(
             name.as_deref(),
             &params,
+            rest.as_deref(),
             Some(&f.params),
             body,
             false,
@@ -703,9 +727,10 @@ impl<'a> FnCompiler<'a> {
                 _ => return Err("arrow parameter patterns not in the zipp-vm subset yet".into()),
             }
         }
-        let captured = capture::captured_locals(&params, &a.body.statements);
+        let rest = rest_name(&a.params)?;
+        let captured = capture::captured_locals(&with_rest(&params, &rest), &a.body.statements);
         let enclosing = self.child_enclosing();
-        let proto = self.cx.compile_arrow_body(&params, a, captured, enclosing)?;
+        let proto = self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing)?;
         let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);
@@ -2092,8 +2117,11 @@ fn is_numeric_expr(e: &ox::Expression) -> bool {
     }
 }
 
-/// Extract (param names, body statements) from an oxc function.
-fn function_parts<'a>(f: &'a ox::Function) -> R<(Vec<String>, &'a [ox::Statement<'a>])> {
+/// Extract (fixed param names, optional rest-param name, body statements) from
+/// an oxc function.
+fn function_parts<'a>(
+    f: &'a ox::Function,
+) -> R<(Vec<String>, Option<String>, &'a [ox::Statement<'a>])> {
     let mut params = Vec::new();
     for item in &f.params.items {
         match &item.pattern {
@@ -2107,12 +2135,32 @@ fn function_parts<'a>(f: &'a ox::Function) -> R<(Vec<String>, &'a [ox::Statement
             _ => return Err("parameter patterns are not in the zipp-vm v1 subset yet".into()),
         }
     }
-    if f.params.rest.is_some() {
-        return Err("rest parameters are not in the zipp-vm v1 subset yet".into());
-    }
+    let rest = rest_name(&f.params)?;
     let body = match &f.body {
         Some(b) => b.statements.as_slice(),
         None => &[],
     };
-    Ok((params, body))
+    Ok((params, rest, body))
+}
+
+/// All bindable parameter names (fixed params plus the rest name, if any) — the
+/// set capture analysis must consider locals of this function.
+fn with_rest(params: &[String], rest: &Option<String>) -> Vec<String> {
+    let mut v = params.to_vec();
+    if let Some(r) = rest {
+        v.push(r.clone());
+    }
+    v
+}
+
+/// The rest-parameter name (`function f(...args)` → `Some("args")`), or `None`.
+/// Only a plain identifier rest target is supported (no `...{a,b}`).
+fn rest_name(params: &ox::FormalParameters) -> R<Option<String>> {
+    match &params.rest {
+        None => Ok(None),
+        Some(r) => match &r.rest.argument {
+            ox::BindingPattern::BindingIdentifier(id) => Ok(Some(id.name.to_string())),
+            _ => Err("rest-parameter destructuring is not in the zipp-vm subset yet".into()),
+        },
+    }
 }

@@ -195,6 +195,10 @@ pub struct FuncProto {
     pub code: Vec<Instr>,
     pub reg_count: u16,
     pub param_count: u16,
+    /// Register receiving the rest parameter array (`function f(a, ...rest)`),
+    /// or `None`. The VM gathers args beyond `param_count` into a fresh array
+    /// and stores it here at call setup. Always `param_count + 1` when present.
+    pub rest_reg: Option<u16>,
     pub constants: Vec<Value>,
     /// Heap-string constants referenced by `LoadConst` need their text; this
     /// parallels `constants` for the string case (resolved at load time).

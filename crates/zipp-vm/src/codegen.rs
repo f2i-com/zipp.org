@@ -453,6 +453,11 @@ fn can_compile(proto: &FuncProto, self_slot: Option<u16>) -> bool {
     if proto.code.is_empty() {
         return false;
     }
+    // A rest parameter's array is materialized by the interpreter's call setup,
+    // not by emitted code; the native entry would skip it. Stay interpreted.
+    if proto.rest_reg.is_some() {
+        return false;
+    }
     let code = &proto.code;
     for (ip, instr) in code.iter().enumerate() {
         match instr {

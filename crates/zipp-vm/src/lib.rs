@@ -1006,6 +1006,22 @@ mod tests {
     }
 
     #[test]
+    fn rest_parameters() {
+        // Pure rest, rest after fixed params, empty rest.
+        assert_eq!(run_ok("function f(...a){return a.length} console.log(f(1,2,3))"), vec!["3"]);
+        assert_eq!(run_ok("function f(a,...b){return a+':'+b.join(',')} console.log(f(1,2,3,4))"), vec!["1:2,3,4"]);
+        assert_eq!(run_ok("function f(a,...b){return b.length} console.log(f(1))"), vec!["0"]);
+        // Arrow rest.
+        assert_eq!(run_ok("let g=(...xs)=>xs.reduce((a,b)=>a+b,0); console.log(g(1,2,3,4))"), vec!["10"]);
+        // Rest fed by spread (the two halves compose).
+        assert_eq!(run_ok("function f(...a){return a.join(',')} console.log(f(...[1,2,3],4))"), vec!["1,2,3,4"]);
+        // Rest array captured by an inner closure (boxed into a cell).
+        assert_eq!(run_ok("function f(...a){return ()=>a.length} console.log(f(1,2,3)())"), vec!["3"]);
+        // Rest method keeps `this`.
+        assert_eq!(run_ok("let o={n:5,f(...xs){return this.n+xs.length}}; console.log(o.f(1,2))"), vec!["7"]);
+    }
+
+    #[test]
     fn array_methods_more() {
         assert_eq!(run_ok("let a=[1,2,3]; a.reverse(); console.log(a.join(','))"), vec!["3,2,1"]);
         assert_eq!(run_ok("console.log([1,2].concat([3,4],5,[6]).join(','))"), vec!["1,2,3,4,5,6"]);
