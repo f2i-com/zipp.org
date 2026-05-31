@@ -716,8 +716,12 @@ impl<'p> Vm<'p> {
                                     t as u32,
                                     ip as u32,
                                     jit_globals_base as usize,
-                                    jit_get_prop as usize,
-                                    jit_set_prop as usize,
+                                    crate::codegen::HeapHelperAddrs {
+                                        get_prop_miss: jit_get_prop_miss as usize,
+                                        set_prop_miss: jit_set_prop_miss as usize,
+                                        versions_base: jit_heap_versions_base as usize,
+                                        ic_base: jit_ic_base as usize,
+                                    },
                                 );
                                 if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                     ip = resume;
@@ -1238,8 +1242,12 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Object(_) => {
                 let k = self.display(key);
+                let mut added = false;
                 if let HeapObj::Object(map) = self.heap.get_mut(idx) {
-                    map.set(&k, val);
+                    added = map.set(&k, val);
+                }
+                if added {
+                    self.heap.bump_version(idx);
                 }
                 Ok(())
             }
@@ -1284,8 +1292,12 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
         let idx = obj.heap_index();
+        let mut added = false;
         if let HeapObj::Object(map) = self.heap.get_mut(idx) {
-            map.set(key, val);
+            added = map.set(key, val);
+        }
+        if added {
+            self.heap.bump_version(idx); // invalidate any JIT inline cache (vals realloc)
         }
         Ok(())
     }
@@ -1874,81 +1886,115 @@ pub(crate) extern "win64" fn jit_self_call(
     }
 }
 
-/// Win64 helper for a JIT'd `GetProp`: `obj.<string_constants[name_idx]>`.
-/// `obj_bits` is the receiver Value; `name_idx` indexes the COMPILING function's
-/// (`func_id`) string_constants (the key text lives there).
-///
-/// FAST PATH ONLY: returns the property Value bits when `obj` is a plain heap
-/// Object (a missing key → `undefined`, matching the interpreter). For anything
-/// else (array/string/`.length`, null/undefined → throw) it returns
-/// `SELF_CALL_DEOPT`, and the native code bails to the interpreter AT THIS ip so
-/// the interpreter re-executes the op through the full (correct) path. No key
-/// clone and no `pending_throw` — the read borrows `vm` immutably only.
-///
-/// # Safety
-/// `vm` is a valid `*mut Vm` (treated as `&Vm`); `func_id`/`name_idx` are valid.
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_get_prop(
-    vm: *mut core::ffi::c_void,
-    obj_bits: u64,
-    func_id: u32,
-    name_idx: u32,
-) -> u64 {
-    let obj = Value::from_bits(obj_bits);
-    if !obj.is_heap() {
-        return crate::codegen::SELF_CALL_DEOPT;
-    }
-    // SAFETY: read-only view; the caller (a region) holds no conflicting borrow.
-    let vm = unsafe { &*(vm as *const Vm) };
-    match vm.heap.get(obj.heap_index()) {
-        HeapObj::Object(map) => {
-            // `program` is a `&'p Program` (Copy) independent of `vm`'s borrow.
-            let key = &vm.program.functions[func_id as usize].string_constants[name_idx as usize];
-            map.get(key).unwrap_or(Value::UNDEFINED).bits()
-        }
-        _ => crate::codegen::SELF_CALL_DEOPT, // arrays/strings/.length → interpreter
-    }
-}
-
-/// Win64 helper for a JIT'd `SetProp`: `obj.<key> = val`. Returns `0` on success
-/// (plain Object receiver) or `SELF_CALL_DEOPT` to bail to the interpreter AT
-/// THIS ip (non-object receiver → the interpreter throws the TypeError).
-/// `packed_ids = (func_id << 32) | name_idx` (win64 passes only 4 register args).
+/// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `GetProp`. The native
+/// fast path (identity + version check, direct `vals[slot]` read) only calls this
+/// when its cache misses. Looks up `obj.<key>`, and on the fast-path-eligible case
+/// (a plain Object that HAS the key) fills inline-cache slot `site` with
+/// `(obj_bits, vals.as_ptr(), version, slot)` so subsequent accesses are call-free.
+/// Returns the property bits, or `SELF_CALL_DEOPT` (non-Object → interpreter
+/// re-executes at this ip; arrays/strings/`.length`/null/undefined handled there).
+/// A missing key on an Object returns `undefined` WITHOUT caching (rare).
+/// `packed = (func_id << 32) | name_idx`.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_set_prop(
+pub(crate) extern "win64" fn jit_get_prop_miss(
     vm: *mut core::ffi::c_void,
     obj_bits: u64,
-    val_bits: u64,
-    packed_ids: u64,
+    site_idx: u32,
+    packed: u64,
 ) -> u64 {
     let obj = Value::from_bits(obj_bits);
     if !obj.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let func_id = (packed_ids >> 32) as u32;
-    let name_idx = packed_ids as u32;
-    // SAFETY: exclusive view for the set; the region holds no conflicting borrow.
+    // SAFETY: exclusive view (updates the IC table); the running region holds no
+    // conflicting borrow (the IC table and the region live in different fields).
     let vm = unsafe { &mut *(vm as *mut Vm) };
-    // Copy the `&'p Program` reference out FIRST so the key borrow does not
-    // conflict with the mutable heap borrow below.
-    let prog = vm.program;
+    let func_id = (packed >> 32) as u32;
+    let name_idx = packed as u32;
     let idx = obj.heap_index();
-    match vm.heap.get_mut(idx) {
-        HeapObj::Object(map) => {
-            let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
-            map.set(key, Value::from_bits(val_bits));
-            0
-        }
-        // A heap non-Object (Array/String/…) silently no-ops, EXACTLY matching the
-        // interpreter's set_prop (which only mutates `HeapObj::Object`). Returning
-        // 0 (success) here — rather than DEOPT — avoids needless region eviction
-        // for array-property writes. (null/undefined was already DEOPT'd above so
-        // the interpreter throws the TypeError.)
-        _ => 0,
+    let prog = vm.program; // &'p Program, independent of `vm`'s borrow
+    let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
+    let (val, vals_ptr, slot) = match vm.heap.get(idx) {
+        HeapObj::Object(map) => match map.keys.iter().position(|k| k == key) {
+            Some(s) => (map.vals[s], map.vals.as_ptr() as u64, s as u32),
+            None => return Value::UNDEFINED.bits(), // missing key: undefined, don't cache
+        },
+        _ => return crate::codegen::SELF_CALL_DEOPT, // array/string/etc → interpreter
+    };
+    let version = vm.heap.version_of(idx);
+    vm.jit.set_ic(site_idx, obj_bits, vals_ptr, version, slot);
+    val.bits()
+}
+
+/// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `SetProp`. Performs
+/// `obj.<key> = val`, then (for a plain Object) fills inline-cache slot `site` so
+/// later writes are call-free. Returns `0` (success — incl. a heap non-Object,
+/// which no-ops, matching the interpreter) or `SELF_CALL_DEOPT` (null/undefined →
+/// the interpreter throws). `packed = (func_id << 32) | name_idx`; `site_idx` is
+/// the 5th argument (passed on the stack by the caller).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_set_prop_miss(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    val_bits: u64,
+    packed: u64,
+    site_idx: u32,
+) -> u64 {
+    let obj = Value::from_bits(obj_bits);
+    if !obj.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
     }
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let func_id = (packed >> 32) as u32;
+    let name_idx = packed as u32;
+    let idx = obj.heap_index();
+    let prog = vm.program;
+    let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
+    let (added, vals_ptr, slot) = match vm.heap.get_mut(idx) {
+        HeapObj::Object(map) => {
+            let added = map.set(key, Value::from_bits(val_bits));
+            // Position AFTER the set (existing key: unchanged; new key: appended).
+            let s = map.keys.iter().position(|k| k == key).unwrap() as u32;
+            (added, map.vals.as_ptr() as u64, s)
+        }
+        _ => return 0, // heap non-Object: silent no-op (matches interpreter)
+    };
+    if added {
+        vm.heap.bump_version(idx);
+    }
+    let version = vm.heap.version_of(idx);
+    vm.jit.set_ic(site_idx, obj_bits, vals_ptr, version, slot);
+    0
+}
+
+/// Win64 helper: base pointer of the heap's per-object version array, pinned by a
+/// heap-op region's prologue. Stable for the run (a region never allocates a heap
+/// object, so the array doesn't reallocate).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_heap_versions_base(vm: *mut core::ffi::c_void) -> *const u32 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    vm.heap.versions_ptr()
+}
+
+/// Win64 helper: base pointer of the JIT inline-cache table, pinned by a heap-op
+/// region's prologue. Stable for the run (the table grows only at compile time,
+/// and a `*_miss` only updates an existing slot — never grows it).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_ic_base(vm: *mut core::ffi::c_void) -> *const core::ffi::c_void {
+    let vm = unsafe { &*(vm as *const Vm) };
+    vm.jit.ic_base_ptr() as *const core::ffi::c_void
 }
 
 /// Win64 helper: the base pointer of `vm.globals`, fetched once by an OSR loop

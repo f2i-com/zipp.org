@@ -29,12 +29,18 @@ impl ObjMap {
         self.keys.iter().position(|k| k == key).map(|i| self.vals[i])
     }
 
-    pub fn set(&mut self, key: &str, val: Value) {
+    /// Set `key = val`. Returns `true` if a NEW key was appended (which may have
+    /// reallocated `vals`), `false` if an existing slot was overwritten. The JIT
+    /// inline cache uses this to bump the object's version on a key-add (an
+    /// existing key's slot never moves — keys are append-only, no delete).
+    pub fn set(&mut self, key: &str, val: Value) -> bool {
         if let Some(i) = self.keys.iter().position(|k| k == key) {
             self.vals[i] = val;
+            false
         } else {
             self.keys.push(key.to_string());
             self.vals.push(val);
+            true
         }
     }
 
@@ -65,18 +71,45 @@ pub enum HeapObj {
 #[derive(Default)]
 pub struct Heap {
     objs: Vec<HeapObj>,
+    /// Per-object version, parallel to `objs` (one `u32` per heap object). Bumped
+    /// whenever an object gains a NEW key (which may reallocate its `vals`). The
+    /// JIT inline cache reads this (by heap index) to validate a cached
+    /// `vals`-pointer: a matching version proves `vals` hasn't reallocated since
+    /// the cache was filled. Allocated in lockstep with `objs` so indices align.
+    versions: Vec<u32>,
 }
 
 impl Heap {
     pub fn new() -> Heap {
-        Heap { objs: Vec::new() }
+        Heap { objs: Vec::new(), versions: Vec::new() }
     }
 
     #[inline]
     pub fn alloc(&mut self, obj: HeapObj) -> u32 {
         let idx = self.objs.len() as u32;
         self.objs.push(obj);
+        self.versions.push(0);
         idx
+    }
+
+    /// Bump object `idx`'s version (call after a key-add reallocates its `vals`).
+    #[inline]
+    pub fn bump_version(&mut self, idx: u32) {
+        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+    }
+
+    /// Base pointer of the parallel version array (for the JIT inline cache). The
+    /// array does not reallocate during a native region run (a region never
+    /// allocates a heap object), so this stays valid for the run.
+    #[inline]
+    pub fn versions_ptr(&self) -> *const u32 {
+        self.versions.as_ptr()
+    }
+
+    /// Current version of object `idx` (for filling an inline-cache entry).
+    #[inline]
+    pub fn version_of(&self, idx: u32) -> u32 {
+        self.versions[idx as usize]
     }
 
     #[inline]
