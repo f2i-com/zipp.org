@@ -513,29 +513,32 @@ byte-identical to node):
 
 | workload | V8 | zipp | ratio |
 |---|---|---|---|
+| 2M array `map` | 22 ms | 5.8 ms | **0.26× (beats V8)** |
+| 2M array `reduce` | 20 ms | 6.0 ms | **0.30× (beats V8)** |
+| 2M array `map→filter→reduce` | 38 ms | 18 ms | **0.47× (2.1× faster)** |
+| 2M array `filter` | 17 ms | 9.9 ms | **0.59× (beats V8)** |
 | 2M `arr.push(i)` loop | 16 ms | 10 ms | **0.65× (beats V8)** |
 | 100k comparator sort | 10.3 ms | 9.8 ms | **0.95× (beats V8)** |
 | 100M integer loop | 50 ms | 53 ms | **1.06× (parity)** |
 | 2M `charCodeAt` scan loop | 0.5 ms | 2.0 ms | 4.0× (sub-ms) |
-| 2M array map→filter→reduce | 55 ms | 91 ms | 1.64× |
 | 4M object field read/write | 3.8 ms | 7.8 ms | 2.05× |
 | fib(37) recursion | 139 ms | 381 ms | 2.74× |
 | 100k string concat + scan | 5.4 ms | 15 ms | 2.80× |
 
-zipp **beats V8 on `push`-heavy loops** (builtin method calls like `push` and
-`charCodeAt` now JIT inside OSR regions via direct helper calls — no
-interpreter round-trip) and **on the comparator sort** (native-callback
-comparator + O(n log n) merge sort), and **ties on the integer loop** (native
-int64 OSR JIT). It trails on: the array pipeline (`map`/`filter`/`reduce` call
-the JIT-compiled callback once per element through a native register window —
-correct and call-free to set up, but V8 *inlines* the callback body into the
-loop; callback inlining is the remaining lever); object field access (~2×);
-deep recursion (a per-call native↔interpreter round-trip — a fully native call
-frame is future work); and string-scan loops (`s[i]===c` stays interpreted —
-the region's `===` is monomorphic-numeric, so routing it through a polymorphic
-string-aware compare is future work). **Startup is ~10× faster** (≈21 ms vs
-≈218 ms — no V8 snapshot/warmup), so end-to-end (incl. startup) zipp finishes
-every benchmark first. Run `bench/run.sh` to reproduce.
+zipp **beats V8 across the whole array `map`/`filter`/`reduce` pipeline** (2.1×
+faster end-to-end): each is compiled to a *fused native kernel* — a tight loop
+that inlines the callback body per element with no per-element call (the same
+thing V8's TurboFan does), computing in f64/SSE so it handles both small-int and
+double arrays. It also **beats V8 on `push`-heavy loops** (builtin method calls
+JIT inside OSR regions), **on the comparator sort** (native-callback comparator +
+O(n log n) merge sort), and **ties on the integer loop** (native int64 OSR JIT).
+It still trails on: object field access (~2×); deep recursion (a per-call
+native↔interpreter round-trip — a fully native call frame is future work); and
+string-scan loops (`s[i]===c` stays interpreted — the region's `===` is
+monomorphic-numeric, so routing it through a polymorphic string-aware compare is
+future work). **Startup is ~10× faster** (≈21 ms vs ≈218 ms — no V8
+snapshot/warmup), so end-to-end (incl. startup) zipp finishes every benchmark
+first. Run `bench/run.sh` to reproduce.
 
 ## License
 
