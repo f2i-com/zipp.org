@@ -4704,6 +4704,57 @@ impl<'p> Vm<'p> {
             }
         }
 
+        // Fused native filter kernel: inline the predicate over the snapshot for
+        // the leading numeric run, compacting kept elements into `out`. The
+        // predicate result must be a Bool (a comparison); a non-Bool result bails
+        // that element to the per-element tail (which evaluates JS truthiness).
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if matches!(mode, EachMode::Filter)
+            && self.jit_enabled
+            && self.jit_recurse_depth == 0
+            && cb.is_heap()
+            && snapshot.len() <= i32::MAX as usize
+        {
+            if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
+                if ups.is_empty() {
+                    let proto: *const crate::bytecode::FuncProto =
+                        &self.program.functions[fid as usize];
+                    // SAFETY: as the map branch above.
+                    let proto_ref = unsafe { &*proto };
+                    let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
+                    let reg_count = (proto_ref.reg_count as usize).max(min_window);
+                    if let Some(entry) = self.jit.filter_kernel(fid, proto_ref) {
+                        let win = self.regs.len();
+                        if !self.regs_would_overflow(win + reg_count) {
+                            self.regs.resize(win + reg_count, Value::UNDEFINED);
+                            let len = snapshot.len();
+                            let window_ptr =
+                                unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
+                            let snap_ptr = snapshot.as_ptr() as *const u64;
+                            let out_ptr = out.as_mut_ptr() as *mut u64;
+                            let mut kept: usize = 0;
+                            // SAFETY: valid win64 filter kernel; window has
+                            // reg_count slots; `out` capacity `len` ≥ kept; the
+                            // kernel is call-free so the pointers don't move.
+                            let kernel: extern "win64" fn(
+                                *mut u64,
+                                *const u64,
+                                usize,
+                                *mut u64,
+                                *mut usize,
+                            ) -> usize = unsafe { core::mem::transmute(entry) };
+                            let scanned =
+                                kernel(window_ptr, snap_ptr, len, out_ptr, &mut kept as *mut usize);
+                            // The kernel wrote `kept` elements into `out[0..kept]`.
+                            unsafe { out.set_len(kept) };
+                            self.regs.truncate(win);
+                            start = scanned;
+                        }
+                    }
+                }
+            }
+        }
+
         // Per-element path for `[start, len)` — the whole array when no kernel
         // ran, or just the tail after a kernel bail (or nothing if it completed).
         let run_tail = start < snapshot.len();

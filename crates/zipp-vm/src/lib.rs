@@ -544,6 +544,33 @@ mod tests {
     }
 
     #[test]
+    fn filter_kernel_matches_interpreter() {
+        // The fused native filter kernel: a Bool-returning predicate (comparison
+        // or `%`-comparison) selects elements; non-Bool predicates and non-number
+        // elements fall to the per-element tail (JS truthiness). Must agree with
+        // the interpreter and node across int/double, mixed, index, and empty.
+        assert_jit_matches("console.log([1,2,3,4,5,6].filter(x=>x%2===0).join(','))", &["2,4,6"]);
+        assert_jit_matches("console.log([1,2,3,4,5,6,7,8,9].filter(x=>x%3===0).join(','))", &["3,6,9"]);
+        assert_jit_matches("console.log([5,3,8,1,9,2].filter(x=>x>=5).join(','))", &["5,8,9"]);
+        assert_jit_matches("console.log([1,2,3,4,5].filter(x=>x<=2).join(','))", &["1,2"]);
+        // Loop-built (double) array.
+        assert_jit_matches(
+            "let a=[]; for(let i=0;i<100;i++) a[i]=i; console.log(a.filter(x=>x%10===0).length)",
+            &["10"],
+        );
+        // Mixed: 3.5 % 2 !== 0 (kept-out), and the run continues past it.
+        assert_jit_matches("console.log([1,2,3.5,4,6].filter(x=>x%2===0).join(','))", &["2,4,6"]);
+        // Non-number element → predicate bails to the tail ('x' % 2 !== 0).
+        assert_jit_matches("console.log([1,2,'x',4].filter(x=>x%2===0).join(','))", &["2,4"]);
+        // Non-Bool predicate result (bare value) → tail evaluates JS truthiness.
+        assert_jit_matches("console.log([0,1,2,0,3].filter(x=>x).join(','))", &["1,2,3"]);
+        // Index predicate (2-param).
+        assert_jit_matches("console.log([1,2,3,4,5,6].filter((x,i)=>i%2===0).join(','))", &["1,3,5"]);
+        // Empty.
+        assert_jit_matches("console.log([].filter(x=>x>0).length)", &["0"]);
+    }
+
+    #[test]
     fn array_sort_comparator() {
         assert_eq!(
             run_ok("let a = [3, 1, 4, 1, 5, 9, 2, 6]; a.sort((x, y) => x - y); console.log(a.join(','))"),

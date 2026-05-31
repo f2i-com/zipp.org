@@ -199,6 +199,8 @@ pub struct Jit {
     map_kernels: FxHashMap<u32, Option<JitFn>>,
     /// Compiled fused `reduce` kernels, keyed by callback `func_id` (as above).
     reduce_kernels: FxHashMap<u32, Option<JitFn>>,
+    /// Compiled fused `filter` kernels, keyed by predicate `func_id` (as above).
+    filter_kernels: FxHashMap<u32, Option<JitFn>>,
 }
 
 impl Jit {
@@ -285,6 +287,18 @@ impl Jit {
         let compiled = compile_reduce_kernel(proto);
         let entry = compiled.as_ref().map(|f| f.entry());
         self.reduce_kernels.insert(func_id, compiled);
+        entry
+    }
+
+    /// Native entry for the fused `filter` kernel of predicate `func_id`,
+    /// compiling and caching on first request. `None` if ineligible.
+    pub fn filter_kernel(&mut self, func_id: u32, proto: &FuncProto) -> Option<*const u8> {
+        if let Some(slot) = self.filter_kernels.get(&func_id) {
+            return slot.as_ref().map(|f| f.entry());
+        }
+        let compiled = compile_filter_kernel(proto);
+        let entry = compiled.as_ref().map(|f| f.entry());
+        self.filter_kernels.insert(func_id, compiled);
         entry
     }
 
@@ -1031,6 +1045,13 @@ fn can_kernel_body(proto: &FuncProto) -> bool {
                 | Instr::Sub { .. }
                 | Instr::Mul { .. }
                 | Instr::Div { .. }
+                | Instr::Mod { .. }
+                | Instr::Lt { .. }
+                | Instr::Le { .. }
+                | Instr::Gt { .. }
+                | Instr::Ge { .. }
+                | Instr::Eq { .. }
+                | Instr::Ne { .. }
                 | Instr::Return { .. }
                 | Instr::ReturnUndefined
         )
@@ -1057,6 +1078,57 @@ fn kmap_dbinop(
         DOp::Div => dynasm!(ops ; divsd xmm0, xmm1),
     }
     store_xmm(ops, dst);
+}
+
+/// f64 remainder for a kernel body (JS `%`): `a - trunc(a/b)*b` (truncated
+/// quotient, sign of the dividend — JS semantics). `% 0` and `Infinity % b`
+/// yield NaN exactly as in JS (Inf/NaN propagate through trunc/mul/sub). Uses
+/// `roundsd` (SSE4.1, universal on x86-64). A non-number operand jumps to `bail`.
+fn kmap_dmod(
+    ops: &mut dynasmrt::x64::Assembler,
+    bail: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+) {
+    load_num_xmm(ops, a, 0, bail); // xmm0 = a
+    load_num_xmm(ops, b, 1, bail); // xmm1 = b
+    dynasm!(ops
+        ; movsd xmm2, xmm0
+        ; divsd xmm2, xmm1           // a / b
+        ; roundsd xmm2, xmm2, 0b11   // truncate toward zero
+        ; mulsd xmm2, xmm1           // trunc(a/b) * b
+        ; subsd xmm0, xmm2           // a - trunc(a/b)*b
+    );
+    store_xmm(ops, dst);
+}
+
+/// f64 ordered comparison → Bool for a kernel body. Mirrors the region `dcmp`
+/// (NaN compares false for </<=/>/>=/==, true for !=). Non-number → `bail`.
+fn kmap_dcmp(
+    ops: &mut dynasmrt::x64::Assembler,
+    bail: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+    cmp: Cmp,
+) {
+    load_num_xmm(ops, a, 0, bail);
+    load_num_xmm(ops, b, 1, bail);
+    match cmp {
+        Cmp::Lt => dynasm!(ops ; ucomisd xmm1, xmm0 ; seta al),
+        Cmp::Le => dynasm!(ops ; ucomisd xmm1, xmm0 ; setae al),
+        Cmp::Gt => dynasm!(ops ; ucomisd xmm0, xmm1 ; seta al),
+        Cmp::Ge => dynasm!(ops ; ucomisd xmm0, xmm1 ; setae al),
+        Cmp::Eq => dynasm!(ops ; ucomisd xmm0, xmm1 ; sete al ; setnp cl ; and al, cl),
+        Cmp::Ne => dynasm!(ops ; ucomisd xmm0, xmm1 ; setne al ; setp cl ; or al, cl),
+    }
+    dynasm!(ops
+        ; movzx rax, al
+        ; mov r8, QWORD BOOL_TAG as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+    );
 }
 
 /// How a kernel callback body op classifies: a value op already emitted, or a
@@ -1097,6 +1169,13 @@ fn emit_kernel_arith(
         Instr::Sub { dst, a, b } => { kmap_dbinop(ops, bail, dst, a, b, DOp::Sub); Some(KBody::Plain) }
         Instr::Mul { dst, a, b } => { kmap_dbinop(ops, bail, dst, a, b, DOp::Mul); Some(KBody::Plain) }
         Instr::Div { dst, a, b } => { kmap_dbinop(ops, bail, dst, a, b, DOp::Div); Some(KBody::Plain) }
+        Instr::Mod { dst, a, b } => { kmap_dmod(ops, bail, dst, a, b); Some(KBody::Plain) }
+        Instr::Lt { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Lt); Some(KBody::Plain) }
+        Instr::Le { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Le); Some(KBody::Plain) }
+        Instr::Gt { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Gt); Some(KBody::Plain) }
+        Instr::Ge { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Ge); Some(KBody::Plain) }
+        Instr::Eq { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Eq); Some(KBody::Plain) }
+        Instr::Ne { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Ne); Some(KBody::Plain) }
         Instr::Return { src } => Some(KBody::Ret(src)),
         Instr::ReturnUndefined => Some(KBody::RetUndef),
         _ => None,
@@ -1279,6 +1358,125 @@ fn compile_reduce_kernel(proto: &FuncProto) -> Option<JitFn> {
         ; => kernel_bail
         ; mov [rdi], r15                         // write acc-so-far (unchanged this elem)
         ; mov rax, r12                           // processed = i (tail reduces [i,count))
+        ; jmp => epilogue
+        ; => epilogue
+        ; pop r15
+        ; pop r14
+        ; pop r13
+        ; pop r12
+        ; pop rdi
+        ; pop rbx
+        ; ret
+    );
+
+    let buf = ops.finalize().ok()?;
+    let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    Some(JitFn { _buf: buf, entry: entry_ptr })
+}
+
+/// Compile a fused native `filter` kernel for predicate `proto`. The predicate
+/// runs inline per element; when it returns `true` the ELEMENT is appended to a
+/// compacted output. The result MUST be a Bool (a comparison) — a non-Bool
+/// predicate result (e.g. a bare number used for truthiness) bails that element
+/// to the interpreter tail. `None` if ineligible.
+///
+/// ABI: `fn(window, snapshot, len, out, out_count: *mut usize) -> usize`. Returns
+/// the count SCANNED (`len` = complete, `< len` = bailed there); writes the
+/// count KEPT to `*out_count`. `out` capacity must be ≥ len.
+fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
+    if proto.param_count == 0 || proto.param_count > 2 || !can_kernel_body(proto) {
+        return None;
+    }
+    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let loop_top = ops.new_dynamic_label();
+    let loop_continue = ops.new_dynamic_label();
+    let loop_done = ops.new_dynamic_label();
+    let kernel_bail = ops.new_dynamic_label();
+    let epilogue = ops.new_dynamic_label();
+    let want_index = proto.param_count >= 2;
+
+    // ── prologue ── window=rbx, snapshot=r13, len=r14, out=r15, i=r12,
+    // out_idx(kept)=rdi. The 5th arg (out_count ptr) stays on the stack and is
+    // read at the exits. 6 callee-saved pushes; no calls ⇒ no shadow space.
+    // After 6 pushes the 5th win64 arg sits at [rsp + 48 + 8(ret) + 32(shadow)].
+    dynasm!(ops
+        ; push rbx
+        ; push rdi
+        ; push r12
+        ; push r13
+        ; push r14
+        ; push r15
+        ; mov rbx, rcx                          // window base
+        ; mov r13, rdx                          // snapshot ptr
+        ; mov r14, r8                           // len
+        ; mov r15, r9                           // out ptr
+        ; xor rdi, rdi                          // out_idx (kept) = 0
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; mov [rbx], rax                        // window[0] = this = undefined
+        ; xor r12, r12                          // i = 0
+        ; => loop_top
+        ; cmp r12, r14
+        ; jae => loop_done
+        ; mov rax, [r13 + r12*8]
+        ; mov [rbx + 8], rax                    // window[1] = element
+    );
+    if want_index {
+        dynasm!(ops
+            ; mov eax, r12d
+            ; mov rcx, QWORD INT_TAG as i64
+            ; or rax, rcx
+            ; mov [rbx + 16], rax               // window[2] = Int(i)
+        );
+    }
+
+    let mut returned = false;
+    for instr in &proto.code {
+        match emit_kernel_arith(&mut ops, instr, kernel_bail)? {
+            KBody::Plain => {}
+            KBody::Ret(src) => {
+                // Predicate result must be a Bool (high16 == 0x7FFA); a non-Bool
+                // (number used for truthiness, etc.) bails to the interpreter
+                // tail, which evaluates JS truthiness correctly.
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov rcx, rax
+                    ; shr rcx, 48
+                    ; cmp ecx, (INT_TAG_HI + 1) as i32   // 0x7FFA bool tag
+                    ; jne => kernel_bail
+                    ; test eax, eax                      // Bool payload: 0=false, 1=true
+                    ; jz => loop_continue                // false ⇒ drop
+                    ; mov rax, [r13 + r12*8]             // keep: out[kept++] = element
+                    ; mov [r15 + rdi*8], rax
+                    ; inc rdi
+                    ; jmp => loop_continue
+                );
+                returned = true;
+                break;
+            }
+            KBody::RetUndef => {
+                // undefined ⇒ falsy ⇒ drop the element.
+                dynasm!(ops ; jmp => loop_continue);
+                returned = true;
+                break;
+            }
+        }
+    }
+    if !returned {
+        // Falling off the end ⇒ undefined ⇒ falsy ⇒ drop (fall into the step).
+    }
+    dynasm!(ops
+        ; => loop_continue
+        ; inc r12
+        ; jmp => loop_top
+        ; => loop_done
+        ; mov rcx, [rsp + 88]                   // out_count ptr (5th arg)
+        ; mov [rcx], rdi                        // *out_count = kept
+        ; mov rax, r14                          // scanned = len (complete)
+        ; jmp => epilogue
+        ; => kernel_bail
+        ; mov rcx, [rsp + 88]
+        ; mov [rcx], rdi                        // kept so far
+        ; mov rax, r12                          // scanned = i (tail filters [i,len))
         ; jmp => epilogue
         ; => epilogue
         ; pop r15
