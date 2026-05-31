@@ -986,6 +986,12 @@ mod tests {
         assert_eq!(run_ok("let x=3.14159; console.log(x.toFixed(2))"), vec!["3.14"]);
         assert_eq!(run_ok("let n=9.5; let o={prop:7}; console.log(o.prop, n)"), vec!["7 9.5"]);
         assert_eq!(run_ok("let a=[1.5]; console.log(a[0].toFixed(1))"), vec!["1.5"]);
+        // toFixed rounds half AWAY from zero (not Rust's half-to-even), on the
+        // EXACT decimal — so float-repr near-ties round the way node does.
+        assert_eq!(run_ok("console.log((0.5).toFixed(0), (2.5).toFixed(0), (1.5).toFixed(0))"), vec!["1 3 2"]);
+        assert_eq!(run_ok("console.log((0.15).toFixed(1), (1.45).toFixed(1), (2.675).toFixed(2), (8.575).toFixed(2))"), vec!["0.1 1.4 2.67 8.57"]);
+        assert_eq!(run_ok("console.log((-0.5).toFixed(0), (-2.5).toFixed(0), (123.456).toFixed(2))"), vec!["-1 -3 123.46"]);
+        assert_eq!(run_ok("console.log((999.999).toFixed(2), (0).toFixed(2))"), vec!["1000.00 0.00"]);
     }
 
     #[test]

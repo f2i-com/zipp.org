@@ -4408,7 +4408,7 @@ impl<'p> Vm<'p> {
         match name {
             "toFixed" => {
                 let digits = args.first().map(|a| a.as_f64() as usize).unwrap_or(0).min(100);
-                Ok(Some(self.alloc_str(format!("{n:.digits$}"))))
+                Ok(Some(self.alloc_str(to_fixed(n, digits))))
             }
             "toString" => {
                 let radix = args.first().map(|a| a.as_f64() as u32).unwrap_or(10);
@@ -6298,6 +6298,61 @@ fn parse_date(s: &str) -> f64 {
     }
     // mo here is 1-based from the string; ms_from_utc wants 0-based.
     ms_from_utc(year, mo - 1, day, h, mi, sec, msec)
+}
+
+/// `Number.prototype.toFixed(f)`. JS rounds half AWAY from zero — `(0.5).toFixed(0)`
+/// is "1", `(2.5).toFixed(0)` is "3" — whereas Rust's `{:.*}` formatter rounds
+/// half-to-even. We round the EXACT decimal of the f64 (not `x*10^f`, whose
+/// product error would mis-round e.g. `0.15` whose true value is `0.14999…`):
+/// format with guard digits to expose the exact value, then round the decimal
+/// string half-up at `f` places. Huge magnitudes (≥1e21) defer to the default
+/// rendering (JS switches to exponential there too).
+fn to_fixed(n: f64, f: usize) -> String {
+    if n.is_nan() {
+        return "NaN".into();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    if n.abs() >= 1e21 {
+        return format!("{n}");
+    }
+    let neg = n.is_sign_negative();
+    // Exact decimal of |n| with 30 guard digits past `f`; the digit at index `f`
+    // (first dropped) decides the rounding, and the formatter computes it exactly.
+    let s = format!("{:.*}", f + 30, n.abs());
+    let dot = s.find('.').unwrap();
+    let int_part = &s[..dot];
+    let frac = s[dot + 1..].as_bytes();
+    let round_up = frac[f] >= b'5';
+    // Digits we keep (integer + first `f` fractional), as a mutable byte buffer.
+    let mut digits: Vec<u8> = int_part.bytes().chain(frac[..f].iter().copied()).collect();
+    if round_up {
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                digits.insert(0, b'1'); // carried past the most-significant digit
+                break;
+            }
+            i -= 1;
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    // Place the decimal point `f` digits from the right.
+    let mut out = String::from_utf8(digits).unwrap();
+    if f > 0 {
+        let point = out.len() - f;
+        out.insert(point, '.');
+    }
+    if neg {
+        out.insert(0, '-');
+    }
+    out
 }
 
 fn num_to_radix(n: f64, radix: u32) -> String {
