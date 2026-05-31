@@ -121,6 +121,100 @@ mod tests {
         );
     }
 
+    /// Run a program with the JIT forced OFF (pure interpreter), for differential
+    /// checks against the default JIT-on `run`.
+    fn run_nojit(src: &str) -> Vec<String> {
+        let allocator = Allocator::default();
+        let ret = Parser::new(&allocator, src, SourceType::default()).parse();
+        assert!(ret.errors.is_empty(), "parse error: {:?}", ret.errors);
+        let program = compile::compile_program(&ret.program).expect("compile");
+        let mut vm = vm::Vm::new(&program);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        vm.set_jit_enabled(false);
+        vm.run().expect("run");
+        vm.output
+    }
+
+    /// Assert JIT-on output == JIT-off output == `expected` for a hot loop. The
+    /// loops here run well past OSR_THRESHOLD so the region JIT (int64 path) fires.
+    fn assert_jit_matches(src: &str, expected: &[&str]) {
+        let on = run_ok(src);
+        let off = run_nojit(src);
+        let exp: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        assert_eq!(on, off, "JIT-on != JIT-off for: {src}");
+        assert_eq!(on, exp, "wrong result for: {src}");
+    }
+
+    #[test]
+    fn int_region_positive_sum() {
+        // sum 0..999 = 499500 (stays well within i32).
+        assert_jit_matches("let s=0; for(let i=0;i<1000;i++){ s+=i; } console.log(s)", &["499500"]);
+    }
+
+    #[test]
+    fn int_region_subtraction_negative() {
+        // 0 - (0+1+...+999) = -499500 (negative i64, signed flush to Int).
+        assert_jit_matches("let s=0; for(let i=0;i<1000;i++){ s-=i; } console.log(s)", &["-499500"]);
+    }
+
+    #[test]
+    fn int_region_crosses_i32() {
+        // sum 0..99999 = 4999950000 > 2^31 — value stays i64 in the loop, flushes
+        // as a DOUBLE (since >i32) and must render identically to the interpreter.
+        assert_jit_matches("let s=0; for(let i=0;i<100000;i++){ s+=i; } console.log(s)", &["4999950000"]);
+    }
+
+    #[test]
+    fn int_region_countdown_and_compare() {
+        // Decrement with an interior comparison/conditional (exercises bool homes).
+        assert_jit_matches(
+            "let i=100000; let c=0; while(i>0){ i=i-1; if(i<50000){ c=c+1; } } console.log(c)",
+            &["50000"],
+        );
+    }
+
+    #[test]
+    fn int_region_overflow_bail_powers_of_two() {
+        // Doubling: s reaches 2^53 then the per-op 2^53 guard bails to the
+        // interpreter; results stay exact (powers of two are representable in f64),
+        // so JIT-on must equal JIT-off. 2^60 = 1152921504606846976.
+        assert_jit_matches(
+            "let s=1; for(let i=0;i<60;i++){ s=s+s; } console.log(s)",
+            &["1152921504606846976"],
+        );
+    }
+
+    #[test]
+    fn int_region_negative_start_and_loop_var() {
+        // Negative live-in and accumulation across zero.
+        assert_jit_matches(
+            "let s=-1000; for(let i=0;i<2000;i++){ s=s+1; } console.log(s)",
+            &["1000"],
+        );
+    }
+
+    #[test]
+    fn int_region_strict_eq_ne() {
+        // === and !== as integer comparisons producing bool homes.
+        assert_jit_matches(
+            "let c=0; for(let i=0;i<1000;i++){ if(i===500){c=c+7;} } console.log(c)",
+            &["7"],
+        );
+        assert_jit_matches(
+            "let c=0; for(let i=0;i<1000;i++){ if(i!==0){c=c+1;} } console.log(c)",
+            &["999"],
+        );
+    }
+
+    #[test]
+    fn int_region_multi_var_and_bounds() {
+        // Several live integer vars + a mix of < and > guards; result spans i32.
+        assert_jit_matches(
+            "let a=0; let b=1000000; for(let i=0;i<500000;i++){ a=a+2; b=b-1; } console.log(a, b)",
+            &["1000000 500000"],
+        );
+    }
+
     #[test]
     fn for_loop() {
         assert_eq!(

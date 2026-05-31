@@ -107,6 +107,9 @@ pub struct Region {
     start: u32,
     end: u32,
     deopts: u32,
+    /// True if compiled by the integer path. On eviction an int region falls
+    /// back to the double path (rather than full-blacklisting the loop).
+    is_int: bool,
 }
 
 /// Per-function JIT state: call counts, compiled code, and a blacklist of
@@ -121,6 +124,9 @@ pub struct Jit {
     regions: FxHashMap<(u32, u32), Region>,
     region_counts: FxHashMap<(u32, u32), u32>,
     region_blacklist: FxHashSet<(u32, u32)>,
+    /// Loop headers where the INTEGER path was tried and deoptimised; the next
+    /// compile for the key skips int and uses the double path instead.
+    region_int_blacklist: FxHashSet<(u32, u32)>,
 }
 
 impl Jit {
@@ -205,9 +211,18 @@ impl Jit {
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
             return;
         }
+        // Prefer the integer path (i64/paddq — beats the double path on integer
+        // loops) unless it already deoptimised for this loop. Fall back to the
+        // double/memory path.
+        if !self.region_int_blacklist.contains(&key) {
+            if let Some(code) = compile_region_int(proto, start, end, globals_base_helper) {
+                self.regions.insert(key, Region { code, start, end, deopts: 0, is_int: true });
+                return;
+            }
+        }
         match compile_region(proto, start, end, globals_base_helper) {
             Some(code) => {
-                self.regions.insert(key, Region { code, start, end, deopts: 0 });
+                self.regions.insert(key, Region { code, start, end, deopts: 0, is_int: false });
             }
             None => {
                 self.region_blacklist.insert(key);
@@ -221,19 +236,28 @@ impl Jit {
     /// failing). Returns whether the region remains installed.
     pub fn note_region_resume(&mut self, func_id: u32, entry_ip: u32, resume_ip: u32) {
         let key = (func_id, entry_ip);
-        let evict = if let Some(r) = self.regions.get_mut(&key) {
+        let (evict, was_int) = if let Some(r) = self.regions.get_mut(&key) {
             if resume_ip >= r.start && resume_ip <= r.end {
                 r.deopts += 1;
-                r.deopts >= OSR_DEOPT_LIMIT
+                (r.deopts >= OSR_DEOPT_LIMIT, r.is_int)
             } else {
-                false
+                (false, false)
             }
         } else {
-            false
+            (false, false)
         };
         if evict {
             self.regions.remove(&key);
-            self.region_blacklist.insert(key);
+            if was_int {
+                // An int region that keeps bailing (e.g. a value grew past 2^53):
+                // don't blacklist the loop — let it recompile on the double path,
+                // which handles large/fractional values without bailing. Reset
+                // the back-edge counter so the next iterations re-trigger compile.
+                self.region_int_blacklist.insert(key);
+                self.region_counts.remove(&key);
+            } else {
+                self.region_blacklist.insert(key);
+            }
         }
     }
 }
@@ -1340,6 +1364,365 @@ fn compile_region_regalloc(
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
     Some(JitFn { _buf: buf, entry: entry_ptr })
+}
+
+/// `2^53` — the largest magnitude where consecutive integers are all exactly
+/// representable in f64. Above it, JS `+`/`-` round, so an exact i64 result would
+/// diverge: the int path bails to the interpreter when a result leaves
+/// `[-2^53, 2^53]`. (Too large for a `cmp r64, imm32`, so it goes via a register.)
+const TWO_POW_53: i64 = 9_007_199_254_740_992;
+
+/// Can the loop region `[start, end]` run on the INTEGER path? Stricter than
+/// `region_can_compile`: every op must be integer-valued (no Mul/Div/Mod — i64
+/// multiply needs 128-bit and div/mod are fractional), and every `LoadConst`
+/// must be an Int-tagged constant (a double constant would be misread as i64).
+fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
+    if !region_can_compile(proto, start, end) {
+        return false;
+    }
+    let (s, e) = (start as usize, end as usize);
+    for instr in &proto.code[s..=e] {
+        match *instr {
+            Instr::LoadInt { .. }
+            | Instr::Move { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::StoreGlobal { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::Return { .. }
+            | Instr::ReturnUndefined => {}
+            Instr::LoadConst { idx, .. } => {
+                // Only Int-tagged constants; a double const can't be an i64 home.
+                match proto.constants.get(idx as usize) {
+                    Some(c) if c.is_int() => {}
+                    _ => return false,
+                }
+            }
+            _ => return false, // Mul / Div / Mod / anything else
+        }
+    }
+    true
+}
+
+/// INTEGER region codegen: each numeric region value is stored as a raw i64 in
+/// the low quadword of its xmm home; arithmetic uses `paddq`/`psubq` (~1-cycle
+/// latency, vs `addsd`'s ~4), so the carried accumulator chain runs far faster
+/// than the double path — the goal being to beat V8 on integer loops.
+///
+/// Correctness (mirrors JS f64 semantics exactly): every Int Value's i32 payload
+/// is SIGN-EXTENDED to i64 on load. After every add/sub the result is checked
+/// against `[-2^53, 2^53]`; if it leaves that range (where JS would round) the
+/// region flushes all homes and bails to the interpreter at the NEXT ip — the
+/// just-overflowed value flushed via `cvtsi2sd` equals JS's rounded result, so
+/// resuming is sound. On exit each i64 home is boxed back to an Int Value (if it
+/// fits i32) or a double (else, exact since |x| ≤ 2^53). All comparisons are
+/// SIGNED. Live-ins are guarded Int-tagged at entry (bail otherwise, no flush).
+fn compile_region_int(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    globals_base_helper: usize,
+) -> Option<JitFn> {
+    if !region_is_int(proto, start, end) {
+        return None;
+    }
+    let plan = plan_region(proto, start, end)?;
+    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let (s, e) = (start as usize, end as usize);
+
+    let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
+    let mut exit_stubs: FxHashMap<u32, dynasmrt::DynamicLabel> = FxHashMap::default();
+    let flush_exit = ops.new_dynamic_label();
+    let entry_bail = ops.new_dynamic_label();
+    let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
+
+    // ── prologue ── identical to the double path (save callee-saved, fetch
+    // globals base, save xmm6..15) — only the live-in loads + body differ.
+    dynasm!(ops
+        ; push rbx
+        ; push rsi
+        ; push rdi
+        ; push r12
+        ; mov rbx, rcx
+        ; mov rsi, rdx
+        ; mov rdi, r8
+        ; sub rsp, 40
+        ; mov rcx, rdi
+        ; mov rax, QWORD globals_base_helper as i64
+        ; call rax
+        ; mov r12, rax
+        ; add rsp, 40
+        ; sub rsp, 160
+    );
+    for k in 0..10u32 {
+        let xi = 6 + k as u8;
+        dynasm!(ops ; movdqu [rsp + (k as i32) * 16], Rx(xi));
+    }
+    // Live-in globals/regs: guard Int-tagged, sign-extend payload, into the home.
+    for &(gi, x) in &plan.live_in_globs {
+        dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]);
+        emit_int_entry_load(&mut ops, x, entry_bail);
+    }
+    for &(r, x) in &plan.live_in_regs {
+        dynasm!(ops ; mov rax, [rbx + dreg(r)]);
+        emit_int_entry_load(&mut ops, x, entry_bail);
+    }
+    for &hip in &plan.hoist_ips {
+        emit_int_const(&mut ops, &plan, &proto.code[hip], proto);
+    }
+    dynasm!(ops ; jmp => lbl(start, &in_region));
+
+    // ── body ──
+    for ip in s..=e {
+        dynasm!(ops ; => lbl(ip as u32, &in_region));
+        if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
+            if plan.hoisted.contains(&dst) {
+                continue;
+            }
+        }
+        match proto.code[ip] {
+            Instr::LoadInt { .. } | Instr::LoadConst { .. } => {
+                emit_int_const(&mut ops, &plan, &proto.code[ip], proto);
+            }
+            Instr::Move { dst, src } => match home(&plan, dst) {
+                Home::Xmm(d) => {
+                    let srx = xh(&plan, src);
+                    dynasm!(ops ; movdqa Rx(d), Rx(srx));
+                }
+                Home::Gpr(d) => {
+                    let sg = gh(&plan, src);
+                    dynasm!(ops ; mov Rq(d), Rq(sg));
+                }
+            },
+            Instr::LoadGlobal { dst, idx } => {
+                let d = xh(&plan, dst);
+                let g = plan.glob_home[&idx];
+                dynasm!(ops ; movdqa Rx(d), Rx(g));
+            }
+            Instr::StoreGlobal { idx, src } => {
+                let g = plan.glob_home[&idx];
+                let srx = xh(&plan, src);
+                dynasm!(ops ; movdqa Rx(g), Rx(srx));
+            }
+            Instr::Add { dst, a, b } => emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, true),
+            Instr::Sub { dst, a, b } => emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, false),
+            Instr::AddInt { dst, a, imm } => {
+                let d = xh(&plan, dst);
+                let ax = xh(&plan, a);
+                // Materialise the (sign-extended) immediate as i64 in xmm0.
+                dynasm!(ops ; mov rax, QWORD imm as i64 ; movq xmm0, rax);
+                if d != ax {
+                    dynasm!(ops ; movdqa Rx(d), Rx(ax));
+                }
+                dynasm!(ops ; paddq Rx(d), xmm0);
+                emit_i53_guard(&mut ops, d, ip, flush_exit);
+            }
+            Instr::Neg { dst, a } => {
+                let d = xh(&plan, dst);
+                let ax = xh(&plan, a);
+                dynasm!(ops
+                    ; pxor xmm0, xmm0
+                    ; psubq xmm0, Rx(ax)
+                    ; movdqa Rx(d), xmm0
+                );
+                emit_i53_guard(&mut ops, d, ip, flush_exit);
+            }
+            Instr::Lt { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Lt),
+            Instr::Le { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Le),
+            Instr::Gt { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Gt),
+            Instr::Ge { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Ge),
+            Instr::Eq { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Eq),
+            Instr::Ne { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Ne),
+            Instr::Jump { target } => {
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                dynasm!(ops ; jmp => t);
+            }
+            Instr::JumpIfFalse { cond, target } => {
+                let c = gh(&plan, cond);
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                dynasm!(ops ; test Rq(c), Rq(c) ; jz => t);
+            }
+            Instr::JumpIfTrue { cond, target } => {
+                let c = gh(&plan, cond);
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                dynasm!(ops ; test Rq(c), Rq(c) ; jnz => t);
+            }
+            Instr::JumpIfNotLt { a, b, target } => {
+                let (ax, bx) = (xh(&plan, a), xh(&plan, b));
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                // !(a<b) ⇔ a>=b (SIGNED).
+                dynasm!(ops ; movq rax, Rx(ax) ; movq rcx, Rx(bx) ; cmp rax, rcx ; jge => t);
+            }
+            Instr::JumpIfNotLe { a, b, target } => {
+                let (ax, bx) = (xh(&plan, a), xh(&plan, b));
+                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                // !(a<=b) ⇔ a>b (SIGNED).
+                dynasm!(ops ; movq rax, Rx(ax) ; movq rcx, Rx(bx) ; cmp rax, rcx ; jg => t);
+            }
+            Instr::Return { .. } | Instr::ReturnUndefined => {
+                dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
+            }
+            _ => return None,
+        }
+    }
+
+    // ── exit stubs ──
+    for (target, label) in &exit_stubs {
+        dynasm!(ops ; => *label ; mov DWORD [rsi], *target as i32 ; jmp => flush_exit);
+    }
+
+    // ── flush_exit ── box each i64 home back to an Int/double Value and write it
+    // to the reg file / globals, restore, return. [rsi] holds the resume ip.
+    dynasm!(ops ; => flush_exit);
+    for &(r, x) in &plan.num_regs {
+        emit_int_box_from_home(&mut ops, x);
+        dynasm!(ops ; mov [rbx + dreg(r)], rax);
+    }
+    for &(r, g) in &plan.bool_regs {
+        dynasm!(ops ; mov rax, QWORD BOOL_TAG as i64 ; or rax, Rq(g) ; mov [rbx + dreg(r)], rax);
+    }
+    for &(gi, x) in &plan.globs {
+        emit_int_box_from_home(&mut ops, x);
+        dynasm!(ops ; mov [r12 + (gi as i32) * 8], rax);
+    }
+    emit_region_restore(&mut ops);
+
+    // ── entry_bail ── a live-in wasn't Int-tagged; nothing computed, so restore
+    // (NO flush) and resume at the header (interpreted).
+    dynasm!(ops ; => entry_bail ; mov DWORD [rsi], start as i32);
+    emit_region_restore(&mut ops);
+
+    let buf = ops.finalize().ok()?;
+    let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    Some(JitFn { _buf: buf, entry: entry_ptr })
+}
+
+/// Entry load for the int path: the Value bits are in `rax`. Guard Int-tagged
+/// (else `entry_bail`), SIGN-EXTEND the i32 payload to i64, store into the home.
+fn emit_int_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, entry_bail: dynasmrt::DynamicLabel) {
+    dynasm!(ops
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => entry_bail        // not Int-tagged (double/bool/null/undef/heap)
+        ; movsxd rax, eax          // sign-extend the i32 payload to i64
+        ; movq Rx(home), rax
+    );
+}
+
+/// Materialise an integer constant (`LoadInt`/`LoadConst`-Int) into its i64 home:
+/// the FULL sign-extended i64 immediate, then `movq` (NOT cvtsi2sd — we want the
+/// integer bit pattern, not its f64 form).
+fn emit_int_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, instr: &Instr, proto: &FuncProto) {
+    let (h, v) = match *instr {
+        Instr::LoadInt { dst, val } => (xh(plan, dst), val as i64),
+        Instr::LoadConst { dst, idx } => {
+            let c = proto.constants[idx as usize];
+            // region_is_int guaranteed c.is_int(); payload is the i32, sign-extend.
+            (xh(plan, dst), (c.bits() as u32 as i32) as i64)
+        }
+        _ => unreachable!("emit_int_const on non-constant"),
+    };
+    dynasm!(ops ; mov rax, QWORD v ; movq Rx(h), rax);
+}
+
+/// Guard that the i64 in xmm home `h` is within `[-2^53, 2^53]` (signed); if not,
+/// flush all homes and resume the interpreter at the NEXT ip (the overflowed
+/// value flushes via cvtsi2sd to exactly JS's rounded result, so ip+1 is sound).
+fn emit_i53_guard(ops: &mut dynasmrt::x64::Assembler, h: u8, ip: usize, flush_exit: dynasmrt::DynamicLabel) {
+    let ovf = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; movq rax, Rx(h)
+        ; mov rdx, QWORD TWO_POW_53          // +2^53 (too big for a cmp immediate)
+        ; cmp rax, rdx
+        ; jg => ovf
+        ; mov rdx, QWORD -TWO_POW_53         // -2^53
+        ; cmp rax, rdx
+        ; jl => ovf
+        ; jmp => done
+        ; => ovf
+        ; mov DWORD [rsi], (ip + 1) as i32   // resume AFTER this op (result flushed)
+        ; jmp => flush_exit
+        ; => done
+    );
+}
+
+/// `home[dst] = home[a] <±> home[b]` as i64 (paddq/psubq), with aliasing handled
+/// and a 2^53 guard. `add = true` ⇒ paddq (commutative); else psubq.
+#[allow(clippy::too_many_arguments)]
+fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, ip: usize, flush_exit: dynasmrt::DynamicLabel, dst: u16, a: u16, b: u16, add: bool) {
+    let (d, ax, bx) = (xh(plan, dst), xh(plan, a), xh(plan, b));
+    if add {
+        if d == ax {
+            dynasm!(ops ; paddq Rx(d), Rx(bx));
+        } else if d == bx {
+            dynasm!(ops ; paddq Rx(d), Rx(ax)); // commutative
+        } else {
+            dynasm!(ops ; movdqa Rx(d), Rx(ax) ; paddq Rx(d), Rx(bx));
+        }
+    } else if d == ax {
+        dynasm!(ops ; psubq Rx(d), Rx(bx));
+    } else if d == bx {
+        // dst == b (and ≠ a): use xmm0 to avoid clobbering b before reading it.
+        dynasm!(ops ; movdqa xmm0, Rx(ax) ; psubq xmm0, Rx(bx) ; movdqa Rx(d), xmm0);
+    } else {
+        dynasm!(ops ; movdqa Rx(d), Rx(ax) ; psubq Rx(d), Rx(bx));
+    }
+    emit_i53_guard(ops, d, ip, flush_exit);
+}
+
+/// `bool_home[dst] = (home[a] <cmp> home[b])` as SIGNED i64 comparison.
+fn emit_icmp(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, cmp: Cmp) {
+    let (ax, bx) = (xh(plan, a), xh(plan, b));
+    let d = gh(plan, dst);
+    dynasm!(ops ; movq rax, Rx(ax) ; movq rcx, Rx(bx) ; cmp rax, rcx);
+    match cmp {
+        Cmp::Lt => dynasm!(ops ; setl al),
+        Cmp::Le => dynasm!(ops ; setle al),
+        Cmp::Gt => dynasm!(ops ; setg al),
+        Cmp::Ge => dynasm!(ops ; setge al),
+        Cmp::Eq => dynasm!(ops ; sete al),
+        Cmp::Ne => dynasm!(ops ; setne al),
+    }
+    dynasm!(ops ; movzx Rq(d), al);
+}
+
+/// Box the i64 in xmm home `h` into a Value, leaving the bits in `rax`: Int-tag
+/// if it fits i32 (low 32 masked in), else a double via `cvtsi2sd` (exact since
+/// |x| ≤ 2^53, enforced by the per-op guard). Used by flush_exit.
+fn emit_int_box_from_home(ops: &mut dynasmrt::x64::Assembler, h: u8) {
+    let big = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; movq rax, Rx(h)
+        ; cmp rax, 0x7FFFFFFF            // > i32::MAX ?
+        ; jg => big
+        ; cmp rax, -0x80000000           // < i32::MIN ?
+        ; jl => big
+        ; mov ecx, eax                   // low 32 (zero-extended into rcx)
+        ; mov rdx, QWORD INT_TAG as i64
+        ; or rdx, rcx
+        ; mov rax, rdx                   // Int-tagged Value
+        ; jmp => done
+        ; => big
+        ; cvtsi2sd xmm0, rax             // exact: |rax| ≤ 2^53
+        ; movq rax, xmm0                 // double Value bits
+        ; => done
+    );
 }
 
 /// Restore xmm6..15 from the save area and the saved gprs, then `ret`.

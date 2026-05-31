@@ -138,6 +138,13 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Force the JIT on/off (overrides the `ZIPP_NOJIT` default). Used by the
+    /// test suite to run a program both ways and assert the outputs match.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn set_jit_enabled(&mut self, on: bool) {
+        self.jit_enabled = on;
+    }
+
     /// Would growing `self.regs` to `needed` slots exceed the pinned capacity?
     /// (Interpreter-only builds: never — there is no pinned native pointer to
     /// protect, so the Vec may grow/reallocate freely.)
