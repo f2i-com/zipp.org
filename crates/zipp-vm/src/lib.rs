@@ -749,15 +749,39 @@ mod tests {
     }
 
     #[test]
-    fn known_limitation_per_iteration_let_in_for() {
-        // KNOWN GAP vs node: a `let` loop variable captured inside a for-loop
-        // body should produce a FRESH binding per iteration (node → "0 1 2").
-        // zipp-vm v1 shares one cell across iterations (→ "3 3 3", i.e. `var`
-        // semantics). Documented here so the divergence is explicit and tracked;
-        // per-iteration loop bindings are a future refinement.
-        let out = run("function mk(){ let xs=[]; for(let i=0;i<3;i++){ xs.push(()=>i) } return xs } let f=mk(); console.log(f[0](), f[1](), f[2]())")
-            .expect("compile");
-        assert_eq!(out.output, vec!["3 3 3"]); // NOT node's "0 1 2" — see comment
+    fn per_iteration_let_bindings() {
+        // A captured `let` loop var gets a FRESH binding per iteration (node 0,1,2),
+        // while `var` shares one (3,3,3). Covers for / for-of / for-in.
+        assert_eq!(
+            run_ok("function mk(){ let xs=[]; for(let i=0;i<3;i++){ xs.push(()=>i) } return xs } let f=mk(); console.log(f.map(g=>g()).join(','))"),
+            vec!["0,1,2"]
+        );
+        assert_eq!(
+            run_ok("function mk(){ let xs=[]; for(var j=0;j<3;j++){ xs.push(()=>j) } return xs } console.log(mk().map(g=>g()).join(','))"),
+            vec!["3,3,3"]
+        );
+        // for-of: fresh binding per element.
+        assert_eq!(
+            run_ok("function mk(){ let xs=[]; for(let x of [10,20,30]){ xs.push(()=>x) } return xs } console.log(mk().map(g=>g()).join(','))"),
+            vec!["10,20,30"]
+        );
+        // for-in: fresh binding per key.
+        assert_eq!(
+            run_ok("function mk(){ let xs=[]; let o={a:1,b:2}; for(let k in o){ xs.push(()=>k) } return xs } console.log(mk().map(g=>g()).join(','))"),
+            vec!["a,b"]
+        );
+        // Mutation inside the body is visible to THAT iteration's closure.
+        assert_eq!(
+            run_ok("function mk(){ let xs=[]; for(let i=0;i<3;i++){ i+=10; xs.push(()=>i) } return xs } console.log(mk().map(g=>g()).join(','))"),
+            vec!["10"]
+        );
+        // Nested for-let captures independently.
+        assert_eq!(
+            run_ok("function mk(){ let xs=[]; for(let a=0;a<2;a++) for(let b=0;b<2;b++) xs.push(()=>a*10+b); return xs } console.log(mk().map(g=>g()).join(','))"),
+            vec!["0,1,10,11"]
+        );
+        // Non-captured loop is unaffected (fast path / hot-loop JIT preserved).
+        assert_eq!(run_ok("let s=0; for(let i=0;i<1000;i++) s+=i; console.log(s)"), vec!["499500"]);
     }
 
     // ── rope strings (cons-strings) + JsStr cached length/index + interning ──

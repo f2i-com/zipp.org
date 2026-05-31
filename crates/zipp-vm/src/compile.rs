@@ -1375,6 +1375,47 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
+    /// Look up an in-scope local's register (innermost scope first), if any.
+    fn local_reg(&self, name: &str) -> Option<Reg> {
+        for scope in self.scopes.iter().rev() {
+            for (n, r) in scope.iter().rev() {
+                if n == name {
+                    return Some(*r);
+                }
+            }
+        }
+        None
+    }
+
+    /// The registers of a declaration's simple-identifier bindings that are
+    /// cell-boxed (captured by a nested closure) — the ones needing per-iteration
+    /// freshening in a loop head.
+    fn captured_decl_regs(&self, d: &ox::VariableDeclaration) -> Vec<Reg> {
+        let mut regs = Vec::new();
+        for decl in &d.declarations {
+            if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
+                if let Some(reg) = self.local_reg(id.name.as_str()) {
+                    if self.cell_regs.contains(&reg) {
+                        regs.push(reg);
+                    }
+                }
+            }
+        }
+        regs
+    }
+
+    /// Rebind each register to a FRESH cell holding its current value (read the
+    /// old cell, re-wrap). Used for per-iteration `let` loop bindings.
+    fn emit_freshen_cells(&mut self, regs: &[Reg]) {
+        for &reg in regs {
+            let tmp = self.alloc_reg();
+            self.emit(Instr::CellGet { dst: tmp, cell: reg });
+            self.emit(Instr::Move { dst: reg, src: tmp });
+            self.emit(Instr::MakeCell { reg });
+            self.next_reg -= 1; // free tmp
+        }
+    }
+
     fn for_stmt(&mut self, f: &ox::ForStatement) -> R<()> {
         self.push_scope();
         // init
@@ -1389,6 +1430,20 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
+        // Per-iteration bindings: a `for (let i …)` loop variable captured by a
+        // closure in the body gets a FRESH binding each iteration (JS semantics:
+        // `for(let i…) fns.push(()=>i)` yields 0,1,2 not 3,3,3). Only when the var
+        // is actually boxed (captured) — otherwise the plain-register fast path
+        // (and the hot-loop JIT) is preserved. `var` is function-scoped → no
+        // freshening.
+        let fresh_regs: Vec<Reg> = match &f.init {
+            Some(ox::ForStatementInit::VariableDeclaration(d))
+                if d.kind != ox::VariableDeclarationKind::Var =>
+            {
+                self.captured_decl_regs(d)
+            }
+            _ => Vec::new(),
+        };
         let top = self.here();
         let jf = match &f.test {
             Some(t) => {
@@ -1404,8 +1459,12 @@ impl<'a> FnCompiler<'a> {
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
         for c in ctx.continue_jumps {
-            self.patch_jump(c, cont); // continue → run the update, then re-test
+            self.patch_jump(c, cont); // continue → freshen, run the update, re-test
         }
+        // End of iteration: copy each captured loop var into a fresh cell, so the
+        // body's closures (which captured the OLD cell) keep this iteration's
+        // value and the update mutates the new binding.
+        self.emit_freshen_cells(&fresh_regs);
         if let Some(update) = &f.update {
             self.expr(update)?;
         }
@@ -1708,7 +1767,10 @@ impl<'a> FnCompiler<'a> {
         if let Some(p) = pattern {
             self.extract_pattern(p, elem)?;
         } else if var_is_cell {
-            self.emit(Instr::CellSet { cell: var_reg, src: elem });
+            // Per-iteration binding: a FRESH cell each iteration so a closure in
+            // the body captures THIS element, not the last one (for-of let).
+            self.emit(Instr::Move { dst: var_reg, src: elem });
+            self.emit(Instr::MakeCell { reg: var_reg });
         }
         self.next_reg = save; // reclaim done + elem temps
 
@@ -1757,10 +1819,9 @@ impl<'a> FnCompiler<'a> {
         self.next_reg -= 1;
 
         if var_is_cell {
-            let tmp = self.temp();
-            self.emit(Instr::GetIndex { dst: tmp, obj: keys_reg, key: idx_reg });
-            self.emit(Instr::CellSet { cell: var_reg, src: tmp });
-            self.next_reg -= 1;
+            // Per-iteration binding: a FRESH cell each iteration (for-in let).
+            self.emit(Instr::GetIndex { dst: var_reg, obj: keys_reg, key: idx_reg });
+            self.emit(Instr::MakeCell { reg: var_reg });
         } else {
             self.emit(Instr::GetIndex { dst: var_reg, obj: keys_reg, key: idx_reg });
         }
