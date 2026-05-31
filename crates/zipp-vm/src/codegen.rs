@@ -1263,6 +1263,94 @@ fn instr_uses(i: &Instr) -> Vec<u16> {
     }
 }
 
+/// Plan for promoting a single stable object's fields to registers (SROA-lite,
+/// the effect of V8's escape-analysis + scalar replacement): when EVERY
+/// GetProp/SetProp in a region targets the SAME object — a global `obj_global`
+/// loaded by `LoadGlobal` and never re-stored in the region, and whose ref reg
+/// is used ONLY as the GetProp/SetProp receiver — its accessed fields can live in
+/// registers for the loop body, synced to the heap object only at region
+/// entry/exit, so the loop becomes register-only like V8.
+#[allow(dead_code)] // wired into codegen in a following step
+struct FieldPromotePlan {
+    /// The global slot holding the promoted object.
+    obj_global: u32,
+    /// Distinct accessed field name-constant indices, in first-seen order. Each
+    /// maps to a synthetic "field global" the heap ops are rewritten to use.
+    fields: Vec<u32>,
+}
+
+/// Detect whether `[start, end]` is field-promotable; see `FieldPromotePlan`.
+#[allow(dead_code)] // wired into codegen in a following step
+fn plan_field_promotion(proto: &FuncProto, start: u32, end: u32) -> Option<FieldPromotePlan> {
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    if !code[s..=e]
+        .iter()
+        .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
+    {
+        return None;
+    }
+
+    // Single-def map (for tracing an obj-ref reg to its LoadGlobal).
+    let mut reg_def: FxHashMap<u16, usize> = FxHashMap::default();
+    let mut reg_def_count: FxHashMap<u16, u32> = FxHashMap::default();
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        if let Some(d) = writes_reg(instr) {
+            reg_def.insert(d, s + off);
+            *reg_def_count.entry(d).or_insert(0) += 1;
+        }
+    }
+
+    // Every heap-op receiver must be the SAME global object, loaded once.
+    let mut obj_global: Option<u32> = None;
+    let mut obj_ref_regs: FxHashSet<u16> = FxHashSet::default();
+    let mut fields: Vec<u32> = Vec::new();
+    for instr in &code[s..=e] {
+        let (obj_reg, name) = match *instr {
+            Instr::GetProp { obj, name, .. } => (obj, name),
+            Instr::SetProp { obj, name, .. } => (obj, name),
+            _ => continue,
+        };
+        let def_ip = *reg_def.get(&obj_reg)?; // must be defined in the region
+        if reg_def_count.get(&obj_reg) != Some(&1) {
+            return None; // multiple defs → can't trace
+        }
+        let g = match code[def_ip] {
+            Instr::LoadGlobal { idx, .. } => idx,
+            _ => return None, // receiver isn't a plain global load
+        };
+        match obj_global {
+            None => obj_global = Some(g),
+            Some(prev) if prev == g => {}
+            Some(_) => return None, // two different objects at the site set
+        }
+        obj_ref_regs.insert(obj_reg);
+        if !fields.contains(&name) {
+            fields.push(name);
+        }
+    }
+    let g = obj_global?;
+
+    // The object ref must be stable (G not re-stored) and its ref reg must not
+    // escape (used only as the GetProp/SetProp receiver, nowhere else).
+    for instr in &code[s..=e] {
+        if let Instr::StoreGlobal { idx, .. } = *instr {
+            if idx == g {
+                return None;
+            }
+        }
+        if matches!(instr, Instr::GetProp { .. } | Instr::SetProp { .. }) {
+            continue;
+        }
+        for u in instr_uses(instr) {
+            if obj_ref_regs.contains(&u) {
+                return None; // ref reg used outside a heap op → object escapes
+            }
+        }
+    }
+    Some(FieldPromotePlan { obj_global: g, fields })
+}
+
 /// Register-promoting region codegen: each region value lives in a fixed xmm
 /// (numbers) or gpr (booleans) home for the whole loop. Live-in values are
 /// loaded + type-guarded ONCE at entry; the loop body is then pure register SSE
