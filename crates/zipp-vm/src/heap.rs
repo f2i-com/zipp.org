@@ -106,6 +106,19 @@ pub enum PromiseState {
     Rejected,
 }
 
+/// Which Promise combinator a `Combinator` is tracking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CombKind {
+    /// `Promise.all` — fulfil with all values, or reject on the first rejection.
+    All,
+    /// `Promise.allSettled` — fulfil with `{status, value|reason}` records.
+    AllSettled,
+    /// `Promise.race` — settle as the first input settles.
+    Race,
+    /// `Promise.any` — first fulfilment, or an AggregateError if all reject.
+    Any,
+}
+
 /// A registered reaction on a pending promise: when it settles, `callback` runs
 /// (as a microtask) and its outcome settles `dependent`. A `callback` of
 /// `undefined` is a pass-through (the value/reason forwards to `dependent`).
@@ -166,6 +179,14 @@ pub enum HeapObj {
     /// A native `resolve`/`reject` function bound to a promise — the pair handed
     /// to a `new Promise(executor)`. Calling it settles `promise`.
     BoundResolver { promise: u32, is_reject: bool },
+    /// Shared state for a Promise combinator (`all`/`allSettled`/`race`/`any`).
+    /// `results` collects per-input outcomes (sized to the input count);
+    /// `remaining` counts inputs still outstanding; `result` is the combinator's
+    /// own promise (settled when the combinator's condition is met).
+    Combinator { kind: CombKind, results: Vec<Value>, remaining: u32, result: u32 },
+    /// A native reaction that performs one combinator step when its subscribed
+    /// input settles — identifying the `combinator` and the input's `index`.
+    CombinatorResolver { combinator: u32, index: u32 },
     /// A suspended generator (`function*`). Owns a DETACHED register window (off
     /// the contiguous live `regs` Vec, so the JIT's pinned-capacity invariant
     /// holds while parked); `func`/`closure` re-create the frame on resume, and

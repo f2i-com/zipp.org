@@ -1345,6 +1345,12 @@ impl<'p> Vm<'p> {
                                 self.reject(p, a0);
                                 Value::heap(p)
                             }
+                            S::PromiseAll => self.promise_combine(crate::heap::CombKind::All, a0)?,
+                            S::PromiseAllSettled => {
+                                self.promise_combine(crate::heap::CombKind::AllSettled, a0)?
+                            }
+                            S::PromiseRace => self.promise_combine(crate::heap::CombKind::Race, a0)?,
+                            S::PromiseAny => self.promise_combine(crate::heap::CombKind::Any, a0)?,
                         };
                         self.set(base, dst, v);
                         ip += 1;
@@ -2541,6 +2547,134 @@ impl<'p> Vm<'p> {
         }
     }
 
+    // ── Promise combinators ──
+
+    /// `Promise.all/allSettled/race/any(iterable)`. Coerces each input to a
+    /// promise and subscribes a native combinator reaction; the shared
+    /// `Combinator` state settles the returned promise per the combinator's rule.
+    fn promise_combine(&mut self, kind: crate::heap::CombKind, iterable: Value) -> Result<Value, Thrown> {
+        use crate::heap::CombKind;
+        let inputs = self.iterate_to_vec(iterable)?;
+        let total = inputs.len() as u32;
+        let result = self.alloc_promise();
+        if total == 0 {
+            // Empty-iterable terminal cases (race stays pending forever).
+            match kind {
+                CombKind::All | CombKind::AllSettled => {
+                    let arr = Value::heap(self.heap.alloc(HeapObj::Array(Vec::new())));
+                    self.resolve(result, arr);
+                }
+                CombKind::Any => {
+                    let e = self.alloc_aggregate_error(Vec::new());
+                    self.reject(result, e);
+                }
+                CombKind::Race => {}
+            }
+            return Ok(Value::heap(result));
+        }
+        let comb = self.heap.alloc(HeapObj::Combinator {
+            kind,
+            results: vec![Value::UNDEFINED; total as usize],
+            remaining: total,
+            result,
+        });
+        for (i, inp) in inputs.into_iter().enumerate() {
+            let p = self.to_promise(inp);
+            let resolver = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
+                combinator: comb,
+                index: i as u32,
+            }));
+            // Both settle paths route to the resolver (it dispatches on the kind).
+            self.then_internal(p, resolver, resolver, None);
+        }
+        Ok(Value::heap(result))
+    }
+
+    /// Perform one combinator step: the input at `index` settled (`kind`) with
+    /// `value`. Updates the shared state and settles the combinator's promise
+    /// when its rule is met (the one-shot `settle` guard absorbs later inputs).
+    fn combinator_step(&mut self, comb: u32, index: u32, kind: ReactionKind, value: Value) {
+        use crate::heap::CombKind;
+        let (ckind, result) = match self.heap.get(comb) {
+            HeapObj::Combinator { kind, result, .. } => (*kind, *result),
+            _ => return,
+        };
+        match (ckind, kind) {
+            (CombKind::Race, ReactionKind::Fulfill) => self.resolve(result, value),
+            (CombKind::Race, ReactionKind::Reject) => self.reject(result, value),
+            (CombKind::All, ReactionKind::Reject) => self.reject(result, value),
+            (CombKind::Any, ReactionKind::Fulfill) => self.resolve(result, value),
+            (CombKind::All, ReactionKind::Fulfill)
+            | (CombKind::Any, ReactionKind::Reject)
+            | (CombKind::AllSettled, _) => {
+                // Record the per-input outcome and decrement the outstanding count.
+                let stored = if ckind == CombKind::AllSettled {
+                    self.make_settled_record(kind, value)
+                } else {
+                    value
+                };
+                let done = if let HeapObj::Combinator { results, remaining, .. } =
+                    self.heap.get_mut(comb)
+                {
+                    results[index as usize] = stored;
+                    *remaining -= 1;
+                    *remaining == 0
+                } else {
+                    false
+                };
+                if done {
+                    let collected = match self.heap.get(comb) {
+                        HeapObj::Combinator { results, .. } => results.clone(),
+                        _ => Vec::new(),
+                    };
+                    match ckind {
+                        CombKind::Any => {
+                            // All inputs rejected → AggregateError of the reasons.
+                            let e = self.alloc_aggregate_error(collected);
+                            self.reject(result, e);
+                        }
+                        _ => {
+                            let arr = Value::heap(self.heap.alloc(HeapObj::Array(collected)));
+                            self.resolve(result, arr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build a `Promise.allSettled` record: `{status:'fulfilled', value}` or
+    /// `{status:'rejected', reason}`.
+    fn make_settled_record(&mut self, kind: ReactionKind, value: Value) -> Value {
+        let mut map = ObjMap::new();
+        match kind {
+            ReactionKind::Fulfill => {
+                let s = self.alloc_str("fulfilled".to_string());
+                map.set("status", s);
+                map.set("value", value);
+            }
+            ReactionKind::Reject => {
+                let s = self.alloc_str("rejected".to_string());
+                map.set("status", s);
+                map.set("reason", value);
+            }
+        }
+        Value::heap(self.heap.alloc(HeapObj::Object(map)))
+    }
+
+    /// Build an `AggregateError`-like object `{name, message, errors}` for a
+    /// failed `Promise.any`.
+    fn alloc_aggregate_error(&mut self, errors: Vec<Value>) -> Value {
+        let mut map = ObjMap::new();
+        let name = self.alloc_str("AggregateError".to_string());
+        map.set("name", name);
+        let msg = self.alloc_str("All promises were rejected".to_string());
+        map.set("message", msg);
+        let errs = Value::heap(self.heap.alloc(HeapObj::Array(errors)));
+        map.set("errors", errs);
+        Value::heap(self.heap.alloc(HeapObj::Object(map)))
+    }
+
     /// Resume (or start) a suspended async activation `idx` with `input` — the
     /// awaited value (fulfill) or the reason to throw in at the await point
     /// (reject). Runs until the next `await` (re-parks the window + subscribes to
@@ -2702,6 +2836,14 @@ impl<'p> Vm<'p> {
                         } else {
                             self.resolve(pr, arg);
                         }
+                        return;
+                    }
+                    // A combinator reaction (Promise.all/allSettled/race/any).
+                    if let HeapObj::CombinatorResolver { combinator, index } =
+                        self.heap.get(callback.heap_index())
+                    {
+                        let (c, i) = (*combinator, *index);
+                        self.combinator_step(c, i, kind, arg);
                         return;
                     }
                 }
@@ -4824,6 +4966,9 @@ impl<'p> Vm<'p> {
                 HeapObj::BoundResolver { .. } => "function".into(),
                 // Internal: never user-visible (an async call yields its Promise).
                 HeapObj::AsyncState { .. } => "[object Promise]".into(),
+                HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
+                    "[object Object]".into()
+                }
             }
         } else {
             "undefined".into()
@@ -4935,6 +5080,7 @@ impl<'p> Vm<'p> {
             HeapObj::BoundResolver { .. } => "[Function (anonymous)]".into(),
             // Internal: never user-visible (an async call yields its Promise).
             HeapObj::AsyncState { .. } => "Promise { <pending> }".into(),
+            HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => "[object Object]".into(),
         }
     }
 

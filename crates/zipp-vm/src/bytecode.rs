@@ -365,6 +365,16 @@ pub enum StaticFn {
     /// `Promise.resolve(v)` / `Promise.reject(r)`.
     PromiseResolve,
     PromiseReject,
+    /// `Promise.all(iterable)` — fulfils with an array of results, or rejects with
+    /// the first rejection.
+    PromiseAll,
+    /// `Promise.allSettled(iterable)` — fulfils with `{status,value|reason}` records.
+    PromiseAllSettled,
+    /// `Promise.race(iterable)` — settles as the first input to settle.
+    PromiseRace,
+    /// `Promise.any(iterable)` — fulfils with the first fulfilment, or rejects with
+    /// an AggregateError if all reject.
+    PromiseAny,
     /// `Array.of(...items)` — a new array of the arguments.
     ArrayOf,
     /// `String.fromCharCode(...codes)` — string from UTF-16 code units.
@@ -387,6 +397,10 @@ impl StaticFn {
             ("Object", "fromEntries") => StaticFn::ObjectFromEntries,
             ("Promise", "resolve") => StaticFn::PromiseResolve,
             ("Promise", "reject") => StaticFn::PromiseReject,
+            ("Promise", "all") => StaticFn::PromiseAll,
+            ("Promise", "allSettled") => StaticFn::PromiseAllSettled,
+            ("Promise", "race") => StaticFn::PromiseRace,
+            ("Promise", "any") => StaticFn::PromiseAny,
             ("Array", "of") => StaticFn::ArrayOf,
             ("String", "fromCharCode") => StaticFn::StringFromCharCode,
             ("Number", "isInteger") => StaticFn::NumberIsInteger,

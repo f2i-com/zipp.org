@@ -1231,6 +1231,28 @@ mod tests {
     }
 
     #[test]
+    fn promise_combinators() {
+        // all: array of values (mixed plain + promise); first rejection wins; empty.
+        assert_eq!(run_ok("Promise.all([1,Promise.resolve(2),3]).then(a=>console.log(a.join(',')))"), vec!["1,2,3"]);
+        assert_eq!(run_ok("Promise.all([Promise.resolve(1),Promise.reject('x'),Promise.resolve(3)]).catch(e=>console.log('r',e))"), vec!["r x"]);
+        assert_eq!(run_ok("Promise.all([]).then(a=>console.log(a.length))"), vec!["0"]);
+        // race: first to settle (fulfil or reject).
+        assert_eq!(run_ok("Promise.race([Promise.resolve('fast'),Promise.reject('slow')]).then(v=>console.log(v))"), vec!["fast"]);
+        assert_eq!(run_ok("Promise.race([Promise.reject('boom'),Promise.resolve('ok')]).catch(e=>console.log('r',e))"), vec!["r boom"]);
+        // allSettled: status records on both paths.
+        assert_eq!(
+            run_ok("Promise.allSettled([Promise.resolve(1),Promise.reject('e')]).then(rs=>console.log(rs.map(r=>r.status+(r.status==='fulfilled'?r.value:r.reason)).join(',')))"),
+            vec!["fulfilled1,rejectede"]
+        );
+        // any: first fulfilment; all-reject → AggregateError; empty → AggregateError.
+        assert_eq!(run_ok("Promise.any([Promise.reject('a'),Promise.resolve('win')]).then(v=>console.log(v))"), vec!["win"]);
+        assert_eq!(run_ok("Promise.any([Promise.reject('e1'),Promise.reject('e2')]).catch(e=>console.log(e.name,e.errors.join(',')))"), vec!["AggregateError e1,e2"]);
+        assert_eq!(run_ok("Promise.any([]).catch(e=>console.log(e.name))"), vec!["AggregateError"]);
+        // Integrates with await + destructuring.
+        assert_eq!(run_ok("async function f(){let [a,b]=await Promise.all([Promise.resolve(10),Promise.resolve(20)]); return a+b} f().then(v=>console.log(v))"), vec!["30"]);
+    }
+
+    #[test]
     fn generators() {
         // Manual next(): values then done; return value reported once.
         assert_eq!(run_ok("function* g(){yield 1;yield 2} let it=g(); console.log(it.next().value,it.next().value,it.next().done)"), vec!["1 2 true"]);
