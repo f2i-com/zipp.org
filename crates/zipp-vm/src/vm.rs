@@ -1527,10 +1527,19 @@ impl<'p> Vm<'p> {
         let mut bail: u32 = crate::codegen::NO_BAIL;
         let bits = f(regs_ptr, &mut bail as *mut u32, vm_ptr);
         if bail == crate::codegen::NO_BAIL {
-            Ok(Value::from_bits(bits))
-        } else {
-            self.call_value(cb, Value::UNDEFINED, args)
+            return Ok(Value::from_bits(bits));
         }
+        // A deopt that left `pending_throw` set means a native self-recursive
+        // callee already THREW (e.g. a recursive callback hit the RangeError
+        // frame cap) — UNWIND with that exception. Re-running via call_value
+        // would execute the callback a second time and propagate a stale thrown
+        // value. Mirrors the try_run_jit ip==0 bail handling.
+        if self.pending_throw.is_some() {
+            return Err(Thrown(String::new()));
+        }
+        // Plain deopt (non-int operand / overflow): re-run this element on the
+        // interpreter, which nests its frame above the reused window.
+        self.call_value(cb, Value::UNDEFINED, args)
     }
 
     /// One per-element callback invocation: native fast path when `native` is

@@ -821,6 +821,17 @@ mod tests {
     }
 
     #[test]
+    fn recursive_callback_in_map_native() {
+        // A self-recursive callback used in map exercises the native callback
+        // fast path invoking a JIT'd self-recursive function (jit_self_call).
+        // tri(n)=n+(n-1)+…; tri(3)=6, tri(4)=10, tri(5)=15.
+        assert_eq!(
+            run_ok("function tri(n){ return n<=0?0:n+tri(n-1); } console.log([3,4,5].map(tri).join(','))"),
+            vec!["6,10,15"],
+        );
+    }
+
+    #[test]
     fn int_function_modulo_jit() {
         // A hot function using `%` compiles via the whole-function JIT (idiv).
         // Negative dividends keep the dividend's sign (JS / interpreter
