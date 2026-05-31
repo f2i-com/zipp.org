@@ -1454,6 +1454,18 @@ mod tests {
     }
 
     #[test]
+    fn array_destructure_iterables() {
+        // Array destructuring drives the iterator protocol for generators and
+        // custom iterables (positional fast path still used for arrays/strings).
+        assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} let [a,b]=g(); console.log(a,b)"), vec!["1 2"]);
+        assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} let [a,...r]=g(); console.log(a,r.join(','))"), vec!["1 2,3"]);
+        assert_eq!(run_ok("let it={[Symbol.iterator](){let i=0;return{next:()=>({value:i++,done:false})}}}; let [a,b,c]=it; console.log(a,b,c)"), vec!["0 1 2"]); // infinite iterator, bounded pull (no hang)
+        assert_eq!(run_ok("let [a,b]=[10,20]; console.log(a,b)"), vec!["10 20"]);          // array fast path
+        assert_eq!(run_ok("let [x,y]='hi'; console.log(x,y)"), vec!["h i"]);              // string
+        assert_eq!(run_ok("let m=new Map([['k',1]]); let [[k,v]]=m; console.log(k,v)"), vec!["k 1"]); // map entries
+    }
+
+    #[test]
     fn map_basics() {
         assert_eq!(run_ok("let m=new Map(); m.set('a',1).set('b',2); console.log(m.get('a'),m.get('b'),m.size,m.has('a'),m.has('z'))"), vec!["1 2 2 true false"]);
         assert_eq!(run_ok("let m=new Map([['x',10],['y',20]]); console.log(m.get('x'),m.get('y'),m.size)"), vec!["10 20 2"]);

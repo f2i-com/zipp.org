@@ -284,6 +284,12 @@ pub enum Instr {
     /// method (a custom iterable) call it (this = src) → the iterator object; else
     /// pass `src` through (arrays/strings/Map/Set/generators iterate directly).
     GetIterator { dst: Reg, src: Reg },
+    /// Normalize `src` for array destructuring (`let [a,b] = src`): a generator or
+    /// custom iterable is drained (LAZILY, ≤ `count` elements — `u32::MAX` when the
+    /// pattern has a `...rest`) into a fresh array; arrays/strings/Map/Set (and
+    /// anything else) pass through, since positional `GetIndex` already handles
+    /// them. Bounding keeps `let [a,b] = infiniteIterator` from looping forever.
+    IterToArray { dst: Reg, src: Reg, count: u32 },
 
     /// Return `src` from the current function.
     Return { src: Reg },

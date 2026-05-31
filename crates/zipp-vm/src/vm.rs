@@ -1902,6 +1902,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, it);
                         ip += 1;
                     }
+                    Instr::IterToArray { dst, src, count } => {
+                        let s = self.get(base, src);
+                        let a = self.iter_to_array(s, count)?;
+                        self.set(base, dst, a);
+                        ip += 1;
+                    }
                     Instr::Random { dst } => {
                         // xorshift64* → a uniform double in [0, 1) (top 53 bits).
                         let mut x = self.rng_state;
@@ -4260,6 +4266,49 @@ impl<'p> Vm<'p> {
             }
         }
         Ok(v)
+    }
+
+    /// Normalize a destructuring source to a positionally-indexable value: a
+    /// generator or a custom iterable (object with `@@iterator`) is drained into a
+    /// fresh array — LAZILY, at most `max` elements (so `let [a,b] = infinite`
+    /// pulls 2, not forever); everything else (arrays/strings/Map/Set, or a
+    /// non-iterable) passes through unchanged.
+    fn iter_to_array(&mut self, v: Value, max: u32) -> Result<Value, Thrown> {
+        if !v.is_heap() {
+            return Ok(v);
+        }
+        let drain = match self.heap.get(v.heap_index()) {
+            HeapObj::Generator { .. } => true,
+            HeapObj::Object(_) => {
+                let it = self.get_prop(v, "@@iterator")?;
+                self.is_callable(it)
+            }
+            _ => false,
+        };
+        if !drain {
+            return Ok(v);
+        }
+        let iter = self.get_iterator(v)?; // generator → itself; iterable → its iterator
+        let lim = max as usize;
+        let mut out = Vec::new();
+        while out.len() < lim {
+            let res = if matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. }) {
+                self.generator_method(iter.heap_index(), "next", &[])?
+                    .unwrap_or(Value::UNDEFINED)
+            } else {
+                let next = self.get_prop(iter, "next")?;
+                if !self.is_callable(next) {
+                    break;
+                }
+                self.call_value(next, iter, &[])?
+            };
+            let done = self.get_prop(res, "done")?;
+            if self.truthy(done) {
+                break;
+            }
+            out.push(self.get_prop(res, "value")?);
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
     }
 
     fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {

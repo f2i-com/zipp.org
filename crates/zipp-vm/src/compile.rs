@@ -926,6 +926,18 @@ impl<'a> FnCompiler<'a> {
                 Ok(())
             }
             P::ArrayPattern(arr) => {
+                // JS array destructuring uses the iterator protocol; positional
+                // GetIndex matches it for arrays/strings/Map/Set, so we only need
+                // to drain a generator / custom iterable into an array first.
+                let src = {
+                    let norm = self.alloc_reg();
+                    // Pull only as many as the fixed elements need (unbounded with
+                    // a `...rest`), so destructuring an infinite iterator is fine.
+                    let count =
+                        if arr.rest.is_some() { u32::MAX } else { arr.elements.len() as u32 };
+                    self.emit(Instr::IterToArray { dst: norm, src, count });
+                    norm
+                };
                 for (i, el) in arr.elements.iter().enumerate() {
                     if let Some(p) = el {
                         let save = self.next_reg;
