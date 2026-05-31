@@ -780,6 +780,69 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::ArrayAppend { arr, val, spread } => {
+                        let aidx = self.get(base, arr).heap_index();
+                        let vv = self.get(base, val);
+                        if spread {
+                            // Materialize the spread source's elements (array →
+                            // elements; string → chars) WITHOUT holding a heap
+                            // borrow across the char allocations.
+                            let chars: Option<Vec<char>> = if vv.is_heap() {
+                                match self.heap.get(vv.heap_index()) {
+                                    HeapObj::Array(items) => {
+                                        let elems = items.clone();
+                                        if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                                            dst_items.extend(elems);
+                                        }
+                                        None
+                                    }
+                                    HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                                        Some(self.heap.str_cow(vv.heap_index()).unwrap().chars().collect())
+                                    }
+                                    _ => return Err(Thrown("TypeError: spread value is not iterable".into())),
+                                }
+                            } else {
+                                return Err(Thrown("TypeError: spread value is not iterable".into()));
+                            };
+                            if let Some(chars) = chars {
+                                let elems: Vec<Value> =
+                                    chars.into_iter().map(|c| self.alloc_str(c.to_string())).collect();
+                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                                    dst_items.extend(elems);
+                                }
+                            }
+                        } else if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                            dst_items.push(vv);
+                        }
+                        ip += 1;
+                    }
+                    Instr::CallSpread { dst, callee, args } => {
+                        let callee_v = self.get(base, callee);
+                        let args_v = self.get(base, args);
+                        let arg_vec = self.array_snapshot(args_v.heap_index());
+                        let result = self.call_value(callee_v, Value::UNDEFINED, &arg_vec)?;
+                        self.set(base, dst, result);
+                        ip += 1;
+                    }
+                    Instr::CallMethodSpread { dst, obj, name, args } => {
+                        let recv = self.get(base, obj);
+                        let prog: &'p Program = self.program;
+                        let key: &'p str =
+                            &prog.functions[func_id as usize].string_constants[name as usize];
+                        let args_v = self.get(base, args);
+                        let arg_vec = self.array_snapshot(args_v.heap_index());
+                        // Builtin (array/string/number) method, else a user method
+                        // resolved off the receiver and called with `this = recv`.
+                        let result = match self.dispatch_builtin_method(recv, key, &arg_vec)? {
+                            Some(r) => r,
+                            None => {
+                                let prop = self.get_prop(recv, key)?;
+                                self.call_value(prop, recv, &arg_vec)?
+                            }
+                        };
+                        self.set(base, dst, result);
+                        ip += 1;
+                    }
                     Instr::MathOp { dst, op, arg_base, argc } => {
                         let r = self.eval_math(op, base, arg_base, argc)?;
                         self.set(base, dst, Value::num(r));
@@ -1844,6 +1907,19 @@ impl<'p> Vm<'p> {
             heapbuf = (0..argc as usize).map(|i| self.regs[base + n + i]).collect();
             &heapbuf
         };
+        self.dispatch_builtin_method(recv, name, args)
+    }
+
+    /// Dispatch a builtin method on `recv` with an already-materialized args
+    /// slice. Shared by `try_builtin_method` (args gathered from registers) and
+    /// the spread method-call path (args taken from an array). `Ok(None)` means
+    /// no builtin matched the receiver kind.
+    fn dispatch_builtin_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         // Number receivers (Int or double) support a small method set.
         if recv.is_number() {
             return self.number_method(recv, name, args);

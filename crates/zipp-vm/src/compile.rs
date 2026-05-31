@@ -1308,6 +1308,32 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn array_literal(&mut self, a: &ox::ArrayExpression, dst: Reg) -> R<Reg> {
+        // With a `...spread` element the final length is dynamic, so build the
+        // array incrementally via ArrayAppend instead of the fixed-block NewArray.
+        if a.elements.iter().any(|e| matches!(e, ox::ArrayExpressionElement::SpreadElement(_))) {
+            self.emit(Instr::NewArray { dst, arg_base: self.next_reg, argc: 0 }); // []
+            for el in &a.elements {
+                let save = self.next_reg;
+                match el {
+                    ox::ArrayExpressionElement::Elision(_) => {
+                        let v = self.temp();
+                        self.emit(Instr::LoadUndefined { dst: v });
+                        self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: false });
+                    }
+                    ox::ArrayExpressionElement::SpreadElement(s) => {
+                        let v = self.expr(&s.argument)?;
+                        self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: true });
+                    }
+                    other => {
+                        let e = other.as_expression().ok_or("unsupported array element")?;
+                        let v = self.expr(e)?;
+                        self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: false });
+                    }
+                }
+                self.next_reg = save;
+            }
+            return Ok(dst);
+        }
         // Elements must occupy a contiguous register run for NewArray. Reserve
         // the block first (same contiguity discipline as call args) so an
         // element expression's scratch temps allocate above the block.
@@ -1323,9 +1349,7 @@ impl<'a> FnCompiler<'a> {
                 ox::ArrayExpressionElement::Elision(_) => {
                     self.emit(Instr::LoadUndefined { dst: slot });
                 }
-                ox::ArrayExpressionElement::SpreadElement(_) => {
-                    return Err("array spread is not in the zipp-vm subset yet".into());
-                }
+                ox::ArrayExpressionElement::SpreadElement(_) => unreachable!("handled above"),
                 other => {
                     let e = other.as_expression().ok_or("unsupported array element")?;
                     let v = self.expr_into(e, slot)?;
@@ -1748,6 +1772,30 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::Call { dst, callee, arg_base, argc });
             return Ok(dst);
         }
+        // Spread call: `f(...args)`, `obj.m(...args)`, `arr.push(...xs)`, etc.
+        // Build the argument list as an array (spreading each `...x` element),
+        // then dispatch via CallMethodSpread (method receiver) or CallSpread
+        // (plain function value). Spread on a builtin like Math.max(...arr) that
+        // isn't a method call is out of scope.
+        if c.arguments.iter().any(|a| matches!(a, ox::Argument::SpreadElement(_))) {
+            // Method call `obj.m(...)` — evaluate the receiver first so `this`
+            // binds correctly, then build args, then CallMethodSpread.
+            if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+                let obj = self.expr(&m.object)?;
+                if m.optional {
+                    self.emit_optional_check(obj);
+                }
+                let name = self.string_name(m.property.name.as_str());
+                let args_arr = self.build_spread_args(&c.arguments)?;
+                self.emit(Instr::CallMethodSpread { dst, obj, name, args: args_arr });
+                return Ok(dst);
+            }
+            let callee = self.expr(&c.callee)?;
+            let args_arr = self.build_spread_args(&c.arguments)?;
+            self.emit(Instr::CallSpread { dst, callee, args: args_arr });
+            return Ok(dst);
+        }
+
         // Bare `Error("msg")` call (no `new`) → same Error object.
         if let ox::Expression::Identifier(id) = &c.callee {
             if let Some(kind) = error_ctor(&id.name) {
@@ -1926,6 +1974,31 @@ impl<'a> FnCompiler<'a> {
             .collect::<R<Vec<_>>>()?;
         let base = self.eval_contiguous(&exprs)?;
         Ok((base, exprs.len() as u16))
+    }
+
+    /// Build a call-argument list containing `...spread` into a fresh array and
+    /// return its (live) register. Each plain arg is pushed as one element; each
+    /// `...x` arg appends every element of `x` (an array, or a string's chars).
+    /// Consumed by `CallSpread` / `CallMethodSpread`.
+    fn build_spread_args(&mut self, args: &oxc_allocator::Vec<ox::Argument>) -> R<Reg> {
+        let args_arr = self.temp();
+        self.emit(Instr::NewArray { dst: args_arr, arg_base: self.next_reg, argc: 0 });
+        for a in args {
+            let save = self.next_reg;
+            match a {
+                ox::Argument::SpreadElement(s) => {
+                    let v = self.expr(&s.argument)?;
+                    self.emit(Instr::ArrayAppend { arr: args_arr, val: v, spread: true });
+                }
+                other => {
+                    let e = other.as_expression().ok_or("unsupported spread-call argument")?;
+                    let v = self.expr(e)?;
+                    self.emit(Instr::ArrayAppend { arr: args_arr, val: v, spread: false });
+                }
+            }
+            self.next_reg = save;
+        }
+        Ok(args_arr)
     }
 
     /// Evaluate `exprs` into the contiguous register block `[base, base+len)`,

@@ -80,6 +80,17 @@ pub enum Instr {
     JsonStringify { dst: Reg, val: Reg, space: Reg },
     /// `dst = JSON.parse(a)` — parse a JSON string; throws SyntaxError on invalid.
     JsonParse { dst: Reg, a: Reg },
+    /// Append to array `arr`: when `spread`, append every element of `val` (an
+    /// array, or a string's chars); otherwise push `val` as one element. Used to
+    /// build array literals / call-arg lists containing `...spread`.
+    ArrayAppend { arr: Reg, val: Reg, spread: bool },
+    /// `dst = callee(...args_array)` — call `callee` (a function value) spreading
+    /// the elements of the array in `args` as the arguments (`this` = undefined).
+    CallSpread { dst: Reg, callee: Reg, args: Reg },
+    /// `dst = obj[name](...args_array)` — method call spreading the elements of
+    /// the array in `args` (`this` = obj). Handles builtin methods (e.g.
+    /// `arr.push(...xs)`) and user methods alike.
+    CallMethodSpread { dst: Reg, obj: Reg, name: u32, args: Reg },
     /// `dst = Math.<op>(args…)` — a builtin Math function over `argc` contiguous
     /// argument registers starting at `arg_base`.
     MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },

@@ -986,6 +986,26 @@ mod tests {
     }
 
     #[test]
+    fn spread_operator() {
+        // Array-literal spread: arrays, repeated sources, with plain elements.
+        assert_eq!(run_ok("let a=[1,2]; console.log([...a,3,...a].join(','))"), vec!["1,2,3,1,2"]);
+        assert_eq!(run_ok("let a=[1,2],b=[3,4]; console.log([0,...a,...b,5].join(','))"), vec!["0,1,2,3,4,5"]);
+        assert_eq!(run_ok("console.log([...[]].length, [...[1]].length)"), vec!["0 1"]);
+        // Spreading a string yields its characters.
+        assert_eq!(run_ok("console.log([...'abc'].join('-'))"), vec!["a-b-c"]);
+        // Call spread on a plain function value (declared fn and arrow).
+        assert_eq!(run_ok("function sum(a,b,c){return a+b+c} console.log(sum(...[1,2,3]))"), vec!["6"]);
+        assert_eq!(run_ok("let g=(a,b)=>a-b; console.log(g(...[10,3]))"), vec!["7"]);
+        assert_eq!(run_ok("function f(a,b,c,d){return a+b+c+d} console.log(f(1,...[2,3],4))"), vec!["10"]);
+        // Method-call spread: builtin (push/concat) and mixed spread+plain args.
+        assert_eq!(run_ok("let a=[3,1,2]; a.push(...[4,5]); console.log(a.join(','))"), vec!["3,1,2,4,5"]);
+        assert_eq!(run_ok("let a=[1,2],b=[5,6]; a.push(...b,7); console.log(a.join(','))"), vec!["1,2,5,6,7"]);
+        assert_eq!(run_ok("console.log([0].concat(...[[1,2],[3]]).join(','))"), vec!["0,1,2,3"]);
+        // Spreading a non-iterable throws a (catchable) TypeError.
+        assert_eq!(run_ok("let e='ok'; try{ [...5]; }catch(x){ e='threw'; } console.log(e)"), vec!["threw"]);
+    }
+
+    #[test]
     fn array_methods_more() {
         assert_eq!(run_ok("let a=[1,2,3]; a.reverse(); console.log(a.join(','))"), vec!["3,2,1"]);
         assert_eq!(run_ok("console.log([1,2].concat([3,4],5,[6]).join(','))"), vec!["1,2,3,4,5,6"]);
