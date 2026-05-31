@@ -218,6 +218,7 @@ impl<'p> Vm<'p> {
     /// Force the JIT on/off (overrides the `ZIPP_NOJIT` default). Used by the
     /// test suite to run a program both ways and assert the outputs match.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(dead_code)] // used by the differential test harness (run_nojit)
     pub(crate) fn set_jit_enabled(&mut self, on: bool) {
         self.jit_enabled = on;
     }
@@ -382,11 +383,6 @@ impl<'p> Vm<'p> {
     /// Allocate a string on the heap and return its boxed Value.
     pub fn alloc_str(&mut self, s: String) -> Value {
         Value::heap(self.heap.alloc_str(s))
-    }
-
-    /// Allocate a function object and return its boxed Value.
-    pub fn alloc_func(&mut self, id: u32) -> Value {
-        Value::heap(self.heap.alloc(HeapObj::Func(id)))
     }
 
     /// Run the top-level function (id 0) to completion.
@@ -694,7 +690,7 @@ impl<'p> Vm<'p> {
                         let v = self.program.functions[func_id as usize].constants[idx as usize];
                         // String constants are stored with a sentinel; resolve
                         // to a freshly-interned heap string the first time.
-                        let resolved = self.resolve_const(func_id, idx, v);
+                        let resolved = self.resolve_const(func_id, v);
                         self.set(base, dst, resolved);
                         ip += 1;
                     }
@@ -3739,7 +3735,7 @@ impl<'p> Vm<'p> {
         // args for push/map/filter/…), avoiding a heap Vec alloc per call; only
         // a rare >8-arg call falls back to the heap.
         let mut stackbuf = [Value::UNDEFINED; 8];
-        let mut heapbuf: Vec<Value>;
+        let heapbuf: Vec<Value>;
         let n = arg_base as usize;
         let args: &[Value] = if argc as usize <= stackbuf.len() {
             for i in 0..argc as usize {
@@ -5500,7 +5496,7 @@ impl<'p> Vm<'p> {
     /// stored as a sentinel index into the function's `string_constants` and
     /// interned to a heap string on first use.
     #[inline]
-    fn resolve_const(&mut self, func_id: u32, idx: u32, v: Value) -> Value {
+    fn resolve_const(&mut self, func_id: u32, v: Value) -> Value {
         // String constants are encoded as `Value::heap(STRING_CONST_BIT | i)`.
         if v.is_heap() && (v.heap_index() & STRING_CONST_BIT) != 0 {
             let si = (v.heap_index() & !STRING_CONST_BIT) as usize;

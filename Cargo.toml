@@ -14,10 +14,8 @@ members = [
     "crates/zipp-llvm", # OPTIONAL release tier: emit LLVM IR, compile with clang -O3
     "crates/zipp-wasm", # OPTIONAL contract profile: emit gas-metered WebAssembly
     "crates/zipp-ts",   # OPTIONAL TypeScript frontend: parse .ts with oxc, lower the subset
-    "crates/zipp-js",   # OPTIONAL dynamic JS engine (Lane 3): tree-walking interpreter over the oxc AST
-    "crates/zipp-engine", # dynamic JS engine (fast tier): NaN-boxed value, register-bytecode VM, shapes + inline caches, optional dynasm JIT (absorbed from the FormLogic prototype, rebranded)
-    "crates/zipp-vm",   # dynamic JS engine v2: clean-sheet explicit-frame register VM (recursion in an explicit frame stack, not the native stack) designed as a JIT-ready substrate
-    "crates/zipp-cli",  # `zipp run [--prove] [--jit|--llvm|--wasm] file.zipp`
+    "crates/zipp-vm",   # dynamic JS engine: explicit-frame register VM (recursion in an explicit frame stack, not the native stack) + native x86-64 OSR JIT — `zipp js`
+    "crates/zipp-cli",  # `zipp run [--prove] [--jit|--llvm|--wasm] file.zipp` + `zipp js file.js`
 ]
 
 [workspace.package]
@@ -25,16 +23,11 @@ version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
 
-# Shared dependency versions for the fast JS engine (crates/zipp-engine). Declared
-# here and referenced via `.workspace = true` so the workspace resolves a single
-# copy of each.
+# Shared dependency versions referenced via `.workspace = true` (one resolved
+# copy each). `rustc-hash` is the JS engine's fast hasher; `dynasm`/`dynasmrt`
+# back its optional native x86-64 JIT.
 [workspace.dependencies]
-indexmap = "2"
-itoa = "1"
-regex = "1"
 rustc-hash = "2"
-ryu = "1"
-serde_json = "1"
 dynasm = "2.0"
 dynasmrt = "2.0"
 

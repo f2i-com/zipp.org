@@ -50,9 +50,6 @@ impl ObjMap {
         }
     }
 
-    pub fn has(&self, key: &str) -> bool {
-        self.keys.iter().any(|k| k == key)
-    }
 }
 
 /// A flat (contiguous) JS string with cached metadata so `.length` and indexing
@@ -331,16 +328,6 @@ impl Heap {
             _ => {}
         }
         self.alloc(HeapObj::Str(JsStr::new(s)))
-    }
-
-    /// Borrow a FLAT string by heap index, or `None` if the object isn't a flat
-    /// string (a rope returns `None` — use [`Heap::str_cow`] to materialize one).
-    #[inline]
-    pub fn as_str(&self, idx: u32) -> Option<&str> {
-        match self.get(idx) {
-            HeapObj::Str(s) => Some(s.bytes.as_str()),
-            _ => None,
-        }
     }
 
     /// Allocate a rope node over two string-like children (O(1) concatenation).

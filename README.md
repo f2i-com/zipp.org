@@ -5,7 +5,9 @@ A sound-TypeScript-subset language, AOT-compiled, in Rust — you can write it i
 design lives in [`../ZIPP.md`](../ZIPP.md); this repo is the standalone
 implementation.
 
-ZIPP has **three execution profiles** from one frontend + IR:
+It also ships a **separate dynamic JavaScript engine** (`zipp js`) that runs
+ordinary `.js` and is competitive with V8 — see
+[Dynamic JavaScript engine](#dynamic-javascript-engine-zipp-js).
 
 ZIPP has **three execution profiles** from one frontend + IR — all three are
 implemented:
@@ -156,6 +158,11 @@ cargo test
 
 # build without the zk profile (drops the Winterfell dependency)
 cargo build --release -p zipp-cli --no-default-features
+
+# dynamic JavaScript — the separate JS engine (zipp-vm), like `node file.js`
+./target/release/zipp js bench/fib.js          # recursion
+./target/release/zipp js bench/loop.js         # hot integer loop (runs native)
+./target/release/zipp js bench/array.js        # closures + map/filter/reduce
 ```
 
 A ZIPP program (`examples/fib.zipp`):
@@ -184,6 +191,7 @@ zipp-lang/
 │   ├── zipp-llvm/    # OPTIONAL release tier (emit LLVM IR, compile with clang -O3)
 │   ├── zipp-wasm/    # OPTIONAL contract profile (emit gas-metered WebAssembly)
 │   ├── zipp-ts/      # OPTIONAL TypeScript frontend (oxc → ZIPP AST, sound subset)
+│   ├── zipp-vm/      # dynamic JavaScript engine: explicit-frame register VM + native x86-64 OSR JIT (`zipp js`)
 │   └── zipp-cli/     # the `zipp` binary
 └── examples/         # add, sum, fib, bits, pi, arrays, hello, fizzbuzz, math, structs, fnv
 ```
@@ -479,14 +487,44 @@ numeric types alias to `number` so arithmetic still checks; ZIPP's own checker
 enforces width/signedness.) The bundled `tsconfig.json` type-checks `examples/`
 clean: `npx -y -p typescript tsc --noEmit -p tsconfig.json`.
 
-This is the **AssemblyScript model** — a typed subset compiled to fast/provable
-code — *not* a JavaScript engine. Running *arbitrary* dynamic JS (`any`,
-prototypes, `eval`, exceptions, async) is an explicit non-goal: it would be
-slower than V8 (you can't out-V8 V8 by reimplementing it) and would forfeit
-ZIPP's AOT speed, gas-metered determinism, and zk-provability — all of which
-depend on static types and no dynamic dispatch. Coverage grows toward more
-idiomatic typed TS (classes, generics via monomorphization); the dynamic core
-stays out by design.
+The `zipp run` pipeline above is the **AssemblyScript model** — a typed subset
+compiled to fast/provable code. Its AOT speed, gas-metered determinism, and
+zk-provability depend on static types and no dynamic dispatch, so *arbitrary*
+dynamic JS stays out of that lane by design.
+
+Dynamic JS lives in a **separate engine** (`zipp js`, the `zipp-vm` crate) —
+described below.
+
+## Dynamic JavaScript engine (`zipp js`)
+
+`zipp js file.js` runs ordinary dynamic JavaScript, like `node file.js`. It is a
+clean-sheet engine — a NaN-boxed value model over an **explicit-frame register
+VM** (recursion lives in an explicit frame stack, not the native one, so deep
+recursion throws a catchable `RangeError` instead of segfaulting) with a native
+**x86-64 OSR JIT** (int64 hot loops, inline caches + object scalar-replacement,
+native callbacks). Coverage includes closures, classes (incl. `extends`,
+get/set, private `#fields`), `for-of`/`for-in`, destructuring, spread/rest,
+generators, `async`/`await` + Promises (`all`/`race`/`allSettled`/`any`),
+`Map`/`Set`, tagged templates, `Symbol.iterator` iterables, `Date`, and the
+common Array/String/Object/Math/JSON/Number builtins.
+
+**Performance vs V8 (Node 24), compute-only, large-N, best-of-7** (every output
+byte-identical to node):
+
+| workload | V8 | zipp | ratio |
+|---|---|---|---|
+| 100M integer loop | 50 ms | 53 ms | **1.06× (parity)** |
+| 2M array map→filter→reduce | 54 ms | 90 ms | 1.66× |
+| 4M object field read/write | 3.9 ms | 7.8 ms | 2.0× |
+| 100k comparator sort | 10 ms | 28 ms | 2.7× |
+| fib(37) recursion | 139 ms | 443 ms | 3.2× |
+| 100k string concat + scan | 5.4 ms | 21 ms | 3.9× |
+
+zipp **ties V8 on the integer loop** (native int64 OSR JIT) and is within ~2× on
+array/object work; it trails on recursion (per-call round-trip) and string-heavy
+code (string loops still interpreted). **Startup is ~10× faster** (≈22 ms vs
+≈216 ms — no V8 snapshot/warmup), so end-to-end (incl. startup) zipp finishes
+every benchmark first. Run `bench/run.sh` to reproduce.
 
 ## License
 

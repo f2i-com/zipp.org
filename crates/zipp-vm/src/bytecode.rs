@@ -180,8 +180,11 @@ pub enum Instr {
 
     /// Fused compare-and-branch: `if !(a < b) goto target`. Keeps the common
     /// loop/recursion guard in one instruction so the boolean never has to be
-    /// materialised into a register.
+    /// materialised into a register. RESERVED: fully handled by the interpreter
+    /// and the JIT, but the compiler does not emit it yet (a planned peephole).
+    #[allow(dead_code)]
     JumpIfNotLt { a: Reg, b: Reg, target: u32 },
+    #[allow(dead_code)]
     JumpIfNotLe { a: Reg, b: Reg, target: u32 },
 
     // ── reference types ──

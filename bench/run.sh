@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Sequential micro-benchmark: zipp (the new register-VM + JIT engine, `js-vm`)
-# vs node (V8). Reports COMPUTE time = best wall time minus the engine's own
-# empty-program startup. Override the engine with ENGINE=js (old engine) etc.
+# Sequential micro-benchmark: zipp's JS engine (register VM + native JIT; the
+# `zipp-vm` crate, run via `js` or its `js-vm` alias) vs node (V8). Reports
+# COMPUTE time = best wall time minus the engine's own empty-program startup.
 # Correctness compares STDOUT only: some benches print a non-deterministic
 # elapsed-ms line to STDERR (their own internal timer), which can never match.
 cd "$(dirname "$0")/.." || exit 1
