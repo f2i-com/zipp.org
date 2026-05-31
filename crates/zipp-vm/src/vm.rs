@@ -1142,6 +1142,13 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
+                    Instr::HasProp { dst, key, obj } => {
+                        let k = self.get(base, key);
+                        let o = self.get(base, obj);
+                        let r = self.has_property(o, k);
+                        self.set(base, dst, Value::bool(r));
+                        ip += 1;
+                    }
                     Instr::InstanceOfDyn { dst, val, ctor } => {
                         let v = self.get(base, val);
                         let c = self.get(base, ctor);
@@ -1178,6 +1185,17 @@ impl<'p> Vm<'p> {
                                 self.alloc_str(s)
                             }
                             S::ObjectAssign => self.object_assign(&args)?,
+                            S::ObjectFromEntries => {
+                                let entries = self.iterate_to_vec(a0)?;
+                                let mut map = ObjMap::new();
+                                for e in entries {
+                                    let kv = self.get_index(e, Value::int(0))?;
+                                    let k = self.display(kv);
+                                    let v = self.get_index(e, Value::int(1))?;
+                                    map.set(&k, v);
+                                }
+                                Value::heap(self.heap.alloc(HeapObj::Object(map)))
+                            }
                         };
                         self.set(base, dst, v);
                         ip += 1;
@@ -2756,6 +2774,56 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `key in obj` — does `obj` have the property `key`? Own object keys, a
+    /// class instance's inherited methods/getters, array indices / `length`,
+    /// Map/Set `size`, and class static members. `in` on a primitive throws
+    /// in JS; here it's `false` (rare).
+    fn has_property(&self, obj: Value, key: Value) -> bool {
+        if !obj.is_heap() {
+            return false;
+        }
+        let idx = obj.heap_index();
+        match self.heap.get(idx) {
+            HeapObj::Object(map) => {
+                let k = self.display(key);
+                if map.get(&k).is_some() {
+                    return true;
+                }
+                // Inherited method/getter through the class chain.
+                let mut cur = map.class;
+                while let Some(cidx) = cur {
+                    match self.heap.get(cidx) {
+                        HeapObj::Class { methods, getters, parent, .. } => {
+                            if methods.iter().any(|(n, _)| *n == k)
+                                || getters.iter().any(|(n, _)| *n == k)
+                            {
+                                return true;
+                            }
+                            cur = *parent;
+                        }
+                        _ => break,
+                    }
+                }
+                false
+            }
+            HeapObj::Array(items) => match array_index(key) {
+                Some(i) => i < items.len(),
+                None => self.display(key) == "length",
+            },
+            HeapObj::Str(s) => match array_index(key) {
+                Some(i) => i < s.char_len,
+                None => self.display(key) == "length",
+            },
+            HeapObj::Cons { len, .. } => match array_index(key) {
+                Some(i) => i < *len,
+                None => self.display(key) == "length",
+            },
+            HeapObj::Map { .. } | HeapObj::Set(_) => self.display(key) == "size",
+            HeapObj::Class { statics, .. } => statics.get(&self.display(key)).is_some(),
+            _ => false,
+        }
+    }
+
     /// `val instanceof <built-in ctor>`. With no user prototype chain the result
     /// is structural: by heap kind for Array/Object/Function, and by the `name`
     /// field for the Error family (any error subtype satisfies `instanceof
@@ -3481,6 +3549,26 @@ impl<'p> Vm<'p> {
                     *items = snapshot;
                 }
                 Ok(Some(Value::heap(idx)))
+            }
+            "reduceRight" => {
+                let cb = arg0;
+                let snapshot = self.array_snapshot(idx);
+                let mut i = snapshot.len();
+                let mut acc = if args.len() >= 2 {
+                    args[1]
+                } else if i > 0 {
+                    i -= 1;
+                    snapshot[i]
+                } else {
+                    return Err(Thrown(
+                        "TypeError: Reduce of empty array with no initial value".into(),
+                    ));
+                };
+                while i > 0 {
+                    i -= 1;
+                    acc = self.call_value(cb, Value::UNDEFINED, &[acc, snapshot[i], Value::int(i as i32)])?;
+                }
+                Ok(Some(acc))
             }
             "flatMap" => {
                 // map(cb) then flatten one level (array results spliced in).

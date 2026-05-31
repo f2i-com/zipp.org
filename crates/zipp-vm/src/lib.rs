@@ -1338,6 +1338,24 @@ mod tests {
     }
 
     #[test]
+    fn in_operator_and_more_methods() {
+        // `in`: own object keys, array indices/length, class-instance inherited
+        // methods, Map/Set size. (Plain-object Object.prototype methods aren't
+        // inherited here — no prototype chain.)
+        assert_eq!(run_ok("let o={a:1,b:2}; console.log('a' in o, 'c' in o)"), vec!["true false"]);
+        assert_eq!(run_ok("console.log(0 in [1,2], 5 in [1,2], 'length' in [])"), vec!["true false true"]);
+        assert_eq!(run_ok("class A{m(){}} let a=new A(); a.x=1; console.log('m' in a, 'x' in a, 'y' in a)"), vec!["true true false"]);
+        assert_eq!(run_ok("class A{am(){}} class B extends A{} console.log('am' in new B())"), vec!["true"]);
+        assert_eq!(run_ok("console.log('size' in new Map())"), vec!["true"]);
+        // reduceRight (with and without an initial value).
+        assert_eq!(run_ok("console.log([1,2,3].reduceRight((a,b)=>a+'-'+b))"), vec!["3-2-1"]);
+        assert_eq!(run_ok("console.log([[0,1],[2,3]].reduceRight((a,b)=>a.concat(b),[]).join(','))"), vec!["2,3,0,1"]);
+        // Object.fromEntries from an array of pairs and from a Map.
+        assert_eq!(run_ok("console.log(JSON.stringify(Object.fromEntries([['a',1],['b',2]])))"), vec![r#"{"a":1,"b":2}"#]);
+        assert_eq!(run_ok("let m=new Map([['x',1]]); console.log(Object.fromEntries(m).x)"), vec!["1"]);
+    }
+
+    #[test]
     fn array_string_methods_batch2() {
         // flatMap (map + flatten one level; empty array => filter out).
         assert_eq!(run_ok("console.log([1,2,3].flatMap(x=>[x,x*2]).join(','))"), vec!["1,2,2,4,3,6"]);

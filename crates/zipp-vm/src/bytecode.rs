@@ -154,6 +154,9 @@ pub enum Instr {
     /// `dst = (val instanceof ctor)` where `ctor` is a runtime class value: true
     /// when `val` is an instance whose class is `ctor`.
     InstanceOfDyn { dst: Reg, val: Reg, ctor: Reg },
+    /// `dst = (key in obj)` — true when `obj` has the property `key` (own or, for
+    /// a class instance, inherited; array indices / `length`; Map/Set `size`).
+    HasProp { dst: Reg, key: Reg, obj: Reg },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },
@@ -330,6 +333,8 @@ impl GlobalFn {
 pub enum StaticFn {
     /// `Object.assign(target, ...sources)` — copy own keys; returns target.
     ObjectAssign,
+    /// `Object.fromEntries(iterable)` — build an object from [k,v] entries.
+    ObjectFromEntries,
     /// `Array.of(...items)` — a new array of the arguments.
     ArrayOf,
     /// `String.fromCharCode(...codes)` — string from UTF-16 code units.
@@ -349,6 +354,7 @@ impl StaticFn {
     pub fn from_name(ns: &str, method: &str) -> Option<StaticFn> {
         Some(match (ns, method) {
             ("Object", "assign") => StaticFn::ObjectAssign,
+            ("Object", "fromEntries") => StaticFn::ObjectFromEntries,
             ("Array", "of") => StaticFn::ArrayOf,
             ("String", "fromCharCode") => StaticFn::StringFromCharCode,
             ("Number", "isInteger") => StaticFn::NumberIsInteger,

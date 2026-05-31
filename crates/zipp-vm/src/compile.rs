@@ -2053,6 +2053,13 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::InstanceOfDyn { dst, val, ctor });
             return Ok(dst);
         }
+        // `key in obj`.
+        if matches!(b.operator, Op::In) {
+            let key = self.expr(&b.left)?;
+            let obj = self.expr(&b.right)?;
+            self.emit(Instr::HasProp { dst, key, obj });
+            return Ok(dst);
+        }
         // `a - <int literal>` and `a + <int literal>` → AddInt fast path, but
         // ONLY when the left operand is provably numeric. `+` is overloaded for
         // string concatenation, so `'n=' + 42` must NOT take the integer path
