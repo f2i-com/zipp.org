@@ -821,6 +821,27 @@ mod tests {
     }
 
     #[test]
+    fn array_index_region_sum() {
+        // `s += a[i]` over a constant bound JITs in the OSR region (GetIndex via
+        // helper). The region computes the loop counter as f64, so a[i] indexes
+        // with a DOUBLE key — array_index must coerce it. JIT-on == JIT-off.
+        assert_jit_matches(
+            "let a=[]; for(let i=0;i<100;i++) a.push(i); let s=0; for(let i=0;i<100;i++){ s+=a[i]; } console.log(s)",
+            &["4950"],
+        );
+    }
+
+    #[test]
+    fn array_double_and_oob_index() {
+        // Integral double keys coerce (a[1.0]==a[1]); negative / fractional /
+        // out-of-range keys are undefined — matching JS and the JIT helper.
+        assert_eq!(
+            run_ok("let a=[10,20,30]; console.log(a[1.0], a[2], a[5], a[-1], a[1.5])"),
+            vec!["20 30 undefined undefined undefined"],
+        );
+    }
+
+    #[test]
     fn recursive_callback_in_map_native() {
         // A self-recursive callback used in map exercises the native callback
         // fast path invoking a JIT'd self-recursive function (jit_self_call).

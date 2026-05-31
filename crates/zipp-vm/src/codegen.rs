@@ -76,6 +76,9 @@ pub struct HeapHelperAddrs {
     pub set_prop_miss: usize,
     pub versions_base: usize,
     pub ic_base: usize,
+    /// Helper for a dense-array element read `a[i]` (`GetIndex`); returns the
+    /// element bits, `undefined` for out-of-range, or the deopt sentinel.
+    pub get_index: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -344,6 +347,7 @@ impl Jit {
             set_prop_miss: heap_helpers.set_prop_miss,
             versions_base: heap_helpers.versions_base,
             ic_base: heap_helpers.ic_base,
+            get_index: heap_helpers.get_index,
             ic_base_idx,
         };
         match compile_region(proto, start, end, globals_base_helper, helpers) {
@@ -1021,6 +1025,9 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             // mem path). A `Print`/`Call`/etc. anywhere still rejects the region.
             | Instr::GetProp { .. }
             | Instr::SetProp { .. }
+            // Dense-array element read `a[i]` — handled by the MEMORY path via a
+            // win64 helper (the int/regalloc paths decline → mem path).
+            | Instr::GetIndex { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
             Instr::LoadConst { idx, .. } => {
@@ -1048,6 +1055,8 @@ struct HeapHelpers {
     versions_base: usize,
     /// Helper returning `vm.jit.ic_base_ptr()` (pinned in r14).
     ic_base: usize,
+    /// Helper for a dense-array `GetIndex` (`a[i]`).
+    get_index: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -1253,6 +1262,12 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
     // type (from defs) and first-occurrence (def vs use). Operand type
     // requirements are validated in a second loop once types are known.
     for instr in &code[s..=e] {
+        // A dense-array element read can't be register-allocated (its result is a
+        // boxed Value from a helper, not a known-type scalar) — decline so the
+        // region takes the memory path that can emit the helper call.
+        if matches!(instr, Instr::GetIndex { .. }) {
+            return None;
+        }
         let (def, dty): (Option<u16>, VTy) = match *instr {
             Instr::LoadInt { dst, .. } => (Some(dst), VTy::Num),
             Instr::LoadConst { dst, .. } => (Some(dst), VTy::Num),
@@ -2636,6 +2651,26 @@ fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
+            }
+            Instr::GetIndex { dst, obj, key } => {
+                // Dense-array element read `a[i]` via a win64 helper. The helper
+                // returns the element bits, `undefined` for out-of-range (a later
+                // numeric op then guard-bails on it, matching the interpreter), or
+                // the deopt sentinel for a non-array / non-int key. No inline
+                // cache: arrays carry no shape, so the read is a direct
+                // bounds-checked `vals[i]` inside the helper.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(obj)]          // array bits
+                    ; mov r8, [rbx + dreg(key)]           // index bits
+                    ; mov rax, QWORD heap.get_index as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 // Resume interpreting at this ip so the interpreter performs the

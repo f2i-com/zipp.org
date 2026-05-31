@@ -780,6 +780,7 @@ impl<'p> Vm<'p> {
                                         set_prop_miss: jit_set_prop_miss as usize,
                                         versions_base: jit_heap_versions_base as usize,
                                         ic_base: jit_ic_base as usize,
+                                        get_index: jit_get_index as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
@@ -1286,10 +1287,11 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Array(items) => {
-                if key.is_int() {
-                    let i = key.as_int();
-                    if i >= 0 && (i as usize) < items.len() {
-                        return Ok(items[i as usize]);
+                // Numeric key (incl. an integral double like 1.0 — the JIT region
+                // produces f64 indices): direct element access, else undefined.
+                if let Some(i) = array_index(key) {
+                    if i < items.len() {
+                        return Ok(items[i]);
                     }
                     return Ok(Value::UNDEFINED);
                 }
@@ -2255,6 +2257,41 @@ pub(crate) extern "win64" fn jit_self_call(
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
+/// Win64 helper for a JIT'd dense-array element read `a[i]` (`GetIndex`).
+/// Returns the element's Value bits; `undefined` bits for an in-bounds-checks-fail
+/// (negative or `>= len`) index, matching JS `a[oob] === undefined`; or
+/// `SELF_CALL_DEOPT` for a non-array receiver or a non-int key (string indexing,
+/// `arr["foo"]`, etc.) so the interpreter re-executes this op. Read-only — no
+/// caching needed (a dense array's element address is a direct `vals[i]`).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_get_index(
+    vm: *mut core::ffi::c_void,
+    arr_bits: u64,
+    key_bits: u64,
+) -> u64 {
+    let arr = Value::from_bits(arr_bits);
+    let key = Value::from_bits(key_bits);
+    // Only a numeric key on a heap object is handled here; a string/other key
+    // (or non-heap receiver) deopts so the interpreter applies full semantics.
+    if !arr.is_heap() || !key.is_number() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: read-only view; the running region holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    match vm.heap.get(arr.heap_index()) {
+        HeapObj::Array(items) => match array_index(key) {
+            // In range → the element; out of range / negative / non-integral →
+            // undefined (matches JS and the interpreter's get_index).
+            Some(i) if i < items.len() => items[i].bits(),
+            _ => Value::UNDEFINED.bits(),
+        },
+        _ => crate::codegen::SELF_CALL_DEOPT, // strings etc → interpreter
+    }
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_get_prop_miss(
     vm: *mut core::ffi::c_void,
@@ -2385,6 +2422,28 @@ fn len_value(n: usize) -> Value {
         Value::int(n as i32)
     } else {
         Value::num(n as f64)
+    }
+}
+
+/// A non-negative array index from a numeric key, coercing an integral double
+/// the way JS does (`a[1.0]` is `a[1]`). `None` for a negative, non-integral, or
+/// non-numeric key (those address no dense element → `undefined`). The JIT region
+/// computes loop counters as f64, so `a[i]` arrives here with a double key.
+#[inline]
+fn array_index(key: Value) -> Option<usize> {
+    if key.is_int() {
+        let i = key.as_int();
+        (i >= 0).then_some(i as usize)
+    } else if key.is_double() {
+        let d = key.as_f64();
+        // Reject negatives, fractions, and absurdly large indices (≥ 2^32).
+        if d >= 0.0 && d.fract() == 0.0 && d < 4_294_967_296.0 {
+            Some(d as usize)
+        } else {
+            None
+        }
+    } else {
+        None
     }
 }
 
