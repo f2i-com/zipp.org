@@ -218,8 +218,8 @@ impl Heap {
         matches!(self.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. })
     }
 
-    /// Character length of a string-like object: O(1) for a rope, O(n) for a
-    /// flat string. `None` if `idx` isn't a string.
+    /// Character length of a string-like object — O(1): a rope stores it; a flat
+    /// `JsStr` caches it (computed once in `JsStr::new`). `None` if not a string.
     pub fn str_char_len(&self, idx: u32) -> Option<usize> {
         match self.get(idx) {
             HeapObj::Str(s) => Some(s.char_len),
@@ -229,7 +229,7 @@ impl Heap {
     }
 
     /// `Some(true)` if the string-like object is empty (O(1)); `None` if not a
-    /// string. Avoids the O(n) `chars().count()` of [`Heap::str_char_len`].
+    /// string. Reads the cached/stored length rather than scanning the bytes.
     #[inline]
     pub fn str_is_empty(&self, idx: u32) -> Option<bool> {
         match self.get(idx) {

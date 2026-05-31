@@ -819,4 +819,14 @@ mod tests {
             vec!["4 \u{00e9} \u{00e9} 8"],
         );
     }
+
+    #[test]
+    fn string_bracket_length_matches_dot_length() {
+        // s['length'] (computed member) must equal s.length and arr['length'] —
+        // the get_index Str arm used to drop non-int keys to undefined.
+        assert_eq!(
+            run_ok("let s='hello'; let a=[1,2,3]; console.log(s['length'], s.length, a['length'])"),
+            vec!["5 5 3"],
+        );
+    }
 }

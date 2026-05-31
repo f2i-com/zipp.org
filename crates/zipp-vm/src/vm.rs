@@ -821,17 +821,17 @@ impl<'p> Vm<'p> {
                     }
                     Instr::LenOf { dst, obj } => {
                         let o = self.get(base, obj);
-                        let len = if o.is_heap() {
+                        let v = if o.is_heap() {
                             match self.heap.get(o.heap_index()) {
-                                HeapObj::Array(items) => items.len() as i32,
-                                HeapObj::Str(s) => s.char_len as i32,
-                                HeapObj::Cons { len, .. } => *len as i32,
-                                _ => 0,
+                                HeapObj::Array(items) => len_value(items.len()),
+                                HeapObj::Str(s) => len_value(s.char_len),
+                                HeapObj::Cons { len, .. } => len_value(*len),
+                                _ => Value::int(0),
                             }
                         } else {
-                            0
+                            Value::int(0)
                         };
-                        self.set(base, dst, Value::int(len));
+                        self.set(base, dst, v);
                         ip += 1;
                     }
                     Instr::MakeClosure { dst, func_id } => {
@@ -1245,7 +1245,7 @@ impl<'p> Vm<'p> {
                 // Non-int key on an array: "length" or out of range → undefined.
                 let k = self.display(key);
                 if k == "length" {
-                    return Ok(Value::int(items.len() as i32));
+                    return Ok(len_value(items.len()));
                 }
                 Ok(Value::UNDEFINED)
             }
@@ -1271,6 +1271,12 @@ impl<'p> Vm<'p> {
                         }
                     }
                     return Ok(Value::UNDEFINED);
+                }
+                // Non-int key: only `s["length"]` is meaningful — mirror the array
+                // and `s.length` paths (was returning undefined, inconsistently).
+                let char_len = s.char_len;
+                if self.display(key) == "length" {
+                    return Ok(len_value(char_len));
                 }
                 Ok(Value::UNDEFINED)
             }
@@ -1329,21 +1335,21 @@ impl<'p> Vm<'p> {
         match self.heap.get(obj.heap_index()) {
             HeapObj::Array(items) => {
                 if key == "length" {
-                    Ok(Value::int(items.len() as i32))
+                    Ok(len_value(items.len()))
                 } else {
                     Ok(Value::UNDEFINED)
                 }
             }
             HeapObj::Str(s) => {
                 if key == "length" {
-                    Ok(Value::int(s.char_len as i32))
+                    Ok(len_value(s.char_len))
                 } else {
                     Ok(Value::UNDEFINED)
                 }
             }
             HeapObj::Cons { len, .. } => {
                 if key == "length" {
-                    Ok(Value::int(*len as i32))
+                    Ok(len_value(*len))
                 } else {
                     Ok(Value::UNDEFINED)
                 }
@@ -2143,6 +2149,20 @@ pub(crate) extern "win64" fn jit_globals_base(vm: *mut core::ffi::c_void) -> *mu
 fn norm_index(i: i32, len: i32) -> i32 {
     let v = if i < 0 { len + i } else { i };
     v.clamp(0, len)
+}
+
+/// A `.length` / array-length result as a JS Number. An `Int` when it fits in
+/// i32 (the overwhelmingly common case), otherwise a double — so a length beyond
+/// 2^31 (cheap to reach now that ropes concatenate lazily without flattening)
+/// reports its true magnitude instead of wrapping negative through `as i32`.
+/// Integers up to 2^53 are exact in f64, matching JS.
+#[inline]
+fn len_value(n: usize) -> Value {
+    if n <= i32::MAX as usize {
+        Value::int(n as i32)
+    } else {
+        Value::num(n as f64)
+    }
 }
 
 fn fmt_f64(n: f64) -> String {
