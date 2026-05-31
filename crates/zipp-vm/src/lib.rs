@@ -1031,6 +1031,20 @@ mod tests {
     }
 
     #[test]
+    fn number_to_radix_and_array_ctor() {
+        // Number.toString(radix).
+        assert_eq!(run_ok("console.log((255).toString(16), (255).toString(2), (10).toString())"), vec!["ff 11111111 10"]);
+        assert_eq!(run_ok("console.log((-42).toString(16), (35).toString(36), (3735928559).toString(16))"), vec!["-2a z deadbeef"]);
+        // new Array(n) → n holes; new Array(a,b,…) / Array(...) → the args.
+        assert_eq!(run_ok("console.log(new Array(3).length, new Array(3).fill(0).join(','))"), vec!["3 0,0,0"]);
+        assert_eq!(run_ok("console.log(new Array(1,2,3).join(','), Array(4,5).join(','))"), vec!["1,2,3 4,5"]);
+        assert_eq!(run_ok("console.log(Array(3).fill(7).map((x,i)=>x+i).join(','))"), vec!["7,8,9"]);
+        // Invalid length throws a RangeError; new Object()/Object() → {}.
+        assert_eq!(run_ok("let e='ok'; try{ new Array(-1); }catch(x){ e='threw'; } console.log(e)"), vec!["threw"]);
+        assert_eq!(run_ok("let o=new Object(); o.x=1; console.log(o.x, JSON.stringify(Object()))"), vec!["1 {}"]);
+    }
+
+    #[test]
     fn static_builtins() {
         // Array.from over array / string / array-like, with and without a map fn.
         assert_eq!(run_ok("console.log(Array.from([1,2,3],x=>x*2).join(','))"), vec!["2,4,6"]);

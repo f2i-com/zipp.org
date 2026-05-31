@@ -940,6 +940,21 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
+                    Instr::ArrayCtor { dst, arg_base, argc } => {
+                        let arr = if argc == 1 && self.get(base, arg_base).is_number() {
+                            // `Array(n)` → n empty slots (undefined).
+                            let n = self.get(base, arg_base).as_f64();
+                            if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
+                                return Err(Thrown("RangeError: Invalid array length".into()));
+                            }
+                            vec![Value::UNDEFINED; n as usize]
+                        } else {
+                            (0..argc).map(|i| self.get(base, arg_base + i)).collect()
+                        };
+                        let v = Value::heap(self.heap.alloc(HeapObj::Array(arr)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::CallSpread { dst, callee, args } => {
                         let callee_v = self.get(base, callee);
                         let args_v = self.get(base, args);
@@ -2362,9 +2377,16 @@ impl<'p> Vm<'p> {
                 let digits = args.first().map(|a| a.as_f64() as usize).unwrap_or(0).min(100);
                 Ok(Some(self.alloc_str(format!("{n:.digits$}"))))
             }
-            // Base-10 uses the engine's canonical number rendering for node
-            // parity; a radix argument (toString(2|16|…)) is out of v1 scope.
-            "toString" => Ok(Some(self.alloc_str(self.display(recv)))),
+            "toString" => {
+                let radix = args.first().map(|a| a.as_f64() as u32).unwrap_or(10);
+                // Base 10 (or a default/out-of-range radix) uses the engine's
+                // canonical rendering; 2..=36 do an integer-radix conversion.
+                if radix == 10 || !(2..=36).contains(&radix) {
+                    Ok(Some(self.alloc_str(self.display(recv))))
+                } else {
+                    Ok(Some(self.alloc_str(num_to_radix(n, radix))))
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -3899,6 +3921,35 @@ fn num_is_safe_integer(v: Value) -> bool {
         let n = if v.is_int() { v.as_int() as f64 } else { v.as_f64() };
         n.abs() <= 9_007_199_254_740_991.0
     }
+}
+
+/// `Number.prototype.toString(radix)` for `radix` in 2..=36. Renders the integer
+/// part in the given base (matching JS for whole numbers; a fractional part is
+/// truncated — full fractional-radix rendering is out of the subset). NaN and
+/// ±Infinity render via the canonical path (handled by the caller for radix 10).
+fn num_to_radix(n: f64, radix: u32) -> String {
+    if n.is_nan() {
+        return "NaN".into();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    let neg = n < 0.0;
+    let mut int = n.abs().trunc() as u64;
+    if int == 0 {
+        return "0".into();
+    }
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut buf = Vec::new();
+    while int > 0 {
+        buf.push(DIGITS[(int % radix as u64) as usize]);
+        int /= radix as u64;
+    }
+    if neg {
+        buf.push(b'-');
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap()
 }
 
 /// JS `ToInt32`: truncate toward zero, take modulo 2^32, interpret as signed.

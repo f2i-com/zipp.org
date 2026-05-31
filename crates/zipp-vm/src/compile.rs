@@ -1608,6 +1608,16 @@ impl<'a> FnCompiler<'a> {
                     if let Some(kind) = error_ctor(&id.name) {
                         return self.build_error(kind, n.arguments.first(), dst);
                     }
+                    // `new Array(…)` / `new Object()` builtins (no real global).
+                    if id.name == "Array" {
+                        let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
+                        self.emit(Instr::ArrayCtor { dst, arg_base, argc });
+                        return Ok(dst);
+                    }
+                    if id.name == "Object" && n.arguments.is_empty() {
+                        self.emit(Instr::NewObject { dst });
+                        return Ok(dst);
+                    }
                 }
                 // General `new C(args)`: evaluate the constructor value, then the
                 // args (contiguous), and let the VM build the instance.
@@ -2536,6 +2546,16 @@ impl<'a> FnCompiler<'a> {
             if let Some(op) = crate::bytecode::GlobalFn::from_name(&id.name) {
                 let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
                 self.emit(Instr::GlobalFn { dst, op, arg_base, argc });
+                return Ok(dst);
+            }
+            // Bare `Array(…)` / `Object()` behave like their `new` forms.
+            if id.name == "Array" {
+                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                self.emit(Instr::ArrayCtor { dst, arg_base, argc });
+                return Ok(dst);
+            }
+            if id.name == "Object" && c.arguments.is_empty() {
+                self.emit(Instr::NewObject { dst });
                 return Ok(dst);
             }
         }
