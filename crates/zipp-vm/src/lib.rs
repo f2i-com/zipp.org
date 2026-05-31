@@ -853,6 +853,18 @@ mod tests {
     }
 
     #[test]
+    fn default_parameters() {
+        // Applied only when the arg is missing/undefined (null does NOT trigger it).
+        assert_eq!(run_ok("function f(x=5){return x} console.log(f(), f(9), f(undefined))"), vec!["5 9 5"]);
+        assert_eq!(run_ok("function z(x=1){return x} console.log(z(null), z(0))"), vec!["null 0"]);
+        // A later default may reference an earlier parameter.
+        assert_eq!(run_ok("function g(a,b=10,c=a+b){return a+','+b+','+c} console.log(g(1), g(1,2))"), vec!["1,10,11 1,2,3"]);
+        // Arrow defaults; and a defaulted parameter captured by a closure.
+        assert_eq!(run_ok("let h=(x=7)=>x*2; console.log(h(), h(4))"), vec!["14 8"]);
+        assert_eq!(run_ok("function cap(n=3){return ()=>n} console.log(cap()(), cap(8)())"), vec!["3 8"]);
+    }
+
+    #[test]
     fn array_is_array() {
         assert_eq!(
             run_ok("console.log(Array.isArray([]), Array.isArray([1]), Array.isArray(1), Array.isArray('x'), Array.isArray({}), Array.isArray(null))"),

@@ -99,6 +99,7 @@ impl Compiler {
         let top = self.compile_function_body(
             None,
             &[],
+            None,
             &prog.body,
             true,
             HashSet::new(),
@@ -114,6 +115,7 @@ impl Compiler {
         &mut self,
         name: Option<&str>,
         params: &[String],
+        params_ast: Option<&ox::FormalParameters>,
         body: &[ox::Statement],
         is_script: bool,
         captured: HashSet<String>,
@@ -121,6 +123,12 @@ impl Compiler {
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params, captured, enclosing);
         fc.is_script = is_script;
+
+        // Apply default parameter values (`function f(x = expr)`) before the body:
+        // for each defaulted param, `if (x === undefined) x = expr`.
+        if let Some(pa) = params_ast {
+            fc.emit_param_defaults(pa)?;
+        }
 
         // Hoist function declarations in this body so calls resolve before the
         // textual definition. Top-level names become globals (the VM
@@ -167,6 +175,7 @@ impl Compiler {
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params, captured, enclosing);
+        fc.emit_param_defaults(&a.params)?;
         if a.expression {
             // `x => expr`: the body is a single ExpressionStatement to return.
             let mut returned = false;
@@ -557,6 +566,7 @@ impl<'a> FnCompiler<'a> {
         let mut proto = self.cx.compile_function_body(
             name.as_deref(),
             &params,
+            Some(&f.params),
             body,
             false,
             captured,
@@ -614,6 +624,7 @@ impl<'a> FnCompiler<'a> {
         let proto = self.cx.compile_function_body(
             name.as_deref(),
             &params,
+            Some(&f.params),
             body,
             false,
             captured,
@@ -633,6 +644,10 @@ impl<'a> FnCompiler<'a> {
         for item in &a.params.items {
             match &item.pattern {
                 ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
+                ox::BindingPattern::AssignmentPattern(ap) => match &ap.left {
+                    ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
+                    _ => return Err("destructuring parameters are not in the zipp-vm subset yet".into()),
+                },
                 _ => return Err("arrow parameter patterns not in the zipp-vm subset yet".into()),
             }
         }
@@ -1328,6 +1343,44 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// Emit default-value init for `x = default` parameters: `if (x === undefined)
+    /// x = default`. Runs once at function entry, before the body. Param regs are
+    /// already bound (captured ones boxed), so reads/writes go through resolve +
+    /// load_binding/store_binding (handling plain locals and cells uniformly).
+    fn emit_param_defaults(&mut self, params: &ox::FormalParameters) -> R<()> {
+        for item in &params.items {
+            // oxc stores a parameter default in `initializer` (the pattern stays a
+            // plain BindingIdentifier), e.g. `function f(x = 5)`.
+            let default = match &item.initializer {
+                Some(d) => d,
+                None => continue,
+            };
+            let name = match &item.pattern {
+                ox::BindingPattern::BindingIdentifier(id) => id.name.to_string(),
+                _ => continue, // destructuring patterns aren't in the subset
+            };
+            let b = self.resolve(&name);
+            let save = self.next_reg;
+            let prtmp = self.alloc_reg();
+            let pr = self.load_binding(&b, prtmp);
+            let undef = self.alloc_reg();
+            self.emit(Instr::LoadUndefined { dst: undef });
+            let cond = self.alloc_reg();
+            self.emit(Instr::Eq { dst: cond, a: pr, b: undef });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse { cond, target: 0 }); // skip when x !== undefined
+            let dtmp = self.alloc_reg();
+            let dv = self.expr_into(default, dtmp)?;
+            self.store_binding(&b, dv);
+            let end = self.here();
+            self.patch_jump(jf, end);
+            // The init temps are dead before the body; reclaim them (max_reg has
+            // already captured the high-water) so body locals reuse the registers.
+            self.next_reg = save;
+        }
+        Ok(())
+    }
+
     fn assign(&mut self, a: &ox::AssignmentExpression, dst: Reg) -> R<Reg> {
         use ox::AssignmentOperator as Op;
         // Member-target assignment: `obj.x = v` / `arr[i] = v`. Only plain
@@ -1712,6 +1765,12 @@ fn function_parts<'a>(f: &'a ox::Function) -> R<(Vec<String>, &'a [ox::Statement
     for item in &f.params.items {
         match &item.pattern {
             ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
+            // `x = default` — bind the name here; the default is applied at the
+            // function entry by compile_function_body's emit_param_defaults.
+            ox::BindingPattern::AssignmentPattern(ap) => match &ap.left {
+                ox::BindingPattern::BindingIdentifier(id) => params.push(id.name.to_string()),
+                _ => return Err("destructuring parameters are not in the zipp-vm subset yet".into()),
+            },
             _ => return Err("parameter patterns are not in the zipp-vm v1 subset yet".into()),
         }
     }
