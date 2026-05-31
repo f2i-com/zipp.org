@@ -513,21 +513,29 @@ byte-identical to node):
 
 | workload | V8 | zipp | ratio |
 |---|---|---|---|
+| 2M `arr.push(i)` loop | 16 ms | 10 ms | **0.65× (beats V8)** |
 | 100k comparator sort | 10.3 ms | 9.8 ms | **0.95× (beats V8)** |
 | 100M integer loop | 50 ms | 53 ms | **1.06× (parity)** |
-| 2M array map→filter→reduce + push | 55 ms | 71 ms | 1.29× |
+| 2M `charCodeAt` scan loop | 0.5 ms | 2.0 ms | 4.0× (sub-ms) |
+| 2M array map→filter→reduce | 55 ms | 91 ms | 1.64× |
 | 4M object field read/write | 3.8 ms | 7.8 ms | 2.05× |
 | fib(37) recursion | 139 ms | 381 ms | 2.74× |
 | 100k string concat + scan | 5.4 ms | 15 ms | 2.80× |
 
-zipp **beats V8 on the comparator sort** (native-callback comparator + O(n log n)
-merge sort) and **ties on the integer loop** (native int64 OSR JIT); it's within
-~1.3× on array work and ~2× on object work. It still trails on deep recursion (a
-per-call native↔interpreter round-trip — a fully native call frame is future
-work) and string-scan loops (`s[i]`/`===` still run interpreted; a string-aware
-JIT region is future work). **Startup is ~10× faster** (≈22 ms vs ≈216 ms — no V8
-snapshot/warmup), so end-to-end (incl. startup) zipp finishes every benchmark
-first. Run `bench/run.sh` to reproduce.
+zipp **beats V8 on `push`-heavy loops** (builtin method calls like `push` and
+`charCodeAt` now JIT inside OSR regions via direct helper calls — no
+interpreter round-trip) and **on the comparator sort** (native-callback
+comparator + O(n log n) merge sort), and **ties on the integer loop** (native
+int64 OSR JIT). It trails on: the array pipeline (`map`/`filter`/`reduce` call
+the JIT-compiled callback once per element through a native register window —
+correct and call-free to set up, but V8 *inlines* the callback body into the
+loop; callback inlining is the remaining lever); object field access (~2×);
+deep recursion (a per-call native↔interpreter round-trip — a fully native call
+frame is future work); and string-scan loops (`s[i]===c` stays interpreted —
+the region's `===` is monomorphic-numeric, so routing it through a polymorphic
+string-aware compare is future work). **Startup is ~10× faster** (≈21 ms vs
+≈218 ms — no V8 snapshot/warmup), so end-to-end (incl. startup) zipp finishes
+every benchmark first. Run `bench/run.sh` to reproduce.
 
 ## License
 
