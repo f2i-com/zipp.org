@@ -97,7 +97,11 @@ pub enum HeapObj {
     Object(ObjMap),
 }
 
-#[derive(Default)]
+/// Heap index of the interned empty string. The 128 single-ASCII-char strings
+/// occupy indices `0..128`; the empty string is `128`; user objects start at
+/// `129` (see [`Heap::new`]).
+pub const INTERN_EMPTY: u32 = 128;
+
 pub struct Heap {
     objs: Vec<HeapObj>,
     /// Per-object version, parallel to `objs` (one `u32` per heap object). Bumped
@@ -108,9 +112,27 @@ pub struct Heap {
     versions: Vec<u32>,
 }
 
+impl Default for Heap {
+    fn default() -> Self {
+        Heap::new()
+    }
+}
+
 impl Heap {
     pub fn new() -> Heap {
-        Heap { objs: Vec::new(), versions: Vec::new() }
+        // Pre-intern the 128 single-ASCII-char strings (indices 0..128) and the
+        // empty string (index 128). These are immutable and ubiquitous — every
+        // `s[i]` and every `s += <digit>` produces one — so sharing a single
+        // heap slot eliminates per-iteration allocation in string loops.
+        let mut objs = Vec::with_capacity(160);
+        let mut versions = Vec::with_capacity(160);
+        for b in 0u8..128 {
+            objs.push(HeapObj::Str(JsStr { bytes: (b as char).to_string(), char_len: 1, ascii: true }));
+            versions.push(0);
+        }
+        objs.push(HeapObj::Str(JsStr { bytes: String::new(), char_len: 0, ascii: true }));
+        versions.push(0);
+        Heap { objs, versions }
     }
 
     #[inline]
@@ -158,6 +180,19 @@ impl Heap {
 
     #[inline]
     pub fn alloc_str(&mut self, s: String) -> u32 {
+        // Reuse the interned slot for the empty string and single-ASCII-char
+        // strings instead of allocating (see `Heap::new`). Safe because strings
+        // are immutable — nothing ever mutates a heap string in place.
+        match s.len() {
+            0 => return INTERN_EMPTY,
+            1 => {
+                let b = s.as_bytes()[0];
+                if b < 128 {
+                    return b as u32;
+                }
+            }
+            _ => {}
+        }
         self.alloc(HeapObj::Str(JsStr::new(s)))
     }
 
