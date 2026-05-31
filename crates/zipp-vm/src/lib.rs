@@ -1325,6 +1325,25 @@ mod tests {
     }
 
     #[test]
+    fn array_string_methods_batch2() {
+        // flatMap (map + flatten one level; empty array => filter out).
+        assert_eq!(run_ok("console.log([1,2,3].flatMap(x=>[x,x*2]).join(','))"), vec!["1,2,2,4,3,6"]);
+        assert_eq!(run_ok("console.log([1,2,3].flatMap(x=>x%2?[x]:[]).join(','))"), vec!["1,3"]);
+        // Immutable toSorted / toReversed leave the receiver unchanged.
+        assert_eq!(run_ok("let a=[3,1,2]; let b=a.toSorted((x,y)=>x-y); console.log(b.join(','), a.join(','))"), vec!["1,2,3 3,1,2"]);
+        assert_eq!(run_ok("let a=[1,2,3]; console.log(a.toReversed().join(','), a.join(','))"), vec!["3,2,1 1,2,3"]);
+        // findLast / findLastIndex.
+        assert_eq!(run_ok("console.log([1,2,3,4].findLast(x=>x<3), [1,2,3,4].findLastIndex(x=>x<3))"), vec!["2 1"]);
+        // splice: remove+insert (returns removed), insert-only, negative start.
+        assert_eq!(run_ok("let a=[1,2,3,4,5]; let r=a.splice(1,2,9,9,9); console.log(r.join(','), a.join(','))"), vec!["2,3 1,9,9,9,4,5"]);
+        assert_eq!(run_ok("let a=[1,2,3]; a.splice(1,0,'x'); console.log(a.join(','))"), vec!["1,x,2,3"]);
+        assert_eq!(run_ok("let a=[1,2,3]; console.log(a.splice(-1).join(','), a.join(','))"), vec!["3 1,2"]);
+        // String indexOf honors a start position; codePointAt.
+        assert_eq!(run_ok("console.log('abcabc'.indexOf('c',3), 'abcabc'.indexOf('a',1))"), vec!["5 3"]);
+        assert_eq!(run_ok("console.log('Hello'.codePointAt(0), 'Hi'.codePointAt(5))"), vec!["72 undefined"]);
+    }
+
+    #[test]
     fn array_methods_more() {
         assert_eq!(run_ok("let a=[1,2,3]; a.reverse(); console.log(a.join(','))"), vec!["3,2,1"]);
         assert_eq!(run_ok("console.log([1,2].concat([3,4],5,[6]).join(','))"), vec!["1,2,3,4,5,6"]);

@@ -3482,6 +3482,78 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::heap(idx)))
             }
+            "flatMap" => {
+                // map(cb) then flatten one level (array results spliced in).
+                let cb = arg0;
+                let snapshot = self.array_snapshot(idx);
+                let mut out: Vec<Value> = Vec::new();
+                for (i, v) in snapshot.iter().enumerate() {
+                    let r = self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
+                    if r.is_heap() {
+                        if let HeapObj::Array(items) = self.heap.get(r.heap_index()) {
+                            out.extend(items.iter().copied());
+                            continue;
+                        }
+                    }
+                    out.push(r);
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "findLast" | "findLastIndex" => {
+                let cb = arg0;
+                let snapshot = self.array_snapshot(idx);
+                for i in (0..snapshot.len()).rev() {
+                    let v = snapshot[i];
+                    let r = self.call_value(cb, Value::UNDEFINED, &[v, Value::int(i as i32)])?;
+                    if self.truthy(r) {
+                        return Ok(Some(if name == "findLast" {
+                            v
+                        } else {
+                            Value::int(i as i32)
+                        }));
+                    }
+                }
+                Ok(Some(if name == "findLast" { Value::UNDEFINED } else { Value::int(-1) }))
+            }
+            "toSorted" => {
+                // Like sort() but returns a NEW array; the receiver is unchanged.
+                let cmp = arg0;
+                let mut snapshot = self.array_snapshot(idx);
+                if cmp.is_heap() && self.heap.as_callable(cmp.heap_index()).is_some() {
+                    self.comparator_sort(&mut snapshot, cmp)?;
+                } else {
+                    snapshot.sort_by(|a, b| self.display(*a).cmp(&self.display(*b)));
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(snapshot)))))
+            }
+            "toReversed" => {
+                let mut snapshot = self.array_snapshot(idx);
+                snapshot.reverse();
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(snapshot)))))
+            }
+            "splice" => {
+                // splice(start, deleteCount?, ...items): mutate in place, return
+                // the removed elements (start may be negative).
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
+                let s = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
+                let start = if s < 0 { (len as i64 + s).max(0) as usize } else { (s as usize).min(len) };
+                let del = if args.len() < 2 {
+                    len - start
+                } else {
+                    let d = if args[1].is_number() { args[1].as_f64() as i64 } else { 0 };
+                    (d.max(0) as usize).min(len - start)
+                };
+                let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
+                let removed: Vec<Value> = match self.heap.get_mut(idx) {
+                    HeapObj::Array(items) => items.splice(start..start + del, insert).collect(),
+                    _ => Vec::new(),
+                };
+                self.heap.bump_version(idx); // length/contents changed
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(removed)))))
+            }
             _ => Ok(None),
         }
     }
@@ -3572,8 +3644,28 @@ impl<'p> Vm<'p> {
             }
             "indexOf" => {
                 let needle = self.display(arg0);
-                let pos = s.find(&needle).map(|b| s[..b].chars().count() as i32).unwrap_or(-1);
+                // Optional fromIndex (a char position) to start searching at.
+                let from = if args.len() >= 2 && args[1].is_number() {
+                    args[1].as_f64().max(0.0) as usize
+                } else {
+                    0
+                };
+                let byte_from = s.char_indices().nth(from).map(|(b, _)| b).unwrap_or(s.len());
+                let pos = s[byte_from..]
+                    .find(&needle)
+                    .map(|b| s[..byte_from + b].chars().count() as i32)
+                    .unwrap_or(-1);
                 Ok(Some(Value::int(pos)))
+            }
+            "codePointAt" => {
+                // Engine strings are Unicode scalars, so the code point at index i
+                // is just the i-th char's value; out of range → undefined.
+                let i = arg0.as_f64() as i32;
+                let cp = if i >= 0 { s.chars().nth(i as usize) } else { None };
+                Ok(Some(match cp {
+                    Some(c) => Value::int(c as i32),
+                    None => Value::UNDEFINED,
+                }))
             }
             "includes" => {
                 let needle = self.display(arg0);
