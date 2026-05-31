@@ -101,6 +101,14 @@ pub enum Instr {
     /// `parent` is the register holding the superclass value (`extends P`), or
     /// `None`; the new class links to it for inherited lookup + instanceof.
     MakeClass { dst: Reg, class_id: u32, parent: Option<Reg> },
+    /// `dst = yield val` — suspend the current generator, handing `val` out as
+    /// the yielded value. On resume the value passed to `.next(v)` lands in `dst`.
+    Yield { dst: Reg, val: Reg },
+    /// for-of step: advance over `iter` (array/string/Map/Set positionally with
+    /// the cursor in `idx`, or a generator via `.next()` ignoring `idx`). Writes
+    /// the next element to `value_dst` and a bool to `done_dst`. Throws if `iter`
+    /// is not iterable.
+    IterNext { value_dst: Reg, done_dst: Reg, iter: Reg, idx: Reg },
     /// `super(args…)`: run the lexical superclass's constructor contribution on
     /// the current `this` (reg 0). `parent_class_id` identifies the superclass.
     SuperCtor { parent_class_id: u32, arg_base: Reg, argc: u16 },
@@ -249,6 +257,9 @@ pub struct FuncProto {
     /// or `None`. The VM gathers args beyond `param_count` into a fresh array
     /// and stores it here at call setup. Always `param_count + 1` when present.
     pub rest_reg: Option<u16>,
+    /// True for a `function*` generator body: calling it builds a suspended
+    /// Generator object instead of running, and it is never whole-function JITed.
+    pub is_generator: bool,
     pub constants: Vec<Value>,
     /// Heap-string constants referenced by `LoadConst` need their text; this
     /// parallels `constants` for the string case (resolved at load time).

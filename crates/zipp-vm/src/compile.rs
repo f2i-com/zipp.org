@@ -123,6 +123,7 @@ impl Compiler {
             None,
             &prog.body,
             true,
+            false, // top-level script is not a generator
             HashSet::new(),
             Vec::new(),
         )?;
@@ -132,6 +133,7 @@ impl Compiler {
 
     /// Compile a function (or the script top-level when `is_script`).
     /// `params` are parameter names; `body` are its statements.
+    #[allow(clippy::too_many_arguments)]
     fn compile_function_body(
         &mut self,
         name: Option<&str>,
@@ -140,11 +142,13 @@ impl Compiler {
         params_ast: Option<&ox::FormalParameters>,
         body: &[ox::Statement],
         is_script: bool,
+        is_generator: bool,
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.is_script = is_script;
+        fc.in_generator = is_generator;
 
         // Apply default parameter values (`function f(x = expr)`) before the body:
         // for each defaulted param, `if (x === undefined) x = expr`.
@@ -182,6 +186,7 @@ impl Compiler {
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
+            is_generator,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
@@ -241,6 +246,7 @@ impl Compiler {
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
+            is_generator: false,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -294,6 +300,7 @@ impl Compiler {
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
+            is_generator: false,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -336,6 +343,7 @@ fn placeholder(name: &str) -> FuncProto {
         reg_count: 0,
         param_count: 0,
         rest_reg: None,
+        is_generator: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
         name_global: None,
@@ -359,6 +367,8 @@ struct FnCompiler<'a> {
     /// When compiling a class method/constructor whose class `extends P`, the
     /// class_id of `P` — so `super(…)` / `super.m(…)` resolve to its members.
     super_class: Option<u32>,
+    /// True while compiling a `function*` body, so `yield` is allowed.
+    in_generator: bool,
     /// True for the top-level script body: declarations (functions AND
     /// let/const/var) bind to globals rather than registers, so only genuinely
     /// nested functions ever capture.
@@ -421,6 +431,7 @@ impl<'a> FnCompiler<'a> {
             max_reg: 0,
             rest_reg: None,
             super_class: None,
+            in_generator: false,
             is_script: false,
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
@@ -886,6 +897,7 @@ impl<'a> FnCompiler<'a> {
             Some(&f.params),
             body,
             false,
+            f.generator,
             captured,
             enclosing,
         )?;
@@ -1045,6 +1057,9 @@ impl<'a> FnCompiler<'a> {
         let mut static_fields: Vec<(String, Option<&'b ox::Expression<'b>>)> = Vec::new();
         for el in &class.body.body {
             match el {
+                ox::ClassElement::MethodDefinition(m) if m.value.generator => {
+                    return Err("generator methods are not in the zipp-vm subset yet".into());
+                }
                 ox::ClassElement::MethodDefinition(m) => match (m.r#static, m.kind) {
                     (true, ox::MethodDefinitionKind::Method) => {
                         statics.push((class_key_name(&m.key)?, &m.value));
@@ -1186,6 +1201,7 @@ impl<'a> FnCompiler<'a> {
             Some(&f.params),
             body,
             false,
+            f.generator,
             captured,
             enclosing,
         )?;
@@ -1488,15 +1504,14 @@ impl<'a> FnCompiler<'a> {
         let pattern =
             decl_pat.filter(|p| !matches!(p, ox::BindingPattern::BindingIdentifier(_)));
 
-        // Evaluate the iterable into a stable scratch local.
+        // Evaluate the iterable into a stable scratch local; `idx` is the cursor
+        // IterNext advances for array/string/Map/Set (ignored for a generator,
+        // which it drives via `.next()`). One loop shape handles every iterable.
         let iter_reg = self.declare_local("<forof.iter>");
         let v = self.expr_into(&f.right, iter_reg)?;
         if v != iter_reg {
             self.emit(Instr::Move { dst: iter_reg, src: v });
         }
-        // Length and index counter.
-        let len_reg = self.declare_local("<forof.len>");
-        self.emit(Instr::LenOf { dst: len_reg, obj: iter_reg });
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
@@ -1515,40 +1530,30 @@ impl<'a> FnCompiler<'a> {
         };
 
         let top = self.here();
-        // while (idx < len)
-        let cond = self.temp();
-        self.emit(Instr::Lt { dst: cond, a: idx_reg, b: len_reg });
-        let jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond, target: 0 });
-        self.next_reg -= 1; // reclaim cond temp
-
-        // <binding> = iter[idx]
+        let save = self.next_reg;
+        let done = self.alloc_reg();
+        // Write the element straight into a plain-local loop var; use a temp for a
+        // destructuring pattern or a cell-boxed var (bound right after).
+        let elem = if pattern.is_some() || var_is_cell { self.alloc_reg() } else { var_reg };
+        self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter: iter_reg, idx: idx_reg });
+        let jdone = self.here();
+        self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
         if let Some(p) = pattern {
-            let save = self.next_reg;
-            let elem = self.alloc_reg();
-            self.emit(Instr::GetIndex { dst: elem, obj: iter_reg, key: idx_reg });
             self.extract_pattern(p, elem)?;
-            self.next_reg = save;
         } else if var_is_cell {
-            let tmp = self.temp();
-            self.emit(Instr::GetIndex { dst: tmp, obj: iter_reg, key: idx_reg });
-            self.emit(Instr::CellSet { cell: var_reg, src: tmp });
-            self.next_reg -= 1;
-        } else {
-            self.emit(Instr::GetIndex { dst: var_reg, obj: iter_reg, key: idx_reg });
+            self.emit(Instr::CellSet { cell: var_reg, src: elem });
         }
+        self.next_reg = save; // reclaim done + elem temps
 
         self.loop_ctx.push(LoopCtx::loop_frame());
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
-        let cont = self.here();
         for c in ctx.continue_jumps {
-            self.patch_jump(c, cont); // continue → increment + re-test
+            self.patch_jump(c, top); // continue → re-run IterNext (advance + test)
         }
-        self.emit(Instr::AddInt { dst: idx_reg, a: idx_reg, imm: 1 });
         self.emit(Instr::Jump { target: top });
         let end = self.here();
-        self.patch_jump(jf, end);
+        self.patch_jump(jdone, end);
         for b in ctx.break_jumps {
             self.patch_jump(b, end);
         }
@@ -1718,6 +1723,7 @@ impl<'a> FnCompiler<'a> {
             E::UpdateExpression(u) => self.update(u, dst),
             E::AssignmentExpression(a) => self.assign(a, dst),
             E::ConditionalExpression(c) => self.conditional(c, dst),
+            E::YieldExpression(y) => self.yield_expr(y, dst),
             E::CallExpression(c) => self.call(c, dst),
             E::NewExpression(n) => {
                 // `new Error(msg)` / `new TypeError(msg)` / `new RangeError(msg)`
@@ -2575,6 +2581,27 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
         }
+    }
+
+    fn yield_expr(&mut self, y: &ox::YieldExpression, dst: Reg) -> R<Reg> {
+        if !self.in_generator {
+            return Err("`yield` is only valid inside a generator (function*)".into());
+        }
+        if y.delegate {
+            return Err("yield* (delegation) is not in the zipp-vm subset yet".into());
+        }
+        // Evaluate the yielded value (undefined for a bare `yield`); on resume
+        // the value passed to `.next(v)` lands in `dst`.
+        let val = match &y.argument {
+            Some(e) => self.expr(e)?,
+            None => {
+                let t = self.temp();
+                self.emit(Instr::LoadUndefined { dst: t });
+                t
+            }
+        };
+        self.emit(Instr::Yield { dst, val });
+        Ok(dst)
     }
 
     fn conditional(&mut self, c: &ox::ConditionalExpression, dst: Reg) -> R<Reg> {

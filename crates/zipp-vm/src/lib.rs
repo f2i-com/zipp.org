@@ -1157,6 +1157,29 @@ mod tests {
     }
 
     #[test]
+    fn generators() {
+        // Manual next(): values then done; return value reported once.
+        assert_eq!(run_ok("function* g(){yield 1;yield 2} let it=g(); console.log(it.next().value,it.next().value,it.next().done)"), vec!["1 2 true"]);
+        assert_eq!(run_ok("function* g(){yield 1; return 9} let it=g(); console.log(JSON.stringify(it.next()),JSON.stringify(it.next()),JSON.stringify(it.next()))"), vec![r#"{"value":1,"done":false} {"value":9,"done":true} {"done":true}"#]);
+        // Empty generator; value sent into a yield expression.
+        assert_eq!(run_ok("function* g(){} console.log(g().next().done)"), vec!["true"]);
+        assert_eq!(run_ok("function* g(){let x=yield 1; yield x+10} let it=g(); console.log(it.next().value, it.next(5).value)"), vec!["1 15"]);
+        // for-of over a generator: direct call AND via a variable.
+        assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} let s=0; for(let x of g()) s+=x; console.log(s)"), vec!["6"]);
+        assert_eq!(run_ok("function* g(){yield 1;yield 2} let gen=g(); let r=[]; for(let x of gen) r.push(x); console.log(r.join(','))"), vec!["1,2"]);
+        // for-of destructuring a generator's elements.
+        assert_eq!(run_ok("function* g(){yield [1,2]; yield [3,4]} let r=[]; for(let [a,b] of g()) r.push(a+b); console.log(r.join(','))"), vec!["3,7"]);
+        // Infinite generator with break terminates (lazy pull).
+        assert_eq!(run_ok("function* nat(){let i=0; while(true) yield i++} let r=[]; for(let x of nat()){ if(x>=4) break; r.push(x); } console.log(r.join(','))"), vec!["0,1,2,3"]);
+        // Spread and Array.from drain a finite generator.
+        assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} console.log([...g()].join('-'), Array.from(g()).length)"), vec!["1-2-3 3"]);
+        // A generator using a captured outer variable + a range helper.
+        assert_eq!(run_ok("function* range(n){for(let i=0;i<n;i++) yield i*i} console.log([...range(4)].join(','))"), vec!["0,1,4,9"]);
+        // typeof and inspect.
+        assert_eq!(run_ok("function* g(){} console.log(typeof g, typeof g())"), vec!["function object"]);
+    }
+
+    #[test]
     fn map_basics() {
         assert_eq!(run_ok("let m=new Map(); m.set('a',1).set('b',2); console.log(m.get('a'),m.get('b'),m.size,m.has('a'),m.has('z'))"), vec!["1 2 2 true false"]);
         assert_eq!(run_ok("let m=new Map([['x',10],['y',20]]); console.log(m.get('x'),m.get('y'),m.size)"), vec!["10 20 2"]);

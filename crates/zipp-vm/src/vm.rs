@@ -20,7 +20,7 @@
 //! later make faster.
 
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
-use crate::heap::{Heap, HeapObj, ObjMap};
+use crate::heap::{GenState, Heap, HeapObj, ObjMap};
 use crate::value::Value;
 
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
@@ -99,6 +99,10 @@ pub struct Vm<'p> {
     /// exact thrown object/string/number, and survives propagation across
     /// nested `run_loop` invocations (builtin callbacks) until caught.
     pending_throw: Option<Value>,
+    /// Set by a `Yield` op to hand a generator's yielded value (+ the yield's
+    /// bytecode ip, for the resume point) back to `generator_method`, which
+    /// `.take()`s it to distinguish a suspension from a normal return.
+    pending_yield: Option<(Value, usize)>,
     /// Native JIT tier (x86-64 only, `feature = "jit"`). Compiles hot leaf
     /// integer functions to native code that shares this VM's register window;
     /// any non-int/heap/call op bails back to the interpreter at the exact ip.
@@ -161,6 +165,7 @@ impl<'p> Vm<'p> {
             errput: Vec::new(),
             start: std::time::Instant::now(),
             pending_throw: None,
+            pending_yield: None,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -383,6 +388,10 @@ impl<'p> Vm<'p> {
     /// still bounds total depth.
     fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         let (func_id, closure) = self.resolve_callable(callee)?;
+        // Calling a generator function builds a suspended Generator, not a frame.
+        if self.program.functions[func_id as usize].is_generator {
+            return Ok(self.alloc_generator(func_id, closure, this, args));
+        }
         if self.frames.len() >= MAX_FRAMES {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
@@ -527,7 +536,11 @@ impl<'p> Vm<'p> {
             // interpreter frames never reach MAX_FRAMES. Staying interpreted in
             // that subtree lets frames accumulate monotonically → RangeError.
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            if ip == 0 && self.jit_enabled && self.jit_recurse_depth == 0 {
+            if ip == 0
+                && self.jit_enabled
+                && self.jit_recurse_depth == 0
+                && !self.program.functions[func_id as usize].is_generator
+            {
                 if let Some((result, bail)) = self.try_run_jit(func_id, base) {
                     if bail == crate::codegen::NO_BAIL {
                         // Native code returned: behave like a `Return`.
@@ -840,6 +853,17 @@ impl<'p> Vm<'p> {
                         let aidx = self.get(base, arr).heap_index();
                         let vv = self.get(base, val);
                         if spread {
+                            // A generator is drained via the iterator protocol.
+                            if vv.is_heap()
+                                && matches!(self.heap.get(vv.heap_index()), HeapObj::Generator { .. })
+                            {
+                                let elems = self.iterate_to_vec(vv)?;
+                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                                    dst_items.extend(elems);
+                                }
+                                ip += 1;
+                                continue;
+                            }
                             // Materialize the spread source's elements (array/set →
                             // elements; string → chars; map → [k,v] entries) WITHOUT
                             // holding a heap borrow across the fresh allocations.
@@ -1469,6 +1493,15 @@ impl<'p> Vm<'p> {
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
                         let (fid, closure) = self.resolve_callable(callee_v)?;
+                        // A generator function returns a Generator object, unrun.
+                        if self.program.functions[fid as usize].is_generator {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let g = self.alloc_generator(fid, closure, Value::UNDEFINED, &argv);
+                            self.set(base, dst, g);
+                            ip += 1;
+                            continue;
+                        }
                         self.setup_call(
                             fid,
                             closure,
@@ -1502,6 +1535,15 @@ impl<'p> Vm<'p> {
                         // (a method on an object); call it with `this = recv`.
                         let prop = self.get_prop(recv, key)?;
                         let (fid, closure) = self.resolve_callable(prop)?;
+                        // A generator method returns a Generator object, unrun.
+                        if self.program.functions[fid as usize].is_generator {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let g = self.alloc_generator(fid, closure, recv, &argv);
+                            self.set(base, dst, g);
+                            ip += 1;
+                            continue;
+                        }
                         self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1)?;
                         break;
                     }
@@ -1538,6 +1580,63 @@ impl<'p> Vm<'p> {
                             return Ok(Value::UNDEFINED);
                         }
                         break;
+                    }
+                    Instr::Yield { val, .. } => {
+                        // Suspend the generator: pop the frame ENTRY but leave its
+                        // register window live at the top of `self.regs` so the
+                        // resumer (generator_method) can copy it back into the heap
+                        // Generator. The generator frame is always the top (and the
+                        // run_loop's stop frame) at a yield, so popping returns to
+                        // the resumer. `pending_yield` carries the value + this ip.
+                        let v = self.get(base, val);
+                        self.frames.pop();
+                        self.pending_yield = Some((v, ip));
+                        return Ok(v);
+                    }
+                    Instr::IterNext { value_dst, done_dst, iter, idx } => {
+                        let it = self.get(base, iter);
+                        if !it.is_heap() {
+                            return Err(Thrown(format!(
+                                "TypeError: {} is not iterable",
+                                self.display(it)
+                            )));
+                        }
+                        // A generator is driven by `.next()`; the cursor is unused.
+                        if matches!(self.heap.get(it.heap_index()), HeapObj::Generator { .. }) {
+                            let res = self
+                                .generator_method(it.heap_index(), "next", &[])?
+                                .unwrap_or(Value::UNDEFINED);
+                            let done = self.get_prop(res, "done")?;
+                            let val = self.get_prop(res, "value")?;
+                            self.set(base, value_dst, val);
+                            self.set(base, done_dst, done);
+                            ip += 1;
+                            continue;
+                        }
+                        // Array/Set element, string char, or Map [k,v] at the cursor.
+                        let cursor = array_index(self.get(base, idx)).unwrap_or(0);
+                        let len = match self.heap.get(it.heap_index()) {
+                            HeapObj::Array(items) => items.len(),
+                            HeapObj::Set(items) => items.len(),
+                            HeapObj::Str(s) => s.char_len,
+                            HeapObj::Cons { len, .. } => *len,
+                            HeapObj::Map { keys, .. } => keys.len(),
+                            _ => {
+                                return Err(Thrown(format!(
+                                    "TypeError: {} is not iterable",
+                                    self.display(it)
+                                )))
+                            }
+                        };
+                        if cursor < len {
+                            let val = self.get_index(it, Value::int(cursor as i32))?;
+                            self.set(base, value_dst, val);
+                            self.set(base, done_dst, Value::bool(false));
+                            self.set(base, idx, Value::int((cursor + 1) as i32));
+                        } else {
+                            self.set(base, done_dst, Value::bool(true));
+                        }
+                        ip += 1;
                     }
                 }
             }
@@ -1760,6 +1859,158 @@ impl<'p> Vm<'p> {
         self.frames[last].ip = caller_ip_next;
         self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new() });
         Ok(())
+    }
+
+    /// Calling a `function*` does NOT run its body — it allocates a suspended
+    /// Generator whose DETACHED register window holds `this` + the bound args
+    /// (incl. a rest array). Resumed later by `generator_method`.
+    fn alloc_generator(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
+        let proto = &self.program.functions[func_id as usize];
+        let reg_count = (proto.reg_count as usize).max(1);
+        let param_count = proto.param_count as usize;
+        let rest_reg = proto.rest_reg;
+        let mut regs = vec![Value::UNDEFINED; reg_count];
+        regs[0] = this;
+        let n = args.len().min(param_count);
+        regs[1..1 + n].copy_from_slice(&args[..n]);
+        if let Some(rr) = rest_reg {
+            let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
+            regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        Value::heap(self.heap.alloc(HeapObj::Generator {
+            func: func_id,
+            closure,
+            state: GenState::Suspended(0),
+            regs,
+        }))
+    }
+
+    /// Resume / query a generator (`gen.next(v)` / `gen.return(v)` / `gen.throw(e)`).
+    /// Returns an iterator-result object `{value, done}` (or propagates a throw).
+    fn generator_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let (state, fid, closure) = match self.heap.get(idx) {
+            HeapObj::Generator { state, func, closure, .. } => (*state, *func, *closure),
+            _ => return Ok(None),
+        };
+        match name {
+            "return" => {
+                // Complete the generator (v1 does not run finally blocks).
+                if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
+                    *state = GenState::Completed;
+                    regs.clear();
+                }
+                Ok(Some(self.iter_result(arg0, true)))
+            }
+            "throw" => {
+                if matches!(state, GenState::Completed) {
+                    return Err(Thrown(self.throw_message(arg0)));
+                }
+                // v1: complete the generator and surface the throw at the call
+                // site (no resume into a `try` inside the body).
+                if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
+                    *state = GenState::Completed;
+                    regs.clear();
+                }
+                self.pending_throw = Some(arg0);
+                Err(Thrown(self.throw_message(arg0)))
+            }
+            "next" => {
+                let resume_ip = match state {
+                    GenState::Completed => return Ok(Some(self.iter_result(Value::UNDEFINED, true))),
+                    GenState::Running => {
+                        return Err(Thrown("TypeError: generator is already running".into()))
+                    }
+                    GenState::Suspended(ip) => ip,
+                };
+                // Take the saved window out of the heap object and splice it onto
+                // the top of the live register file.
+                let saved = match self.heap.get_mut(idx) {
+                    HeapObj::Generator { state, regs, .. } => {
+                        *state = GenState::Running;
+                        std::mem::take(regs)
+                    }
+                    _ => return Ok(None),
+                };
+                let reg_count = saved.len();
+                let new_base = self.regs.len();
+                if self.regs_would_overflow(new_base + reg_count) {
+                    if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
+                        *state = GenState::Suspended(resume_ip);
+                        *regs = saved;
+                    }
+                    return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+                }
+                self.regs.extend_from_slice(&saved);
+                if new_base + reg_count > self.regs_hw {
+                    self.regs_hw = new_base + reg_count;
+                }
+                // First next() runs from ip 0; a later one resumes after the Yield,
+                // delivering the sent value into the yield expression's dst.
+                let ip = if resume_ip == 0 {
+                    0
+                } else {
+                    if let Instr::Yield { dst, .. } =
+                        self.program.functions[fid as usize].code[resume_ip]
+                    {
+                        self.regs[new_base + dst as usize] = arg0;
+                    }
+                    resume_ip + 1
+                };
+                let stop = self.frames.len();
+                self.frames.push(Frame {
+                    func: fid,
+                    base: new_base,
+                    ip,
+                    ret_dst: 0,
+                    closure,
+                    handlers: Vec::new(),
+                });
+                let outcome = self.run_loop(stop);
+                if let Some((y, yield_ip)) = self.pending_yield.take() {
+                    // Suspended: the window is still live at [new_base..]; park it.
+                    let back = self.regs.split_off(new_base);
+                    if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
+                        *state = GenState::Suspended(yield_ip);
+                        *regs = back;
+                    }
+                    return Ok(Some(self.iter_result(y, false)));
+                }
+                match outcome {
+                    Ok(ret) => {
+                        // Returned / fell off the end (pop_frame_with already truncated).
+                        if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
+                            *state = GenState::Completed;
+                            regs.clear();
+                        }
+                        Ok(Some(self.iter_result(ret, true)))
+                    }
+                    Err(t) => {
+                        self.regs.truncate(new_base);
+                        if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
+                            *state = GenState::Completed;
+                            regs.clear();
+                        }
+                        Err(t)
+                    }
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Build an iterator-result object `{ value, done }` (insertion order matches
+    /// the spec / node).
+    fn iter_result(&mut self, value: Value, done: bool) -> Value {
+        let mut map = ObjMap::new();
+        map.set("value", value);
+        map.set("done", Value::bool(done));
+        Value::heap(self.heap.alloc(HeapObj::Object(map)))
     }
 
     // ── property / index access ──
@@ -2090,9 +2341,9 @@ impl<'p> Vm<'p> {
                 }
                 Some(wrap_json(&parts, '{', '}', indent, depth))
             }
-            // A Map/Set has no enumerable own properties, so JSON.stringify
-            // renders it as an empty object (not omitted, unlike a function).
-            HeapObj::Map { .. } | HeapObj::Set(_) => Some("{}".into()),
+            // A Map/Set/Generator has no enumerable own properties, so
+            // JSON.stringify renders it as an empty object (not omitted).
+            HeapObj::Map { .. } | HeapObj::Set(_) | HeapObj::Generator { .. } => Some("{}".into()),
             _ => None,
         }
     }
@@ -2315,6 +2566,7 @@ impl<'p> Vm<'p> {
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
             HeapObj::Map { .. } => self.map_method(idx, name, args),
             HeapObj::Set(_) => self.set_method(idx, name, args),
+            HeapObj::Generator { .. } => self.generator_method(idx, name, args),
             _ => Ok(None),
         }
     }
@@ -2709,6 +2961,23 @@ impl<'p> Vm<'p> {
     /// arrays. Throws a TypeError for a non-iterable. Allocations happen after the
     /// heap borrow is released (two phases).
     fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        // A generator is drained eagerly via repeated next() (spread / Array.from
+        // produce a buffer; an infinite generator hangs here, matching V8).
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. }) {
+            let gidx = v.heap_index();
+            let mut out = Vec::new();
+            loop {
+                let res = self
+                    .generator_method(gidx, "next", &[])?
+                    .unwrap_or(Value::UNDEFINED);
+                let done = self.get_prop(res, "done")?;
+                if self.truthy(done) {
+                    break;
+                }
+                out.push(self.get_prop(res, "value")?);
+            }
+            return Ok(out);
+        }
         enum Plan {
             Vals(Vec<Value>),
             Chars(Vec<char>),
@@ -2754,7 +3023,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Str(_)
                 | HeapObj::Cons { .. }
                 | HeapObj::Set(_)
-                | HeapObj::Map { .. } => Kind::Iterable,
+                | HeapObj::Map { .. }
+                | HeapObj::Generator { .. } => Kind::Iterable,
                 HeapObj::Object(_) => Kind::Obj,
                 _ => Kind::Other,
             }
@@ -3642,6 +3912,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Class { name, .. } => format!("class {name} {{ }}"),
                 HeapObj::Map { .. } => "[object Map]".into(),
                 HeapObj::Set(_) => "[object Set]".into(),
+                HeapObj::Generator { .. } => "[object Generator]".into(),
             }
         } else {
             "undefined".into()
@@ -3740,6 +4011,7 @@ impl<'p> Vm<'p> {
                 let parts: Vec<String> = items.iter().map(|v| self.inspect_nested(*v)).collect();
                 format!("Set({}) {{ {} }}", items.len(), parts.join(", "))
             }
+            HeapObj::Generator { .. } => "Object [Generator] {}".into(),
         }
     }
 

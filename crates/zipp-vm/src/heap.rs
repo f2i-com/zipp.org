@@ -75,6 +75,17 @@ impl JsStr {
     }
 }
 
+/// A generator's execution state. `Suspended(ip)` parks at the bytecode index of
+/// the `Yield` that paused it (resume re-decodes that op to deliver the sent
+/// value into its `dst`, then continues at `ip + 1`); `ip == 0` is the
+/// not-yet-started state (the first `next()` runs from the top).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenState {
+    Suspended(usize),
+    Running,
+    Completed,
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -106,6 +117,12 @@ pub enum HeapObj {
     /// object, installs the methods as own properties, and runs the ctor with
     /// `this` = the new object. No prototype chain (methods are own props) and no
     /// inheritance in this subset.
+    /// A suspended generator (`function*`). Owns a DETACHED register window (off
+    /// the contiguous live `regs` Vec, so the JIT's pinned-capacity invariant
+    /// holds while parked); `func`/`closure` re-create the frame on resume, and
+    /// `state` carries the resume ip / completion. v1 does not preserve `try`
+    /// handlers across a yield.
+    Generator { func: u32, closure: u32, state: GenState, regs: Vec<Value> },
     /// A JS `Map`: insertion-ordered (key, value) entries with SameValueZero key
     /// equality. Parallel `keys`/`vals` Vecs (small Maps dominate; linear scan).
     Map { keys: Vec<Value>, vals: Vec<Value> },
