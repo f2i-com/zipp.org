@@ -2784,9 +2784,6 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn assign_object_target(&mut self, o: &ox::ObjectAssignmentTarget, src: Reg) -> R<()> {
-        if o.rest.is_some() {
-            return Err("object rest in destructuring assignment is not in the zipp-vm subset yet".into());
-        }
         for prop in &o.properties {
             let save = self.next_reg;
             match prop {
@@ -2808,6 +2805,31 @@ impl<'a> FnCompiler<'a> {
                     self.assign_maybe_default(&p.binding, val)?;
                 }
             }
+            self.next_reg = save;
+        }
+        // `({a, ...rest} = o)` — a new object of `src`'s own keys minus the
+        // siblings, assigned to the rest target (mirrors the declaration form).
+        if let Some(rest) = &o.rest {
+            let exclude_start = self.string_constants.len() as u32;
+            let mut exclude_count = 0u16;
+            for prop in &o.properties {
+                let key = match prop {
+                    ox::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                        p.binding.name.to_string()
+                    }
+                    ox::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                        class_key_name(&p.name).map_err(|_| {
+                            "object-rest with a computed sibling key is not in the subset"
+                        })?
+                    }
+                };
+                self.string_name(&key);
+                exclude_count += 1;
+            }
+            let save = self.next_reg;
+            let val = self.alloc_reg();
+            self.emit(Instr::ObjectRest { dst: val, src, exclude_start, exclude_count });
+            self.assign_target(&rest.target, val)?;
             self.next_reg = save;
         }
         Ok(())

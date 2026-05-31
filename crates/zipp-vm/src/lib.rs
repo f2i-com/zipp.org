@@ -1183,6 +1183,10 @@ mod tests {
         assert_eq!(run_ok("let a,b,c; [a,[b,c]]=[1,[2,3]]; console.log(a,b,c)"), vec!["1 2 3"]);
         // The assignment expression evaluates to the right-hand side.
         assert_eq!(run_ok("let a,b; let r=([a,b]=[1,2]); console.log(r.join(','))"), vec!["1,2"]);
+        // Object rest in an assignment target (own keys minus the siblings).
+        assert_eq!(run_ok("let a,rest; ({a,...rest}=({a:1,b:2,c:3})); console.log(a, JSON.stringify(rest))"), vec![r#"1 {"b":2,"c":3}"#]);
+        assert_eq!(run_ok("let x,others; ({a:x,...others}=({a:10,p:1,q:2})); console.log(x, JSON.stringify(others))"), vec![r#"10 {"p":1,"q":2}"#]);
+        assert_eq!(run_ok("let a,o={}; ({a,...o.bag}=({a:5,m:6})); console.log(a, JSON.stringify(o.bag))"), vec![r#"5 {"m":6}"#]);
     }
 
     #[test]
