@@ -1013,6 +1013,53 @@ const HOME_XMM_LAST: u8 = 15;
 /// in its body so they survive). 4 simultaneous bools.
 const BOOL_GPRS: [u8; 4] = [8, 9, 10, 11];
 
+/// A numeric value being allocated an xmm home: a VM register or a global slot.
+enum NumVal {
+    Reg(u16),
+    Glob(u32),
+}
+
+/// Tiny linear-scan xmm allocator: hands out home indices and reuses one once its
+/// interval has ended. Intervals MUST be supplied in ascending start order. Used
+/// only when one-home-per-value would overflow the pool (e.g. object SROA loops);
+/// reusing a register can cost ILP, so simpler loops keep distinct homes.
+struct XmmAlloc {
+    next: u8,                 // next never-used xmm index
+    active: Vec<(usize, u8)>, // (interval_end, xmm) currently live
+    free: Vec<u8>,            // homes freed by expired intervals, available to reuse
+}
+
+impl XmmAlloc {
+    fn new() -> XmmAlloc {
+        XmmAlloc { next: HOME_XMM_FIRST, active: Vec::new(), free: Vec::new() }
+    }
+
+    /// Allocate a home for the interval `[start, end]`, or `None` if the pool is
+    /// exhausted even after expiring intervals that ended before `start`.
+    fn alloc(&mut self, start: usize, end: usize) -> Option<u8> {
+        let mut i = 0;
+        while i < self.active.len() {
+            if self.active[i].0 < start {
+                self.free.push(self.active[i].1);
+                self.active.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        let x = if let Some(x) = self.free.pop() {
+            x
+        } else if self.next <= HOME_XMM_LAST {
+            let x = self.next;
+            self.next += 1;
+            x
+        } else {
+            return None;
+        };
+        self.active.push((end, x));
+        Some(x)
+    }
+}
+
 /// Plan register homes for `[start, end]`, or `None` to decline (use mem path).
 fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
     let code = &proto.code;
@@ -1171,53 +1218,129 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
     }
     hoist_ips.sort_unstable();
 
-    // Allocate homes. Numeric regs + globals share the xmm pool; bools use gprs.
-    let mut next_xmm = HOME_XMM_FIRST;
-    let mut next_bool = 0usize;
+    // Per-register live range [first_ip, last_ip] within the region (for linear-
+    // scan reuse). A live-in reg (used before defined) is loop-carried, so its
+    // value spans the whole region [s, e]; otherwise it lives from its first
+    // appearance to its last. Globals are loop-carried (whole region).
+    let mut first_ip: FxHashMap<u16, usize> = FxHashMap::default();
+    let mut last_ip: FxHashMap<u16, usize> = FxHashMap::default();
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        let ip = s + off;
+        let mut touch = |r: u16| {
+            first_ip.entry(r).or_insert(ip);
+            last_ip.insert(r, ip);
+        };
+        for u in instr_uses(instr) {
+            touch(u);
+        }
+        if let Some(d) = writes_reg(instr) {
+            touch(d);
+        }
+    }
+    let range = |r: u16| -> (usize, usize) {
+        // Whole-region (permanent home) if loop-carried (live-in, used before
+        // defined) OR a HOISTED constant — hoisted values are materialised once
+        // in the prologue and read every iteration, so their home must never be
+        // freed/reused mid-region (doing so clobbered them — a real bug).
+        if first_seen.get(&r) == Some(&false) || hoisted.contains(&r) {
+            (s, e)
+        } else {
+            (first_ip[&r], last_ip[&r])
+        }
+    };
+
+    // The xmm home pool size. If one-home-per-numeric-value fits, use the simple
+    // allocation (distinct home each — best ILP, what loop.js relies on). Only
+    // when it would OVERFLOW do we linear-scan-reuse homes for non-overlapping
+    // live ranges (lets bigger loops JIT, and is required for object SROA).
+    const POOL: usize = (HOME_XMM_LAST - HOME_XMM_FIRST + 1) as usize;
+    let n_numeric = reg_order.iter().filter(|r| ty[r] == VTy::Num).count() + glob_order.len();
+    let reuse = n_numeric > POOL;
+
+    // ── allocate xmm/gpr homes ──
     let mut reg_home: FxHashMap<u16, Home> = FxHashMap::default();
     let mut glob_home: FxHashMap<u32, u8> = FxHashMap::default();
+    if reuse {
+        // Linear-scan: numeric values (regs + globals) by ascending range start,
+        // reusing a home once a value's range ends. Loop-carried values (globals
+        // and live-in regs) span [s, e] and so keep a permanent home.
+        let mut intervals: Vec<(usize, usize, NumVal)> = Vec::new();
+        for &r in &reg_order {
+            if ty[&r] == VTy::Num {
+                let (a, b) = range(r);
+                intervals.push((a, b, NumVal::Reg(r)));
+            }
+        }
+        for &gi in &glob_order {
+            intervals.push((s, e, NumVal::Glob(gi)));
+        }
+        intervals.sort_by_key(|&(a, _, _)| a);
+        let mut alloc = XmmAlloc::new();
+        for (a, b, v) in intervals {
+            let x = alloc.alloc(a, b)?; // None ⇒ pool exhausted even with reuse
+            match v {
+                NumVal::Reg(r) => {
+                    reg_home.insert(r, Home::Xmm(x));
+                }
+                NumVal::Glob(gi) => {
+                    glob_home.insert(gi, x);
+                }
+            }
+        }
+    } else {
+        // One distinct home per numeric value (best ILP — what loop.js relies on).
+        let mut next_xmm = HOME_XMM_FIRST;
+        for &r in &reg_order {
+            if ty[&r] == VTy::Num {
+                if next_xmm > HOME_XMM_LAST {
+                    return None;
+                }
+                reg_home.insert(r, Home::Xmm(next_xmm));
+                next_xmm += 1;
+            }
+        }
+        for &gi in &glob_order {
+            if next_xmm > HOME_XMM_LAST {
+                return None;
+            }
+            glob_home.insert(gi, next_xmm);
+            next_xmm += 1;
+        }
+    }
+    // Bools (both modes): gpr homes; a live-in bool is unsupported.
+    let mut next_bool = 0usize;
+    for &r in &reg_order {
+        if ty[&r] == VTy::Bool {
+            if first_seen.get(&r) == Some(&false) || next_bool >= BOOL_GPRS.len() {
+                return None;
+            }
+            reg_home.insert(r, Home::Gpr(BOOL_GPRS[next_bool]));
+            next_bool += 1;
+        }
+    }
+
+    // ── derived lists from the final homes (unified for both modes) ──
+    // With reuse, several regs may share an xmm; flush_exit writes the shared
+    // value to each reg's slot, which is sound (non-overlapping live ranges mean
+    // the dead members are never read before being redefined).
     let mut num_regs = Vec::new();
     let mut bool_regs = Vec::new();
     let mut live_in_regs = Vec::new();
     for &r in &reg_order {
-        match ty[&r] {
-            VTy::Num => {
-                if next_xmm > HOME_XMM_LAST {
-                    return None; // out of xmm homes
-                }
-                let x = next_xmm;
-                next_xmm += 1;
-                reg_home.insert(r, Home::Xmm(x));
+        match reg_home[&r] {
+            Home::Xmm(x) => {
                 num_regs.push((r, x));
                 if first_seen.get(&r) == Some(&false) {
                     live_in_regs.push((r, x));
                 }
             }
-            VTy::Bool => {
-                // A live-in bool would need to be unboxed from the reg file at
-                // entry; not supported (bools are loop-ephemeral in practice).
-                if first_seen.get(&r) == Some(&false) {
-                    return None;
-                }
-                if next_bool >= BOOL_GPRS.len() {
-                    return None;
-                }
-                let g = BOOL_GPRS[next_bool];
-                next_bool += 1;
-                reg_home.insert(r, Home::Gpr(g));
-                bool_regs.push((r, g));
-            }
+            Home::Gpr(g) => bool_regs.push((r, g)),
         }
     }
     let mut globs = Vec::new();
     let mut live_in_globs = Vec::new();
     for &gi in &glob_order {
-        if next_xmm > HOME_XMM_LAST {
-            return None;
-        }
-        let x = next_xmm;
-        next_xmm += 1;
-        glob_home.insert(gi, x);
+        let x = glob_home[&gi];
         globs.push((gi, x));
         if glob_first_read.get(&gi) == Some(&true) {
             live_in_globs.push((gi, x));

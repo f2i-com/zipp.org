@@ -250,6 +250,18 @@ mod tests {
     }
 
     #[test]
+    fn regalloc_linear_scan_reuse_many_values() {
+        // A loop with far more numeric values (~33) than the 14-home pool, forcing
+        // linear-scan home REUSE. Hoisted constants (1..16) must keep permanent
+        // homes (a reused home would clobber them — a real bug this guards).
+        // s = sum_{i<100000} sum_{k=1..16}(i+k) = 16*sum(i) + 136*100000.
+        assert_jit_matches(
+            "let s=0; for(let i=0;i<100000;i++){ s += (i+1)+(i+2)+(i+3)+(i+4)+(i+5)+(i+6)+(i+7)+(i+8)+(i+9)+(i+10)+(i+11)+(i+12)+(i+13)+(i+14)+(i+15)+(i+16); } console.log(s)",
+            &["80012800000"],
+        );
+    }
+
+    #[test]
     fn heap_region_setprop_on_array_noops() {
         // Setting a property on an ARRAY is a silent no-op in this engine (only
         // plain Objects store props) — the JIT must match the interpreter (return
