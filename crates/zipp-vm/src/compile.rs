@@ -221,7 +221,18 @@ impl Compiler {
         is_generator: bool,
         is_async: bool,
     ) -> R<FuncProto> {
-        let mut fc = FnCompiler::new(self, params, rest, HashSet::new(), Vec::new());
+        // A nested closure in the method body may capture the method's own
+        // params/locals — they must be boxed. (Class methods don't close over an
+        // enclosing function in this subset, so the enclosing chain stays empty.)
+        let mut names: Vec<String> = params.to_vec();
+        if let Some(r) = rest {
+            names.push(r.to_string());
+        }
+        if let Some(pa) = params_ast {
+            names.extend(param_pattern_leaves(pa));
+        }
+        let captured = capture::captured_locals(&names, body);
+        let mut fc = FnCompiler::new(self, params, rest, captured, Vec::new());
         fc.super_class = super_class;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
@@ -1780,6 +1791,9 @@ impl<'a> FnCompiler<'a> {
         if v != iter_reg {
             self.emit(Instr::Move { dst: iter_reg, src: v });
         }
+        // Resolve a custom iterable's `@@iterator` to its iterator object; arrays/
+        // strings/Map/Set/generators pass through and iterate positionally.
+        self.emit(Instr::GetIterator { dst: iter_reg, src: iter_reg });
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
@@ -2100,6 +2114,21 @@ impl<'a> FnCompiler<'a> {
                 };
                 if let Some(v) = c {
                     self.load_number(dst, v);
+                    return Ok(dst);
+                }
+            }
+            // Well-known symbols map to a reserved string key (no real Symbol
+            // type): `Symbol.iterator` → "@@iterator". Lets `obj[Symbol.iterator]`
+            // and `{ [Symbol.iterator]() {} }` define/read the iteration method.
+            if o.name == "Symbol" {
+                let wk = match m.property.name.as_str() {
+                    "iterator" => Some("@@iterator"),
+                    "asyncIterator" => Some("@@asyncIterator"),
+                    _ => None,
+                };
+                if let Some(s) = wk {
+                    let idx = self.add_string_const(s);
+                    self.emit(Instr::LoadConst { dst, idx });
                     return Ok(dst);
                 }
             }
@@ -3534,6 +3563,20 @@ fn class_key_name(key: &ox::PropertyKey) -> R<String> {
         ox::PropertyKey::StaticIdentifier(id) => Ok(id.name.to_string()),
         ox::PropertyKey::StringLiteral(s) => Ok(s.value.to_string()),
         ox::PropertyKey::NumericLiteral(n) => Ok(fmt_key_num(n.value)),
+        // A computed well-known-symbol key, e.g. `[Symbol.iterator]() {}`, maps to
+        // the reserved string key (so a class can define the iteration method).
+        ox::PropertyKey::StaticMemberExpression(m) => {
+            if let ox::Expression::Identifier(o) = &m.object {
+                if o.name == "Symbol" {
+                    match m.property.name.as_str() {
+                        "iterator" => return Ok("@@iterator".into()),
+                        "asyncIterator" => return Ok("@@asyncIterator".into()),
+                        _ => {}
+                    }
+                }
+            }
+            Err("computed or private class member names are not in the zipp-vm subset yet".into())
+        }
         _ => Err("computed or private class member names are not in the zipp-vm subset yet".into()),
     }
 }

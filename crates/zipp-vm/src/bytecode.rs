@@ -265,6 +265,10 @@ pub enum Instr {
     SetRaw { arr: Reg, raw: Reg },
     /// `Math.random()` → a float in [0, 1) from the VM's PRNG.
     Random { dst: Reg },
+    /// Resolve the iterator of `src` for a `for-of`: if `src` has a `@@iterator`
+    /// method (a custom iterable) call it (this = src) → the iterator object; else
+    /// pass `src` through (arrays/strings/Map/Set/generators iterate directly).
+    GetIterator { dst: Reg, src: Reg },
 
     /// Return `src` from the current function.
     Return { src: Reg },

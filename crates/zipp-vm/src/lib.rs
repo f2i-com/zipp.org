@@ -1378,6 +1378,28 @@ mod tests {
     }
 
     #[test]
+    fn symbol_iterator_custom_iterables() {
+        // A custom-iterable object: for-of, spread, and Array.from all drive its
+        // `[Symbol.iterator]()`.
+        let range = "let range={from:1,to:4,[Symbol.iterator](){let c=this.from,e=this.to;return{next:()=>c<=e?{value:c++,done:false}:{done:true}}}};";
+        assert_eq!(run_ok(&format!("{range} let r=[]; for(let x of range) r.push(x); console.log(r.join(','))")), vec!["1,2,3,4"]);
+        assert_eq!(run_ok(&format!("{range} console.log([...range].join(','))")), vec!["1,2,3,4"]);
+        assert_eq!(run_ok(&format!("{range} console.log(Array.from(range).join(','))")), vec!["1,2,3,4"]);
+        // Lazy: a `break` stops pulling from an infinite iterator.
+        assert_eq!(
+            run_ok("let nat={[Symbol.iterator](){let i=0;return{next:()=>({value:i++,done:false})}}}; let o=[]; for(let n of nat){if(n>=4)break; o.push(n)} console.log(o.join(','))"),
+            vec!["0,1,2,3"]
+        );
+        // A class implementing the protocol (and a closure capturing a method local).
+        assert_eq!(
+            run_ok("class S{constructor(){this.xs=[1,2,3]} [Symbol.iterator](){let i=this.xs.length,s=this; return{next:()=>i>0?{value:s.xs[--i],done:false}:{done:true}}}} console.log([...new S()].join(','))"),
+            vec!["3,2,1"]
+        );
+        // `obj[Symbol.iterator]` reads the (inherited) method via computed access.
+        assert_eq!(run_ok(&format!("{range} console.log(typeof range[Symbol.iterator])")), vec!["function"]);
+    }
+
+    #[test]
     fn map_basics() {
         assert_eq!(run_ok("let m=new Map(); m.set('a',1).set('b',2); console.log(m.get('a'),m.get('b'),m.size,m.has('a'),m.has('z'))"), vec!["1 2 2 true false"]);
         assert_eq!(run_ok("let m=new Map([['x',10],['y',20]]); console.log(m.get('x'),m.get('y'),m.size)"), vec!["10 20 2"]);

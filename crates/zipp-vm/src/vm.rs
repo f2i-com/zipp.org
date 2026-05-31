@@ -948,9 +948,14 @@ impl<'p> Vm<'p> {
                         let aidx = self.get(base, arr).heap_index();
                         let vv = self.get(base, val);
                         if spread {
-                            // A generator is drained via the iterator protocol.
+                            // A generator or a custom iterable (object) is drained
+                            // via the iterator protocol (iterate_to_vec also errors
+                            // for a plain, non-iterable object, as a spread should).
                             if vv.is_heap()
-                                && matches!(self.heap.get(vv.heap_index()), HeapObj::Generator { .. })
+                                && matches!(
+                                    self.heap.get(vv.heap_index()),
+                                    HeapObj::Generator { .. } | HeapObj::Object(_)
+                                )
                             {
                                 let elems = self.iterate_to_vec(vv)?;
                                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
@@ -1843,6 +1848,12 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    Instr::GetIterator { dst, src } => {
+                        let s = self.get(base, src);
+                        let it = self.get_iterator(s)?;
+                        self.set(base, dst, it);
+                        ip += 1;
+                    }
                     Instr::Random { dst } => {
                         // xorshift64* → a uniform double in [0, 1) (top 53 bits).
                         let mut x = self.rng_state;
@@ -1923,6 +1934,21 @@ impl<'p> Vm<'p> {
                             self.set(base, done_dst, done);
                             ip += 1;
                             continue;
+                        }
+                        // A user iterator object (`@@iterator` already resolved by
+                        // GetIterator): pull the next result via `.next()`. Lazy —
+                        // a `break` simply stops calling it.
+                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_)) {
+                            let next = self.get_prop(it, "next")?;
+                            if self.is_callable(next) {
+                                let res = self.call_value(next, it, &[])?;
+                                let done = self.get_prop(res, "done")?;
+                                let val = self.get_prop(res, "value")?;
+                                self.set(base, value_dst, val);
+                                self.set(base, done_dst, done);
+                                ip += 1;
+                                continue;
+                            }
                         }
                         // Array/Set element, string char, or Map [k,v] at the cursor.
                         let cursor = array_index(self.get(base, idx)).unwrap_or(0);
@@ -2915,6 +2941,13 @@ impl<'p> Vm<'p> {
                 "TypeError: cannot read property of {}",
                 self.display(obj)
             )));
+        }
+        // Object index access is property access: delegate to `get_prop` so a
+        // computed key reaches inherited methods/getters (e.g. a class instance's
+        // `obj[Symbol.iterator]`), not just own data properties.
+        if matches!(self.heap.get(obj.heap_index()), HeapObj::Object(_)) {
+            let k = self.display(key);
+            return self.get_prop(obj, &k);
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Array(items) => {
@@ -3991,7 +4024,27 @@ impl<'p> Vm<'p> {
     /// string → its chars (as 1-char strings), a map → fresh `[key, value]` entry
     /// arrays. Throws a TypeError for a non-iterable. Allocations happen after the
     /// heap borrow is released (two phases).
+    /// Whether `v` is a user-callable value (function or closure).
+    fn is_callable(&self, v: Value) -> bool {
+        v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Func(_) | HeapObj::Closure { .. })
+    }
+
+    /// Resolve an iterable's iterator: a plain object with a `@@iterator` method
+    /// (a custom iterable) yields `obj[@@iterator]()`; everything else (arrays,
+    /// strings, Map/Set, generators) iterates directly and passes through.
+    fn get_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            let m = self.get_prop(v, "@@iterator")?;
+            if self.is_callable(m) {
+                return self.call_value(m, v, &[]);
+            }
+        }
+        Ok(v)
+    }
+
     fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        let v = self.get_iterator(v)?;
         // A generator is drained eagerly via repeated next() (spread / Array.from
         // produce a buffer; an infinite generator hangs here, matching V8).
         if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. }) {
@@ -4008,6 +4061,22 @@ impl<'p> Vm<'p> {
                 out.push(self.get_prop(res, "value")?);
             }
             return Ok(out);
+        }
+        // A user iterator object (one with a `next()` method): drain it.
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            let next = self.get_prop(v, "next")?;
+            if self.is_callable(next) {
+                let mut out = Vec::new();
+                loop {
+                    let res = self.call_value(next, v, &[])?;
+                    let done = self.get_prop(res, "done")?;
+                    if self.truthy(done) {
+                        break;
+                    }
+                    out.push(self.get_prop(res, "value")?);
+                }
+                return Ok(out);
+            }
         }
         enum Plan {
             Vals(Vec<Value>),
@@ -4065,15 +4134,21 @@ impl<'p> Vm<'p> {
         match kind {
             Kind::Iterable => elems = self.iterate_to_vec(src)?,
             Kind::Obj => {
-                // Array-like: read its `length`, then indices 0..length.
-                let len = self.get_prop(src, "length")?;
-                let n = if len.is_number() && len.as_f64() >= 0.0 {
-                    len.as_f64() as usize
+                // A custom iterable object (`@@iterator`) → iterate it; otherwise
+                // treat it as array-like (read `length`, then indices 0..length).
+                let it = self.get_prop(src, "@@iterator")?;
+                if self.is_callable(it) {
+                    elems = self.iterate_to_vec(src)?;
                 } else {
-                    0
-                };
-                for i in 0..n {
-                    elems.push(self.get_index(src, Value::int(i as i32))?);
+                    let len = self.get_prop(src, "length")?;
+                    let n = if len.is_number() && len.as_f64() >= 0.0 {
+                        len.as_f64() as usize
+                    } else {
+                        0
+                    };
+                    for i in 0..n {
+                        elems.push(self.get_index(src, Value::int(i as i32))?);
+                    }
                 }
             }
             Kind::Other => {}
