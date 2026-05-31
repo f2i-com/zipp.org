@@ -2118,6 +2118,130 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
+    /// Assign `src` to a destructuring-assignment target (existing binding or
+    /// member, or a nested array/object pattern). Counterpart to `extract_pattern`
+    /// for `=` targets that aren't declarations.
+    fn assign_target(&mut self, target: &ox::AssignmentTarget, src: Reg) -> R<()> {
+        use ox::AssignmentTarget as T;
+        match target {
+            T::AssignmentTargetIdentifier(id) => {
+                let b = self.resolve(&id.name);
+                self.store_binding(&b, src);
+                Ok(())
+            }
+            T::StaticMemberExpression(m) => {
+                let save = self.next_reg;
+                let obj = self.expr(&m.object)?;
+                let name = self.string_name(m.property.name.as_str());
+                self.emit(Instr::SetProp { obj, name, val: src });
+                self.next_reg = save;
+                Ok(())
+            }
+            T::ComputedMemberExpression(m) => {
+                let save = self.next_reg;
+                let obj = self.expr(&m.object)?;
+                let key = self.expr(&m.expression)?;
+                self.emit(Instr::SetIndex { obj, key, val: src });
+                self.next_reg = save;
+                Ok(())
+            }
+            T::ArrayAssignmentTarget(arr) => self.assign_array_target(arr, src),
+            T::ObjectAssignmentTarget(o) => self.assign_object_target(o, src),
+            _ => Err("unsupported destructuring-assignment target in the zipp-vm subset".into()),
+        }
+    }
+
+    /// One element of a destructuring assignment, applying its `= default` first.
+    fn assign_maybe_default(
+        &mut self,
+        m: &ox::AssignmentTargetMaybeDefault,
+        val: Reg,
+    ) -> R<()> {
+        use ox::AssignmentTargetMaybeDefault as M;
+        match m {
+            M::AssignmentTargetWithDefault(d) => {
+                self.apply_default_in_place(val, &d.init)?;
+                self.assign_target(&d.binding, val)
+            }
+            M::AssignmentTargetIdentifier(id) => {
+                let b = self.resolve(&id.name);
+                self.store_binding(&b, val);
+                Ok(())
+            }
+            M::StaticMemberExpression(m) => {
+                let save = self.next_reg;
+                let obj = self.expr(&m.object)?;
+                let name = self.string_name(m.property.name.as_str());
+                self.emit(Instr::SetProp { obj, name, val });
+                self.next_reg = save;
+                Ok(())
+            }
+            M::ComputedMemberExpression(m) => {
+                let save = self.next_reg;
+                let obj = self.expr(&m.object)?;
+                let key = self.expr(&m.expression)?;
+                self.emit(Instr::SetIndex { obj, key, val });
+                self.next_reg = save;
+                Ok(())
+            }
+            M::ArrayAssignmentTarget(arr) => self.assign_array_target(arr, val),
+            M::ObjectAssignmentTarget(o) => self.assign_object_target(o, val),
+            _ => Err("unsupported destructuring-assignment element in the zipp-vm subset".into()),
+        }
+    }
+
+    fn assign_array_target(&mut self, arr: &ox::ArrayAssignmentTarget, src: Reg) -> R<()> {
+        for (i, el) in arr.elements.iter().enumerate() {
+            if let Some(maybe) = el {
+                let save = self.next_reg;
+                let val = self.alloc_reg();
+                let idx = self.alloc_reg();
+                self.emit(Instr::LoadInt { dst: idx, val: i as i32 });
+                self.emit(Instr::GetIndex { dst: val, obj: src, key: idx });
+                self.assign_maybe_default(maybe, val)?;
+                self.next_reg = save;
+            }
+        }
+        if let Some(rest) = &arr.rest {
+            let save = self.next_reg;
+            let val = self.alloc_reg();
+            self.emit(Instr::ArrayRest { dst: val, src, start: arr.elements.len() as u32 });
+            self.assign_target(&rest.target, val)?;
+            self.next_reg = save;
+        }
+        Ok(())
+    }
+
+    fn assign_object_target(&mut self, o: &ox::ObjectAssignmentTarget, src: Reg) -> R<()> {
+        if o.rest.is_some() {
+            return Err("object rest in destructuring assignment is not in the zipp-vm subset yet".into());
+        }
+        for prop in &o.properties {
+            let save = self.next_reg;
+            match prop {
+                ox::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                    // `({x} = o)` / `({x = d} = o)` — target is the identifier itself.
+                    let val = self.alloc_reg();
+                    let name = self.string_name(&p.binding.name);
+                    self.emit(Instr::GetProp { dst: val, obj: src, name });
+                    if let Some(init) = &p.init {
+                        self.apply_default_in_place(val, init)?;
+                    }
+                    let b = self.resolve(&p.binding.name);
+                    self.store_binding(&b, val);
+                }
+                ox::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                    // `({key: target} = o)`.
+                    let val = self.alloc_reg();
+                    self.extract_member(src, &p.name, p.computed, val)?;
+                    self.assign_maybe_default(&p.binding, val)?;
+                }
+            }
+            self.next_reg = save;
+        }
+        Ok(())
+    }
+
     /// For a logical assignment (`||= &&= ??=`), emit the short-circuit test on
     /// `val` (which already holds the target's current value) and return the ip
     /// of the jump that, when taken, SKIPS the assignment (keeping `val`).
@@ -2216,6 +2340,16 @@ impl<'a> FnCompiler<'a> {
                     self.emit(instr);
                     self.emit(Instr::SetIndex { obj, key, val: dst });
                 }
+                return Ok(dst);
+            }
+            // Destructuring assignment to existing targets: `[a,b]=arr`, `({x}=o)`.
+            ox::AssignmentTarget::ArrayAssignmentTarget(_)
+            | ox::AssignmentTarget::ObjectAssignmentTarget(_) => {
+                let src = self.expr_into(&a.right, dst)?;
+                if src != dst {
+                    self.emit(Instr::Move { dst, src });
+                }
+                self.assign_target(&a.left, dst)?;
                 return Ok(dst);
             }
             _ => {}

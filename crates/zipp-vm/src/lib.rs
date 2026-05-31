@@ -1103,6 +1103,25 @@ mod tests {
     }
 
     #[test]
+    fn assignment_destructuring() {
+        // The swap idiom + plain array targets.
+        assert_eq!(run_ok("let a=1,b=2; [a,b]=[b,a]; console.log(a,b)"), vec!["2 1"]);
+        assert_eq!(run_ok("let a,b,c; [a,b,c]=[10,20,30]; console.log(a+b+c)"), vec!["60"]);
+        // Rest and defaults in an assignment target.
+        assert_eq!(run_ok("let a,r; [a,...r]=[1,2,3,4]; console.log(a, r.join(','))"), vec!["1 2,3,4"]);
+        assert_eq!(run_ok("let a,b; [a=5,b=9]=[1]; console.log(a,b)"), vec!["1 9"]);
+        // Object assignment destructuring (shorthand, rename, default).
+        assert_eq!(run_ok("let x,y; ({x,y}=({x:1,y:2})); console.log(x+y)"), vec!["3"]);
+        assert_eq!(run_ok("let p,q; ({a:p,b:q}=({a:7,b:8})); console.log(p,q)"), vec!["7 8"]);
+        assert_eq!(run_ok("let x; ({x=42}=({})); console.log(x)"), vec!["42"]);
+        // Member targets and nesting.
+        assert_eq!(run_ok("let o={}; [o.a,o.b]=[1,2]; console.log(o.a,o.b)"), vec!["1 2"]);
+        assert_eq!(run_ok("let a,b,c; [a,[b,c]]=[1,[2,3]]; console.log(a,b,c)"), vec!["1 2 3"]);
+        // The assignment expression evaluates to the right-hand side.
+        assert_eq!(run_ok("let a,b; let r=([a,b]=[1,2]); console.log(r.join(','))"), vec!["1,2"]);
+    }
+
+    #[test]
     fn for_of_destructuring() {
         assert_eq!(run_ok("let r=[]; for(let [a,b] of [[1,2],[3,4]]) r.push(a+b); console.log(r.join(','))"), vec!["3,7"]);
         // The canonical Object.entries idiom.
