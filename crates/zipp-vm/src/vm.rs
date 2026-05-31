@@ -954,19 +954,23 @@ impl<'p> Vm<'p> {
 
                     Instr::CallMethod { dst, obj, name, arg_base, argc } => {
                         let recv = self.get(base, obj);
-                        let key = self.program.functions[func_id as usize]
-                            .string_constants[name as usize]
-                            .clone();
+                        // `program` outlives the VM, so borrow the method name
+                        // with the program's lifetime (NOT self's) — avoids
+                        // cloning the name string on every method call (a heap
+                        // alloc per `a.push(i)` / `a.map(cb)` etc.).
+                        let prog: &'p Program = self.program;
+                        let key: &'p str =
+                            &prog.functions[func_id as usize].string_constants[name as usize];
                         // Builtin methods (array/string) execute inline and
                         // produce a result without pushing a frame.
-                        if let Some(result) = self.try_builtin_method(recv, &key, base, arg_base, argc)? {
+                        if let Some(result) = self.try_builtin_method(recv, key, base, arg_base, argc)? {
                             self.set(base, dst, result);
                             ip += 1;
                             continue;
                         }
                         // Otherwise the property must resolve to a user function
                         // (a method on an object); call it with `this = recv`.
-                        let prop = self.get_prop(recv, &key)?;
+                        let prop = self.get_prop(recv, key)?;
                         let (fid, closure) = self.resolve_callable(prop)?;
                         self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1)?;
                         break;
@@ -1391,20 +1395,32 @@ impl<'p> Vm<'p> {
         arg_base: u16,
         argc: u16,
     ) -> Result<Option<Value>, Thrown> {
-        let args: Vec<Value> = (0..argc)
-            .map(|i| self.regs[base + arg_base as usize + i as usize])
-            .collect();
+        // Gather args into a stack buffer for the common small-arity case (1-2
+        // args for push/map/filter/…), avoiding a heap Vec alloc per call; only
+        // a rare >8-arg call falls back to the heap.
+        let mut stackbuf = [Value::UNDEFINED; 8];
+        let mut heapbuf: Vec<Value>;
+        let n = arg_base as usize;
+        let args: &[Value] = if argc as usize <= stackbuf.len() {
+            for i in 0..argc as usize {
+                stackbuf[i] = self.regs[base + n + i];
+            }
+            &stackbuf[..argc as usize]
+        } else {
+            heapbuf = (0..argc as usize).map(|i| self.regs[base + n + i]).collect();
+            &heapbuf
+        };
         // Number receivers (Int or double) support a small method set.
         if recv.is_number() {
-            return self.number_method(recv, name, &args);
+            return self.number_method(recv, name, args);
         }
         if !recv.is_heap() {
             return Ok(None);
         }
         let idx = recv.heap_index();
         match self.heap.get(idx) {
-            HeapObj::Array(_) => self.array_method(idx, name, &args),
-            HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, &args),
+            HeapObj::Array(_) => self.array_method(idx, name, args),
+            HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
             _ => Ok(None),
         }
     }
