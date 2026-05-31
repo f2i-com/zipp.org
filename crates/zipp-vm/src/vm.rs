@@ -132,6 +132,9 @@ pub struct Vm<'p> {
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).
     template_raws: std::collections::HashMap<u32, Value>,
+    /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
+    /// program's random sequence is reproducible run-to-run (and JIT-on == off).
+    rng_state: u64,
     /// Native JIT tier (x86-64 only, `feature = "jit"`). Compiles hot leaf
     /// integer functions to native code that shares this VM's register window;
     /// any non-int/heap/call op bails back to the interpreter at the exact ip.
@@ -198,6 +201,7 @@ impl<'p> Vm<'p> {
             pending_await: None,
             microtasks: std::collections::VecDeque::new(),
             template_raws: std::collections::HashMap::new(),
+            rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1837,6 +1841,18 @@ impl<'p> Vm<'p> {
                         if a.is_heap() {
                             self.template_raws.insert(a.heap_index(), r);
                         }
+                        ip += 1;
+                    }
+                    Instr::Random { dst } => {
+                        // xorshift64* → a uniform double in [0, 1) (top 53 bits).
+                        let mut x = self.rng_state;
+                        x ^= x >> 12;
+                        x ^= x << 25;
+                        x ^= x >> 27;
+                        self.rng_state = x;
+                        let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                        let f = (r >> 11) as f64 / (1u64 << 53) as f64;
+                        self.set(base, dst, Value::num(f));
                         ip += 1;
                     }
                     Instr::Return { src } => {

@@ -3313,6 +3313,10 @@ impl<'a> FnCompiler<'a> {
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             if let ox::Expression::Identifier(obj) = &m.object {
                 if obj.name == "Math" {
+                    if m.property.name == "random" {
+                        self.emit(Instr::Random { dst });
+                        return Ok(dst);
+                    }
                     if let Some(op) = crate::bytecode::MathFn::from_name(m.property.name.as_str()) {
                         let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
                         self.emit(Instr::MathOp { dst, op, arg_base, argc });

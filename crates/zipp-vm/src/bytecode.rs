@@ -263,6 +263,8 @@ pub enum Instr {
     /// Attach `raw` (an array) as the `.raw` of a tagged-template strings array
     /// `arr` (arrays can't hold named props, so it lands in a VM side table).
     SetRaw { arr: Reg, raw: Reg },
+    /// `Math.random()` → a float in [0, 1) from the VM's PRNG.
+    Random { dst: Reg },
 
     /// Return `src` from the current function.
     Return { src: Reg },

@@ -1582,6 +1582,9 @@ mod tests {
         );
         // Argument coercion (string → number).
         assert_eq!(run_ok("console.log(Math.sqrt('9'))"), vec!["3"]);
+        // Math.random(): always in [0,1); a dice roll lands in range.
+        assert_eq!(run_ok("let ok=true; for(let i=0;i<500;i++){let r=Math.random(); if(!(r>=0&&r<1))ok=false} console.log(ok)"), vec!["true"]);
+        assert_eq!(run_ok("let d=Math.floor(Math.random()*6)+1; console.log(d>=1&&d<=6)"), vec!["true"]);
     }
 
     #[test]
