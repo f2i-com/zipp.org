@@ -77,6 +77,9 @@ enum EachMode {
 
 pub struct Vm<'p> {
     program: &'p Program,
+    /// Most-recent class value per class_id (filled by `MakeClass`), so a
+    /// `super` call can reach its lexical superclass value at runtime.
+    class_values: Vec<Option<Value>>,
     heap: Heap,
     globals: Vec<Value>,
     /// One contiguous register file shared by all live frames; each frame owns
@@ -149,6 +152,7 @@ impl<'p> Vm<'p> {
         let _ = &mut heap;
         Vm {
             program,
+            class_values: vec![None; program.classes.len()],
             heap,
             globals,
             regs: Vec::new(),
@@ -908,8 +912,12 @@ impl<'p> Vm<'p> {
                         self.object_assign(&[t, s])?; // mutates target in place
                         ip += 1;
                     }
-                    Instr::MakeClass { dst, class_id } => {
+                    Instr::MakeClass { dst, class_id, parent } => {
                         let cd = self.program.classes[class_id as usize].clone();
+                        let parent_idx = parent.and_then(|p| {
+                            let pv = self.get(base, p);
+                            pv.is_heap().then(|| pv.heap_index())
+                        });
                         // Materialize each method as a Func value once; instances
                         // share these (no per-access alloc, no per-instance copy).
                         let mk = |heap: &mut Heap, defs: &[(String, u32)]| -> Vec<(String, Value)> {
@@ -929,10 +937,14 @@ impl<'p> Vm<'p> {
                         let v = Value::heap(self.heap.alloc(HeapObj::Class {
                             name: cd.name,
                             ctor: cd.ctor,
+                            has_explicit_ctor: cd.has_explicit_ctor,
                             methods,
                             getters,
                             statics,
+                            parent: parent_idx,
                         }));
+                        // Remember it so `super` in a derived class can reach it.
+                        self.class_values[class_id as usize] = Some(v);
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -944,6 +956,50 @@ impl<'p> Vm<'p> {
                         }
                         let result = self.construct(cv, &args)?;
                         self.set(base, dst, result);
+                        ip += 1;
+                    }
+                    Instr::SuperCtor { parent_class_id, arg_base, argc } => {
+                        let parent = self.class_values[parent_class_id as usize]
+                            .ok_or_else(|| Thrown("TypeError: superclass is not a constructor".into()))?;
+                        let this = self.get(base, 0);
+                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                        for i in 0..argc {
+                            args.push(self.get(base, arg_base + i));
+                        }
+                        self.run_class_ctor(parent, this, &args)?;
+                        ip += 1;
+                    }
+                    Instr::SuperMethod { dst, parent_class_id, name, arg_base, argc } => {
+                        let prog: &'p Program = self.program;
+                        let key: &'p str =
+                            &prog.functions[func_id as usize].string_constants[name as usize];
+                        let parent = self.class_values[parent_class_id as usize]
+                            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
+                        // Find the method up the parent's class chain.
+                        let mut method = None;
+                        let mut cur = parent.is_heap().then(|| parent.heap_index());
+                        while let Some(cidx) = cur {
+                            match self.heap.get(cidx) {
+                                HeapObj::Class { methods, parent, .. } => {
+                                    if let Some((_, v)) = methods.iter().find(|(k, _)| k == key) {
+                                        method = Some(*v);
+                                        break;
+                                    }
+                                    cur = *parent;
+                                }
+                                _ => break,
+                            }
+                        }
+                        let m = method.ok_or_else(|| {
+                            Thrown(format!("TypeError: super.{key} is not a function"))
+                        })?;
+                        let this = self.get(base, 0);
+                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                        for i in 0..argc {
+                            args.push(self.get(base, arg_base + i));
+                        }
+                        let r = self.call_value(m, this, &args)?;
+                        self.set(base, dst, r);
                         ip += 1;
                     }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
@@ -1031,14 +1087,11 @@ impl<'p> Vm<'p> {
                     Instr::InstanceOfDyn { dst, val, ctor } => {
                         let v = self.get(base, val);
                         let c = self.get(base, ctor);
-                        // True iff `v` is an instance whose class link is `c`.
+                        // True iff `v` is an instance whose class chain includes `c`.
                         let r = c.is_heap()
                             && matches!(self.heap.get(c.heap_index()), HeapObj::Class { .. })
                             && v.is_heap()
-                            && matches!(
-                                self.heap.get(v.heap_index()),
-                                HeapObj::Object(m) if m.class == Some(c.heap_index())
-                            );
+                            && self.instance_of_class(v, c.heap_index());
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
@@ -1807,28 +1860,53 @@ impl<'p> Vm<'p> {
                 if let Some(v) = map.get(key) {
                     return Ok(v);
                 }
-                // Own-property miss: resolve a method or getter through the class.
-                if let Some(cidx) = map.class {
-                    let (mut method, mut getter) = (None, None);
-                    if let HeapObj::Class { methods, getters, .. } = self.heap.get(cidx) {
-                        if let Some((_, v)) = methods.iter().find(|(k, _)| k == key) {
-                            method = Some(*v);
-                        } else if let Some((_, v)) = getters.iter().find(|(k, _)| k == key) {
-                            getter = Some(*v);
+                // Own-property miss: walk the class chain for an inherited method
+                // (return its func) or getter (invoke it with this = obj).
+                let (mut method, mut getter) = (None, None);
+                let mut cur = map.class;
+                while let Some(cidx) = cur {
+                    match self.heap.get(cidx) {
+                        HeapObj::Class { methods, getters, parent, .. } => {
+                            if let Some((_, v)) = methods.iter().find(|(k, _)| k == key) {
+                                method = Some(*v);
+                                break;
+                            }
+                            if let Some((_, v)) = getters.iter().find(|(k, _)| k == key) {
+                                getter = Some(*v);
+                                break;
+                            }
+                            cur = *parent;
                         }
+                        _ => break,
                     }
-                    if let Some(m) = method {
-                        return Ok(m);
-                    }
-                    if let Some(g) = getter {
-                        return self.call_value(g, obj, &[]); // run the getter, this = obj
-                    }
+                }
+                if let Some(m) = method {
+                    return Ok(m);
+                }
+                if let Some(g) = getter {
+                    return self.call_value(g, obj, &[]);
                 }
                 Ok(Value::UNDEFINED)
             }
-            // Static members are own properties of the class value (`C.method`).
-            HeapObj::Class { statics, .. } => {
-                Ok(statics.get(key).unwrap_or(Value::UNDEFINED))
+            // Static members are own properties of the class value; statics are
+            // inherited, so walk the `extends` chain (`C.method`, `Sub.parentStatic`).
+            HeapObj::Class { statics, parent, .. } => {
+                if let Some(v) = statics.get(key) {
+                    return Ok(v);
+                }
+                let mut cur = *parent;
+                while let Some(pidx) = cur {
+                    match self.heap.get(pidx) {
+                        HeapObj::Class { statics, parent, .. } => {
+                            if let Some(v) = statics.get(key) {
+                                return Ok(v);
+                            }
+                            cur = *parent;
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(Value::UNDEFINED)
             }
             _ => Ok(Value::UNDEFINED),
         }
@@ -2234,8 +2312,10 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
         }
-        let ctor = match self.heap.get(cv.heap_index()) {
-            HeapObj::Class { ctor, .. } => *ctor,
+        let (ctor, has_explicit, parent) = match self.heap.get(cv.heap_index()) {
+            HeapObj::Class { ctor, has_explicit_ctor, parent, .. } => {
+                (*ctor, *has_explicit_ctor, *parent)
+            }
             _ => return Err(Thrown("TypeError: value is not a constructor".into())),
         };
         // The instance links to its class for method lookup + instanceof; its own
@@ -2243,16 +2323,82 @@ impl<'p> Vm<'p> {
         let mut map = ObjMap::new();
         map.class = Some(cv.heap_index());
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(map)));
-        if let Some(fid) = ctor {
-            let cval = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
-            let ret = self.call_value(cval, obj, args)?;
-            if ret.is_heap()
-                && matches!(self.heap.get(ret.heap_index()), HeapObj::Object(_) | HeapObj::Array(_))
-            {
-                return Ok(ret);
+        if has_explicit {
+            // The explicit constructor runs its own `super(...)`; a ctor that
+            // returns an object/array replaces the instance.
+            if let Some(fid) = ctor {
+                let f = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+                let ret = self.call_value(f, obj, args)?;
+                if ret.is_heap()
+                    && matches!(self.heap.get(ret.heap_index()), HeapObj::Object(_) | HeapObj::Array(_))
+                {
+                    return Ok(ret);
+                }
+            }
+        } else {
+            // No own constructor: run the parent's ctor (implicit `super(...args)`)
+            // then this class's field initializers.
+            if let Some(pidx) = parent {
+                self.run_class_ctor(Value::heap(pidx), obj, args)?;
+            }
+            if let Some(fid) = ctor {
+                let f = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+                self.call_value(f, obj, &[])?;
             }
         }
         Ok(obj)
+    }
+
+    /// True iff `v` is an object whose class chain includes the class at heap
+    /// index `class_idx` (`v instanceof C`, walking `extends` links).
+    fn instance_of_class(&self, v: Value, class_idx: u32) -> bool {
+        if !v.is_heap() {
+            return false;
+        }
+        let mut cur = match self.heap.get(v.heap_index()) {
+            HeapObj::Object(m) => m.class,
+            _ => None,
+        };
+        while let Some(cidx) = cur {
+            if cidx == class_idx {
+                return true;
+            }
+            cur = match self.heap.get(cidx) {
+                HeapObj::Class { parent, .. } => *parent,
+                _ => None,
+            };
+        }
+        false
+    }
+
+    /// Run a class's constructor contribution on an existing instance `obj` —
+    /// for `super(...)` and the implicit-super chain. An explicit ctor runs its
+    /// own `super`; an implicit one runs the parent chain then its fields.
+    fn run_class_ctor(&mut self, cval: Value, obj: Value, args: &[Value]) -> Result<(), Thrown> {
+        if !cval.is_heap() {
+            return Ok(());
+        }
+        let (ctor, has_explicit, parent) = match self.heap.get(cval.heap_index()) {
+            HeapObj::Class { ctor, has_explicit_ctor, parent, .. } => {
+                (*ctor, *has_explicit_ctor, *parent)
+            }
+            _ => return Ok(()),
+        };
+        if has_explicit {
+            if let Some(fid) = ctor {
+                let f = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+                self.call_value(f, obj, args)?;
+            }
+        } else {
+            if let Some(pidx) = parent {
+                self.run_class_ctor(Value::heap(pidx), obj, args)?;
+            }
+            if let Some(fid) = ctor {
+                let f = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+                self.call_value(f, obj, &[])?;
+            }
+        }
+        Ok(())
     }
 
     /// `Object.assign(target, ...sources)`: copy each source's own enumerable

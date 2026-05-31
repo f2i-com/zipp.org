@@ -109,12 +109,18 @@ pub enum HeapObj {
     Class {
         name: String,
         ctor: Option<u32>,
+        /// Whether `ctor` is an explicit constructor (its body calls `super`
+        /// itself) vs. a fields-only proto (the `new` path runs the parent ctor).
+        has_explicit_ctor: bool,
         methods: Vec<(String, Value)>,
         /// `get x()` accessors, invoked with `this` = instance on property read.
         getters: Vec<(String, Value)>,
         /// Static members — own properties of the class value (`C.method`,
         /// `C.field`). Methods start here; static fields are added by SetProp.
         statics: ObjMap,
+        /// Heap index of the superclass value (`class C extends P`), for
+        /// inherited method/getter lookup and `instanceof` up the chain.
+        parent: Option<u32>,
     },
 }
 

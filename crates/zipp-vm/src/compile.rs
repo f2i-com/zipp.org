@@ -68,11 +68,18 @@ struct Compiler {
     globals: Vec<String>,
     /// Compiled class descriptors, indexed by the `MakeClass` class_id.
     classes: Vec<ClassDef>,
+    /// Class name → class_id, for resolving `extends <Name>` and `super`.
+    class_names: Vec<(String, u32)>,
 }
 
 impl Compiler {
     fn new() -> Compiler {
-        Compiler { functions: Vec::new(), globals: Vec::new(), classes: Vec::new() }
+        Compiler {
+            functions: Vec::new(),
+            globals: Vec::new(),
+            classes: Vec::new(),
+            class_names: Vec::new(),
+        }
     }
 
     fn global_slot(&mut self, name: &str) -> u16 {
@@ -194,8 +201,10 @@ impl Compiler {
         params_ast: Option<&ox::FormalParameters>,
         fields: &[(String, Option<&ox::Expression>)],
         body: &[ox::Statement],
+        super_class: Option<u32>,
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params, rest, HashSet::new(), Vec::new());
+        fc.super_class = super_class;
         if let Some(pa) = params_ast {
             fc.emit_param_defaults(pa)?;
         }
@@ -347,6 +356,9 @@ struct FnCompiler<'a> {
     max_reg: Reg,
     /// Register holding the rest-parameter array, if this function has one.
     rest_reg: Option<Reg>,
+    /// When compiling a class method/constructor whose class `extends P`, the
+    /// class_id of `P` — so `super(…)` / `super.m(…)` resolve to its members.
+    super_class: Option<u32>,
     /// True for the top-level script body: declarations (functions AND
     /// let/const/var) bind to globals rather than registers, so only genuinely
     /// nested functions ever capture.
@@ -408,6 +420,7 @@ impl<'a> FnCompiler<'a> {
             next_reg: 0,
             max_reg: 0,
             rest_reg: None,
+            super_class: None,
             is_script: false,
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
@@ -939,7 +952,21 @@ impl<'a> FnCompiler<'a> {
             Dest::Reg(r) => *r,
             Dest::Cell(_, t) | Dest::Global(_, t) => *t,
         };
-        self.emit(Instr::MakeClass { dst: cls, class_id });
+        // Evaluate the superclass value (`extends P`) into a temp the VM links in.
+        let parent_reg = if let Some(sc) = &class.super_class {
+            let t = self.temp();
+            let v = self.expr_into(sc, t)?;
+            if v != t {
+                self.emit(Instr::Move { dst: t, src: v });
+            }
+            Some(t)
+        } else {
+            None
+        };
+        self.emit(Instr::MakeClass { dst: cls, class_id, parent: parent_reg });
+        if parent_reg.is_some() {
+            self.next_reg -= 1; // reclaim the parent temp
+        }
         // Static fields are own properties of the class value, initialized here
         // (in the enclosing scope) right after the class is created.
         for (fname, finit) in &static_fields {
@@ -980,10 +1007,36 @@ impl<'a> FnCompiler<'a> {
         &mut self,
         class: &'b ox::Class,
     ) -> R<(u32, Vec<(String, Option<&'b ox::Expression<'b>>)>)> {
-        if class.super_class.is_some() {
-            return Err("class extends/super is not in the zipp-vm subset yet".into());
-        }
+        // `extends P`: P must be a class declared earlier (resolved to its id);
+        // arbitrary superclass expressions / built-ins are out of the subset.
+        let super_class_id = match &class.super_class {
+            None => None,
+            Some(ox::Expression::Identifier(id)) => Some(
+                self.cx
+                    .class_names
+                    .iter()
+                    .find(|(n, _)| n == id.name.as_str())
+                    .map(|(_, cid)| *cid)
+                    .ok_or("class can only `extend` a class declared earlier in the program")?,
+            ),
+            Some(_) => {
+                return Err("class `extends` must name a class (arbitrary superclass expressions are out of the subset)".into())
+            }
+        };
         let cname = class.id.as_ref().map(|i| i.name.to_string()).unwrap_or_else(|| "<class>".into());
+        // Reserve this class's id and register its name BEFORE compiling members,
+        // so a method body containing a subclass / `new ThisClass` resolves, and
+        // nested classes compiled within get distinct ids.
+        let class_id = self.cx.classes.len() as u32;
+        self.cx.classes.push(ClassDef {
+            name: cname.clone(),
+            ctor: None,
+            has_explicit_ctor: false,
+            methods: Vec::new(),
+            getters: Vec::new(),
+            statics: Vec::new(),
+        });
+        self.cx.class_names.push((cname.clone(), class_id));
         let mut ctor_fn: Option<&ox::Function> = None;
         let mut methods: Vec<(String, &ox::Function)> = Vec::new();
         let mut getters: Vec<(String, &ox::Function)> = Vec::new();
@@ -1034,6 +1087,7 @@ impl<'a> FnCompiler<'a> {
                 Some(&*func.params),
                 &[],
                 body,
+                super_class_id,
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1050,6 +1104,7 @@ impl<'a> FnCompiler<'a> {
                 Some(&*func.params),
                 &[],
                 body,
+                super_class_id,
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1066,13 +1121,18 @@ impl<'a> FnCompiler<'a> {
                 Some(&*func.params),
                 &[],
                 body,
+                None, // statics: `super` would refer to the parent class, not handled
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_defs.push((sname.clone(), fid));
         }
-        // Constructor proto (only needed when there's a ctor or any field init).
-        let ctor = if ctor_fn.is_some() || !fields.is_empty() {
+        // Constructor proto. With an explicit ctor: field inits prepended + the
+        // user body (which calls `super` itself). Without one but with fields: a
+        // fields-only proto (the `new` path runs the parent ctor first). Neither:
+        // None.
+        let has_explicit_ctor = ctor_fn.is_some();
+        let ctor = if has_explicit_ctor || !fields.is_empty() {
             let (params, rest, body) = match ctor_fn {
                 Some(f) => function_parts(f)?,
                 None => (Vec::new(), None, &[][..]),
@@ -1085,6 +1145,7 @@ impl<'a> FnCompiler<'a> {
                 params_ast,
                 &fields,
                 body,
+                super_class_id,
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1092,14 +1153,14 @@ impl<'a> FnCompiler<'a> {
         } else {
             None
         };
-        let class_id = self.cx.classes.len() as u32;
-        self.cx.classes.push(ClassDef {
+        self.cx.classes[class_id as usize] = ClassDef {
             name: cname,
             ctor,
+            has_explicit_ctor,
             methods: method_defs,
             getters: getter_defs,
             statics: static_defs,
-        });
+        };
         Ok((class_id, static_fields))
     }
 
@@ -2591,6 +2652,29 @@ impl<'a> FnCompiler<'a> {
             let args_arr = self.build_spread_args(&c.arguments)?;
             self.emit(Instr::CallSpread { dst, callee, args: args_arr });
             return Ok(dst);
+        }
+
+        // `super(args)` — run the superclass constructor on the current `this`.
+        if matches!(&c.callee, ox::Expression::Super(_)) {
+            let pid = self
+                .super_class
+                .ok_or("`super(...)` is only valid in a derived class constructor")?;
+            let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+            self.emit(Instr::SuperCtor { parent_class_id: pid, arg_base, argc });
+            self.emit(Instr::LoadUndefined { dst }); // `super()` yields undefined here
+            return Ok(dst);
+        }
+        // `super.method(args)` — call an inherited method with the current `this`.
+        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+            if matches!(&m.object, ox::Expression::Super(_)) {
+                let pid = self
+                    .super_class
+                    .ok_or("`super.method(...)` is only valid in a derived class")?;
+                let name = self.string_name(m.property.name.as_str());
+                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                self.emit(Instr::SuperMethod { dst, parent_class_id: pid, name, arg_base, argc });
+                return Ok(dst);
+            }
         }
 
         // Bare `Error("msg")` call (no `new`) → same Error object.

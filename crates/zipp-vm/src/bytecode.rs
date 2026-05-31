@@ -98,7 +98,15 @@ pub enum Instr {
     /// `src` may be an object, array, or string; null/undefined contribute none.
     ObjectSpread { target: Reg, src: Reg },
     /// `dst = <the class value for classes[class_id]>` — materialize a class.
-    MakeClass { dst: Reg, class_id: u32 },
+    /// `parent` is the register holding the superclass value (`extends P`), or
+    /// `None`; the new class links to it for inherited lookup + instanceof.
+    MakeClass { dst: Reg, class_id: u32, parent: Option<Reg> },
+    /// `super(args…)`: run the lexical superclass's constructor contribution on
+    /// the current `this` (reg 0). `parent_class_id` identifies the superclass.
+    SuperCtor { parent_class_id: u32, arg_base: Reg, argc: u16 },
+    /// `dst = super.<name>(args…)`: call the named method found from the lexical
+    /// superclass up its chain, with `this` = the current frame's `this` (reg 0).
+    SuperMethod { dst: Reg, parent_class_id: u32, name: u32, arg_base: Reg, argc: u16 },
     /// `dst = new callee(args…)` — construct an instance. `callee` must be a
     /// class value; builds an object, installs the methods, runs the ctor.
     New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
@@ -400,7 +408,12 @@ pub struct Program {
 #[derive(Clone, Debug)]
 pub struct ClassDef {
     pub name: String,
+    /// The constructor proto: an explicit ctor (field inits prepended + body)
+    /// when `has_explicit_ctor`, else a fields-only proto (or `None`).
     pub ctor: Option<u32>,
+    /// Whether the class declared its own `constructor`. When false, `new` runs
+    /// the parent ctor (implicit `super(...args)`) before this class's fields.
+    pub has_explicit_ctor: bool,
     pub methods: Vec<(String, u32)>,
     /// `get name()` accessors: invoked (with `this` = instance) on property read.
     pub getters: Vec<(String, u32)>,

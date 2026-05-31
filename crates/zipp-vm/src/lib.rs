@@ -1177,6 +1177,24 @@ mod tests {
     }
 
     #[test]
+    fn class_inheritance() {
+        // Inherited method; instanceof up the chain.
+        assert_eq!(run_ok("class A{m(){return 1}} class B extends A{} let b=new B(); console.log(b.m(), b instanceof A, b instanceof B)"), vec!["1 true true"]);
+        // super(args) in a derived constructor; fields after super.
+        assert_eq!(run_ok("class A{constructor(x){this.x=x}} class B extends A{constructor(x,y){super(x);this.y=y}} let b=new B(3,4); console.log(b.x,b.y)"), vec!["3 4"]);
+        // Implicit super forwards constructor args.
+        assert_eq!(run_ok("class A{constructor(n){this.n=n}} class B extends A{} console.log(new B(7).n)"), vec!["7"]);
+        // super.method() and override.
+        assert_eq!(run_ok("class A{g(){return 'A'}} class B extends A{g(){return 'B->'+super.g()}} console.log(new B().g())"), vec!["B->A"]);
+        assert_eq!(run_ok("class Animal{constructor(n){this.name=n} speak(){return this.name+' sound'}} class Dog extends Animal{speak(){return this.name+' barks'}} console.log(new Dog('Rex').speak())"), vec!["Rex barks"]);
+        // Inherited fields; 3-level chain.
+        assert_eq!(run_ok("class A{x=1} class B extends A{y=2} let b=new B(); console.log(b.x,b.y)"), vec!["1 2"]);
+        assert_eq!(run_ok("class A{constructor(){this.t='a'}} class B extends A{} class C extends B{} console.log(new C().t, new C() instanceof A)"), vec!["a true"]);
+        // Inherited static method.
+        assert_eq!(run_ok("class A{static make(){return 'A'}} class B extends A{} console.log(B.make())"), vec!["A"]);
+    }
+
+    #[test]
     fn instanceof_operator() {
         // Built-in collections / functions.
         assert_eq!(run_ok("console.log([] instanceof Array, [] instanceof Object)"), vec!["true true"]);
