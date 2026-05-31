@@ -853,6 +853,15 @@ mod tests {
     }
 
     #[test]
+    fn template_literals() {
+        assert_eq!(run_ok("let x=5; console.log(`val=${x+1}`)"), vec!["val=6"]);
+        assert_eq!(run_ok("let a='A',b=2; console.log(`${a}-${b}-${a+b}`)"), vec!["A-2-A2"]);
+        assert_eq!(run_ok("let o={n:7}; console.log(`obj ${o.n} arr ${[1,2].length}`)"), vec!["obj 7 arr 2"]);
+        assert_eq!(run_ok("console.log(`no interp`)"), vec!["no interp"]);
+        assert_eq!(run_ok("let n=10; let f=()=>`n=${n}`; console.log(f())"), vec!["n=10"]);
+    }
+
+    #[test]
     fn typeof_operator() {
         // null is "object" (the historic quirk); arrays/objects "object";
         // functions/arrows "function"; primitives their type.

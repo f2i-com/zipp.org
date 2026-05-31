@@ -929,6 +929,28 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadConst { dst, idx });
                 Ok(dst)
             }
+            E::TemplateLiteral(t) => {
+                // Desugar `q0${e0}q1${e1}...qN` to string concatenation
+                // q0 + e0 + q1 + e1 + ... + qN. q0 is loaded as a string, so every
+                // `+` is a (rope) string concat that coerces each ${e} to a string.
+                let q0 = t.quasis[0].value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
+                let idx = self.add_string_const(q0);
+                self.emit(Instr::LoadConst { dst, idx });
+                for (i, e) in t.expressions.iter().enumerate() {
+                    let r = self.expr(e)?;
+                    self.emit(Instr::Add { dst, a: dst, b: r });
+                    if let Some(qe) = t.quasis.get(i + 1) {
+                        let q = qe.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
+                        if !q.is_empty() {
+                            let qidx = self.add_string_const(q);
+                            let qr = self.temp();
+                            self.emit(Instr::LoadConst { dst: qr, idx: qidx });
+                            self.emit(Instr::Add { dst, a: dst, b: qr });
+                        }
+                    }
+                }
+                Ok(dst)
+            }
             E::BooleanLiteral(b) => {
                 self.emit(Instr::LoadBool { dst, val: b.value });
                 Ok(dst)
