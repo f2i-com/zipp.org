@@ -126,6 +126,7 @@ impl Compiler {
             &prog.body,
             true,
             false, // top-level script is not a generator
+            false, // top-level script is not async
             captured,
             Vec::new(),
         )?;
@@ -145,12 +146,17 @@ impl Compiler {
         body: &[ox::Statement],
         is_script: bool,
         is_generator: bool,
+        is_async: bool,
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
+        if is_generator && is_async {
+            return Err("async generators (async function*) are not in the zipp-vm subset yet".into());
+        }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.is_script = is_script;
         fc.in_generator = is_generator;
+        fc.in_async = is_async;
 
         // Apply default parameter values (`function f(x = expr)`) before the body:
         // for each defaulted param, `if (x === undefined) x = expr`.
@@ -190,6 +196,7 @@ impl Compiler {
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
             is_generator,
+            is_async,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
@@ -212,10 +219,12 @@ impl Compiler {
         body: &[ox::Statement],
         super_class: Option<u32>,
         is_generator: bool,
+        is_async: bool,
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params, rest, HashSet::new(), Vec::new());
         fc.super_class = super_class;
         fc.in_generator = is_generator;
+        fc.in_async = is_async;
         if let Some(pa) = params_ast {
             fc.emit_param_defaults(pa)?;
             fc.bind_pattern_params(pa)?;
@@ -254,6 +263,7 @@ impl Compiler {
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
             is_generator,
+            is_async,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -271,6 +281,7 @@ impl Compiler {
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.in_async = a.r#async;
         fc.emit_param_defaults(&a.params)?;
         fc.bind_pattern_params(&a.params)?;
         if a.expression {
@@ -309,6 +320,7 @@ impl Compiler {
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
             is_generator: false,
+            is_async: a.r#async,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -352,6 +364,7 @@ fn placeholder(name: &str) -> FuncProto {
         param_count: 0,
         rest_reg: None,
         is_generator: false,
+        is_async: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
         name_global: None,
@@ -377,6 +390,8 @@ struct FnCompiler<'a> {
     super_class: Option<u32>,
     /// True while compiling a `function*` body, so `yield` is allowed.
     in_generator: bool,
+    /// True while compiling an `async` body, so `await` is allowed.
+    in_async: bool,
     /// A label seen on a `LabeledStatement`, consumed by the immediately-following
     /// loop/switch so `break label` / `continue label` can target it.
     pending_label: Option<String>,
@@ -446,6 +461,7 @@ impl<'a> FnCompiler<'a> {
             rest_reg: None,
             super_class: None,
             in_generator: false,
+            in_async: false,
             pending_label: None,
             is_script: false,
             chain_bails: Vec::new(),
@@ -970,6 +986,7 @@ impl<'a> FnCompiler<'a> {
             body,
             false,
             f.generator,
+            f.r#async,
             captured,
             enclosing,
         )?;
@@ -1173,6 +1190,7 @@ impl<'a> FnCompiler<'a> {
                 body,
                 super_class_id,
                 func.generator,
+                func.r#async,
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1191,6 +1209,7 @@ impl<'a> FnCompiler<'a> {
                 body,
                 super_class_id,
                 false, // getters are never generators
+                false, // getters are never async
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1209,6 +1228,7 @@ impl<'a> FnCompiler<'a> {
                 body,
                 None, // statics: `super` would refer to the parent class, not handled
                 func.generator,
+                func.r#async,
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1234,6 +1254,7 @@ impl<'a> FnCompiler<'a> {
                 body,
                 super_class_id,
                 false, // a constructor is never a generator
+                false, // a constructor is never async
             )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
@@ -1277,6 +1298,7 @@ impl<'a> FnCompiler<'a> {
             body,
             false,
             f.generator,
+            f.r#async,
             captured,
             enclosing,
         )?;
@@ -1791,6 +1813,7 @@ impl<'a> FnCompiler<'a> {
             E::AssignmentExpression(a) => self.assign(a, dst),
             E::ConditionalExpression(c) => self.conditional(c, dst),
             E::YieldExpression(y) => self.yield_expr(y, dst),
+            E::AwaitExpression(a) => self.await_expr(a, dst),
             E::CallExpression(c) => self.call(c, dst),
             E::NewExpression(n) => {
                 // `new Error(msg)` / `new TypeError(msg)` / `new RangeError(msg)`
@@ -2737,6 +2760,17 @@ impl<'a> FnCompiler<'a> {
             }
         };
         self.emit(Instr::Yield { dst, val });
+        Ok(dst)
+    }
+
+    fn await_expr(&mut self, a: &ox::AwaitExpression, dst: Reg) -> R<Reg> {
+        if !self.in_async {
+            return Err("`await` is only valid inside an async function".into());
+        }
+        // Evaluate the awaited value; on resume the settled result (or a thrown
+        // rejection) lands in `dst`. The VM coerces non-promises via Promise.resolve.
+        let val = self.expr(&a.argument)?;
+        self.emit(Instr::Await { dst, val });
         Ok(dst)
     }
 

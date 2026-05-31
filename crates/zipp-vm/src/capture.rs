@@ -263,6 +263,36 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
                 }
             }
         }
+        E::NewExpression(n) => {
+            expr_refs(&n.callee, out);
+            for arg in &n.arguments {
+                if let Some(e) = arg.as_expression() {
+                    expr_refs(e, out);
+                }
+            }
+        }
+        E::AwaitExpression(a) => expr_refs(&a.argument, out),
+        E::YieldExpression(y) => {
+            if let Some(a) = &y.argument {
+                expr_refs(a, out);
+            }
+        }
+        E::SequenceExpression(s) => {
+            for e in &s.expressions {
+                expr_refs(e, out);
+            }
+        }
+        E::TemplateLiteral(t) => {
+            for e in &t.expressions {
+                expr_refs(e, out);
+            }
+        }
+        E::TaggedTemplateExpression(t) => {
+            expr_refs(&t.tag, out);
+            for e in &t.quasi.expressions {
+                expr_refs(e, out);
+            }
+        }
         E::StaticMemberExpression(m) => expr_refs(&m.object, out),
         E::ComputedMemberExpression(m) => {
             expr_refs(&m.object, out);
@@ -396,6 +426,36 @@ fn collect_nested_free_expr(e: &ox::Expression, out: &mut HashSet<String>) {
                 if let Some(e) = arg.as_expression() {
                     collect_nested_free_expr(e, out);
                 }
+            }
+        }
+        E::NewExpression(n) => {
+            collect_nested_free_expr(&n.callee, out);
+            for arg in &n.arguments {
+                if let Some(e) = arg.as_expression() {
+                    collect_nested_free_expr(e, out);
+                }
+            }
+        }
+        E::AwaitExpression(a) => collect_nested_free_expr(&a.argument, out),
+        E::YieldExpression(y) => {
+            if let Some(a) = &y.argument {
+                collect_nested_free_expr(a, out);
+            }
+        }
+        E::SequenceExpression(s) => {
+            for e in &s.expressions {
+                collect_nested_free_expr(e, out);
+            }
+        }
+        E::TemplateLiteral(t) => {
+            for e in &t.expressions {
+                collect_nested_free_expr(e, out);
+            }
+        }
+        E::TaggedTemplateExpression(t) => {
+            collect_nested_free_expr(&t.tag, out);
+            for e in &t.quasi.expressions {
+                collect_nested_free_expr(e, out);
             }
         }
         E::StaticMemberExpression(m) => collect_nested_free_expr(&m.object, out),

@@ -1200,6 +1200,9 @@ mod tests {
         assert_eq!(run_ok("new Promise(r=>r(Promise.resolve(99))).then(v=>console.log(v))"), vec!["99"]);
         // A promise resolved later by a stored resolver.
         assert_eq!(run_ok("let r; let p=new Promise(res=>{r=res}); p.then(v=>console.log('late',v)); r(7)"), vec!["late 7"]);
+        // The executor captures an outer variable (regression: capture analysis
+        // must descend into `new` arguments to box `v`).
+        assert_eq!(run_ok("function delay(v){return new Promise(res=>res(v))} delay(9).then(x=>console.log('d',x))"), vec!["d 9"]);
         // finally runs on both paths and passes the value/reason through.
         assert_eq!(run_ok("Promise.resolve(1).finally(()=>console.log('cleanup')).then(v=>console.log('v',v))"), vec!["cleanup", "v 1"]);
         assert_eq!(run_ok("console.log(typeof Promise.resolve(1))"), vec!["object"]);
@@ -1240,6 +1243,39 @@ mod tests {
         assert_eq!(run_ok("function* g(){yield* [1,2,3]; yield* 'ab'} console.log([...g()].join(','))"), vec!["1,2,3,a,b"]);
         assert_eq!(run_ok("function* g(){yield 0; yield* [1,2]; yield 3} console.log([...g()].join(','))"), vec!["0,1,2,3"]);
         assert_eq!(run_ok("function* nest(){yield* (function*(){yield* [1,2]})()} console.log([...nest()].join(','))"), vec!["1,2"]);
+    }
+
+    #[test]
+    fn async_await() {
+        // An async function returns a Promise; its body's `return` fulfills it.
+        assert_eq!(run_ok("async function f(){return 1} f().then(v=>console.log('v',v))"), vec!["v 1"]);
+        // await a non-promise (still yields a microtask tick) and a real promise.
+        assert_eq!(run_ok("async function f(){let x=await 5; return x+10} f().then(v=>console.log(v))"), vec!["15"]);
+        assert_eq!(run_ok("async function f(){let x=await Promise.resolve(3); let y=await Promise.resolve(4); return x*y} f().then(v=>console.log(v))"), vec!["12"]);
+        // Rejection caught by try/catch around the await.
+        assert_eq!(run_ok("async function f(){try{await Promise.reject('boom'); return 'no'}catch(e){return 'caught '+e}} f().then(v=>console.log(v))"), vec!["caught boom"]);
+        // Uncaught rejection / a thrown body error reject the returned promise.
+        assert_eq!(run_ok("async function f(){await Promise.reject('k')} f().catch(e=>console.log('c',e))"), vec!["c k"]);
+        assert_eq!(run_ok("async function f(){throw new Error('x')} f().catch(e=>console.log(e.message))"), vec!["x"]);
+        // Ordering: sync runs first; the await suspends and resumes as a microtask.
+        assert_eq!(
+            run_ok("console.log('start'); async function f(){console.log('before'); await 0; console.log('after')} f(); console.log('end')"),
+            vec!["start", "before", "end", "after"]
+        );
+        // Async calling async + await in a loop, accumulating.
+        assert_eq!(
+            run_ok("async function dbl(n){return n*2} async function f(){let t=0; for(let i=1;i<=3;i++){t+=await dbl(i)} return t} f().then(v=>console.log(v))"),
+            vec!["12"]
+        );
+        // await a `new Promise` that resolves synchronously with a captured value.
+        assert_eq!(
+            run_ok("function delay(v){return new Promise(res=>res(v))} async function f(){let a=await delay(10); let b=await delay(20); return a+b} f().then(v=>console.log(v))"),
+            vec!["30"]
+        );
+        // Async arrow.
+        assert_eq!(run_ok("const f=async()=>(await Promise.resolve(7))+1; f().then(v=>console.log(v))"), vec!["8"]);
+        // typeof of an async call is the Promise object.
+        assert_eq!(run_ok("async function f(){} console.log(typeof f())"), vec!["object"]);
     }
 
     #[test]

@@ -104,6 +104,9 @@ pub struct Reaction {
     /// A `.finally(cb)` reaction: run `callback` (no args) for its side effect,
     /// then forward the ORIGINAL value/reason (a throw in `callback` overrides).
     pub finally: bool,
+    /// An `await` reaction: `dependent` is the suspended async ACTIVATION's heap
+    /// index, resumed (value or thrown rejection) instead of running a callback.
+    pub is_async: bool,
 }
 
 /// A heap-allocated object.
@@ -157,6 +160,18 @@ pub enum HeapObj {
     /// `state` carries the resume ip / completion. v1 does not preserve `try`
     /// handlers across a yield.
     Generator { func: u32, closure: u32, state: GenState, regs: Vec<Value> },
+    /// A suspended `async function` activation — like Generator (detached window
+    /// resumed at each `await`) but it also owns its `result` Promise's heap index
+    /// and PRESERVES `try` handlers across an await (so `try { await p } catch`
+    /// works). `handlers` are (catch_target, catch_reg) pairs.
+    AsyncState {
+        func: u32,
+        closure: u32,
+        state: GenState,
+        regs: Vec<Value>,
+        result: u32,
+        handlers: Vec<(u32, u16)>,
+    },
     /// A JS `Map`: insertion-ordered (key, value) entries with SameValueZero key
     /// equality. Parallel `keys`/`vals` Vecs (small Maps dominate; linear scan).
     Map { keys: Vec<Value>, vals: Vec<Value> },

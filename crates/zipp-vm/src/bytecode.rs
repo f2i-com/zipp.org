@@ -108,6 +108,10 @@ pub enum Instr {
     /// `dst = yield val` — suspend the current generator, handing `val` out as
     /// the yielded value. On resume the value passed to `.next(v)` lands in `dst`.
     Yield { dst: Reg, val: Reg },
+    /// `dst = await val` — suspend the async activation on the awaited value's
+    /// promise; on resume the settled value lands in `dst` (a rejection is thrown
+    /// in at this point so an enclosing `try`/`catch` sees it).
+    Await { dst: Reg, val: Reg },
     /// for-of step: advance over `iter` (array/string/Map/Set positionally with
     /// the cursor in `idx`, or a generator via `.next()` ignoring `idx`). Writes
     /// the next element to `value_dst` and a bool to `done_dst`. Throws if `iter`
@@ -270,6 +274,9 @@ pub struct FuncProto {
     /// True for a `function*` generator body: calling it builds a suspended
     /// Generator object instead of running, and it is never whole-function JITed.
     pub is_generator: bool,
+    /// True for an `async function` body: calling it builds an AsyncState, runs
+    /// to the first await, and returns a Promise; never whole-function JITed.
+    pub is_async: bool,
     pub constants: Vec<Value>,
     /// Heap-string constants referenced by `LoadConst` need their text; this
     /// parallels `constants` for the string case (resolved at load time).

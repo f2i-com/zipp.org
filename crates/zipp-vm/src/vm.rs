@@ -127,9 +127,11 @@ pub struct Vm<'p> {
     /// bytecode ip, for the resume point) back to `generator_method`, which
     /// `.take()`s it to distinguish a suspension from a normal return.
     pending_yield: Option<(Value, usize)>,
-    /// Set by an `Await` op (the awaited value + the Await's ip); `drive_async`
-    /// `.take()`s it to suspend the async activation, mirroring `pending_yield`.
-    pending_await: Option<(Value, usize)>,
+    /// Set by an `Await` op (the awaited value + the Await's ip + the activation's
+    /// live `try` handlers); `drive_async` `.take()`s it to suspend the async
+    /// activation, mirroring `pending_yield`. Unlike generators, async activations
+    /// PRESERVE handlers across a suspension so `try { await p } catch` works.
+    pending_await: Option<(Value, usize, Vec<Handler>)>,
     /// FIFO microtask queue — the entire event loop (no timers/IO exist). Drained
     /// to empty by `drain_microtasks` after the main script returns; a microtask
     /// may enqueue more, which run in the same drain.
@@ -443,6 +445,11 @@ impl<'p> Vm<'p> {
         if self.program.functions[func_id as usize].is_generator {
             return Ok(self.alloc_generator(func_id, closure, this, args));
         }
+        // Calling an async function runs synchronously up to the first `await`,
+        // then returns its result Promise.
+        if self.program.functions[func_id as usize].is_async {
+            return Ok(self.alloc_async(func_id, closure, this, args));
+        }
         if self.frames.len() >= MAX_FRAMES {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
@@ -591,6 +598,7 @@ impl<'p> Vm<'p> {
                 && self.jit_enabled
                 && self.jit_recurse_depth == 0
                 && !self.program.functions[func_id as usize].is_generator
+                && !self.program.functions[func_id as usize].is_async
             {
                 if let Some((result, bail)) = self.try_run_jit(func_id, base) {
                     if bail == crate::codegen::NO_BAIL {
@@ -1655,6 +1663,16 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
+                        // An async function runs to its first `await` then returns
+                        // its result Promise.
+                        if self.program.functions[fid as usize].is_async {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let p = self.alloc_async(fid, closure, Value::UNDEFINED, &argv);
+                            self.set(base, dst, p);
+                            ip += 1;
+                            continue;
+                        }
                         self.setup_call(
                             fid,
                             closure,
@@ -1694,6 +1712,16 @@ impl<'p> Vm<'p> {
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                             let g = self.alloc_generator(fid, closure, recv, &argv);
                             self.set(base, dst, g);
+                            ip += 1;
+                            continue;
+                        }
+                        // An async method runs to its first `await` then returns
+                        // its result Promise.
+                        if self.program.functions[fid as usize].is_async {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let p = self.alloc_async(fid, closure, recv, &argv);
+                            self.set(base, dst, p);
                             ip += 1;
                             continue;
                         }
@@ -1744,6 +1772,21 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         self.frames.pop();
                         self.pending_yield = Some((v, ip));
+                        return Ok(v);
+                    }
+                    Instr::Await { val, .. } => {
+                        // Suspend the async activation: pop the frame ENTRY but
+                        // leave its register window live at the top of `self.regs`
+                        // for `drive_async` to park into the heap AsyncState. Unlike
+                        // a generator yield, we CAPTURE the frame's `try` handlers
+                        // (carried in `pending_await`) so they can be restored on
+                        // resume — letting `try { await p } catch (e)` see a
+                        // rejection thrown back in at the await point. The async
+                        // frame is always the top (and the run_loop stop frame) at
+                        // an await, so popping returns to `drive_async`.
+                        let v = self.get(base, val);
+                        let f = self.frames.pop().unwrap();
+                        self.pending_await = Some((v, ip, f.handlers));
                         return Ok(v);
                     }
                     Instr::IterNext { value_dst, done_dst, iter, idx } => {
@@ -2203,13 +2246,24 @@ impl<'p> Vm<'p> {
             ReactionKind::Reject
         };
         for r in reactions {
-            self.microtasks.push_back(Microtask::Reaction {
-                callback: r.callback,
-                arg: val,
-                dependent: r.dependent,
-                kind,
-                finally: r.finally,
-            });
+            if r.is_async {
+                // `dependent` is a suspended async activation; resume it with the
+                // value (fulfill) or by throwing the reason in (reject).
+                let input = match kind {
+                    ReactionKind::Fulfill => Resume::Value(val),
+                    ReactionKind::Reject => Resume::Throw(val),
+                };
+                self.microtasks
+                    .push_back(Microtask::AsyncResume { activation: r.dependent, input });
+            } else {
+                self.microtasks.push_back(Microtask::Reaction {
+                    callback: r.callback,
+                    arg: val,
+                    dependent: r.dependent,
+                    kind,
+                    finally: r.finally,
+                });
+            }
         }
     }
 
@@ -2248,8 +2302,8 @@ impl<'p> Vm<'p> {
         match state {
             PromiseState::Pending => {
                 if let HeapObj::Promise { fulfill, reject, handled, .. } = self.heap.get_mut(p) {
-                    fulfill.push(Reaction { callback: on_f, dependent: dep, finally: false });
-                    reject.push(Reaction { callback: on_r, dependent: dep, finally: false });
+                    fulfill.push(Reaction { callback: on_f, dependent: dep, finally: false, is_async: false });
+                    reject.push(Reaction { callback: on_r, dependent: dep, finally: false, is_async: false });
                     if !on_r.is_undefined() {
                         *handled = true;
                     }
@@ -2291,8 +2345,8 @@ impl<'p> Vm<'p> {
         match state {
             PromiseState::Pending => {
                 if let HeapObj::Promise { fulfill, reject, .. } = self.heap.get_mut(p) {
-                    fulfill.push(Reaction { callback: cb, dependent: dep, finally: true });
-                    reject.push(Reaction { callback: cb, dependent: dep, finally: true });
+                    fulfill.push(Reaction { callback: cb, dependent: dep, finally: true, is_async: false });
+                    reject.push(Reaction { callback: cb, dependent: dep, finally: true, is_async: false });
                 }
             }
             PromiseState::Fulfilled => self.microtasks.push_back(Microtask::Reaction {
@@ -2311,6 +2365,231 @@ impl<'p> Vm<'p> {
             }),
         }
         dep
+    }
+
+    // ── async functions ──
+
+    /// Build a suspended `async function` activation and run it synchronously up
+    /// to its first `await` (or to completion / a throw). Returns the activation's
+    /// result Promise — the value an `async` call evaluates to.
+    fn alloc_async(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
+        let proto = &self.program.functions[func_id as usize];
+        let reg_count = (proto.reg_count as usize).max(1);
+        let param_count = proto.param_count as usize;
+        let rest_reg = proto.rest_reg;
+        let mut regs = vec![Value::UNDEFINED; reg_count];
+        regs[0] = this;
+        let n = args.len().min(param_count);
+        regs[1..1 + n].copy_from_slice(&args[..n]);
+        if let Some(rr) = rest_reg {
+            let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
+            regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        let result = self.alloc_promise();
+        let idx = self.heap.alloc(HeapObj::AsyncState {
+            func: func_id,
+            closure,
+            state: GenState::Suspended(0),
+            regs,
+            result,
+            handlers: Vec::new(),
+        });
+        // Run from the top until the first await suspends it (or it finishes —
+        // settling `result` either way).
+        self.drive_async(idx, Resume::Value(Value::UNDEFINED));
+        Value::heap(result)
+    }
+
+    /// `Promise.resolve` as an internal helper: a Promise passes through (identity
+    /// preserved); any other value is wrapped in a fulfilled promise. The basis of
+    /// awaiting a non-promise (`await 5` still yields a microtask tick).
+    fn to_promise(&mut self, v: Value) -> u32 {
+        if v.is_heap() {
+            if matches!(self.heap.get(v.heap_index()), HeapObj::Promise { .. }) {
+                return v.heap_index();
+            }
+        }
+        let p = self.alloc_promise();
+        self.resolve(p, v);
+        p
+    }
+
+    /// Subscribe a suspended async `activation` to promise `p`: when `p` settles,
+    /// the activation resumes with the value, or has the reason thrown back in at
+    /// the await point. If `p` is already settled, schedule the resume as a
+    /// microtask (so `await` always yields to the queue, per spec).
+    fn settle_subscribe(&mut self, p: u32, activation: u32) {
+        let (state, result) = match self.heap.get(p) {
+            HeapObj::Promise { state, result, .. } => (*state, *result),
+            _ => {
+                self.microtasks.push_back(Microtask::AsyncResume {
+                    activation,
+                    input: Resume::Value(Value::UNDEFINED),
+                });
+                return;
+            }
+        };
+        match state {
+            PromiseState::Pending => {
+                if let HeapObj::Promise { fulfill, reject, handled, .. } = self.heap.get_mut(p) {
+                    fulfill.push(Reaction {
+                        callback: Value::UNDEFINED,
+                        dependent: activation,
+                        finally: false,
+                        is_async: true,
+                    });
+                    reject.push(Reaction {
+                        callback: Value::UNDEFINED,
+                        dependent: activation,
+                        finally: false,
+                        is_async: true,
+                    });
+                    *handled = true; // an `await` consumes the rejection
+                }
+            }
+            PromiseState::Fulfilled => self.microtasks.push_back(Microtask::AsyncResume {
+                activation,
+                input: Resume::Value(result),
+            }),
+            PromiseState::Rejected => {
+                if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
+                    *handled = true;
+                }
+                self.microtasks.push_back(Microtask::AsyncResume {
+                    activation,
+                    input: Resume::Throw(result),
+                });
+            }
+        }
+    }
+
+    /// Resume (or start) a suspended async activation `idx` with `input` — the
+    /// awaited value (fulfill) or the reason to throw in at the await point
+    /// (reject). Runs until the next `await` (re-parks the window + subscribes to
+    /// the awaited promise), a normal return (resolves the result Promise), or an
+    /// uncaught throw (rejects it). Mirrors `generator_method`'s resume path, but
+    /// restores the activation's `try` handlers so a rejection can be caught.
+    fn drive_async(&mut self, idx: u32, input: Resume) {
+        let (state, fid, closure, result) = match self.heap.get(idx) {
+            HeapObj::AsyncState { state, func, closure, result, .. } => {
+                (*state, *func, *closure, *result)
+            }
+            _ => return,
+        };
+        let resume_ip = match state {
+            GenState::Completed | GenState::Running => return,
+            GenState::Suspended(ip) => ip,
+        };
+        // Detach the saved window + handlers, then splice the window onto the top
+        // of the live register file.
+        let (saved, saved_handlers) = match self.heap.get_mut(idx) {
+            HeapObj::AsyncState { state, regs, handlers, .. } => {
+                *state = GenState::Running;
+                (std::mem::take(regs), std::mem::take(handlers))
+            }
+            _ => return,
+        };
+        let reg_count = saved.len();
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            // Can't make progress — abandon the activation and reject its result.
+            if let HeapObj::AsyncState { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                *state = GenState::Completed;
+                regs.clear();
+                handlers.clear();
+            }
+            let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+            self.reject(result, e);
+            return;
+        }
+        self.regs.extend_from_slice(&saved);
+        if new_base + reg_count > self.regs_hw {
+            self.regs_hw = new_base + reg_count;
+        }
+        let stop = self.frames.len();
+        // AsyncState stores handlers as bare (target, reg) pairs (heap.rs can't
+        // name the private `Handler` type); rebuild `Handler`s for the frame.
+        let restored: Vec<Handler> = saved_handlers
+            .iter()
+            .map(|&(catch_target, catch_reg)| Handler { catch_target, catch_reg })
+            .collect();
+        self.frames.push(Frame {
+            func: fid,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
+            closure,
+            handlers: restored,
+        });
+        // Position the resume point and deliver the awaited value / rejection.
+        let outcome = if resume_ip == 0 {
+            self.run_loop(stop)
+        } else {
+            match input {
+                Resume::Value(v) => {
+                    if let Instr::Await { dst, .. } =
+                        self.program.functions[fid as usize].code[resume_ip]
+                    {
+                        self.regs[new_base + dst as usize] = v;
+                    }
+                    self.frames[stop].ip = resume_ip + 1;
+                    self.run_loop(stop)
+                }
+                Resume::Throw(e) => {
+                    // Throw the rejection in at the await point: unwind to a
+                    // handler within this activation (down to `stop`). If caught,
+                    // resume at the catch; otherwise it propagates out as the
+                    // function's rejection (pending_throw stays set for the Err
+                    // arm below).
+                    self.pending_throw = Some(e);
+                    if self.unwind_to_handler(e, stop) {
+                        self.pending_throw = None;
+                        self.run_loop(stop)
+                    } else {
+                        Err(Thrown(String::new()))
+                    }
+                }
+            }
+        };
+        // Suspended again at an await?
+        if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
+            let back = self.regs.split_off(new_base);
+            let parked: Vec<(u32, u16)> =
+                handlers.iter().map(|h| (h.catch_target, h.catch_reg)).collect();
+            if let HeapObj::AsyncState { state, regs, handlers: h, .. } = self.heap.get_mut(idx) {
+                *state = GenState::Suspended(await_ip);
+                *regs = back;
+                *h = parked;
+            }
+            let p = self.to_promise(awaited);
+            self.settle_subscribe(p, idx);
+            return;
+        }
+        // Otherwise the activation finished — settle `result`.
+        match outcome {
+            Ok(ret) => {
+                if let HeapObj::AsyncState { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                    *state = GenState::Completed;
+                    regs.clear();
+                    handlers.clear();
+                }
+                self.resolve(result, ret);
+            }
+            Err(_) => {
+                let e = match self.pending_throw.take() {
+                    Some(v) => v,
+                    None => self.alloc_error_from_message("Error"),
+                };
+                // The unwind already truncated the window; keep regs consistent.
+                self.regs.truncate(new_base);
+                if let HeapObj::AsyncState { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                    *state = GenState::Completed;
+                    regs.clear();
+                    handlers.clear();
+                }
+                self.reject(result, e);
+            }
+        }
     }
 
     /// Run one microtask. A reaction's callback may be a JS function (re-enters
@@ -2364,8 +2643,11 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            // Resumes a suspended async activation — wired in Stage 2.
-            Microtask::AsyncResume { .. } => {}
+            // Resumes a suspended async activation with the settled value (or by
+            // throwing the rejection reason in at the await point).
+            Microtask::AsyncResume { activation, input } => {
+                self.drive_async(activation, input);
+            }
         }
     }
 
@@ -4470,6 +4752,8 @@ impl<'p> Vm<'p> {
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
                 HeapObj::BoundResolver { .. } => "function".into(),
+                // Internal: never user-visible (an async call yields its Promise).
+                HeapObj::AsyncState { .. } => "[object Promise]".into(),
             }
         } else {
             "undefined".into()
@@ -4579,6 +4863,8 @@ impl<'p> Vm<'p> {
                 }
             },
             HeapObj::BoundResolver { .. } => "[Function (anonymous)]".into(),
+            // Internal: never user-visible (an async call yields its Promise).
+            HeapObj::AsyncState { .. } => "Promise { <pending> }".into(),
         }
     }
 
