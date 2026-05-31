@@ -1919,6 +1919,7 @@ impl<'a> FnCompiler<'a> {
                 }
                 Ok(dst)
             }
+            E::TaggedTemplateExpression(tt) => self.tagged_template(tt, dst),
             E::BooleanLiteral(b) => {
                 self.emit(Instr::LoadBool { dst, val: b.value });
                 Ok(dst)
@@ -2147,6 +2148,124 @@ impl<'a> FnCompiler<'a> {
         self.patch_jump(jmp, end);
         for b in bails {
             self.patch_jump(b, undef_at);
+        }
+        Ok(dst)
+    }
+
+    /// `` tag`q0${e0}q1…` `` — call `tag(strings, e0, e1, …)` where `strings` is
+    /// the array of cooked literal parts carrying a `.raw` array of the un-escaped
+    /// parts. `String.raw` is handled inline (no real global exists).
+    fn tagged_template(&mut self, tt: &ox::TaggedTemplateExpression, dst: Reg) -> R<Reg> {
+        let quasi = &tt.quasi;
+        // `String.raw` template — concatenate the RAW parts with the values.
+        if let ox::Expression::StaticMemberExpression(m) = &tt.tag {
+            if let ox::Expression::Identifier(o) = &m.object {
+                if o.name == "String" && m.property.name == "raw" {
+                    return self.string_raw(quasi, dst);
+                }
+            }
+        }
+        let n = quasi.expressions.len();
+        // Evaluate the tag (and its `this` for a member tag) first, into stable
+        // registers that survive the argument block.
+        enum Tag {
+            Plain(Reg),
+            Method(Reg, u32),
+        }
+        let tag = match &tt.tag {
+            ox::Expression::StaticMemberExpression(m) => {
+                let obj = self.expr(&m.object)?;
+                let obj_reg = self.alloc_reg();
+                if obj != obj_reg {
+                    self.emit(Instr::Move { dst: obj_reg, src: obj });
+                }
+                let name = self.string_name(m.property.name.as_str());
+                Tag::Method(obj_reg, name)
+            }
+            other => {
+                let callee = self.expr(other)?;
+                let callee_reg = self.alloc_reg();
+                if callee != callee_reg {
+                    self.emit(Instr::Move { dst: callee_reg, src: callee });
+                }
+                Tag::Plain(callee_reg)
+            }
+        };
+        // Build the (cooked + .raw) strings array into a stable register.
+        let strings_reg = self.alloc_reg();
+        self.build_template_strings(quasi, strings_reg)?;
+        // Contiguous argument block: [strings, e0, e1, …].
+        let arg_base = self.next_reg;
+        for _ in 0..=n {
+            self.alloc_reg();
+        }
+        let block_top = self.next_reg;
+        self.emit(Instr::Move { dst: arg_base, src: strings_reg });
+        for (i, e) in quasi.expressions.iter().enumerate() {
+            let slot = arg_base + 1 + i as Reg;
+            let v = self.expr_into(e, slot)?;
+            if v != slot {
+                self.emit(Instr::Move { dst: slot, src: v });
+            }
+            self.next_reg = block_top;
+        }
+        let argc = (n + 1) as u16;
+        match tag {
+            Tag::Plain(callee) => self.emit(Instr::Call { dst, callee, arg_base, argc }),
+            Tag::Method(obj, name) => {
+                self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc })
+            }
+        }
+        Ok(dst)
+    }
+
+    /// Build the tagged-template strings array `[q0,q1,…]` (cooked) into `dst`,
+    /// with its `.raw` property set to the array of raw (un-escaped) parts.
+    fn build_template_strings(&mut self, quasi: &ox::TemplateLiteral, dst: Reg) -> R<()> {
+        let nq = quasi.quasis.len() as u16;
+        let save = self.next_reg;
+        // Cooked array → dst.
+        let cooked_base = self.next_reg;
+        for q in &quasi.quasis {
+            let r = self.alloc_reg();
+            let cooked = q.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let idx = self.add_string_const(cooked);
+            self.emit(Instr::LoadConst { dst: r, idx });
+        }
+        self.emit(Instr::NewArray { dst, arg_base: cooked_base, argc: nq });
+        self.next_reg = save;
+        // Raw array → a temp, then dst.raw = it.
+        let raw_reg = self.alloc_reg();
+        let raw_base = self.next_reg;
+        for q in &quasi.quasis {
+            let r = self.alloc_reg();
+            let idx = self.add_string_const(q.value.raw.as_str());
+            self.emit(Instr::LoadConst { dst: r, idx });
+        }
+        self.emit(Instr::NewArray { dst: raw_reg, arg_base: raw_base, argc: nq });
+        self.emit(Instr::SetRaw { arr: dst, raw: raw_reg });
+        self.next_reg = save;
+        Ok(())
+    }
+
+    /// `String.raw` template: concatenate the RAW literal parts with the
+    /// stringified interpolation values (`String.raw\`a\\n${1}b\`` → `a\\n1b`).
+    fn string_raw(&mut self, quasi: &ox::TemplateLiteral, dst: Reg) -> R<Reg> {
+        let r0 = quasi.quasis[0].value.raw.as_str();
+        let idx = self.add_string_const(r0);
+        self.emit(Instr::LoadConst { dst, idx });
+        for (i, e) in quasi.expressions.iter().enumerate() {
+            let r = self.expr(e)?;
+            self.emit(Instr::Add { dst, a: dst, b: r });
+            if let Some(qe) = quasi.quasis.get(i + 1) {
+                let raw = qe.value.raw.as_str();
+                if !raw.is_empty() {
+                    let qidx = self.add_string_const(raw);
+                    let qr = self.temp();
+                    self.emit(Instr::LoadConst { dst: qr, idx: qidx });
+                    self.emit(Instr::Add { dst, a: dst, b: qr });
+                }
+            }
         }
         Ok(dst)
     }

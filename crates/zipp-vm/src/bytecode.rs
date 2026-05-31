@@ -260,6 +260,10 @@ pub enum Instr {
     /// pending throw, or fall through on normal completion.
     EndFinally { kind_reg: Reg, val_reg: Reg },
 
+    /// Attach `raw` (an array) as the `.raw` of a tagged-template strings array
+    /// `arr` (arrays can't hold named props, so it lands in a VM side table).
+    SetRaw { arr: Reg, raw: Reg },
+
     /// Return `src` from the current function.
     Return { src: Reg },
     /// Return undefined.

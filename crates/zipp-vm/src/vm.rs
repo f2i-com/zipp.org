@@ -128,6 +128,10 @@ pub struct Vm<'p> {
     /// to empty by `drain_microtasks` after the main script returns; a microtask
     /// may enqueue more, which run in the same drain.
     microtasks: std::collections::VecDeque<Microtask>,
+    /// The `.raw` array of a tagged-template strings object, keyed by the cooked
+    /// array's heap index. Arrays don't carry named properties here, so a
+    /// template object's `raw` lives in this side table (read by `get_prop`).
+    template_raws: std::collections::HashMap<u32, Value>,
     /// Native JIT tier (x86-64 only, `feature = "jit"`). Compiles hot leaf
     /// integer functions to native code that shares this VM's register window;
     /// any non-int/heap/call op bails back to the interpreter at the exact ip.
@@ -193,6 +197,7 @@ impl<'p> Vm<'p> {
             pending_yield: None,
             pending_await: None,
             microtasks: std::collections::VecDeque::new(),
+            template_raws: std::collections::HashMap::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1826,6 +1831,14 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
+                    Instr::SetRaw { arr, raw } => {
+                        let a = self.get(base, arr);
+                        let r = self.get(base, raw);
+                        if a.is_heap() {
+                            self.template_raws.insert(a.heap_index(), r);
+                        }
+                        ip += 1;
+                    }
                     Instr::Return { src } => {
                         let v = self.regs[base + src as usize];
                         // Run any pending `finally` in this frame first.
@@ -3005,6 +3018,9 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => {
                 if key == "length" {
                     Ok(len_value(items.len()))
+                } else if key == "raw" {
+                    // A tagged-template strings array's `.raw` (side table).
+                    Ok(self.template_raws.get(&obj.heap_index()).copied().unwrap_or(Value::UNDEFINED))
                 } else {
                     Ok(Value::UNDEFINED)
                 }

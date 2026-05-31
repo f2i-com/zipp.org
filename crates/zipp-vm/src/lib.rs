@@ -1594,6 +1594,22 @@ mod tests {
     }
 
     #[test]
+    fn tagged_templates() {
+        // The tag gets the cooked strings array + the interpolated values.
+        assert_eq!(run_ok("function t(s,...v){return s.join('|')+'#'+v.join(',')} console.log(t`a${1}b${2}c`)"), vec!["a|b|c#1,2"]);
+        // No interpolations: one string, no values.
+        assert_eq!(run_ok("function t(s,...v){return s.join('|')+'#'+v.length} console.log(t`hi`)"), vec!["hi#0"]);
+        // `.raw` is the un-escaped parts (here `\\n` stays literal).
+        assert_eq!(run_ok(r"function t(s){return s.raw[0]} console.log(t`a\nb`)"), vec![r"a\nb"]);
+        // String.raw built-in.
+        assert_eq!(run_ok(r"console.log(String.raw`a\n${1+1}b`)"), vec![r"a\n2b"]);
+        // A member tag binds `this`.
+        assert_eq!(run_ok("let o={p:'P',f(s,...v){return this.p+':'+s.join('/')+v.join('')}}; console.log(o.f`x${10}y`)"), vec!["P:x/y10"]);
+        // A closure capturing an outer var inside an interpolation.
+        assert_eq!(run_ok("function t(s,...v){return v[0]} function mk(n){return ()=>t`${n*2}`} console.log(mk(21)())"), vec!["42"]);
+    }
+
+    #[test]
     fn typeof_operator() {
         // null is "object" (the historic quirk); arrays/objects "object";
         // functions/arrows "function"; primitives their type.
