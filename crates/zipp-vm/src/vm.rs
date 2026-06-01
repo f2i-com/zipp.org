@@ -4817,6 +4817,19 @@ impl<'p> Vm<'p> {
             }
             REFLECT_CONSTRUCT => {
                 let target = a0;
+                if !self.is_constructor(target) {
+                    return Err(Thrown("TypeError: Reflect.construct target is not a constructor".into()));
+                }
+                // An explicit newTarget (3rd arg) must also be a constructor. We
+                // don't model newTarget-driven prototype selection, but the throw is
+                // what test262's isConstructor relies on.
+                if let Some(nt) = args.get(2) {
+                    if !self.is_constructor(*nt) {
+                        return Err(Thrown(
+                            "TypeError: Reflect.construct newTarget is not a constructor".into(),
+                        ));
+                    }
+                }
                 let arg_vec = if a1.is_heap() { self.array_snapshot(a1.heap_index()) } else { Vec::new() };
                 self.construct(target, &arg_vec)?
             }
@@ -8097,6 +8110,18 @@ impl<'p> Vm<'p> {
     /// primitive string (`Str`/`Cons`). Used by Reflect, which throws on non-objects.
     fn is_object_value(&self, v: Value) -> bool {
         v.is_heap() && !self.heap.is_str_like(v.heap_index())
+    }
+
+    /// Whether `v` has a `[[Construct]]` slot — i.e. `new v` / `Reflect.construct`
+    /// is valid. Plain functions and classes qualify; native methods, bound values,
+    /// and non-callables do not. (test262's `isConstructor` helper probes this via
+    /// `Reflect.construct(fn, [], v)`, so getting it right matters across the suite.)
+    fn is_constructor(&self, v: Value) -> bool {
+        v.is_heap()
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class(_)
+            )
     }
 
     /// JS `SameValue` (Object.is): like SameValueZero but +0 and -0 are distinct.
