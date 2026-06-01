@@ -522,7 +522,7 @@ byte-identical to node):
 | 50M integer loop | 50 ms | 53 ms | **1.06× (parity)** |
 | 200k `charCodeAt` scan loop | 0.9 ms | 1.9 ms | 1.8× (sub-ms) |
 | 200k `s[i]===c` scan loop | 0.9 ms | 2.0 ms | 2.2× (sub-ms) |
-| 4M object field read/write | 4.6 ms | 8.6 ms | 1.86× |
+| 4M object field read/write | 4.6 ms | 5.1 ms | **1.10× (near parity)** |
 | 100k string concat + scan | 5.5 ms | 5.9 ms | **1.06× (parity)** |
 | 1M string concat (`s += …`) | 26 ms | 43 ms | 1.64× |
 | fib(37) recursion | 140 ms | 204 ms | 1.46× |
@@ -545,10 +545,14 @@ concat ties V8 on the mixed workload** (and is ~1.6× on a pure 1M `s += …` bu
 `+` builds a cons-string (rope) in O(1) like V8, and shrinking the heap-object
 representation to one cache line (64 B — the large `Class`/`AsyncState` variants are
 boxed so tiny `Cons` nodes don't pay for them) roughly halved the per-concat
-allocation cost. It still trails on: object field access (~1.9×); the residual
-recursion gap (the per-call native call + the warmup→native handoff — closing it
-needs call inlining); and the pure-build concat case (V8's bump-allocated GC still
-edges the rope-node churn). **Startup is ~10× faster** (≈21 ms vs ≈218 ms — no V8
+allocation cost. **Object field access is near parity (~1.1×):** non-escaping
+loop objects are scalar-replaced (SROA) so fields become registers, and a
+dead-code pass drops the now-unused object-ref loads SROA leaves behind (which
+also frees register homes, keeping the loop on the higher-ILP allocation path).
+It still trails on: the residual recursion gap (the per-call native call + the
+warmup→native handoff — closing it needs call inlining); and the pure-build concat
+case (V8's bump-allocated GC still edges the rope-node churn). **Startup is ~10×
+faster** (≈21 ms vs ≈218 ms — no V8
 snapshot/warmup), so end-to-end (incl. startup) zipp finishes every benchmark
 first. Run `bench/run.sh` to reproduce.
 
