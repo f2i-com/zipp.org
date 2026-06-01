@@ -161,6 +161,33 @@ mod native {
     // JSON namespace methods as first-class values.
     pub const JSON_PARSE: u16 = 58;
     pub const JSON_STRINGIFY: u16 = 59;
+    pub const MATH_RANDOM: u16 = 60;
+    // Math methods as first-class values: id = MATH_METHOD_BASE + index into
+    // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
+    // PROTO_METHODS id range (64 + ~127) to avoid collision.
+    pub const MATH_METHOD_BASE: u16 = 256;
+    pub const MATH_METHODS: &[(&str, crate::bytecode::MathFn, u8)] = {
+        use crate::bytecode::MathFn as F;
+        &[
+            ("abs", F::Abs, 1), ("floor", F::Floor, 1), ("ceil", F::Ceil, 1),
+            ("round", F::Round, 1), ("trunc", F::Trunc, 1), ("sign", F::Sign, 1),
+            ("sqrt", F::Sqrt, 1), ("cbrt", F::Cbrt, 1), ("exp", F::Exp, 1),
+            ("log", F::Log, 1), ("log2", F::Log2, 1), ("log10", F::Log10, 1),
+            ("expm1", F::Expm1, 1), ("log1p", F::Log1p, 1), ("sin", F::Sin, 1),
+            ("cos", F::Cos, 1), ("tan", F::Tan, 1), ("asin", F::Asin, 1),
+            ("acos", F::Acos, 1), ("atan", F::Atan, 1), ("sinh", F::Sinh, 1),
+            ("cosh", F::Cosh, 1), ("tanh", F::Tanh, 1), ("asinh", F::Asinh, 1),
+            ("acosh", F::Acosh, 1), ("atanh", F::Atanh, 1), ("clz32", F::Clz32, 1),
+            ("fround", F::Fround, 1), ("pow", F::Pow, 2), ("atan2", F::Atan2, 2),
+            ("imul", F::Imul, 2), ("min", F::Min, 2), ("max", F::Max, 2),
+            ("hypot", F::Hypot, 2),
+        ]
+    };
+
+    pub fn math_method(id: u16) -> Option<(&'static str, crate::bytecode::MathFn, u8)> {
+        id.checked_sub(MATH_METHOD_BASE)
+            .and_then(|i| MATH_METHODS.get(i as usize).copied())
+    }
 
     /// First native id for a prototype method (`Array.prototype.map` etc.). Method
     /// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
@@ -288,6 +315,7 @@ mod native {
             REFLECT_PREVENT_EXT => ("preventExtensions", 1),
             JSON_PARSE => ("parse", 2),
             JSON_STRINGIFY => ("stringify", 3),
+            MATH_RANDOM => ("random", 0),
             _ => return None,
         })
     }
@@ -4540,6 +4568,34 @@ impl<'p> Vm<'p> {
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
         let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
+        // `Math`: a namespace object — the 8 constants (non-w/e/c) + the methods as
+        // first-class values + `random`. Direct `Math.abs(x)` is compile-lowered to
+        // MathOp; this backs the value form + reflection.
+        let math_ctor = {
+            let mut methods: Vec<(&str, u16)> = native::MATH_METHODS
+                .iter()
+                .enumerate()
+                .map(|(i, &(name, _, _))| (name, native::MATH_METHOD_BASE + i as u16))
+                .collect();
+            methods.push(("random", MATH_RANDOM));
+            let idx = build(self, &methods, None);
+            let consts: &[(&str, f64)] = &[
+                ("E", std::f64::consts::E),
+                ("LN10", std::f64::consts::LN_10),
+                ("LN2", std::f64::consts::LN_2),
+                ("LOG10E", std::f64::consts::LOG10_E),
+                ("LOG2E", std::f64::consts::LOG2_E),
+                ("PI", std::f64::consts::PI),
+                ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+                ("SQRT2", std::f64::consts::SQRT_2),
+            ];
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                for &(n, v) in consts {
+                    m.define(n, Value::num(v), proto_attr);
+                }
+            }
+            idx
+        };
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -4561,6 +4617,7 @@ impl<'p> Vm<'p> {
                 "Promise" => Some(promise_ctor),
                 "Reflect" => Some(reflect_ctor),
                 "JSON" => Some(json_ctor),
+                "Math" => Some(math_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -4969,6 +5026,22 @@ impl<'p> Vm<'p> {
                     Some(s) => self.alloc_str(s),
                     None => Value::UNDEFINED,
                 }
+            }
+            // `Math.random` as a value (the call form uses the Random op). xorshift64*.
+            MATH_RANDOM => {
+                let mut x = self.rng_state;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.rng_state = x;
+                let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                Value::num((r >> 11) as f64 / (1u64 << 53) as f64)
+            }
+            // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
+            // form is compile-lowered to MathOp; these back the value form.
+            _ if native::math_method(id).is_some() => {
+                let (_, op, _) = native::math_method(id).unwrap();
+                Value::num(self.eval_math_args(op, args)?)
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
             PROMISE_RESOLVE => {
@@ -5456,6 +5529,7 @@ impl<'p> Vm<'p> {
             // method (`Object.keys.name === "keys"`, `Reflect.get.length === 2`).
             HeapObj::Native(id) => native::proto_method(*id)
                 .map(|(n, _)| (n.to_string(), 1))
+                .or_else(|| native::math_method(*id).map(|(n, _, l)| (n.to_string(), l as i32)))
                 .or_else(|| native::static_name_length(*id).map(|(n, l)| (n.to_string(), l as i32))),
             _ => None,
         }
@@ -5707,6 +5781,40 @@ impl<'p> Vm<'p> {
     /// fallback for an unusual non-variadic spread like `Math.abs(...arr)`).
     fn eval_math_one(&self, op: crate::bytecode::MathFn, x: f64) -> f64 {
         math_unary(op, x)
+    }
+
+    /// Evaluate a Math method over an argument SLICE (the value-form `Math.abs`
+    /// invoked as a native), mirroring `eval_math`'s register-based variant.
+    fn eval_math_args(&self, op: crate::bytecode::MathFn, args: &[Value]) -> Result<f64, Thrown> {
+        use crate::bytecode::MathFn as M;
+        let arg = |i: usize| -> Result<f64, Thrown> {
+            match args.get(i) {
+                Some(v) => self.to_number(*v),
+                None => Ok(f64::NAN),
+            }
+        };
+        Ok(match op {
+            M::Min | M::Max | M::Hypot => {
+                let mut acc = match op {
+                    M::Min => f64::INFINITY,
+                    M::Max => f64::NEG_INFINITY,
+                    _ => 0.0,
+                };
+                for i in 0..args.len() {
+                    let v = arg(i)?;
+                    acc = match op {
+                        M::Min => if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.min(v) },
+                        M::Max => if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.max(v) },
+                        _ => acc + v * v,
+                    };
+                }
+                if matches!(op, M::Hypot) { acc.sqrt() } else { acc }
+            }
+            M::Pow => arg(0)?.powf(arg(1)?),
+            M::Atan2 => arg(0)?.atan2(arg(1)?),
+            M::Imul => (to_uint32(arg(0)?).wrapping_mul(to_uint32(arg(1)?)) as i32) as f64,
+            _ => math_unary(op, arg(0)?),
+        })
     }
 
     /// The per-level indent string for `JSON.stringify`'s `space` argument: a
