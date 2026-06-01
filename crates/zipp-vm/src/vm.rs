@@ -134,6 +134,12 @@ pub struct Vm<'p> {
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).
     template_raws: std::collections::HashMap<u32, Value>,
+    /// Lazily-created `.prototype` object for a function/class value, keyed by the
+    /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
+    /// stable object (identity: `C.prototype === C.prototype`), so it is built on
+    /// first access and cached here. For a class it carries the own methods +
+    /// `constructor`; for a plain function just `constructor`.
+    prototypes: std::collections::HashMap<u32, u32>,
     /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
     /// program's random sequence is reproducible run-to-run (and JIT-on == off).
     rng_state: u64,
@@ -203,6 +209,7 @@ impl<'p> Vm<'p> {
             pending_await: None,
             microtasks: std::collections::VecDeque::new(),
             template_raws: std::collections::HashMap::new(),
+            prototypes: std::collections::HashMap::new(),
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
@@ -3470,6 +3477,40 @@ impl<'p> Vm<'p> {
         Ok(Value::num(ms))
     }
 
+    /// The `.prototype` object of a function/class value — lazily created and
+    /// cached so it has stable identity (`C.prototype === C.prototype`). A class's
+    /// prototype carries its OWN methods plus a `constructor` back-reference; a
+    /// plain function's prototype just has `constructor`. `None` for non-callables
+    /// (a plain object / array / instance has no `.prototype`).
+    fn prototype_of(&mut self, obj: Value) -> Option<Value> {
+        if !obj.is_heap() {
+            return None;
+        }
+        let idx = obj.heap_index();
+        if !matches!(
+            self.heap.get(idx),
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class(_)
+        ) {
+            return None;
+        }
+        if let Some(&p) = self.prototypes.get(&idx) {
+            return Some(Value::heap(p));
+        }
+        // Collect own methods first (ends the immutable heap borrow before alloc).
+        let methods: Vec<(String, Value)> = match self.heap.get(idx) {
+            HeapObj::Class(c) => c.methods.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            _ => Vec::new(),
+        };
+        let mut map = ObjMap::new();
+        for (k, v) in &methods {
+            map.set(k, *v);
+        }
+        map.set("constructor", obj);
+        let p = self.heap.alloc(HeapObj::Object(map));
+        self.prototypes.insert(idx, p);
+        Some(Value::heap(p))
+    }
+
     /// The `(name, length)` of a callable value (function, closure, or class) for
     /// its `.name`/`.length` properties — `None` for non-callables. A synthetic
     /// proto name (`<arrow>`, `<script>`, …) reads as the empty string (anonymous).
@@ -3513,6 +3554,12 @@ impl<'p> Vm<'p> {
         if key == "name" || key == "length" {
             if let Some((nm, len)) = self.callable_name_length(obj) {
                 return Ok(if key == "name" { self.alloc_str(nm) } else { Value::int(len) });
+            }
+        }
+        // A function's / class's `.prototype` (a lazily-created, stable object).
+        if key == "prototype" {
+            if let Some(p) = self.prototype_of(obj) {
+                return Ok(p);
             }
         }
         match self.heap.get(obj.heap_index()) {
