@@ -155,6 +155,19 @@ mod native {
         ("has", 4), ("keys", 4), ("set", 4), ("values", 4),
         // Boolean.prototype (kind 5 → boolean_method on the boolean value).
         ("toString", 5), ("valueOf", 5),
+        // Date.prototype (kind 6 → date_method on the Date receiver).
+        ("getDate", 6), ("getDay", 6), ("getFullYear", 6), ("getHours", 6),
+        ("getMilliseconds", 6), ("getMinutes", 6), ("getMonth", 6), ("getSeconds", 6),
+        ("getTime", 6), ("getTimezoneOffset", 6), ("getUTCDate", 6), ("getUTCDay", 6),
+        ("getUTCFullYear", 6), ("getUTCHours", 6), ("getUTCMilliseconds", 6),
+        ("getUTCMinutes", 6), ("getUTCMonth", 6), ("getUTCSeconds", 6), ("setDate", 6),
+        ("setFullYear", 6), ("setHours", 6), ("setMilliseconds", 6), ("setMinutes", 6),
+        ("setMonth", 6), ("setSeconds", 6), ("setTime", 6), ("setUTCDate", 6),
+        ("setUTCFullYear", 6), ("setUTCHours", 6), ("setUTCMilliseconds", 6),
+        ("setUTCMinutes", 6), ("setUTCMonth", 6), ("setUTCSeconds", 6), ("toDateString", 6),
+        ("toISOString", 6), ("toJSON", 6), ("toLocaleDateString", 6), ("toLocaleString", 6),
+        ("toLocaleTimeString", 6), ("toString", 6), ("toTimeString", 6), ("toUTCString", 6),
+        ("valueOf", 6),
     ];
 
     /// `(name, kind)` for a prototype-method native id, if it is one.
@@ -4249,6 +4262,7 @@ impl<'p> Vm<'p> {
         let mut num_methods: Vec<(&str, u16)> = Vec::new();
         let mut map_methods: Vec<(&str, u16)> = Vec::new();
         let mut bool_methods: Vec<(&str, u16)> = Vec::new();
+        let mut date_methods: Vec<(&str, u16)> = Vec::new();
         for (i, &(name, kind)) in native::PROTO_METHODS.iter().enumerate() {
             let id = native::PROTO_METHOD_BASE + i as u16;
             match kind {
@@ -4256,7 +4270,8 @@ impl<'p> Vm<'p> {
                 1 => str_methods.push((name, id)),
                 2 => num_methods.push((name, id)),
                 4 => map_methods.push((name, id)),
-                _ => bool_methods.push((name, id)),
+                5 => bool_methods.push((name, id)),
+                _ => date_methods.push((name, id)), // kind 6
             }
         }
         self.arr_proto = build(self, &arr_methods, None);
@@ -4265,6 +4280,7 @@ impl<'p> Vm<'p> {
         let num_proto = build(self, &num_methods, None);
         let map_proto = build(self, &map_methods, None);
         let bool_proto = build(self, &bool_methods, None);
+        let date_proto = build(self, &date_methods, None);
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -4309,10 +4325,11 @@ impl<'p> Vm<'p> {
             m.define("prototype", Value::heap(num_proto), proto_attr);
             self.heap.alloc(HeapObj::Object(m))
         };
-        // Map / Boolean globals: just their .prototype (construction is
-        // compile-lowered to NewMap; the value-level shape is built here).
+        // Map / Boolean / Date globals: their .prototype (construction is
+        // compile-lowered to NewMap / DateNew; the value-level shape is built here).
         let map_ctor = build(self, &[], Some(map_proto));
         let boolean_ctor = build(self, &[], Some(bool_proto));
+        let date_ctor = build(self, &[], Some(date_proto));
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -4329,6 +4346,7 @@ impl<'p> Vm<'p> {
                 "Number" => Some(number_ctor),
                 "Map" => Some(map_ctor),
                 "Boolean" => Some(boolean_ctor),
+                "Date" => Some(date_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -4429,8 +4447,8 @@ impl<'p> Vm<'p> {
                     let r = match kind {
                         0 => self.array_method(this.heap_index(), m, args)?,
                         1 => self.string_method(this.heap_index(), m, args)?,
-                        3 => self.set_method(this.heap_index(), m, args)?,
-                        _ => self.map_method(this.heap_index(), m, args)?,
+                        4 => self.map_method(this.heap_index(), m, args)?,
+                        _ => self.date_method(this.heap_index(), m, args)?, // kind 6
                     };
                     r.unwrap_or(Value::UNDEFINED)
                 }
