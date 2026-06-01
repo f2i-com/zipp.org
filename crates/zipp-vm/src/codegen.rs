@@ -1815,6 +1815,7 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::Sub { .. }
             | Instr::Mul { .. }
             | Instr::Div { .. }
+            | Instr::Mod { .. }
             | Instr::AddInt { .. }
             | Instr::Neg { .. }
             | Instr::Lt { .. }
@@ -2118,7 +2119,8 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
             Instr::Add { dst, .. }
             | Instr::Sub { dst, .. }
             | Instr::Mul { dst, .. }
-            | Instr::Div { dst, .. } => (Some(dst), VTy::Num),
+            | Instr::Div { dst, .. }
+            | Instr::Mod { dst, .. } => (Some(dst), VTy::Num),
             Instr::Lt { dst, .. }
             | Instr::Le { dst, .. }
             | Instr::Gt { dst, .. }
@@ -2183,6 +2185,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
             | Instr::Sub { a, b, .. }
             | Instr::Mul { a, b, .. }
             | Instr::Div { a, b, .. }
+            | Instr::Mod { a, b, .. }
             | Instr::Lt { a, b, .. }
             | Instr::Le { a, b, .. }
             | Instr::Gt { a, b, .. }
@@ -2414,6 +2417,7 @@ fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::Sub { a, b, .. }
         | Instr::Mul { a, b, .. }
         | Instr::Div { a, b, .. }
+        | Instr::Mod { a, b, .. }
         | Instr::Lt { a, b, .. }
         | Instr::Le { a, b, .. }
         | Instr::Gt { a, b, .. }
@@ -2768,9 +2772,9 @@ const TWO_POW_53: i64 = 9_007_199_254_740_992;
 const TWO_POW_54: i64 = 18_014_398_509_481_984;
 
 /// Can the loop region `[start, end]` run on the INTEGER path? Stricter than
-/// `region_can_compile`: every op must be integer-valued (no Mul/Div/Mod — i64
-/// multiply needs 128-bit and div/mod are fractional), and every `LoadConst`
-/// must be an Int-tagged constant (a double constant would be misread as i64).
+/// `region_is_int`: every op must be integer-valued (no Div — fractional; `Mod`
+/// IS allowed, via integer `idiv`), and every `LoadConst` must be an Int-tagged
+/// constant (a double constant would be misread as i64).
 fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
     if !region_can_compile(proto, start, end) {
         return false;
@@ -2785,6 +2789,7 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::Add { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
+            | Instr::Mod { .. }
             | Instr::AddInt { .. }
             | Instr::Neg { .. }
             | Instr::Lt { .. }
@@ -2952,6 +2957,34 @@ fn compile_region_int(
                     ; => done
                 );
                 emit_i53_guard(&mut ops, d, ip, flush_exit);
+            }
+            Instr::Mod { dst, a, b } => {
+                // i64 remainder via idiv (gpr): `rem = a % b`, truncated toward
+                // zero with the dividend's sign — exactly JS `%` for integer
+                // operands (the region is all-int). `% 0` → NaN (not an Int) →
+                // bail at THIS ip (the interpreter redoes it, yielding NaN). The
+                // dividend is guaranteed |a| ≤ 2^53 (entry guard + per-op i53
+                // guard) so it is never i64::MIN ⇒ idiv can't #DE; and
+                // |rem| < |b| ≤ 2^53, so the result is always representable (no
+                // i53 guard needed). rcx/rdx are scratch here (bool homes live in
+                // r8..r11, never rcx/rdx).
+                let (d, ax, bx) = (xh(&plan, dst), xh(&plan, a), xh(&plan, b));
+                let zbail = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; movq rax, Rx(ax)
+                    ; movq rcx, Rx(bx)
+                    ; test rcx, rcx
+                    ; jz => zbail              // % 0 → NaN → redo in interp
+                    ; cqo                       // sign-extend rax into rdx:rax
+                    ; idiv rcx                  // rdx = remainder, rax = quotient
+                    ; movq Rx(d), rdx
+                    ; jmp => done
+                    ; => zbail
+                    ; mov DWORD [rsi], ip as i32 // resume at THIS op (dst unwritten)
+                    ; jmp => flush_exit
+                    ; => done
+                );
             }
             Instr::AddInt { dst, a, imm } => {
                 let d = xh(&plan, dst);
