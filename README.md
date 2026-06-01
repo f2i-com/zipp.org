@@ -523,7 +523,8 @@ byte-identical to node):
 | 200k `charCodeAt` scan loop | 0.9 ms | 1.9 ms | 1.8× (sub-ms) |
 | 200k `s[i]===c` scan loop | 0.9 ms | 2.0 ms | 2.2× (sub-ms) |
 | 4M object field read/write | 4.6 ms | 8.6 ms | 1.86× |
-| 100k string concat + scan | 6.0 ms | 14 ms | 2.38× |
+| 100k string concat + scan | 5.5 ms | 5.9 ms | **1.06× (parity)** |
+| 1M string concat (`s += …`) | 26 ms | 43 ms | 1.64× |
 | fib(37) recursion | 140 ms | 204 ms | 1.46× |
 
 zipp **beats V8 across the whole array `map`/`filter`/`reduce` pipeline** (~2×
@@ -539,11 +540,15 @@ f64, interned single-char strings compare by NaN-boxed bits), turning a former ~
 gap into ~2× (sub-millisecond absolute). **Self-recursion runs native-to-native:**
 a recursive call compiles to a direct native call to the function's own entry (an
 inline depth guard bounds the native stack; runaway recursion still deopts to a
-catchable `RangeError`), cutting fib(37) from ~2.8× to ~1.5× off V8. It still trails
-on: object field access (~1.9×); the residual recursion gap (the per-call native
-call + the warmup→native handoff — closing it needs call inlining); and string
-*concatenation* (`s += …` builds rope nodes that still allocate). **Startup is ~10×
-faster** (≈21 ms vs ≈218 ms — no V8
+catchable `RangeError`), cutting fib(37) from ~2.8× to ~1.5× off V8. **String
+concat ties V8 on the mixed workload** (and is ~1.6× on a pure 1M `s += …` build):
+`+` builds a cons-string (rope) in O(1) like V8, and shrinking the heap-object
+representation to one cache line (64 B — the large `Class`/`AsyncState` variants are
+boxed so tiny `Cons` nodes don't pay for them) roughly halved the per-concat
+allocation cost. It still trails on: object field access (~1.9×); the residual
+recursion gap (the per-call native call + the warmup→native handoff — closing it
+needs call inlining); and the pure-build concat case (V8's bump-allocated GC still
+edges the rope-node churn). **Startup is ~10× faster** (≈21 ms vs ≈218 ms — no V8
 snapshot/warmup), so end-to-end (incl. startup) zipp finishes every benchmark
 first. Run `bench/run.sh` to reproduce.
 
