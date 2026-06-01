@@ -640,16 +640,22 @@ fn compile_proto(
     // Shared epilogue: every Return/bail sets rax + [rsi] then jumps here, which
     // restores the stack frame and callee-saved regs before `ret`.
     let epilogue = ops.new_dynamic_label();
+    // The function's own entry (offset 0). A self-recursive `Call` issues a
+    // DIRECT native call here (same win64 ABI as `JitFn::run`), skipping the Rust
+    // trampoline on the clean hot path. The recursion runs on the native stack,
+    // bounded by an inline depth guard (see `emit_self_call`).
+    let self_entry = ops.new_dynamic_label();
 
     // ── prologue ── save callee-saved regs, stash the 3 inputs, reserve shadow.
-    // 3 pushes (24B) + sub 8 → 32B from a 16-aligned entry ⇒ 16-aligned, and
-    // gives 32B shadow space below for helper calls (we sub 0x28 = 40 to also
-    // hold the shadow region; 3 pushes + 40 = 64, 16-aligned).
+    // 3 pushes (24B) + sub 48 = 72B; +8 (return addr) = 80 ⇒ 16-aligned. The 48
+    // gives 32B shadow for helper calls PLUS a 4B callee bail slot (at [rsp+32])
+    // for the inline self-call.
     dynasm!(ops
+        ; => self_entry
         ; push rbx
         ; push rsi
         ; push rdi
-        ; sub rsp, 32
+        ; sub rsp, 48
         ; mov rbx, rcx        // regs base
         ; mov rsi, rdx        // bail_ip ptr
         ; mov rdi, r8         // vm ptr
@@ -740,9 +746,14 @@ fn compile_proto(
             }
             Instr::Call { dst, arg_base, argc, .. } => {
                 // Self-recursive call (can_compile verified callee == self_slot).
-                // Marshal args, call the depth-guarded Rust helper, store result.
+                // Fast path: a DIRECT native call to this function's own entry
+                // with an inline depth guard — no Rust trampoline. Cold paths
+                // (depth limit, or the callee bailed mid-body) route to the Rust
+                // helper, which runs the activation on the interpreter WITH the
+                // recursion depth held elevated (so re-entry can't livelock).
                 emit_self_call(
-                    &mut ops, ip, bail, self_func_id, self_call_helper, dst, arg_base, argc,
+                    &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst, arg_base,
+                    argc, proto.reg_count,
                 );
             }
             Instr::Return { src } => {
@@ -775,7 +786,7 @@ fn compile_proto(
     // or 0-for-bail; [rsi] already holds NO_BAIL or the bail ip).
     dynasm!(ops
         ; => epilogue
-        ; add rsp, 32
+        ; add rsp, 48
         ; pop rdi
         ; pop rsi
         ; pop rbx
@@ -821,7 +832,7 @@ fn emit_bail(ops: &mut dynasmrt::x64::Assembler, ip: usize, bail: dynasmrt::Dyna
         ; => bail
         ; mov DWORD [rsi], ip as i32
         ; xor rax, rax
-        ; add rsp, 32
+        ; add rsp, 48
         ; pop rdi
         ; pop rsi
         ; pop rbx
@@ -983,27 +994,84 @@ pub const SELF_CALL_DEOPT: u64 = 0x7FFE_DEAD_BEEF_0000;
 /// and returns the result Value bits, or `SELF_CALL_DEOPT` to bail. rbx/rsi/rdi
 /// are callee-saved so they survive the call; 32B shadow space was reserved in
 /// the prologue (rsp stays 16-aligned: prologue did 3 pushes + sub 40 = 64B).
+#[allow(clippy::too_many_arguments)]
 fn emit_self_call(
     ops: &mut dynasmrt::x64::Assembler,
     ip: usize,
     bail: dynasmrt::DynamicLabel,
+    self_entry: dynasmrt::DynamicLabel,
     func_id: u32,
     helper: usize,
     dst: u16,
     arg_base: u16,
     argc: u16,
+    reg_count: u16,
 ) {
+    let depth_off = crate::vm::JIT_RECURSE_DEPTH_OFFSET as i32;
+    let max = crate::vm::JIT_SELF_RECURSE_MAX_PUB as i32;
+    let slow = ops.new_dynamic_label();
+    let store = ops.new_dynamic_label();
+    // Pack func_id (low 24b) + argc (high 8b) for the slow-path helper. Function
+    // ids and arities are far below 2^24 / 2^8, so this is lossless.
+    let packed = (func_id & 0x00FF_FFFF) | ((argc as u32) << 24);
+
+    // ── FAST PATH ── depth guard, then a direct native call to our own entry.
+    // The callee window is CONTIGUOUS at rbx + reg_count*8 (the register file is
+    // pinned to a fixed capacity and never reallocates; get/set index it by raw
+    // pointer, so writing past the live `len` is sound — the memory is allocated
+    // and the callee defs every reg before reading). Depth bounds the native
+    // stack; the depth limit (256) × reg_count is far below the reserved
+    // capacity (max_window × MAX_FRAMES), so the window can't overflow the buffer.
     dynasm!(ops
+        ; mov eax, [rdi + depth_off]
+        ; cmp eax, max
+        ; jae => slow                        // at the limit → Rust trampoline
+        ; lea r11, [rbx + dreg(reg_count)]   // r11 = callee regs base
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; mov [r11], rax                     // callee reg0 = this = undefined
+    );
+    for i in 0..argc as i32 {
+        dynasm!(ops
+            ; mov rax, [rbx + dreg(arg_base) + i * 8]
+            ; mov [r11 + (1 + i) * 8], rax   // callee reg(1+i) = arg i
+        );
+    }
+    dynasm!(ops
+        ; inc DWORD [rdi + depth_off]        // depth += 1
+        ; mov rcx, r11                       // rcx = callee regs base
+        ; lea rdx, [rsp + 32]                // rdx = callee's bail slot (our frame)
+        ; mov DWORD [rsp + 32], NO_BAIL as i32
+        ; mov r8, rdi                        // r8 = vm
+        ; call => self_entry                 // win64 ABI; result bits → rax
+        ; dec DWORD [rdi + depth_off]        // depth -= 1
+        ; mov r10d, [rsp + 32]               // callee resume ip
+        ; cmp r10d, NO_BAIL as i32
+        ; je => store                        // clean native return → store result
+        // The callee bailed mid-body. We must NOT unwind here (that would drop
+        // depth to 0 and let the top-level interpreter re-enter native →
+        // livelock). Instead fall through to the Rust finisher, which re-runs
+        // this whole activation on the interpreter with depth held elevated.
+    );
+
+    // ── SLOW / FINISH PATH ── the Rust helper `jit_self_call_at` runs the
+    // recursion (or the bailed continuation) with full bail-recovery + MAX_FRAMES
+    // → RangeError handling, holding depth elevated so JIT re-entry can't
+    // livelock. It needs the caller window base EXPLICITLY (rbx) since the fast
+    // path tracks the window by raw pointer, not `regs.len()`. ABI: rcx=vm,
+    // rdx=caller_base_ptr, r8=args_ptr, r9d=(func_id | argc<<24). rbx/rsi/rdi are
+    // callee-saved across the call.
+    dynasm!(ops
+        ; => slow
         ; mov rcx, rdi                       // vm
-        ; mov edx, func_id as i32            // func_id
-        ; lea r8, [rbx + dreg(arg_base)]     // args_ptr (in the reg window)
-        ; mov r9d, argc as i32               // argc
+        ; mov rdx, rbx                        // caller window base
+        ; lea r8, [rbx + dreg(arg_base)]     // args_ptr
+        ; mov r9d, packed as i32             // func_id | argc<<24
         ; mov rax, QWORD helper as i64
         ; call rax
-        // rax = result bits OR SELF_CALL_DEOPT. Compare against the sentinel.
         ; mov r10, QWORD SELF_CALL_DEOPT as i64
         ; cmp rax, r10
-        ; je => bail
+        ; je => bail                         // helper deopted → redo in interp
+        ; => store
         ; mov [rbx + dreg(dst)], rax
     );
     emit_bail(ops, ip, bail);

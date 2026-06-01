@@ -247,6 +247,11 @@ impl<'p> Vm<'p> {
     /// NEVER reallocates — the native CALLER's window pointer (`rbx`) therefore
     /// stays valid across this call. We `truncate` back to the caller's length
     /// before returning so the register file is exactly as the caller left it.
+    ///
+    /// NOTE: superseded by the inline native→native fast path + `jit_self_call_at`
+    /// (the codegen now calls its own entry directly, no per-call Rust). Retained
+    /// for reference / potential reuse; not on any hot path.
+    #[allow(dead_code)]
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn jit_self_call_impl(&mut self, func_id: u32, args: *const u64, argc: usize) -> u64 {
         // Depth guard: deopt (not crash) past the native recursion budget; the
@@ -344,6 +349,110 @@ impl<'p> Vm<'p> {
         self.jit_recurse_depth -= 1;
         self.regs.truncate(new_base);
         result_bits
+    }
+
+    /// Slow/finish path for the JIT's inline native→native self-call. Called
+    /// when the inline fast path can't complete a recursive call purely natively:
+    /// either the native depth limit was hit, or the callee bailed mid-body. The
+    /// caller passes its window base EXPLICITLY (`caller_base_ptr`, the native
+    /// `rbx`) because the fast path tracks windows by raw pointer, not
+    /// `self.regs.len()`. Runs the activation on the interpreter over a transient
+    /// frame at the callee window, holding `jit_recurse_depth` ELEVATED for the
+    /// duration so the dispatch JIT-entry gate (`== 0`) stays closed and the
+    /// recursion can't re-enter native and livelock — frames then accumulate
+    /// monotonically to `MAX_FRAMES` → catchable RangeError. Returns the result
+    /// bits, or `SELF_CALL_DEOPT` if the activation threw (the throw is left in
+    /// `pending_throw`; the native chain unwinds and the top-level interpreter
+    /// re-raises it).
+    ///
+    /// # Safety
+    /// `caller_base_ptr` is the caller's window base within `self.regs`; `args`
+    /// points to `argc` valid `Value` bits.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn jit_self_call_at_impl(
+        &mut self,
+        func_id: u32,
+        caller_base_ptr: *const u64,
+        args: *const u64,
+        argc: usize,
+    ) -> u64 {
+        let proto = &self.program.functions[func_id as usize];
+        let reg_count = (proto.reg_count as usize).max(1);
+        let params = proto.param_count as usize;
+
+        // Caller window base as a slot index (the fast path placed it by raw
+        // pointer); the callee window sits contiguously above it.
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' (non-reallocating) buffer.
+        let caller_base =
+            unsafe { (caller_base_ptr).offset_from(regs_base) } as usize;
+        let new_base = caller_base + reg_count;
+        let needed = new_base + reg_count;
+        if self.regs_would_overflow(needed) {
+            // Out of reserved register headroom (very deep): treat as stack
+            // overflow — throw so the interpreter surfaces a catchable RangeError.
+            let e =
+                self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+            self.pending_throw = Some(e);
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+
+        // RESYNC self.regs.len() to span the callee window so the transient
+        // interpreter frame + MAX_FRAMES accounting are consistent. Save the
+        // entry length and restore it on the way out (the native caller doesn't
+        // use `len`, but the eventual return to the dispatch loop expects it
+        // unchanged).
+        let saved_len = self.regs.len();
+        // CRITICAL: grow `len` with `set_len`, NOT `resize`. The native fast path
+        // advanced the register windows by raw pointer WITHOUT touching
+        // `self.regs.len()`, so on entry here `len` (≈ the warmup top) is far below
+        // the live native windows, which occupy slots up to `new_base`. A
+        // `resize(needed, UNDEFINED)` would ZERO-FILL `[len, needed)` — overwriting
+        // every parked native frame's registers with `undefined` and corrupting the
+        // recursion (this was the bug that capped JIT recursion below the
+        // interpreter). The native windows hold valid `Value`s already (each native
+        // frame defs its registers before reading — the same def-before-use
+        // invariant the leaf JIT relies on), and the buffer is pinned to capacity
+        // by `reserve_jit_regs`, so simply exposing them via `set_len` is correct.
+        // Bounds: `needed ≤ capacity` (guarded above by `regs_would_overflow`).
+        // SAFETY: `needed ≤ capacity`; slots `[0, needed)` are live `Value`s —
+        // `[0, len)` from the interpreter, `[len, new_base+reg_count)` written by
+        // the native frames whose windows we're spanning.
+        unsafe { self.regs.set_len(needed); }
+        if needed > self.regs_hw {
+            self.regs_hw = needed;
+        }
+        self.regs[new_base] = Value::UNDEFINED;
+        let n = argc.min(params);
+        for i in 0..n {
+            self.regs[new_base + 1 + i] = Value::from_bits(unsafe { *args.add(i) });
+        }
+
+        // Run this activation on the interpreter via a transient frame. Depth is
+        // held ELEVATED across the whole run (we only restore it after), so any
+        // self-call inside stays interpreted (the dispatch gate sees depth != 0)
+        // and the recursion can't re-enter native → no livelock; frames grow to
+        // MAX_FRAMES → RangeError on runaway.
+        self.jit_recurse_depth += 1;
+        self.frames.push(Frame {
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
+            closure: NO_CLOSURE,
+            handlers: Vec::new(),
+        });
+        let stop = self.frames.len() - 1;
+        let r = self.run_loop(stop);
+        self.jit_recurse_depth -= 1;
+        // SAFETY: restore the entry length (allocation unchanged, slots valid).
+        unsafe { self.regs.set_len(saved_len); }
+        match r {
+            Ok(v) => v.bits(),
+            // Threw (e.g. RangeError): leave it in pending_throw and signal the
+            // native caller to unwind; the top-level interpreter re-raises it.
+            Err(_) => crate::codegen::SELF_CALL_DEOPT,
+        }
     }
 
     /// Reserve enough register-file capacity that a full JIT self-recursion
@@ -675,7 +784,7 @@ impl<'p> Vm<'p> {
                     self.jit.compile(
                         func_id,
                         proto_ref,
-                        jit_self_call as usize,
+                        jit_self_call_at as usize,
                         self_val,
                     );
                 }
@@ -4560,7 +4669,7 @@ impl<'p> Vm<'p> {
                 .and_then(|s| self.globals.get(s as usize).copied())
                 .unwrap_or(Value::UNDEFINED)
                 .bits();
-            self.jit.compile(fid, proto_ref, jit_self_call as usize, self_val);
+            self.jit.compile(fid, proto_ref, jit_self_call_at as usize, self_val);
         }
         let entry = self.jit.get(fid)?.entry();
         let proto = &self.program.functions[fid as usize];
@@ -5907,33 +6016,46 @@ fn function_global_slot(f: &crate::bytecode::FuncProto) -> Option<u16> {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const JIT_SELF_RECURSE_MAX: u32 = 256;
 
-/// Win64 helper invoked by JIT'd native code for a self-recursive call:
-/// `result_bits = self(args[0..argc])`, where `self` is the function with id
-/// `func_id`. Returns the result `Value` bits, or `codegen::SELF_CALL_DEOPT`
-/// when it can't run natively (depth exceeded, a non-int arg, or the callee
-/// isn't int-JIT'd) — the native caller then bails that Call to the interpreter.
-///
-/// SAFETY / why the caller's register window survives: the recursive frame runs
-/// on a SEPARATE, freshly-allocated register buffer (`window`), NOT `vm.regs`.
-/// So nothing here resizes `vm.regs`, and the native caller's `rbx` (pointer
-/// into its own window) stays valid across this call. The native callee gets
-/// `window.as_mut_ptr()` as its regs base. If the callee itself bails mid-body,
-/// we finish that activation through the interpreter over the SAME window via a
-/// transient frame, then restore vm state.
+/// Public mirror of `JIT_SELF_RECURSE_MAX` for codegen's inline depth guard (the
+/// native fast path compares `vm.jit_recurse_depth` against this before a direct
+/// recursive call), kept identical so the inline guard and the slow path agree.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_SELF_RECURSE_MAX_PUB: u32 = JIT_SELF_RECURSE_MAX;
+
+/// Byte offset of `jit_recurse_depth` within `Vm`, for the JIT's inline
+/// native→native self-call: the compiled code reads/bumps the counter directly
+/// through the `vm` pointer (rdi) rather than crossing into Rust per recursive
+/// call. Computed at compile time (verified to match the live field address
+/// during bring-up).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_RECURSE_DEPTH_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, jit_recurse_depth);
+
+/// Win64 helper for the slow/finish path of the JIT's inline native→native
+/// self-call (see `jit_self_call_at_impl`). The native fast path tracks register
+/// windows by raw pointer, so it passes its window base EXPLICITLY in
+/// `caller_base_ptr` (the native `rbx`). `packed` carries `func_id` in the low 24
+/// bits and `argc` in the high 8. Returns the result bits or `SELF_CALL_DEOPT`
+/// (the activation threw — `pending_throw` is set, the native chain unwinds, and
+/// the top-level interpreter re-raises it). ABI: rcx=vm, rdx=caller_base_ptr,
+/// r8=args_ptr, r9=packed.
 ///
 /// # Safety
-/// `vm` is a valid `*mut Vm`; `args` points to `argc` valid `Value` bits.
+/// `vm` is a valid `*mut Vm`; `caller_base_ptr` is the caller's window base
+/// within `vm.regs`; `args` points to `argc` valid `Value` bits.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_self_call(
+pub(crate) extern "win64" fn jit_self_call_at(
     vm: *mut core::ffi::c_void,
-    func_id: u32,
+    caller_base_ptr: *const u64,
     args: *const u64,
-    argc: u32,
+    packed: u32,
 ) -> u64 {
+    let func_id = packed & 0x00FF_FFFF;
+    let argc = (packed >> 24) as usize;
     // Catch Rust panics at the FFI boundary (UB to unwind across `extern`).
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let vm = &mut *(vm as *mut Vm);
-        vm.jit_self_call_impl(func_id, args, argc as usize)
+        vm.jit_self_call_at_impl(func_id, caller_base_ptr, args, argc)
     }));
     match r {
         Ok(bits) => bits,
