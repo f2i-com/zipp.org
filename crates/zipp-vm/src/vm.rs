@@ -220,6 +220,72 @@ mod native {
         id.checked_sub(PROTO_METHOD_BASE)
             .and_then(|i| PROTO_METHODS.get(i as usize).copied())
     }
+
+    /// The spec `name` and `length` of a static/namespace native (Object.*,
+    /// Reflect.*, Function.prototype.call, …) so it exposes real own `name`/
+    /// `length` properties like any function. (Proto methods use `proto_method`.)
+    pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
+        Some(match id {
+            OBJ_DEFINE_PROPERTY => ("defineProperty", 3),
+            OBJ_DEFINE_PROPERTIES => ("defineProperties", 2),
+            OBJ_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),
+            OBJ_GET_OWN_NAMES => ("getOwnPropertyNames", 1),
+            OBJ_GET_PROTO => ("getPrototypeOf", 1),
+            OBJ_KEYS => ("keys", 1),
+            OBJ_VALUES => ("values", 1),
+            OBJ_ENTRIES => ("entries", 1),
+            OBJ_ASSIGN => ("assign", 2),
+            OBJ_CREATE => ("create", 2),
+            PROTO_HAS_OWN => ("hasOwnProperty", 1),
+            PROTO_PROP_ENUM => ("propertyIsEnumerable", 1),
+            PROTO_IS_PROTO_OF => ("isPrototypeOf", 1),
+            PROTO_VALUE_OF => ("valueOf", 0),
+            PROTO_TO_STRING => ("toString", 0),
+            FN_CALL => ("call", 1),
+            FN_APPLY => ("apply", 2),
+            FN_BIND => ("bind", 1),
+            ARR_IS_ARRAY => ("isArray", 1),
+            ARR_FROM => ("from", 1),
+            ARR_OF => ("of", 0),
+            ARR_JOIN => ("join", 1),
+            ARR_PUSH => ("push", 1),
+            PROMISE_RESOLVE => ("resolve", 1),
+            PROMISE_REJECT => ("reject", 1),
+            PROMISE_ALL => ("all", 1),
+            PROMISE_ALLSETTLED => ("allSettled", 1),
+            PROMISE_RACE => ("race", 1),
+            PROMISE_ANY => ("any", 1),
+            OBJ_IS => ("is", 2),
+            OBJ_HAS_OWN => ("hasOwn", 2),
+            OBJ_FROM_ENTRIES => ("fromEntries", 1),
+            OBJ_SET_PROTO_OF => ("setPrototypeOf", 2),
+            OBJ_GET_OWN_SYMBOLS => ("getOwnPropertySymbols", 1),
+            OBJ_GET_OWN_DESCS => ("getOwnPropertyDescriptors", 1),
+            OBJ_FREEZE => ("freeze", 1),
+            OBJ_IS_FROZEN => ("isFrozen", 1),
+            OBJ_SEAL => ("seal", 1),
+            OBJ_IS_SEALED => ("isSealed", 1),
+            OBJ_PREVENT_EXT => ("preventExtensions", 1),
+            OBJ_IS_EXT => ("isExtensible", 1),
+            OBJ_GROUP_BY => ("groupBy", 2),
+            MAP_GROUP_BY => ("groupBy", 2),
+            PROMISE_WITH_RESOLVERS => ("withResolvers", 0),
+            REFLECT_APPLY => ("apply", 3),
+            REFLECT_CONSTRUCT => ("construct", 2),
+            REFLECT_GET => ("get", 2),
+            REFLECT_SET => ("set", 3),
+            REFLECT_HAS => ("has", 2),
+            REFLECT_DELETE => ("deleteProperty", 2),
+            REFLECT_OWN_KEYS => ("ownKeys", 1),
+            REFLECT_GET_PROTO => ("getPrototypeOf", 1),
+            REFLECT_SET_PROTO => ("setPrototypeOf", 2),
+            REFLECT_DEFINE => ("defineProperty", 3),
+            REFLECT_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),
+            REFLECT_IS_EXT => ("isExtensible", 1),
+            REFLECT_PREVENT_EXT => ("preventExtensions", 1),
+            _ => return None,
+        })
+    }
 }
 
 /// What `object_enum_own` collects.
@@ -5348,8 +5414,12 @@ impl<'p> Vm<'p> {
                     .unwrap_or(0);
                 Some((clean(&c.name), len))
             }
-            // A prototype-method native value (`Array.prototype.map.name === "map"`).
-            HeapObj::Native(id) => native::proto_method(*id).map(|(n, _)| (n.to_string(), 1)),
+            // A native value's `name`/`length`: a prototype method
+            // (`Array.prototype.map.name === "map"`, length 1) or a static/namespace
+            // method (`Object.keys.name === "keys"`, `Reflect.get.length === 2`).
+            HeapObj::Native(id) => native::proto_method(*id)
+                .map(|(n, _)| (n.to_string(), 1))
+                .or_else(|| native::static_name_length(*id).map(|(n, l)| (n.to_string(), l as i32))),
             _ => None,
         }
     }
