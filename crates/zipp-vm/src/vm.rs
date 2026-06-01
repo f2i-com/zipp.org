@@ -145,6 +145,8 @@ mod native {
         ("slice", 1), ("split", 1), ("startsWith", 1), ("substring", 1),
         ("toLowerCase", 1), ("toUpperCase", 1), ("trim", 1), ("trimEnd", 1),
         ("trimStart", 1),
+        // Number.prototype (kind 2 → number_method, receiver is a number value).
+        ("toFixed", 2), ("toString", 2), ("valueOf", 2),
     ];
 
     /// `(name, kind)` for a prototype-method native id, if it is one.
@@ -4236,17 +4238,19 @@ impl<'p> Vm<'p> {
         // first-class values (`Array.prototype.map.call(arr, fn)`).
         let mut arr_methods: Vec<(&str, u16)> = vec![("join", ARR_JOIN), ("push", ARR_PUSH)];
         let mut str_methods: Vec<(&str, u16)> = Vec::new();
+        let mut num_methods: Vec<(&str, u16)> = Vec::new();
         for (i, &(name, kind)) in native::PROTO_METHODS.iter().enumerate() {
             let id = native::PROTO_METHOD_BASE + i as u16;
-            if kind == 0 {
-                arr_methods.push((name, id));
-            } else {
-                str_methods.push((name, id));
+            match kind {
+                0 => arr_methods.push((name, id)),
+                1 => str_methods.push((name, id)),
+                _ => num_methods.push((name, id)),
             }
         }
         self.arr_proto = build(self, &arr_methods, None);
         self.str_proto = build(self, &str_methods, None);
         let str_proto = self.str_proto;
+        let num_proto = build(self, &num_methods, None);
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -4270,6 +4274,27 @@ impl<'p> Vm<'p> {
         let array_ctor = build(self, &[("isArray", ARR_IS_ARRAY), ("from", ARR_FROM), ("of", ARR_OF)], Some(arr_proto));
         let function_ctor = build(self, &[], Some(fn_proto));
         let string_ctor = build(self, &[], Some(str_proto));
+        // `Number`: the numeric constants (non-writable/enumerable/configurable per
+        // spec) + Number.prototype. `Number(x)` / `Number.isInteger(x)` etc. are
+        // call-site lowered (GlobalFn), so only the value-level shape is built here.
+        let number_ctor = {
+            let mut m = ObjMap::new();
+            let consts: &[(&str, f64)] = &[
+                ("MAX_SAFE_INTEGER", 9007199254740991.0),
+                ("MIN_SAFE_INTEGER", -9007199254740991.0),
+                ("MAX_VALUE", f64::MAX),
+                ("MIN_VALUE", 5e-324),
+                ("EPSILON", f64::EPSILON),
+                ("POSITIVE_INFINITY", f64::INFINITY),
+                ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+                ("NaN", f64::NAN),
+            ];
+            for &(n, v) in consts {
+                m.define(n, Value::num(v), proto_attr);
+            }
+            m.define("prototype", Value::heap(num_proto), proto_attr);
+            self.heap.alloc(HeapObj::Object(m))
+        };
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -4283,6 +4308,7 @@ impl<'p> Vm<'p> {
                 "Array" => Some(array_ctor),
                 "Function" => Some(function_ctor),
                 "String" => Some(string_ctor),
+                "Number" => Some(number_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -4369,19 +4395,20 @@ impl<'p> Vm<'p> {
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
                 let (m, kind) = native::proto_method(id).unwrap();
-                if !this.is_heap() {
+                if kind == 2 {
+                    // Number.prototype method — the receiver is a number value.
+                    self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
+                } else if !this.is_heap() {
                     return Err(Thrown(format!(
                         "TypeError: {}.prototype.{m} called on {}",
                         if kind == 0 { "Array" } else { "String" },
                         self.display(this)
                     )));
-                }
-                let r = if kind == 0 {
-                    self.array_method(this.heap_index(), m, args)?
+                } else if kind == 0 {
+                    self.array_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
                 } else {
-                    self.string_method(this.heap_index(), m, args)?
-                };
-                r.unwrap_or(Value::UNDEFINED)
+                    self.string_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                }
             }
             _ => Value::UNDEFINED,
         })
@@ -6412,6 +6439,7 @@ impl<'p> Vm<'p> {
                     Ok(Some(self.alloc_str(num_to_radix(n, radix))))
                 }
             }
+            "valueOf" => Ok(Some(recv)),
             _ => Ok(None),
         }
     }
