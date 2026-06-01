@@ -119,6 +119,39 @@ mod native {
     pub const ARR_OF: u16 = 21;
     pub const ARR_JOIN: u16 = 22;
     pub const ARR_PUSH: u16 = 23;
+
+    /// First native id for a prototype method (`Array.prototype.map` etc.). Method
+    /// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
+    /// first-class callable VALUES (`Array.prototype.map.call(arr, fn)`).
+    pub const PROTO_METHOD_BASE: u16 = 64;
+
+    /// Prototype methods exposed as values, paired with their receiver kind
+    /// (0 = Array.prototype, 1 = String.prototype). Only methods that
+    /// `array_method`/`string_method` actually implement are listed, so a `.call`
+    /// through the value behaves identically to a direct `arr.method()` call.
+    pub const PROTO_METHODS: &[(&str, u8)] = &[
+        // Array.prototype (join/push already on arr_proto via ARR_JOIN/ARR_PUSH).
+        ("at", 0), ("concat", 0), ("every", 0), ("fill", 0), ("filter", 0),
+        ("find", 0), ("findIndex", 0), ("findLast", 0), ("findLastIndex", 0),
+        ("flat", 0), ("flatMap", 0), ("forEach", 0), ("includes", 0),
+        ("indexOf", 0), ("lastIndexOf", 0), ("map", 0), ("pop", 0), ("reduce", 0),
+        ("reduceRight", 0), ("reverse", 0), ("shift", 0), ("slice", 0),
+        ("some", 0), ("sort", 0), ("splice", 0), ("toReversed", 0),
+        ("toSorted", 0), ("toString", 0),
+        // String.prototype.
+        ("at", 1), ("charAt", 1), ("charCodeAt", 1), ("codePointAt", 1),
+        ("endsWith", 1), ("includes", 1), ("indexOf", 1), ("padEnd", 1),
+        ("padStart", 1), ("repeat", 1), ("replace", 1), ("replaceAll", 1),
+        ("slice", 1), ("split", 1), ("startsWith", 1), ("substring", 1),
+        ("toLowerCase", 1), ("toUpperCase", 1), ("trim", 1), ("trimEnd", 1),
+        ("trimStart", 1),
+    ];
+
+    /// `(name, kind)` for a prototype-method native id, if it is one.
+    pub fn proto_method(id: u16) -> Option<(&'static str, u8)> {
+        id.checked_sub(PROTO_METHOD_BASE)
+            .and_then(|i| PROTO_METHODS.get(i as usize).copied())
+    }
 }
 
 /// What `object_enum_own` collects.
@@ -4184,7 +4217,21 @@ impl<'p> Vm<'p> {
             &[("call", FN_CALL), ("apply", FN_APPLY), ("bind", FN_BIND)],
             None,
         );
-        self.arr_proto = build(self, &[("join", ARR_JOIN), ("push", ARR_PUSH)], None);
+        // Build the Array.prototype / String.prototype method lists from the
+        // PROTO_METHODS table (id = PROTO_METHOD_BASE + index), so methods are
+        // first-class values (`Array.prototype.map.call(arr, fn)`).
+        let mut arr_methods: Vec<(&str, u16)> = vec![("join", ARR_JOIN), ("push", ARR_PUSH)];
+        let mut str_methods: Vec<(&str, u16)> = Vec::new();
+        for (i, &(name, kind)) in native::PROTO_METHODS.iter().enumerate() {
+            let id = native::PROTO_METHOD_BASE + i as u16;
+            if kind == 0 {
+                arr_methods.push((name, id));
+            } else {
+                str_methods.push((name, id));
+            }
+        }
+        self.arr_proto = build(self, &arr_methods, None);
+        let str_proto = build(self, &str_methods, None);
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -4207,6 +4254,7 @@ impl<'p> Vm<'p> {
         );
         let array_ctor = build(self, &[("isArray", ARR_IS_ARRAY), ("from", ARR_FROM), ("of", ARR_OF)], Some(arr_proto));
         let function_ctor = build(self, &[], Some(fn_proto));
+        let string_ctor = build(self, &[], Some(str_proto));
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).
         let mut sets: Vec<(usize, u32)> = Vec::new();
@@ -4215,6 +4263,7 @@ impl<'p> Vm<'p> {
                 "Object" => Some(object_ctor),
                 "Array" => Some(array_ctor),
                 "Function" => Some(function_ctor),
+                "String" => Some(string_ctor),
                 _ => None,
             };
             if let Some(v) = v {
@@ -4295,6 +4344,24 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::UNDEFINED
                 }
+            }
+            // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
+            // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
+            _ if native::proto_method(id).is_some() => {
+                let (m, kind) = native::proto_method(id).unwrap();
+                if !this.is_heap() {
+                    return Err(Thrown(format!(
+                        "TypeError: {}.prototype.{m} called on {}",
+                        if kind == 0 { "Array" } else { "String" },
+                        self.display(this)
+                    )));
+                }
+                let r = if kind == 0 {
+                    self.array_method(this.heap_index(), m, args)?
+                } else {
+                    self.string_method(this.heap_index(), m, args)?
+                };
+                r.unwrap_or(Value::UNDEFINED)
             }
             _ => Value::UNDEFINED,
         })
@@ -4704,6 +4771,8 @@ impl<'p> Vm<'p> {
                     .unwrap_or(0);
                 Some((clean(&c.name), len))
             }
+            // A prototype-method native value (`Array.prototype.map.name === "map"`).
+            HeapObj::Native(id) => native::proto_method(*id).map(|(n, _)| (n.to_string(), 1)),
             _ => None,
         }
     }
