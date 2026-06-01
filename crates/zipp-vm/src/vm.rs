@@ -1333,11 +1333,23 @@ impl<'p> Vm<'p> {
                         let fv = Value::heap(self.heap.alloc(HeapObj::Func(func)));
                         if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
                             if kind == 3 {
-                                c.statics.set(&kstr, fv); // static method
+                                // Static method — non-enumerable (like a named one).
+                                let attr = PropAttr {
+                                    writable: true,
+                                    enumerable: false,
+                                    configurable: true,
+                                    accessor: false,
+                                    setter: Value::UNDEFINED,
+                                };
+                                c.statics.define(&kstr, fv, attr);
                             } else {
+                                // kind: 1=getter 2=setter 4=static getter 5=static
+                                // setter, else instance method.
                                 let list = match kind {
                                     1 => &mut c.getters,
                                     2 => &mut c.setters,
+                                    4 => &mut c.static_getters,
+                                    5 => &mut c.static_setters,
                                     _ => &mut c.methods,
                                 };
                                 // Replace a same-key member, else append.

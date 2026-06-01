@@ -1578,11 +1578,15 @@ impl<'a> FnCompiler<'a> {
                     // A constructor is never computed; otherwise a key that
                     // class_key_name can't name statically (and is `computed`) is a
                     // runtime-keyed member.
+                    // kind: 0=method 1=getter 2=setter 3=static method
+                    //       4=static getter 5=static setter
                     let kind = match m.kind {
                         ox::MethodDefinitionKind::Constructor => {
                             ctor_fn = Some(&m.value);
                             continue;
                         }
+                        ox::MethodDefinitionKind::Get if m.r#static => 4u8,
+                        ox::MethodDefinitionKind::Set if m.r#static => 5u8,
                         ox::MethodDefinitionKind::Get => 1u8,
                         ox::MethodDefinitionKind::Set => 2u8,
                         ox::MethodDefinitionKind::Method if m.r#static => 3u8,
@@ -1600,9 +1604,6 @@ impl<'a> FnCompiler<'a> {
                             (false, ox::MethodDefinitionKind::Constructor) => unreachable!(),
                         },
                         Err(e) if m.computed => {
-                            if m.r#static && m.kind != ox::MethodDefinitionKind::Method {
-                                return Err("static computed getters/setters are not in the zipp-vm subset yet".into());
-                            }
                             let key = m.key.as_expression().ok_or(e)?;
                             computed.push((key, &m.value, kind));
                         }
@@ -1793,7 +1794,7 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 &[],
                 body,
-                if *kind == 3 { None } else { super_class_id }, // statics get no super
+                if matches!(*kind, 3 | 4 | 5) { None } else { super_class_id }, // statics get no super
                 func.generator,
                 func.r#async,
             )?;
