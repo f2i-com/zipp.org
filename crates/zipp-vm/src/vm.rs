@@ -203,6 +203,11 @@ mod native {
         "Error", "TypeError", "RangeError", "SyntaxError",
         "ReferenceError", "EvalError", "URIError", "AggregateError",
     ];
+    // BigInt: statics + BigInt.prototype methods.
+    pub const BIGINT_AS_INTN: u16 = 322;
+    pub const BIGINT_AS_UINTN: u16 = 323;
+    pub const BIGINT_TO_STRING: u16 = 324;
+    pub const BIGINT_VALUE_OF: u16 = 325;
     // Symbol: the static methods + Symbol.prototype methods as first-class values.
     pub const SYMBOL_FOR: u16 = 318;
     pub const SYMBOL_KEY_FOR: u16 = 319;
@@ -347,6 +352,10 @@ mod native {
             SYMBOL_KEY_FOR => ("keyFor", 1),
             SYMBOL_TO_STRING => ("toString", 0),
             SYMBOL_VALUE_OF => ("valueOf", 0),
+            BIGINT_TO_STRING => ("toString", 0),
+            BIGINT_VALUE_OF => ("valueOf", 0),
+            BIGINT_AS_INTN => ("asIntN", 2),
+            BIGINT_AS_UINTN => ("asUintN", 2),
             FN_CALL => ("call", 1),
             FN_APPLY => ("apply", 2),
             FN_BIND => ("bind", 1),
@@ -530,6 +539,10 @@ pub struct Vm<'p> {
     /// constructor object heap index (callable, NOT constructable). 0 until setup.
     symbol_proto: u32,
     symbol_ctor: u32,
+    /// `BigInt.prototype` and the `BigInt` constructor object (callable, NOT
+    /// constructable — like `Symbol`). 0 until setup.
+    bigint_proto: u32,
+    bigint_ctor: u32,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -653,6 +666,8 @@ impl<'p> Vm<'p> {
             error_ctors: [0; 8],
             symbol_proto: 0,
             symbol_ctor: 0,
+            bigint_proto: 0,
+            bigint_ctor: 0,
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -1382,6 +1397,8 @@ impl<'p> Vm<'p> {
                                 Some(v) => Value::int(v),
                                 None => Value::num(va.as_int() as f64 - vb.as_int() as f64),
                             }
+                        } else if let Some(bv) = self.bigint_binop(BigOp::Sub, va, vb)? {
+                            bv
                         } else {
                             Value::num(self.to_number(va)? - self.to_number(vb)?)
                         };
@@ -1396,6 +1413,8 @@ impl<'p> Vm<'p> {
                                 Some(v) => Value::int(v),
                                 None => Value::num(va.as_int() as f64 * vb.as_int() as f64),
                             }
+                        } else if let Some(bv) = self.bigint_binop(BigOp::Mul, va, vb)? {
+                            bv
                         } else {
                             Value::num(self.to_number(va)? * self.to_number(vb)?)
                         };
@@ -1405,21 +1424,36 @@ impl<'p> Vm<'p> {
                     Instr::Div { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = Value::num(self.to_number(va)? / self.to_number(vb)?);
+                        let r = if let Some(bv) = self.bigint_binop(BigOp::Div, va, vb)? {
+                            bv
+                        } else {
+                            Value::num(self.to_number(va)? / self.to_number(vb)?)
+                        };
                         self.set(base, dst, r);
                         ip += 1;
                     }
                     Instr::Mod { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = Value::num(self.to_number(va)? % self.to_number(vb)?);
+                        let r = if let Some(bv) = self.bigint_binop(BigOp::Mod, va, vb)? {
+                            bv
+                        } else {
+                            Value::num(self.to_number(va)? % self.to_number(vb)?)
+                        };
                         self.set(base, dst, r);
                         ip += 1;
                     }
                     Instr::ToNum { dst, a } => {
                         let va = self.get(base, a);
-                        // `+x`: numbers pass through (keep Int tag); else ToNumber.
-                        let r = if va.is_number() { va } else { Value::num(self.to_number(va)?) };
+                        // `+x`: numbers pass through (keep Int tag); `+bigint` throws
+                        // (unary plus is not defined on BigInt); else ToNumber.
+                        let r = if va.is_number() {
+                            va
+                        } else if self.bigint_value(va).is_some() {
+                            return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
+                        } else {
+                            Value::num(self.to_number(va)?)
+                        };
                         self.set(base, dst, r);
                         ip += 1;
                     }
@@ -1430,6 +1464,8 @@ impl<'p> Vm<'p> {
                                 Some(v) => Value::int(v),
                                 None => Value::num(-(va.as_int() as f64)),
                             }
+                        } else if let Some(n) = self.bigint_value(va) {
+                            self.make_bigint(n.wrapping_neg())
                         } else {
                             Value::num(-self.to_number(va)?)
                         };
@@ -1440,6 +1476,28 @@ impl<'p> Vm<'p> {
                         use crate::bytecode::BitwiseOp as B;
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
+                        // BigInt bitwise: &/|/^/<</>> on two BigInts; `>>>` is not
+                        // defined for BigInt (TypeError); mixing → TypeError.
+                        if self.bigint_value(va).is_some() || self.bigint_value(vb).is_some() {
+                            let bop = match op {
+                                B::And => BigOp::And,
+                                B::Or => BigOp::Or,
+                                B::Xor => BigOp::Xor,
+                                B::Shl => BigOp::Shl,
+                                B::Shr => BigOp::Shr,
+                                B::Ushr => {
+                                    return Err(Thrown(
+                                        "TypeError: BigInts have no unsigned right shift, use >> instead"
+                                            .into(),
+                                    ))
+                                }
+                            };
+                            if let Some(bv) = self.bigint_binop(bop, va, vb)? {
+                                self.set(base, dst, bv);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         let x = to_int32(self.to_number(va)?);
                         // Shift counts use the low 5 bits per the JS spec.
                         let r = match op {
@@ -1471,14 +1529,23 @@ impl<'p> Vm<'p> {
                     Instr::Pow { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = self.to_number(va)?.powf(self.to_number(vb)?);
-                        self.set(base, dst, Value::num(r));
+                        let r = if let Some(bv) = self.bigint_binop(BigOp::Pow, va, vb)? {
+                            bv
+                        } else {
+                            Value::num(self.to_number(va)?.powf(self.to_number(vb)?))
+                        };
+                        self.set(base, dst, r);
                         ip += 1;
                     }
                     Instr::BitNot { dst, a } => {
                         let va = self.get(base, a);
-                        let r = !to_int32(self.to_number(va)?);
-                        self.set(base, dst, Value::int(r));
+                        if let Some(n) = self.bigint_value(va) {
+                            let r = self.make_bigint(!n);
+                            self.set(base, dst, r);
+                        } else {
+                            let r = !to_int32(self.to_number(va)?);
+                            self.set(base, dst, Value::int(r));
+                        }
                         ip += 1;
                     }
                     Instr::AddInt { dst, a, imm } => {
@@ -2570,6 +2637,18 @@ impl<'p> Vm<'p> {
                         };
                         let sym = self.make_symbol(d);
                         self.set(base, dst, sym);
+                        ip += 1;
+                    }
+                    Instr::LoadBigInt { dst, value } => {
+                        let v = Value::heap(self.heap.alloc(HeapObj::BigInt(value)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::BigIntFrom { dst, arg } => {
+                        let a = self.get(base, arg);
+                        let n = self.to_bigint(a)?;
+                        let v = self.make_bigint(n);
+                        self.set(base, dst, v);
                         ip += 1;
                     }
                     Instr::GetIndex { dst, obj, key } => {
@@ -5158,6 +5237,39 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // `BigInt`: callable-but-NOT-constructable (typeof "function"; new BigInt()
+        // throws). BigInt(x) converts (compile-lowered to BigIntFrom); asIntN/asUintN
+        // are statics; toString/valueOf on BigInt.prototype.
+        {
+            let bigint_proto = build(
+                self,
+                &[("toString", BIGINT_TO_STRING), ("valueOf", BIGINT_VALUE_OF)],
+                None,
+            );
+            self.proto_of.insert(bigint_proto, Value::heap(obj_proto));
+            self.bigint_proto = bigint_proto;
+            let fn_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let asintn = Value::heap(self.heap.alloc(HeapObj::Native(BIGINT_AS_INTN)));
+            let asuintn = Value::heap(self.heap.alloc(HeapObj::Native(BIGINT_AS_UINTN)));
+            let name_v = self.alloc_str("BigInt".to_string());
+            let mut m = ObjMap::new();
+            m.define("prototype", Value::heap(bigint_proto), proto_attr);
+            m.define("asIntN", asintn, method_attr);
+            m.define("asUintN", asuintn, method_attr);
+            m.define("name", name_v, fn_attr);
+            m.define("length", Value::num(1.0), fn_attr);
+            let bigint_ctor = self.heap.alloc(HeapObj::Object(m));
+            self.bigint_ctor = bigint_ctor;
+            if let HeapObj::Object(p) = self.heap.get_mut(bigint_proto) {
+                p.define("constructor", Value::heap(bigint_ctor), method_attr);
+            }
+        }
         // Wire each built-in prototype's `constructor` back to its constructor
         // (`Array.prototype.constructor === Array`, `p.constructor === Promise`,
         // `(5).constructor === Number`, …) — a fundamental invariant assertions
@@ -5256,6 +5368,7 @@ impl<'p> Vm<'p> {
                 "URIError" => Some(self.error_ctors[6]),
                 "AggregateError" => Some(self.error_ctors[7]),
                 "Symbol" => Some(self.symbol_ctor),
+                "BigInt" => Some(self.bigint_ctor),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -5412,6 +5525,46 @@ impl<'p> Vm<'p> {
                     Some(k) => self.alloc_str(k),
                     None => Value::UNDEFINED,
                 }
+            }
+            BIGINT_TO_STRING => {
+                let n = match self.bigint_value(this) {
+                    Some(n) => n,
+                    None => {
+                        return Err(Thrown(
+                            "TypeError: BigInt.prototype.toString requires that 'this' be a BigInt".into(),
+                        ))
+                    }
+                };
+                let radix = if a0 == Value::UNDEFINED { 10 } else { self.to_number(a0)? as i64 };
+                if !(2..=36).contains(&radix) {
+                    return Err(Thrown("RangeError: toString() radix must be between 2 and 36".into()));
+                }
+                self.alloc_str(bigint_to_radix(n, radix as u32))
+            }
+            BIGINT_VALUE_OF => {
+                if self.bigint_value(this).is_some() {
+                    this
+                } else {
+                    return Err(Thrown(
+                        "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt".into(),
+                    ));
+                }
+            }
+            BIGINT_AS_INTN => {
+                let bits = self.to_number(a0)?;
+                if !bits.is_finite() || bits < 0.0 {
+                    return Err(Thrown("RangeError: Invalid bits for BigInt.asIntN".into()));
+                }
+                let x = self.to_bigint(a1)?;
+                self.make_bigint(bigint_as_intn(bits as u32, x))
+            }
+            BIGINT_AS_UINTN => {
+                let bits = self.to_number(a0)?;
+                if !bits.is_finite() || bits < 0.0 {
+                    return Err(Thrown("RangeError: Invalid bits for BigInt.asUintN".into()));
+                }
+                let x = self.to_bigint(a1)?;
+                self.make_bigint(bigint_as_uintn(bits as u32, x))
             }
             FN_CALL => {
                 let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
@@ -6693,6 +6846,8 @@ impl<'p> Vm<'p> {
                 }
                 Ok(self.proto_member(self.symbol_proto, key))
             }
+            // A BigInt: methods (toString/valueOf/constructor) via BigInt.prototype.
+            HeapObj::BigInt(_) => Ok(self.proto_member(self.bigint_proto, key)),
             // Functions / natives / bound functions: own props set on them
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
             _ if matches!(
@@ -7011,6 +7166,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::BoundResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
                 HeapObj::Symbol { .. } => "symbol",
+                HeapObj::BigInt(_) => "bigint",
                 // The built-in constructor globals (Object/Array/Map/…) are callable.
                 HeapObj::Object(m) if m.is_ctor => "function",
                 // %Function.prototype% is itself a (no-op) callable function.
@@ -7018,6 +7174,7 @@ impl<'p> Vm<'p> {
                 // `Symbol` is callable (typeof "function") but NOT a constructor
                 // (so `new Symbol()` throws and IsConstructor is false).
                 HeapObj::Object(_) if v.heap_index() == self.symbol_ctor && self.symbol_ctor != 0 => "function",
+                HeapObj::Object(_) if v.heap_index() == self.bigint_ctor && self.bigint_ctor != 0 => "function",
                 _ => "object", // Array, ordinary Object, namespace globals
             }
         } else {
@@ -7954,6 +8111,95 @@ impl<'p> Vm<'p> {
             }
         }
         self.display(key)
+    }
+
+    /// Allocate a BigInt value.
+    fn make_bigint(&mut self, v: i128) -> Value {
+        Value::heap(self.heap.alloc(HeapObj::BigInt(v)))
+    }
+
+    /// The i128 of a BigInt value, else None.
+    fn bigint_value(&self, v: Value) -> Option<i128> {
+        if v.is_heap() {
+            if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
+                return Some(*n);
+            }
+        }
+        None
+    }
+
+    /// `ToBigInt(v)` (used by `BigInt(x)`, asIntN/asUintN, and `==`). A non-integer
+    /// number → RangeError; symbol/null/undefined/object → TypeError; a bad numeric
+    /// string → SyntaxError.
+    fn to_bigint(&mut self, v: Value) -> Result<i128, Thrown> {
+        if let Some(n) = self.bigint_value(v) {
+            return Ok(n);
+        }
+        if v.is_bool() {
+            return Ok(if v.as_bool() { 1 } else { 0 });
+        }
+        if v.is_int() {
+            return Ok(v.as_int() as i128);
+        }
+        if v.is_double() {
+            let d = v.as_f64();
+            if !d.is_finite() || d.fract() != 0.0 {
+                return Err(Thrown(
+                    "RangeError: The number is not a safe integer and cannot be converted to a BigInt"
+                        .into(),
+                ));
+            }
+            return Ok(d as i128);
+        }
+        if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
+            let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+            let t = s.trim();
+            if t.is_empty() {
+                return Ok(0);
+            }
+            return parse_bigint_str(t)
+                .ok_or_else(|| Thrown(format!("SyntaxError: Cannot convert {t} to a BigInt")));
+        }
+        Err(Thrown("TypeError: Cannot convert this value to a BigInt".into()))
+    }
+
+    /// A binary arithmetic/bitwise op where at least one operand might be a BigInt.
+    /// `Ok(None)` ⇒ neither is a BigInt (caller does its numeric path); `Ok(Some)`
+    /// ⇒ both BigInt (result); `Err` ⇒ exactly one BigInt (mixing TypeError) or a
+    /// BigInt-specific RangeError (÷0, negative exponent).
+    fn bigint_binop(&mut self, op: BigOp, va: Value, vb: Value) -> Result<Option<Value>, Thrown> {
+        let (a, b) = (self.bigint_value(va), self.bigint_value(vb));
+        if a.is_none() && b.is_none() {
+            return Ok(None);
+        }
+        let (a, b) = match (a, b) {
+            (Some(a), Some(b)) => (a, b),
+            _ => {
+                return Err(Thrown(
+                    "TypeError: Cannot mix BigInt and other types, use explicit conversions".into(),
+                ))
+            }
+        };
+        let r = match op {
+            BigOp::Add => a.wrapping_add(b),
+            BigOp::Sub => a.wrapping_sub(b),
+            BigOp::Mul => a.wrapping_mul(b),
+            BigOp::Div | BigOp::Mod if b == 0 => {
+                return Err(Thrown("RangeError: Division by zero".into()))
+            }
+            BigOp::Div => a.wrapping_div(b),
+            BigOp::Mod => a.wrapping_rem(b),
+            BigOp::Pow if b < 0 => {
+                return Err(Thrown("RangeError: Exponent must be non-negative".into()))
+            }
+            BigOp::Pow => a.wrapping_pow(b.min(u32::MAX as i128) as u32),
+            BigOp::And => a & b,
+            BigOp::Or => a | b,
+            BigOp::Xor => a ^ b,
+            BigOp::Shl => a.wrapping_shl(b as u32),
+            BigOp::Shr => a.wrapping_shr(b as u32),
+        };
+        Ok(Some(self.make_bigint(r)))
     }
 
     /// `new <class>(args)`: build a plain object, install the class's methods as
@@ -9804,6 +10050,9 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
                 return self.heap.str_eq(ai, bi);
             }
+            if let (HeapObj::BigInt(x), HeapObj::BigInt(y)) = (self.heap.get(ai), self.heap.get(bi)) {
+                return x == y;
+            }
         }
         false
     }
@@ -9814,6 +10063,18 @@ impl<'p> Vm<'p> {
     /// number; an object vs a primitive coerces the object to its primitive
     /// (here: string coercion, since we have no valueOf). NaN is never equal.
     fn loose_eq(&self, a: Value, b: Value) -> Result<bool, Thrown> {
+        // BigInt loose equality compares mathematical values across types
+        // (`1n == 1`, `1n == "1"`, `1n == true`), so handle it before the generic
+        // same-tag/heap shortcuts (two distinct 1n allocations aren't bit-equal).
+        let (ab, bb) = (self.bigint_value(a), self.bigint_value(b));
+        if ab.is_some() || bb.is_some() {
+            return Ok(match (ab, bb) {
+                (Some(x), Some(y)) => x == y,
+                (Some(x), None) => self.bigint_loose_eq_other(x, b),
+                (None, Some(y)) => self.bigint_loose_eq_other(y, a),
+                _ => false,
+            });
+        }
         // Same NaN-box tag class → strict semantics already cover it.
         if (a.is_number() && b.is_number())
             || (a.is_bool() && b.is_bool())
@@ -9842,6 +10103,29 @@ impl<'p> Vm<'p> {
         let an = self.to_number(a)?;
         let bn = self.to_number(b)?;
         Ok(an == bn)
+    }
+
+    /// `BigInt x == <non-BigInt other>`: compare mathematical values. Number must
+    /// be a finite integer; a string is parsed as a BigInt; boolean → 0/1; an
+    /// object/symbol/null/undefined is never loosely equal to a BigInt here.
+    fn bigint_loose_eq_other(&self, x: i128, other: Value) -> bool {
+        if other.is_bool() {
+            return x == if other.as_bool() { 1 } else { 0 };
+        }
+        if other.is_number() {
+            let n = other.as_f64();
+            return n.is_finite() && n.fract() == 0.0 && (x as f64) == n;
+        }
+        if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
+            if let Some(s) = self.heap.str_cow(other.heap_index()) {
+                let t = s.trim();
+                if t.is_empty() {
+                    return x == 0;
+                }
+                return parse_bigint_str(t).is_some_and(|y| y == x);
+            }
+        }
+        false
     }
 
     // ── arithmetic / coercion helpers ──
@@ -9883,6 +10167,22 @@ impl<'p> Vm<'p> {
                 Some(v) => Value::int(v),
                 None => Value::num(va.as_int() as f64 + vb.as_int() as f64),
             });
+        }
+        // BigInt `+`: both BigInt → addition; BigInt + string → concatenation
+        // (ToString the BigInt); BigInt + anything-else → mixing TypeError.
+        let (ab, bb) = (self.bigint_value(va), self.bigint_value(vb));
+        if ab.is_some() || bb.is_some() {
+            if let (Some(x), Some(y)) = (ab, bb) {
+                return Ok(self.make_bigint(x.wrapping_add(y)));
+            }
+            let other = if ab.is_some() { vb } else { va };
+            let other_is_str = other.is_heap() && self.heap.is_str_like(other.heap_index());
+            if !other_is_str {
+                return Err(Thrown(
+                    "TypeError: Cannot mix BigInt and other types, use explicit conversions".into(),
+                ));
+            }
+            // else: fall through to string concatenation (to_str_idx → decimal).
         }
         // If either side is a heap value, JS `+` is string concatenation (arrays
         // and objects coerce to a string primitive, and string+anything joins).
@@ -10034,6 +10334,12 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
                 return self.heap.str_eq(ai, bi);
             }
+            // BigInt === BigInt compares by value (1n === 1n), not heap identity.
+            if let (HeapObj::BigInt(x), HeapObj::BigInt(y)) =
+                (self.heap.get(ai), self.heap.get(bi))
+            {
+                return x == y;
+            }
         }
         false
     }
@@ -10043,9 +10349,12 @@ impl<'p> Vm<'p> {
         if let Some(t) = v.truthy_primitive() {
             return t;
         }
-        // Heap: empty string is falsy; everything else truthy.
+        // Heap: empty string is falsy; 0n is falsy; everything else truthy.
         if let Some(empty) = self.heap.str_is_empty(v.heap_index()) {
             return !empty;
+        }
+        if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
+            return *n != 0;
         }
         true
     }
@@ -10074,6 +10383,11 @@ impl<'p> Vm<'p> {
         // ToNumber of a Symbol is a TypeError.
         if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
             return Err(Thrown("TypeError: Cannot convert a Symbol value to a number".into()));
+        }
+        // A BigInt's numeric value (for `Number(1n)` and relational comparison;
+        // arithmetic mixing is rejected earlier by `bigint_binop`).
+        if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
+            return Ok(*n as f64);
         }
         if let Some(s) = self.heap.str_cow(v.heap_index()) {
             let t = s.trim();
@@ -10139,6 +10453,8 @@ impl<'p> Vm<'p> {
                     let d = if *desc == Value::UNDEFINED { String::new() } else { self.display(*desc) };
                     format!("Symbol({d})")
                 }
+                // ToString(BigInt) is the decimal digits with NO "n" (String(1n) === "1").
+                HeapObj::BigInt(n) => n.to_string(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -10273,6 +10589,8 @@ impl<'p> Vm<'p> {
                 let d = if *desc == Value::UNDEFINED { String::new() } else { self.display(*desc) };
                 format!("Symbol({d})")
             }
+            // console.log shows BigInt with the `n` suffix (1n), unlike ToString.
+            HeapObj::BigInt(n) => format!("{n}n"),
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
             HeapObj::Promise { state, result, .. } => match state {
@@ -10759,6 +11077,94 @@ fn norm_index(i: i32, len: i32) -> i32 {
 /// access reads them directly.
 fn is_private_key(k: &str) -> bool {
     k.starts_with('#')
+}
+
+/// BigInt binary operations (see `bigint_binop`).
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // `Add` is handled inline in `add_values` (string-concat fallthrough)
+enum BigOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+}
+
+/// Parse a BigInt string: optional sign + decimal, or a `0x`/`0o`/`0b` prefix.
+/// `None` ⇒ not a valid BigInt literal (→ SyntaxError at the call site).
+fn parse_bigint_str(s: &str) -> Option<i128> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let v: i128 = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+        i128::from_str_radix(h, 16).ok()?
+    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
+        i128::from_str_radix(o, 8).ok()?
+    } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
+        i128::from_str_radix(b, 2).ok()?
+    } else {
+        body.parse::<i128>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+/// Format an i128 BigInt in the given radix (2..=36), lowercase digits.
+fn bigint_to_radix(n: i128, radix: u32) -> String {
+    if radix == 10 {
+        return n.to_string();
+    }
+    if n == 0 {
+        return "0".to_string();
+    }
+    let neg = n < 0;
+    let mut m = (n as i128).unsigned_abs();
+    let r = radix as u128;
+    let mut digits = Vec::new();
+    while m > 0 {
+        let d = (m % r) as u32;
+        digits.push(std::char::from_digit(d, radix).unwrap());
+        m /= r;
+    }
+    if neg {
+        digits.push('-');
+    }
+    digits.iter().rev().collect()
+}
+
+/// `BigInt.asUintN(bits, x)`: x mod 2^bits as a non-negative value (i128-limited).
+fn bigint_as_uintn(bits: u32, x: i128) -> i128 {
+    if bits == 0 {
+        return 0;
+    }
+    if bits >= 127 {
+        return x; // beyond the i128 representable mask — pass through (approx)
+    }
+    x & ((1i128 << bits) - 1)
+}
+
+/// `BigInt.asIntN(bits, x)`: x mod 2^bits as a signed bits-bit value.
+fn bigint_as_intn(bits: u32, x: i128) -> i128 {
+    if bits == 0 {
+        return 0;
+    }
+    if bits >= 127 {
+        return x;
+    }
+    let m = x & ((1i128 << bits) - 1);
+    let half = 1i128 << (bits - 1);
+    if m >= half {
+        m - (1i128 << bits)
+    } else {
+        m
+    }
 }
 
 #[inline]

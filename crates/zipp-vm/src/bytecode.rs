@@ -284,6 +284,11 @@ pub enum Instr {
     /// `dst = Symbol(desc?)` — a fresh unique Symbol primitive. `desc` (when present)
     /// is coerced to a string description (undefined → no description).
     MakeSymbol { dst: Reg, desc: Option<Reg> },
+    /// `dst = <BigInt literal>` (`123n`) — allocate a BigInt with the given value.
+    LoadBigInt { dst: Reg, value: i128 },
+    /// `dst = BigInt(arg)` — convert a number/string/boolean/BigInt to a BigInt
+    /// (non-integer number → RangeError; symbol/null/undefined → TypeError).
+    BigIntFrom { dst: Reg, arg: Reg },
     /// `dst = <array of obj's own enumerable string keys>` — drives `for-in`.
     /// For an array, the keys are the index strings "0".."len-1".
     ObjectKeys { dst: Reg, obj: Reg },

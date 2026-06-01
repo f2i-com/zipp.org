@@ -2509,6 +2509,16 @@ impl<'a> FnCompiler<'a> {
                 self.load_number(dst, n.value);
                 Ok(dst)
             }
+            E::BigIntLiteral(b) => {
+                // oxc gives `value` as a base-10 string (the source base is already
+                // normalized). Parse to i128 (our BigInt repr); too-large literals
+                // are out of range for now.
+                let v = b.value.as_str().parse::<i128>().map_err(|_| {
+                    "BigInt literals beyond i128 are not in the zipp-vm subset yet".to_string()
+                })?;
+                self.emit(Instr::LoadBigInt { dst, value: v });
+                Ok(dst)
+            }
             E::StringLiteral(s) => {
                 let idx = self.add_string_const(s.value.as_str());
                 self.emit(Instr::LoadConst { dst, idx });
@@ -4066,6 +4076,25 @@ impl<'a> FnCompiler<'a> {
                 if desc.is_some() {
                     self.next_reg -= 1;
                 }
+                return Ok(dst);
+            }
+        }
+        // `BigInt(x)` → conversion (BigIntFrom op). No arg → undefined (→ TypeError
+        // at runtime, matching the spec).
+        if let ox::Expression::Identifier(id) = &c.callee {
+            if id.name == "BigInt" {
+                let t = self.temp();
+                match c.arguments.first().and_then(|a| a.as_expression()) {
+                    Some(e) => {
+                        let v = self.expr_into(e, t)?;
+                        if v != t {
+                            self.emit(Instr::Move { dst: t, src: v });
+                        }
+                    }
+                    None => self.emit(Instr::LoadUndefined { dst: t }),
+                }
+                self.emit(Instr::BigIntFrom { dst, arg: t });
+                self.next_reg -= 1;
                 return Ok(dst);
             }
         }

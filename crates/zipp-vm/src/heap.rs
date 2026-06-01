@@ -387,6 +387,10 @@ pub enum HeapObj {
     /// wrapped primitive ([[PrimitiveValue]]). `typeof` is "object"; valueOf returns
     /// the value; the kind's prototype provides the methods.
     Boxed { kind: u8, value: Value },
+    /// A JS `BigInt` primitive. Stored as `i128` (covers the common test262
+    /// magnitudes; true arbitrary precision is a later refinement). Compared by
+    /// VALUE (`1n === 1n`), not identity; `typeof` is "bigint".
+    BigInt(i128),
     /// A JS `Symbol` primitive. Identity is the heap index (so `===` and use as a
     /// property key dedupe correctly). `desc` is the description (a string Value or
     /// UNDEFINED). `prop_key` is the internal string under which the symbol is
