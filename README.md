@@ -508,24 +508,24 @@ generators, `async`/`await` + Promises (`all`/`race`/`allSettled`/`any`),
 `Map`/`Set`, tagged templates, `Symbol.iterator` iterables, `Date`, and the
 common Array/String/Object/Math/JSON/Number builtins.
 
-**Performance vs V8 (Node 24), compute-only, large-N, best-of-7** (every output
+**Performance vs V8 (Node 24), compute-only, large-N, best-of-9** (every output
 byte-identical to node):
 
 | workload | V8 | zipp | ratio |
 |---|---|---|---|
-| 2M array `map` | 22 ms | 5.8 ms | **0.26× (beats V8)** |
-| 2M array `reduce` | 20 ms | 6.0 ms | **0.30× (beats V8)** |
-| 2M array `map→filter→reduce` | 38 ms | 18 ms | **0.47× (2.1× faster)** |
-| 2M array `filter` | 17 ms | 9.9 ms | **0.59× (beats V8)** |
-| 2M `arr.push(i)` loop | 16 ms | 10 ms | **0.65× (beats V8)** |
-| 100k comparator sort | 10.3 ms | 9.8 ms | **0.95× (beats V8)** |
-| 50M integer loop | 50 ms | 53 ms | **1.06× (parity)** |
-| 200k `charCodeAt` scan loop | 0.9 ms | 1.9 ms | 1.8× (sub-ms) |
-| 200k `s[i]===c` scan loop | 0.9 ms | 2.0 ms | 2.2× (sub-ms) |
-| 4M object field read/write | 4.6 ms | 5.1 ms | **1.10× (near parity)** |
-| 100k string concat + scan | 5.5 ms | 5.9 ms | **1.06× (parity)** |
-| 1M string concat (`s += …`) | 26 ms | 43 ms | 1.64× |
-| fib(37) recursion | 140 ms | 134 ms | **0.96× (beats V8)** |
+| 2M array `map` | 23.8 ms | 5.8 ms | **0.24× (beats V8)** |
+| 2M array `reduce` | 21.4 ms | 6.0 ms | **0.28× (beats V8)** |
+| 2M array `map→filter→reduce` | 39.9 ms | 17.5 ms | **0.44× (2.3× faster)** |
+| 2M array `filter` | 18.2 ms | 10.1 ms | **0.55× (beats V8)** |
+| 2M `arr.push(i)` loop | 18.5 ms | 10.5 ms | **0.57× (beats V8)** |
+| 100k comparator sort | 10.2 ms | 7.4 ms | **0.73× (beats V8)** |
+| 50M integer loop | 27.4 ms | 26.4 ms | **0.97× (beats V8)** |
+| 200k `charCodeAt` scan loop | 2.2 ms | 2.9 ms | 1.28× (sub-3ms) |
+| 200k `s[i]===c` scan loop | 2.3 ms | 2.9 ms | 1.27× (sub-3ms) |
+| 4M object field read/write | 5.1 ms | 5.1 ms | **1.01× (parity)** |
+| 100k string concat + scan | 7.6 ms | 7.2 ms | **0.94× (beats V8)** |
+| 1M string concat (`s += …`) | 27.6 ms | 49.5 ms | 1.79× |
+| fib(37) recursion | 141.5 ms | 129.9 ms | **0.92× (beats V8)** |
 
 zipp **beats V8 across the whole array `map`/`filter`/`reduce` pipeline** (~2×
 faster end-to-end): each is compiled to a *fused native kernel* — a tight loop
@@ -533,29 +533,31 @@ that inlines the callback body per element with no per-element call (the same
 thing V8's TurboFan does), computing in f64/SSE so it handles both small-int and
 double arrays. It also **beats V8 on `push`-heavy loops** (builtin method calls
 JIT inside OSR regions), **on the comparator sort** (native-callback comparator +
-O(n log n) merge sort), and **ties on the integer loop** (native int64 OSR JIT).
+O(n log n) merge sort), and now **beats V8 on the integer loop** (native int64 OSR
+JIT; integer `%` also compiles in-region via `idiv`, so `i % k` loops JIT too).
 **String scans now JIT too:** both `s.charCodeAt(i)===n` and `s[i]==="c"` compile
 in the OSR region (the region's `===` is polymorphic — numeric operands compare as
 f64, interned single-char strings compare by NaN-boxed bits), turning a former ~20×
-gap into ~2× (sub-millisecond absolute). **Self-recursion now beats V8:**
+gap into ~1.3× (sub-3ms absolute). **Self-recursion now beats V8:**
 a recursive call compiles to a direct native call to the function's own entry (an
 inline depth guard bounds the native stack; runaway recursion still deopts to a
 catchable `RangeError`). On top of that, a function whose base case returns its
 argument unchanged (`fib`: `n<2 ? n`) has that base case **inlined at the call
 site**, so the ~half of calls that hit a leaf skip the call/prologue/epilogue
-entirely — taking fib(37) from ~2.8× off V8 to **~0.96× (faster than V8)**. **String
-concat ties V8 on the mixed workload** (and is ~1.6× on a pure 1M `s += …` build):
-`+` builds a cons-string (rope) in O(1) like V8, and shrinking the heap-object
-representation to one cache line (64 B — the large `Class`/`AsyncState` variants are
-boxed so tiny `Cons` nodes don't pay for them) roughly halved the per-concat
-allocation cost. **Object field access is near parity (~1.1×):** non-escaping
-loop objects are scalar-replaced (SROA) so fields become registers, and a
-dead-code pass drops the now-unused object-ref loads SROA leaves behind (which
-also frees register homes, keeping the loop on the higher-ILP allocation path).
-It still trails on: the pure-build concat
-case (V8's bump-allocated GC still edges the rope-node churn); and the sub-ms
-string-scan loops (absolute times under 2 ms). **Startup is ~10×
-faster** (≈21 ms vs ≈218 ms — no V8
+entirely — taking fib(37) from ~2.8× off V8 to **~0.92× (faster than V8)**. **String
+concat beats V8 on the mixed concat-and-scan workload** (0.94×; the pure 1M `s += …`
+build is still ~1.8×): `+` builds a cons-string (rope) in O(1) like V8, and shrinking
+the heap-object representation to one cache line (64 B — the large
+`Class`/`AsyncState` variants are boxed so tiny `Cons` nodes don't pay for them)
+roughly halved the per-concat allocation cost. **Object field access is at parity
+(~1.0×):** non-escaping loop objects are scalar-replaced (SROA) so fields become
+registers, and a dead-code pass drops the now-unused object-ref loads SROA leaves
+behind (which also frees register homes, keeping the loop on the higher-ILP
+allocation path). It still trails on: the pure-build 1M concat
+case (V8's bump-allocated GC still edges the rope-node churn — the loop runs
+interpreted, dispatch-bound, since a string `+` falls outside the numeric OSR
+region); and the sub-3ms string-scan loops (absolute times under 3 ms). **Startup
+is ~10× faster** (≈21 ms vs ≈218 ms — no V8
 snapshot/warmup), so end-to-end (incl. startup) zipp finishes every benchmark
 first. Run `bench/run.sh` to reproduce.
 
