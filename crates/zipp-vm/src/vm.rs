@@ -237,6 +237,8 @@ mod native {
     ];
     pub const DV_METHOD_BASE: u16 = 372;
     pub const ARRAYBUFFER_SLICE: u16 = 396;
+    pub const PROXY_REVOCABLE: u16 = 397;
+    pub const PROXY_REVOKE: u16 = 398;
     // RegExp.prototype methods.
     pub const REGEXP_TEST: u16 = 326;
     pub const REGEXP_EXEC: u16 = 327;
@@ -622,6 +624,8 @@ pub struct Vm<'p> {
     arraybuffer_proto: u32,
     dataview_ctor: u32,
     dataview_proto: u32,
+    /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
+    proxy_ctor: u32,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -758,6 +762,7 @@ impl<'p> Vm<'p> {
             arraybuffer_proto: 0,
             dataview_ctor: 0,
             dataview_proto: 0,
+            proxy_ctor: 0,
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -1101,6 +1106,21 @@ impl<'p> Vm<'p> {
     /// calling itself) does NOT — it stays on the frame stack. The frame cap
     /// still bounds total depth.
     fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        // A callable Proxy: `apply` trap (or call the target).
+        if callee.is_heap() {
+            if let Some((target, handler, revoked)) = self.proxy_parts(callee.heap_index()) {
+                if revoked {
+                    return Err(Thrown("TypeError: Cannot perform 'apply' on a revoked proxy".into()));
+                }
+                return match self.proxy_trap(handler, "apply")? {
+                    Some(trap) => {
+                        let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+                        self.call_value(trap, handler, &[target, this, arr])
+                    }
+                    None => self.call_value(target, this, args),
+                };
+            }
+        }
         // A bound function: invoke its target with the fixed `this` and the bound
         // arguments prepended (handles bind-of-bind by recursing).
         if callee.is_heap() {
@@ -2288,7 +2308,25 @@ impl<'p> Vm<'p> {
                     Instr::HasProp { dst, key, obj } => {
                         let k = self.get(base, key);
                         let o = self.get(base, obj);
-                        let r = self.has_property(o, k);
+                        // Proxy `has` trap (or fall through to the target).
+                        let r = if let Some((target, handler, revoked)) =
+                            o.is_heap().then(|| self.proxy_parts(o.heap_index())).flatten()
+                        {
+                            if revoked {
+                                return Err(Thrown("TypeError: Cannot perform 'has' on a revoked proxy".into()));
+                            }
+                            match self.proxy_trap(handler, "has")? {
+                                Some(trap) => {
+                                    let ks = self.key_of(k);
+                                    let kv = self.key_to_value(&ks);
+                                    let res = self.call_value(trap, handler, &[target, kv])?;
+                                    self.truthy(res)
+                                }
+                                None => self.has_property(target, k),
+                            }
+                        } else {
+                            self.has_property(o, k)
+                        };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
@@ -2788,7 +2826,7 @@ impl<'p> Vm<'p> {
                         let key = self.program.functions[func_id as usize]
                             .string_constants[name as usize]
                             .clone();
-                        let r = self.delete_prop(o, &key);
+                        let r = self.delete_property(o, &key)?;
                         self.set(base, dst, r);
                         ip += 1;
                     }
@@ -2796,13 +2834,24 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let ks = self.key_of(k); // ToPropertyKey (symbol → its prop_key)
-                        let r = self.delete_prop(o, &ks);
+                        let r = self.delete_property(o, &ks)?;
                         self.set(base, dst, r);
                         ip += 1;
                     }
 
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
+                        // A callable Proxy: route through call_value (apply trap).
+                        if callee_v.is_heap()
+                            && matches!(self.heap.get(callee_v.heap_index()), HeapObj::Proxy { .. })
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let r = self.call_value(callee_v, Value::UNDEFINED, &argv)?;
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
                         // A native resolve/reject function (from `new Promise`).
                         if callee_v.is_heap() {
                             if let HeapObj::BoundResolver { promise, is_reject } =
@@ -4622,6 +4671,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::BigInt(_)
                 | HeapObj::ArrayBuffer { .. }
                 | HeapObj::DataView { .. }
+                | HeapObj::Proxy { .. }
         ) {
             let k = self.key_of(key);
             return self.get_prop(obj, &k);
@@ -4733,6 +4783,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Class(_)
                 | HeapObj::Bound { .. }
                 | HeapObj::Native(_)
+                | HeapObj::Proxy { .. }
         ) {
             let k = self.key_of(key);
             return self.set_prop(obj, &k, val);
@@ -5474,6 +5525,12 @@ impl<'p> Vm<'p> {
             let dataview_proto = build(self, &dv_methods, None);
             self.proto_of.insert(dataview_proto, Value::heap(obj_proto));
             self.dataview_proto = dataview_proto;
+            // `Proxy`: a constructor with no `.prototype`; `Proxy.revocable` static.
+            let revocable = Value::heap(self.heap.alloc(HeapObj::Native(PROXY_REVOCABLE)));
+            let mut pm = ObjMap::new();
+            pm.define("revocable", revocable, method_attr);
+            pm.is_ctor = true;
+            self.proxy_ctor = self.heap.alloc(HeapObj::Object(pm));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
             if let HeapObj::Object(m) = self.heap.get_mut(dataview_proto) {
@@ -5582,6 +5639,7 @@ impl<'p> Vm<'p> {
                 "RegExp" => Some(self.regexp_ctor),
                 "ArrayBuffer" => Some(self.arraybuffer_ctor),
                 "DataView" => Some(self.dataview_ctor),
+                "Proxy" => Some(self.proxy_ctor),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -5603,6 +5661,7 @@ impl<'p> Vm<'p> {
                         "Map" | "Set" | "WeakMap" | "WeakSet" => 0.0,
                         "AggregateError" => 2.0, // (errors, message?)
                         "RegExp" => 2.0,         // (pattern, flags)
+                        "Proxy" => 2.0,          // (target, handler)
                         // TypedArray ctors take (length | buffer, byteOffset, length).
                         n if native::TA_KINDS.iter().any(|t| t.0 == n) => 3.0,
                         _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise/Error+subtypes/ArrayBuffer/DataView
@@ -6379,6 +6438,28 @@ impl<'p> Vm<'p> {
                 }
                 self.arraybuffer_method(this.heap_index(), "slice", args)?.unwrap_or(Value::UNDEFINED)
             }
+            PROXY_REVOCABLE => {
+                // Proxy.revocable(target, handler) → { proxy, revoke }.
+                let p = self.make_proxy(a0, a1)?;
+                let revoke_fn = self.heap.alloc(HeapObj::Native(PROXY_REVOKE));
+                let revoke = Value::heap(self.heap.alloc(HeapObj::Bound {
+                    target: Value::heap(revoke_fn),
+                    this: p,
+                    args: Vec::new(),
+                }));
+                let mut m = ObjMap::new();
+                m.set("proxy", p);
+                m.set("revoke", revoke);
+                Value::heap(self.heap.alloc(HeapObj::Object(m)))
+            }
+            PROXY_REVOKE => {
+                if this.is_heap() {
+                    if let HeapObj::Proxy { revoked, .. } = self.heap.get_mut(this.heap_index()) {
+                        *revoked = true;
+                    }
+                }
+                Value::UNDEFINED
+            }
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -6628,6 +6709,17 @@ impl<'p> Vm<'p> {
             return Value::NULL;
         }
         let idx = obj.heap_index();
+        // Proxy `getPrototypeOf` trap (errors degrade to null — this signature is
+        // infallible; the throwing path is rare and used internally by instanceof).
+        if let Some((target, handler, revoked)) = self.proxy_parts(idx) {
+            if revoked {
+                return Value::NULL;
+            }
+            if let Ok(Some(trap)) = self.proxy_trap(handler, "getPrototypeOf") {
+                return self.call_value(trap, handler, &[target]).unwrap_or(Value::NULL);
+            }
+            return self.object_get_prototype_of(target);
+        }
         if let Some(&p) = self.proto_of.get(&idx) {
             return p;
         }
@@ -6981,6 +7073,21 @@ impl<'p> Vm<'p> {
     }
 
     fn get_prop(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
+        // Proxy `get` trap (or fall through to the target).
+        if obj.is_heap() {
+            if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
+                if revoked {
+                    return Err(Thrown("TypeError: Cannot perform 'get' on a revoked proxy".into()));
+                }
+                return match self.proxy_trap(handler, "get")? {
+                    Some(trap) => {
+                        let kv = self.key_to_value(key);
+                        self.call_value(trap, handler, &[target, kv, obj])
+                    }
+                    None => self.get_prop(target, key),
+                };
+            }
+        }
         if !obj.is_heap() {
             // Reading a property of null/undefined throws a TypeError (matches
             // JS); other primitives (number/bool) have no own props here → undef.
@@ -7543,6 +7650,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::BoundResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
+                HeapObj::Proxy { target, .. } => self.type_of(*target), // typeof = target's
                 HeapObj::Symbol { .. } => "symbol",
                 HeapObj::BigInt(_) => "bigint",
                 // The built-in constructor globals (Object/Array/Map/…) are callable.
@@ -7564,6 +7672,27 @@ impl<'p> Vm<'p> {
     /// Without property descriptors every own property is configurable, so this
     /// yields `true` (matching `delete` on a missing property / non-object too).
     /// An array element delete leaves a hole (reads as `undefined`), length kept.
+    /// `delete obj[key]` honoring a Proxy `deleteProperty` trap (Result-returning
+    /// so the trap can throw); else delegates to `delete_prop`.
+    fn delete_property(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
+        if obj.is_heap() {
+            if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
+                if revoked {
+                    return Err(Thrown("TypeError: Cannot perform 'deleteProperty' on a revoked proxy".into()));
+                }
+                return match self.proxy_trap(handler, "deleteProperty")? {
+                    Some(trap) => {
+                        let kv = self.key_to_value(key);
+                        let r = self.call_value(trap, handler, &[target, kv])?;
+                        Ok(Value::bool(self.truthy(r)))
+                    }
+                    None => Ok(self.delete_prop(target, key)),
+                };
+            }
+        }
+        Ok(self.delete_prop(obj, key))
+    }
+
     fn delete_prop(&mut self, obj: Value, key: &str) -> Value {
         if !obj.is_heap() {
             return Value::bool(true);
@@ -7607,6 +7736,20 @@ impl<'p> Vm<'p> {
     fn set_prop(&mut self, obj: Value, key: &str, val: Value) -> Result<(), Thrown> {
         if !obj.is_heap() {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
+        }
+        // Proxy `set` trap (or fall through to the target).
+        if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
+            if revoked {
+                return Err(Thrown("TypeError: Cannot perform 'set' on a revoked proxy".into()));
+            }
+            return match self.proxy_trap(handler, "set")? {
+                Some(trap) => {
+                    let kv = self.key_to_value(key);
+                    self.call_value(trap, handler, &[target, kv, val, obj])?;
+                    Ok(())
+                }
+                None => self.set_prop(target, key, val),
+            };
         }
         let idx = obj.heap_index();
         // `re.lastIndex = n` — the only writable own property of a RegExp.
@@ -9080,6 +9223,48 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(idx))
     }
 
+    /// `new Proxy(target, handler)` — both must be objects.
+    fn make_proxy(&mut self, target: Value, handler: Value) -> Result<Value, Thrown> {
+        if !self.is_object_value(target) || !self.is_object_value(handler) {
+            return Err(Thrown(
+                "TypeError: Cannot create proxy with a non-object as target or handler".into(),
+            ));
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Proxy { target, handler, revoked: false })))
+    }
+
+    fn proxy_parts(&self, idx: u32) -> Option<(Value, Value, bool)> {
+        match self.heap.get(idx) {
+            HeapObj::Proxy { target, handler, revoked } => Some((*target, *handler, *revoked)),
+            _ => None,
+        }
+    }
+
+    /// Reconstruct a property KEY as a Value (a Symbol for an `@@`-encoded key,
+    /// else a string) — so a Proxy trap / Reflect receives the real key.
+    fn key_to_value(&mut self, key: &str) -> Value {
+        if key.starts_with("@@") {
+            if let Some(&sym) = self.symbol_keys.get(key) {
+                return sym;
+            }
+        }
+        self.alloc_str(key.to_string())
+    }
+
+    /// Look up a Proxy handler trap by name; `Ok(Some(fn))` if it's callable,
+    /// `Ok(None)` to fall through to the target. A non-callable non-undefined trap
+    /// is a TypeError. (`revoked` is checked by the caller.)
+    fn proxy_trap(&mut self, handler: Value, name: &str) -> Result<Option<Value>, Thrown> {
+        let t = self.get_prop(handler, name)?;
+        if t.is_undefined() || t.is_null() {
+            Ok(None)
+        } else if self.is_callable(t) {
+            Ok(Some(t))
+        } else {
+            Err(Thrown(format!("TypeError: proxy handler's {name} trap is not a function")))
+        }
+    }
+
     fn set_regexp_last_index(&mut self, idx: u32, n: usize) {
         if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
             *last_index = n;
@@ -9657,6 +9842,25 @@ impl<'p> Vm<'p> {
         }
         if ci == self.ta_base_ctor && ci != 0 {
             return Err(Thrown("TypeError: Abstract class TypedArray not directly constructable".into()));
+        }
+        if ci == self.proxy_ctor && ci != 0 {
+            return self.make_proxy(
+                args.first().copied().unwrap_or(Value::UNDEFINED),
+                args.get(1).copied().unwrap_or(Value::UNDEFINED),
+            );
+        }
+        // Constructing through a Proxy: `construct` trap (or construct the target).
+        if let Some((target, handler, revoked)) = self.proxy_parts(ci) {
+            if revoked {
+                return Err(Thrown("TypeError: Cannot perform 'construct' on a revoked proxy".into()));
+            }
+            return match self.proxy_trap(handler, "construct")? {
+                Some(trap) => {
+                    let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+                    self.call_value(trap, handler, &[target, arr, cv])
+                }
+                None => self.construct(target, args),
+            };
         }
         // Constructor FUNCTION (`new F()`, the pre-class OOP idiom): make an object
         // whose [[Prototype]] is `F.prototype` (so its methods + `constructor`
@@ -11947,6 +12151,7 @@ impl<'p> Vm<'p> {
             "undefined".into()
         } else if v.is_heap() {
             match self.heap.get(v.heap_index()) {
+                HeapObj::Proxy { target, .. } => return self.display(*target),
                 HeapObj::Str(s) => s.bytes.clone(),
                 HeapObj::Cons { .. } => {
                     let mut out = String::new();
@@ -12060,6 +12265,10 @@ impl<'p> Vm<'p> {
             return self.display(v);
         }
         match self.heap.get(v.heap_index()) {
+            HeapObj::Proxy { target, .. } => {
+                let t = *target;
+                return self.inspect_nested(t);
+            }
             HeapObj::Str(s) => format!("'{}'", s.bytes),
             HeapObj::Cons { .. } => {
                 let mut out = String::new();

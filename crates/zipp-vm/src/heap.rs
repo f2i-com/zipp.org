@@ -400,6 +400,9 @@ pub enum HeapObj {
     TypedArray { buffer: u32, kind: u8, byte_offset: usize, length: usize },
     /// A JS `DataView` over an ArrayBuffer (`buffer` heap index, byte window).
     DataView { buffer: u32, byte_offset: usize, byte_length: usize },
+    /// A JS `Proxy`: property/call operations route through `handler`'s traps (or
+    /// fall through to `target`). `revoked` cuts it off (every op then throws).
+    Proxy { target: Value, handler: Value, revoked: bool },
     /// A JS `BigInt` primitive. Stored as `i128` (covers the common test262
     /// magnitudes; true arbitrary precision is a later refinement). Compared by
     /// VALUE (`1n === 1n`), not identity; `typeof` is "bigint".
