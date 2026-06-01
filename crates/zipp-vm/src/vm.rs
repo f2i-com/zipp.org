@@ -4210,14 +4210,28 @@ impl<'p> Vm<'p> {
     /// property with explicit attributes (unspecified attrs default to false on a
     /// new property; an existing non-configurable property rejects most changes).
     fn object_define_property(&mut self, obj: Value, key: &str, desc: Value) -> Result<(), Thrown> {
-        if !obj.is_heap() || !matches!(self.heap.get(obj.heap_index()), HeapObj::Object(_)) {
+        if !obj.is_heap() {
             return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
         }
-        let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
         let idx = obj.heap_index();
+        // 0 = plain object, 1 = class (own props live in `statics`), 2 = callable
+        // (own props live in `fn_props`).
+        let target = match self.heap.get(idx) {
+            HeapObj::Object(_) => 0u8,
+            HeapObj::Class(_) => 1,
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => 2,
+            _ => return Err(Thrown("TypeError: Object.defineProperty called on non-object".into())),
+        };
+        // A callable's/class's `name`/`length`/`prototype` are synthesized; accept
+        // the call but don't shadow them (full redefinition isn't modelled).
+        if target != 0 && matches!(key, "name" | "length" | "prototype") {
+            return Ok(());
+        }
+        let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
         let existing = match self.heap.get(idx) {
             HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
-            _ => None,
+            HeapObj::Class(c) => c.statics.pos(key).map(|i| (c.statics.attrs[i], c.statics.vals[i])),
+            _ => self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
         let is_accessor = get.is_some() || set.is_some();
         // Start from the existing attrs (redefine) or all-false (new property).
@@ -4260,8 +4274,20 @@ impl<'p> Vm<'p> {
         } else {
             value.or(existing.map(|(_, v)| v)).unwrap_or(Value::UNDEFINED)
         };
-        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-            m.define(key, stored, attr);
+        match target {
+            0 => {
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    m.define(key, stored, attr);
+                }
+            }
+            1 => {
+                if let HeapObj::Class(c) = self.heap.get_mut(idx) {
+                    c.statics.define(key, stored, attr);
+                }
+            }
+            _ => {
+                self.fn_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
+            }
         }
         self.heap.bump_version(idx);
         Ok(())
