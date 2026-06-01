@@ -158,7 +158,8 @@ mod native {
         ("indexOf", 0), ("lastIndexOf", 0), ("map", 0), ("pop", 0), ("reduce", 0),
         ("reduceRight", 0), ("reverse", 0), ("shift", 0), ("slice", 0),
         ("some", 0), ("sort", 0), ("splice", 0), ("toReversed", 0),
-        ("toSorted", 0), ("toString", 0),
+        ("toSorted", 0), ("toSpliced", 0), ("toString", 0), ("with", 0),
+        ("copyWithin", 0),
         // String.prototype.
         ("at", 1), ("charAt", 1), ("charCodeAt", 1), ("codePointAt", 1),
         ("endsWith", 1), ("includes", 1), ("indexOf", 1), ("padEnd", 1),
@@ -7388,6 +7389,60 @@ impl<'p> Vm<'p> {
                 };
                 self.heap.bump_version(idx); // length/contents changed
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(removed)))))
+            }
+            "with" => {
+                // with(index, value): a COPY with one index replaced. The index is
+                // relative (negative from the end) and NOT clamped — an out-of-range
+                // index throws a RangeError.
+                let mut out = self.array_snapshot(idx);
+                let len = out.len() as i64;
+                let n = self.to_number(arg0)?;
+                let rel = if n.is_nan() { 0 } else { n.trunc() as i64 };
+                let actual = if rel >= 0 { rel } else { len + rel };
+                if actual < 0 || actual >= len {
+                    return Err(Thrown("RangeError: Invalid index".into()));
+                }
+                out[actual as usize] = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "toSpliced" => {
+                // Like splice() but returns the modified COPY; receiver unchanged.
+                let mut out = self.array_snapshot(idx);
+                let len = out.len();
+                let s = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
+                let start = if s < 0 { (len as i64 + s).max(0) as usize } else { (s as usize).min(len) };
+                let del = if args.len() < 2 {
+                    len - start
+                } else {
+                    let d = if args[1].is_number() { args[1].as_f64() as i64 } else { 0 };
+                    (d.max(0) as usize).min(len - start)
+                };
+                let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
+                out.splice(start..start + del, insert);
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "copyWithin" => {
+                // copyWithin(target, start, end?): copy the [start,end) slice over the
+                // run beginning at target, in place. Reads from a snapshot so
+                // overlapping ranges behave as if copied from the original.
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len() as i32,
+                    _ => 0,
+                };
+                let target = norm_index(if arg0.is_number() { arg0.as_f64() as i32 } else { 0 }, len);
+                let start = norm_index(if args.len() >= 2 && args[1].is_number() { args[1].as_f64() as i32 } else { 0 }, len);
+                let end = norm_index(if args.len() >= 3 && args[2].is_number() { args[2].as_f64() as i32 } else { len }, len);
+                let count = (end - start).min(len - target).max(0);
+                if count > 0 {
+                    let snapshot = self.array_snapshot(idx);
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        for k in 0..count {
+                            items[(target + k) as usize] = snapshot[(start + k) as usize];
+                        }
+                    }
+                    self.heap.bump_version(idx);
+                }
+                Ok(Some(Value::heap(idx)))
             }
             _ => Ok(None),
         }
