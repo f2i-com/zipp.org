@@ -187,6 +187,10 @@ mod native {
     pub const GLOBAL_PARSE_FLOAT: u16 = 308;
     pub const GLOBAL_IS_NAN: u16 = 309;
     pub const GLOBAL_IS_FINITE: u16 = 310;
+    // String static methods.
+    pub const STR_FROM_CHAR_CODE: u16 = 311;
+    pub const STR_FROM_CODE_POINT: u16 = 312;
+    pub const STR_RAW: u16 = 313;
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -365,6 +369,9 @@ mod native {
             GLOBAL_PARSE_FLOAT => ("parseFloat", 1),
             GLOBAL_IS_NAN => ("isNaN", 1),
             GLOBAL_IS_FINITE => ("isFinite", 1),
+            STR_FROM_CHAR_CODE => ("fromCharCode", 1),
+            STR_FROM_CODE_POINT => ("fromCodePoint", 1),
+            STR_RAW => ("raw", 1),
             _ => return None,
         })
     }
@@ -4683,7 +4690,15 @@ impl<'p> Vm<'p> {
         );
         let array_ctor = build(self, &[("isArray", ARR_IS_ARRAY), ("from", ARR_FROM), ("of", ARR_OF)], Some(arr_proto));
         let function_ctor = build(self, &[], Some(fn_proto));
-        let string_ctor = build(self, &[], Some(str_proto));
+        let string_ctor = build(
+            self,
+            &[
+                ("fromCharCode", STR_FROM_CHAR_CODE),
+                ("fromCodePoint", STR_FROM_CODE_POINT),
+                ("raw", STR_RAW),
+            ],
+            Some(str_proto),
+        );
         // `Number`: the numeric constants (non-writable/enumerable/configurable per
         // spec) + Number.prototype. `Number(x)` / `Number.isInteger(x)` etc. are
         // call-site lowered (GlobalFn), so only the value-level shape is built here.
@@ -5406,6 +5421,50 @@ impl<'p> Vm<'p> {
             GLOBAL_PARSE_FLOAT => Value::num(parse_float(&self.display(a0))),
             GLOBAL_IS_NAN => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan()),
             GLOBAL_IS_FINITE => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite()),
+            // String static methods.
+            STR_FROM_CHAR_CODE => {
+                let mut s = String::new();
+                for &v in args {
+                    let u = to_uint32(self.to_number(v).unwrap_or(0.0)) as u16;
+                    s.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}'));
+                }
+                self.alloc_str(s)
+            }
+            STR_FROM_CODE_POINT => {
+                let mut s = String::new();
+                for &v in args {
+                    let n = self.to_number(v)?;
+                    if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
+                        return Err(Thrown(format!("RangeError: Invalid code point {n}")));
+                    }
+                    // A lone-surrogate code point can't be a Rust char → replacement.
+                    s.push(char::from_u32(n as u32).unwrap_or('\u{FFFD}'));
+                }
+                self.alloc_str(s)
+            }
+            STR_RAW => {
+                // String.raw(template, ...subs): interleave template.raw[i] with subs[i].
+                let raw = self.get_prop(a0, "raw")?;
+                if !raw.is_heap() {
+                    return Ok(self.alloc_str(String::new()));
+                }
+                let len_v = self.get_prop(raw, "length")?;
+                let n = self.to_number(len_v)?;
+                let raw_len = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
+                let subs = args.get(1..).unwrap_or(&[]);
+                let mut out = String::new();
+                for i in 0..raw_len {
+                    let seg = self.get_index(raw, Value::int(i as i32))?;
+                    out.push_str(&self.display(seg));
+                    if i + 1 == raw_len {
+                        break;
+                    }
+                    if let Some(sub) = subs.get(i) {
+                        out.push_str(&self.display(*sub));
+                    }
+                }
+                self.alloc_str(out)
+            }
             // Object.prototype.toLocaleString() → this.toString().
             PROTO_TO_LOCALE_STRING => {
                 let ts = self.get_prop(this, "toString")?;
