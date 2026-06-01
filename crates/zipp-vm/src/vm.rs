@@ -5893,6 +5893,55 @@ impl<'p> Vm<'p> {
                     .collect();
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(entries)))))
             }
+            // ES2025 set methods. `other` must be set-like; the common (and tested)
+            // case is a real Set, whose elements we read directly.
+            "union" | "intersection" | "difference" | "symmetricDifference"
+            | "isSubsetOf" | "isSupersetOf" | "isDisjointFrom" => {
+                let this_items = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.clone(),
+                    _ => Vec::new(),
+                };
+                let other_items = match a0.is_heap().then(|| self.heap.get(a0.heap_index())) {
+                    Some(HeapObj::Set(items)) => items.clone(),
+                    _ => return Err(Thrown("TypeError: Set method argument is not a Set".into())),
+                };
+                let has = |hay: &[Value], v: Value, vm: &Self| hay.iter().any(|x| vm.same_value_zero(*x, v));
+                let result = match name {
+                    "union" => {
+                        let mut r = this_items.clone();
+                        for &v in &other_items {
+                            if !has(&r, v, self) {
+                                r.push(v);
+                            }
+                        }
+                        Value::heap(self.heap.alloc(HeapObj::Set(r)))
+                    }
+                    "intersection" => {
+                        let r: Vec<Value> =
+                            this_items.iter().copied().filter(|&v| has(&other_items, v, self)).collect();
+                        Value::heap(self.heap.alloc(HeapObj::Set(r)))
+                    }
+                    "difference" => {
+                        let r: Vec<Value> =
+                            this_items.iter().copied().filter(|&v| !has(&other_items, v, self)).collect();
+                        Value::heap(self.heap.alloc(HeapObj::Set(r)))
+                    }
+                    "symmetricDifference" => {
+                        let mut r: Vec<Value> =
+                            this_items.iter().copied().filter(|&v| !has(&other_items, v, self)).collect();
+                        for &v in &other_items {
+                            if !has(&this_items, v, self) && !has(&r, v, self) {
+                                r.push(v);
+                            }
+                        }
+                        Value::heap(self.heap.alloc(HeapObj::Set(r)))
+                    }
+                    "isSubsetOf" => Value::bool(this_items.iter().all(|&v| has(&other_items, v, self))),
+                    "isSupersetOf" => Value::bool(other_items.iter().all(|&v| has(&this_items, v, self))),
+                    _ => Value::bool(!this_items.iter().any(|&v| has(&other_items, v, self))), // isDisjointFrom
+                };
+                Ok(Some(result))
+            }
             _ => Ok(None),
         }
     }
