@@ -1035,6 +1035,15 @@ impl<'a> FnCompiler<'a> {
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
+            // `const C = class {}` / `x = class {}` — an anonymous class takes the
+            // binding name (a named `class C {}` keeps its own).
+            ox::Expression::ClassExpression(c) if c.id.is_none() => {
+                self.class_expr(c, dst, Some(name))
+            }
+            // NamedEvaluation sees through parentheses: `var f = (function(){})`.
+            ox::Expression::ParenthesizedExpression(p) => {
+                self.compile_named_init(dst, &p.expression, name)
+            }
             _ => self.expr_into(init, dst),
         }
     }
@@ -1160,7 +1169,12 @@ impl<'a> FnCompiler<'a> {
             // `target = default`: `src` is our scratch temp, so patch the default
             // into it in place when it came out undefined, then bind the target.
             P::AssignmentPattern(ap) => {
-                self.apply_default_in_place(src, &ap.right)?;
+                // `[x = function(){}]` ⇒ the default function takes the name "x".
+                let name = match &ap.left {
+                    ox::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                    _ => None,
+                };
+                self.apply_default_in_place_named(src, &ap.right, name.as_deref())?;
                 self.extract_pattern(&ap.left, src)
             }
             P::ObjectPattern(op) => {
@@ -1262,6 +1276,18 @@ impl<'a> FnCompiler<'a> {
     /// `if (reg === undefined) reg = default` — apply a destructuring/parameter
     /// default to a scratch register in place.
     fn apply_default_in_place(&mut self, reg: Reg, default: &ox::Expression) -> R<()> {
+        self.apply_default_in_place_named(reg, default, None)
+    }
+
+    /// As `apply_default_in_place`, but when the default fills a single named
+    /// binding (`[x = function(){}]` ⇒ `x.name === "x"`), infer that name for an
+    /// anonymous function/class default (NamedEvaluation).
+    fn apply_default_in_place_named(
+        &mut self,
+        reg: Reg,
+        default: &ox::Expression,
+        name: Option<&str>,
+    ) -> R<()> {
         let save = self.next_reg;
         let undef = self.alloc_reg();
         self.emit(Instr::LoadUndefined { dst: undef });
@@ -1269,7 +1295,10 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::Eq { dst: cond, a: reg, b: undef });
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 }); // skip default when defined
-        let dv = self.expr_into(default, reg)?;
+        let dv = match name {
+            Some(n) => self.compile_named_init(reg, default, n)?,
+            None => self.expr_into(default, reg)?,
+        };
         if dv != reg {
             self.emit(Instr::Move { dst: reg, src: dv });
         }
@@ -1339,7 +1368,7 @@ impl<'a> FnCompiler<'a> {
         let Some(n) = name else {
             // Anonymous class declaration (e.g. `export default class {}`):
             // compile its body for completeness; it binds no name.
-            self.compile_class(class)?;
+            self.compile_class(class, None)?;
             return Ok(());
         };
 
@@ -1365,7 +1394,7 @@ impl<'a> FnCompiler<'a> {
             Dest::Reg(r) => *r,
             Dest::Cell(_, t) | Dest::Global(_, t) => *t,
         };
-        self.build_class_into(class, cls)?;
+        self.build_class_into(class, cls, None)?;
         match &dest {
             Dest::Reg(_) => {}
             Dest::Cell(cell, t) => {
@@ -1383,8 +1412,8 @@ impl<'a> FnCompiler<'a> {
     /// Compile a class body and emit its runtime materialization into register
     /// `cls`: evaluate `extends`, `MakeClass`, then install static fields and
     /// computed-key members. Shared by class declarations and class expressions.
-    fn build_class_into(&mut self, class: &ox::Class, cls: Reg) -> R<()> {
-        let (class_id, static_fields, computed) = self.compile_class(class)?;
+    fn build_class_into(&mut self, class: &ox::Class, cls: Reg, name: Option<&str>) -> R<()> {
+        let (class_id, static_fields, computed) = self.compile_class(class, name)?;
         // Evaluate the superclass value (`extends P`) into a temp the VM links in.
         let parent_reg = if let Some(sc) = &class.super_class {
             let t = self.temp();
@@ -1428,8 +1457,8 @@ impl<'a> FnCompiler<'a> {
 
     /// A class expression (`let C = class { … }`, `x = class extends B {}`):
     /// materialize the class value into `dst` and return it.
-    fn class_expr(&mut self, class: &ox::Class, dst: Reg) -> R<Reg> {
-        self.build_class_into(class, dst)?;
+    fn class_expr(&mut self, class: &ox::Class, dst: Reg, name: Option<&str>) -> R<Reg> {
+        self.build_class_into(class, dst, name)?;
         Ok(dst)
     }
 
@@ -1443,6 +1472,7 @@ impl<'a> FnCompiler<'a> {
     fn compile_class<'b>(
         &mut self,
         class: &'b ox::Class,
+        name: Option<&str>,
     ) -> R<(
         u32,
         Vec<(String, Option<&'b ox::Expression<'b>>)>,
@@ -1464,7 +1494,14 @@ impl<'a> FnCompiler<'a> {
                 return Err("class `extends` must name a class (arbitrary superclass expressions are out of the subset)".into())
             }
         };
-        let cname = class.id.as_ref().map(|i| i.name.to_string()).unwrap_or_else(|| "<class>".into());
+        // A named class expression keeps its own name; an anonymous one inherits
+        // the binding it's assigned to (NamedEvaluation), else the "<class>" stub.
+        let cname = class
+            .id
+            .as_ref()
+            .map(|i| i.name.to_string())
+            .or_else(|| name.map(|s| s.to_string()))
+            .unwrap_or_else(|| "<class>".into());
         // Reserve this class's id and register its name BEFORE compiling members,
         // so a method body containing a subclass / `new ThisClass` resolves, and
         // nested classes compiled within get distinct ids.
@@ -2540,7 +2577,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
-            E::ClassExpression(c) => self.class_expr(c, dst),
+            E::ClassExpression(c) => self.class_expr(c, dst, None),
             E::ArrayExpression(a) => self.array_literal(a, dst),
             E::ObjectExpression(o) => self.object_literal(o, dst),
             E::StaticMemberExpression(m) => self.static_member(m, dst),
@@ -2872,7 +2909,10 @@ impl<'a> FnCompiler<'a> {
                             _ => return Err("unsupported object key in the zipp-vm subset".into()),
                         };
                         let name = self.string_name(&key);
-                        let v = self.expr(&p.value)?;
+                        // `{ fn: function(){}, m(){}, C: class{} }` — an anonymous
+                        // value function/class takes the property key as its name.
+                        let vtmp = self.alloc_reg();
+                        let v = self.compile_named_init(vtmp, &p.value, &key)?;
                         self.emit(Instr::SetProp { obj: dst, name, val: v });
                     }
                 }
@@ -3228,7 +3268,8 @@ impl<'a> FnCompiler<'a> {
             let jf = self.here();
             self.emit(Instr::JumpIfFalse { cond, target: 0 }); // skip when x !== undefined
             let dtmp = self.alloc_reg();
-            let dv = self.expr_into(default, dtmp)?;
+            // `function f(x = function(){})` ⇒ the default takes the name "x".
+            let dv = self.compile_named_init(dtmp, default, &name)?;
             self.store_binding(&b, dv);
             let end = self.here();
             self.patch_jump(jf, end);
@@ -3305,7 +3346,12 @@ impl<'a> FnCompiler<'a> {
         use ox::AssignmentTargetMaybeDefault as M;
         match m {
             M::AssignmentTargetWithDefault(d) => {
-                self.apply_default_in_place(val, &d.init)?;
+                // `[a = function(){}] = arr` ⇒ the default function takes name "a".
+                let name = match &d.binding {
+                    ox::AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.to_string()),
+                    _ => None,
+                };
+                self.apply_default_in_place_named(val, &d.init, name.as_deref())?;
                 self.assign_target(&d.binding, val)
             }
             M::AssignmentTargetIdentifier(id) => {
@@ -3367,7 +3413,8 @@ impl<'a> FnCompiler<'a> {
                     let name = self.string_name(&p.binding.name);
                     self.emit(Instr::GetProp { dst: val, obj: src, name });
                     if let Some(init) = &p.init {
-                        self.apply_default_in_place(val, init)?;
+                        // `({x = function(){}} = o)` ⇒ default takes the name "x".
+                        self.apply_default_in_place_named(val, init, Some(&p.binding.name))?;
                     }
                     let b = self.resolve(&p.binding.name);
                     self.store_binding(&b, val);
@@ -3559,9 +3606,11 @@ impl<'a> FnCompiler<'a> {
         let binding = self.resolve(&name);
         match a.operator {
             Op::Assign => {
+                // `x = function(){}` / `x = class {}` names the anonymous value
+                // after the target (NamedEvaluation), like a declaration.
                 if let Binding::Local(r) = binding {
                     // Plain local: evaluate the RHS directly into its register.
-                    let v = self.expr_into(&a.right, r)?;
+                    let v = self.compile_named_init(r, &a.right, &name)?;
                     if v != r {
                         self.emit(Instr::Move { dst: r, src: v });
                     }
@@ -3570,7 +3619,7 @@ impl<'a> FnCompiler<'a> {
                     }
                 } else {
                     // Cell / upvalue / global: evaluate into dst, then store.
-                    let v = self.expr_into(&a.right, dst)?;
+                    let v = self.compile_named_init(dst, &a.right, &name)?;
                     if v != dst {
                         self.emit(Instr::Move { dst, src: v });
                     }
