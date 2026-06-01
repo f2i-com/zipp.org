@@ -50,6 +50,18 @@ impl ObjMap {
         }
     }
 
+    /// Remove `key`'s own property; returns whether it existed. Shifts later
+    /// slots, so the caller MUST bump the object's version (a JIT inline cache
+    /// may have recorded a now-stale slot index for another key).
+    pub fn remove(&mut self, key: &str) -> bool {
+        if let Some(i) = self.keys.iter().position(|k| k == key) {
+            self.keys.remove(i);
+            self.vals.remove(i);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A flat (contiguous) JS string with cached metadata so `.length` and indexing

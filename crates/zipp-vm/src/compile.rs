@@ -2418,6 +2418,18 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             E::ChainExpression(ce) => self.chain_expr(ce, dst),
+            E::SequenceExpression(s) => {
+                // `(a, b, c)` — evaluate each for side effects; value is the last.
+                let n = s.expressions.len();
+                for (i, e) in s.expressions.iter().enumerate() {
+                    if i + 1 == n {
+                        return self.expr_into(e, dst);
+                    }
+                    let _ = self.expr(e)?;
+                }
+                self.emit(Instr::LoadUndefined { dst }); // empty sequence (unreachable)
+                Ok(dst)
+            }
             _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
         }
     }
@@ -2902,7 +2914,39 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::BitNot { dst, a });
                 Ok(dst)
             }
-            _ => Err("unsupported unary operator (zipp-vm v1)".into()),
+            Op::Void => {
+                // Evaluate the operand for side effects; the value is `undefined`.
+                let _ = self.expr(&u.argument)?;
+                self.emit(Instr::LoadUndefined { dst });
+                Ok(dst)
+            }
+            Op::Delete => self.delete_expr(&u.argument, dst),
+        }
+    }
+
+    /// `delete <ref>` — remove a property (`obj.x` / `obj[k]`) and yield the
+    /// boolean result. A non-reference operand (or a bare identifier) evaluates
+    /// for side effects and yields `true` (matching sloppy-mode `delete x`).
+    fn delete_expr(&mut self, arg: &ox::Expression, dst: Reg) -> R<Reg> {
+        match arg {
+            ox::Expression::StaticMemberExpression(m) => {
+                let obj = self.expr(&m.object)?;
+                let name = self.string_name(&m.property.name);
+                self.emit(Instr::DeleteProp { dst, obj, name });
+                Ok(dst)
+            }
+            ox::Expression::ComputedMemberExpression(m) => {
+                let obj = self.expr(&m.object)?;
+                let key = self.expr(&m.expression)?;
+                self.emit(Instr::DeleteIndex { dst, obj, key });
+                Ok(dst)
+            }
+            ox::Expression::ParenthesizedExpression(p) => self.delete_expr(&p.expression, dst),
+            other => {
+                let _ = self.expr(other)?;
+                self.emit(Instr::LoadBool { dst, val: true });
+                Ok(dst)
+            }
         }
     }
 

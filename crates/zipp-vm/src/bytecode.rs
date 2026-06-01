@@ -254,6 +254,11 @@ pub enum Instr {
     GetProp { dst: Reg, obj: Reg, name: u32 },
     /// `obj.<string_constants[name]> = val` — static property write.
     SetProp { obj: Reg, name: u32, val: Reg },
+    /// `dst = delete obj.<string_constants[name]>` — remove an own property;
+    /// `dst` is the boolean result (true unless the property is non-deletable).
+    DeleteProp { dst: Reg, obj: Reg, name: u32 },
+    /// `dst = delete obj[key]` — computed property delete.
+    DeleteIndex { dst: Reg, obj: Reg, key: Reg },
 
     /// Call `callee` with `argc` arguments staged in registers
     /// `[arg_base, arg_base+argc)`. Result lands in `dst`.

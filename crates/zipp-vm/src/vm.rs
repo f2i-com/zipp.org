@@ -1843,6 +1843,23 @@ impl<'p> Vm<'p> {
                         self.set_prop(o, &key, v)?;
                         ip += 1;
                     }
+                    Instr::DeleteProp { dst, obj, name } => {
+                        let o = self.get(base, obj);
+                        let key = self.program.functions[func_id as usize]
+                            .string_constants[name as usize]
+                            .clone();
+                        let r = self.delete_prop(o, &key);
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::DeleteIndex { dst, obj, key } => {
+                        let o = self.get(base, obj);
+                        let k = self.get(base, key);
+                        let ks = self.display(k); // ToPropertyKey (string form)
+                        let r = self.delete_prop(o, &ks);
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
 
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
@@ -3835,6 +3852,34 @@ impl<'p> Vm<'p> {
         } else {
             "undefined"
         }
+    }
+
+    /// `delete obj[key]` — remove an own property, returning the boolean result.
+    /// Without property descriptors every own property is configurable, so this
+    /// yields `true` (matching `delete` on a missing property / non-object too).
+    /// An array element delete leaves a hole (reads as `undefined`), length kept.
+    fn delete_prop(&mut self, obj: Value, key: &str) -> Value {
+        if !obj.is_heap() {
+            return Value::bool(true);
+        }
+        let idx = obj.heap_index();
+        let removed = match self.heap.get_mut(idx) {
+            HeapObj::Object(map) => map.remove(key),
+            HeapObj::Array(items) => {
+                if let Ok(i) = key.parse::<usize>() {
+                    if i < items.len() {
+                        items[i] = Value::UNDEFINED;
+                    }
+                }
+                false // array slot stays (a hole); no version bump needed
+            }
+            HeapObj::Class(c) => c.statics.remove(key),
+            _ => false,
+        };
+        if removed {
+            self.heap.bump_version(idx); // a key was removed → slots shifted (IC)
+        }
+        Value::bool(true)
     }
 
     fn set_prop(&mut self, obj: Value, key: &str, val: Value) -> Result<(), Thrown> {
