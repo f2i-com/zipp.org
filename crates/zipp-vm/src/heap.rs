@@ -391,6 +391,15 @@ pub enum HeapObj {
     /// `source` is the pattern text, `flags` the JS flag string (`"gi"`); `last_index`
     /// is the mutable `lastIndex` (a char offset, for `g`/`y` stateful matching).
     RegExp { regex: Box<regress::Regex>, source: String, flags: String, last_index: usize },
+    /// A JS `ArrayBuffer` — a raw byte buffer backing TypedArrays/DataViews.
+    /// `detached` is set by transfer (we never detach via GC); `data` is the bytes.
+    ArrayBuffer { data: Vec<u8>, detached: bool },
+    /// A JS TypedArray view (`Int8Array`, `Float64Array`, …). `kind` indexes the
+    /// element type (see `vm::native::TA_KINDS`); `buffer` is the backing
+    /// `ArrayBuffer`'s heap index; `byte_offset`/`length` (in elements) frame the view.
+    TypedArray { buffer: u32, kind: u8, byte_offset: usize, length: usize },
+    /// A JS `DataView` over an ArrayBuffer (`buffer` heap index, byte window).
+    DataView { buffer: u32, byte_offset: usize, byte_length: usize },
     /// A JS `BigInt` primitive. Stored as `i128` (covers the common test262
     /// magnitudes; true arbitrary precision is a later refinement). Compared by
     /// VALUE (`1n === 1n`), not identity; `typeof` is "bigint".

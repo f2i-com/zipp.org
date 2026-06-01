@@ -203,6 +203,21 @@ mod native {
         "Error", "TypeError", "RangeError", "SyntaxError",
         "ReferenceError", "EvalError", "URIError", "AggregateError",
     ];
+    /// TypedArray element kinds, indexed by `kind`: (ctor name, element byte size,
+    /// is_bigint, is_float). Uint8Clamped (index 2) clamps on write.
+    pub const TA_KINDS: &[(&str, usize, bool, bool)] = &[
+        ("Int8Array", 1, false, false),
+        ("Uint8Array", 1, false, false),
+        ("Uint8ClampedArray", 1, false, false),
+        ("Int16Array", 2, false, false),
+        ("Uint16Array", 2, false, false),
+        ("Int32Array", 4, false, false),
+        ("Uint32Array", 4, false, false),
+        ("Float32Array", 4, false, true),
+        ("Float64Array", 8, false, true),
+        ("BigInt64Array", 8, true, false),
+        ("BigUint64Array", 8, true, false),
+    ];
     // RegExp.prototype methods.
     pub const REGEXP_TEST: u16 = 326;
     pub const REGEXP_EXEC: u16 = 327;
@@ -558,6 +573,17 @@ pub struct Vm<'p> {
     /// `Vec` with no slot for named properties, so they live in this side table
     /// (mirroring `template_raws`). Tuple is (index, input, groups).
     regexp_match_extras: std::collections::HashMap<u32, (Value, Value, Value)>,
+    /// The `%TypedArray%` intrinsic (abstract base ctor) + its prototype, the 11
+    /// concrete TypedArray ctors + their prototypes (indexed by `kind`), and the
+    /// `ArrayBuffer`/`DataView` ctors + prototypes. 0 until setup.
+    ta_base_ctor: u32,
+    ta_base_proto: u32,
+    ta_ctors: [u32; 11],
+    ta_protos: [u32; 11],
+    arraybuffer_ctor: u32,
+    arraybuffer_proto: u32,
+    dataview_ctor: u32,
+    dataview_proto: u32,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -686,6 +712,14 @@ impl<'p> Vm<'p> {
             regexp_proto: 0,
             regexp_ctor: 0,
             regexp_match_extras: std::collections::HashMap::new(),
+            ta_base_ctor: 0,
+            ta_base_proto: 0,
+            ta_ctors: [0; 11],
+            ta_protos: [0; 11],
+            arraybuffer_ctor: 0,
+            arraybuffer_proto: 0,
+            dataview_ctor: 0,
+            dataview_proto: 0,
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -1671,7 +1705,10 @@ impl<'p> Vm<'p> {
                             if vv.is_heap()
                                 && matches!(
                                     self.heap.get(vv.heap_index()),
-                                    HeapObj::Generator { .. } | HeapObj::Object(_) | HeapObj::Iterator { .. }
+                                    HeapObj::Generator { .. }
+                                        | HeapObj::Object(_)
+                                        | HeapObj::Iterator { .. }
+                                        | HeapObj::TypedArray { .. }
                                 )
                             {
                                 let elems = self.iterate_to_vec(vv)?;
@@ -3171,6 +3208,7 @@ impl<'p> Vm<'p> {
                             HeapObj::Str(s) => s.char_len,
                             HeapObj::Cons { len, .. } => *len,
                             HeapObj::Map { keys, .. } => keys.len(),
+                            HeapObj::TypedArray { length, .. } => *length,
                             _ => {
                                 return Err(Thrown(format!(
                                     "TypeError: {} is not iterable",
@@ -4517,6 +4555,15 @@ impl<'p> Vm<'p> {
         // static members (`C["m"]`) — not just own data properties. The built-in
         // instance types (Date/Promise/Weak*) have no integer-index meaning, so all
         // their computed access delegates here too.
+        // A TypedArray: a canonical numeric index reads the element; everything
+        // else (length/byteLength/methods) delegates to get_prop.
+        if matches!(self.heap.get(obj.heap_index()), HeapObj::TypedArray { .. }) {
+            if let Some(i) = array_index(key) {
+                return Ok(self.ta_element_get(obj.heap_index(), i));
+            }
+            let k = self.key_of(key);
+            return self.get_prop(obj, &k);
+        }
         if matches!(
             self.heap.get(obj.heap_index()),
             HeapObj::Object(_)
@@ -4532,6 +4579,11 @@ impl<'p> Vm<'p> {
                 | HeapObj::WeakSet(_)
                 | HeapObj::WeakRef(_)
                 | HeapObj::FinalizationRegistry { .. }
+                | HeapObj::RegExp { .. }
+                | HeapObj::Symbol { .. }
+                | HeapObj::BigInt(_)
+                | HeapObj::ArrayBuffer { .. }
+                | HeapObj::DataView { .. }
         ) {
             let k = self.key_of(key);
             return self.get_prop(obj, &k);
@@ -4624,6 +4676,15 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
         let idx = obj.heap_index();
+        // A TypedArray: a canonical numeric index writes the element (coerced +
+        // out-of-bounds is a silent no-op); other keys go to set_prop.
+        if matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
+            if let Some(i) = array_index(key) {
+                return self.ta_element_set(idx, i, val);
+            }
+            let k = self.key_of(key);
+            return self.set_prop(obj, &k, val);
+        }
         // Callable / class computed assignment (`fn["x"] = v`, `C["s"] = v`) is
         // property assignment: route through `set_prop` (honours non-writable
         // `name`/`length`, static setters, function own props).
@@ -5312,6 +5373,65 @@ impl<'p> Vm<'p> {
                 p.define("constructor", Value::heap(regexp_ctor), method_attr);
             }
         }
+        // TypedArrays: the %TypedArray% abstract base (its prototype holds the shared
+        // methods), the 11 concrete kinds inheriting from it, plus ArrayBuffer and
+        // DataView. `Object.getPrototypeOf(Int8Array) === %TypedArray%` and
+        // `Int8Array.prototype.__proto__ === %TypedArray%.prototype`.
+        {
+            let fn_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let ta_base_proto = build(self, &[], None);
+            self.proto_of.insert(ta_base_proto, Value::heap(obj_proto));
+            self.ta_base_proto = ta_base_proto;
+            let ta_base_ctor = build(self, &[], Some(ta_base_proto));
+            self.ta_base_ctor = ta_base_ctor;
+            self.proto_of.insert(ta_base_ctor, Value::heap(fn_proto));
+            let tname = self.alloc_str("TypedArray".to_string());
+            if let HeapObj::Object(m) = self.heap.get_mut(ta_base_ctor) {
+                m.define("name", tname, fn_attr);
+                m.define("length", Value::num(0.0), fn_attr);
+            }
+            if let HeapObj::Object(m) = self.heap.get_mut(ta_base_proto) {
+                m.define("constructor", Value::heap(ta_base_ctor), method_attr);
+            }
+            for k in 0..native::TA_KINDS.len() {
+                let size = native::TA_KINDS[k].1;
+                let proto = build(self, &[], None);
+                self.proto_of.insert(proto, Value::heap(ta_base_proto));
+                self.ta_protos[k] = proto;
+                let ctor = build(self, &[], Some(proto));
+                self.proto_of.insert(ctor, Value::heap(ta_base_ctor));
+                self.ta_ctors[k] = ctor;
+                if let HeapObj::Object(m) = self.heap.get_mut(proto) {
+                    m.define("constructor", Value::heap(ctor), method_attr);
+                    m.define("BYTES_PER_ELEMENT", Value::num(size as f64), proto_attr);
+                }
+                if let HeapObj::Object(m) = self.heap.get_mut(ctor) {
+                    m.define("BYTES_PER_ELEMENT", Value::num(size as f64), proto_attr);
+                }
+            }
+            let arraybuffer_proto = build(self, &[], None);
+            self.proto_of.insert(arraybuffer_proto, Value::heap(obj_proto));
+            self.arraybuffer_proto = arraybuffer_proto;
+            let arraybuffer_ctor = build(self, &[], Some(arraybuffer_proto));
+            self.arraybuffer_ctor = arraybuffer_ctor;
+            if let HeapObj::Object(m) = self.heap.get_mut(arraybuffer_proto) {
+                m.define("constructor", Value::heap(arraybuffer_ctor), method_attr);
+            }
+            let dataview_proto = build(self, &[], None);
+            self.proto_of.insert(dataview_proto, Value::heap(obj_proto));
+            self.dataview_proto = dataview_proto;
+            let dataview_ctor = build(self, &[], Some(dataview_proto));
+            self.dataview_ctor = dataview_ctor;
+            if let HeapObj::Object(m) = self.heap.get_mut(dataview_proto) {
+                m.define("constructor", Value::heap(dataview_ctor), method_attr);
+            }
+        }
         // Wire each built-in prototype's `constructor` back to its constructor
         // (`Array.prototype.constructor === Array`, `p.constructor === Promise`,
         // `(5).constructor === Number`, …) — a fundamental invariant assertions
@@ -5412,12 +5532,18 @@ impl<'p> Vm<'p> {
                 "Symbol" => Some(self.symbol_ctor),
                 "BigInt" => Some(self.bigint_ctor),
                 "RegExp" => Some(self.regexp_ctor),
+                "ArrayBuffer" => Some(self.arraybuffer_ctor),
+                "DataView" => Some(self.dataview_ctor),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
                 "isFinite" => Some(is_finite_fn),
                 "globalThis" => Some(global_this),
-                _ => None,
+                // The 11 TypedArray constructors (Int8Array … BigUint64Array).
+                _ => native::TA_KINDS
+                    .iter()
+                    .position(|t| t.0 == name.as_str())
+                    .map(|k| self.ta_ctors[k]),
             };
             if let Some(v) = v {
                 // Constructor globals expose own `name`/`length` like any function
@@ -5429,7 +5555,9 @@ impl<'p> Vm<'p> {
                         "Map" | "Set" | "WeakMap" | "WeakSet" => 0.0,
                         "AggregateError" => 2.0, // (errors, message?)
                         "RegExp" => 2.0,         // (pattern, flags)
-                        _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise/Error+subtypes
+                        // TypedArray ctors take (length | buffer, byteOffset, length).
+                        n if native::TA_KINDS.iter().any(|t| t.0 == n) => 3.0,
+                        _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise/Error+subtypes/ArrayBuffer/DataView
                     };
                     let nm = self.alloc_str(name.clone());
                     let fn_attr = PropAttr {
@@ -6779,6 +6907,40 @@ impl<'p> Vm<'p> {
                 "groups" => return Ok(groups),
                 _ => {}
             }
+        }
+        // TypedArray / ArrayBuffer / DataView instance properties.
+        if let HeapObj::TypedArray { buffer, kind, byte_offset, length } = self.heap.get(obj.heap_index()) {
+            let (buffer, kind, byte_offset, length) = (*buffer, *kind, *byte_offset, *length);
+            let size = native::TA_KINDS[kind as usize].1;
+            // A canonical numeric string index reads the element.
+            if let Ok(i) = key.parse::<usize>() {
+                return Ok(self.ta_element_get(obj.heap_index(), i));
+            }
+            return Ok(match key {
+                "length" => Value::num(length as f64),
+                "byteLength" => Value::num((length * size) as f64),
+                "byteOffset" => Value::num(byte_offset as f64),
+                "BYTES_PER_ELEMENT" => Value::num(size as f64),
+                "buffer" => Value::heap(buffer),
+                "@@toStringTag" => self.alloc_str(native::TA_KINDS[kind as usize].0.to_string()),
+                _ => self.proto_member(self.ta_protos[kind as usize], key),
+            });
+        }
+        if let HeapObj::ArrayBuffer { data, .. } = self.heap.get(obj.heap_index()) {
+            let len = data.len();
+            return Ok(match key {
+                "byteLength" => Value::num(len as f64),
+                _ => self.proto_member(self.arraybuffer_proto, key),
+            });
+        }
+        if let HeapObj::DataView { buffer, byte_offset, byte_length } = self.heap.get(obj.heap_index()) {
+            let (buffer, byte_offset, byte_length) = (*buffer, *byte_offset, *byte_length);
+            return Ok(match key {
+                "byteLength" => Value::num(byte_length as f64),
+                "byteOffset" => Value::num(byte_offset as f64),
+                "buffer" => Value::heap(buffer),
+                _ => self.proto_member(self.dataview_proto, key),
+            });
         }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
         // match so an accessor's getter can be invoked outside the heap borrow.
@@ -8579,6 +8741,252 @@ impl<'p> Vm<'p> {
         Ok(out)
     }
 
+    // ── TypedArrays / ArrayBuffer / DataView ──
+
+    fn as_array_buffer(&self, v: Value) -> Option<u32> {
+        (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::ArrayBuffer { .. }))
+            .then(|| v.heap_index())
+    }
+    fn as_typed_array(&self, v: Value) -> Option<u32> {
+        (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::TypedArray { .. }))
+            .then(|| v.heap_index())
+    }
+    fn array_buffer_len(&self, idx: u32) -> usize {
+        match self.heap.get(idx) {
+            HeapObj::ArrayBuffer { data, .. } => data.len(),
+            _ => 0,
+        }
+    }
+    fn alloc_array_buffer(&mut self, byte_len: usize) -> u32 {
+        let idx = self.heap.alloc(HeapObj::ArrayBuffer { data: vec![0u8; byte_len], detached: false });
+        if self.arraybuffer_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.arraybuffer_proto));
+        }
+        idx
+    }
+    /// Allocate a TypedArray view over `buffer`, linked to that kind's prototype.
+    fn alloc_typed_array(&mut self, buffer: u32, kind: u8, byte_offset: usize, length: usize) -> Value {
+        let idx = self.heap.alloc(HeapObj::TypedArray { buffer, kind, byte_offset, length });
+        let p = self.ta_protos[kind as usize];
+        if p != 0 {
+            self.proto_of.insert(idx, Value::heap(p));
+        }
+        Value::heap(idx)
+    }
+
+    /// Read element `i` of a TypedArray as a Value (number, or BigInt for the
+    /// 64-bit BigInt kinds). Out-of-bounds → undefined.
+    fn ta_element_get(&mut self, ta_idx: u32, i: usize) -> Value {
+        let (kind, bytes) = {
+            let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
+                HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
+                    (*buffer, *kind, *byte_offset, *length)
+                }
+                _ => return Value::UNDEFINED,
+            };
+            if i >= length {
+                return Value::UNDEFINED;
+            }
+            let size = native::TA_KINDS[kind as usize].1;
+            let data = match self.heap.get(buffer) {
+                HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+                _ => return Value::UNDEFINED,
+            };
+            let off = byte_offset + i * size;
+            if off + size > data.len() {
+                return Value::UNDEFINED;
+            }
+            let mut b = [0u8; 8];
+            b[..size].copy_from_slice(&data[off..off + size]);
+            (kind, b)
+        };
+        match kind {
+            0 => Value::num(bytes[0] as i8 as f64),
+            1 | 2 => Value::num(bytes[0] as f64),
+            3 => Value::num(i16::from_le_bytes([bytes[0], bytes[1]]) as f64),
+            4 => Value::num(u16::from_le_bytes([bytes[0], bytes[1]]) as f64),
+            5 => Value::num(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64),
+            6 => Value::num(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64),
+            7 => Value::num(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64),
+            8 => Value::num(f64::from_le_bytes(bytes)),
+            9 => self.make_bigint(i64::from_le_bytes(bytes) as i128),
+            _ => self.make_bigint(u64::from_le_bytes(bytes) as i128),
+        }
+    }
+
+    /// A TypedArray element as its display string (read-only, no allocation) —
+    /// for `display`/`inspect` (ToString of a TypedArray is the comma-join).
+    fn ta_elem_string(&self, ta_idx: u32, i: usize) -> String {
+        let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
+                (*buffer, *kind, *byte_offset, *length)
+            }
+            _ => return String::new(),
+        };
+        if i >= length {
+            return "undefined".to_string();
+        }
+        let size = native::TA_KINDS[kind as usize].1;
+        let data = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, .. } => data,
+            _ => return String::new(),
+        };
+        let off = byte_offset + i * size;
+        if off + size > data.len() {
+            return "undefined".to_string();
+        }
+        let b = &data[off..off + size];
+        match kind {
+            0 => (b[0] as i8).to_string(),
+            1 | 2 => b[0].to_string(),
+            3 => i16::from_le_bytes([b[0], b[1]]).to_string(),
+            4 => u16::from_le_bytes([b[0], b[1]]).to_string(),
+            5 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string(),
+            6 => u32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string(),
+            7 => fmt_f64(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+            8 => fmt_f64(f64::from_le_bytes(b.try_into().unwrap())),
+            9 => i64::from_le_bytes(b.try_into().unwrap()).to_string(),
+            _ => u64::from_le_bytes(b.try_into().unwrap()).to_string(),
+        }
+    }
+
+    /// Write `v` to element `i` of a TypedArray (ToNumber/ToBigInt then encode per
+    /// the element kind). Out-of-bounds → silent no-op (after coercion).
+    fn ta_element_set(&mut self, ta_idx: u32, i: usize, v: Value) -> Result<(), Thrown> {
+        let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
+                (*buffer, *kind, *byte_offset, *length)
+            }
+            _ => return Ok(()),
+        };
+        let size = native::TA_KINDS[kind as usize].1;
+        let is_bigint = native::TA_KINDS[kind as usize].2;
+        // Coerce BEFORE borrowing the buffer mutably (coercion can run user code).
+        let bytes: [u8; 8] = if is_bigint {
+            let n = self.to_bigint(v)?;
+            if kind == 9 {
+                let mut o = [0u8; 8];
+                o.copy_from_slice(&(n as i64).to_le_bytes());
+                o
+            } else {
+                let mut o = [0u8; 8];
+                o.copy_from_slice(&(n as u64).to_le_bytes());
+                o
+            }
+        } else {
+            let f = self.to_number(v)?;
+            ta_encode(kind, f)
+        };
+        if i >= length {
+            return Ok(());
+        }
+        if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buffer) {
+            if *detached {
+                return Ok(());
+            }
+            let off = byte_offset + i * size;
+            if off + size <= data.len() {
+                data[off..off + size].copy_from_slice(&bytes[..size]);
+            }
+        }
+        Ok(())
+    }
+
+    /// `new ArrayBuffer(byteLength)`.
+    fn build_array_buffer(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let n = match args.first() {
+            Some(&v) if v != Value::UNDEFINED => self.to_number(v)?,
+            _ => 0.0,
+        };
+        if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+            return Err(Thrown("RangeError: Invalid ArrayBuffer length".into()));
+        }
+        Ok(Value::heap(self.alloc_array_buffer(n as usize)))
+    }
+
+    /// `new <TA>(length | buffer[,off[,len]] | typedArray | array/iterable)`.
+    fn build_typed_array(&mut self, kind: u8, args: &[Value]) -> Result<Value, Thrown> {
+        let size = native::TA_KINDS[kind as usize].1;
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        // new TA(buffer, byteOffset?, length?)
+        if let Some(buf) = self.as_array_buffer(a0) {
+            let byte_offset = match args.get(1) {
+                Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+                _ => 0,
+            };
+            let buf_len = self.array_buffer_len(buf);
+            let length = match args.get(2) {
+                Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+                _ => {
+                    if buf_len < byte_offset || (buf_len - byte_offset) % size != 0 {
+                        return Err(Thrown("RangeError: byte length not a multiple of element size".into()));
+                    }
+                    (buf_len - byte_offset) / size
+                }
+            };
+            if byte_offset % size != 0 || byte_offset + length * size > buf_len {
+                return Err(Thrown("RangeError: invalid TypedArray length/offset".into()));
+            }
+            return Ok(self.alloc_typed_array(buf, kind, byte_offset, length));
+        }
+        // new TA(typedArray) / new TA(array | iterable) → copy element-by-element.
+        if a0.is_heap() && !a0.is_uninitialized() {
+            let src: Vec<Value> = if let Some(src_ta) = self.as_typed_array(a0) {
+                let len = match self.heap.get(src_ta) {
+                    HeapObj::TypedArray { length, .. } => *length,
+                    _ => 0,
+                };
+                (0..len).map(|i| self.ta_element_get(src_ta, i)).collect()
+            } else {
+                self.iterate_to_vec(a0)?
+            };
+            let len = src.len();
+            let buf = self.alloc_array_buffer(len * size);
+            let ta = self.alloc_typed_array(buf, kind, 0, len);
+            for (i, v) in src.into_iter().enumerate() {
+                self.ta_element_set(ta.heap_index(), i, v)?;
+            }
+            return Ok(ta);
+        }
+        // new TA(length)
+        let length = if a0 == Value::UNDEFINED {
+            0
+        } else {
+            let n = self.to_number(a0)?;
+            if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+                return Err(Thrown("RangeError: invalid typed array length".into()));
+            }
+            n as usize
+        };
+        let buf = self.alloc_array_buffer(length * size);
+        Ok(self.alloc_typed_array(buf, kind, 0, length))
+    }
+
+    /// `new DataView(buffer, byteOffset?, byteLength?)`.
+    fn build_data_view(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let buf = self
+            .as_array_buffer(a0)
+            .ok_or_else(|| Thrown("TypeError: DataView requires an ArrayBuffer".into()))?;
+        let buf_len = self.array_buffer_len(buf);
+        let byte_offset = match args.get(1) {
+            Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+            _ => 0,
+        };
+        let byte_length = match args.get(2) {
+            Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+            _ => buf_len.saturating_sub(byte_offset),
+        };
+        if byte_offset + byte_length > buf_len {
+            return Err(Thrown("RangeError: invalid DataView offset/length".into()));
+        }
+        let idx = self.heap.alloc(HeapObj::DataView { buffer: buf, byte_offset, byte_length });
+        if self.dataview_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.dataview_proto));
+        }
+        Ok(Value::heap(idx))
+    }
+
     /// A binary arithmetic/bitwise op where at least one operand might be a BigInt.
     /// `Ok(None)` ⇒ neither is a BigInt (caller does its numeric path); `Ok(Some)`
     /// ⇒ both BigInt (result); `Err` ⇒ exactly one BigInt (mixing TypeError) or a
@@ -8632,6 +9040,20 @@ impl<'p> Vm<'p> {
         if let Some(k) = self.error_ctors.iter().position(|&c| c == cv.heap_index()) {
             let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
             return Ok(self.make_error(k as u8, msg));
+        }
+        // ArrayBuffer / DataView / TypedArray constructors used as values.
+        let ci = cv.heap_index();
+        if ci == self.arraybuffer_ctor && ci != 0 {
+            return self.build_array_buffer(args);
+        }
+        if ci == self.dataview_ctor && ci != 0 {
+            return self.build_data_view(args);
+        }
+        if let Some(k) = self.ta_ctors.iter().position(|&c| c == ci && ci != 0) {
+            return self.build_typed_array(k as u8, args);
+        }
+        if ci == self.ta_base_ctor && ci != 0 {
+            return Err(Thrown("TypeError: Abstract class TypedArray not directly constructable".into()));
         }
         // Constructor FUNCTION (`new F()`, the pre-class OOP idiom): make an object
         // whose [[Prototype]] is `F.prototype` (so its methods + `constructor`
@@ -8978,6 +9400,14 @@ impl<'p> Vm<'p> {
     }
 
     fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        // A TypedArray iterates positionally over its elements.
+        if let Some(ta) = self.as_typed_array(v) {
+            let n = match self.heap.get(ta) {
+                HeapObj::TypedArray { length, .. } => *length,
+                _ => 0,
+            };
+            return Ok((0..n).map(|i| self.ta_element_get(ta, i)).collect());
+        }
         let v = self.get_iterator(v)?;
         // A generator is drained eagerly via repeated next() (spread / Array.from
         // produce a buffer; an infinite generator hangs here, matching V8).
@@ -9059,6 +9489,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Cons { .. }
                 | HeapObj::Set(_)
                 | HeapObj::Map { .. }
+                | HeapObj::TypedArray { .. }
                 | HeapObj::Generator { .. } => Kind::Iterable,
                 HeapObj::Object(_) => Kind::Obj,
                 _ => Kind::Other,
@@ -10958,6 +11389,14 @@ impl<'p> Vm<'p> {
                     let s = if source.is_empty() { "(?:)" } else { source };
                     format!("/{s}/{flags}")
                 }
+                // ToString of a TypedArray is the comma-joined elements (like Array).
+                HeapObj::TypedArray { length, .. } => {
+                    let n = *length;
+                    let idx = v.heap_index();
+                    (0..n).map(|i| self.ta_elem_string(idx, i)).collect::<Vec<_>>().join(",")
+                }
+                HeapObj::ArrayBuffer { .. } => "[object ArrayBuffer]".into(),
+                HeapObj::DataView { .. } => "[object DataView]".into(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -11097,6 +11536,19 @@ impl<'p> Vm<'p> {
             HeapObj::RegExp { source, flags, .. } => {
                 let s = if source.is_empty() { "(?:)" } else { source };
                 format!("/{s}/{flags}")
+            }
+            HeapObj::TypedArray { kind, length, .. } => {
+                let (name, n, idx) = (native::TA_KINDS[*kind as usize].0, *length, v.heap_index());
+                let parts: Vec<String> = (0..n).map(|i| self.ta_elem_string(idx, i)).collect();
+                if n == 0 {
+                    format!("{name}(0) []")
+                } else {
+                    format!("{name}({n}) [ {} ]", parts.join(", "))
+                }
+            }
+            HeapObj::ArrayBuffer { data, .. } => format!("ArrayBuffer {{ byteLength: {} }}", data.len()),
+            HeapObj::DataView { byte_length, .. } => {
+                format!("DataView {{ byteLength: {byte_length} }}")
             }
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
@@ -11621,6 +12073,55 @@ fn parse_bigint_str(s: &str) -> Option<i128> {
         body.parse::<i128>().ok()?
     };
     Some(if neg { -v } else { v })
+}
+
+/// Encode `f` (already ToNumber'd) into a TypedArray element's little-endian
+/// bytes per the element `kind` (JS ToInt8/ToUint8/clamp/… modular reduction;
+/// Rust's `as` saturates, so reduce via `rem_euclid` first). BigInt kinds are
+/// encoded by the caller.
+fn ta_encode(kind: u8, f: f64) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    match kind {
+        0 | 1 => out[0] = to_uint_modular(f, 8) as u8,
+        2 => out[0] = clamp_u8(f),
+        3 | 4 => out[..2].copy_from_slice(&(to_uint_modular(f, 16) as u16).to_le_bytes()),
+        5 | 6 => out[..4].copy_from_slice(&(to_uint_modular(f, 32) as u32).to_le_bytes()),
+        7 => out[..4].copy_from_slice(&(f as f32).to_le_bytes()),
+        8 => out.copy_from_slice(&f.to_le_bytes()),
+        _ => {}
+    }
+    out
+}
+
+/// JS ToUintN modular reduction (the low `bits` bits of trunc(f)), NaN/±∞ → 0.
+fn to_uint_modular(f: f64, bits: u32) -> u64 {
+    if !f.is_finite() {
+        return 0;
+    }
+    let m = 2f64.powi(bits as i32);
+    f.trunc().rem_euclid(m) as u64
+}
+
+/// JS ToUint8Clamp: clamp to [0,255] with round-half-to-even.
+fn clamp_u8(f: f64) -> u8 {
+    if f.is_nan() || f <= 0.0 {
+        return 0;
+    }
+    if f >= 255.0 {
+        return 255;
+    }
+    let fl = f.floor();
+    let diff = f - fl;
+    let r = if diff < 0.5 {
+        fl
+    } else if diff > 0.5 {
+        fl + 1.0
+    } else if (fl as u64) % 2 == 0 {
+        fl
+    } else {
+        fl + 1.0
+    };
+    r as u8
 }
 
 /// Convert a byte offset into `s` to a char offset (regress reports byte offsets;
