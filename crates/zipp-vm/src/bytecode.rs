@@ -34,8 +34,15 @@ pub enum Instr {
     /// `dst = src`
     Move { dst: Reg, src: Reg },
 
-    /// `dst = globals[idx]`
+    /// `dst = globals[idx]`. Throws ReferenceError if the slot holds the
+    /// never-declared sentinel (`Value::UNINITIALIZED`) — i.e. the name was
+    /// referenced but never bound (`x` where no `var`/`let`/`function`/builtin/
+    /// assignment ever defined it).
     LoadGlobal { dst: Reg, idx: u32 },
+    /// `dst = globals[idx]`, but the never-declared sentinel reads as `undefined`
+    /// instead of throwing. Emitted for `typeof <ident>`, where an unbound name
+    /// must yield "undefined" rather than a ReferenceError.
+    LoadGlobalOrUndefined { dst: Reg, idx: u32 },
     /// `globals[idx] = src`
     StoreGlobal { idx: u32, src: Reg },
 
@@ -270,6 +277,10 @@ pub enum Instr {
     NewArray { dst: Reg, arg_base: Reg, argc: u16 },
     /// `dst = {}` — empty object (populated by following SetProp/SetIndex).
     NewObject { dst: Reg },
+    /// `dst = new <Error subtype>(arg?)` — a proto-linked error instance. `kind`
+    /// indexes the canonical error list (0=Error, 1=TypeError, …, 7=AggregateError);
+    /// `arg` (when present) is coerced to the `message` string.
+    NewError { dst: Reg, kind: u8, arg: Option<Reg> },
     /// `dst = <array of obj's own enumerable string keys>` — drives `for-in`.
     /// For an array, the keys are the index strings "0".."len-1".
     ObjectKeys { dst: Reg, obj: Reg },
@@ -566,6 +577,10 @@ pub enum InstanceCtor {
     TypeError,
     RangeError,
     SyntaxError,
+    ReferenceError,
+    EvalError,
+    UriError,
+    AggregateError,
 }
 
 impl InstanceCtor {
@@ -578,6 +593,10 @@ impl InstanceCtor {
             "TypeError" => InstanceCtor::TypeError,
             "RangeError" => InstanceCtor::RangeError,
             "SyntaxError" => InstanceCtor::SyntaxError,
+            "ReferenceError" => InstanceCtor::ReferenceError,
+            "EvalError" => InstanceCtor::EvalError,
+            "URIError" => InstanceCtor::UriError,
+            "AggregateError" => InstanceCtor::AggregateError,
             _ => return None,
         })
     }
@@ -601,6 +620,11 @@ pub struct Program {
     /// Global slot names, indexed by slot. Lets the VM populate slots for free
     /// builtin identifiers (`Object`, `Array`, `Function`, …) at startup.
     pub global_names: Vec<String>,
+    /// Global slots for top-level `var` declarations — hoisted to `undefined` at
+    /// startup so a read before the textual declaration yields `undefined` (not
+    /// the never-declared ReferenceError). Other slots start as the uninitialized
+    /// sentinel; a write (StoreGlobal/builtin/function) clears it.
+    pub hoisted_globals: Vec<u32>,
 }
 
 /// A compiled class: the constructor func id (runs field inits + user ctor body),

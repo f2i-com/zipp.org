@@ -298,6 +298,7 @@ pub fn compile_program(prog: &ox::Program) -> R<Program> {
         global_count: c.globals.len() as u32,
         classes: c.classes,
         global_names: c.globals,
+        hoisted_globals: c.hoisted_globals,
     })
 }
 
@@ -309,6 +310,10 @@ struct Compiler {
     classes: Vec<ClassDef>,
     /// Class name → class_id, for resolving `extends <Name>` and `super`.
     class_names: Vec<(String, u32)>,
+    /// Slots for top-level `var` names — pre-initialized to `undefined` at VM
+    /// startup (var hoisting), so a read before the textual decl isn't a
+    /// never-declared ReferenceError.
+    hoisted_globals: Vec<u32>,
 }
 
 impl Compiler {
@@ -318,6 +323,7 @@ impl Compiler {
             globals: Vec::new(),
             classes: Vec::new(),
             class_names: Vec::new(),
+            hoisted_globals: Vec::new(),
         }
     }
 
@@ -349,6 +355,22 @@ impl Compiler {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Also hoist every top-level `var` name (recursing through blocks/loops/
+        // try/switch but not into nested functions). These slots are pre-set to
+        // `undefined` at startup so `x; var x;` reads `undefined` rather than
+        // throwing the never-declared ReferenceError.
+        {
+            let mut vars = std::collections::HashSet::new();
+            for s in &prog.body {
+                collect_hoisted_vars(s, &mut vars);
+            }
+            for name in vars {
+                let slot = self.global_slot(&name) as u32;
+                if !self.hoisted_globals.contains(&slot) {
+                    self.hoisted_globals.push(slot);
+                }
             }
         }
 
@@ -2578,7 +2600,7 @@ impl<'a> FnCompiler<'a> {
                 // the subset yet.
                 if let ox::Expression::Identifier(id) = &n.callee {
                     if let Some(kind) = error_ctor(&id.name) {
-                        return self.build_error(kind, n.arguments.first(), dst);
+                        return self.build_error(kind, &n.arguments, dst);
                     }
                     // `new Array(…)` / `new Object()` builtins (no real global).
                     if id.name == "Array" {
@@ -3237,6 +3259,20 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             Op::Typeof => {
+                // `typeof <unbound identifier>` must yield "undefined", NOT throw
+                // a ReferenceError. A bare identifier that resolves to a global is
+                // read with the non-throwing variant so the never-declared sentinel
+                // degrades to undefined. (`undefined`/`NaN`/`Infinity` are literals,
+                // handled by the normal expr path.)
+                if let ox::Expression::Identifier(id) = &u.argument {
+                    if !matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
+                        if let Binding::Global(idx) = self.resolve(id.name.as_str()) {
+                            self.emit(Instr::LoadGlobalOrUndefined { dst, idx });
+                            self.emit(Instr::TypeOf { dst, a: dst });
+                            return Ok(dst);
+                        }
+                    }
+                }
                 let a = self.expr(&u.argument)?;
                 self.emit(Instr::TypeOf { dst, a });
                 Ok(dst)
@@ -3907,31 +3943,28 @@ impl<'a> FnCompiler<'a> {
 
     /// Build an Error-like object `{ name, message }` for `Error("msg")` (called
     /// either with `new` or bare). `arg` is the optional message argument.
-    fn build_error(&mut self, kind: &str, arg: Option<&ox::Argument>, dst: Reg) -> R<Reg> {
-        self.emit(Instr::NewObject { dst });
-        // name = kind
-        let name_const = self.add_string_const(kind);
-        let tmp = self.temp();
-        self.emit(Instr::LoadConst { dst: tmp, idx: name_const });
-        let name_key = self.string_name("name");
-        self.emit(Instr::SetProp { obj: dst, name: name_key, val: tmp });
-        // message = arg (coerced to string at use; stored as-is)
-        if let Some(a) = arg {
-            if let Some(e) = a.as_expression() {
-                let mv = self.expr_into(e, tmp)?;
-                if mv != tmp {
-                    self.emit(Instr::Move { dst: tmp, src: mv });
+    fn build_error(&mut self, kind: &str, args: &[ox::Argument], dst: Reg) -> R<Reg> {
+        // `new TypeError(msg)` etc. → a proto-linked error instance (NewError op
+        // sets own `name`/`message` and links the prototype so `.constructor`,
+        // `.toString`, and `instanceof` resolve). AggregateError takes the message
+        // as its SECOND argument (`new AggregateError(errors, message)`).
+        let kidx = error_kind_index(kind);
+        let msg_pos = if kidx == 7 { 1 } else { 0 };
+        let arg = match args.get(msg_pos).and_then(|a| a.as_expression()) {
+            Some(e) => {
+                let t = self.temp();
+                let v = self.expr_into(e, t)?;
+                if v != t {
+                    self.emit(Instr::Move { dst: t, src: v });
                 }
-            } else {
-                self.emit(Instr::LoadUndefined { dst: tmp });
+                Some(t)
             }
-        } else {
-            let empty = self.add_string_const("");
-            self.emit(Instr::LoadConst { dst: tmp, idx: empty });
+            None => None,
+        };
+        self.emit(Instr::NewError { dst, kind: kidx, arg });
+        if arg.is_some() {
+            self.next_reg -= 1; // reclaim the message temp
         }
-        let msg_key = self.string_name("message");
-        self.emit(Instr::SetProp { obj: dst, name: msg_key, val: tmp });
-        self.next_reg -= 1; // reclaim tmp
         Ok(dst)
     }
 
@@ -4023,7 +4056,7 @@ impl<'a> FnCompiler<'a> {
         // Bare `Error("msg")` call (no `new`) → same Error object.
         if let ox::Expression::Identifier(id) = &c.callee {
             if let Some(kind) = error_ctor(&id.name) {
-                return self.build_error(kind, c.arguments.first(), dst);
+                return self.build_error(kind, &c.arguments, dst);
             }
         }
         // Number(x) / parseInt(s,radix) / parseFloat(s) → GlobalFn op.
@@ -4429,12 +4462,116 @@ fn private_key(name: &str) -> String {
 /// Recognise the built-in Error constructor names the subset supports. Returns
 /// the canonical `name` to store on the error object.
 fn error_ctor(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Error" => "Error",
+        "TypeError" => "TypeError",
+        "RangeError" => "RangeError",
+        "SyntaxError" => "SyntaxError",
+        "ReferenceError" => "ReferenceError",
+        "EvalError" => "EvalError",
+        "URIError" => "URIError",
+        "AggregateError" => "AggregateError",
+        _ => return None,
+    })
+}
+
+/// Collect the names introduced by top-level `var` declarations, recursing
+/// through nested statements (blocks, loops, `if`, `try`, `switch`, labels,
+/// `with`) but NOT into nested function/class bodies — `var` hoists to the
+/// enclosing function/script scope, stopping at a function boundary. `let`/
+/// `const`/`class` are excluded (they keep TDZ — a forward read throws). These
+/// slots are pre-initialized to `undefined` so var hoisting matches JS.
+fn collect_hoisted_vars(s: &ox::Statement, out: &mut std::collections::HashSet<String>) {
+    use ox::Statement as S;
+    match s {
+        S::VariableDeclaration(d) if d.kind == ox::VariableDeclarationKind::Var => {
+            for decl in &d.declarations {
+                capture::collect_pattern_names(&decl.id, out);
+            }
+        }
+        S::BlockStatement(b) => {
+            for s in &b.body {
+                collect_hoisted_vars(s, out);
+            }
+        }
+        S::IfStatement(i) => {
+            collect_hoisted_vars(&i.consequent, out);
+            if let Some(a) = &i.alternate {
+                collect_hoisted_vars(a, out);
+            }
+        }
+        S::WhileStatement(w) => collect_hoisted_vars(&w.body, out),
+        S::DoWhileStatement(d) => collect_hoisted_vars(&d.body, out),
+        S::ForStatement(f) => {
+            if let Some(ox::ForStatementInit::VariableDeclaration(d)) = &f.init {
+                if d.kind == ox::VariableDeclarationKind::Var {
+                    for decl in &d.declarations {
+                        capture::collect_pattern_names(&decl.id, out);
+                    }
+                }
+            }
+            collect_hoisted_vars(&f.body, out);
+        }
+        S::ForOfStatement(f) => {
+            if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                if d.kind == ox::VariableDeclarationKind::Var {
+                    for decl in &d.declarations {
+                        capture::collect_pattern_names(&decl.id, out);
+                    }
+                }
+            }
+            collect_hoisted_vars(&f.body, out);
+        }
+        S::ForInStatement(f) => {
+            if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                if d.kind == ox::VariableDeclarationKind::Var {
+                    for decl in &d.declarations {
+                        capture::collect_pattern_names(&decl.id, out);
+                    }
+                }
+            }
+            collect_hoisted_vars(&f.body, out);
+        }
+        S::TryStatement(t) => {
+            for s in &t.block.body {
+                collect_hoisted_vars(s, out);
+            }
+            if let Some(h) = &t.handler {
+                for s in &h.body.body {
+                    collect_hoisted_vars(s, out);
+                }
+            }
+            if let Some(f) = &t.finalizer {
+                for s in &f.body {
+                    collect_hoisted_vars(s, out);
+                }
+            }
+        }
+        S::SwitchStatement(sw) => {
+            for case in &sw.cases {
+                for s in &case.consequent {
+                    collect_hoisted_vars(s, out);
+                }
+            }
+        }
+        S::LabeledStatement(l) => collect_hoisted_vars(&l.body, out),
+        S::WithStatement(w) => collect_hoisted_vars(&w.body, out),
+        _ => {}
+    }
+}
+
+/// The canonical index of an error constructor name (parallel to the VM's
+/// `ERROR_NAMES` / `error_protos`). Unknown → 0 (`Error`).
+fn error_kind_index(name: &str) -> u8 {
     match name {
-        "Error" => Some("Error"),
-        "TypeError" => Some("TypeError"),
-        "RangeError" => Some("RangeError"),
-        "SyntaxError" => Some("SyntaxError"),
-        _ => None,
+        "TypeError" => 1,
+        "RangeError" => 2,
+        "SyntaxError" => 3,
+        "ReferenceError" => 4,
+        "EvalError" => 5,
+        "URIError" => 6,
+        "AggregateError" => 7,
+        _ => 0, // "Error" and anything unexpected
     }
 }
 

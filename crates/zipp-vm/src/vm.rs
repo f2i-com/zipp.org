@@ -195,6 +195,14 @@ mod native {
     pub const DATE_NOW: u16 = 314;
     pub const DATE_PARSE: u16 = 315;
     pub const DATE_UTC: u16 = 316;
+    /// `Error.prototype.toString` — `name`/`message` → "name: message".
+    pub const ERROR_TO_STRING: u16 = 317;
+    /// Canonical native error names, indexed by error kind (parallels compile.rs
+    /// `error_kind_index` and the VM's `error_protos`/`error_ctors`).
+    pub const ERROR_NAMES: [&str; 8] = [
+        "Error", "TypeError", "RangeError", "SyntaxError",
+        "ReferenceError", "EvalError", "URIError", "AggregateError",
+    ];
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -309,6 +317,7 @@ mod native {
             PROTO_IS_PROTO_OF => ("isPrototypeOf", 1),
             PROTO_VALUE_OF => ("valueOf", 0),
             PROTO_TO_STRING => ("toString", 0),
+            ERROR_TO_STRING => ("toString", 0),
             FN_CALL => ("call", 1),
             FN_APPLY => ("apply", 2),
             FN_BIND => ("bind", 1),
@@ -478,6 +487,16 @@ pub struct Vm<'p> {
     weakset_proto: u32,
     weakref_proto: u32,
     finreg_proto: u32,
+    /// Error prototypes, indexed by the canonical error kind (0=Error.prototype,
+    /// 1=TypeError.prototype, …, 7=AggregateError.prototype). The subtype protos
+    /// chain to `error_protos[0]`; every error instance links here via `proto_of`
+    /// so `.constructor`/`.name`/`.message`/`.toString`/`instanceof` resolve. 0
+    /// until `setup_globals`.
+    error_protos: [u32; 8],
+    /// The matching error constructor function values (`Error`, `TypeError`, …),
+    /// indexed the same way. Stored on each proto as `.constructor` and used by the
+    /// runtime `new (TypeError)()` / `Reflect.construct` path.
+    error_ctors: [u32; 8],
     /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
     /// iterators (and the default array `@@iterator`). 0 until set up.
     array_iter_proto: u32,
@@ -540,7 +559,20 @@ impl<'p> Vm<'p> {
         // on pool slots, and the interpreter syncs object.field ↔ pool slot around
         // the native run. Sized once here so the globals Vec never reallocates at
         // runtime (the JIT pins its base pointer).
-        let globals = vec![Value::UNDEFINED; program.global_count as usize + FIELD_POOL];
+        let mut globals = vec![Value::UNDEFINED; program.global_count as usize + FIELD_POOL];
+        // Real global slots start as the never-declared sentinel: a LoadGlobal of
+        // one throws ReferenceError unless a builtin (setup_globals), a hoisted
+        // function, a top-level `var` (hoisted to undefined just below), or a
+        // StoreGlobal writes it first. The JIT scratch pool (past global_count)
+        // stays undefined.
+        for slot in globals.iter_mut().take(program.global_count as usize) {
+            *slot = Value::UNINITIALIZED;
+        }
+        for &slot in &program.hoisted_globals {
+            if (slot as usize) < globals.len() {
+                globals[slot as usize] = Value::UNDEFINED;
+            }
+        }
         let _ = &mut heap;
         Vm {
             program,
@@ -575,6 +607,8 @@ impl<'p> Vm<'p> {
             weakset_proto: 0,
             weakref_proto: 0,
             finreg_proto: 0,
+            error_protos: [0; 8],
+            error_ctors: [0; 8],
             array_iter_proto: 0,
             map_iter_proto: 0,
             set_iter_proto: 0,
@@ -1235,6 +1269,22 @@ impl<'p> Vm<'p> {
                     }
                     Instr::LoadGlobal { dst, idx } => {
                         let v = self.globals[idx as usize];
+                        if v.is_uninitialized() {
+                            // Referenced but never declared → ReferenceError.
+                            let name = self
+                                .program
+                                .global_names
+                                .get(idx as usize)
+                                .map(|s| s.as_str())
+                                .unwrap_or("?");
+                            return Err(Thrown(format!("ReferenceError: {name} is not defined")));
+                        }
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::LoadGlobalOrUndefined { dst, idx } => {
+                        let v = self.globals[idx as usize];
+                        let v = if v.is_uninitialized() { Value::UNDEFINED } else { v };
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2448,6 +2498,12 @@ impl<'p> Vm<'p> {
                     }
                     Instr::NewObject { dst } => {
                         let v = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::NewError { dst, kind, arg } => {
+                        let msg = arg.map(|r| self.get(base, r));
+                        let v = self.make_error(kind, msg);
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -4938,6 +4994,49 @@ impl<'p> Vm<'p> {
         let weakset_ctor = build(self, &[], Some(weakset_proto));
         let weakref_ctor = build(self, &[], Some(weakref_proto));
         let finreg_ctor = build(self, &[], Some(finreg_proto));
+        // Error hierarchy: `Error` + the 7 native subtypes. Each is a constructor
+        // VALUE (is_ctor object with a `.prototype`) whose prototype carries own
+        // `name`/`message`/`constructor` (+ `Error.prototype.toString`). Every error
+        // instance — `new TypeError(x)` AND internal VM throws — links here via
+        // `proto_of`, so `e.constructor === TypeError`, `e.name`, `e.toString()`,
+        // and `e instanceof <ctor value>` all resolve through the chain.
+        {
+            // Error.prototype (chains to Object.prototype) carries toString.
+            let err_proto = build(self, &[("toString", ERROR_TO_STRING)], None);
+            self.proto_of.insert(err_proto, Value::heap(obj_proto));
+            self.error_protos[0] = err_proto;
+            // Subtype prototypes chain to Error.prototype.
+            for k in 1..8usize {
+                let p = build(self, &[], None);
+                self.proto_of.insert(p, Value::heap(err_proto));
+                self.error_protos[k] = p;
+            }
+            // Constructor function values (is_ctor, with a non-writable `.prototype`).
+            for k in 0..8usize {
+                let proto = self.error_protos[k];
+                self.error_ctors[k] = build(self, &[], Some(proto));
+            }
+            // `Object.getPrototypeOf(TypeError) === Error`; `Error` → Function.prototype.
+            let err_ctor = self.error_ctors[0];
+            self.proto_of.insert(err_ctor, Value::heap(fn_proto));
+            for k in 1..8usize {
+                let c = self.error_ctors[k];
+                self.proto_of.insert(c, Value::heap(err_ctor));
+            }
+            // Each prototype's own name/message/constructor (writable, non-enum,
+            // configurable — matching the spec's Error.prototype descriptors).
+            for k in 0..8usize {
+                let name_v = self.alloc_str(native::ERROR_NAMES[k].to_string());
+                let empty_v = self.alloc_str(String::new());
+                let ctor_v = Value::heap(self.error_ctors[k]);
+                let proto = self.error_protos[k];
+                if let HeapObj::Object(m) = self.heap.get_mut(proto) {
+                    m.define("name", name_v, method_attr);
+                    m.define("message", empty_v, method_attr);
+                    m.define("constructor", ctor_v, method_attr);
+                }
+            }
+        }
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
         let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
@@ -5000,6 +5099,14 @@ impl<'p> Vm<'p> {
                 "WeakSet" => Some(weakset_ctor),
                 "WeakRef" => Some(weakref_ctor),
                 "FinalizationRegistry" => Some(finreg_ctor),
+                "Error" => Some(self.error_ctors[0]),
+                "TypeError" => Some(self.error_ctors[1]),
+                "RangeError" => Some(self.error_ctors[2]),
+                "SyntaxError" => Some(self.error_ctors[3]),
+                "ReferenceError" => Some(self.error_ctors[4]),
+                "EvalError" => Some(self.error_ctors[5]),
+                "URIError" => Some(self.error_ctors[6]),
+                "AggregateError" => Some(self.error_ctors[7]),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -5015,7 +5122,8 @@ impl<'p> Vm<'p> {
                     let len = match name.as_str() {
                         "Date" => 7.0,
                         "Map" | "Set" | "WeakMap" | "WeakSet" => 0.0,
-                        _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise
+                        "AggregateError" => 2.0, // (errors, message?)
+                        _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise/Error+subtypes
                     };
                     let nm = self.alloc_str(name.clone());
                     let fn_attr = PropAttr {
@@ -5082,6 +5190,23 @@ impl<'p> Vm<'p> {
             PROTO_IS_PROTO_OF => Value::bool(self.is_prototype_of(this, a0)),
             PROTO_VALUE_OF => this,
             PROTO_TO_STRING => self.alloc_str("[object Object]".to_string()),
+            ERROR_TO_STRING => {
+                // `name` (default "Error") + ": " + `message` (default ""), dropping
+                // the separator when either part is empty.
+                let nv = self.get_prop(this, "name")?;
+                let name =
+                    if nv == Value::UNDEFINED { "Error".to_string() } else { self.to_js_string(nv)? };
+                let mv = self.get_prop(this, "message")?;
+                let msg = if mv == Value::UNDEFINED { String::new() } else { self.to_js_string(mv)? };
+                let s = if name.is_empty() {
+                    msg
+                } else if msg.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {msg}")
+                };
+                self.alloc_str(s)
+            }
             FN_CALL => {
                 let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
                 self.call_value(this, a0, rest)?
@@ -6064,7 +6189,12 @@ impl<'p> Vm<'p> {
     /// (or None if there is no such global). Backs property access on globalThis.
     fn global_by_name(&self, name: &str) -> Option<Value> {
         let slot = self.program.global_names.iter().position(|n| n == name)?;
-        self.globals.get(slot).copied()
+        // A never-declared slot reads as "absent" for `globalThis.x` (→ undefined),
+        // not the internal sentinel.
+        match self.globals.get(slot).copied() {
+            Some(v) if v.is_uninitialized() => None,
+            other => other,
+        }
     }
 
     /// Look up `key` on a built-in prototype object (`arr_proto`/`str_proto`),
@@ -6956,6 +7086,10 @@ impl<'p> Vm<'p> {
                 // Generic `Object.prototype.toString` for a plain object; arrays /
                 // numbers / dates etc. have their own toString in the type dispatch.
                 if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+                    // An error instance inherits Error.prototype.toString ("name: message").
+                    if self.is_error_instance(idx) {
+                        return self.call_native(native::ERROR_TO_STRING, recv, args).map(Some);
+                    }
                     return Ok(Some(self.alloc_str("[object Object]".to_string())));
                 }
             }
@@ -7499,6 +7633,10 @@ impl<'p> Vm<'p> {
             C::TypeError => self.error_name(idx).as_deref() == Some("TypeError"),
             C::RangeError => self.error_name(idx).as_deref() == Some("RangeError"),
             C::SyntaxError => self.error_name(idx).as_deref() == Some("SyntaxError"),
+            C::ReferenceError => self.error_name(idx).as_deref() == Some("ReferenceError"),
+            C::EvalError => self.error_name(idx).as_deref() == Some("EvalError"),
+            C::UriError => self.error_name(idx).as_deref() == Some("URIError"),
+            C::AggregateError => self.error_name(idx).as_deref() == Some("AggregateError"),
         }
     }
 
@@ -7508,20 +7646,43 @@ impl<'p> Vm<'p> {
     /// message is the whole text. Mirrors the `{name, message}` shape the
     /// compiler emits for `new TypeError(…)`, so both catch paths are uniform.
     fn alloc_error_from_message(&mut self, raw: &str) -> Value {
-        let (name, message) = match raw.split_once(": ") {
-            Some((pre, rest))
-                if matches!(pre, "Error" | "TypeError" | "RangeError" | "SyntaxError") =>
-            {
-                (pre.to_string(), rest.to_string())
-            }
-            _ => ("Error".to_string(), raw.to_string()),
+        // Internal errors are formatted "Name: message"; recover the kind so the
+        // synthesised object links to the right prototype (and `e instanceof X`,
+        // `e.constructor` work). Anything unrecognised is a base `Error`.
+        let (kind, message) = match raw.split_once(": ") {
+            Some((pre, rest)) => match native::ERROR_NAMES.iter().position(|&n| n == pre) {
+                Some(i) => (i as u8, rest.to_string()),
+                None => (0, raw.to_string()),
+            },
+            None => (0, raw.to_string()),
         };
-        let name_v = self.alloc_str(name);
         let msg_v = self.alloc_str(message);
+        self.make_error(kind, Some(msg_v))
+    }
+
+    /// Allocate a proto-linked error instance of the given kind (0=Error … 7=
+    /// AggregateError). `name` is set own (so the structural `instanceof`/`error_name`
+    /// path keeps working); `message` is set own only when supplied and not
+    /// `undefined` (else inherited as "" from the prototype). The prototype link
+    /// gives `.constructor`, `.toString`, and value-`instanceof` resolution.
+    fn make_error(&mut self, kind: u8, msg: Option<Value>) -> Value {
+        let k = (kind as usize).min(7);
+        let name_v = self.alloc_str(native::ERROR_NAMES[k].to_string());
+        let msg_idx = match msg {
+            Some(m) if m != Value::UNDEFINED => Some(self.to_str_idx(m)),
+            _ => None,
+        };
         let mut map = ObjMap::new();
         map.set("name", name_v);
-        map.set("message", msg_v);
-        Value::heap(self.heap.alloc(HeapObj::Object(map)))
+        if let Some(mi) = msg_idx {
+            map.set("message", Value::heap(mi));
+        }
+        let obj = self.heap.alloc(HeapObj::Object(map));
+        let p = self.error_protos[k];
+        if p != 0 {
+            self.proto_of.insert(obj, Value::heap(p));
+        }
+        Value::heap(obj)
     }
 
     /// `new <class>(args)`: build a plain object, install the class's methods as
@@ -7531,6 +7692,13 @@ impl<'p> Vm<'p> {
     fn construct(&mut self, cv: Value, args: &[Value]) -> Result<Value, Thrown> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
+        }
+        // A built-in error constructor used as a VALUE (`var E = TypeError; new E()`,
+        // `Reflect.construct(RangeError, [msg])`). Mirrors the compile-lowered
+        // `new TypeError(msg)` path. AggregateError takes the message as arg[1].
+        if let Some(k) = self.error_ctors.iter().position(|&c| c == cv.heap_index()) {
+            let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
+            return Ok(self.make_error(k as u8, msg));
         }
         // Constructor FUNCTION (`new F()`, the pre-class OOP idiom): make an object
         // whose [[Prototype]] is `F.prototype` (so its methods + `constructor`
@@ -8011,8 +8179,64 @@ impl<'p> Vm<'p> {
         };
         let nv = map.get("name")?;
         let name = self.display(nv);
-        matches!(name.as_str(), "Error" | "TypeError" | "RangeError" | "SyntaxError")
-            .then_some(name)
+        native::ERROR_NAMES.contains(&name.as_str()).then_some(name)
+    }
+
+    /// Whether `idx`'s prototype chain reaches one of the error prototypes — i.e.
+    /// it's a real error instance (created via `new TypeError` or an internal
+    /// throw), as opposed to a plain object that merely has a `name` property.
+    fn is_error_instance(&self, idx: u32) -> bool {
+        if self.error_protos[0] == 0 {
+            return false;
+        }
+        let mut cur = idx;
+        for _ in 0..64 {
+            match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => {
+                    let pi = p.heap_index();
+                    if self.error_protos.contains(&pi) {
+                        return true;
+                    }
+                    cur = pi;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Read a DATA property from `idx` walking the `proto_of` chain (no getters,
+    /// no class methods) — used by the read-only `display`/ToString path for error
+    /// instances, where `name`/`message` may be inherited from the prototype.
+    fn read_data_prop(&self, idx: u32, key: &str) -> Option<Value> {
+        let mut cur = idx;
+        for _ in 0..64 {
+            if let HeapObj::Object(m) = self.heap.get(cur) {
+                if let Some(v) = m.get(key) {
+                    return Some(v);
+                }
+            }
+            match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => cur = p.heap_index(),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// `Error.prototype.toString` semantics for the read-only `display` path:
+    /// "name: message", dropping the separator when either part is empty.
+    fn error_display_string(&self, idx: u32) -> String {
+        let name =
+            self.read_data_prop(idx, "name").map(|v| self.display(v)).unwrap_or_else(|| "Error".into());
+        let msg = self.read_data_prop(idx, "message").map(|v| self.display(v)).unwrap_or_default();
+        if name.is_empty() {
+            msg
+        } else if msg.is_empty() {
+            name
+        } else {
+            format!("{name}: {msg}")
+        }
     }
 
     /// Methods on a number receiver: `toFixed`, `toString`. Returns `Ok(None)`
@@ -9603,7 +9827,14 @@ impl<'p> Vm<'p> {
                     .map(|e| if e.is_nullish() { String::new() } else { self.display(*e) })
                     .collect::<Vec<_>>()
                     .join(","),
-                HeapObj::Object(_) => "[object Object]".into(),
+                HeapObj::Object(_) => {
+                    // Error instances ToString to "name: message" (Error.prototype.toString).
+                    if self.is_error_instance(v.heap_index()) {
+                        self.error_display_string(v.heap_index())
+                    } else {
+                        "[object Object]".into()
+                    }
+                }
                 HeapObj::Class(c) => format!("class {} {{ }}", c.name),
                 HeapObj::Map { .. } => "[object Map]".into(),
                 HeapObj::Set(_) => "[object Set]".into(),

@@ -64,6 +64,12 @@ pub struct Value(u64);
 
 impl Value {
     pub const UNDEFINED: Value = Value(TAG_UNDEFINED);
+    /// A sentinel for a global slot that was reserved (the name is referenced)
+    /// but never declared/assigned — reading it throws ReferenceError (the JS
+    /// "x is not defined"). Shares the UNDEFINED tag with a payload bit, so if it
+    /// ever escapes a guard it degrades to undefined-ish rather than a wild NaN.
+    /// `is_undefined()`/`is_nullish()` use exact bit compares, so this is distinct.
+    pub const UNINITIALIZED: Value = Value(TAG_UNDEFINED | 1);
     pub const NULL: Value = Value(TAG_NULL);
     pub const TRUE: Value = Value(TAG_BOOL | 1);
     pub const FALSE: Value = Value(TAG_BOOL);
@@ -139,6 +145,12 @@ impl Value {
     #[inline(always)]
     pub fn is_undefined(self) -> bool {
         self.0 == TAG_UNDEFINED
+    }
+
+    /// The never-declared-global sentinel (see `UNINITIALIZED`).
+    #[inline(always)]
+    pub fn is_uninitialized(self) -> bool {
+        self.0 == Value::UNINITIALIZED.0
     }
 
     #[inline(always)]
