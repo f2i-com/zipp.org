@@ -4692,10 +4692,18 @@ impl<'p> Vm<'p> {
             ARR_FROM => self.array_from(a0, a1)?,
             ARR_OF => Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec()))),
             // `Array.prototype.{join,push}` as values: `this` is the receiver array.
-            ARR_JOIN | ARR_PUSH => {
-                let m = if id == ARR_JOIN { "join" } else { "push" };
+            // join is generic over array-likes (array_method materializes a
+            // non-array receiver); push mutates, so it still requires a real array.
+            ARR_JOIN => {
+                if this.is_heap() {
+                    self.array_method(this.heap_index(), "join", args)?.unwrap_or(Value::UNDEFINED)
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            ARR_PUSH => {
                 if this.is_heap() && matches!(self.heap.get(this.heap_index()), HeapObj::Array(_)) {
-                    self.array_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                    self.array_method(this.heap_index(), "push", args)?.unwrap_or(Value::UNDEFINED)
                 } else {
                     Value::UNDEFINED
                 }
@@ -7509,6 +7517,25 @@ impl<'p> Vm<'p> {
 
     fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        // Generic array methods accept an array-like `this`
+        // (`Array.prototype.map.call({length:2, 0:'a', 1:'b'}, cb)`, or on a string).
+        // For a non-array receiver, snapshot its `length` + indexed elements into a
+        // temp array and run the (read-only) method against that. Mutating methods
+        // still require a real array (they fall through to their HeapObj::Array arms).
+        if !matches!(self.heap.get(idx), HeapObj::Array(_))
+            && matches!(
+                name,
+                "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
+                    | "find" | "findIndex" | "findLast" | "findLastIndex" | "indexOf"
+                    | "lastIndexOf" | "includes" | "join" | "toString" | "slice" | "at"
+                    | "concat" | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
+                    | "toSpliced"
+            )
+        {
+            let elems = self.array_like_read(idx);
+            let tmp = self.heap.alloc(HeapObj::Array(elems));
+            return self.array_method(tmp, name, args);
+        }
         match name {
             "push" => {
                 let mut last = Value::UNDEFINED;
@@ -8204,6 +8231,27 @@ impl<'p> Vm<'p> {
 
     /// Clone an array's current elements out of the heap. Used before invoking
     /// callbacks so a heap reallocation during the call can't dangle a borrow.
+    /// Read an array-like receiver's elements (`this.length` coerced via ToLength,
+    /// then `this[0 .. length]`) into a Vec — backs the generic Array.prototype
+    /// methods invoked via `.call(arrayLike, …)` on a non-array (object or string).
+    fn array_like_read(&mut self, idx: u32) -> Vec<Value> {
+        let this = Value::heap(idx);
+        if let HeapObj::Array(items) = self.heap.get(idx) {
+            return items.clone();
+        }
+        let len = self
+            .get_prop(this, "length")
+            .ok()
+            .and_then(|v| self.to_number(v).ok())
+            .unwrap_or(0.0);
+        let len = if len.is_finite() && len > 0.0 { (len as usize).min(1 << 26) } else { 0 };
+        let mut out = Vec::with_capacity(len.min(4096));
+        for i in 0..len {
+            out.push(self.get_index(this, Value::int(i as i32)).unwrap_or(Value::UNDEFINED));
+        }
+        out
+    }
+
     fn array_snapshot(&self, idx: u32) -> Vec<Value> {
         match self.heap.get(idx) {
             HeapObj::Array(items) => items.clone(),
