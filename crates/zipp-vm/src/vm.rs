@@ -21,7 +21,7 @@
 
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
-    AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap, PropAttr, PromiseState, Reaction,
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap, PropAttr, PromiseState, Reaction,
 };
 use crate::value::Value;
 
@@ -635,13 +635,22 @@ impl<'p> Vm<'p> {
             }
         }
         let (func_id, closure) = self.resolve_callable(callee)?;
+        let (is_gen, is_async) = {
+            let p = &self.program.functions[func_id as usize];
+            (p.is_generator, p.is_async)
+        };
+        // An `async function*` builds a suspended AsyncGenerator (an async
+        // iterator); it doesn't run until `.next()`.
+        if is_gen && is_async {
+            return Ok(self.alloc_async_generator(func_id, closure, this, args));
+        }
         // Calling a generator function builds a suspended Generator, not a frame.
-        if self.program.functions[func_id as usize].is_generator {
+        if is_gen {
             return Ok(self.alloc_generator(func_id, closure, this, args));
         }
         // Calling an async function runs synchronously up to the first `await`,
         // then returns its result Promise.
-        if self.program.functions[func_id as usize].is_async {
+        if is_async {
             return Ok(self.alloc_async(func_id, closure, this, args));
         }
         if self.frames.len() >= MAX_FRAMES {
@@ -2098,6 +2107,18 @@ impl<'p> Vm<'p> {
                             }
                         }
                         let (fid, closure) = self.resolve_callable(callee_v)?;
+                        // An `async function*` returns an AsyncGenerator (checked
+                        // before the plain-generator/async cases since it is both).
+                        if self.program.functions[fid as usize].is_generator
+                            && self.program.functions[fid as usize].is_async
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let ag = self.alloc_async_generator(fid, closure, Value::UNDEFINED, &argv);
+                            self.set(base, dst, ag);
+                            ip += 1;
+                            continue;
+                        }
                         // A generator function returns a Generator object, unrun.
                         if self.program.functions[fid as usize].is_generator {
                             let argv: Vec<Value> =
@@ -2185,6 +2206,17 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let (fid, closure) = self.resolve_callable(prop)?;
+                        // An `async function*` method returns an AsyncGenerator.
+                        if self.program.functions[fid as usize].is_generator
+                            && self.program.functions[fid as usize].is_async
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let ag = self.alloc_async_generator(fid, closure, recv, &argv);
+                            self.set(base, dst, ag);
+                            ip += 1;
+                            continue;
+                        }
                         // A generator method returns a Generator object, unrun.
                         if self.program.functions[fid as usize].is_generator {
                             let argv: Vec<Value> =
@@ -2224,6 +2256,16 @@ impl<'p> Vm<'p> {
                         // and call it with `this = recv`.
                         let method = self.get_index(recv, k)?;
                         let (fid, closure) = self.resolve_callable(method)?;
+                        if self.program.functions[fid as usize].is_generator
+                            && self.program.functions[fid as usize].is_async
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let ag = self.alloc_async_generator(fid, closure, recv, &argv);
+                            self.set(base, dst, ag);
+                            ip += 1;
+                            continue;
+                        }
                         if self.program.functions[fid as usize].is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -3042,6 +3084,266 @@ impl<'p> Vm<'p> {
         Value::heap(result)
     }
 
+    /// Calling an `async function*` builds a suspended AsyncGenerator (an async
+    /// iterator). It does NOT run until the first `.next()`.
+    fn alloc_async_generator(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
+        let proto = &self.program.functions[func_id as usize];
+        let reg_count = (proto.reg_count as usize).max(1);
+        let param_count = proto.param_count as usize;
+        let rest_reg = proto.rest_reg;
+        let mut regs = vec![Value::UNDEFINED; reg_count];
+        regs[0] = this;
+        let n = args.len().min(param_count);
+        regs[1..1 + n].copy_from_slice(&args[..n]);
+        if let Some(rr) = rest_reg {
+            let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
+            regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        Value::heap(self.heap.alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
+            func: func_id,
+            closure,
+            state: GenState::Suspended(0),
+            regs,
+            handlers: Vec::new(),
+            queue: Vec::new(),
+        }))))
+    }
+
+    /// `.next()`/`.return()`/`.throw()` on an async generator. Each returns a
+    /// Promise that settles when the body next yields/returns/throws. The result
+    /// promise is queued; the driver services the queue FIFO.
+    fn async_generator_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Option<Value> {
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let p = self.alloc_promise();
+        match name {
+            "next" => {
+                if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                    g.queue.push(p);
+                }
+                // Only kick the driver if the generator is idle at a yield (or not
+                // started, or completed-to-drain). If it's awaiting a promise or
+                // already running, the in-flight resume services the queue when it
+                // next yields — resuming now would deliver the wrong value.
+                if self.async_gen_should_drive(idx) {
+                    self.drive_async_gen(idx, Resume::Value(arg0));
+                }
+            }
+            "return" => {
+                // Force completion: settle with { value: arg, done: true }. (v1
+                // does not resume `finally` blocks inside the body.)
+                if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                    g.state = GenState::Completed;
+                    g.regs.clear();
+                    g.handlers.clear();
+                }
+                let r = self.iter_result(arg0, true);
+                self.resolve(p, r);
+            }
+            "throw" => {
+                if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                    g.state = GenState::Completed;
+                    g.regs.clear();
+                    g.handlers.clear();
+                }
+                self.reject(p, arg0);
+            }
+            _ => return None,
+        }
+        Some(Value::heap(p))
+    }
+
+    /// Whether a fresh `.next()` should immediately drive the async generator: yes
+    /// if it's suspended at a `yield` (or hasn't started, or has completed — to
+    /// drain the queued promise as done); NO if it's awaiting a promise or already
+    /// running (the in-flight resume will service the queue at its next yield).
+    fn async_gen_should_drive(&self, idx: u32) -> bool {
+        match self.heap.get(idx) {
+            HeapObj::AsyncGenerator(g) => match g.state {
+                GenState::Completed => true,
+                GenState::Running => false,
+                GenState::Suspended(ip) => {
+                    ip == 0
+                        || matches!(
+                            self.program.functions[g.func as usize].code.get(ip),
+                            Some(Instr::Yield { .. })
+                        )
+                }
+            },
+            _ => false,
+        }
+    }
+
+    /// Resolve every still-queued `.next()` promise with `{ value: undefined,
+    /// done: true }` — called once the async generator has completed.
+    fn async_gen_drain_done(&mut self, idx: u32) {
+        loop {
+            let p = match self.heap.get_mut(idx) {
+                HeapObj::AsyncGenerator(g) if !g.queue.is_empty() => g.queue.remove(0),
+                _ => break,
+            };
+            let r = self.iter_result(Value::UNDEFINED, true);
+            self.resolve(p, r);
+        }
+    }
+
+    /// Advance an async generator: run its body until the next `yield` (resolve
+    /// the front queued promise with `{value, done:false}`), `await` (park +
+    /// subscribe, the promise stays pending), or return/throw (settle + drain).
+    /// `input` delivers the `.next()` argument or a settled awaited value/throw.
+    fn drive_async_gen(&mut self, idx: u32, input: Resume) {
+        let (state, fid, closure) = match self.heap.get(idx) {
+            HeapObj::AsyncGenerator(g) => (g.state, g.func, g.closure),
+            _ => return,
+        };
+        let resume_ip = match state {
+            GenState::Completed => return self.async_gen_drain_done(idx),
+            GenState::Running => return, // re-entrant; will resume when current settles
+            GenState::Suspended(ip) => ip,
+        };
+        // Nothing queued ⇒ idle until a `.next()` arrives.
+        if matches!(self.heap.get(idx), HeapObj::AsyncGenerator(g) if g.queue.is_empty()) {
+            return;
+        }
+        let (saved, saved_handlers) = match self.heap.get_mut(idx) {
+            HeapObj::AsyncGenerator(g) => {
+                g.state = GenState::Running;
+                (std::mem::take(&mut g.regs), std::mem::take(&mut g.handlers))
+            }
+            _ => return,
+        };
+        let reg_count = saved.len();
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                g.state = GenState::Completed;
+                g.regs.clear();
+            }
+            let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+            if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                if !g.queue.is_empty() {
+                    let p = g.queue.remove(0);
+                    self.reject(p, e);
+                }
+            }
+            self.async_gen_drain_done(idx);
+            return;
+        }
+        self.regs.extend_from_slice(&saved);
+        if new_base + reg_count > self.regs_hw {
+            self.regs_hw = new_base + reg_count;
+        }
+        let stop = self.frames.len();
+        self.frames.push(Frame {
+            func: fid,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
+            closure,
+            handlers: saved_handlers,
+        });
+        // Resume after the suspending op, delivering the sent/awaited value. The
+        // op at `resume_ip` is a Yield (resumed by `.next(v)`) or Await (resumed
+        // by a settled promise) — both write the value into the op's `dst`.
+        let outcome = if resume_ip == 0 {
+            self.run_loop(stop)
+        } else {
+            match input {
+                Resume::Value(v) => {
+                    let dst = match self.program.functions[fid as usize].code[resume_ip] {
+                        Instr::Yield { dst, .. } => Some(dst),
+                        Instr::Await { dst, .. } => Some(dst),
+                        _ => None,
+                    };
+                    if let Some(d) = dst {
+                        self.regs[new_base + d as usize] = v;
+                    }
+                    self.frames[stop].ip = resume_ip + 1;
+                    self.run_loop(stop)
+                }
+                Resume::Throw(e) => {
+                    self.pending_throw = Some(e);
+                    if self.unwind_to_handler(e, stop) {
+                        self.pending_throw = None;
+                        self.run_loop(stop)
+                    } else {
+                        Err(Thrown(String::new()))
+                    }
+                }
+            }
+        };
+        // Yielded a value → resolve the front queued promise with {value, done:false}.
+        if let Some((y, yield_ip)) = self.pending_yield.take() {
+            let back = self.regs.split_off(new_base);
+            let front = match self.heap.get_mut(idx) {
+                HeapObj::AsyncGenerator(g) => {
+                    g.state = GenState::Suspended(yield_ip);
+                    g.regs = back;
+                    (!g.queue.is_empty()).then(|| g.queue.remove(0))
+                }
+                _ => None,
+            };
+            if let Some(p) = front {
+                let r = self.iter_result(y, false);
+                self.resolve(p, r);
+            }
+            // More `.next()` calls already queued → service the next one now.
+            if matches!(self.heap.get(idx), HeapObj::AsyncGenerator(g) if !g.queue.is_empty()) {
+                self.drive_async_gen(idx, Resume::Value(Value::UNDEFINED));
+            }
+            return;
+        }
+        // Awaited → park and subscribe; the front promise stays pending.
+        if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
+            let back = self.regs.split_off(new_base);
+            if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                g.state = GenState::Suspended(await_ip);
+                g.regs = back;
+                g.handlers = handlers;
+            }
+            let p = self.to_promise(awaited);
+            self.settle_subscribe(p, idx);
+            return;
+        }
+        // Returned / fell off the end, or threw.
+        match outcome {
+            Ok(ret) => {
+                let front = match self.heap.get_mut(idx) {
+                    HeapObj::AsyncGenerator(g) => {
+                        g.state = GenState::Completed;
+                        g.regs.clear();
+                        g.handlers.clear();
+                        (!g.queue.is_empty()).then(|| g.queue.remove(0))
+                    }
+                    _ => None,
+                };
+                if let Some(p) = front {
+                    let r = self.iter_result(ret, true);
+                    self.resolve(p, r);
+                }
+                self.async_gen_drain_done(idx);
+            }
+            Err(t) => {
+                self.regs.truncate(new_base);
+                let reason = self.pending_throw.take().unwrap_or_else(|| {
+                    self.alloc_error_from_message(&t.0)
+                });
+                let front = match self.heap.get_mut(idx) {
+                    HeapObj::AsyncGenerator(g) => {
+                        g.state = GenState::Completed;
+                        g.regs.clear();
+                        g.handlers.clear();
+                        (!g.queue.is_empty()).then(|| g.queue.remove(0))
+                    }
+                    _ => None,
+                };
+                if let Some(p) = front {
+                    self.reject(p, reason);
+                }
+                self.async_gen_drain_done(idx);
+            }
+        }
+    }
+
     /// `Promise.resolve` as an internal helper: a Promise passes through (identity
     /// preserved); any other value is wrapped in a fulfilled promise. The basis of
     /// awaiting a non-promise (`await 5` still yields a microtask tick).
@@ -3412,9 +3714,14 @@ impl<'p> Vm<'p> {
                 }
             }
             // Resumes a suspended async activation with the settled value (or by
-            // throwing the rejection reason in at the await point).
+            // throwing the rejection reason in at the await point). An async
+            // generator routes to its own driver.
             Microtask::AsyncResume { activation, input } => {
-                self.drive_async(activation, input);
+                if matches!(self.heap.get(activation), HeapObj::AsyncGenerator(_)) {
+                    self.drive_async_gen(activation, input);
+                } else {
+                    self.drive_async(activation, input);
+                }
             }
         }
     }
@@ -5084,6 +5391,7 @@ impl<'p> Vm<'p> {
             HeapObj::Map { .. } => self.map_method(idx, name, args),
             HeapObj::Set(_) => self.set_method(idx, name, args),
             HeapObj::Generator { .. } => self.generator_method(idx, name, args),
+            HeapObj::AsyncGenerator(_) => Ok(self.async_generator_method(idx, name, args)),
             HeapObj::Promise { .. } => self.promise_method(idx, name, args),
             HeapObj::Date(_) => self.date_method(idx, name, args),
             _ => Ok(None),
@@ -7169,6 +7477,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Map { .. } => "[object Map]".into(),
                 HeapObj::Set(_) => "[object Set]".into(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
+                HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
                 HeapObj::BoundResolver { .. } => "function".into(),
                 // Internal: never user-visible (an async call yields its Promise).
@@ -7285,6 +7594,7 @@ impl<'p> Vm<'p> {
                 format!("Set({}) {{ {} }}", items.len(), parts.join(", "))
             }
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
+            HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
             HeapObj::Promise { state, result, .. } => match state {
                 crate::heap::PromiseState::Pending => "Promise { <pending> }".into(),
                 crate::heap::PromiseState::Fulfilled => {

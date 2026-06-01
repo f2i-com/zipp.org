@@ -239,6 +239,21 @@ pub struct AsyncStateData {
     pub handlers: Vec<Handler>,
 }
 
+/// Payload of [`HeapObj::AsyncGenerator`] (an `async function*` activation). Like
+/// a generator (suspend/resume on `yield`) AND an async activation (suspend on
+/// `await`), so it carries the saved window + handlers like both. `queue` holds
+/// the result promises of `.next()`/`.return()`/`.throw()` calls awaiting the
+/// next yield/return (FIFO) — each `.next()` returns a Promise.
+#[derive(Clone, Debug)]
+pub struct AsyncGenState {
+    pub func: u32,
+    pub closure: u32,
+    pub state: GenState,
+    pub regs: Vec<Value>,
+    pub handlers: Vec<Handler>,
+    pub queue: Vec<u32>,
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -304,6 +319,9 @@ pub enum HeapObj {
     /// `state` carries the resume ip / completion. v1 does not preserve `try`
     /// handlers across a yield.
     Generator { func: u32, closure: u32, state: GenState, regs: Vec<Value> },
+    /// An `async function*` activation — see [`AsyncGenState`]. Its `.next()`
+    /// returns a Promise; the body may both `yield` and `await`.
+    AsyncGenerator(Box<AsyncGenState>),
     /// A suspended `async function` activation — like Generator (detached window
     /// resumed at each `await`) but it also owns its `result` Promise's heap index
     /// and PRESERVES `try` handlers across an await (so `try { await p } catch`

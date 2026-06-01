@@ -389,9 +389,6 @@ impl Compiler {
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
-        if is_generator && is_async {
-            return Err("async generators (async function*) are not in the zipp-vm subset yet".into());
-        }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.is_script = is_script;
         fc.in_generator = is_generator;
