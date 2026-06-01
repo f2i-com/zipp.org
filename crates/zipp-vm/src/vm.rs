@@ -1319,6 +1319,7 @@ impl<'p> Vm<'p> {
                             static_getters,
                             static_setters,
                             parent: parent_idx,
+                            computed_field_keys: Vec::new(),
                         }))));
                         // Remember it so `super` in a derived class can reach it.
                         self.class_values[class_id as usize] = Some(v);
@@ -1357,6 +1358,33 @@ impl<'p> Vm<'p> {
                         }
                         let result = self.construct(cv, &args)?;
                         self.set(base, dst, result);
+                        ip += 1;
+                    }
+                    Instr::PushFieldKey { class, key } => {
+                        let cv = self.get(base, class);
+                        let kv = self.get(base, key);
+                        if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
+                            c.computed_field_keys.push(kv);
+                        }
+                        ip += 1;
+                    }
+                    Instr::FieldInit { key_index, val } => {
+                        let this = self.get(base, 0);
+                        let v = self.get(base, val);
+                        // The computed key was evaluated once at class definition and
+                        // stored on this instance's class.
+                        let key = match self.heap.get(this.heap_index()) {
+                            HeapObj::Object(m) => m.class.and_then(|cidx| {
+                                match self.heap.get(cidx) {
+                                    HeapObj::Class(c) => c.computed_field_keys.get(key_index as usize).copied(),
+                                    _ => None,
+                                }
+                            }),
+                            _ => None,
+                        };
+                        if let Some(key) = key {
+                            self.set_index(this, key, v)?;
+                        }
                         ip += 1;
                     }
                     Instr::SuperCtor { home_class_id, arg_base, argc } => {

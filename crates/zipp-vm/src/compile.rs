@@ -459,6 +459,7 @@ impl Compiler {
         rest: Option<&str>,
         params_ast: Option<&ox::FormalParameters>,
         fields: &[(String, Option<&ox::Expression>)],
+        computed_inits: &[Option<&ox::Expression>],
         body: &[ox::Statement],
         super_class: Option<u32>,
         is_generator: bool,
@@ -497,6 +498,21 @@ impl Compiler {
             };
             let name_idx = fc.string_name(fname);
             fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v });
+            fc.next_reg = save;
+        }
+        // Computed instance fields (`[k] = v`): the key was evaluated at class
+        // definition and stored on the class; init the i-th here as `this[key]=v`.
+        for (i, finit) in computed_inits.iter().enumerate() {
+            let save = fc.next_reg;
+            let v = match finit {
+                Some(e) => fc.expr(e)?,
+                None => {
+                    let t = fc.temp();
+                    fc.emit(Instr::LoadUndefined { dst: t });
+                    t
+                }
+            };
+            fc.emit(Instr::FieldInit { key_index: i as u16, val: v });
             fc.next_reg = save;
         }
         for s in body {
@@ -1413,7 +1429,7 @@ impl<'a> FnCompiler<'a> {
     /// `cls`: evaluate `extends`, `MakeClass`, then install static fields and
     /// computed-key members. Shared by class declarations and class expressions.
     fn build_class_into(&mut self, class: &ox::Class, cls: Reg, name: Option<&str>) -> R<()> {
-        let (class_id, static_fields, computed) = self.compile_class(class, name)?;
+        let (class_id, static_fields, computed, computed_fields) = self.compile_class(class, name)?;
         // Evaluate the superclass value (`extends P`) into a temp the VM links in.
         let parent_reg = if let Some(sc) = &class.super_class {
             let t = self.temp();
@@ -1452,6 +1468,27 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::ClassAddMember { class: cls, key: kr, func: *func, kind: *kind });
             self.next_reg = save;
         }
+        // Computed-key fields: evaluate each KEY now (once, in source order). A
+        // static field also assigns its value on the class here; an instance
+        // field's key is parked on the class for the ctor's per-instance FieldInit.
+        for (key, init, is_static) in &computed_fields {
+            let save = self.next_reg;
+            let kr = self.expr(key)?;
+            if *is_static {
+                let vr = match init {
+                    Some(e) => self.expr(e)?,
+                    None => {
+                        let t = self.temp();
+                        self.emit(Instr::LoadUndefined { dst: t });
+                        t
+                    }
+                };
+                self.emit(Instr::SetIndex { obj: cls, key: kr, val: vr });
+            } else {
+                self.emit(Instr::PushFieldKey { class: cls, key: kr });
+            }
+            self.next_reg = save;
+        }
         Ok(())
     }
 
@@ -1477,6 +1514,7 @@ impl<'a> FnCompiler<'a> {
         u32,
         Vec<(String, Option<&'b ox::Expression<'b>>)>,
         Vec<(&'b ox::Expression<'b>, u32, u8)>,
+        Vec<(&'b ox::Expression<'b>, Option<&'b ox::Expression<'b>>, bool)>,
     )> {
         // A named class expression keeps its own name; an anonymous one inherits
         // the binding it's assigned to (NamedEvaluation), else the "<class>" stub.
@@ -1518,6 +1556,18 @@ impl<'a> FnCompiler<'a> {
         let mut static_setters: Vec<(String, &ox::Function)> = Vec::new();
         let mut fields: Vec<(String, Option<&ox::Expression>)> = Vec::new();
         let mut static_fields: Vec<(String, Option<&'b ox::Expression<'b>>)> = Vec::new();
+        // Computed-key fields (`[expr] = v` / `static [expr] = v`). Their KEYS are
+        // evaluated once at class definition (in source order, see class_decl);
+        // `computed_fields_ordered` drives that. Instance ones also need their init
+        // run per-instance in the ctor — `instance_computed_inits` (index i ↔ the
+        // i-th instance computed key) feeds the ctor's `FieldInit` ops.
+        #[allow(clippy::type_complexity)]
+        let mut computed_fields_ordered: Vec<(
+            &'b ox::Expression<'b>,
+            Option<&'b ox::Expression<'b>>,
+            bool,
+        )> = Vec::new();
+        let mut instance_computed_inits: Vec<Option<&'b ox::Expression<'b>>> = Vec::new();
         // Members with a runtime-computed key (`[expr]() {}`) — the key is
         // evaluated and the member installed at class-creation time (see
         // class_decl). kind: 0=method 1=getter 2=setter 3=static method.
@@ -1560,15 +1610,19 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
                 ox::ClassElement::PropertyDefinition(p) => {
-                    // Computed FIELD names (`[k] = v`) aren't supported yet (would
-                    // need per-instance ctor init); static/instance string-keyed
-                    // fields work.
-                    let name = class_key_name(&p.key)
-                        .map_err(|_| "computed class field names are not in the zipp-vm subset yet")?;
-                    if p.r#static {
-                        static_fields.push((name, p.value.as_ref()));
-                    } else {
-                        fields.push((name, p.value.as_ref()));
+                    match class_key_name(&p.key) {
+                        // Static string key.
+                        Ok(name) if p.r#static => static_fields.push((name, p.value.as_ref())),
+                        // Instance string key.
+                        Ok(name) => fields.push((name, p.value.as_ref())),
+                        // Computed key `[expr] = v` — evaluated once at class def.
+                        Err(e) => {
+                            let key = p.key.as_expression().ok_or(e)?;
+                            computed_fields_ordered.push((key, p.value.as_ref(), p.r#static));
+                            if !p.r#static {
+                                instance_computed_inits.push(p.value.as_ref());
+                            }
+                        }
                     }
                 }
                 ox::ClassElement::StaticBlock(_) => {
@@ -1586,6 +1640,7 @@ impl<'a> FnCompiler<'a> {
                 &params,
                 rest.as_deref(),
                 Some(&*func.params),
+                &[],
                 &[],
                 body,
                 super_class_id,
@@ -1606,6 +1661,7 @@ impl<'a> FnCompiler<'a> {
                 rest.as_deref(),
                 Some(&*func.params),
                 &[],
+                &[],
                 body,
                 super_class_id,
                 false, // getters are never generators
@@ -1624,6 +1680,7 @@ impl<'a> FnCompiler<'a> {
                 &params,
                 rest.as_deref(),
                 Some(&*func.params),
+                &[],
                 &[],
                 body,
                 super_class_id,
@@ -1644,6 +1701,7 @@ impl<'a> FnCompiler<'a> {
                 rest.as_deref(),
                 Some(&*func.params),
                 &[],
+                &[],
                 body,
                 None, // statics: `super` would refer to the parent class, not handled
                 func.generator,
@@ -1663,6 +1721,7 @@ impl<'a> FnCompiler<'a> {
                 rest.as_deref(),
                 Some(&*func.params),
                 &[],
+                &[],
                 body,
                 None, // statics: no `super`
                 false,
@@ -1681,6 +1740,7 @@ impl<'a> FnCompiler<'a> {
                 rest.as_deref(),
                 Some(&*func.params),
                 &[],
+                &[],
                 body,
                 None, // statics: no `super`
                 false,
@@ -1695,7 +1755,7 @@ impl<'a> FnCompiler<'a> {
         // fields-only proto (the `new` path runs the parent ctor first). Neither:
         // None.
         let has_explicit_ctor = ctor_fn.is_some();
-        let ctor = if has_explicit_ctor || !fields.is_empty() {
+        let ctor = if has_explicit_ctor || !fields.is_empty() || !instance_computed_inits.is_empty() {
             let (params, rest, body) = match ctor_fn {
                 Some(f) => function_parts(f)?,
                 None => (Vec::new(), None, &[][..]),
@@ -1707,6 +1767,7 @@ impl<'a> FnCompiler<'a> {
                 rest.as_deref(),
                 params_ast,
                 &fields,
+                &instance_computed_inits,
                 body,
                 super_class_id,
                 false, // a constructor is never a generator
@@ -1730,6 +1791,7 @@ impl<'a> FnCompiler<'a> {
                 rest.as_deref(),
                 Some(&*func.params),
                 &[],
+                &[],
                 body,
                 if *kind == 3 { None } else { super_class_id }, // statics get no super
                 func.generator,
@@ -1750,7 +1812,7 @@ impl<'a> FnCompiler<'a> {
             static_getters: static_getter_defs,
             static_setters: static_setter_defs,
         };
-        Ok((class_id, static_fields, computed_defs))
+        Ok((class_id, static_fields, computed_defs, computed_fields_ordered))
     }
 
     /// The enclosing-function chain to hand a function nested in THIS one: our

@@ -220,6 +220,10 @@ pub struct ClassData {
     /// Heap index of the superclass value (`class C extends P`), for
     /// inherited method/getter lookup and `instanceof` up the chain.
     pub parent: Option<u32>,
+    /// Computed instance-field keys (`[expr] = v`), evaluated ONCE at class
+    /// definition (in source order) and read per-instance by the `FieldInit` op
+    /// during construction. Empty for classes with no computed instance fields.
+    pub computed_field_keys: Vec<Value>,
 }
 
 /// Boxed payload of a [`HeapObj::AsyncState`] (see that variant's docs). Boxed for

@@ -151,6 +151,14 @@ pub enum Instr {
     /// `dst = new callee(args…)` — construct an instance. `callee` must be a
     /// class value; builds an object, installs the methods, runs the ctor.
     New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
+    /// Append a computed instance-field KEY (already evaluated into `key`) to the
+    /// class value `class`'s `computed_field_keys`, at class-definition time and
+    /// in source order. Read later by `FieldInit`.
+    PushFieldKey { class: Reg, key: Reg },
+    /// `this[key] = val` for the `key_index`-th computed instance field, run in a
+    /// constructor: looks up the key from the instance's class `computed_field_keys`
+    /// (eval-once at class definition) and assigns. `this` is reg 0.
+    FieldInit { key_index: u16, val: Reg },
     /// `dst = Array(args…)` / `new Array(args…)`: a single numeric arg makes an
     /// array of that length (holes → undefined); otherwise an array of the args.
     ArrayCtor { dst: Reg, arg_base: Reg, argc: u16 },
