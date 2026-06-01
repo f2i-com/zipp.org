@@ -191,6 +191,10 @@ mod native {
     pub const STR_FROM_CHAR_CODE: u16 = 311;
     pub const STR_FROM_CODE_POINT: u16 = 312;
     pub const STR_RAW: u16 = 313;
+    // Date static methods as first-class values (the call form uses Now/DateParse/DateUTC).
+    pub const DATE_NOW: u16 = 314;
+    pub const DATE_PARSE: u16 = 315;
+    pub const DATE_UTC: u16 = 316;
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -372,6 +376,9 @@ mod native {
             STR_FROM_CHAR_CODE => ("fromCharCode", 1),
             STR_FROM_CODE_POINT => ("fromCodePoint", 1),
             STR_RAW => ("raw", 1),
+            DATE_NOW => ("now", 0),
+            DATE_PARSE => ("parse", 1),
+            DATE_UTC => ("UTC", 7),
             _ => return None,
         })
     }
@@ -4738,7 +4745,11 @@ impl<'p> Vm<'p> {
         let set_ctor = build(self, &[], Some(set_proto));
         let map_ctor = build(self, &[("groupBy", MAP_GROUP_BY)], Some(map_proto));
         let boolean_ctor = build(self, &[], Some(bool_proto));
-        let date_ctor = build(self, &[], Some(date_proto));
+        let date_ctor = build(
+            self,
+            &[("now", DATE_NOW), ("parse", DATE_PARSE), ("UTC", DATE_UTC)],
+            Some(date_proto),
+        );
         // Promise global: static combinators + Promise.prototype. `new Promise`
         // is compile-lowered to NewPromise.
         let promise_ctor = build(
@@ -5442,6 +5453,15 @@ impl<'p> Vm<'p> {
                 }
                 self.alloc_str(s)
             }
+            // Date static methods as values.
+            DATE_NOW => Value::num(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(0.0),
+            ),
+            DATE_PARSE => Value::num(parse_date(&self.display(a0))),
+            DATE_UTC => Value::num(self.date_utc_ms(args)?),
             STR_RAW => {
                 // String.raw(template, ...subs): interleave template.raw[i] with subs[i].
                 let raw = self.get_prop(a0, "raw")?;
