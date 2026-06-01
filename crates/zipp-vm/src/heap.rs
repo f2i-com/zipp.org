@@ -213,6 +213,10 @@ pub struct ClassData {
     /// Static members — own properties of the class value (`C.method`,
     /// `C.field`). Methods start here; static fields are added by SetProp.
     pub statics: ObjMap,
+    /// `static get`/`set` accessors, invoked with `this` = the class value on
+    /// read/write of a static property.
+    pub static_getters: Vec<(String, Value)>,
+    pub static_setters: Vec<(String, Value)>,
     /// Heap index of the superclass value (`class C extends P`), for
     /// inherited method/getter lookup and `instanceof` up the chain.
     pub parent: Option<u32>,

@@ -1285,6 +1285,8 @@ impl<'p> Vm<'p> {
                         let methods = mk(&mut self.heap, &cd.methods);
                         let getters = mk(&mut self.heap, &cd.getters);
                         let setters = mk(&mut self.heap, &cd.setters);
+                        let static_getters = mk(&mut self.heap, &cd.static_getters);
+                        let static_setters = mk(&mut self.heap, &cd.static_setters);
                         let mut statics = ObjMap::new();
                         for (n, fid) in &cd.statics {
                             let fv = Value::heap(self.heap.alloc(HeapObj::Func(*fid)));
@@ -1298,6 +1300,8 @@ impl<'p> Vm<'p> {
                             getters,
                             setters,
                             statics,
+                            static_getters,
+                            static_setters,
                             parent: parent_idx,
                         }))));
                         // Remember it so `super` in a derived class can reach it.
@@ -4269,9 +4273,14 @@ impl<'p> Vm<'p> {
             }
             // Static members are own properties of the class value; statics are
             // inherited, so walk the `extends` chain (`C.method`, `Sub.parentStatic`).
+            // A `static get name()` is invoked with `this` = the class value.
             HeapObj::Class(c) => {
                 if let Some(v) = c.statics.get(key) {
                     return Ok(v);
+                }
+                if let Some((_, g)) = c.static_getters.iter().find(|(k, _)| k == key) {
+                    let g = *g;
+                    return self.call_value(g, obj, &[]);
                 }
                 let mut cur = c.parent;
                 while let Some(pidx) = cur {
@@ -4279,6 +4288,10 @@ impl<'p> Vm<'p> {
                         HeapObj::Class(pc) => {
                             if let Some(v) = pc.statics.get(key) {
                                 return Ok(v);
+                            }
+                            if let Some((_, g)) = pc.static_getters.iter().find(|(k, _)| k == key) {
+                                let g = *g;
+                                return self.call_value(g, obj, &[]);
                             }
                             cur = pc.parent;
                         }
@@ -4669,6 +4682,18 @@ impl<'p> Vm<'p> {
             }
             return Ok(());
         }
+        // A `static set name(v)` (or getter-only accessor) on the class chain
+        // intercepts the write before it becomes a static data property.
+        if matches!(self.heap.get(idx), HeapObj::Class(_)) {
+            match self.lookup_static_accessor(Some(idx), key) {
+                Some(Some(setter)) => {
+                    self.call_value(setter, obj, &[val])?;
+                    return Ok(());
+                }
+                Some(None) => return Ok(()), // getter-only ⇒ sloppy no-op
+                None => {}                    // fall through to a data write
+            }
+        }
         let mut added = false;
         match self.heap.get_mut(idx) {
             HeapObj::Object(map) => added = map.set(key, val),
@@ -4692,6 +4717,33 @@ impl<'p> Vm<'p> {
                 HeapObj::Class(c) => {
                     if let Some((_, v)) = c.setters.iter().find(|(k, _)| k == key) {
                         return Some(*v);
+                    }
+                    cur = c.parent;
+                }
+                _ => break,
+            }
+        }
+        None
+    }
+
+    /// Resolve a static-property write against the class chain starting at heap
+    /// index `start`. The first chain level that owns the key decides:
+    ///   `Some(Some(setter))` → invoke `setter`;
+    ///   `Some(None)`         → a getter-only accessor shadows the write (no-op);
+    ///   `None`               → no accessor shadows it → write a static data prop.
+    fn lookup_static_accessor(&self, start: Option<u32>, key: &str) -> Option<Option<Value>> {
+        let mut cur = start;
+        while let Some(cidx) = cur {
+            match self.heap.get(cidx) {
+                HeapObj::Class(c) => {
+                    if let Some((_, s)) = c.static_setters.iter().find(|(k, _)| k == key) {
+                        return Some(Some(*s));
+                    }
+                    if c.static_getters.iter().any(|(k, _)| k == key) {
+                        return Some(None); // accessor with no setter ⇒ sloppy no-op
+                    }
+                    if c.statics.get(key).is_some() {
+                        return None; // own data property shadows inherited accessors
                     }
                     cur = c.parent;
                 }
@@ -5068,7 +5120,27 @@ impl<'p> Vm<'p> {
                 None => self.display(key) == "length",
             },
             HeapObj::Map { .. } | HeapObj::Set(_) => self.display(key) == "size",
-            HeapObj::Class(c) => c.statics.get(&self.display(key)).is_some(),
+            // Static members (data + `static get`/`set` accessors) are own
+            // properties of the class value and are inherited up the chain.
+            HeapObj::Class(_) => {
+                let k = self.display(key);
+                let mut cur = Some(idx);
+                while let Some(cidx) = cur {
+                    match self.heap.get(cidx) {
+                        HeapObj::Class(c) => {
+                            if c.statics.get(&k).is_some()
+                                || c.static_getters.iter().any(|(n, _)| *n == k)
+                                || c.static_setters.iter().any(|(n, _)| *n == k)
+                            {
+                                return true;
+                            }
+                            cur = c.parent;
+                        }
+                        _ => break,
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }

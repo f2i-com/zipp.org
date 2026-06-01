@@ -580,4 +580,8 @@ pub struct ClassDef {
     pub setters: Vec<(String, u32)>,
     /// `static name()` methods: own properties of the class value itself.
     pub statics: Vec<(String, u32)>,
+    /// `static get name()` / `static set name(v)` accessors: invoked with
+    /// `this` = the class value on read/write of `C.name`.
+    pub static_getters: Vec<(String, u32)>,
+    pub static_setters: Vec<(String, u32)>,
 }

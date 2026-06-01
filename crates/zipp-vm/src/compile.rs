@@ -1457,6 +1457,8 @@ impl<'a> FnCompiler<'a> {
             getters: Vec::new(),
             setters: Vec::new(),
             statics: Vec::new(),
+            static_getters: Vec::new(),
+            static_setters: Vec::new(),
         });
         self.cx.class_names.push((cname.clone(), class_id));
         let mut ctor_fn: Option<&ox::Function> = None;
@@ -1464,6 +1466,8 @@ impl<'a> FnCompiler<'a> {
         let mut getters: Vec<(String, &ox::Function)> = Vec::new();
         let mut setters: Vec<(String, &ox::Function)> = Vec::new();
         let mut statics: Vec<(String, &ox::Function)> = Vec::new();
+        let mut static_getters: Vec<(String, &ox::Function)> = Vec::new();
+        let mut static_setters: Vec<(String, &ox::Function)> = Vec::new();
         let mut fields: Vec<(String, Option<&ox::Expression>)> = Vec::new();
         let mut static_fields: Vec<(String, Option<&'b ox::Expression<'b>>)> = Vec::new();
         // Members with a runtime-computed key (`[expr]() {}`) — the key is
@@ -1489,9 +1493,9 @@ impl<'a> FnCompiler<'a> {
                     match class_key_name(&m.key) {
                         Ok(name) => match (m.r#static, m.kind) {
                             (true, ox::MethodDefinitionKind::Method) => statics.push((name, &m.value)),
-                            (true, _) => {
-                                return Err("static getters/setters are not in the zipp-vm subset yet".into())
-                            }
+                            (true, ox::MethodDefinitionKind::Get) => static_getters.push((name, &m.value)),
+                            (true, ox::MethodDefinitionKind::Set) => static_setters.push((name, &m.value)),
+                            (true, ox::MethodDefinitionKind::Constructor) => unreachable!(),
                             (false, ox::MethodDefinitionKind::Method) => methods.push((name, &m.value)),
                             (false, ox::MethodDefinitionKind::Get) => getters.push((name, &m.value)),
                             (false, ox::MethodDefinitionKind::Set) => setters.push((name, &m.value)),
@@ -1601,6 +1605,43 @@ impl<'a> FnCompiler<'a> {
             self.cx.functions.push(proto);
             static_defs.push((sname.clone(), fid));
         }
+        // Static accessor protos (this = the class value on `C.name` read/write).
+        let mut static_getter_defs: Vec<(String, u32)> = Vec::new();
+        for (gname, func) in &static_getters {
+            let (params, rest, body) = function_parts(func)?;
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.static get {gname}"),
+                &params,
+                rest.as_deref(),
+                Some(&*func.params),
+                &[],
+                body,
+                None, // statics: no `super`
+                false,
+                false,
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            static_getter_defs.push((gname.clone(), fid));
+        }
+        let mut static_setter_defs: Vec<(String, u32)> = Vec::new();
+        for (sname, func) in &static_setters {
+            let (params, rest, body) = function_parts(func)?;
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.static set {sname}"),
+                &params,
+                rest.as_deref(),
+                Some(&*func.params),
+                &[],
+                body,
+                None, // statics: no `super`
+                false,
+                false,
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            static_setter_defs.push((sname.clone(), fid));
+        }
         // Constructor proto. With an explicit ctor: field inits prepended + the
         // user body (which calls `super` itself). Without one but with fields: a
         // fields-only proto (the `new` path runs the parent ctor first). Neither:
@@ -1658,6 +1699,8 @@ impl<'a> FnCompiler<'a> {
             getters: getter_defs,
             setters: setter_defs,
             statics: static_defs,
+            static_getters: static_getter_defs,
+            static_setters: static_setter_defs,
         };
         Ok((class_id, static_fields, computed_defs))
     }
