@@ -5074,6 +5074,20 @@ impl<'p> Vm<'p> {
                     self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
                 } else if kind == 5 {
                     self.boolean_method(this, m)
+                } else if kind == 1 {
+                    // String methods are generic: RequireObjectCoercible(this) then
+                    // ToString(this), so `String.prototype.slice.call(123, …)` works.
+                    let s_idx = if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                        this.heap_index()
+                    } else if this == Value::UNDEFINED || this == Value::NULL {
+                        return Err(Thrown(format!(
+                            "TypeError: String.prototype.{m} called on null or undefined"
+                        )));
+                    } else {
+                        let s = self.to_js_string(this)?;
+                        self.alloc_str(s).heap_index()
+                    };
+                    self.string_method(s_idx, m, args)?.unwrap_or(Value::UNDEFINED)
                 } else if !this.is_heap() {
                     return Err(Thrown(format!(
                         "TypeError: prototype method {m} called on {}",
@@ -8290,6 +8304,26 @@ impl<'p> Vm<'p> {
     /// primitive string (`Str`/`Cons`). Used by Reflect, which throws on non-objects.
     fn is_object_value(&self, v: Value) -> bool {
         v.is_heap() && !self.heap.is_str_like(v.heap_index())
+    }
+
+    /// `ToString(v)` as a Rust String, honouring a user `toString`/`valueOf` on an
+    /// object (ToPrimitive with the string hint). Primitives and engine strings use
+    /// `display`; a plain object with only the built-in (native) toString also falls
+    /// back to `display` (which already yields "[object Object]" / the array join).
+    fn to_js_string(&mut self, v: Value) -> Result<String, Thrown> {
+        if !v.is_heap() || self.heap.is_str_like(v.heap_index()) {
+            return Ok(self.display(v));
+        }
+        for name in ["toString", "valueOf"] {
+            let f = self.get_prop(v, name)?;
+            if f.is_heap() && self.heap.as_callable(f.heap_index()).is_some() {
+                let r = self.call_value(f, v, &[])?;
+                if !r.is_heap() || self.heap.is_str_like(r.heap_index()) {
+                    return Ok(self.display(r));
+                }
+            }
+        }
+        Ok(self.display(v))
     }
 
     /// Whether `v` has a `[[Construct]]` slot — i.e. `new v` / `Reflect.construct`
