@@ -6730,6 +6730,48 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
         }
         let idx = obj.heap_index();
+        // Array: a numeric-index data descriptor sets the element; `length` resizes.
+        // (Index accessors / extra named props aren't modeled — accepted as a no-op
+        // so the definition doesn't abort the program, matching common test setup.)
+        if let HeapObj::Array(_) = self.heap.get(idx) {
+            let (value, get, set, ..) = self.read_descriptor(desc)?;
+            if let Ok(i) = key.parse::<usize>() {
+                if get.is_none() && set.is_none() {
+                    let v = value.unwrap_or(Value::UNDEFINED);
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        if i >= items.len() {
+                            items.resize(i + 1, Value::UNDEFINED);
+                        }
+                        items[i] = v;
+                    }
+                    self.heap.bump_version(idx);
+                }
+                return Ok(());
+            }
+            if key == "length" {
+                if let Some(v) = value {
+                    let n = self.to_number(v)?;
+                    if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
+                        return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        items.resize(n as usize, Value::UNDEFINED);
+                    }
+                    self.heap.bump_version(idx);
+                }
+            }
+            return Ok(());
+        }
+        // TypedArray: a numeric-index data descriptor writes the element.
+        if let HeapObj::TypedArray { .. } = self.heap.get(idx) {
+            let (value, get, set, ..) = self.read_descriptor(desc)?;
+            if get.is_none() && set.is_none() {
+                if let Ok(i) = key.parse::<usize>() {
+                    self.ta_element_set(idx, i, value.unwrap_or(Value::UNDEFINED))?;
+                }
+            }
+            return Ok(());
+        }
         // 0 = plain object, 1 = class (own props live in `statics`), 2 = callable
         // (own props live in `fn_props`).
         let target = match self.heap.get(idx) {
