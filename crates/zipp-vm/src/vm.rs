@@ -183,6 +183,11 @@ pub struct Vm<'p> {
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.
     fn_props: std::collections::HashMap<u32, ObjMap>,
+    /// Callables expose `name`/`length` as synthesized own properties (computed
+    /// from the proto, not stored). They're `configurable: true`, so `delete
+    /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |
+    /// 1=length)`. Empty in normal programs; only `delete` on these keys fills it.
+    deleted_callable_intrinsics: std::collections::HashSet<(u32, u8)>,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods
@@ -262,6 +267,7 @@ impl<'p> Vm<'p> {
             prototypes: std::collections::HashMap::new(),
             proto_of: std::collections::HashMap::new(),
             fn_props: std::collections::HashMap::new(),
+            deleted_callable_intrinsics: std::collections::HashSet::new(),
             obj_proto: 0,
             fn_proto: 0,
             arr_proto: 0,
@@ -3384,10 +3390,19 @@ impl<'p> Vm<'p> {
                 self.display(obj)
             )));
         }
-        // Object index access is property access: delegate to `get_prop` so a
-        // computed key reaches inherited methods/getters (e.g. a class instance's
-        // `obj[Symbol.iterator]`), not just own data properties.
-        if matches!(self.heap.get(obj.heap_index()), HeapObj::Object(_)) {
+        // Object / callable / class index access is property access: delegate to
+        // `get_prop` so a computed key reaches inherited methods/getters (e.g. a
+        // class instance's `obj[Symbol.iterator]`), a callable's `fn["name"]`, and
+        // static members (`C["m"]`) — not just own data properties.
+        if matches!(
+            self.heap.get(obj.heap_index()),
+            HeapObj::Object(_)
+                | HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Class(_)
+                | HeapObj::Bound { .. }
+                | HeapObj::Native(_)
+        ) {
             let k = self.display(key);
             return self.get_prop(obj, &k);
         }
@@ -3472,6 +3487,20 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
         let idx = obj.heap_index();
+        // Callable / class computed assignment (`fn["x"] = v`, `C["s"] = v`) is
+        // property assignment: route through `set_prop` (honours non-writable
+        // `name`/`length`, static setters, function own props).
+        if matches!(
+            self.heap.get(idx),
+            HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Class(_)
+                | HeapObj::Bound { .. }
+                | HeapObj::Native(_)
+        ) {
+            let k = self.display(key);
+            return self.set_prop(obj, &k, val);
+        }
         match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 // Numeric key (incl. an integral double — the JIT region produces
@@ -3919,6 +3948,12 @@ impl<'p> Vm<'p> {
             return Value::UNDEFINED;
         }
         let idx = obj.heap_index();
+        // A callable's `name`/`length`: non-writable, non-enumerable, configurable.
+        if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
+            if let Some(v) = self.callable_intrinsic_value(obj, key) {
+                return self.make_data_descriptor(v, false, false, true);
+            }
+        }
         let own = match self.heap.get(idx) {
             HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
             HeapObj::Array(items) => {
@@ -3934,6 +3969,43 @@ impl<'p> Vm<'p> {
                     _ => return Value::UNDEFINED,
                 }
             }
+            // Class static members: data props, plus `static get`/`set` rendered
+            // as an accessor descriptor (raw = getter, attr.setter = setter).
+            HeapObj::Class(c) => {
+                if let Some(i) = c.statics.pos(key) {
+                    Some((c.statics.attrs[i], c.statics.vals[i]))
+                } else if let Some((_, g)) = c.static_getters.iter().find(|(n, _)| n == key) {
+                    let setter = c
+                        .static_setters
+                        .iter()
+                        .find(|(n, _)| n == key)
+                        .map(|(_, s)| *s)
+                        .unwrap_or(Value::UNDEFINED);
+                    let attr = PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: true,
+                        setter,
+                    };
+                    Some((attr, *g))
+                } else if let Some((_, s)) = c.static_setters.iter().find(|(n, _)| n == key) {
+                    let attr = PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: true,
+                        setter: *s,
+                    };
+                    Some((attr, Value::UNDEFINED))
+                } else {
+                    None
+                }
+            }
+            // A function's assigned own properties (`fn.x = y`).
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
+            }
             _ => None,
         };
         match own {
@@ -3947,25 +4019,56 @@ impl<'p> Vm<'p> {
 
     /// `Object.getOwnPropertyNames(obj)` — all own string keys (enumerable or not).
     fn object_own_property_names(&mut self, obj: Value) -> Value {
-        let mut names: Vec<Value> = Vec::new();
+        // Collect the key strings under the (immutable) heap borrow, then allocate
+        // the result strings afterwards (alloc needs `&mut self`).
+        let mut keys: Vec<String> = Vec::new();
         if obj.is_heap() {
-            match self.heap.get(obj.heap_index()) {
-                HeapObj::Object(m) => {
-                    let keys: Vec<String> = m.keys.clone();
-                    for k in keys {
-                        names.push(self.alloc_str(k));
+            let idx = obj.heap_index();
+            // `length`, then `name` — the spec order for ordinary callables.
+            let has_length = self.callable_has_intrinsic(obj, "length");
+            let has_name = self.callable_has_intrinsic(obj, "name");
+            match self.heap.get(idx) {
+                HeapObj::Object(m) => keys.extend(m.keys.iter().cloned()),
+                HeapObj::Array(items) => {
+                    for i in 0..items.len() {
+                        keys.push(i.to_string());
+                    }
+                    keys.push("length".to_string());
+                }
+                HeapObj::Class(c) => {
+                    if has_length {
+                        keys.push("length".to_string());
+                    }
+                    if has_name {
+                        keys.push("name".to_string());
+                    }
+                    keys.extend(c.statics.keys.iter().cloned());
+                    for (n, _) in &c.static_getters {
+                        if !keys.iter().any(|k| k == n) {
+                            keys.push(n.clone());
+                        }
+                    }
+                    for (n, _) in &c.static_setters {
+                        if !keys.iter().any(|k| k == n) {
+                            keys.push(n.clone());
+                        }
                     }
                 }
-                HeapObj::Array(items) => {
-                    let n = items.len();
-                    for i in 0..n {
-                        names.push(self.alloc_str(i.to_string()));
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                    if has_length {
+                        keys.push("length".to_string());
                     }
-                    names.push(self.alloc_str("length".to_string()));
+                    if has_name {
+                        keys.push("name".to_string());
+                    }
+                    if let Some(m) = self.fn_props.get(&idx) {
+                        keys.extend(m.keys.iter().cloned());
+                    }
                 }
                 _ => {}
             }
         }
+        let names: Vec<Value> = keys.into_iter().map(|k| self.alloc_str(k)).collect();
         Value::heap(self.heap.alloc(HeapObj::Array(names)))
     }
 
@@ -4154,10 +4257,34 @@ impl<'p> Vm<'p> {
                     .ctor
                     .map(|f| self.program.functions[f as usize].param_count as i32)
                     .unwrap_or(0);
-                Some((c.name.clone(), len))
+                Some((clean(&c.name), len))
             }
             _ => None,
         }
+    }
+
+    /// Does this callable expose `key` (`name`/`length`) as an own property right
+    /// now? True for any named callable unless that intrinsic was `delete`d.
+    fn callable_has_intrinsic(&self, obj: Value, key: &str) -> bool {
+        let bit = match key {
+            "name" => 0u8,
+            "length" => 1u8,
+            _ => return false,
+        };
+        if !obj.is_heap() || self.deleted_callable_intrinsics.contains(&(obj.heap_index(), bit)) {
+            return false;
+        }
+        self.callable_name_length(obj).is_some()
+    }
+
+    /// The current value of a callable's `name`/`length` own property (allocating
+    /// the name string), or None if absent/deleted.
+    fn callable_intrinsic_value(&mut self, obj: Value, key: &str) -> Option<Value> {
+        if !self.callable_has_intrinsic(obj, key) {
+            return None;
+        }
+        let (nm, len) = self.callable_name_length(obj)?;
+        Some(if key == "name" { self.alloc_str(nm) } else { Value::int(len) })
     }
 
     fn get_prop(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
@@ -4172,10 +4299,11 @@ impl<'p> Vm<'p> {
             }
             return Ok(Value::UNDEFINED);
         }
-        // A function's / class's `.name` and `.length` (read from its proto).
+        // A function's / class's `.name` and `.length` — synthesized own data
+        // properties (configurable, so a prior `delete` suppresses them).
         if key == "name" || key == "length" {
-            if let Some((nm, len)) = self.callable_name_length(obj) {
-                return Ok(if key == "name" { self.alloc_str(nm) } else { Value::int(len) });
+            if let Some(v) = self.callable_intrinsic_value(obj, key) {
+                return Ok(v);
             }
         }
         // A function's / class's `.prototype` (a lazily-created, stable object).
@@ -4600,6 +4728,13 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // A callable's `name`/`length` are configurable: record the deletion so
+        // the synthesized property stops appearing (own-property queries + reads).
+        if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
+            self.deleted_callable_intrinsics
+                .insert((idx, if key == "name" { 0 } else { 1 }));
+            return Value::bool(true);
+        }
         let removed = match self.heap.get_mut(idx) {
             HeapObj::Object(map) => map.remove(key),
             HeapObj::Array(items) => {
@@ -4611,7 +4746,8 @@ impl<'p> Vm<'p> {
                 false // array slot stays (a hole); no version bump needed
             }
             HeapObj::Class(c) => c.statics.remove(key),
-            _ => false,
+            // A function's assigned own property (`delete fn.x`).
+            _ => self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key)),
         };
         if removed {
             self.heap.bump_version(idx); // a key was removed → slots shifted (IC)
@@ -4636,6 +4772,12 @@ impl<'p> Vm<'p> {
                 items.resize(n as usize, Value::UNDEFINED);
             }
             self.heap.bump_version(idx);
+            return Ok(());
+        }
+        // A callable's `name`/`length` are non-writable: assignment is a sloppy
+        // no-op while the synthesized intrinsic is present. (Once `delete`d it
+        // falls through and becomes an ordinary assigned property.)
+        if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
             return Ok(());
         }
         // An OWN property's descriptor governs assignment: an accessor invokes its
@@ -5412,7 +5554,18 @@ impl<'p> Vm<'p> {
             HeapObj::Cons { len, .. } => {
                 key == "length" || key.parse::<usize>().map_or(false, |i| i < *len)
             }
-            _ => false,
+            // A class value: own statics (data + `static get`/`set`) + name/length.
+            HeapObj::Class(c) => {
+                c.statics.pos(key).is_some()
+                    || c.static_getters.iter().any(|(n, _)| n == key)
+                    || c.static_setters.iter().any(|(n, _)| n == key)
+                    || self.callable_has_intrinsic(obj, key)
+            }
+            // Functions/closures/etc.: assigned own props (`fn.x`) + name/length.
+            _ => {
+                self.fn_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
+                    || self.callable_has_intrinsic(obj, key)
+            }
         }
     }
 
