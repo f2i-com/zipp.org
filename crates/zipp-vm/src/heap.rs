@@ -32,6 +32,11 @@ pub struct ObjMap {
     /// `[[Extensible]]`: whether new own properties may be added. Cleared by
     /// `Object.preventExtensions`/`seal`/`freeze`. Default `true`.
     pub extensible: bool,
+    /// True for the built-in constructor globals (Object/Array/Map/…), which are
+    /// modelled as objects but are callable constructors: `typeof` reports
+    /// "function" and they satisfy IsConstructor. False for ordinary objects and
+    /// the namespace globals (Reflect/Math/JSON).
+    pub is_ctor: bool,
 }
 
 /// One property's attributes — the ECMAScript property-descriptor flags plus an
@@ -57,7 +62,7 @@ impl PropAttr {
 
 impl ObjMap {
     pub fn new() -> ObjMap {
-        ObjMap { keys: Vec::new(), vals: Vec::new(), attrs: Vec::new(), class: None, extensible: true }
+        ObjMap { keys: Vec::new(), vals: Vec::new(), attrs: Vec::new(), class: None, extensible: true, is_ctor: false }
     }
 
     /// `Object.isSealed`: not extensible and every own property non-configurable.

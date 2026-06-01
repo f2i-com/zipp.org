@@ -4426,6 +4426,9 @@ impl<'p> Vm<'p> {
             }
             if let Some(p) = protolink {
                 m.define("prototype", Value::heap(p), proto_attr);
+                // A global built WITH a .prototype is a constructor (Object/Array/Map/…);
+                // a namespace (Reflect/Math/JSON, protolink None) is not.
+                m.is_ctor = true;
             }
             vm.heap.alloc(HeapObj::Object(m))
         };
@@ -4542,6 +4545,7 @@ impl<'p> Vm<'p> {
                 m.define(n, Value::num(v), proto_attr);
             }
             m.define("prototype", Value::heap(num_proto), proto_attr);
+            m.is_ctor = true; // Number is a constructor (typeof "function").
             self.heap.alloc(HeapObj::Object(m))
         };
         // Set / Map / Boolean / Date globals: their .prototype (construction is
@@ -6083,7 +6087,9 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::BoundResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
-                _ => "object", // Array, Object
+                // The built-in constructor globals (Object/Array/Map/…) are callable.
+                HeapObj::Object(m) if m.is_ctor => "function",
+                _ => "object", // Array, ordinary Object, namespace globals
             }
         } else {
             "undefined"
@@ -8370,11 +8376,15 @@ impl<'p> Vm<'p> {
     /// and non-callables do not. (test262's `isConstructor` helper probes this via
     /// `Reflect.construct(fn, [], v)`, so getting it right matters across the suite.)
     fn is_constructor(&self, v: Value) -> bool {
-        v.is_heap()
-            && matches!(
-                self.heap.get(v.heap_index()),
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class(_)
-            )
+        if !v.is_heap() {
+            return false;
+        }
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class(_) => true,
+            // The built-in constructor globals (Object/Array/Map/…) are constructors.
+            HeapObj::Object(m) => m.is_ctor,
+            _ => false,
+        }
     }
 
     /// JS `SameValue` (Object.is): like SameValueZero but +0 and -0 are distinct.
