@@ -579,6 +579,59 @@ fn is_self_call(code: &[Instr], ip: usize, callee: u16, self_slot: Option<u16>) 
     false
 }
 
+/// Is `reg`'s value at `ip` known to be an Int from a preceding int-producing op?
+/// Finds the nearest backward writer of `reg`; it must be one of
+/// `LoadInt`/`AddInt`/`Add`/`Sub`/`Mul`/`Mod` (each yields a boxed Int natively,
+/// guarding its operands and bailing otherwise — so reaching `ip` natively proves
+/// the value is an Int). SOUNDNESS: the writer must also DOMINATE the use along
+/// the only entry path — i.e. no jump may land in `(writer_ip, ip]`, which would
+/// let control reach `ip` bypassing the writer (possibly with a non-int value).
+/// Conservative: returns false on any doubt. Lets the base-case-inline decision
+/// skip a redundant int guard on `fib`'s `n-1` / `n-2` arguments.
+fn arg_is_known_int(code: &[Instr], ip: usize, reg: u16) -> bool {
+    let mut writer = None;
+    for j in (0..ip).rev() {
+        if let Some(w) = writes_reg(&code[j]) {
+            if w == reg {
+                writer = Some(j);
+                break;
+            }
+        }
+    }
+    let w = match writer {
+        Some(w) => w,
+        None => return false,
+    };
+    let int_producing = matches!(
+        &code[w],
+        Instr::LoadInt { .. }
+            | Instr::AddInt { .. }
+            | Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Mod { .. }
+    );
+    if !int_producing {
+        return false;
+    }
+    // No branch may jump into (w, ip]: such an edge could reach `ip` without
+    // executing the writer at `w`.
+    for instr in code {
+        let target = match *instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => target as usize,
+            _ => continue,
+        };
+        if target > w && target <= ip {
+            return false;
+        }
+    }
+    true
+}
+
 /// The destination register an instruction writes, if it writes exactly one.
 fn writes_reg(i: &Instr) -> Option<u16> {
     match *i {
@@ -825,7 +878,11 @@ fn compile_proto(
                         let inline_base = ops.new_dynamic_label();
                         let after = ops.new_dynamic_label();
                         // Non-int arg → real call (which guards + bails correctly).
-                        guard_int(&mut ops, arg_base, do_call);
+                        // Skip the guard when the arg provably came from an
+                        // int-producing op (`fib`'s `n-1`/`n-2` from AddInt).
+                        if !arg_is_known_int(&proto.code, ip, arg_base) {
+                            guard_int(&mut ops, arg_base, do_call);
+                        }
                         dynasm!(ops
                             ; mov eax, [rbx + dreg(arg_base)]   // arg payload (i32)
                             ; cmp eax, k
