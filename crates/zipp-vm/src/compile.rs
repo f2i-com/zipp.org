@@ -2632,6 +2632,30 @@ impl<'a> FnCompiler<'a> {
                         }
                         return Ok(dst);
                     }
+                    // `new String/Number/Boolean(arg?)` — a boxed primitive wrapper.
+                    if matches!(id.name.as_str(), "String" | "Number" | "Boolean") {
+                        let kind = match id.name.as_str() {
+                            "String" => 0u8,
+                            "Number" => 1,
+                            _ => 2,
+                        };
+                        let arg = match n.arguments.first().and_then(|a| a.as_expression()) {
+                            Some(e) => {
+                                let t = self.temp();
+                                let v = self.expr_into(e, t)?;
+                                if v != t {
+                                    self.emit(Instr::Move { dst: t, src: v });
+                                }
+                                Some(t)
+                            }
+                            None => None,
+                        };
+                        self.emit(Instr::NewBox { dst, kind, arg });
+                        if arg.is_some() {
+                            self.next_reg -= 1;
+                        }
+                        return Ok(dst);
+                    }
                     // `new WeakRef(target)` — target required (the op validates it's
                     // an object).
                     if id.name == "WeakRef" {

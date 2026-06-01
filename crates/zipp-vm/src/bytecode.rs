@@ -185,6 +185,9 @@ pub enum Instr {
     NewWeakSet { dst: Reg, src: Option<Reg> },
     /// `dst = new WeakRef(target)` — target must be an object.
     NewWeakRef { dst: Reg, target: Reg },
+    /// `dst = new String/Number/Boolean(arg?)` — a boxed primitive wrapper.
+    /// `kind` 0=String/1=Number/2=Boolean; `arg` is the (optional) argument register.
+    NewBox { dst: Reg, kind: u8, arg: Option<Reg> },
     /// `dst = new FinalizationRegistry(cleanupCallback)` — callback must be callable.
     NewFinalizationRegistry { dst: Reg, cleanup: Reg },
     /// `dst = new Promise(executor)` — alloc a pending promise, call `executor`

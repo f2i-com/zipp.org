@@ -251,6 +251,7 @@ mod native {
         ("toLowerCase", 1, 0), ("toUpperCase", 1, 0), ("trim", 1, 0), ("trimEnd", 1, 0),
         ("trimStart", 1, 0), ("concat", 1, 1), ("substr", 1, 2), ("localeCompare", 1, 1),
         ("normalize", 1, 0), ("isWellFormed", 1, 0), ("toWellFormed", 1, 0),
+        ("valueOf", 1, 0), ("toString", 1, 0),
         // Number.prototype (kind 2 → number_method, receiver is a number value).
         ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0), ("toLocaleString", 2, 0),
         // Set.prototype (kind 3 → set_method on the Set receiver).
@@ -1892,6 +1893,33 @@ impl<'p> Vm<'p> {
                         }
                         let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));
                         self.set(base, dst, wr);
+                        ip += 1;
+                    }
+                    Instr::NewBox { dst, kind, arg } => {
+                        let value = match kind {
+                            0 => {
+                                // String box: ToString(arg) (no arg -> "").
+                                let s = match arg {
+                                    Some(a) => self.to_js_string(self.get(base, a))?,
+                                    None => String::new(),
+                                };
+                                self.alloc_str(s)
+                            }
+                            1 => {
+                                // Number box: ToNumber(arg) (no arg -> +0).
+                                let n = match arg {
+                                    Some(a) => self.to_number(self.get(base, a))?,
+                                    None => 0.0,
+                                };
+                                Value::num(n)
+                            }
+                            _ => {
+                                // Boolean box: ToBoolean(arg) (no arg -> false).
+                                Value::bool(arg.map(|a| self.truthy(self.get(base, a))).unwrap_or(false))
+                            }
+                        };
+                        let b = Value::heap(self.heap.alloc(HeapObj::Boxed { kind, value }));
+                        self.set(base, dst, b);
                         ip += 1;
                     }
                     Instr::NewFinalizationRegistry { dst, cleanup } => {
@@ -4237,6 +4265,16 @@ impl<'p> Vm<'p> {
             let k = self.display(key);
             return self.get_prop(obj, &k);
         }
+        // A boxed String indexes its wrapped string (chars / length); a boxed
+        // Number/Boolean has no index, so computed access goes through the prototype.
+        if let HeapObj::Boxed { kind, value } = self.heap.get(obj.heap_index()) {
+            let (k, v) = (*kind, *value);
+            if k == 0 {
+                return self.get_index(v, key);
+            }
+            let key_s = self.display(key);
+            return self.get_prop(obj, &key_s);
+        }
         // Object / callable / class index access is property access: delegate to
         // `get_prop` so a computed key reaches inherited methods/getters (e.g. a
         // class instance's `obj[Symbol.iterator]`), a callable's `fn["name"]`, and
@@ -5558,6 +5596,12 @@ impl<'p> Vm<'p> {
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
                 let (m, kind, _len) = native::proto_method(id).unwrap();
+                // A boxed primitive receiver unwraps to its [[PrimitiveValue]] so the
+                // method runs on the primitive (`new Number(5).toFixed(2)`).
+                let this = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Boxed { value, .. }) => *value,
+                    _ => this,
+                };
                 // Number/Boolean receivers are primitive values; the rest are heap.
                 if kind == 2 {
                     self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
@@ -5813,6 +5857,11 @@ impl<'p> Vm<'p> {
             HeapObj::WeakRef(_) => self.weakref_proto,
             HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
             HeapObj::Iterator { proto, .. } => *proto,
+            HeapObj::Boxed { kind, .. } => match kind {
+                0 => self.str_proto,
+                1 => self.num_proto,
+                _ => self.bool_proto,
+            },
             HeapObj::Date(_) => self.date_proto,
             HeapObj::Promise { .. } => self.promise_proto,
             _ => 0,
@@ -6267,6 +6316,20 @@ impl<'p> Vm<'p> {
             HeapObj::Iterator { proto, .. } => {
                 let p = *proto;
                 Ok(self.proto_member(p, key))
+            }
+            // A boxed primitive: `length` (String box) reads the wrapped string;
+            // everything else resolves through the wrapped type's prototype.
+            HeapObj::Boxed { kind, value } => {
+                let (k, v) = (*kind, *value);
+                if k == 0 && key == "length" {
+                    return self.get_prop(v, "length");
+                }
+                let proto = match k {
+                    0 => self.str_proto,
+                    1 => self.num_proto,
+                    _ => self.bool_proto,
+                };
+                Ok(self.proto_member(proto, key))
             }
             HeapObj::Date(_) => Ok(self.proto_member(self.date_proto, key)),
             HeapObj::Promise { .. } => Ok(self.proto_member(self.promise_proto, key)),
@@ -6859,6 +6922,20 @@ impl<'p> Vm<'p> {
                 }
                 _ => {}
             }
+        }
+        // ── Boxed primitive: dispatch on the wrapped value (so new Number(5).
+        // toFixed(), new String("x").charAt(), and valueOf/toString unwrap) — this
+        // must precede the generic Object.prototype valueOf/toString below.
+        if let HeapObj::Boxed { kind, value } = self.heap.get(idx) {
+            let (k, v) = (*kind, *value);
+            return match k {
+                0 => self.string_method(v.heap_index(), name, args),
+                1 => self.number_method(v, name, args),
+                _ => match name {
+                    "toString" | "valueOf" => Ok(Some(self.boolean_method(v, name))),
+                    _ => Ok(None),
+                },
+            };
         }
         // ── Object.prototype methods (available on every object) ──
         match name {
@@ -9035,6 +9112,9 @@ impl<'p> Vm<'p> {
             // Engine strings are valid UTF-8 (no lone surrogates), so always well-formed.
             "isWellFormed" => Ok(Some(Value::bool(true))),
             "toWellFormed" => Ok(Some(self.alloc_str(s.clone()))),
+            // String.prototype.valueOf/toString return the string primitive itself
+            // (used by a boxed String's valueOf/toString after unwrapping).
+            "valueOf" | "toString" => Ok(Some(Value::heap(idx))),
             "padStart" | "padEnd" => {
                 let cur = char_len(&s);
                 let t = arg0.as_f64();
@@ -9275,7 +9355,20 @@ impl<'p> Vm<'p> {
     /// The `+` operator on two already-fetched Values (shared by the interpreter's
     /// `Add`/`StrConcat` and the JIT's `jit_concat` helper).
     #[inline]
+    /// ToPrimitive a boxed primitive (`new Number(5)` → 5) for use in operators;
+    /// a non-box passes through. (Our boxes' valueOf returns the wrapped value, so
+    /// this is ToPrimitive with the default/number hint.)
+    fn unwrap_boxed(&self, v: Value) -> Value {
+        if v.is_heap() {
+            if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
+                return *value;
+            }
+        }
+        v
+    }
+
     pub(crate) fn add_values(&mut self, va: Value, vb: Value) -> Result<Value, Thrown> {
+        let (va, vb) = (self.unwrap_boxed(va), self.unwrap_boxed(vb));
         // Fast path: int + int with overflow check.
         if va.is_int() && vb.is_int() {
             return Ok(match va.as_int().checked_add(vb.as_int()) {
@@ -9466,6 +9559,10 @@ impl<'p> Vm<'p> {
         if let HeapObj::Date(ms) = self.heap.get(v.heap_index()) {
             return Ok(*ms);
         }
+        // A boxed primitive coerces to its wrapped value's number (ToPrimitive).
+        if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
+            return self.to_number(*value);
+        }
         if let Some(s) = self.heap.str_cow(v.heap_index()) {
             let t = s.trim();
             if t.is_empty() {
@@ -9515,6 +9612,8 @@ impl<'p> Vm<'p> {
                 HeapObj::WeakRef(_) => "[object WeakRef]".into(),
                 HeapObj::FinalizationRegistry { .. } => "[object FinalizationRegistry]".into(),
                 HeapObj::Iterator { .. } => "[object Array Iterator]".into(),
+                // A boxed primitive stringifies as its wrapped value (ToString).
+                HeapObj::Boxed { value, .. } => self.display(*value),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -9637,6 +9736,14 @@ impl<'p> Vm<'p> {
             HeapObj::WeakRef(_) => "WeakRef {}".into(),
             HeapObj::FinalizationRegistry { .. } => "FinalizationRegistry {}".into(),
             HeapObj::Iterator { .. } => "Object [Array Iterator] {}".into(),
+            HeapObj::Boxed { kind, value } => {
+                let inner = self.inspect_nested(*value);
+                match kind {
+                    0 => format!("[String: {inner}]"),
+                    1 => format!("[Number: {inner}]"),
+                    _ => format!("[Boolean: {inner}]"),
+                }
+            }
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
             HeapObj::Promise { state, result, .. } => match state {

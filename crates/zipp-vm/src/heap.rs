@@ -382,6 +382,11 @@ pub enum HeapObj {
     /// unregister tokens. No GC, so cleanup never fires (spec-permitted); only
     /// `register`/`unregister` are observable. `tokens` tracks unregister tokens.
     FinalizationRegistry { cleanup: Value, tokens: Vec<Value> },
+    /// A boxed primitive wrapper (`new String(x)`/`new Number(x)`/`new Boolean(x)`,
+    /// or `Object(primitive)`). `kind` 0=String/1=Number/2=Boolean; `value` is the
+    /// wrapped primitive ([[PrimitiveValue]]). `typeof` is "object"; valueOf returns
+    /// the value; the kind's prototype provides the methods.
+    Boxed { kind: u8, value: Value },
     /// A built-in iterator (Array/Map/Set `entries()`/`keys()`/`values()` and the
     /// default `@@iterator`). A snapshot of the values to yield plus a cursor;
     /// `proto` is its prototype heap index (%ArrayIteratorPrototype% etc., distinct
