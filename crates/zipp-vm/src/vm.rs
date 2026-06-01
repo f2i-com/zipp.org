@@ -126,6 +126,13 @@ mod native {
     pub const PROMISE_ALLSETTLED: u16 = 27;
     pub const PROMISE_RACE: u16 = 28;
     pub const PROMISE_ANY: u16 = 29;
+    // More Object statics (as first-class values).
+    pub const OBJ_IS: u16 = 30;
+    pub const OBJ_HAS_OWN: u16 = 31;
+    pub const OBJ_FROM_ENTRIES: u16 = 32;
+    pub const OBJ_SET_PROTO_OF: u16 = 33;
+    pub const OBJ_GET_OWN_SYMBOLS: u16 = 34;
+    pub const OBJ_GET_OWN_DESCS: u16 = 35;
 
     /// First native id for a prototype method (`Array.prototype.map` etc.). Method
     /// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
@@ -4316,6 +4323,12 @@ impl<'p> Vm<'p> {
                 ("entries", OBJ_ENTRIES),
                 ("assign", OBJ_ASSIGN),
                 ("create", OBJ_CREATE),
+                ("is", OBJ_IS),
+                ("hasOwn", OBJ_HAS_OWN),
+                ("fromEntries", OBJ_FROM_ENTRIES),
+                ("setPrototypeOf", OBJ_SET_PROTO_OF),
+                ("getOwnPropertySymbols", OBJ_GET_OWN_SYMBOLS),
+                ("getOwnPropertyDescriptors", OBJ_GET_OWN_DESCS),
             ],
             Some(obj_proto),
         );
@@ -4463,6 +4476,53 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::UNDEFINED
                 }
+            }
+            // More Object statics as values.
+            OBJ_IS => {
+                let a = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let b = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                Value::bool(self.same_value(a, b))
+            }
+            OBJ_HAS_OWN => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let k = self.display(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                Value::bool(self.has_own_property(o, &k))
+            }
+            OBJ_SET_PROTO_OF => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let proto = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if o.is_heap() {
+                    self.proto_of.insert(o.heap_index(), proto);
+                }
+                o
+            }
+            OBJ_GET_OWN_SYMBOLS => Value::heap(self.heap.alloc(HeapObj::Array(Vec::new()))),
+            OBJ_FROM_ENTRIES => {
+                let src = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let entries = if src.is_heap() { self.iterate_to_vec(src)? } else { Vec::new() };
+                let mut map = ObjMap::new();
+                for e in entries {
+                    let k = self.get_index(e, Value::int(0))?;
+                    let v = self.get_index(e, Value::int(1))?;
+                    let ks = self.display(k);
+                    map.set(&ks, v);
+                }
+                Value::heap(self.heap.alloc(HeapObj::Object(map)))
+            }
+            OBJ_GET_OWN_DESCS => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let names = self.object_own_property_names(o);
+                let keys: Vec<Value> = match self.heap.get(names.heap_index()) {
+                    HeapObj::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                };
+                let mut map = ObjMap::new();
+                for kv in keys {
+                    let ks = self.display(kv);
+                    let desc = self.object_get_own_property_descriptor(o, &ks);
+                    map.set(&ks, desc);
+                }
+                Value::heap(self.heap.alloc(HeapObj::Object(map)))
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
             PROMISE_RESOLVE => {
@@ -7547,6 +7607,21 @@ impl<'p> Vm<'p> {
     /// NaN (so NaN is a usable key and all NaNs dedupe). +0/-0 are equal here too
     /// (matching `===`); the store side normalizes -0 → +0. Strings compare by
     /// value, objects by reference identity, and there is no type coercion.
+    /// JS `SameValue` (Object.is): like SameValueZero but +0 and -0 are distinct.
+    fn same_value(&self, a: Value, b: Value) -> bool {
+        if a.is_number() && b.is_number() {
+            let (x, y) = (a.as_f64(), b.as_f64());
+            if x == 0.0 && y == 0.0 {
+                return x.is_sign_negative() == y.is_sign_negative();
+            }
+            if x.is_nan() && y.is_nan() {
+                return true;
+            }
+            return x == y;
+        }
+        self.same_value_zero(a, b)
+    }
+
     fn same_value_zero(&self, a: Value, b: Value) -> bool {
         if a.is_number() && b.is_number() {
             let (na, nb) = (a.as_f64(), b.as_f64());
