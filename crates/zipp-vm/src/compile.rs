@@ -1335,9 +1335,13 @@ impl<'a> FnCompiler<'a> {
     /// Compile a `class C { … }` declaration: build the method + constructor
     /// protos, register a ClassDef, and bind `C` to the materialized class value.
     fn class_decl(&mut self, class: &ox::Class) -> R<()> {
-        let (class_id, static_fields, computed) = self.compile_class(class)?;
         let name = class.id.as_ref().map(|i| i.name.to_string());
-        let Some(n) = name else { return Ok(()) };
+        let Some(n) = name else {
+            // Anonymous class declaration (e.g. `export default class {}`):
+            // compile its body for completeness; it binds no name.
+            self.compile_class(class)?;
+            return Ok(());
+        };
 
         // Resolve where the class value will live. A plain register local builds
         // in place; a cell/global builds in a temp then stores through.
@@ -1361,6 +1365,26 @@ impl<'a> FnCompiler<'a> {
             Dest::Reg(r) => *r,
             Dest::Cell(_, t) | Dest::Global(_, t) => *t,
         };
+        self.build_class_into(class, cls)?;
+        match &dest {
+            Dest::Reg(_) => {}
+            Dest::Cell(cell, t) => {
+                self.emit(Instr::CellSet { cell: *cell, src: *t });
+                self.next_reg -= 1; // reclaim the temp
+            }
+            Dest::Global(slot, t) => {
+                self.emit(Instr::StoreGlobal { idx: *slot, src: *t });
+                self.next_reg -= 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a class body and emit its runtime materialization into register
+    /// `cls`: evaluate `extends`, `MakeClass`, then install static fields and
+    /// computed-key members. Shared by class declarations and class expressions.
+    fn build_class_into(&mut self, class: &ox::Class, cls: Reg) -> R<()> {
+        let (class_id, static_fields, computed) = self.compile_class(class)?;
         // Evaluate the superclass value (`extends P`) into a temp the VM links in.
         let parent_reg = if let Some(sc) = &class.super_class {
             let t = self.temp();
@@ -1399,18 +1423,14 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::ClassAddMember { class: cls, key: kr, func: *func, kind: *kind });
             self.next_reg = save;
         }
-        match &dest {
-            Dest::Reg(_) => {}
-            Dest::Cell(cell, t) => {
-                self.emit(Instr::CellSet { cell: *cell, src: *t });
-                self.next_reg -= 1; // reclaim the temp
-            }
-            Dest::Global(slot, t) => {
-                self.emit(Instr::StoreGlobal { idx: *slot, src: *t });
-                self.next_reg -= 1;
-            }
-        }
         Ok(())
+    }
+
+    /// A class expression (`let C = class { … }`, `x = class extends B {}`):
+    /// materialize the class value into `dst` and return it.
+    fn class_expr(&mut self, class: &ox::Class, dst: Reg) -> R<Reg> {
+        self.build_class_into(class, dst)?;
+        Ok(dst)
     }
 
     /// Compile a class body into protos (methods get `this` at reg 0; the
@@ -2474,6 +2494,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit_make_callable(dst, id, has_up);
                 Ok(dst)
             }
+            E::ClassExpression(c) => self.class_expr(c, dst),
             E::ArrayExpression(a) => self.array_literal(a, dst),
             E::ObjectExpression(o) => self.object_literal(o, dst),
             E::StaticMemberExpression(m) => self.static_member(m, dst),
