@@ -173,6 +173,9 @@ mod native {
     pub const WR_DEREF: u16 = 297;
     pub const FR_REGISTER: u16 = 298;
     pub const FR_UNREGISTER: u16 = 299;
+    // Built-in iterator methods.
+    pub const ITER_NEXT: u16 = 300;
+    pub const ITER_SELF: u16 = 301; // `[Symbol.iterator]()` → returns the iterator
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -219,7 +222,7 @@ mod native {
         ("reduceRight", 0, 1), ("reverse", 0, 0), ("shift", 0, 0), ("slice", 0, 2),
         ("some", 0, 1), ("sort", 0, 1), ("splice", 0, 2), ("toReversed", 0, 0),
         ("toSorted", 0, 1), ("toSpliced", 0, 2), ("toString", 0, 0), ("with", 0, 2),
-        ("copyWithin", 0, 2),
+        ("copyWithin", 0, 2), ("entries", 0, 0), ("keys", 0, 0), ("values", 0, 0),
         // String.prototype.
         ("at", 1, 1), ("charAt", 1, 1), ("charCodeAt", 1, 1), ("codePointAt", 1, 1),
         ("endsWith", 1, 1), ("includes", 1, 1), ("indexOf", 1, 1), ("padEnd", 1, 1),
@@ -338,6 +341,8 @@ mod native {
             WR_DEREF => ("deref", 0),
             FR_REGISTER => ("register", 2),
             FR_UNREGISTER => ("unregister", 1),
+            ITER_NEXT => ("next", 0),
+            ITER_SELF => ("[Symbol.iterator]", 0),
             _ => return None,
         })
     }
@@ -435,6 +440,9 @@ pub struct Vm<'p> {
     weakset_proto: u32,
     weakref_proto: u32,
     finreg_proto: u32,
+    /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
+    /// iterators (and the default array `@@iterator`). 0 until set up.
+    array_iter_proto: u32,
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
@@ -525,6 +533,7 @@ impl<'p> Vm<'p> {
             weakset_proto: 0,
             weakref_proto: 0,
             finreg_proto: 0,
+            array_iter_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1432,7 +1441,7 @@ impl<'p> Vm<'p> {
                             if vv.is_heap()
                                 && matches!(
                                     self.heap.get(vv.heap_index()),
-                                    HeapObj::Generator { .. } | HeapObj::Object(_)
+                                    HeapObj::Generator { .. } | HeapObj::Object(_) | HeapObj::Iterator { .. }
                                 )
                             {
                                 let elems = self.iterate_to_vec(vv)?;
@@ -2840,7 +2849,7 @@ impl<'p> Vm<'p> {
                         // A user iterator object (`@@iterator` already resolved by
                         // GetIterator): pull the next result via `.next()`. Lazy —
                         // a `break` simply stops calling it.
-                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_)) {
+                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. }) {
                             let next = self.get_prop(it, "next")?;
                             if self.is_callable(next) {
                                 let res = self.call_value(next, it, &[])?;
@@ -4185,6 +4194,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Class(_)
                 | HeapObj::Bound { .. }
                 | HeapObj::Native(_)
+                | HeapObj::Iterator { .. }
         ) {
             let k = self.display(key);
             return self.get_prop(obj, &k);
@@ -4199,12 +4209,13 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(Value::UNDEFINED);
                 }
-                // Non-int key on an array: "length" or out of range → undefined.
+                // Non-int key on an array: "length", else resolve via the prototype
+                // (a computed method name / `@@iterator`, mirroring dot access).
                 let k = self.display(key);
                 if k == "length" {
                     return Ok(len_value(items.len()));
                 }
-                Ok(Value::UNDEFINED)
+                self.get_prop(obj, &k)
             }
             HeapObj::Object(map) => {
                 let k = self.display(key);
@@ -4717,6 +4728,27 @@ impl<'p> Vm<'p> {
         let weakset_proto = build(self, &[("add", WS_ADD), ("has", WS_HAS), ("delete", WS_DELETE)], None);
         let weakref_proto = build(self, &[("deref", WR_DEREF)], None);
         let finreg_proto = build(self, &[("register", FR_REGISTER), ("unregister", FR_UNREGISTER)], None);
+        // %ArrayIteratorPrototype% (next + @@iterator). Array entries/keys/values
+        // iterators delegate here.
+        let array_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        self.array_iter_proto = array_iter_proto;
+        // `Array.prototype[Symbol.iterator]` IS `Array.prototype.values` (same fn).
+        let values_fn = match self.heap.get(self.arr_proto) {
+            HeapObj::Object(m) => m.get("values"),
+            _ => None,
+        };
+        if let Some(vf) = values_fn {
+            let attr = PropAttr {
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            if let HeapObj::Object(m) = self.heap.get_mut(self.arr_proto) {
+                m.define("@@iterator", vf, attr);
+            }
+        }
         self.weakmap_proto = weakmap_proto;
         self.weakset_proto = weakset_proto;
         self.weakref_proto = weakref_proto;
@@ -5251,6 +5283,29 @@ impl<'p> Vm<'p> {
             }
             FR_REGISTER => self.finreg_method(this, "register", args)?,
             FR_UNREGISTER => self.finreg_method(this, "unregister", args)?,
+            ITER_NEXT => {
+                let (val, done) = match this.is_heap().then(|| self.heap.get_mut(this.heap_index())) {
+                    Some(HeapObj::Iterator { items, index, .. }) => {
+                        if *index < items.len() {
+                            let v = items[*index];
+                            *index += 1;
+                            (v, false)
+                        } else {
+                            (Value::UNDEFINED, true)
+                        }
+                    }
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: Iterator.prototype.next called on incompatible receiver".into(),
+                        ))
+                    }
+                };
+                let mut m = ObjMap::new();
+                m.set("value", val);
+                m.set("done", Value::bool(done));
+                Value::heap(self.heap.alloc(HeapObj::Object(m)))
+            }
+            ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
             // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
             // form is compile-lowered to MathOp; these back the value form.
             _ if native::math_method(id).is_some() => {
@@ -5529,6 +5584,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakSet(_) => self.weakset_proto,
             HeapObj::WeakRef(_) => self.weakref_proto,
             HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
+            HeapObj::Iterator { proto, .. } => *proto,
             HeapObj::Date(_) => self.date_proto,
             HeapObj::Promise { .. } => self.promise_proto,
             _ => 0,
@@ -5980,6 +6036,10 @@ impl<'p> Vm<'p> {
             HeapObj::WeakSet(_) => Ok(self.proto_member(self.weakset_proto, key)),
             HeapObj::WeakRef(_) => Ok(self.proto_member(self.weakref_proto, key)),
             HeapObj::FinalizationRegistry { .. } => Ok(self.proto_member(self.finreg_proto, key)),
+            HeapObj::Iterator { proto, .. } => {
+                let p = *proto;
+                Ok(self.proto_member(p, key))
+            }
             HeapObj::Date(_) => Ok(self.proto_member(self.date_proto, key)),
             HeapObj::Promise { .. } => Ok(self.proto_member(self.promise_proto, key)),
             // Functions / natives / bound functions: own props set on them
@@ -7528,8 +7588,9 @@ impl<'p> Vm<'p> {
             }
             return Ok(out);
         }
-        // A user iterator object (one with a `next()` method): drain it.
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+        // A user iterator object (one with a `next()` method) or a built-in
+        // Iterator: drain it.
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. }) {
             let next = self.get_prop(v, "next")?;
             if self.is_callable(next) {
                 let mut out = Vec::new();
@@ -7953,6 +8014,11 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Allocate a built-in iterator over a snapshot of `items` with prototype `proto`.
+    fn make_iterator(&mut self, items: Vec<Value>, proto: u32) -> Value {
+        Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto }))
+    }
+
     fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // Generic array methods accept an array-like `this`
@@ -7967,7 +8033,7 @@ impl<'p> Vm<'p> {
                     | "find" | "findIndex" | "findLast" | "findLastIndex" | "indexOf"
                     | "lastIndexOf" | "includes" | "join" | "toString" | "slice" | "at"
                     | "concat" | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
-                    | "toSpliced"
+                    | "toSpliced" | "entries" | "keys" | "values"
             )
         {
             let elems = self.array_like_read(idx);
@@ -8344,6 +8410,29 @@ impl<'p> Vm<'p> {
                 };
                 self.heap.bump_version(idx); // length/contents changed
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(removed)))))
+            }
+            // Array iterators (real iterator objects with .next(), proto =
+            // %ArrayIteratorPrototype%). values() is also the default @@iterator.
+            "values" => {
+                let items = self.array_snapshot(idx);
+                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
+            }
+            "keys" => {
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
+                let items: Vec<Value> = (0..len).map(|i| Value::int(i as i32)).collect();
+                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
+            }
+            "entries" => {
+                let snap = self.array_snapshot(idx);
+                let items: Vec<Value> = snap
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![Value::int(i as i32), v]))))
+                    .collect();
+                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
             }
             "with" => {
                 // with(index, value): a COPY with one index replaced. The index is
@@ -9095,6 +9184,7 @@ impl<'p> Vm<'p> {
                 HeapObj::WeakSet(_) => "[object WeakSet]".into(),
                 HeapObj::WeakRef(_) => "[object WeakRef]".into(),
                 HeapObj::FinalizationRegistry { .. } => "[object FinalizationRegistry]".into(),
+                HeapObj::Iterator { .. } => "[object Array Iterator]".into(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -9216,6 +9306,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakSet(_) => "WeakSet { <items unknown> }".into(),
             HeapObj::WeakRef(_) => "WeakRef {}".into(),
             HeapObj::FinalizationRegistry { .. } => "FinalizationRegistry {}".into(),
+            HeapObj::Iterator { .. } => "Object [Array Iterator] {}".into(),
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
             HeapObj::Promise { state, result, .. } => match state {

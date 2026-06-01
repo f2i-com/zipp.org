@@ -382,6 +382,11 @@ pub enum HeapObj {
     /// unregister tokens. No GC, so cleanup never fires (spec-permitted); only
     /// `register`/`unregister` are observable. `tokens` tracks unregister tokens.
     FinalizationRegistry { cleanup: Value, tokens: Vec<Value> },
+    /// A built-in iterator (Array/Map/Set `entries()`/`keys()`/`values()` and the
+    /// default `@@iterator`). A snapshot of the values to yield plus a cursor;
+    /// `proto` is its prototype heap index (%ArrayIteratorPrototype% etc., distinct
+    /// per collection). `.next()` yields `items[index]` then advances.
+    Iterator { items: Vec<Value>, index: usize, proto: u32 },
     /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
     /// `ctor` is the func id that runs instance field initializers then the user
     /// constructor (or `None`); `methods` maps each instance method name to its
