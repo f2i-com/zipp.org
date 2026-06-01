@@ -147,6 +147,14 @@ mod native {
         ("trimStart", 1),
         // Number.prototype (kind 2 → number_method, receiver is a number value).
         ("toFixed", 2), ("toString", 2), ("valueOf", 2),
+        // (Set.prototype/kind 3 omitted — injecting a Set global net-regressed
+        // built-ins/Set by 7; revisit with the full ES2025 Set method set +
+        // @@iterator before exposing it.)
+        // Map.prototype (kind 4 → map_method on the Map receiver).
+        ("clear", 4), ("delete", 4), ("entries", 4), ("forEach", 4), ("get", 4),
+        ("has", 4), ("keys", 4), ("set", 4), ("values", 4),
+        // Boolean.prototype (kind 5 → boolean_method on the boolean value).
+        ("toString", 5), ("valueOf", 5),
     ];
 
     /// `(name, kind)` for a prototype-method native id, if it is one.
@@ -4239,18 +4247,24 @@ impl<'p> Vm<'p> {
         let mut arr_methods: Vec<(&str, u16)> = vec![("join", ARR_JOIN), ("push", ARR_PUSH)];
         let mut str_methods: Vec<(&str, u16)> = Vec::new();
         let mut num_methods: Vec<(&str, u16)> = Vec::new();
+        let mut map_methods: Vec<(&str, u16)> = Vec::new();
+        let mut bool_methods: Vec<(&str, u16)> = Vec::new();
         for (i, &(name, kind)) in native::PROTO_METHODS.iter().enumerate() {
             let id = native::PROTO_METHOD_BASE + i as u16;
             match kind {
                 0 => arr_methods.push((name, id)),
                 1 => str_methods.push((name, id)),
-                _ => num_methods.push((name, id)),
+                2 => num_methods.push((name, id)),
+                4 => map_methods.push((name, id)),
+                _ => bool_methods.push((name, id)),
             }
         }
         self.arr_proto = build(self, &arr_methods, None);
         self.str_proto = build(self, &str_methods, None);
         let str_proto = self.str_proto;
         let num_proto = build(self, &num_methods, None);
+        let map_proto = build(self, &map_methods, None);
+        let bool_proto = build(self, &bool_methods, None);
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -4295,6 +4309,10 @@ impl<'p> Vm<'p> {
             m.define("prototype", Value::heap(num_proto), proto_attr);
             self.heap.alloc(HeapObj::Object(m))
         };
+        // Map / Boolean globals: just their .prototype (construction is
+        // compile-lowered to NewMap; the value-level shape is built here).
+        let map_ctor = build(self, &[], Some(map_proto));
+        let boolean_ctor = build(self, &[], Some(bool_proto));
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -4309,6 +4327,8 @@ impl<'p> Vm<'p> {
                 "Function" => Some(function_ctor),
                 "String" => Some(string_ctor),
                 "Number" => Some(number_ctor),
+                "Map" => Some(map_ctor),
+                "Boolean" => Some(boolean_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -4395,19 +4415,24 @@ impl<'p> Vm<'p> {
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
                 let (m, kind) = native::proto_method(id).unwrap();
+                // Number/Boolean receivers are primitive values; the rest are heap.
                 if kind == 2 {
-                    // Number.prototype method — the receiver is a number value.
                     self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
+                } else if kind == 5 {
+                    self.boolean_method(this, m)
                 } else if !this.is_heap() {
                     return Err(Thrown(format!(
-                        "TypeError: {}.prototype.{m} called on {}",
-                        if kind == 0 { "Array" } else { "String" },
+                        "TypeError: prototype method {m} called on {}",
                         self.display(this)
                     )));
-                } else if kind == 0 {
-                    self.array_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
                 } else {
-                    self.string_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                    let r = match kind {
+                        0 => self.array_method(this.heap_index(), m, args)?,
+                        1 => self.string_method(this.heap_index(), m, args)?,
+                        3 => self.set_method(this.heap_index(), m, args)?,
+                        _ => self.map_method(this.heap_index(), m, args)?,
+                    };
+                    r.unwrap_or(Value::UNDEFINED)
                 }
             }
             _ => Value::UNDEFINED,
@@ -6441,6 +6466,15 @@ impl<'p> Vm<'p> {
             }
             "valueOf" => Ok(Some(recv)),
             _ => Ok(None),
+        }
+    }
+
+    /// `Boolean.prototype.toString`/`valueOf` on a boolean value.
+    fn boolean_method(&mut self, recv: Value, name: &str) -> Value {
+        match name {
+            "toString" => self.alloc_str(if recv == Value::bool(true) { "true" } else { "false" }.to_string()),
+            "valueOf" => recv,
+            _ => Value::UNDEFINED,
         }
     }
 
