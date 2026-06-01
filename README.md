@@ -523,8 +523,8 @@ byte-identical to node):
 | 200k `charCodeAt` scan loop | 2.2 ms | 2.9 ms | 1.28× (sub-3ms) |
 | 200k `s[i]===c` scan loop | 2.3 ms | 2.9 ms | 1.27× (sub-3ms) |
 | 4M object field read/write | 5.1 ms | 5.1 ms | **1.01× (parity)** |
-| 100k string concat + scan | 6.8 ms | 4.6 ms | **0.69× (beats V8)** |
-| 1M string concat (`s += …`) | 27.0 ms | 28.6 ms | **1.06× (parity)** |
+| 100k string concat + scan | 6.7 ms | 1.7 ms | **0.25× (4× faster)** |
+| 1M string concat (`s += …`) | 27.5 ms | 5.6 ms | **0.20× (5× faster)** |
 | fib(37) recursion | 141.5 ms | 129.9 ms | **0.92× (beats V8)** |
 
 zipp **beats V8 across the whole array `map`/`filter`/`reduce` pipeline** (~2×
@@ -550,10 +550,13 @@ is a heap op outside the numeric OSR region, so the loop paid dispatch every
 iteration). A compile pass detects the `s = s + x` accumulator and emits a
 `StrConcat` op (semantically identical to `Add`) that routes the loop into the
 helper-call OSR region — control flow runs native, the concat is a lean
-`jit_concat` helper (the same O(1) cons-string rope `+` builds). That **beats V8
-on the realistic concat-and-scan workload (0.69×)** and brings the pure 1M `s += …`
-build from ~1.8× to **parity (~1.06×)** — the remaining sliver is V8's
-bump-allocated GC edging the 64 B `Cons`-node churn. **Object field access is at
+`jit_concat` helper. When a compile pass can PROVE the accumulator is never
+aliased (top-level, non-nested loop, the global is built only by this loop and
+never escapes into a second live reference), it upgrades to an in-place append
+(`StrAppendInPlace`) that mutates the string buffer — ~1M allocations collapse to
+amortized buffer growth. The result **beats V8 by 4–5× on both string workloads**
+(1M `s += …` build **0.20×**, concat-and-scan **0.25×**); any case that fails the
+aliasing proof falls back to the safe rope. **Object field access is at
 parity (~1.0×):** non-escaping loop objects are scalar-replaced (SROA) so fields
 become registers, and a dead-code pass drops the now-unused object-ref loads SROA
 leaves behind (which also frees register homes, keeping the loop on the higher-ILP
