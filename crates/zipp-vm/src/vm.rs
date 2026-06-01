@@ -4709,9 +4709,12 @@ impl<'p> Vm<'p> {
             match self.heap.get(v.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "string",
                 // A class is callable (with `new`), so `typeof C === "function"`.
+                // Native builtins and bound functions are callable too.
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }
                 | HeapObj::Class(_)
+                | HeapObj::Native(_)
+                | HeapObj::Bound { .. }
                 | HeapObj::BoundResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
                 _ => "object", // Array, Object
