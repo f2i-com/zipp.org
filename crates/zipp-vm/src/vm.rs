@@ -119,6 +119,13 @@ mod native {
     pub const ARR_OF: u16 = 21;
     pub const ARR_JOIN: u16 = 22;
     pub const ARR_PUSH: u16 = 23;
+    // Promise static methods as first-class values (`Promise.resolve`, …).
+    pub const PROMISE_RESOLVE: u16 = 24;
+    pub const PROMISE_REJECT: u16 = 25;
+    pub const PROMISE_ALL: u16 = 26;
+    pub const PROMISE_ALLSETTLED: u16 = 27;
+    pub const PROMISE_RACE: u16 = 28;
+    pub const PROMISE_ANY: u16 = 29;
 
     /// First native id for a prototype method (`Array.prototype.map` etc.). Method
     /// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
@@ -155,6 +162,8 @@ mod native {
         ("has", 4), ("keys", 4), ("set", 4), ("values", 4),
         // Boolean.prototype (kind 5 → boolean_method on the boolean value).
         ("toString", 5), ("valueOf", 5),
+        // Promise.prototype (kind 7 → promise_method on the Promise receiver).
+        ("then", 7), ("catch", 7), ("finally", 7),
         // Date.prototype (kind 6 → date_method on the Date receiver).
         ("getDate", 6), ("getDay", 6), ("getFullYear", 6), ("getHours", 6),
         ("getMilliseconds", 6), ("getMinutes", 6), ("getMonth", 6), ("getSeconds", 6),
@@ -4263,6 +4272,7 @@ impl<'p> Vm<'p> {
         let mut map_methods: Vec<(&str, u16)> = Vec::new();
         let mut bool_methods: Vec<(&str, u16)> = Vec::new();
         let mut date_methods: Vec<(&str, u16)> = Vec::new();
+        let mut promise_methods: Vec<(&str, u16)> = Vec::new();
         for (i, &(name, kind)) in native::PROTO_METHODS.iter().enumerate() {
             let id = native::PROTO_METHOD_BASE + i as u16;
             match kind {
@@ -4271,7 +4281,8 @@ impl<'p> Vm<'p> {
                 2 => num_methods.push((name, id)),
                 4 => map_methods.push((name, id)),
                 5 => bool_methods.push((name, id)),
-                _ => date_methods.push((name, id)), // kind 6
+                6 => date_methods.push((name, id)),
+                _ => promise_methods.push((name, id)), // kind 7
             }
         }
         self.arr_proto = build(self, &arr_methods, None);
@@ -4281,6 +4292,7 @@ impl<'p> Vm<'p> {
         let map_proto = build(self, &map_methods, None);
         let bool_proto = build(self, &bool_methods, None);
         let date_proto = build(self, &date_methods, None);
+        let promise_proto = build(self, &promise_methods, None);
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -4330,6 +4342,20 @@ impl<'p> Vm<'p> {
         let map_ctor = build(self, &[], Some(map_proto));
         let boolean_ctor = build(self, &[], Some(bool_proto));
         let date_ctor = build(self, &[], Some(date_proto));
+        // Promise global: static combinators + Promise.prototype. `new Promise`
+        // is compile-lowered to NewPromise.
+        let promise_ctor = build(
+            self,
+            &[
+                ("resolve", PROMISE_RESOLVE),
+                ("reject", PROMISE_REJECT),
+                ("all", PROMISE_ALL),
+                ("allSettled", PROMISE_ALLSETTLED),
+                ("race", PROMISE_RACE),
+                ("any", PROMISE_ANY),
+            ],
+            Some(promise_proto),
+        );
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -4347,6 +4373,7 @@ impl<'p> Vm<'p> {
                 "Map" => Some(map_ctor),
                 "Boolean" => Some(boolean_ctor),
                 "Date" => Some(date_ctor),
+                "Promise" => Some(promise_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -4429,6 +4456,20 @@ impl<'p> Vm<'p> {
                     Value::UNDEFINED
                 }
             }
+            // Promise static methods invoked as values (`Promise.resolve`, …).
+            PROMISE_RESOLVE => {
+                let p = self.to_promise(args.first().copied().unwrap_or(Value::UNDEFINED));
+                Value::heap(p)
+            }
+            PROMISE_REJECT => {
+                let p = self.alloc_promise();
+                self.reject(p, args.first().copied().unwrap_or(Value::UNDEFINED));
+                Value::heap(p)
+            }
+            PROMISE_ALL => self.promise_combine(crate::heap::CombKind::All, args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            PROMISE_ALLSETTLED => self.promise_combine(crate::heap::CombKind::AllSettled, args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            PROMISE_RACE => self.promise_combine(crate::heap::CombKind::Race, args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            PROMISE_ANY => self.promise_combine(crate::heap::CombKind::Any, args.first().copied().unwrap_or(Value::UNDEFINED))?,
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -4448,7 +4489,8 @@ impl<'p> Vm<'p> {
                         0 => self.array_method(this.heap_index(), m, args)?,
                         1 => self.string_method(this.heap_index(), m, args)?,
                         4 => self.map_method(this.heap_index(), m, args)?,
-                        _ => self.date_method(this.heap_index(), m, args)?, // kind 6
+                        6 => self.date_method(this.heap_index(), m, args)?,
+                        _ => self.promise_method(this.heap_index(), m, args)?, // kind 7
                     };
                     r.unwrap_or(Value::UNDEFINED)
                 }
