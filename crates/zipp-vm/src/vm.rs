@@ -198,55 +198,56 @@ mod native {
     /// (0 = Array.prototype, 1 = String.prototype). Only methods that
     /// `array_method`/`string_method` actually implement are listed, so a `.call`
     /// through the value behaves identically to a direct `arr.method()` call.
-    pub const PROTO_METHODS: &[(&str, u8)] = &[
-        // Array.prototype (join/push already on arr_proto via ARR_JOIN/ARR_PUSH).
-        ("at", 0), ("concat", 0), ("every", 0), ("fill", 0), ("filter", 0),
-        ("find", 0), ("findIndex", 0), ("findLast", 0), ("findLastIndex", 0),
-        ("flat", 0), ("flatMap", 0), ("forEach", 0), ("includes", 0),
-        ("indexOf", 0), ("lastIndexOf", 0), ("map", 0), ("pop", 0), ("reduce", 0),
-        ("reduceRight", 0), ("reverse", 0), ("shift", 0), ("slice", 0),
-        ("some", 0), ("sort", 0), ("splice", 0), ("toReversed", 0),
-        ("toSorted", 0), ("toSpliced", 0), ("toString", 0), ("with", 0),
-        ("copyWithin", 0),
+    pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
+        // (name, kind, spec `length`). join/push already on arr_proto via ARR_*.
+        // Array.prototype.
+        ("at", 0, 1), ("concat", 0, 1), ("every", 0, 1), ("fill", 0, 1), ("filter", 0, 1),
+        ("find", 0, 1), ("findIndex", 0, 1), ("findLast", 0, 1), ("findLastIndex", 0, 1),
+        ("flat", 0, 0), ("flatMap", 0, 1), ("forEach", 0, 1), ("includes", 0, 1),
+        ("indexOf", 0, 1), ("lastIndexOf", 0, 1), ("map", 0, 1), ("pop", 0, 0), ("reduce", 0, 1),
+        ("reduceRight", 0, 1), ("reverse", 0, 0), ("shift", 0, 0), ("slice", 0, 2),
+        ("some", 0, 1), ("sort", 0, 1), ("splice", 0, 2), ("toReversed", 0, 0),
+        ("toSorted", 0, 1), ("toSpliced", 0, 2), ("toString", 0, 0), ("with", 0, 2),
+        ("copyWithin", 0, 2),
         // String.prototype.
-        ("at", 1), ("charAt", 1), ("charCodeAt", 1), ("codePointAt", 1),
-        ("endsWith", 1), ("includes", 1), ("indexOf", 1), ("padEnd", 1),
-        ("padStart", 1), ("repeat", 1), ("replace", 1), ("replaceAll", 1),
-        ("slice", 1), ("split", 1), ("startsWith", 1), ("substring", 1),
-        ("toLowerCase", 1), ("toUpperCase", 1), ("trim", 1), ("trimEnd", 1),
-        ("trimStart", 1),
+        ("at", 1, 1), ("charAt", 1, 1), ("charCodeAt", 1, 1), ("codePointAt", 1, 1),
+        ("endsWith", 1, 1), ("includes", 1, 1), ("indexOf", 1, 1), ("padEnd", 1, 1),
+        ("padStart", 1, 1), ("repeat", 1, 1), ("replace", 1, 2), ("replaceAll", 1, 2),
+        ("slice", 1, 2), ("split", 1, 2), ("startsWith", 1, 1), ("substring", 1, 2),
+        ("toLowerCase", 1, 0), ("toUpperCase", 1, 0), ("trim", 1, 0), ("trimEnd", 1, 0),
+        ("trimStart", 1, 0),
         // Number.prototype (kind 2 → number_method, receiver is a number value).
-        ("toFixed", 2), ("toString", 2), ("valueOf", 2),
-        // Set.prototype (kind 3 → set_method on the Set receiver) — now that the
-        // full ES2025 method set is implemented.
-        ("add", 3), ("clear", 3), ("delete", 3), ("entries", 3), ("forEach", 3),
-        ("has", 3), ("keys", 3), ("values", 3), ("union", 3), ("intersection", 3),
-        ("difference", 3), ("symmetricDifference", 3), ("isSubsetOf", 3),
-        ("isSupersetOf", 3), ("isDisjointFrom", 3),
+        ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0),
+        // Set.prototype (kind 3 → set_method on the Set receiver).
+        ("add", 3, 1), ("clear", 3, 0), ("delete", 3, 1), ("entries", 3, 0), ("forEach", 3, 1),
+        ("has", 3, 1), ("keys", 3, 0), ("values", 3, 0), ("union", 3, 1), ("intersection", 3, 1),
+        ("difference", 3, 1), ("symmetricDifference", 3, 1), ("isSubsetOf", 3, 1),
+        ("isSupersetOf", 3, 1), ("isDisjointFrom", 3, 1),
         // Map.prototype (kind 4 → map_method on the Map receiver).
-        ("clear", 4), ("delete", 4), ("entries", 4), ("forEach", 4), ("get", 4),
-        ("has", 4), ("keys", 4), ("set", 4), ("values", 4),
+        ("clear", 4, 0), ("delete", 4, 1), ("entries", 4, 0), ("forEach", 4, 1), ("get", 4, 1),
+        ("has", 4, 1), ("keys", 4, 0), ("set", 4, 2), ("values", 4, 0),
         // Boolean.prototype (kind 5 → boolean_method on the boolean value).
-        ("toString", 5), ("valueOf", 5),
+        ("toString", 5, 0), ("valueOf", 5, 0),
         // Promise.prototype (kind 7 → promise_method on the Promise receiver).
-        ("then", 7), ("catch", 7), ("finally", 7),
-        // Date.prototype (kind 6 → date_method on the Date receiver).
-        ("getDate", 6), ("getDay", 6), ("getFullYear", 6), ("getHours", 6),
-        ("getMilliseconds", 6), ("getMinutes", 6), ("getMonth", 6), ("getSeconds", 6),
-        ("getTime", 6), ("getTimezoneOffset", 6), ("getUTCDate", 6), ("getUTCDay", 6),
-        ("getUTCFullYear", 6), ("getUTCHours", 6), ("getUTCMilliseconds", 6),
-        ("getUTCMinutes", 6), ("getUTCMonth", 6), ("getUTCSeconds", 6), ("setDate", 6),
-        ("setFullYear", 6), ("setHours", 6), ("setMilliseconds", 6), ("setMinutes", 6),
-        ("setMonth", 6), ("setSeconds", 6), ("setTime", 6), ("setUTCDate", 6),
-        ("setUTCFullYear", 6), ("setUTCHours", 6), ("setUTCMilliseconds", 6),
-        ("setUTCMinutes", 6), ("setUTCMonth", 6), ("setUTCSeconds", 6), ("toDateString", 6),
-        ("toISOString", 6), ("toJSON", 6), ("toLocaleDateString", 6), ("toLocaleString", 6),
-        ("toLocaleTimeString", 6), ("toString", 6), ("toTimeString", 6), ("toUTCString", 6),
-        ("valueOf", 6),
+        ("then", 7, 2), ("catch", 7, 1), ("finally", 7, 1),
+        // Date.prototype (kind 6 → date_method on the Date receiver). Getters length 0;
+        // setters per spec (setHours=4, setMinutes/setFullYear=3, setMonth/setSeconds=2, …).
+        ("getDate", 6, 0), ("getDay", 6, 0), ("getFullYear", 6, 0), ("getHours", 6, 0),
+        ("getMilliseconds", 6, 0), ("getMinutes", 6, 0), ("getMonth", 6, 0), ("getSeconds", 6, 0),
+        ("getTime", 6, 0), ("getTimezoneOffset", 6, 0), ("getUTCDate", 6, 0), ("getUTCDay", 6, 0),
+        ("getUTCFullYear", 6, 0), ("getUTCHours", 6, 0), ("getUTCMilliseconds", 6, 0),
+        ("getUTCMinutes", 6, 0), ("getUTCMonth", 6, 0), ("getUTCSeconds", 6, 0), ("setDate", 6, 1),
+        ("setFullYear", 6, 3), ("setHours", 6, 4), ("setMilliseconds", 6, 1), ("setMinutes", 6, 3),
+        ("setMonth", 6, 2), ("setSeconds", 6, 2), ("setTime", 6, 1), ("setUTCDate", 6, 1),
+        ("setUTCFullYear", 6, 3), ("setUTCHours", 6, 4), ("setUTCMilliseconds", 6, 1),
+        ("setUTCMinutes", 6, 3), ("setUTCMonth", 6, 2), ("setUTCSeconds", 6, 2), ("toDateString", 6, 0),
+        ("toISOString", 6, 0), ("toJSON", 6, 1), ("toLocaleDateString", 6, 0), ("toLocaleString", 6, 0),
+        ("toLocaleTimeString", 6, 0), ("toString", 6, 0), ("toTimeString", 6, 0), ("toUTCString", 6, 0),
+        ("valueOf", 6, 0),
     ];
 
     /// `(name, kind)` for a prototype-method native id, if it is one.
-    pub fn proto_method(id: u16) -> Option<(&'static str, u8)> {
+    pub fn proto_method(id: u16) -> Option<(&'static str, u8, u8)> {
         id.checked_sub(PROTO_METHOD_BASE)
             .and_then(|i| PROTO_METHODS.get(i as usize).copied())
     }
@@ -4440,7 +4441,7 @@ impl<'p> Vm<'p> {
         let mut bool_methods: Vec<(&str, u16)> = Vec::new();
         let mut date_methods: Vec<(&str, u16)> = Vec::new();
         let mut promise_methods: Vec<(&str, u16)> = Vec::new();
-        for (i, &(name, kind)) in native::PROTO_METHODS.iter().enumerate() {
+        for (i, &(name, kind, _len)) in native::PROTO_METHODS.iter().enumerate() {
             let id = native::PROTO_METHOD_BASE + i as u16;
             match kind {
                 0 => arr_methods.push((name, id)),
@@ -5068,7 +5069,7 @@ impl<'p> Vm<'p> {
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
-                let (m, kind) = native::proto_method(id).unwrap();
+                let (m, kind, _len) = native::proto_method(id).unwrap();
                 // Number/Boolean receivers are primitive values; the rest are heap.
                 if kind == 2 {
                     self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
@@ -5550,7 +5551,7 @@ impl<'p> Vm<'p> {
             // (`Array.prototype.map.name === "map"`, length 1) or a static/namespace
             // method (`Object.keys.name === "keys"`, `Reflect.get.length === 2`).
             HeapObj::Native(id) => native::proto_method(*id)
-                .map(|(n, _)| (n.to_string(), 1))
+                .map(|(n, _, l)| (n.to_string(), l as i32))
                 .or_else(|| native::math_method(*id).map(|(n, _, l)| (n.to_string(), l as i32)))
                 .or_else(|| native::static_name_length(*id).map(|(n, l)| (n.to_string(), l as i32))),
             _ => None,
