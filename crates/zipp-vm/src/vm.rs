@@ -144,6 +144,20 @@ mod native {
     pub const OBJ_GROUP_BY: u16 = 42;
     pub const MAP_GROUP_BY: u16 = 43;
     pub const PROMISE_WITH_RESOLVERS: u16 = 44;
+    // Reflect namespace statics.
+    pub const REFLECT_APPLY: u16 = 45;
+    pub const REFLECT_CONSTRUCT: u16 = 46;
+    pub const REFLECT_GET: u16 = 47;
+    pub const REFLECT_SET: u16 = 48;
+    pub const REFLECT_HAS: u16 = 49;
+    pub const REFLECT_DELETE: u16 = 50;
+    pub const REFLECT_OWN_KEYS: u16 = 51;
+    pub const REFLECT_GET_PROTO: u16 = 52;
+    pub const REFLECT_SET_PROTO: u16 = 53;
+    pub const REFLECT_DEFINE: u16 = 54;
+    pub const REFLECT_GET_OWN_DESC: u16 = 55;
+    pub const REFLECT_IS_EXT: u16 = 56;
+    pub const REFLECT_PREVENT_EXT: u16 = 57;
 
     /// First native id for a prototype method (`Array.prototype.map` etc.). Method
     /// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
@@ -4431,6 +4445,27 @@ impl<'p> Vm<'p> {
             ],
             Some(promise_proto),
         );
+        // `Reflect`: a namespace object (no .prototype) of static methods that
+        // mostly delegate to the existing property machinery.
+        let reflect_ctor = build(
+            self,
+            &[
+                ("apply", REFLECT_APPLY),
+                ("construct", REFLECT_CONSTRUCT),
+                ("get", REFLECT_GET),
+                ("set", REFLECT_SET),
+                ("has", REFLECT_HAS),
+                ("deleteProperty", REFLECT_DELETE),
+                ("ownKeys", REFLECT_OWN_KEYS),
+                ("getPrototypeOf", REFLECT_GET_PROTO),
+                ("setPrototypeOf", REFLECT_SET_PROTO),
+                ("defineProperty", REFLECT_DEFINE),
+                ("getOwnPropertyDescriptor", REFLECT_GET_OWN_DESC),
+                ("isExtensible", REFLECT_IS_EXT),
+                ("preventExtensions", REFLECT_PREVENT_EXT),
+            ],
+            None,
+        );
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -4450,6 +4485,7 @@ impl<'p> Vm<'p> {
                 "Boolean" => Some(boolean_ctor),
                 "Date" => Some(date_ctor),
                 "Promise" => Some(promise_ctor),
+                "Reflect" => Some(reflect_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -4702,6 +4738,134 @@ impl<'p> Vm<'p> {
                 map.set("resolve", resolve);
                 map.set("reject", reject);
                 Value::heap(self.heap.alloc(HeapObj::Object(map)))
+            }
+            // Reflect namespace. apply/construct accept any callable target; the
+            // property-reflecting methods require Type(target) === Object (else TypeError).
+            REFLECT_APPLY => {
+                let target = a0;
+                let this_arg = a1;
+                let args_list = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let arg_vec =
+                    if args_list.is_heap() { self.array_snapshot(args_list.heap_index()) } else { Vec::new() };
+                self.call_value(target, this_arg, &arg_vec)?
+            }
+            REFLECT_CONSTRUCT => {
+                let target = a0;
+                let arg_vec = if a1.is_heap() { self.array_snapshot(a1.heap_index()) } else { Vec::new() };
+                self.construct(target, &arg_vec)?
+            }
+            REFLECT_GET => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.get called on non-object".into()));
+                }
+                self.get_index(a0, a1)?
+            }
+            REFLECT_SET => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.set called on non-object".into()));
+                }
+                let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let key = self.display(a1);
+                // success = not blocked by a non-writable own data property, an
+                // accessor without a setter, or a new key on a non-extensible object.
+                let ok = match self.heap.get(a0.heap_index()) {
+                    HeapObj::Object(m) => match m.pos(&key) {
+                        Some(i) => {
+                            if m.attrs[i].accessor {
+                                m.attrs[i].setter != Value::UNDEFINED
+                            } else {
+                                m.attrs[i].writable
+                            }
+                        }
+                        None => m.extensible,
+                    },
+                    _ => true,
+                };
+                if ok {
+                    self.set_index(a0, a1, value)?;
+                }
+                Value::bool(ok)
+            }
+            REFLECT_HAS => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.has called on non-object".into()));
+                }
+                Value::bool(self.has_property(a0, a1))
+            }
+            REFLECT_DELETE => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.deleteProperty called on non-object".into()));
+                }
+                let key = self.display(a1);
+                self.delete_prop(a0, &key)
+            }
+            REFLECT_OWN_KEYS => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.ownKeys called on non-object".into()));
+                }
+                self.object_own_property_names(a0)
+            }
+            REFLECT_GET_PROTO => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.getPrototypeOf called on non-object".into()));
+                }
+                self.object_get_prototype_of(a0)
+            }
+            REFLECT_SET_PROTO => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.setPrototypeOf called on non-object".into()));
+                }
+                if a1 != Value::NULL && !self.is_object_value(a1) {
+                    return Err(Thrown(
+                        "TypeError: Reflect.setPrototypeOf prototype must be an object or null".into(),
+                    ));
+                }
+                self.proto_of.insert(a0.heap_index(), a1);
+                Value::bool(true)
+            }
+            REFLECT_DEFINE => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.defineProperty called on non-object".into()));
+                }
+                let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_object_value(desc) {
+                    return Err(Thrown("TypeError: Property description must be an object".into()));
+                }
+                let key = self.display(a1);
+                // Reflect.defineProperty returns false (not throw) when the definition
+                // is rejected (non-configurable redefine, non-extensible new key).
+                match self.object_define_property(a0, &key, desc) {
+                    Ok(()) => Value::bool(true),
+                    Err(_) => Value::bool(false),
+                }
+            }
+            REFLECT_GET_OWN_DESC => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Reflect.getOwnPropertyDescriptor called on non-object".into(),
+                    ));
+                }
+                let key = self.display(a1);
+                self.object_get_own_property_descriptor(a0, &key)
+            }
+            REFLECT_IS_EXT => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.isExtensible called on non-object".into()));
+                }
+                let ext = match self.heap.get(a0.heap_index()) {
+                    HeapObj::Object(m) => m.extensible,
+                    _ => true,
+                };
+                Value::bool(ext)
+            }
+            REFLECT_PREVENT_EXT => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.preventExtensions called on non-object".into()));
+                }
+                if let HeapObj::Object(m) = self.heap.get_mut(a0.heap_index()) {
+                    m.extensible = false;
+                }
+                Value::bool(true)
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
             PROMISE_RESOLVE => {
@@ -7859,6 +8023,12 @@ impl<'p> Vm<'p> {
     /// NaN (so NaN is a usable key and all NaNs dedupe). +0/-0 are equal here too
     /// (matching `===`); the store side normalizes -0 → +0. Strings compare by
     /// value, objects by reference identity, and there is no type coercion.
+    /// Whether `v` is a JS Object (Type(v) === Object): a heap value that is not a
+    /// primitive string (`Str`/`Cons`). Used by Reflect, which throws on non-objects.
+    fn is_object_value(&self, v: Value) -> bool {
+        v.is_heap() && !self.heap.is_str_like(v.heap_index())
+    }
+
     /// JS `SameValue` (Object.is): like SameValueZero but +0 and -0 are distinct.
     fn same_value(&self, a: Value, b: Value) -> bool {
         if a.is_number() && b.is_number() {
