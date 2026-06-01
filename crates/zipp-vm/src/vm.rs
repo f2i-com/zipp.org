@@ -177,6 +177,16 @@ mod native {
     pub const ITER_NEXT: u16 = 300;
     pub const ITER_SELF: u16 = 301; // `[Symbol.iterator]()` → returns the iterator
     pub const PROTO_TO_LOCALE_STRING: u16 = 302; // Object.prototype.toLocaleString
+    // Number static methods as first-class values (the CALL form is a StaticFn).
+    pub const NUM_IS_INTEGER: u16 = 303;
+    pub const NUM_IS_NAN: u16 = 304;
+    pub const NUM_IS_FINITE: u16 = 305;
+    pub const NUM_IS_SAFE_INTEGER: u16 = 306;
+    // Global functions as first-class values (the CALL form is a GlobalFn).
+    pub const GLOBAL_PARSE_INT: u16 = 307;
+    pub const GLOBAL_PARSE_FLOAT: u16 = 308;
+    pub const GLOBAL_IS_NAN: u16 = 309;
+    pub const GLOBAL_IS_FINITE: u16 = 310;
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -347,6 +357,14 @@ mod native {
             ITER_NEXT => ("next", 0),
             ITER_SELF => ("[Symbol.iterator]", 0),
             PROTO_TO_LOCALE_STRING => ("toLocaleString", 0),
+            NUM_IS_INTEGER => ("isInteger", 1),
+            NUM_IS_NAN => ("isNaN", 1),
+            NUM_IS_FINITE => ("isFinite", 1),
+            NUM_IS_SAFE_INTEGER => ("isSafeInteger", 1),
+            GLOBAL_PARSE_INT => ("parseInt", 2),
+            GLOBAL_PARSE_FLOAT => ("parseFloat", 1),
+            GLOBAL_IS_NAN => ("isNaN", 1),
+            GLOBAL_IS_FINITE => ("isFinite", 1),
             _ => return None,
         })
     }
@@ -4684,6 +4702,18 @@ impl<'p> Vm<'p> {
             for &(n, v) in consts {
                 m.define(n, Value::num(v), proto_attr);
             }
+            // Static methods as first-class values (the call form is StaticFn/GlobalFn).
+            for &(name, id) in &[
+                ("isInteger", NUM_IS_INTEGER),
+                ("isNaN", NUM_IS_NAN),
+                ("isFinite", NUM_IS_FINITE),
+                ("isSafeInteger", NUM_IS_SAFE_INTEGER),
+                ("parseInt", GLOBAL_PARSE_INT),
+                ("parseFloat", GLOBAL_PARSE_FLOAT),
+            ] {
+                let nv = Value::heap(self.heap.alloc(HeapObj::Native(id)));
+                m.define(name, nv, method_attr);
+            }
             m.define("prototype", Value::heap(num_proto), proto_attr);
             m.is_ctor = true; // Number is a constructor (typeof "function").
             self.heap.alloc(HeapObj::Object(m))
@@ -4835,6 +4865,11 @@ impl<'p> Vm<'p> {
             }
             idx
         };
+        // Bare global functions as first-class values (the call form is GlobalFn).
+        let parse_int_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_INT));
+        let parse_float_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_FLOAT));
+        let is_nan_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_NAN));
+        let is_finite_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_FINITE));
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -4861,6 +4896,10 @@ impl<'p> Vm<'p> {
                 "WeakSet" => Some(weakset_ctor),
                 "WeakRef" => Some(weakref_ctor),
                 "FinalizationRegistry" => Some(finreg_ctor),
+                "parseInt" => Some(parse_int_fn),
+                "parseFloat" => Some(parse_float_fn),
+                "isNaN" => Some(is_nan_fn),
+                "isFinite" => Some(is_finite_fn),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -5353,6 +5392,20 @@ impl<'p> Vm<'p> {
                 Value::heap(self.heap.alloc(HeapObj::Object(m)))
             }
             ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
+            // Number static methods as values (no coercion, per spec).
+            NUM_IS_INTEGER => Value::bool(num_is_integer(a0)),
+            NUM_IS_NAN => Value::bool(a0.is_double() && a0.as_f64().is_nan()),
+            NUM_IS_FINITE => Value::bool(num_is_finite(a0)),
+            NUM_IS_SAFE_INTEGER => Value::bool(num_is_safe_integer(a0)),
+            // Global functions as values.
+            GLOBAL_PARSE_INT => {
+                let s = self.display(a0);
+                let radix = if args.len() >= 2 { self.to_number(a1)? as i32 } else { 0 };
+                Value::num(parse_int(&s, radix))
+            }
+            GLOBAL_PARSE_FLOAT => Value::num(parse_float(&self.display(a0))),
+            GLOBAL_IS_NAN => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan()),
+            GLOBAL_IS_FINITE => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite()),
             // Object.prototype.toLocaleString() → this.toString().
             PROTO_TO_LOCALE_STRING => {
                 let ts = self.get_prop(this, "toString")?;
