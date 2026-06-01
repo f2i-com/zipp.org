@@ -158,6 +158,9 @@ mod native {
     pub const REFLECT_GET_OWN_DESC: u16 = 55;
     pub const REFLECT_IS_EXT: u16 = 56;
     pub const REFLECT_PREVENT_EXT: u16 = 57;
+    // JSON namespace methods as first-class values.
+    pub const JSON_PARSE: u16 = 58;
+    pub const JSON_STRINGIFY: u16 = 59;
 
     /// First native id for a prototype method (`Array.prototype.map` etc.). Method
     /// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
@@ -283,6 +286,8 @@ mod native {
             REFLECT_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),
             REFLECT_IS_EXT => ("isExtensible", 1),
             REFLECT_PREVENT_EXT => ("preventExtensions", 1),
+            JSON_PARSE => ("parse", 2),
+            JSON_STRINGIFY => ("stringify", 3),
             _ => return None,
         })
     }
@@ -4532,6 +4537,9 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
+        // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
+        // forms are compile-lowered to ops; these back the value form + reflection.
+        let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -4552,6 +4560,7 @@ impl<'p> Vm<'p> {
                 "Date" => Some(date_ctor),
                 "Promise" => Some(promise_ctor),
                 "Reflect" => Some(reflect_ctor),
+                "JSON" => Some(json_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -4945,6 +4954,21 @@ impl<'p> Vm<'p> {
                     m.extensible = false;
                 }
                 Value::bool(true)
+            }
+            // JSON namespace methods as values (`JSON.parse`/`JSON.stringify`).
+            // (The direct `JSON.parse(x)` call form is compile-lowered to a JSON op;
+            // these back the value form + reflection.)
+            JSON_PARSE => {
+                let s = self.display(a0);
+                self.json_parse(&s)?
+            }
+            JSON_STRINGIFY => {
+                let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let indent = self.json_indent(space);
+                match self.json_value(a0, &indent, 0) {
+                    Some(s) => self.alloc_str(s),
+                    None => Value::UNDEFINED,
+                }
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
             PROMISE_RESOLVE => {
