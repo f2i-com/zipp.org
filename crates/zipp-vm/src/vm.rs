@@ -4651,6 +4651,28 @@ impl<'p> Vm<'p> {
                 _ => None,
             };
             if let Some(v) = v {
+                // Constructor globals expose own `name`/`length` like any function
+                // ({writable:false, enumerable:false, configurable:true}). Namespaces
+                // (Reflect/Math/JSON, is_ctor==false) don't.
+                if matches!(self.heap.get(v), HeapObj::Object(m) if m.is_ctor) {
+                    let len = match name.as_str() {
+                        "Date" => 7.0,
+                        "Map" | "Set" => 0.0,
+                        _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise
+                    };
+                    let nm = self.alloc_str(name.clone());
+                    let fn_attr = PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    };
+                    if let HeapObj::Object(m) = self.heap.get_mut(v) {
+                        m.define("length", Value::num(len), fn_attr);
+                        m.define("name", nm, fn_attr);
+                    }
+                }
                 sets.push((slot, v));
             }
         }
