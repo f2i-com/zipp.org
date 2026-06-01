@@ -154,9 +154,12 @@ mod native {
         ("trimStart", 1),
         // Number.prototype (kind 2 → number_method, receiver is a number value).
         ("toFixed", 2), ("toString", 2), ("valueOf", 2),
-        // (Set.prototype/kind 3 omitted — injecting a Set global net-regressed
-        // built-ins/Set by 7; revisit with the full ES2025 Set method set +
-        // @@iterator before exposing it.)
+        // Set.prototype (kind 3 → set_method on the Set receiver) — now that the
+        // full ES2025 method set is implemented.
+        ("add", 3), ("clear", 3), ("delete", 3), ("entries", 3), ("forEach", 3),
+        ("has", 3), ("keys", 3), ("values", 3), ("union", 3), ("intersection", 3),
+        ("difference", 3), ("symmetricDifference", 3), ("isSubsetOf", 3),
+        ("isSupersetOf", 3), ("isDisjointFrom", 3),
         // Map.prototype (kind 4 → map_method on the Map receiver).
         ("clear", 4), ("delete", 4), ("entries", 4), ("forEach", 4), ("get", 4),
         ("has", 4), ("keys", 4), ("set", 4), ("values", 4),
@@ -4269,6 +4272,7 @@ impl<'p> Vm<'p> {
         let mut arr_methods: Vec<(&str, u16)> = vec![("join", ARR_JOIN), ("push", ARR_PUSH)];
         let mut str_methods: Vec<(&str, u16)> = Vec::new();
         let mut num_methods: Vec<(&str, u16)> = Vec::new();
+        let mut set_methods: Vec<(&str, u16)> = Vec::new();
         let mut map_methods: Vec<(&str, u16)> = Vec::new();
         let mut bool_methods: Vec<(&str, u16)> = Vec::new();
         let mut date_methods: Vec<(&str, u16)> = Vec::new();
@@ -4279,6 +4283,7 @@ impl<'p> Vm<'p> {
                 0 => arr_methods.push((name, id)),
                 1 => str_methods.push((name, id)),
                 2 => num_methods.push((name, id)),
+                3 => set_methods.push((name, id)),
                 4 => map_methods.push((name, id)),
                 5 => bool_methods.push((name, id)),
                 6 => date_methods.push((name, id)),
@@ -4289,6 +4294,7 @@ impl<'p> Vm<'p> {
         self.str_proto = build(self, &str_methods, None);
         let str_proto = self.str_proto;
         let num_proto = build(self, &num_methods, None);
+        let set_proto = build(self, &set_methods, None);
         let map_proto = build(self, &map_methods, None);
         let bool_proto = build(self, &bool_methods, None);
         let date_proto = build(self, &date_methods, None);
@@ -4337,8 +4343,9 @@ impl<'p> Vm<'p> {
             m.define("prototype", Value::heap(num_proto), proto_attr);
             self.heap.alloc(HeapObj::Object(m))
         };
-        // Map / Boolean / Date globals: their .prototype (construction is
-        // compile-lowered to NewMap / DateNew; the value-level shape is built here).
+        // Set / Map / Boolean / Date globals: their .prototype (construction is
+        // compile-lowered to NewSet / NewMap / DateNew; value-level shape here).
+        let set_ctor = build(self, &[], Some(set_proto));
         let map_ctor = build(self, &[], Some(map_proto));
         let boolean_ctor = build(self, &[], Some(bool_proto));
         let date_ctor = build(self, &[], Some(date_proto));
@@ -4370,6 +4377,7 @@ impl<'p> Vm<'p> {
                 "Function" => Some(function_ctor),
                 "String" => Some(string_ctor),
                 "Number" => Some(number_ctor),
+                "Set" => Some(set_ctor),
                 "Map" => Some(map_ctor),
                 "Boolean" => Some(boolean_ctor),
                 "Date" => Some(date_ctor),
@@ -4488,6 +4496,7 @@ impl<'p> Vm<'p> {
                     let r = match kind {
                         0 => self.array_method(this.heap_index(), m, args)?,
                         1 => self.string_method(this.heap_index(), m, args)?,
+                        3 => self.set_method(this.heap_index(), m, args)?,
                         4 => self.map_method(this.heap_index(), m, args)?,
                         6 => self.date_method(this.heap_index(), m, args)?,
                         _ => self.promise_method(this.heap_index(), m, args)?, // kind 7
