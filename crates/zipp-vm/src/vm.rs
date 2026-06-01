@@ -176,6 +176,7 @@ mod native {
     // Built-in iterator methods.
     pub const ITER_NEXT: u16 = 300;
     pub const ITER_SELF: u16 = 301; // `[Symbol.iterator]()` → returns the iterator
+    pub const PROTO_TO_LOCALE_STRING: u16 = 302; // Object.prototype.toLocaleString
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -223,6 +224,7 @@ mod native {
         ("some", 0, 1), ("sort", 0, 1), ("splice", 0, 2), ("toReversed", 0, 0),
         ("toSorted", 0, 1), ("toSpliced", 0, 2), ("toString", 0, 0), ("with", 0, 2),
         ("copyWithin", 0, 2), ("entries", 0, 0), ("keys", 0, 0), ("values", 0, 0),
+        ("toLocaleString", 0, 0),
         // String.prototype.
         ("at", 1, 1), ("charAt", 1, 1), ("charCodeAt", 1, 1), ("codePointAt", 1, 1),
         ("endsWith", 1, 1), ("includes", 1, 1), ("indexOf", 1, 1), ("padEnd", 1, 1),
@@ -231,7 +233,7 @@ mod native {
         ("toLowerCase", 1, 0), ("toUpperCase", 1, 0), ("trim", 1, 0), ("trimEnd", 1, 0),
         ("trimStart", 1, 0),
         // Number.prototype (kind 2 → number_method, receiver is a number value).
-        ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0),
+        ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0), ("toLocaleString", 2, 0),
         // Set.prototype (kind 3 → set_method on the Set receiver).
         ("add", 3, 1), ("clear", 3, 0), ("delete", 3, 1), ("entries", 3, 0), ("forEach", 3, 1),
         ("has", 3, 1), ("keys", 3, 0), ("values", 3, 0), ("union", 3, 1), ("intersection", 3, 1),
@@ -343,6 +345,7 @@ mod native {
             FR_UNREGISTER => ("unregister", 1),
             ITER_NEXT => ("next", 0),
             ITER_SELF => ("[Symbol.iterator]", 0),
+            PROTO_TO_LOCALE_STRING => ("toLocaleString", 0),
             _ => return None,
         })
     }
@@ -4576,6 +4579,7 @@ impl<'p> Vm<'p> {
                 ("isPrototypeOf", PROTO_IS_PROTO_OF),
                 ("valueOf", PROTO_VALUE_OF),
                 ("toString", PROTO_TO_STRING),
+                ("toLocaleString", PROTO_TO_LOCALE_STRING),
             ],
             None,
         );
@@ -5348,6 +5352,15 @@ impl<'p> Vm<'p> {
                 Value::heap(self.heap.alloc(HeapObj::Object(m)))
             }
             ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
+            // Object.prototype.toLocaleString() → this.toString().
+            PROTO_TO_LOCALE_STRING => {
+                let ts = self.get_prop(this, "toString")?;
+                if self.is_callable(ts) {
+                    self.call_value(ts, this, &[])?
+                } else {
+                    return Err(Thrown("TypeError: toString is not callable".into()));
+                }
+            }
             // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
             // form is compile-lowered to MathOp; these back the value form.
             _ if native::math_method(id).is_some() => {
@@ -7771,6 +7784,8 @@ impl<'p> Vm<'p> {
                 }
             }
             "valueOf" => Ok(Some(recv)),
+            // No Intl: toLocaleString() behaves like the default base-10 toString().
+            "toLocaleString" => Ok(Some(self.alloc_str(self.display(recv)))),
             _ => Ok(None),
         }
     }
@@ -8075,7 +8090,7 @@ impl<'p> Vm<'p> {
                     | "find" | "findIndex" | "findLast" | "findLastIndex" | "indexOf"
                     | "lastIndexOf" | "includes" | "join" | "toString" | "slice" | "at"
                     | "concat" | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
-                    | "toSpliced" | "entries" | "keys" | "values"
+                    | "toSpliced" | "entries" | "keys" | "values" | "toLocaleString"
             )
         {
             let elems = self.array_like_read(idx);
@@ -8475,6 +8490,26 @@ impl<'p> Vm<'p> {
                     .map(|(i, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![Value::int(i as i32), v]))))
                     .collect();
                 Ok(Some(self.make_iterator(items, self.array_iter_proto)))
+            }
+            "toLocaleString" => {
+                // Join each element's own toLocaleString() with ","; nullish → "".
+                let snapshot = self.array_snapshot(idx);
+                let mut parts: Vec<String> = Vec::with_capacity(snapshot.len());
+                for v in snapshot {
+                    if v.is_nullish() {
+                        parts.push(String::new());
+                    } else {
+                        let f = self.get_prop(v, "toLocaleString")?;
+                        let s = if self.is_callable(f) {
+                            let r = self.call_value(f, v, &[])?;
+                            self.display(r)
+                        } else {
+                            self.display(v)
+                        };
+                        parts.push(s);
+                    }
+                }
+                Ok(Some(self.alloc_str(parts.join(","))))
             }
             "with" => {
                 // with(index, value): a COPY with one index replaced. The index is

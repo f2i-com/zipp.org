@@ -1028,6 +1028,7 @@ impl<'a> FnCompiler<'a> {
             S::TryStatement(t) => self.try_statement(t)?,
             S::ClassDeclaration(c) => self.class_decl(c)?,
             S::EmptyStatement(_) => {}
+            S::DebuggerStatement(_) => {} // `debugger;` is a no-op (no attached debugger)
             _ => return Err("unsupported statement (not in the zipp-vm v1 subset yet)".into()),
         }
         Ok(())
