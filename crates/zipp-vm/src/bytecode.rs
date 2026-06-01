@@ -154,6 +154,9 @@ pub enum Instr {
     /// to; its runtime `ClassData.parent` is the superclass to invoke (so an
     /// `extends <arbitrary expression>` parent resolves dynamically).
     SuperCtor { home_class_id: u32, arg_base: Reg, argc: u16 },
+    /// `super(...args_array)`: like SuperCtor but spreads the elements of the
+    /// array in `args` (`super(...xs)` in a derived constructor).
+    SuperCtorSpread { home_class_id: u32, args: Reg },
     /// `dst = super.<name>(args…)`: call the named method found from the lexical
     /// superclass up its chain, with `this` = the current frame's `this` (reg 0).
     SuperMethod { dst: Reg, home_class_id: u32, name: u32, arg_base: Reg, argc: u16 },
@@ -186,6 +189,9 @@ pub enum Instr {
     /// the array in `args` (`this` = obj). Handles builtin methods (e.g.
     /// `arr.push(...xs)`) and user methods alike.
     CallMethodSpread { dst: Reg, obj: Reg, name: u32, args: Reg },
+    /// `dst = new callee(...args_array)` — construct `callee` spreading the
+    /// elements of the array in `args` as the arguments.
+    NewSpread { dst: Reg, callee: Reg, args: Reg },
     /// `dst = Math.<op>(args…)` — a builtin Math function over `argc` contiguous
     /// argument registers starting at `arg_base`.
     MathOp { dst: Reg, op: MathFn, arg_base: Reg, argc: u16 },

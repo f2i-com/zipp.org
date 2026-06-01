@@ -1476,6 +1476,14 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
+                    Instr::NewSpread { dst, callee, args } => {
+                        let cv = self.get(base, callee);
+                        let args_v = self.get(base, args);
+                        let arg_vec = self.array_snapshot(args_v.heap_index());
+                        let result = self.construct(cv, &arg_vec)?;
+                        self.set(base, dst, result);
+                        ip += 1;
+                    }
                     Instr::PushFieldKey { class, key } => {
                         let cv = self.get(base, class);
                         let kv = self.get(base, key);
@@ -1512,6 +1520,15 @@ impl<'p> Vm<'p> {
                             args.push(self.get(base, arg_base + i));
                         }
                         self.run_class_ctor(parent, this, &args)?;
+                        ip += 1;
+                    }
+                    Instr::SuperCtorSpread { home_class_id, args } => {
+                        let parent = self.super_parent(home_class_id)
+                            .ok_or_else(|| Thrown("TypeError: superclass is not a constructor".into()))?;
+                        let this = self.get(base, 0);
+                        let args_v = self.get(base, args);
+                        let arg_vec = self.array_snapshot(args_v.heap_index());
+                        self.run_class_ctor(parent, this, &arg_vec)?;
                         ip += 1;
                     }
                     Instr::SuperMethod { dst, home_class_id, name, arg_base, argc } => {

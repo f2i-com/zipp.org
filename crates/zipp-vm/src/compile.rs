@@ -2637,8 +2637,15 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
                 // General `new C(args)`: evaluate the constructor value, then the
-                // args (contiguous), and let the VM build the instance.
+                // args (contiguous), and let the VM build the instance. When the
+                // arguments contain a spread (`new C(...xs)`), build a flat args
+                // array and construct via NewSpread instead.
                 let callee = self.expr(&n.callee)?;
+                if n.arguments.iter().any(|a| a.as_expression().is_none()) {
+                    let args_arr = self.build_spread_args(&n.arguments)?;
+                    self.emit(Instr::NewSpread { dst, callee, args: args_arr });
+                    return Ok(dst);
+                }
                 let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
                 self.emit(Instr::New { dst, callee, arg_base, argc });
                 Ok(dst)
@@ -3886,6 +3893,18 @@ impl<'a> FnCompiler<'a> {
         // (plain function value). Spread on a builtin like Math.max(...arr) that
         // isn't a method call is out of scope.
         if c.arguments.iter().any(|a| matches!(a, ox::Argument::SpreadElement(_))) {
+            // `super(...args)` — spread into the superclass constructor. Handled
+            // here (before the generic branches) because `super` is not a value
+            // and would fail `expr(callee)`.
+            if matches!(&c.callee, ox::Expression::Super(_)) {
+                let pid = self
+                    .super_class
+                    .ok_or("`super(...)` is only valid in a derived class constructor")?;
+                let args_arr = self.build_spread_args(&c.arguments)?;
+                self.emit(Instr::SuperCtorSpread { home_class_id: pid, args: args_arr });
+                self.emit(Instr::LoadUndefined { dst });
+                return Ok(dst);
+            }
             // `Math.max(...arr)` / `Math.min(...arr)` / `Math.hypot(...arr)` —
             // a variadic Math reduction over the spread array.
             if let ox::Expression::StaticMemberExpression(m) = &c.callee {
@@ -3922,6 +3941,7 @@ impl<'a> FnCompiler<'a> {
             let pid = self
                 .super_class
                 .ok_or("`super(...)` is only valid in a derived class constructor")?;
+            // (Spread `super(...args)` is handled in the spread block above.)
             let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
             self.emit(Instr::SuperCtor { home_class_id: pid, arg_base, argc });
             self.emit(Instr::LoadUndefined { dst }); // `super()` yields undefined here
