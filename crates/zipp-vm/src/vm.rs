@@ -941,6 +941,10 @@ impl<'p> Vm<'p> {
                 return Ok(Value::UNDEFINED);
             }
         }
+        // %Function.prototype% is itself a callable that returns undefined.
+        if callee.is_heap() && self.fn_proto != 0 && callee.heap_index() == self.fn_proto {
+            return Ok(Value::UNDEFINED);
+        }
         let (func_id, closure) = self.resolve_callable(callee)?;
         let (is_gen, is_async) = {
             let p = &self.program.functions[func_id as usize];
@@ -2493,10 +2497,12 @@ impl<'p> Vm<'p> {
                             }
                             // A bound or native function: run via call_value (fixes
                             // `this`/prepends bound args, or dispatches the builtin).
+                            // %Function.prototype% is also a callable (returns undefined).
                             if matches!(
                                 self.heap.get(callee_v.heap_index()),
                                 HeapObj::Bound { .. } | HeapObj::Native(_)
-                            ) {
+                            ) || (self.fn_proto != 0 && callee_v.heap_index() == self.fn_proto)
+                            {
                                 let argv: Vec<Value> =
                                     (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                                 let r = self.call_value(callee_v, Value::UNDEFINED, &argv)?;
@@ -2592,10 +2598,10 @@ impl<'p> Vm<'p> {
                         // A native or bound method value (e.g. inherited from a
                         // prototype) is invoked via call_value with this = recv.
                         if prop.is_heap()
-                            && matches!(
+                            && (matches!(
                                 self.heap.get(prop.heap_index()),
                                 HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::BoundResolver { .. }
-                            )
+                            ) || (self.fn_proto != 0 && prop.heap_index() == self.fn_proto))
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -2656,10 +2662,10 @@ impl<'p> Vm<'p> {
                         let method = self.get_index(recv, k)?;
                         // A native / bound / resolver method value runs via call_value.
                         if method.is_heap()
-                            && matches!(
+                            && (matches!(
                                 self.heap.get(method.heap_index()),
                                 HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::BoundResolver { .. }
-                            )
+                            ) || (self.fn_proto != 0 && method.heap_index() == self.fn_proto))
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -6578,6 +6584,8 @@ impl<'p> Vm<'p> {
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
                 // The built-in constructor globals (Object/Array/Map/…) are callable.
                 HeapObj::Object(m) if m.is_ctor => "function",
+                // %Function.prototype% is itself a (no-op) callable function.
+                HeapObj::Object(_) if v.heap_index() == self.fn_proto && self.fn_proto != 0 => "function",
                 _ => "object", // Array, ordinary Object, namespace globals
             }
         } else {
