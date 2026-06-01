@@ -1926,6 +1926,9 @@ impl<'p> Vm<'p> {
                             match self.heap.get(c.heap_index()) {
                                 HeapObj::Class(_) => 1u8,
                                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } => 2,
+                                // Built-in constructor globals (Map/Set/Date/WeakMap/…)
+                                // are objects but constructable: use prototype-chain check.
+                                HeapObj::Object(m) if m.is_ctor => 2,
                                 _ => 0,
                             }
                         } else {
@@ -4434,6 +4437,13 @@ impl<'p> Vm<'p> {
             return None;
         }
         let idx = obj.heap_index();
+        // A built-in constructor global (Map/Set/Date/…) keeps its .prototype as an
+        // own property; return it so `x instanceof Map` (instanceof_via_proto) works.
+        if let HeapObj::Object(m) = self.heap.get(idx) {
+            if m.is_ctor {
+                return m.get("prototype");
+            }
+        }
         if !matches!(
             self.heap.get(idx),
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class(_)
@@ -5455,6 +5465,20 @@ impl<'p> Vm<'p> {
         }
         if idx == self.obj_proto {
             return Value::NULL; // Object.prototype's [[Prototype]] is null
+        }
+        // Built-in instance types delegate to their respective prototype (so
+        // `Object.getPrototypeOf(new Map()) === Map.prototype` and `m instanceof Map`).
+        let builtin_proto = match self.heap.get(idx) {
+            HeapObj::Map { .. } => self.map_proto,
+            HeapObj::Set(_) => self.set_proto,
+            HeapObj::WeakMap { .. } => self.weakmap_proto,
+            HeapObj::WeakSet(_) => self.weakset_proto,
+            HeapObj::Date(_) => self.date_proto,
+            HeapObj::Promise { .. } => self.promise_proto,
+            _ => 0,
+        };
+        if builtin_proto != 0 {
+            return Value::heap(builtin_proto);
         }
         // kind: 0=plain/instance object, 1=callable, 2=array, 3=other.
         let (class, kind) = match self.heap.get(idx) {
