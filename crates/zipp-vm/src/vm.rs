@@ -3758,6 +3758,19 @@ impl<'p> Vm<'p> {
         );
         let array_ctor = build(self, &[("isArray", ARR_IS_ARRAY), ("from", ARR_FROM), ("of", ARR_OF)], Some(arr_proto));
         let function_ctor = build(self, &[], Some(fn_proto));
+        // `.name` on each constructor (`Array.name === "Array"`), and a
+        // `constructor` back-reference on each prototype (`[].constructor === Array`).
+        for (idx, nm) in [(object_ctor, "Object"), (array_ctor, "Array"), (function_ctor, "Function")] {
+            let nv = self.alloc_str(nm.to_string());
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.define("name", nv, method_attr);
+            }
+        }
+        for (proto, ctor) in [(obj_proto, object_ctor), (arr_proto, array_ctor), (fn_proto, function_ctor)] {
+            if let HeapObj::Object(m) = self.heap.get_mut(proto) {
+                m.define("constructor", Value::heap(ctor), method_attr);
+            }
+        }
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).
         let mut sets: Vec<(usize, u32)> = Vec::new();
@@ -4200,6 +4213,10 @@ impl<'p> Vm<'p> {
                 } else if key == "raw" {
                     // A tagged-template strings array's `.raw` (side table).
                     Ok(self.template_raws.get(&obj.heap_index()).copied().unwrap_or(Value::UNDEFINED))
+                } else if self.arr_proto != 0 {
+                    // Delegate to Array.prototype (`.constructor`, and array methods
+                    // accessed as values like `[].join`).
+                    self.get_prop(Value::heap(self.arr_proto), key)
                 } else {
                     Ok(Value::UNDEFINED)
                 }
