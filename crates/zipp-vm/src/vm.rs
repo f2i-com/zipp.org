@@ -443,6 +443,10 @@ pub struct Vm<'p> {
     /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
     /// iterators (and the default array `@@iterator`). 0 until set up.
     array_iter_proto: u32,
+    /// `%MapIteratorPrototype%` / `%SetIteratorPrototype%` — distinct prototypes so
+    /// `getPrototypeOf(map.entries())` differs from a Set/Array iterator's.
+    map_iter_proto: u32,
+    set_iter_proto: u32,
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
@@ -534,6 +538,8 @@ impl<'p> Vm<'p> {
             weakref_proto: 0,
             finreg_proto: 0,
             array_iter_proto: 0,
+            map_iter_proto: 0,
+            set_iter_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -4245,13 +4251,14 @@ impl<'p> Vm<'p> {
                         None => return Ok(Value::UNDEFINED),
                     }
                 }
-                // Non-numeric key: only `s["length"]` is meaningful — mirror the
-                // array and `s.length` paths.
+                // Non-numeric key: `s["length"]`, else resolve via String.prototype
+                // (a computed method name / `@@iterator`), mirroring dot access.
                 let char_len = s.char_len;
-                if self.display(key) == "length" {
+                let k = self.display(key);
+                if k == "length" {
                     return Ok(len_value(char_len));
                 }
-                Ok(Value::UNDEFINED)
+                self.get_prop(obj, &k)
             }
             // Positional access drives for-of / spread over a Map (the i-th
             // [key, value] entry) and a Set (the i-th value). Insertion order.
@@ -4261,16 +4268,21 @@ impl<'p> Vm<'p> {
                         let (k, v) = (keys[i], vals[i]);
                         return Ok(Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))));
                     }
+                    return Ok(Value::UNDEFINED);
                 }
-                Ok(Value::UNDEFINED)
+                // Non-numeric key (`map[Symbol.iterator]`, `map["set"]`): via prototype.
+                let k = self.display(key);
+                self.get_prop(obj, &k)
             }
             HeapObj::Set(items) => {
                 if let Some(i) = array_index(key) {
                     if i < items.len() {
                         return Ok(items[i]);
                     }
+                    return Ok(Value::UNDEFINED);
                 }
-                Ok(Value::UNDEFINED)
+                let k = self.display(key);
+                self.get_prop(obj, &k)
             }
             _ => Ok(Value::UNDEFINED),
         }
@@ -4732,6 +4744,36 @@ impl<'p> Vm<'p> {
         // iterators delegate here.
         let array_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
         self.array_iter_proto = array_iter_proto;
+        // Distinct %MapIteratorPrototype% / %SetIteratorPrototype% (same natives,
+        // different identity so getPrototypeOf discriminates them).
+        self.map_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        self.set_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        // Default @@iterator: Map → entries, Set → values (alias to the same fn).
+        let map_entries = match self.heap.get(map_proto) {
+            HeapObj::Object(m) => m.get("entries"),
+            _ => None,
+        };
+        let set_values = match self.heap.get(set_proto) {
+            HeapObj::Object(m) => m.get("values"),
+            _ => None,
+        };
+        let iter_attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        if let Some(v) = map_entries {
+            if let HeapObj::Object(m) = self.heap.get_mut(map_proto) {
+                m.define("@@iterator", v, iter_attr);
+            }
+        }
+        if let Some(v) = set_values {
+            if let HeapObj::Object(m) = self.heap.get_mut(set_proto) {
+                m.define("@@iterator", v, iter_attr);
+            }
+        }
         // `Array.prototype[Symbol.iterator]` IS `Array.prototype.values` (same fn).
         let values_fn = match self.heap.get(self.arr_proto) {
             HeapObj::Object(m) => m.get("values"),
@@ -6770,20 +6812,20 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::UNDEFINED))
             }
-            // Iterators are approximated as arrays (iterable / spreadable alike).
+            // Real iterators over %MapIteratorPrototype% (snapshot semantics).
             "keys" => {
                 let v = match self.heap.get(idx) {
                     HeapObj::Map { keys, .. } => keys.clone(),
                     _ => Vec::new(),
                 };
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(v)))))
+                Ok(Some(self.make_iterator(v, self.map_iter_proto)))
             }
             "values" => {
                 let v = match self.heap.get(idx) {
                     HeapObj::Map { vals, .. } => vals.clone(),
                     _ => Vec::new(),
                 };
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(v)))))
+                Ok(Some(self.make_iterator(v, self.map_iter_proto)))
             }
             "entries" => {
                 let pairs: Vec<(Value, Value)> = match self.heap.get(idx) {
@@ -6796,7 +6838,7 @@ impl<'p> Vm<'p> {
                     .into_iter()
                     .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))
                     .collect();
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(entries)))))
+                Ok(Some(self.make_iterator(entries, self.map_iter_proto)))
             }
             _ => Ok(None),
         }
@@ -7026,13 +7068,13 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::UNDEFINED))
             }
-            // keys() === values() for a Set; both yield the values.
+            // keys() === values() for a Set; both yield the values (real iterator).
             "keys" | "values" => {
                 let v = match self.heap.get(idx) {
                     HeapObj::Set(items) => items.clone(),
                     _ => Vec::new(),
                 };
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(v)))))
+                Ok(Some(self.make_iterator(v, self.set_iter_proto)))
             }
             "entries" => {
                 let items = match self.heap.get(idx) {
@@ -7043,7 +7085,7 @@ impl<'p> Vm<'p> {
                     .into_iter()
                     .map(|v| Value::heap(self.heap.alloc(HeapObj::Array(vec![v, v]))))
                     .collect();
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(entries)))))
+                Ok(Some(self.make_iterator(entries, self.set_iter_proto)))
             }
             // ES2025 set methods. `other` must be set-like; the common (and tested)
             // case is a real Set, whose elements we read directly.
