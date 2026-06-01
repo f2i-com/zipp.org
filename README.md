@@ -524,7 +524,7 @@ byte-identical to node):
 | 200k `s[i]===c` scan loop | 0.9 ms | 2.0 ms | 2.2× (sub-ms) |
 | 4M object field read/write | 4.6 ms | 8.6 ms | 1.86× |
 | 100k string concat + scan | 6.0 ms | 14 ms | 2.38× |
-| fib(37) recursion | 140 ms | 388 ms | 2.78× |
+| fib(37) recursion | 140 ms | 204 ms | 1.46× |
 
 zipp **beats V8 across the whole array `map`/`filter`/`reduce` pipeline** (~2×
 faster end-to-end): each is compiled to a *fused native kernel* — a tight loop
@@ -536,10 +536,14 @@ O(n log n) merge sort), and **ties on the integer loop** (native int64 OSR JIT).
 **String scans now JIT too:** both `s.charCodeAt(i)===n` and `s[i]==="c"` compile
 in the OSR region (the region's `===` is polymorphic — numeric operands compare as
 f64, interned single-char strings compare by NaN-boxed bits), turning a former ~20×
-gap into ~2× (sub-millisecond absolute). It still trails on: object field access
-(~1.9×); deep recursion (a per-call native↔interpreter round-trip — a fully native
-call frame is future work); and string *concatenation* (`s += …` builds rope nodes
-that still allocate). **Startup is ~10× faster** (≈21 ms vs ≈218 ms — no V8
+gap into ~2× (sub-millisecond absolute). **Self-recursion runs native-to-native:**
+a recursive call compiles to a direct native call to the function's own entry (an
+inline depth guard bounds the native stack; runaway recursion still deopts to a
+catchable `RangeError`), cutting fib(37) from ~2.8× to ~1.5× off V8. It still trails
+on: object field access (~1.9×); the residual recursion gap (the per-call native
+call + the warmup→native handoff — closing it needs call inlining); and string
+*concatenation* (`s += …` builds rope nodes that still allocate). **Startup is ~10×
+faster** (≈21 ms vs ≈218 ms — no V8
 snapshot/warmup), so end-to-end (incl. startup) zipp finishes every benchmark
 first. Run `bench/run.sh` to reproduce.
 
