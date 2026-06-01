@@ -278,6 +278,7 @@ mod native {
         ("setUTCMinutes", 6, 3), ("setUTCMonth", 6, 2), ("setUTCSeconds", 6, 2), ("toDateString", 6, 0),
         ("toISOString", 6, 0), ("toJSON", 6, 1), ("toLocaleDateString", 6, 0), ("toLocaleString", 6, 0),
         ("toLocaleTimeString", 6, 0), ("toString", 6, 0), ("toTimeString", 6, 0), ("toUTCString", 6, 0),
+        ("toGMTString", 6, 0), ("getYear", 6, 0), ("setYear", 6, 1),
         ("valueOf", 6, 0),
     ];
 
@@ -4219,15 +4220,23 @@ impl<'p> Vm<'p> {
             self.heap.flatten(obj.heap_index());
         }
         if !obj.is_heap() {
-            return Err(Thrown(format!(
-                "TypeError: cannot read property of {}",
-                self.display(obj)
-            )));
+            // null/undefined throw; a number/boolean primitive resolves method-as-value
+            // through its prototype (`(5)["toFixed"]`, `true["toString"]`).
+            if obj.is_nullish() {
+                return Err(Thrown(format!(
+                    "TypeError: cannot read property of {}",
+                    self.display(obj)
+                )));
+            }
+            let k = self.display(key);
+            return self.get_prop(obj, &k);
         }
         // Object / callable / class index access is property access: delegate to
         // `get_prop` so a computed key reaches inherited methods/getters (e.g. a
         // class instance's `obj[Symbol.iterator]`), a callable's `fn["name"]`, and
-        // static members (`C["m"]`) — not just own data properties.
+        // static members (`C["m"]`) — not just own data properties. The built-in
+        // instance types (Date/Promise/Weak*) have no integer-index meaning, so all
+        // their computed access delegates here too.
         if matches!(
             self.heap.get(obj.heap_index()),
             HeapObj::Object(_)
@@ -4237,6 +4246,12 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::Native(_)
                 | HeapObj::Iterator { .. }
+                | HeapObj::Date(_)
+                | HeapObj::Promise { .. }
+                | HeapObj::WeakMap { .. }
+                | HeapObj::WeakSet(_)
+                | HeapObj::WeakRef(_)
+                | HeapObj::FinalizationRegistry { .. }
         ) {
             let k = self.display(key);
             return self.get_prop(obj, &k);
@@ -4458,12 +4473,31 @@ impl<'p> Vm<'p> {
                 }
             }
             // Simplified: ISO (node's local/tz-formatted strings aren't matched).
-            "toString" | "toUTCString" | "toDateString" | "toTimeString"
+            // toGMTString is a legacy (Annex B) alias of toUTCString.
+            "toString" | "toUTCString" | "toGMTString" | "toDateString" | "toTimeString"
             | "toLocaleString" | "toLocaleDateString" | "toLocaleTimeString" => {
                 if ms.is_nan() {
                     self.alloc_str("Invalid Date".to_string())
                 } else {
                     self.alloc_str(date_to_iso(ms))
+                }
+            }
+            // Legacy (Annex B): getYear = full year - 1900; setYear maps 0..99 to 19xx.
+            "getYear" => field(p.0 - 1900),
+            "setYear" => {
+                let y = match args.first() {
+                    Some(&v) => self.to_number(v)?,
+                    None => f64::NAN,
+                };
+                if y.is_nan() {
+                    if let HeapObj::Date(m) = self.heap.get_mut(idx) {
+                        *m = f64::NAN;
+                    }
+                    Value::num(f64::NAN)
+                } else {
+                    let yi = y as i64;
+                    let full = if (0..=99).contains(&yi) { 1900 + yi } else { yi };
+                    self.date_set(idx, &p, &[Value::num(full as f64)], 0)?
                 }
             }
             "setTime" => {
