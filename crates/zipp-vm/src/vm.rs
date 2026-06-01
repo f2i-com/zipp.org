@@ -203,6 +203,10 @@ mod native {
         "Error", "TypeError", "RangeError", "SyntaxError",
         "ReferenceError", "EvalError", "URIError", "AggregateError",
     ];
+    // RegExp.prototype methods.
+    pub const REGEXP_TEST: u16 = 326;
+    pub const REGEXP_EXEC: u16 = 327;
+    pub const REGEXP_TO_STRING: u16 = 328;
     // BigInt: statics + BigInt.prototype methods.
     pub const BIGINT_AS_INTN: u16 = 322;
     pub const BIGINT_AS_UINTN: u16 = 323;
@@ -356,6 +360,9 @@ mod native {
             BIGINT_VALUE_OF => ("valueOf", 0),
             BIGINT_AS_INTN => ("asIntN", 2),
             BIGINT_AS_UINTN => ("asUintN", 2),
+            REGEXP_TEST => ("test", 1),
+            REGEXP_EXEC => ("exec", 1),
+            REGEXP_TO_STRING => ("toString", 0),
             FN_CALL => ("call", 1),
             FN_APPLY => ("apply", 2),
             FN_BIND => ("bind", 1),
@@ -543,6 +550,14 @@ pub struct Vm<'p> {
     /// constructable — like `Symbol`). 0 until setup.
     bigint_proto: u32,
     bigint_ctor: u32,
+    /// `RegExp.prototype` and the `RegExp` constructor object. 0 until setup.
+    regexp_proto: u32,
+    regexp_ctor: u32,
+    /// Extra own properties of a regex match-result Array (`.index`, `.input`,
+    /// `.groups`), keyed by the result array's heap index — our `Array` is a plain
+    /// `Vec` with no slot for named properties, so they live in this side table
+    /// (mirroring `template_raws`). Tuple is (index, input, groups).
+    regexp_match_extras: std::collections::HashMap<u32, (Value, Value, Value)>,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -668,6 +683,9 @@ impl<'p> Vm<'p> {
             symbol_ctor: 0,
             bigint_proto: 0,
             bigint_ctor: 0,
+            regexp_proto: 0,
+            regexp_ctor: 0,
+            regexp_match_extras: std::collections::HashMap::new(),
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -2648,6 +2666,13 @@ impl<'p> Vm<'p> {
                         let a = self.get(base, arg);
                         let n = self.to_bigint(a)?;
                         let v = self.make_bigint(n);
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::NewRegExp { dst, pattern, flags } => {
+                        let p = self.get(base, pattern);
+                        let f = self.get(base, flags);
+                        let v = self.build_regexp(p, f)?;
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -5270,6 +5295,23 @@ impl<'p> Vm<'p> {
                 p.define("constructor", Value::heap(bigint_ctor), method_attr);
             }
         }
+        // `RegExp` (constructable; `new RegExp`/`/x/` literals lower to NewRegExp).
+        // Instance accessors (source/flags/lastIndex/…) are computed in get_prop;
+        // the prototype carries test/exec/toString.
+        {
+            let regexp_proto = build(
+                self,
+                &[("test", REGEXP_TEST), ("exec", REGEXP_EXEC), ("toString", REGEXP_TO_STRING)],
+                None,
+            );
+            self.proto_of.insert(regexp_proto, Value::heap(obj_proto));
+            self.regexp_proto = regexp_proto;
+            let regexp_ctor = build(self, &[], Some(regexp_proto));
+            self.regexp_ctor = regexp_ctor;
+            if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
+                p.define("constructor", Value::heap(regexp_ctor), method_attr);
+            }
+        }
         // Wire each built-in prototype's `constructor` back to its constructor
         // (`Array.prototype.constructor === Array`, `p.constructor === Promise`,
         // `(5).constructor === Number`, …) — a fundamental invariant assertions
@@ -5369,6 +5411,7 @@ impl<'p> Vm<'p> {
                 "AggregateError" => Some(self.error_ctors[7]),
                 "Symbol" => Some(self.symbol_ctor),
                 "BigInt" => Some(self.bigint_ctor),
+                "RegExp" => Some(self.regexp_ctor),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -5385,6 +5428,7 @@ impl<'p> Vm<'p> {
                         "Date" => 7.0,
                         "Map" | "Set" | "WeakMap" | "WeakSet" => 0.0,
                         "AggregateError" => 2.0, // (errors, message?)
+                        "RegExp" => 2.0,         // (pattern, flags)
                         _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise/Error+subtypes
                     };
                     let nm = self.alloc_str(name.clone());
@@ -5565,6 +5609,43 @@ impl<'p> Vm<'p> {
                 }
                 let x = self.to_bigint(a1)?;
                 self.make_bigint(bigint_as_uintn(bits as u32, x))
+            }
+            REGEXP_EXEC => {
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
+                    ));
+                }
+                self.regexp_exec(this.heap_index(), a0)?
+            }
+            REGEXP_TEST => {
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.test called on a non-RegExp".into(),
+                    ));
+                }
+                let r = self.regexp_exec(this.heap_index(), a0)?;
+                Value::bool(r != Value::NULL)
+            }
+            REGEXP_TO_STRING => {
+                let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::RegExp { source, flags, .. }) => (
+                        if source.is_empty() { "(?:)".to_string() } else { source.clone() },
+                        flags.clone(),
+                    ),
+                    _ => {
+                        let s = self.get_prop(this, "source")?;
+                        let f = self.get_prop(this, "flags")?;
+                        (self.to_js_string(s)?, self.to_js_string(f)?)
+                    }
+                };
+                self.alloc_str(format!("/{src}/{flg}"))
             }
             FN_CALL => {
                 let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
@@ -6684,6 +6765,21 @@ impl<'p> Vm<'p> {
                 return Ok(p);
             }
         }
+        // A RegExp's accessor-like own properties (source/flags/lastIndex + the
+        // flag booleans) and its match-result Array's `.index`/`.input`/`.groups`.
+        // Cloned out of the heap borrow before any allocation.
+        if let HeapObj::RegExp { source, flags, last_index, .. } = self.heap.get(obj.heap_index()) {
+            let (s, f, li) = (source.clone(), flags.clone(), *last_index);
+            return self.regexp_get_prop(&s, &f, li, key);
+        }
+        if let Some(&(index, input, groups)) = self.regexp_match_extras.get(&obj.heap_index()) {
+            match key {
+                "index" => return Ok(index),
+                "input" => return Ok(input),
+                "groups" => return Ok(groups),
+                _ => {}
+            }
+        }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
         // match so an accessor's getter can be invoked outside the heap borrow.
         let own = match self.heap.get(obj.heap_index()) {
@@ -7231,6 +7327,13 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
         let idx = obj.heap_index();
+        // `re.lastIndex = n` — the only writable own property of a RegExp.
+        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+            let n = self.to_number(val)?;
+            let li = if n.is_finite() && n >= 0.0 { n as usize } else { 0 };
+            self.set_regexp_last_index(idx, li);
+            return Ok(());
+        }
         // `arr.length = n` truncates (n < len) or extends-with-holes (n > len) a
         // dense array — a very common idiom (`arr.length = 0` clears it). Per JS,
         // n must be a non-negative integer < 2^32, else a RangeError.
@@ -8161,6 +8264,162 @@ impl<'p> Vm<'p> {
                 .ok_or_else(|| Thrown(format!("SyntaxError: Cannot convert {t} to a BigInt")));
         }
         Err(Thrown("TypeError: Cannot convert this value to a BigInt".into()))
+    }
+
+    /// Build a RegExp from a pattern value + flags value (`/x/g`, `new RegExp(p,f)`).
+    /// A RegExp pattern contributes its source (+ its flags when none are given);
+    /// else ToString. Validates flags + compiles via `regress` (bad → SyntaxError).
+    fn build_regexp(&mut self, p: Value, f: Value) -> Result<Value, Thrown> {
+        let (source, inherited) = if p.is_heap() {
+            if let HeapObj::RegExp { source, flags, .. } = self.heap.get(p.heap_index()) {
+                (source.clone(), Some(flags.clone()))
+            } else {
+                (self.to_js_string(p)?, None)
+            }
+        } else if p.is_undefined() {
+            (String::new(), None)
+        } else {
+            (self.to_js_string(p)?, None)
+        };
+        let flags = if f.is_undefined() {
+            inherited.unwrap_or_default()
+        } else {
+            self.to_js_string(f)?
+        };
+        // Validate: only g/i/m/s/u/y/d/v, each at most once.
+        let mut seen = std::collections::HashSet::new();
+        for c in flags.chars() {
+            if !"gimsuyvd".contains(c) || !seen.insert(c) {
+                return Err(Thrown(format!(
+                    "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
+                )));
+            }
+        }
+        // The matching flags `regress` understands (g/y/d are JS-level state).
+        let mut rflags = String::new();
+        for c in flags.chars() {
+            match c {
+                'i' | 'm' | 's' => rflags.push(c),
+                'u' | 'v' if !rflags.contains('u') => rflags.push('u'),
+                _ => {}
+            }
+        }
+        let regex = regress::Regex::with_flags(&source, rflags.as_str())
+            .map_err(|e| Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}")))?;
+        let idx = self
+            .heap
+            .alloc(HeapObj::RegExp { regex: Box::new(regex), source, flags, last_index: 0 });
+        if self.regexp_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.regexp_proto));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    fn set_regexp_last_index(&mut self, idx: u32, n: usize) {
+        if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
+            *last_index = n;
+        }
+    }
+
+    /// RegExp instance property reads: `lastIndex`, `source` (empty → "(?:)"),
+    /// `flags`, and the per-flag booleans; methods delegate to RegExp.prototype.
+    fn regexp_get_prop(
+        &mut self,
+        source: &str,
+        flags: &str,
+        last_index: usize,
+        key: &str,
+    ) -> Result<Value, Thrown> {
+        Ok(match key {
+            "lastIndex" => Value::num(last_index as f64),
+            "source" => {
+                let s = if source.is_empty() { "(?:)".to_string() } else { source.to_string() };
+                self.alloc_str(s)
+            }
+            "flags" => self.alloc_str(flags.to_string()),
+            "global" => Value::bool(flags.contains('g')),
+            "ignoreCase" => Value::bool(flags.contains('i')),
+            "multiline" => Value::bool(flags.contains('m')),
+            "dotAll" => Value::bool(flags.contains('s')),
+            "unicode" => Value::bool(flags.contains('u')),
+            "unicodeSets" => Value::bool(flags.contains('v')),
+            "sticky" => Value::bool(flags.contains('y')),
+            "hasIndices" => Value::bool(flags.contains('d')),
+            _ => self.proto_member(self.regexp_proto, key),
+        })
+    }
+
+    /// `RegExp.prototype.exec(input)`: returns the match-result Array (group 0 +
+    /// captures, with `.index`/`.input`/`.groups` in the side table) or `null`.
+    /// Advances `lastIndex` for a global/sticky regex.
+    fn regexp_exec(&mut self, re_idx: u32, input_v: Value) -> Result<Value, Thrown> {
+        let input = self.to_js_string(input_v)?;
+        let (global, sticky, start_char) = match self.heap.get(re_idx) {
+            HeapObj::RegExp { flags, last_index, .. } => {
+                (flags.contains('g'), flags.contains('y'), *last_index)
+            }
+            _ => {
+                return Err(Thrown(
+                    "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
+                ))
+            }
+        };
+        let stateful = global || sticky;
+        let start = if stateful { start_char } else { 0 };
+        let byte_start = char_to_byte(&input, start);
+        let found = if start > input.chars().count() {
+            None
+        } else {
+            match self.heap.get(re_idx) {
+                HeapObj::RegExp { regex, .. } => regex.find_from(&input, byte_start).next(),
+                _ => None,
+            }
+        };
+        // Sticky: the match must begin exactly at the search start.
+        let found = found.filter(|m| !(sticky && m.start() != byte_start));
+        let m = match found {
+            Some(m) => m,
+            None => {
+                if stateful {
+                    self.set_regexp_last_index(re_idx, 0);
+                }
+                return Ok(Value::NULL);
+            }
+        };
+        let (mstart, mend) = (m.start(), m.end());
+        let whole = self.alloc_str(input[m.range()].to_string());
+        let mut elems = vec![whole];
+        let caps = m.captures.clone();
+        for cap in &caps {
+            let v = match cap {
+                Some(r) => self.alloc_str(input[r.clone()].to_string()),
+                None => Value::UNDEFINED,
+            };
+            elems.push(v);
+        }
+        let named: Vec<(String, Option<std::ops::Range<usize>>)> =
+            m.named_groups().map(|(n, r)| (n.to_string(), r)).collect();
+        let groups = if named.is_empty() {
+            Value::UNDEFINED
+        } else {
+            let mut gm = ObjMap::new();
+            for (name, r) in &named {
+                let v = match r {
+                    Some(r) => self.alloc_str(input[r.clone()].to_string()),
+                    None => Value::UNDEFINED,
+                };
+                gm.set(name, v);
+            }
+            Value::heap(self.heap.alloc(HeapObj::Object(gm)))
+        };
+        let arr_idx = self.heap.alloc(HeapObj::Array(elems));
+        let index_v = Value::num(byte_to_char(&input, mstart) as f64);
+        let input_sv = self.alloc_str(input.clone());
+        self.regexp_match_extras.insert(arr_idx, (index_v, input_sv, groups));
+        if stateful {
+            self.set_regexp_last_index(re_idx, byte_to_char(&input, mend));
+        }
+        Ok(Value::heap(arr_idx))
     }
 
     /// A binary arithmetic/bitwise op where at least one operand might be a BigInt.
@@ -10455,6 +10714,10 @@ impl<'p> Vm<'p> {
                 }
                 // ToString(BigInt) is the decimal digits with NO "n" (String(1n) === "1").
                 HeapObj::BigInt(n) => n.to_string(),
+                HeapObj::RegExp { source, flags, .. } => {
+                    let s = if source.is_empty() { "(?:)" } else { source };
+                    format!("/{s}/{flags}")
+                }
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -10591,6 +10854,10 @@ impl<'p> Vm<'p> {
             }
             // console.log shows BigInt with the `n` suffix (1n), unlike ToString.
             HeapObj::BigInt(n) => format!("{n}n"),
+            HeapObj::RegExp { source, flags, .. } => {
+                let s = if source.is_empty() { "(?:)" } else { source };
+                format!("/{s}/{flags}")
+            }
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
             HeapObj::Promise { state, result, .. } => match state {
@@ -11114,6 +11381,18 @@ fn parse_bigint_str(s: &str) -> Option<i128> {
         body.parse::<i128>().ok()?
     };
     Some(if neg { -v } else { v })
+}
+
+/// Convert a byte offset into `s` to a char offset (regress reports byte offsets;
+/// our string indexing is char-based). Identity for ASCII.
+fn byte_to_char(s: &str, byte: usize) -> usize {
+    let b = byte.min(s.len());
+    s[..b].chars().count()
+}
+
+/// Convert a char offset into `s` to a byte offset (for seeking regress).
+fn char_to_byte(s: &str, ch: usize) -> usize {
+    s.char_indices().nth(ch).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 /// Format an i128 BigInt in the given radix (2..=36), lowercase digits.

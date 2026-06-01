@@ -289,6 +289,10 @@ pub enum Instr {
     /// `dst = BigInt(arg)` — convert a number/string/boolean/BigInt to a BigInt
     /// (non-integer number → RangeError; symbol/null/undefined → TypeError).
     BigIntFrom { dst: Reg, arg: Reg },
+    /// `dst = new RegExp(pattern, flags)` — compile a regex (`/pat/flags` literal
+    /// and the constructor both lower here). `pattern`/`flags` are string regs;
+    /// a bad pattern throws SyntaxError.
+    NewRegExp { dst: Reg, pattern: Reg, flags: Reg },
     /// `dst = <array of obj's own enumerable string keys>` — drives `for-in`.
     /// For an array, the keys are the index strings "0".."len-1".
     ObjectKeys { dst: Reg, obj: Reg },

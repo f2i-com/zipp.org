@@ -387,6 +387,10 @@ pub enum HeapObj {
     /// wrapped primitive ([[PrimitiveValue]]). `typeof` is "object"; valueOf returns
     /// the value; the kind's prototype provides the methods.
     Boxed { kind: u8, value: Value },
+    /// A JS `RegExp`. `regex` is the compiled `regress` engine (ECMAScript regex);
+    /// `source` is the pattern text, `flags` the JS flag string (`"gi"`); `last_index`
+    /// is the mutable `lastIndex` (a char offset, for `g`/`y` stateful matching).
+    RegExp { regex: Box<regress::Regex>, source: String, flags: String, last_index: usize },
     /// A JS `BigInt` primitive. Stored as `i128` (covers the common test262
     /// magnitudes; true arbitrary precision is a later refinement). Compared by
     /// VALUE (`1n === 1n`), not identity; `typeof` is "bigint".

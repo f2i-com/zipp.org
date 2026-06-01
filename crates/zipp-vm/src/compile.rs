@@ -2519,6 +2519,20 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadBigInt { dst, value: v });
                 Ok(dst)
             }
+            E::RegExpLiteral(r) => {
+                // `/pat/flags` → NewRegExp (compiles via the `regress` engine at
+                // runtime). pattern.text is the source; flags as the JS flag string.
+                let pat = self.add_string_const(r.regex.pattern.text.as_str());
+                let flags_s = r.regex.flags.to_inline_string();
+                let flg = self.add_string_const(&flags_s);
+                let pt = self.temp();
+                self.emit(Instr::LoadConst { dst: pt, idx: pat });
+                let ft = self.temp();
+                self.emit(Instr::LoadConst { dst: ft, idx: flg });
+                self.emit(Instr::NewRegExp { dst, pattern: pt, flags: ft });
+                self.next_reg -= 2;
+                Ok(dst)
+            }
             E::StringLiteral(s) => {
                 let idx = self.add_string_const(s.value.as_str());
                 self.emit(Instr::LoadConst { dst, idx });
@@ -2638,6 +2652,10 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::NewPromise { dst, executor });
                         self.next_reg -= 1; // reclaim executor temp
                         return Ok(dst);
+                    }
+                    // `new RegExp(pattern?, flags?)` — pattern may be a string or a RegExp.
+                    if id.name == "RegExp" {
+                        return self.emit_regexp(&n.arguments, dst);
                     }
                     // `new Map(iter?)` / `new Set(iter?)` / `new WeakMap(iter?)` /
                     // `new WeakSet(iter?)`.
@@ -3941,6 +3959,34 @@ impl<'a> FnCompiler<'a> {
 
     /// Build an Error-like object `{ name, message }` for `Error("msg")` (called
     /// either with `new` or bare). `arg` is the optional message argument.
+    /// Emit `NewRegExp` for `RegExp(pattern?, flags?)` / `new RegExp(...)` — the
+    /// VM coerces a string/RegExp pattern and the flags (undefined → defaults).
+    fn emit_regexp(&mut self, args: &[ox::Argument], dst: Reg) -> R<Reg> {
+        let pt = self.temp();
+        match args.first().and_then(|a| a.as_expression()) {
+            Some(e) => {
+                let v = self.expr_into(e, pt)?;
+                if v != pt {
+                    self.emit(Instr::Move { dst: pt, src: v });
+                }
+            }
+            None => self.emit(Instr::LoadUndefined { dst: pt }),
+        }
+        let ft = self.temp();
+        match args.get(1).and_then(|a| a.as_expression()) {
+            Some(e) => {
+                let v = self.expr_into(e, ft)?;
+                if v != ft {
+                    self.emit(Instr::Move { dst: ft, src: v });
+                }
+            }
+            None => self.emit(Instr::LoadUndefined { dst: ft }),
+        }
+        self.emit(Instr::NewRegExp { dst, pattern: pt, flags: ft });
+        self.next_reg -= 2;
+        Ok(dst)
+    }
+
     fn build_error(&mut self, kind: &str, args: &[ox::Argument], dst: Reg) -> R<Reg> {
         // `new TypeError(msg)` etc. → a proto-linked error instance (NewError op
         // sets own `name`/`message` and links the prototype so `.constructor`,
@@ -4077,6 +4123,12 @@ impl<'a> FnCompiler<'a> {
                     self.next_reg -= 1;
                 }
                 return Ok(dst);
+            }
+        }
+        // `RegExp(pattern?, flags?)` (no `new`) → same as `new RegExp(...)`.
+        if let ox::Expression::Identifier(id) = &c.callee {
+            if id.name == "RegExp" {
+                return self.emit_regexp(&c.arguments, dst);
             }
         }
         // `BigInt(x)` → conversion (BigIntFrom op). No arg → undefined (→ TypeError
