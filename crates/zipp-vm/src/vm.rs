@@ -231,6 +231,9 @@ pub struct Vm<'p> {
     /// `String.prototype` — primitive string values delegate here for method
     /// access (`"x".charAt`, `"x".slice`, …, as values), 0 until `setup_globals`.
     str_proto: u32,
+    /// The `globalThis` object (an empty Object at this heap index); property
+    /// access on it is routed to the global slots by name. 0 until `setup_globals`.
+    global_this: u32,
     /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
     /// program's random sequence is reproducible run-to-run (and JIT-on == off).
     rng_state: u64,
@@ -308,6 +311,7 @@ impl<'p> Vm<'p> {
             fn_proto: 0,
             arr_proto: 0,
             str_proto: 0,
+            global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
@@ -4266,6 +4270,10 @@ impl<'p> Vm<'p> {
         let array_ctor = build(self, &[("isArray", ARR_IS_ARRAY), ("from", ARR_FROM), ("of", ARR_OF)], Some(arr_proto));
         let function_ctor = build(self, &[], Some(fn_proto));
         let string_ctor = build(self, &[], Some(str_proto));
+        // `globalThis`: an empty Object whose property access is routed to the
+        // global slots by name (see get_prop/set_prop/has_own_property).
+        let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+        self.global_this = global_this;
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).
         let mut sets: Vec<(usize, u32)> = Vec::new();
@@ -4275,6 +4283,7 @@ impl<'p> Vm<'p> {
                 "Array" => Some(array_ctor),
                 "Function" => Some(function_ctor),
                 "String" => Some(string_ctor),
+                "globalThis" => Some(global_this),
                 _ => None,
             };
             if let Some(v) = v {
@@ -4762,6 +4771,13 @@ impl<'p> Vm<'p> {
     /// The `(name, length)` of a callable value (function, closure, or class) for
     /// its `.name`/`.length` properties — `None` for non-callables. A synthetic
     /// proto name (`<arrow>`, `<script>`, …) reads as the empty string (anonymous).
+    /// `globalThis.<name>`: the value of the reserved global slot named `name`
+    /// (or None if there is no such global). Backs property access on globalThis.
+    fn global_by_name(&self, name: &str) -> Option<Value> {
+        let slot = self.program.global_names.iter().position(|n| n == name)?;
+        self.globals.get(slot).copied()
+    }
+
     /// Look up `key` on a built-in prototype object (`arr_proto`/`str_proto`),
     /// returning the method value (or undefined). Lets primitive array/string
     /// values expose their methods as first-class values.
@@ -4893,6 +4909,12 @@ impl<'p> Vm<'p> {
             HeapObj::Object(map) => {
                 if let Some(v) = map.get(key) {
                     return Ok(v);
+                }
+                // `globalThis.X` → the reserved global slot named X.
+                if obj.heap_index() == self.global_this && self.global_this != 0 {
+                    if let Some(v) = self.global_by_name(key) {
+                        return Ok(v);
+                    }
                 }
                 // Own-property miss: walk the class chain for an inherited method
                 // (return its func) or getter (invoke it with this = obj).
@@ -6099,7 +6121,13 @@ impl<'p> Vm<'p> {
             return false; // private names aren't reflectable own properties
         }
         match self.heap.get(obj.heap_index()) {
-            HeapObj::Object(m) => m.pos(key).is_some(),
+            HeapObj::Object(m) => {
+                m.pos(key).is_some()
+                    // globalThis own properties are the reserved global bindings.
+                    || (obj.heap_index() == self.global_this
+                        && self.global_this != 0
+                        && self.global_by_name(key).is_some())
+            }
             HeapObj::Array(items) => {
                 key == "length" || key.parse::<usize>().map_or(false, |i| i < items.len())
             }
