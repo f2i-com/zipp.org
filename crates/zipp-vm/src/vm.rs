@@ -4046,7 +4046,18 @@ impl<'p> Vm<'p> {
     /// `Combinator` state settles the returned promise per the combinator's rule.
     fn promise_combine(&mut self, kind: crate::heap::CombKind, iterable: Value) -> Result<Value, Thrown> {
         use crate::heap::CombKind;
-        let inputs = self.iterate_to_vec(iterable)?;
+        // GetIterator / iteration abrupt completion → a REJECTED promise, not a
+        // synchronous throw (IfAbruptRejectPromise): `Promise.all(1)` rejects with
+        // a TypeError rather than throwing out of the call.
+        let inputs = match self.iterate_to_vec(iterable) {
+            Ok(v) => v,
+            Err(Thrown(msg)) => {
+                let result = self.alloc_promise();
+                let err = self.alloc_error_from_message(&msg);
+                self.reject(result, err);
+                return Ok(Value::heap(result));
+            }
+        };
         let total = inputs.len() as u32;
         let result = self.alloc_promise();
         if total == 0 {
