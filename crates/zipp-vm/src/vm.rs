@@ -1294,9 +1294,19 @@ impl<'p> Vm<'p> {
                         let static_getters = mk(&mut self.heap, &cd.static_getters);
                         let static_setters = mk(&mut self.heap, &cd.static_setters);
                         let mut statics = ObjMap::new();
+                        // Static methods are non-enumerable (writable + configurable),
+                        // like instance methods. Static *fields* are added later via
+                        // SetProp and stay enumerable, as ES requires.
+                        let method_attr = PropAttr {
+                            writable: true,
+                            enumerable: false,
+                            configurable: true,
+                            accessor: false,
+                            setter: Value::UNDEFINED,
+                        };
                         for (n, fid) in &cd.statics {
                             let fv = Value::heap(self.heap.alloc(HeapObj::Func(*fid)));
-                            statics.set(n, fv);
+                            statics.define(n, fv, method_attr);
                         }
                         let v = Value::heap(self.heap.alloc(HeapObj::Class(Box::new(ClassData {
                             name: cd.name,
