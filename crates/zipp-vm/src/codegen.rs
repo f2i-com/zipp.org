@@ -733,27 +733,25 @@ fn compile_proto(
             Instr::JumpIfNotLe { a, b, target } => {
                 jump_if_not_cmp(&mut ops, ip, bail, a, b, Cmp::Le, labels[target as usize]);
             }
-            Instr::LoadGlobal { dst, .. } => {
-                // Only reached for `LoadGlobal(self_slot)` (can_compile gated).
-                // Store the REAL self-function Value (embedded at compile time,
-                // stable since hoisting). This matters when a self-`Call` deopts
-                // to the interpreter: it resumes at the Call op and reads this
-                // register as the callee, which must be the actual function.
-                dynasm!(ops
-                    ; mov rax, QWORD self_val_bits as i64
-                    ; mov [rbx + dreg(dst)], rax
-                );
+            Instr::LoadGlobal { .. } => {
+                // `LoadGlobal(self_slot)` (can_compile gated) — only ever the
+                // callee load of a self-`Call`. The native fast path calls the
+                // entry DIRECTLY and never reads this register, so materialising
+                // the self-Value here is dead work on every call (2 instr × ~96M
+                // for fib(37)). SKIP it; `emit_self_call` lazily writes the callee
+                // register on its cold (interpreter-bound) paths, where the
+                // interpreter resume actually reads it. No-op here.
             }
-            Instr::Call { dst, arg_base, argc, .. } => {
+            Instr::Call { dst, callee, arg_base, argc } => {
                 // Self-recursive call (can_compile verified callee == self_slot).
                 // Fast path: a DIRECT native call to this function's own entry
                 // with an inline depth guard — no Rust trampoline. Cold paths
                 // (depth limit, or the callee bailed mid-body) route to the Rust
-                // helper, which runs the activation on the interpreter WITH the
-                // recursion depth held elevated (so re-entry can't livelock).
+                // helper / interpreter, which read `regs[callee]` — so they
+                // restore it from `self_val_bits` first (the skipped LoadGlobal).
                 emit_self_call(
-                    &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst, arg_base,
-                    argc, proto.reg_count,
+                    &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst, callee,
+                    arg_base, argc, proto.reg_count, self_val_bits,
                 );
             }
             Instr::Return { src } => {
@@ -1003,9 +1001,11 @@ fn emit_self_call(
     func_id: u32,
     helper: usize,
     dst: u16,
+    callee: u16,
     arg_base: u16,
     argc: u16,
     reg_count: u16,
+    self_val_bits: u64,
 ) {
     let depth_off = crate::vm::JIT_RECURSE_DEPTH_OFFSET as i32;
     let max = crate::vm::JIT_SELF_RECURSE_MAX_PUB as i32;
@@ -1062,6 +1062,13 @@ fn emit_self_call(
     // callee-saved across the call.
     dynasm!(ops
         ; => slow
+        // Restore the callee register the hot path SKIPPED (the elided
+        // `LoadGlobal(self_slot)`): every exit from here that reaches the
+        // interpreter (`=> bail`) re-executes this Call op, which reads
+        // `regs[callee]`. Writing it only on the cold path keeps the hot path
+        // free of the per-call self-Value store.
+        ; mov rax, QWORD self_val_bits as i64
+        ; mov [rbx + dreg(callee)], rax
         ; mov rcx, rdi                       // vm
         ; mov rdx, rbx                        // caller window base
         ; lea r8, [rbx + dreg(arg_base)]     // args_ptr
