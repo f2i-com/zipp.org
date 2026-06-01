@@ -605,6 +605,66 @@ fn writes_reg(i: &Instr) -> Option<u16> {
     }
 }
 
+/// If this single-parameter function opens with a base case of the shape
+/// `if (param <cmp> K) return param;` — i.e. it returns its argument UNCHANGED
+/// for small inputs — report `(cmp, K)`. A self-call to such a function can then
+/// inline the base case at the call site (`arg <cmp> K ? arg : recurse`),
+/// eliminating the call + prologue/epilogue for every LEAF invocation (about
+/// half of `fib`'s calls). The recognised shape is exactly what `fib` compiles
+/// to (LoadInt K; compare param,K; JumpIfFalse; Move/Jump…; Return param); any
+/// deviation returns `None`, so the optimization is opt-in and never wrong.
+fn base_case_returns_arg(proto: &FuncProto) -> Option<(Cmp, i32)> {
+    if proto.param_count != 1 {
+        return None;
+    }
+    let code = &proto.code;
+    if code.len() < 3 {
+        return None;
+    }
+    // ip0: LoadInt{c, K}
+    let (c, k) = match code[0] {
+        Instr::LoadInt { dst, val } => (dst, val),
+        _ => return None,
+    };
+    // ip1: compare param (reg 1) against c → t. The reported Cmp is the one whose
+    // TRUE branch selects the base case.
+    let (cmp, t) = match code[1] {
+        Instr::Lt { dst, a: 1, b } if b == c => (Cmp::Lt, dst),
+        Instr::Le { dst, a: 1, b } if b == c => (Cmp::Le, dst),
+        Instr::Gt { dst, a: 1, b } if b == c => (Cmp::Gt, dst),
+        Instr::Ge { dst, a: 1, b } if b == c => (Cmp::Ge, dst),
+        _ => return None,
+    };
+    // ip2: JumpIfFalse{t, _} — when (param<cmp>K) is FALSE we leave for the
+    // recursive body, so the base case is the FALL-THROUGH (ip3).
+    match code[2] {
+        Instr::JumpIfFalse { cond, .. } if cond == t => {}
+        _ => return None,
+    }
+    // Base path from ip3: follow Move/Jump to a Return whose source traces back
+    // to the param (reg 1). Bounded walk; any other op disqualifies.
+    let mut ip = 3usize;
+    let mut ret_reg: u16 = 1; // register currently holding the (copied) param
+    for _ in 0..8 {
+        match code.get(ip)? {
+            Instr::Move { dst, src } => {
+                if *src == ret_reg {
+                    ret_reg = *dst;
+                } else if *dst == ret_reg {
+                    return None; // our tracked value was overwritten
+                }
+                ip += 1;
+            }
+            Instr::Jump { target } => ip = *target as usize,
+            Instr::Return { src } => {
+                return if *src == ret_reg { Some((cmp, k)) } else { None };
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Win64 register plan (integer subset):
 /// * `rcx` = regs base pointer (preserved across the body; we never clobber it
 ///   because we issue no calls).
@@ -631,6 +691,10 @@ fn compile_proto(
     if !can_compile(proto, self_slot) {
         return None;
     }
+    // If the callee (== self for our self-calls) returns its argument unchanged
+    // for small inputs (`fib`: `n<2 ? n`), inline that base case at each call
+    // site so leaf invocations skip the call + prologue/epilogue entirely.
+    let base_case = base_case_returns_arg(proto);
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
 
     // A label per bytecode index so jumps resolve to the right native offset.
@@ -749,10 +813,51 @@ fn compile_proto(
                 // (depth limit, or the callee bailed mid-body) route to the Rust
                 // helper / interpreter, which read `regs[callee]` — so they
                 // restore it from `self_val_bits` first (the skipped LoadGlobal).
-                emit_self_call(
-                    &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst, callee,
-                    arg_base, argc, proto.reg_count, self_val_bits,
-                );
+                //
+                // BASE-CASE INLINING: when the callee returns its argument
+                // unchanged for small inputs (`base_case`), test the guard here
+                // and produce the result inline for the leaf case — no call. Only
+                // for argc==1 (the recognised shape). A non-int arg or the
+                // recursive case routes to the real call.
+                match base_case {
+                    Some((cmp, k)) if argc == 1 => {
+                        let do_call = ops.new_dynamic_label();
+                        let inline_base = ops.new_dynamic_label();
+                        let after = ops.new_dynamic_label();
+                        // Non-int arg → real call (which guards + bails correctly).
+                        guard_int(&mut ops, arg_base, do_call);
+                        dynasm!(ops
+                            ; mov eax, [rbx + dreg(arg_base)]   // arg payload (i32)
+                            ; cmp eax, k
+                        );
+                        // Jump to the inline base case when `arg <cmp> k` is TRUE.
+                        match cmp {
+                            Cmp::Lt => dynasm!(ops ; jl => inline_base),
+                            Cmp::Le => dynasm!(ops ; jle => inline_base),
+                            Cmp::Gt => dynasm!(ops ; jg => inline_base),
+                            Cmp::Ge => dynasm!(ops ; jge => inline_base),
+                            Cmp::Eq | Cmp::Ne => unreachable!("base_case yields only Lt/Le/Gt/Ge"),
+                        }
+                        dynasm!(ops ; => do_call);
+                        emit_self_call(
+                            &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst,
+                            callee, arg_base, argc, proto.reg_count, self_val_bits,
+                        );
+                        dynasm!(ops
+                            ; jmp => after
+                            ; => inline_base
+                            ; mov rax, [rbx + dreg(arg_base)]   // result = arg (base returns it)
+                            ; mov [rbx + dreg(dst)], rax
+                            ; => after
+                        );
+                    }
+                    _ => {
+                        emit_self_call(
+                            &mut ops, ip, bail, self_entry, self_func_id, self_call_helper, dst,
+                            callee, arg_base, argc, proto.reg_count, self_val_bits,
+                        );
+                    }
+                }
             }
             Instr::Return { src } => {
                 dynasm!(ops
