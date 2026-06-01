@@ -21,7 +21,7 @@
 
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
-    AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap, PromiseState, Reaction,
+    AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap, PropAttr, PromiseState, Reaction,
 };
 use crate::value::Value;
 
@@ -140,6 +140,9 @@ pub struct Vm<'p> {
     /// first access and cached here. For a class it carries the own methods +
     /// `constructor`; for a plain function just `constructor`.
     prototypes: std::collections::HashMap<u32, u32>,
+    /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
+    /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
+    proto_of: std::collections::HashMap<u32, Value>,
     /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
     /// program's random sequence is reproducible run-to-run (and JIT-on == off).
     rng_state: u64,
@@ -210,6 +213,7 @@ impl<'p> Vm<'p> {
             microtasks: std::collections::VecDeque::new(),
             template_raws: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),
+            proto_of: std::collections::HashMap::new(),
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
@@ -1535,6 +1539,35 @@ impl<'p> Vm<'p> {
                             }
                             S::PromiseRace => self.promise_combine(crate::heap::CombKind::Race, a0)?,
                             S::PromiseAny => self.promise_combine(crate::heap::CombKind::Any, a0)?,
+                            S::ObjectDefineProperty => {
+                                let key = self.display(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                                let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                                self.object_define_property(a0, &key, desc)?;
+                                a0
+                            }
+                            S::ObjectDefineProperties => {
+                                let props = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                                self.object_define_properties(a0, props)?;
+                                a0
+                            }
+                            S::ObjectGetOwnPropertyDescriptor => {
+                                let key = self.display(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                                self.object_get_own_property_descriptor(a0, &key)
+                            }
+                            S::ObjectGetOwnPropertyNames => self.object_own_property_names(a0),
+                            S::ObjectGetPrototypeOf => self.object_get_prototype_of(a0),
+                            S::ObjectCreate => {
+                                let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                                if a0 != Value::UNDEFINED {
+                                    self.proto_of.insert(o.heap_index(), a0);
+                                }
+                                if let Some(props) = args.get(1).copied() {
+                                    if props != Value::UNDEFINED {
+                                        self.object_define_properties(o, props)?;
+                                    }
+                                }
+                                o
+                            }
                         };
                         self.set(base, dst, v);
                         ip += 1;
@@ -1674,7 +1707,14 @@ impl<'p> Vm<'p> {
                         // borrow), then intern them (mutable) — can't hold both.
                         let key_strs: Vec<String> = if o.is_heap() {
                             match self.heap.get(o.heap_index()) {
-                                HeapObj::Object(map) => map.keys.clone(),
+                                // Only OWN ENUMERABLE keys (skip non-enumerable).
+                                HeapObj::Object(map) => map
+                                    .keys
+                                    .iter()
+                                    .zip(map.attrs.iter())
+                                    .filter(|(_, a)| a.enumerable)
+                                    .map(|(k, _)| k.clone())
+                                    .collect(),
                                 HeapObj::Array(items) => {
                                     (0..items.len()).map(|i| i.to_string()).collect()
                                 }
@@ -1693,7 +1733,13 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let vals: Vec<Value> = if o.is_heap() {
                             match self.heap.get(o.heap_index()) {
-                                HeapObj::Object(map) => map.vals.clone(),
+                                HeapObj::Object(map) => map
+                                    .vals
+                                    .iter()
+                                    .zip(map.attrs.iter())
+                                    .filter(|(_, a)| a.enumerable)
+                                    .map(|(v, _)| *v)
+                                    .collect(),
                                 HeapObj::Array(items) => items.clone(),
                                 _ => Vec::new(),
                             }
@@ -1710,9 +1756,15 @@ impl<'p> Vm<'p> {
                         // borrow, then build `[key, value]` arrays (which allocate).
                         let pairs: Vec<(String, Value)> = if o.is_heap() {
                             match self.heap.get(o.heap_index()) {
-                                HeapObj::Object(map) => {
-                                    map.keys.iter().cloned().zip(map.vals.iter().copied()).collect()
-                                }
+                                HeapObj::Object(map) => map
+                                    .keys
+                                    .iter()
+                                    .cloned()
+                                    .zip(map.vals.iter().copied())
+                                    .zip(map.attrs.iter())
+                                    .filter(|(_, a)| a.enumerable)
+                                    .map(|(kv, _)| kv)
+                                    .collect(),
                                 HeapObj::Array(items) => {
                                     items.iter().enumerate().map(|(i, v)| (i.to_string(), *v)).collect()
                                 }
@@ -3501,14 +3553,242 @@ impl<'p> Vm<'p> {
             HeapObj::Class(c) => c.methods.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             _ => Vec::new(),
         };
+        // Methods and the constructor back-reference are NON-enumerable
+        // (writable + configurable), matching ES `class`/function semantics that
+        // test262's verifyProperty checks.
+        let nonenum =
+            PropAttr { writable: true, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
         let mut map = ObjMap::new();
         for (k, v) in &methods {
-            map.set(k, *v);
+            map.define(k, *v, nonenum);
         }
-        map.set("constructor", obj);
+        map.define("constructor", obj, nonenum);
         let p = self.heap.alloc(HeapObj::Object(map));
         self.prototypes.insert(idx, p);
         Some(Value::heap(p))
+    }
+
+    /// Build a data property descriptor object `{value, writable, enumerable,
+    /// configurable}` (for `Object.getOwnPropertyDescriptor`).
+    fn make_data_descriptor(&mut self, value: Value, w: bool, e: bool, c: bool) -> Value {
+        let mut m = ObjMap::new();
+        m.set("value", value);
+        m.set("writable", Value::bool(w));
+        m.set("enumerable", Value::bool(e));
+        m.set("configurable", Value::bool(c));
+        Value::heap(self.heap.alloc(HeapObj::Object(m)))
+    }
+
+    /// Build an accessor descriptor object `{get, set, enumerable, configurable}`.
+    fn make_accessor_descriptor(&mut self, get: Value, set: Value, e: bool, c: bool) -> Value {
+        let mut m = ObjMap::new();
+        m.set("get", get);
+        m.set("set", set);
+        m.set("enumerable", Value::bool(e));
+        m.set("configurable", Value::bool(c));
+        Value::heap(self.heap.alloc(HeapObj::Object(m)))
+    }
+
+    /// `Object.getOwnPropertyDescriptor(obj, key)` — the property's descriptor, or
+    /// undefined for a missing own property / non-object.
+    fn object_get_own_property_descriptor(&mut self, obj: Value, key: &str) -> Value {
+        if !obj.is_heap() {
+            return Value::UNDEFINED;
+        }
+        let idx = obj.heap_index();
+        let own = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
+            HeapObj::Array(items) => {
+                if key == "length" {
+                    let len = len_value(items.len());
+                    return self.make_data_descriptor(len, true, false, false);
+                }
+                match key.parse::<usize>() {
+                    Ok(i) if i < items.len() => {
+                        let v = items[i];
+                        return self.make_data_descriptor(v, true, true, true);
+                    }
+                    _ => return Value::UNDEFINED,
+                }
+            }
+            _ => None,
+        };
+        match own {
+            Some((a, raw)) if a.accessor => {
+                self.make_accessor_descriptor(raw, a.setter, a.enumerable, a.configurable)
+            }
+            Some((a, raw)) => self.make_data_descriptor(raw, a.writable, a.enumerable, a.configurable),
+            None => Value::UNDEFINED,
+        }
+    }
+
+    /// `Object.getOwnPropertyNames(obj)` — all own string keys (enumerable or not).
+    fn object_own_property_names(&mut self, obj: Value) -> Value {
+        let mut names: Vec<Value> = Vec::new();
+        if obj.is_heap() {
+            match self.heap.get(obj.heap_index()) {
+                HeapObj::Object(m) => {
+                    let keys: Vec<String> = m.keys.clone();
+                    for k in keys {
+                        names.push(self.alloc_str(k));
+                    }
+                }
+                HeapObj::Array(items) => {
+                    let n = items.len();
+                    for i in 0..n {
+                        names.push(self.alloc_str(i.to_string()));
+                    }
+                    names.push(self.alloc_str("length".to_string()));
+                }
+                _ => {}
+            }
+        }
+        Value::heap(self.heap.alloc(HeapObj::Array(names)))
+    }
+
+    /// `Object.getPrototypeOf(obj)` — the prototype: a class instance's is its
+    /// class's `.prototype`; an `Object.create`d object's is the recorded proto;
+    /// otherwise `null` (a plain object's real `Object.prototype` isn't modelled).
+    fn object_get_prototype_of(&mut self, obj: Value) -> Value {
+        if !obj.is_heap() {
+            return Value::NULL;
+        }
+        let idx = obj.heap_index();
+        if let Some(&p) = self.proto_of.get(&idx) {
+            return p;
+        }
+        let class = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.class,
+            _ => None,
+        };
+        if let Some(cidx) = class {
+            if let Some(p) = self.prototype_of(Value::heap(cidx)) {
+                return p;
+            }
+        }
+        Value::NULL
+    }
+
+    /// Read a property-descriptor object's fields (present-or-absent) for
+    /// `Object.defineProperty`. Throws if `desc` is not an object.
+    fn read_descriptor(
+        &mut self,
+        desc: Value,
+    ) -> Result<(Option<Value>, Option<Value>, Option<Value>, Option<bool>, Option<bool>, Option<bool>), Thrown>
+    {
+        if !desc.is_heap() || !matches!(self.heap.get(desc.heap_index()), HeapObj::Object(_)) {
+            return Err(Thrown("TypeError: Property description must be an object".into()));
+        }
+        let idx = desc.heap_index();
+        let present = |vm: &Self, k: &str| -> bool {
+            matches!(vm.heap.get(idx), HeapObj::Object(m) if m.pos(k).is_some())
+        };
+        let value = if present(self, "value") { Some(self.get_prop(desc, "value")?) } else { None };
+        let get = if present(self, "get") { Some(self.get_prop(desc, "get")?) } else { None };
+        let set = if present(self, "set") { Some(self.get_prop(desc, "set")?) } else { None };
+        let writable = if present(self, "writable") {
+            let v = self.get_prop(desc, "writable")?;
+            Some(self.truthy(v))
+        } else {
+            None
+        };
+        let enumerable = if present(self, "enumerable") {
+            let v = self.get_prop(desc, "enumerable")?;
+            Some(self.truthy(v))
+        } else {
+            None
+        };
+        let configurable = if present(self, "configurable") {
+            let v = self.get_prop(desc, "configurable")?;
+            Some(self.truthy(v))
+        } else {
+            None
+        };
+        Ok((value, get, set, writable, enumerable, configurable))
+    }
+
+    /// `Object.defineProperty(obj, key, descriptor)` — define/redefine an own
+    /// property with explicit attributes (unspecified attrs default to false on a
+    /// new property; an existing non-configurable property rejects most changes).
+    fn object_define_property(&mut self, obj: Value, key: &str, desc: Value) -> Result<(), Thrown> {
+        if !obj.is_heap() || !matches!(self.heap.get(obj.heap_index()), HeapObj::Object(_)) {
+            return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
+        }
+        let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
+        let idx = obj.heap_index();
+        let existing = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
+            _ => None,
+        };
+        let is_accessor = get.is_some() || set.is_some();
+        // Start from the existing attrs (redefine) or all-false (new property).
+        let (mut wr, mut en, mut cf) = match existing {
+            Some((a, _)) => (a.writable, a.enumerable, a.configurable),
+            None => (false, false, false),
+        };
+        if let Some(b) = d_wr {
+            wr = b;
+        }
+        if let Some(b) = d_en {
+            en = b;
+        }
+        if let Some(b) = d_cf {
+            cf = b;
+        }
+        // A non-configurable existing property rejects illegal redefinitions.
+        if let Some((a, oldv)) = existing {
+            if !a.configurable {
+                let make_cfg = d_cf == Some(true);
+                let change_enum = d_en.is_some_and(|b| b != a.enumerable);
+                let change_kind = is_accessor != a.accessor;
+                let make_writable = !a.writable && d_wr == Some(true);
+                let change_frozen_value =
+                    !a.accessor && !a.writable && value.is_some_and(|v| v != oldv);
+                if make_cfg || change_enum || change_kind || make_writable || change_frozen_value {
+                    return Err(Thrown(format!("TypeError: Cannot redefine property: {key}")));
+                }
+            }
+        }
+        let attr = PropAttr {
+            writable: wr,
+            enumerable: en,
+            configurable: cf,
+            accessor: is_accessor,
+            setter: set.unwrap_or(Value::UNDEFINED),
+        };
+        let stored = if is_accessor {
+            get.unwrap_or(Value::UNDEFINED)
+        } else {
+            value.or(existing.map(|(_, v)| v)).unwrap_or(Value::UNDEFINED)
+        };
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            m.define(key, stored, attr);
+        }
+        self.heap.bump_version(idx);
+        Ok(())
+    }
+
+    /// `Object.defineProperties(obj, props)` — define each own enumerable key of
+    /// `props` as a descriptor on `obj`.
+    fn object_define_properties(&mut self, obj: Value, props: Value) -> Result<(), Thrown> {
+        if !props.is_heap() {
+            return Ok(());
+        }
+        let keys: Vec<String> = match self.heap.get(props.heap_index()) {
+            HeapObj::Object(m) => m
+                .keys
+                .iter()
+                .zip(m.attrs.iter())
+                .filter(|(_, a)| a.enumerable)
+                .map(|(k, _)| k.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        for k in keys {
+            let desc = self.get_prop(props, &k)?;
+            self.object_define_property(obj, &k, desc)?;
+        }
+        Ok(())
     }
 
     /// The `(name, length)` of a callable value (function, closure, or class) for
@@ -3561,6 +3841,19 @@ impl<'p> Vm<'p> {
             if let Some(p) = self.prototype_of(obj) {
                 return Ok(p);
             }
+        }
+        // Own data/accessor property on a plain object. Extracted BEFORE the type
+        // match so an accessor's getter can be invoked outside the heap borrow.
+        let own = match self.heap.get(obj.heap_index()) {
+            HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
+            _ => None,
+        };
+        if let Some((a, raw)) = own {
+            if a.accessor {
+                // `raw` is the getter (UNDEFINED ⇒ no getter ⇒ read is undefined).
+                return if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, obj, &[]) };
+            }
+            return Ok(raw);
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Array(items) => {
@@ -3910,6 +4203,14 @@ impl<'p> Vm<'p> {
             return Value::bool(true);
         }
         let idx = obj.heap_index();
+        // A non-configurable own property cannot be deleted (`delete` yields false).
+        if let HeapObj::Object(m) = self.heap.get(idx) {
+            if let Some(i) = m.pos(key) {
+                if !m.attrs[i].configurable {
+                    return Value::bool(false);
+                }
+            }
+        }
         let removed = match self.heap.get_mut(idx) {
             HeapObj::Object(map) => map.remove(key),
             HeapObj::Array(items) => {
@@ -3947,6 +4248,24 @@ impl<'p> Vm<'p> {
             }
             self.heap.bump_version(idx);
             return Ok(());
+        }
+        // An OWN property's descriptor governs assignment: an accessor invokes its
+        // setter; a non-writable data property silently ignores the write (sloppy).
+        let own_attr = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
+            _ => None,
+        };
+        if let Some(a) = own_attr {
+            if a.accessor {
+                if a.setter != Value::UNDEFINED {
+                    self.call_value(a.setter, obj, &[val])?;
+                }
+                return Ok(()); // accessor with no setter ⇒ no-op (sloppy)
+            }
+            if !a.writable {
+                return Ok(()); // non-writable own data property ⇒ no-op (sloppy)
+            }
+            // writable own data property → fall through to overwrite its value.
         }
         // A class instance with an inherited `set x(v)` accessor: assigning a
         // property that is NOT an own data property invokes the setter (own data

@@ -19,6 +19,11 @@ use std::borrow::Cow;
 pub struct ObjMap {
     pub keys: Vec<String>,
     pub vals: Vec<Value>,
+    /// Per-property attributes, parallel to `keys`/`vals` (a property descriptor's
+    /// writable/enumerable/configurable + accessor get/set). For a DATA property
+    /// `vals[i]` is the value; for an ACCESSOR `vals[i]` is the getter and
+    /// `attrs[i].setter` the setter.
+    pub attrs: Vec<PropAttr>,
     /// Heap index of the class this object is an instance of (`new C()`), used
     /// for prototype-style method lookup and `instanceof`. `None` for a plain
     /// object literal. Own properties (the fields) live in `keys`/`vals`;
@@ -26,26 +31,71 @@ pub struct ObjMap {
     pub class: Option<u32>,
 }
 
+/// One property's attributes — the ECMAScript property-descriptor flags plus an
+/// accessor pair. A data property uses `writable` and the parallel `vals` entry;
+/// an accessor (`accessor == true`) uses `vals[i]` as the getter and `setter`.
+#[derive(Clone, Copy, Debug)]
+pub struct PropAttr {
+    pub writable: bool,
+    pub enumerable: bool,
+    pub configurable: bool,
+    pub accessor: bool,
+    /// The setter function for an accessor property (`UNDEFINED` if none / data).
+    pub setter: Value,
+}
+
+impl PropAttr {
+    /// The default attributes for an ordinary created property (`obj.x = v`,
+    /// object literals): a writable, enumerable, configurable data property.
+    pub fn data() -> PropAttr {
+        PropAttr { writable: true, enumerable: true, configurable: true, accessor: false, setter: Value::UNDEFINED }
+    }
+}
+
 impl ObjMap {
     pub fn new() -> ObjMap {
-        ObjMap { keys: Vec::new(), vals: Vec::new(), class: None }
+        ObjMap { keys: Vec::new(), vals: Vec::new(), attrs: Vec::new(), class: None }
     }
 
+    pub fn pos(&self, key: &str) -> Option<usize> {
+        self.keys.iter().position(|k| k == key)
+    }
+
+    /// The raw stored value for `key` (a data value, or an accessor's getter).
+    /// Callers that must honour accessors check `attrs[i].accessor` first.
     pub fn get(&self, key: &str) -> Option<Value> {
-        self.keys.iter().position(|k| k == key).map(|i| self.vals[i])
+        self.pos(key).map(|i| self.vals[i])
     }
 
-    /// Set `key = val`. Returns `true` if a NEW key was appended (which may have
-    /// reallocated `vals`), `false` if an existing slot was overwritten. The JIT
-    /// inline cache uses this to bump the object's version on a key-add (an
-    /// existing key's slot never moves — keys are append-only, no delete).
+    /// Set `key = val` as a DATA property. Returns `true` if a NEW key was
+    /// appended (which may have reallocated `vals`), `false` if an existing slot
+    /// was overwritten. New keys get default data attributes; existing keys keep
+    /// their attributes (only the value changes). The JIT inline cache uses the
+    /// return to bump the object's version on a key-add.
     pub fn set(&mut self, key: &str, val: Value) -> bool {
-        if let Some(i) = self.keys.iter().position(|k| k == key) {
+        if let Some(i) = self.pos(key) {
             self.vals[i] = val;
             false
         } else {
             self.keys.push(key.to_string());
             self.vals.push(val);
+            self.attrs.push(PropAttr::data());
+            true
+        }
+    }
+
+    /// Define `key` with explicit attributes (`Object.defineProperty`, or a method
+    /// with non-default enumerability). Overwrites any existing slot. Returns
+    /// `true` if a new key was appended.
+    pub fn define(&mut self, key: &str, val: Value, attr: PropAttr) -> bool {
+        if let Some(i) = self.pos(key) {
+            self.vals[i] = val;
+            self.attrs[i] = attr;
+            false
+        } else {
+            self.keys.push(key.to_string());
+            self.vals.push(val);
+            self.attrs.push(attr);
             true
         }
     }
@@ -54,9 +104,10 @@ impl ObjMap {
     /// slots, so the caller MUST bump the object's version (a JIT inline cache
     /// may have recorded a now-stale slot index for another key).
     pub fn remove(&mut self, key: &str) -> bool {
-        if let Some(i) = self.keys.iter().position(|k| k == key) {
+        if let Some(i) = self.pos(key) {
             self.keys.remove(i);
             self.vals.remove(i);
+            self.attrs.remove(i);
             true
         } else {
             false

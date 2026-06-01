@@ -453,6 +453,18 @@ pub enum StaticFn {
     NumberIsFinite,
     /// `Number.isSafeInteger(x)` — integer within ±(2^53 − 1).
     NumberIsSafeInteger,
+    /// `Object.defineProperty(obj, key, descriptor)` — returns obj.
+    ObjectDefineProperty,
+    /// `Object.getOwnPropertyDescriptor(obj, key)` — a descriptor object or undefined.
+    ObjectGetOwnPropertyDescriptor,
+    /// `Object.getOwnPropertyNames(obj)` — array of own string keys (incl. non-enumerable).
+    ObjectGetOwnPropertyNames,
+    /// `Object.getPrototypeOf(obj)` — the object's prototype (or null).
+    ObjectGetPrototypeOf,
+    /// `Object.create(proto[, props])` — a new object with the given prototype.
+    ObjectCreate,
+    /// `Object.defineProperties(obj, descs)` — define multiple properties.
+    ObjectDefineProperties,
 }
 
 impl StaticFn {
@@ -473,6 +485,12 @@ impl StaticFn {
             ("Number", "isNaN") => StaticFn::NumberIsNaN,
             ("Number", "isFinite") => StaticFn::NumberIsFinite,
             ("Number", "isSafeInteger") => StaticFn::NumberIsSafeInteger,
+            ("Object", "defineProperty") => StaticFn::ObjectDefineProperty,
+            ("Object", "getOwnPropertyDescriptor") => StaticFn::ObjectGetOwnPropertyDescriptor,
+            ("Object", "getOwnPropertyNames") => StaticFn::ObjectGetOwnPropertyNames,
+            ("Object", "getPrototypeOf") => StaticFn::ObjectGetPrototypeOf,
+            ("Object", "create") => StaticFn::ObjectCreate,
+            ("Object", "defineProperties") => StaticFn::ObjectDefineProperties,
             _ => return None,
         })
     }
