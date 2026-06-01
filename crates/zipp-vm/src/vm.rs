@@ -1541,11 +1541,22 @@ impl<'p> Vm<'p> {
                     Instr::InstanceOfDyn { dst, val, ctor } => {
                         let v = self.get(base, val);
                         let c = self.get(base, ctor);
-                        // True iff `v` is an instance whose class chain includes `c`.
-                        let r = c.is_heap()
-                            && matches!(self.heap.get(c.heap_index()), HeapObj::Class(_))
-                            && v.is_heap()
-                            && self.instance_of_class(v, c.heap_index());
+                        // A class uses its `extends` chain; a constructor FUNCTION
+                        // checks whether `F.prototype` is in `v`'s prototype chain.
+                        let kind = if c.is_heap() {
+                            match self.heap.get(c.heap_index()) {
+                                HeapObj::Class(_) => 1u8,
+                                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } => 2,
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
+                        let r = match kind {
+                            1 => v.is_heap() && self.instance_of_class(v, c.heap_index()),
+                            2 => self.instanceof_via_proto(v, c),
+                            _ => false,
+                        };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
@@ -4213,8 +4224,9 @@ impl<'p> Vm<'p> {
                 }
                 // Own-property miss: walk the class chain for an inherited method
                 // (return its func) or getter (invoke it with this = obj).
+                let class = map.class;
                 let (mut method, mut getter) = (None, None);
-                let mut cur = map.class;
+                let mut cur = class;
                 while let Some(cidx) = cur {
                     match self.heap.get(cidx) {
                         HeapObj::Class(c) => {
@@ -4237,18 +4249,19 @@ impl<'p> Vm<'p> {
                 if let Some(g) = getter {
                     return self.call_value(g, obj, &[]);
                 }
-                // Own + class miss: delegate to the object's prototype
-                // (Object.prototype's hasOwnProperty/toString/… as values), or an
-                // explicit `Object.create` prototype.
-                let proto = self
-                    .proto_of
-                    .get(&obj.heap_index())
-                    .copied()
-                    .filter(|p| p.is_heap())
-                    .or_else(|| {
-                        (self.obj_proto != 0 && obj.heap_index() != self.obj_proto)
-                            .then(|| Value::heap(self.obj_proto))
-                    });
+                // Own + class miss: delegate up the prototype chain — an explicit
+                // `Object.create` proto, else a class instance's `C.prototype`
+                // (carries `constructor` + inherited methods, and itself chains to
+                // Object.prototype), else the base Object.prototype.
+                let proto = if let Some(&p) = self.proto_of.get(&obj.heap_index()) {
+                    p.is_heap().then_some(p)
+                } else if let Some(cidx) = class {
+                    self.prototype_of(Value::heap(cidx))
+                } else if self.obj_proto != 0 && obj.heap_index() != self.obj_proto {
+                    Some(Value::heap(self.obj_proto))
+                } else {
+                    None
+                };
                 match proto {
                     Some(p) => self.get_prop(p, key),
                     None => Ok(Value::UNDEFINED),
@@ -4647,7 +4660,13 @@ impl<'p> Vm<'p> {
             self.heap.get(idx),
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
         ) {
-            self.fn_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            // Reassigning `fn.prototype = obj` redirects what `new fn()` / the
+            // `.prototype` getter see (the lazily-cached prototype object).
+            if key == "prototype" && val.is_heap() {
+                self.prototypes.insert(idx, val.heap_index());
+            } else {
+                self.fn_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            }
             return Ok(());
         }
         let mut added = false;
@@ -5111,6 +5130,27 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
         }
+        // Constructor FUNCTION (`new F()`, the pre-class OOP idiom): make an object
+        // whose [[Prototype]] is `F.prototype` (so its methods + `constructor`
+        // resolve), run `F` with `this` = that object, and use F's return value if
+        // it returns an object (else the new object).
+        if matches!(
+            self.heap.get(cv.heap_index()),
+            HeapObj::Func(_) | HeapObj::Closure { .. }
+        ) {
+            let proto = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
+            let obj = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+            if proto.is_heap() {
+                self.proto_of.insert(obj.heap_index(), proto);
+            }
+            let ret = self.call_value(cv, obj, args)?;
+            if ret.is_heap()
+                && matches!(self.heap.get(ret.heap_index()), HeapObj::Object(_) | HeapObj::Array(_))
+            {
+                return Ok(ret);
+            }
+            return Ok(obj);
+        }
         let (ctor, has_explicit, parent) = match self.heap.get(cv.heap_index()) {
             HeapObj::Class(c) => (c.ctor, c.has_explicit_ctor, c.parent),
             _ => return Err(Thrown("TypeError: value is not a constructor".into())),
@@ -5144,6 +5184,26 @@ impl<'p> Vm<'p> {
             }
         }
         Ok(obj)
+    }
+
+    /// `v instanceof F` for a constructor FUNCTION `F`: true iff `F.prototype` is
+    /// somewhere in `v`'s prototype chain.
+    fn instanceof_via_proto(&mut self, v: Value, ctor: Value) -> bool {
+        let target = match self.prototype_of(ctor) {
+            Some(p) => p,
+            None => return false,
+        };
+        let mut cur = self.object_get_prototype_of(v);
+        for _ in 0..10_000 {
+            if !cur.is_heap() {
+                return false;
+            }
+            if cur == target {
+                return true;
+            }
+            cur = self.object_get_prototype_of(cur);
+        }
+        false
     }
 
     /// True iff `v` is an object whose class chain includes the class at heap
