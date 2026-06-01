@@ -131,6 +131,43 @@ pub struct Reaction {
     pub is_async: bool,
 }
 
+/// Boxed payload of a [`HeapObj::Class`] (see that variant's docs). Kept behind a
+/// `Box` so the rarely-allocated class object — 8 fields incl. a `String`, three
+/// `Vec`s and an `ObjMap` — does not inflate `size_of::<HeapObj>()` for the hot,
+/// tiny variants (`Cons`/`Str`/`Array`/`Object`) that pay it on every alloc.
+#[derive(Clone, Debug)]
+pub struct ClassData {
+    pub name: String,
+    pub ctor: Option<u32>,
+    /// Whether `ctor` is an explicit constructor (its body calls `super`
+    /// itself) vs. a fields-only proto (the `new` path runs the parent ctor).
+    pub has_explicit_ctor: bool,
+    pub methods: Vec<(String, Value)>,
+    /// `get x()` accessors, invoked with `this` = instance on property read.
+    pub getters: Vec<(String, Value)>,
+    /// `set x(v)` accessors, invoked with `this` = instance on property write.
+    pub setters: Vec<(String, Value)>,
+    /// Static members — own properties of the class value (`C.method`,
+    /// `C.field`). Methods start here; static fields are added by SetProp.
+    pub statics: ObjMap,
+    /// Heap index of the superclass value (`class C extends P`), for
+    /// inherited method/getter lookup and `instanceof` up the chain.
+    pub parent: Option<u32>,
+}
+
+/// Boxed payload of a [`HeapObj::AsyncState`] (see that variant's docs). Boxed for
+/// the same reason as [`ClassData`]: it carries two `Vec`s and so is one of the
+/// largest variants, but is allocated only when an `async` function suspends.
+#[derive(Clone, Debug)]
+pub struct AsyncStateData {
+    pub func: u32,
+    pub closure: u32,
+    pub state: GenState,
+    pub regs: Vec<Value>,
+    pub result: u32,
+    pub handlers: Vec<Handler>,
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -156,12 +193,6 @@ pub enum HeapObj {
     Array(Vec<Value>),
     /// A plain object.
     Object(ObjMap),
-    /// A class value (`class C {…}`). `ctor` is the func id that runs instance
-    /// field initializers then the user constructor (or `None`); `methods` maps
-    /// each instance method name to its func id. `new C(args)` builds a plain
-    /// object, installs the methods as own properties, and runs the ctor with
-    /// `this` = the new object. No prototype chain (methods are own props) and no
-    /// inheritance in this subset.
     /// A JS Promise. `result` holds the fulfillment value / rejection reason
     /// (undefined while Pending); `fulfill`/`reject` are reactions registered
     /// while Pending (drained as microtasks on settle). `handled` tracks whether
@@ -198,37 +229,18 @@ pub enum HeapObj {
     /// resumed at each `await`) but it also owns its `result` Promise's heap index
     /// and PRESERVES `try` handlers across an await (so `try { await p } catch`
     /// works). `handlers` are (catch_target, catch_reg) pairs.
-    AsyncState {
-        func: u32,
-        closure: u32,
-        state: GenState,
-        regs: Vec<Value>,
-        result: u32,
-        handlers: Vec<Handler>,
-    },
+    AsyncState(Box<AsyncStateData>),
     /// A JS `Map`: insertion-ordered (key, value) entries with SameValueZero key
     /// equality. Parallel `keys`/`vals` Vecs (small Maps dominate; linear scan).
     Map { keys: Vec<Value>, vals: Vec<Value> },
     /// A JS `Set`: insertion-ordered unique values (SameValueZero equality).
     Set(Vec<Value>),
-    Class {
-        name: String,
-        ctor: Option<u32>,
-        /// Whether `ctor` is an explicit constructor (its body calls `super`
-        /// itself) vs. a fields-only proto (the `new` path runs the parent ctor).
-        has_explicit_ctor: bool,
-        methods: Vec<(String, Value)>,
-        /// `get x()` accessors, invoked with `this` = instance on property read.
-        getters: Vec<(String, Value)>,
-        /// `set x(v)` accessors, invoked with `this` = instance on property write.
-        setters: Vec<(String, Value)>,
-        /// Static members — own properties of the class value (`C.method`,
-        /// `C.field`). Methods start here; static fields are added by SetProp.
-        statics: ObjMap,
-        /// Heap index of the superclass value (`class C extends P`), for
-        /// inherited method/getter lookup and `instanceof` up the chain.
-        parent: Option<u32>,
-    },
+    /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
+    /// `ctor` is the func id that runs instance field initializers then the user
+    /// constructor (or `None`); `methods` maps each instance method name to its
+    /// func id. `new C(args)` builds a plain object, links it to its class for
+    /// method lookup, and runs the ctor with `this` = the new object.
+    Class(Box<ClassData>),
 }
 
 /// Heap index of the interned empty string. The 128 single-ASCII-char strings

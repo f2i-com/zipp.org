@@ -20,7 +20,9 @@
 //! later make faster.
 
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
-use crate::heap::{GenState, Handler, Heap, HeapObj, ObjMap, PromiseState, Reaction};
+use crate::heap::{
+    AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap, PromiseState, Reaction,
+};
 use crate::value::Value;
 
 /// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
@@ -1194,7 +1196,7 @@ impl<'p> Vm<'p> {
                             let fv = Value::heap(self.heap.alloc(HeapObj::Func(*fid)));
                             statics.set(n, fv);
                         }
-                        let v = Value::heap(self.heap.alloc(HeapObj::Class {
+                        let v = Value::heap(self.heap.alloc(HeapObj::Class(Box::new(ClassData {
                             name: cd.name,
                             ctor: cd.ctor,
                             has_explicit_ctor: cd.has_explicit_ctor,
@@ -1203,7 +1205,7 @@ impl<'p> Vm<'p> {
                             setters,
                             statics,
                             parent: parent_idx,
-                        }));
+                        }))));
                         // Remember it so `super` in a derived class can reach it.
                         self.class_values[class_id as usize] = Some(v);
                         self.set(base, dst, v);
@@ -1214,16 +1216,14 @@ impl<'p> Vm<'p> {
                         let k = self.get(base, key);
                         let kstr = self.display(k);
                         let fv = Value::heap(self.heap.alloc(HeapObj::Func(func)));
-                        if let HeapObj::Class { methods, getters, setters, statics, .. } =
-                            self.heap.get_mut(cv.heap_index())
-                        {
+                        if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
                             if kind == 3 {
-                                statics.set(&kstr, fv); // static method
+                                c.statics.set(&kstr, fv); // static method
                             } else {
                                 let list = match kind {
-                                    1 => getters,
-                                    2 => setters,
-                                    _ => methods,
+                                    1 => &mut c.getters,
+                                    2 => &mut c.setters,
+                                    _ => &mut c.methods,
                                 };
                                 // Replace a same-key member, else append.
                                 if let Some(slot) = list.iter_mut().find(|(n, _)| *n == kstr) {
@@ -1267,12 +1267,12 @@ impl<'p> Vm<'p> {
                         let mut cur = parent.is_heap().then(|| parent.heap_index());
                         while let Some(cidx) = cur {
                             match self.heap.get(cidx) {
-                                HeapObj::Class { methods, parent, .. } => {
-                                    if let Some((_, v)) = methods.iter().find(|(k, _)| k == key) {
+                                HeapObj::Class(c) => {
+                                    if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
                                         method = Some(*v);
                                         break;
                                     }
-                                    cur = *parent;
+                                    cur = c.parent;
                                 }
                                 _ => break,
                             }
@@ -1449,7 +1449,7 @@ impl<'p> Vm<'p> {
                         let c = self.get(base, ctor);
                         // True iff `v` is an instance whose class chain includes `c`.
                         let r = c.is_heap()
-                            && matches!(self.heap.get(c.heap_index()), HeapObj::Class { .. })
+                            && matches!(self.heap.get(c.heap_index()), HeapObj::Class(_))
                             && v.is_heap()
                             && self.instance_of_class(v, c.heap_index());
                         self.set(base, dst, Value::bool(r));
@@ -2759,14 +2759,14 @@ impl<'p> Vm<'p> {
             regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
         }
         let result = self.alloc_promise();
-        let idx = self.heap.alloc(HeapObj::AsyncState {
+        let idx = self.heap.alloc(HeapObj::AsyncState(Box::new(AsyncStateData {
             func: func_id,
             closure,
             state: GenState::Suspended(0),
             regs,
             result,
             handlers: Vec::new(),
-        });
+        })));
         // Run from the top until the first await suspends it (or it finishes —
         // settling `result` either way).
         self.drive_async(idx, Resume::Value(Value::UNDEFINED));
@@ -2972,9 +2972,7 @@ impl<'p> Vm<'p> {
     /// restores the activation's `try` handlers so a rejection can be caught.
     fn drive_async(&mut self, idx: u32, input: Resume) {
         let (state, fid, closure, result) = match self.heap.get(idx) {
-            HeapObj::AsyncState { state, func, closure, result, .. } => {
-                (*state, *func, *closure, *result)
-            }
+            HeapObj::AsyncState(a) => (a.state, a.func, a.closure, a.result),
             _ => return,
         };
         let resume_ip = match state {
@@ -2984,9 +2982,9 @@ impl<'p> Vm<'p> {
         // Detach the saved window + handlers, then splice the window onto the top
         // of the live register file.
         let (saved, saved_handlers) = match self.heap.get_mut(idx) {
-            HeapObj::AsyncState { state, regs, handlers, .. } => {
-                *state = GenState::Running;
-                (std::mem::take(regs), std::mem::take(handlers))
+            HeapObj::AsyncState(a) => {
+                a.state = GenState::Running;
+                (std::mem::take(&mut a.regs), std::mem::take(&mut a.handlers))
             }
             _ => return,
         };
@@ -2994,10 +2992,10 @@ impl<'p> Vm<'p> {
         let new_base = self.regs.len();
         if self.regs_would_overflow(new_base + reg_count) {
             // Can't make progress — abandon the activation and reject its result.
-            if let HeapObj::AsyncState { state, regs, handlers, .. } = self.heap.get_mut(idx) {
-                *state = GenState::Completed;
-                regs.clear();
-                handlers.clear();
+            if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                a.state = GenState::Completed;
+                a.regs.clear();
+                a.handlers.clear();
             }
             let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
             self.reject(result, e);
@@ -3049,10 +3047,10 @@ impl<'p> Vm<'p> {
         // Suspended again at an await?
         if let Some((awaited, await_ip, handlers)) = self.pending_await.take() {
             let back = self.regs.split_off(new_base);
-            if let HeapObj::AsyncState { state, regs, handlers: h, .. } = self.heap.get_mut(idx) {
-                *state = GenState::Suspended(await_ip);
-                *regs = back;
-                *h = handlers;
+            if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                a.state = GenState::Suspended(await_ip);
+                a.regs = back;
+                a.handlers = handlers;
             }
             let p = self.to_promise(awaited);
             self.settle_subscribe(p, idx);
@@ -3061,10 +3059,10 @@ impl<'p> Vm<'p> {
         // Otherwise the activation finished — settle `result`.
         match outcome {
             Ok(ret) => {
-                if let HeapObj::AsyncState { state, regs, handlers, .. } = self.heap.get_mut(idx) {
-                    *state = GenState::Completed;
-                    regs.clear();
-                    handlers.clear();
+                if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                    a.state = GenState::Completed;
+                    a.regs.clear();
+                    a.handlers.clear();
                 }
                 self.resolve(result, ret);
             }
@@ -3075,10 +3073,10 @@ impl<'p> Vm<'p> {
                 };
                 // The unwind already truncated the window; keep regs consistent.
                 self.regs.truncate(new_base);
-                if let HeapObj::AsyncState { state, regs, handlers, .. } = self.heap.get_mut(idx) {
-                    *state = GenState::Completed;
-                    regs.clear();
-                    handlers.clear();
+                if let HeapObj::AsyncState(a) = self.heap.get_mut(idx) {
+                    a.state = GenState::Completed;
+                    a.regs.clear();
+                    a.handlers.clear();
                 }
                 self.reject(result, e);
             }
@@ -3455,11 +3453,12 @@ impl<'p> Vm<'p> {
                 let p = &self.program.functions[*func as usize];
                 Some((clean(&p.name), p.param_count as i32))
             }
-            HeapObj::Class { name, ctor, .. } => {
-                let len = ctor
-                    .map(|c| self.program.functions[c as usize].param_count as i32)
+            HeapObj::Class(c) => {
+                let len = c
+                    .ctor
+                    .map(|f| self.program.functions[f as usize].param_count as i32)
                     .unwrap_or(0);
-                Some((name.clone(), len))
+                Some((c.name.clone(), len))
             }
             _ => None,
         }
@@ -3518,16 +3517,16 @@ impl<'p> Vm<'p> {
                 let mut cur = map.class;
                 while let Some(cidx) = cur {
                     match self.heap.get(cidx) {
-                        HeapObj::Class { methods, getters, parent, .. } => {
-                            if let Some((_, v)) = methods.iter().find(|(k, _)| k == key) {
+                        HeapObj::Class(c) => {
+                            if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
                                 method = Some(*v);
                                 break;
                             }
-                            if let Some((_, v)) = getters.iter().find(|(k, _)| k == key) {
+                            if let Some((_, v)) = c.getters.iter().find(|(k, _)| k == key) {
                                 getter = Some(*v);
                                 break;
                             }
-                            cur = *parent;
+                            cur = c.parent;
                         }
                         _ => break,
                     }
@@ -3542,18 +3541,18 @@ impl<'p> Vm<'p> {
             }
             // Static members are own properties of the class value; statics are
             // inherited, so walk the `extends` chain (`C.method`, `Sub.parentStatic`).
-            HeapObj::Class { statics, parent, .. } => {
-                if let Some(v) = statics.get(key) {
+            HeapObj::Class(c) => {
+                if let Some(v) = c.statics.get(key) {
                     return Ok(v);
                 }
-                let mut cur = *parent;
+                let mut cur = c.parent;
                 while let Some(pidx) = cur {
                     match self.heap.get(pidx) {
-                        HeapObj::Class { statics, parent, .. } => {
-                            if let Some(v) = statics.get(key) {
+                        HeapObj::Class(pc) => {
+                            if let Some(v) = pc.statics.get(key) {
                                 return Ok(v);
                             }
-                            cur = *parent;
+                            cur = pc.parent;
                         }
                         _ => break,
                     }
@@ -3812,7 +3811,7 @@ impl<'p> Vm<'p> {
                 // A class is callable (with `new`), so `typeof C === "function"`.
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }
-                | HeapObj::Class { .. }
+                | HeapObj::Class(_)
                 | HeapObj::BoundResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
                 _ => "object", // Array, Object
@@ -3856,8 +3855,8 @@ impl<'p> Vm<'p> {
         match self.heap.get_mut(idx) {
             HeapObj::Object(map) => added = map.set(key, val),
             // Static-member assignment on a class value (`C.x = …`).
-            HeapObj::Class { statics, .. } => {
-                statics.set(key, val);
+            HeapObj::Class(c) => {
+                c.statics.set(key, val);
             }
             _ => {}
         }
@@ -3872,11 +3871,11 @@ impl<'p> Vm<'p> {
         let mut cur = class;
         while let Some(cidx) = cur {
             match self.heap.get(cidx) {
-                HeapObj::Class { setters, parent, .. } => {
-                    if let Some((_, v)) = setters.iter().find(|(k, _)| k == key) {
+                HeapObj::Class(c) => {
+                    if let Some((_, v)) = c.setters.iter().find(|(k, _)| k == key) {
                         return Some(*v);
                     }
-                    cur = *parent;
+                    cur = c.parent;
                 }
                 _ => break,
             }
@@ -4178,13 +4177,13 @@ impl<'p> Vm<'p> {
                 let mut cur = map.class;
                 while let Some(cidx) = cur {
                     match self.heap.get(cidx) {
-                        HeapObj::Class { methods, getters, parent, .. } => {
-                            if methods.iter().any(|(n, _)| *n == k)
-                                || getters.iter().any(|(n, _)| *n == k)
+                        HeapObj::Class(c) => {
+                            if c.methods.iter().any(|(n, _)| *n == k)
+                                || c.getters.iter().any(|(n, _)| *n == k)
                             {
                                 return true;
                             }
-                            cur = *parent;
+                            cur = c.parent;
                         }
                         _ => break,
                     }
@@ -4204,7 +4203,7 @@ impl<'p> Vm<'p> {
                 None => self.display(key) == "length",
             },
             HeapObj::Map { .. } | HeapObj::Set(_) => self.display(key) == "size",
-            HeapObj::Class { statics, .. } => statics.get(&self.display(key)).is_some(),
+            HeapObj::Class(c) => c.statics.get(&self.display(key)).is_some(),
             _ => false,
         }
     }
@@ -4267,9 +4266,7 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: value is not a constructor".into()));
         }
         let (ctor, has_explicit, parent) = match self.heap.get(cv.heap_index()) {
-            HeapObj::Class { ctor, has_explicit_ctor, parent, .. } => {
-                (*ctor, *has_explicit_ctor, *parent)
-            }
+            HeapObj::Class(c) => (c.ctor, c.has_explicit_ctor, c.parent),
             _ => return Err(Thrown("TypeError: value is not a constructor".into())),
         };
         // The instance links to its class for method lookup + instanceof; its own
@@ -4318,7 +4315,7 @@ impl<'p> Vm<'p> {
                 return true;
             }
             cur = match self.heap.get(cidx) {
-                HeapObj::Class { parent, .. } => *parent,
+                HeapObj::Class(c) => c.parent,
                 _ => None,
             };
         }
@@ -4333,9 +4330,7 @@ impl<'p> Vm<'p> {
             return Ok(());
         }
         let (ctor, has_explicit, parent) = match self.heap.get(cval.heap_index()) {
-            HeapObj::Class { ctor, has_explicit_ctor, parent, .. } => {
-                (*ctor, *has_explicit_ctor, *parent)
-            }
+            HeapObj::Class(c) => (c.ctor, c.has_explicit_ctor, c.parent),
             _ => return Ok(()),
         };
         if has_explicit {
@@ -5833,14 +5828,14 @@ impl<'p> Vm<'p> {
                     .collect::<Vec<_>>()
                     .join(","),
                 HeapObj::Object(_) => "[object Object]".into(),
-                HeapObj::Class { name, .. } => format!("class {name} {{ }}"),
+                HeapObj::Class(c) => format!("class {} {{ }}", c.name),
                 HeapObj::Map { .. } => "[object Map]".into(),
                 HeapObj::Set(_) => "[object Set]".into(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
                 HeapObj::BoundResolver { .. } => "function".into(),
                 // Internal: never user-visible (an async call yields its Promise).
-                HeapObj::AsyncState { .. } => "[object Promise]".into(),
+                HeapObj::AsyncState(_) => "[object Promise]".into(),
                 HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
                     "[object Object]".into()
                 }
@@ -5915,7 +5910,7 @@ impl<'p> Vm<'p> {
                 // A class instance prints with its constructor name (`Pt { … }`).
                 let prefix = match map.class {
                     Some(cidx) => match self.heap.get(cidx) {
-                        HeapObj::Class { name, .. } => format!("{name} "),
+                        HeapObj::Class(c) => format!("{} ", c.name),
                         _ => String::new(),
                     },
                     None => String::new(),
@@ -5931,7 +5926,7 @@ impl<'p> Vm<'p> {
                     .collect();
                 format!("{prefix}{{ {} }}", parts.join(", "))
             }
-            HeapObj::Class { name, .. } => format!("[class {name}]"),
+            HeapObj::Class(c) => format!("[class {}]", c.name),
             HeapObj::Map { keys, vals } => {
                 if keys.is_empty() {
                     return "Map(0) {}".into();
@@ -5962,7 +5957,7 @@ impl<'p> Vm<'p> {
             },
             HeapObj::BoundResolver { .. } => "[Function (anonymous)]".into(),
             // Internal: never user-visible (an async call yields its Promise).
-            HeapObj::AsyncState { .. } => "Promise { <pending> }".into(),
+            HeapObj::AsyncState(_) => "Promise { <pending> }".into(),
             HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => "[object Object]".into(),
             // node renders a Date in console.log as its ISO string (unquoted).
             HeapObj::Date(ms) => {
