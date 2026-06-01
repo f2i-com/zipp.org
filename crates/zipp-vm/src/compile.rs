@@ -1478,22 +1478,6 @@ impl<'a> FnCompiler<'a> {
         Vec<(String, Option<&'b ox::Expression<'b>>)>,
         Vec<(&'b ox::Expression<'b>, u32, u8)>,
     )> {
-        // `extends P`: P must be a class declared earlier (resolved to its id);
-        // arbitrary superclass expressions / built-ins are out of the subset.
-        let super_class_id = match &class.super_class {
-            None => None,
-            Some(ox::Expression::Identifier(id)) => Some(
-                self.cx
-                    .class_names
-                    .iter()
-                    .find(|(n, _)| n == id.name.as_str())
-                    .map(|(_, cid)| *cid)
-                    .ok_or("class can only `extend` a class declared earlier in the program")?,
-            ),
-            Some(_) => {
-                return Err("class `extends` must name a class (arbitrary superclass expressions are out of the subset)".into())
-            }
-        };
         // A named class expression keeps its own name; an anonymous one inherits
         // the binding it's assigned to (NamedEvaluation), else the "<class>" stub.
         let cname = class
@@ -1518,6 +1502,13 @@ impl<'a> FnCompiler<'a> {
             static_setters: Vec::new(),
         });
         self.cx.class_names.push((cname.clone(), class_id));
+        // `super` resolves its target at RUNTIME via this class's own
+        // `ClassData.parent` (set by MakeClass from the evaluated `extends`
+        // expression). So methods of a derived class carry THIS class's id as
+        // their super context — which lets `extends <any expression>` (mixins,
+        // conditionals, built-ins, class expressions) work, not just
+        // `extends <identifier-of-an-earlier-class>`.
+        let super_class_id = class.super_class.as_ref().map(|_| class_id);
         let mut ctor_fn: Option<&ox::Function> = None;
         let mut methods: Vec<(String, &ox::Function)> = Vec::new();
         let mut getters: Vec<(String, &ox::Function)> = Vec::new();
@@ -3836,7 +3827,7 @@ impl<'a> FnCompiler<'a> {
                 .super_class
                 .ok_or("`super(...)` is only valid in a derived class constructor")?;
             let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
-            self.emit(Instr::SuperCtor { parent_class_id: pid, arg_base, argc });
+            self.emit(Instr::SuperCtor { home_class_id: pid, arg_base, argc });
             self.emit(Instr::LoadUndefined { dst }); // `super()` yields undefined here
             return Ok(dst);
         }
@@ -3848,7 +3839,7 @@ impl<'a> FnCompiler<'a> {
                     .ok_or("`super.method(...)` is only valid in a derived class")?;
                 let name = self.string_name(m.property.name.as_str());
                 let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
-                self.emit(Instr::SuperMethod { dst, parent_class_id: pid, name, arg_base, argc });
+                self.emit(Instr::SuperMethod { dst, home_class_id: pid, name, arg_base, argc });
                 return Ok(dst);
             }
         }

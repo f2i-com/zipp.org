@@ -1359,8 +1359,8 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
-                    Instr::SuperCtor { parent_class_id, arg_base, argc } => {
-                        let parent = self.class_values[parent_class_id as usize]
+                    Instr::SuperCtor { home_class_id, arg_base, argc } => {
+                        let parent = self.super_parent(home_class_id)
                             .ok_or_else(|| Thrown("TypeError: superclass is not a constructor".into()))?;
                         let this = self.get(base, 0);
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
@@ -1370,11 +1370,11 @@ impl<'p> Vm<'p> {
                         self.run_class_ctor(parent, this, &args)?;
                         ip += 1;
                     }
-                    Instr::SuperMethod { dst, parent_class_id, name, arg_base, argc } => {
+                    Instr::SuperMethod { dst, home_class_id, name, arg_base, argc } => {
                         let prog: &'p Program = self.program;
                         let key: &'p str =
                             &prog.functions[func_id as usize].string_constants[name as usize];
-                        let parent = self.class_values[parent_class_id as usize]
+                        let parent = self.super_parent(home_class_id)
                             .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
                         // Find the method up the parent's class chain.
                         let mut method = None;
@@ -5453,6 +5453,17 @@ impl<'p> Vm<'p> {
             };
         }
         false
+    }
+
+    /// The superclass value for a `super` reference inside a method of class
+    /// `home_class_id`: that class's runtime `ClassData.parent` (linked by
+    /// MakeClass from the evaluated `extends` expression), or None.
+    fn super_parent(&self, home_class_id: u32) -> Option<Value> {
+        let home = (*self.class_values.get(home_class_id as usize)?)?;
+        match self.heap.get(home.heap_index()) {
+            HeapObj::Class(c) => c.parent.map(Value::heap),
+            _ => None,
+        }
     }
 
     /// Run a class's constructor contribution on an existing instance `obj` —

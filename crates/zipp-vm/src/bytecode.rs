@@ -141,11 +141,13 @@ pub enum Instr {
     /// is not iterable.
     IterNext { value_dst: Reg, done_dst: Reg, iter: Reg, idx: Reg },
     /// `super(args…)`: run the lexical superclass's constructor contribution on
-    /// the current `this` (reg 0). `parent_class_id` identifies the superclass.
-    SuperCtor { parent_class_id: u32, arg_base: Reg, argc: u16 },
+    /// the current `this` (reg 0). `home_class_id` is the class the method belongs
+    /// to; its runtime `ClassData.parent` is the superclass to invoke (so an
+    /// `extends <arbitrary expression>` parent resolves dynamically).
+    SuperCtor { home_class_id: u32, arg_base: Reg, argc: u16 },
     /// `dst = super.<name>(args…)`: call the named method found from the lexical
     /// superclass up its chain, with `this` = the current frame's `this` (reg 0).
-    SuperMethod { dst: Reg, parent_class_id: u32, name: u32, arg_base: Reg, argc: u16 },
+    SuperMethod { dst: Reg, home_class_id: u32, name: u32, arg_base: Reg, argc: u16 },
     /// `dst = new callee(args…)` — construct an instance. `callee` must be a
     /// class value; builds an object, installs the methods, runs the ctor.
     New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
