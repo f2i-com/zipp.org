@@ -2583,6 +2583,16 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::GetProp { dst, obj, name });
                 Ok(dst)
             }
+            // `#field in obj` — private brand check (private fields are stored as
+            // the reserved "#field" property, so this is a HasProp on that key).
+            E::PrivateInExpression(p) => {
+                let kr = self.temp();
+                let idx = self.add_string_const(&private_key(&p.left.name));
+                self.emit(Instr::LoadConst { dst: kr, idx });
+                let obj = self.expr(&p.right)?;
+                self.emit(Instr::HasProp { dst, key: kr, obj });
+                Ok(dst)
+            }
             E::ChainExpression(ce) => self.chain_expr(ce, dst),
             E::SequenceExpression(s) => {
                 // `(a, b, c)` — evaluate each for side effects; value is the last.

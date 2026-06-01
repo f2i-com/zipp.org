@@ -1807,12 +1807,13 @@ impl<'p> Vm<'p> {
                         // borrow), then intern them (mutable) — can't hold both.
                         let key_strs: Vec<String> = if o.is_heap() {
                             match self.heap.get(o.heap_index()) {
-                                // Only OWN ENUMERABLE keys (skip non-enumerable).
+                                // Only OWN ENUMERABLE keys (skip non-enumerable
+                                // and private "#" names).
                                 HeapObj::Object(map) => map
                                     .keys
                                     .iter()
                                     .zip(map.attrs.iter())
-                                    .filter(|(_, a)| a.enumerable)
+                                    .filter(|(k, a)| a.enumerable && !is_private_key(k))
                                     .map(|(k, _)| k.clone())
                                     .collect(),
                                 HeapObj::Array(items) => {
@@ -3905,7 +3906,7 @@ impl<'p> Vm<'p> {
                     .cloned()
                     .zip(m.vals.iter().copied())
                     .zip(m.attrs.iter())
-                    .filter(|(_, a)| a.enumerable)
+                    .filter(|((k, _), a)| a.enumerable && !is_private_key(k))
                     .map(|(kv, _)| kv)
                     .collect(),
                 HeapObj::Array(items) => {
@@ -3954,8 +3955,8 @@ impl<'p> Vm<'p> {
     /// `Object.getOwnPropertyDescriptor(obj, key)` — the property's descriptor, or
     /// undefined for a missing own property / non-object.
     fn object_get_own_property_descriptor(&mut self, obj: Value, key: &str) -> Value {
-        if !obj.is_heap() {
-            return Value::UNDEFINED;
+        if !obj.is_heap() || is_private_key(key) {
+            return Value::UNDEFINED; // private names aren't reflectable
         }
         let idx = obj.heap_index();
         // A callable's `name`/`length`: non-writable, non-enumerable, configurable.
@@ -4038,7 +4039,10 @@ impl<'p> Vm<'p> {
             let has_length = self.callable_has_intrinsic(obj, "length");
             let has_name = self.callable_has_intrinsic(obj, "name");
             match self.heap.get(idx) {
-                HeapObj::Object(m) => keys.extend(m.keys.iter().cloned()),
+                // Private names (stored as "#x") are not reflectable own properties.
+                HeapObj::Object(m) => {
+                    keys.extend(m.keys.iter().filter(|k| !is_private_key(k)).cloned())
+                }
                 HeapObj::Array(items) => {
                     for i in 0..items.len() {
                         keys.push(i.to_string());
@@ -4052,14 +4056,14 @@ impl<'p> Vm<'p> {
                     if has_name {
                         keys.push("name".to_string());
                     }
-                    keys.extend(c.statics.keys.iter().cloned());
+                    keys.extend(c.statics.keys.iter().filter(|k| !is_private_key(k)).cloned());
                     for (n, _) in &c.static_getters {
-                        if !keys.iter().any(|k| k == n) {
+                        if !is_private_key(n) && !keys.iter().any(|k| k == n) {
                             keys.push(n.clone());
                         }
                     }
                     for (n, _) in &c.static_setters {
-                        if !keys.iter().any(|k| k == n) {
+                        if !is_private_key(n) && !keys.iter().any(|k| k == n) {
                             keys.push(n.clone());
                         }
                     }
@@ -4072,7 +4076,7 @@ impl<'p> Vm<'p> {
                         keys.push("name".to_string());
                     }
                     if let Some(m) = self.fn_props.get(&idx) {
-                        keys.extend(m.keys.iter().cloned());
+                        keys.extend(m.keys.iter().filter(|k| !is_private_key(k)).cloned());
                     }
                 }
                 _ => {}
@@ -5564,8 +5568,8 @@ impl<'p> Vm<'p> {
     /// `obj.hasOwnProperty(key)` — own data/accessor property, array index/length,
     /// or string index/length.
     fn has_own_property(&self, obj: Value, key: &str) -> bool {
-        if !obj.is_heap() {
-            return false;
+        if !obj.is_heap() || is_private_key(key) {
+            return false; // private names aren't reflectable own properties
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Object(m) => m.pos(key).is_some(),
@@ -5596,7 +5600,7 @@ impl<'p> Vm<'p> {
     /// `obj.propertyIsEnumerable(key)` — true if `key` is an own enumerable
     /// property. Array indices are enumerable; `length` is not.
     fn own_is_enumerable(&self, obj: Value, key: &str) -> bool {
-        if !obj.is_heap() {
+        if !obj.is_heap() || is_private_key(key) {
             return false;
         }
         match self.heap.get(obj.heap_index()) {
@@ -7693,6 +7697,14 @@ fn norm_index(i: i32, len: i32) -> i32 {
 /// reports its true magnitude instead of wrapping negative through `as i32`.
 /// Integers up to 2^53 are exact in f64, matching JS.
 #[inline]
+/// A class private name is stored internally as the property "#name". Such keys
+/// are NOT reflectable own properties (hidden from getOwnPropertyNames, keys,
+/// for-in, hasOwnProperty, getOwnPropertyDescriptor) even though field/method
+/// access reads them directly.
+fn is_private_key(k: &str) -> bool {
+    k.starts_with('#')
+}
+
 fn len_value(n: usize) -> Value {
     if n <= i32::MAX as usize {
         Value::int(n as i32)
