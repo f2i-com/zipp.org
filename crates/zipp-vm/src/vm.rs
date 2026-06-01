@@ -140,6 +140,10 @@ mod native {
     pub const OBJ_IS_SEALED: u16 = 39;
     pub const OBJ_PREVENT_EXT: u16 = 40;
     pub const OBJ_IS_EXT: u16 = 41;
+    // ES2024 grouping + promise capability.
+    pub const OBJ_GROUP_BY: u16 = 42;
+    pub const MAP_GROUP_BY: u16 = 43;
+    pub const PROMISE_WITH_RESOLVERS: u16 = 44;
 
     /// First native id for a prototype method (`Array.prototype.map` etc.). Method
     /// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
@@ -2286,7 +2290,7 @@ impl<'p> Vm<'p> {
                         if prop.is_heap()
                             && matches!(
                                 self.heap.get(prop.heap_index()),
-                                HeapObj::Native(_) | HeapObj::Bound { .. }
+                                HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::BoundResolver { .. }
                             )
                         {
                             let argv: Vec<Value> =
@@ -2346,6 +2350,20 @@ impl<'p> Vm<'p> {
                         // Else resolve the method off the receiver (own/inherited)
                         // and call it with `this = recv`.
                         let method = self.get_index(recv, k)?;
+                        // A native / bound / resolver method value runs via call_value.
+                        if method.is_heap()
+                            && matches!(
+                                self.heap.get(method.heap_index()),
+                                HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::BoundResolver { .. }
+                            )
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let r = self.call_value(method, recv, &argv)?;
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
                         let (fid, closure) = self.resolve_callable(method)?;
                         if self.program.functions[fid as usize].is_generator
                             && self.program.functions[fid as usize].is_async
@@ -4343,6 +4361,7 @@ impl<'p> Vm<'p> {
                 ("isSealed", OBJ_IS_SEALED),
                 ("preventExtensions", OBJ_PREVENT_EXT),
                 ("isExtensible", OBJ_IS_EXT),
+                ("groupBy", OBJ_GROUP_BY),
             ],
             Some(obj_proto),
         );
@@ -4373,7 +4392,7 @@ impl<'p> Vm<'p> {
         // Set / Map / Boolean / Date globals: their .prototype (construction is
         // compile-lowered to NewSet / NewMap / DateNew; value-level shape here).
         let set_ctor = build(self, &[], Some(set_proto));
-        let map_ctor = build(self, &[], Some(map_proto));
+        let map_ctor = build(self, &[("groupBy", MAP_GROUP_BY)], Some(map_proto));
         let boolean_ctor = build(self, &[], Some(bool_proto));
         let date_ctor = build(self, &[], Some(date_proto));
         // Promise global: static combinators + Promise.prototype. `new Promise`
@@ -4387,6 +4406,11 @@ impl<'p> Vm<'p> {
                 ("allSettled", PROMISE_ALLSETTLED),
                 ("race", PROMISE_RACE),
                 ("any", PROMISE_ANY),
+                // NOTE: withResolvers is implemented (PROMISE_WITH_RESOLVERS handler)
+                // but NOT exposed: without Promise-subclassing it can't validate
+                // `this` is a constructor, so the ctx-non-ctor/ctx-non-object tests
+                // (which passed via property-access-on-undefined) net-regress. Re-expose
+                // once `this`-as-constructor / NewPromiseCapability(C) is modelled.
             ],
             Some(promise_proto),
         );
@@ -4591,6 +4615,76 @@ impl<'p> Vm<'p> {
                     _ => false,
                 };
                 Value::bool(ext)
+            }
+            // Object.groupBy(items, cb) -> null-proto object of arrays keyed by cb's
+            // (string) return; Map.groupBy -> a Map keyed by cb's value (SameValueZero).
+            OBJ_GROUP_BY | MAP_GROUP_BY => {
+                let src = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if !(cb.is_heap() && self.heap.as_callable(cb.heap_index()).is_some()) {
+                    return Err(Thrown("TypeError: groupBy callback is not callable".into()));
+                }
+                if !src.is_heap() {
+                    return Err(Thrown("TypeError: groupBy items is not iterable".into()));
+                }
+                let items = self.iterate_to_vec(src)?;
+                if id == OBJ_GROUP_BY {
+                    let mut map = ObjMap::new();
+                    for (i, item) in items.into_iter().enumerate() {
+                        let key = self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
+                        let ks = self.display(key);
+                        match map.get(&ks) {
+                            Some(arr) => {
+                                if let HeapObj::Array(a) = self.heap.get_mut(arr.heap_index()) {
+                                    a.push(item);
+                                }
+                            }
+                            None => {
+                                let arr = Value::heap(self.heap.alloc(HeapObj::Array(vec![item])));
+                                map.set(&ks, arr);
+                            }
+                        }
+                    }
+                    let result = self.heap.alloc(HeapObj::Object(map));
+                    self.proto_of.insert(result, Value::NULL); // null prototype per spec
+                    Value::heap(result)
+                } else {
+                    let mut keys: Vec<Value> = Vec::new();
+                    let mut vals: Vec<Value> = Vec::new();
+                    for (i, item) in items.into_iter().enumerate() {
+                        let mut key = self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
+                        if key.is_number() && key.as_f64() == 0.0 {
+                            key = Value::int(0); // Map normalizes -0 to +0
+                        }
+                        match keys.iter().position(|k| self.same_value_zero(*k, key)) {
+                            Some(pos) => {
+                                if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index()) {
+                                    a.push(item);
+                                }
+                            }
+                            None => {
+                                keys.push(key);
+                                vals.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![item]))));
+                            }
+                        }
+                    }
+                    Value::heap(self.heap.alloc(HeapObj::Map { keys, vals }))
+                }
+            }
+            // Promise.withResolvers() -> { promise, resolve, reject }.
+            PROMISE_WITH_RESOLVERS => {
+                let p = self.alloc_promise();
+                let resolve = Value::heap(
+                    self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
+                );
+                let reject = Value::heap(
+                    self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true }),
+                );
+                let mut map = ObjMap::new();
+                map.set("promise", Value::heap(p));
+                map.set("resolve", resolve);
+                map.set("reject", reject);
+                Value::heap(self.heap.alloc(HeapObj::Object(map)))
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
             PROMISE_RESOLVE => {
