@@ -239,6 +239,18 @@ mod native {
     pub const ARRAYBUFFER_SLICE: u16 = 396;
     pub const PROXY_REVOCABLE: u16 = 397;
     pub const PROXY_REVOKE: u16 = 398;
+    /// Temporal.Duration.prototype instance methods (dispatched by name via
+    /// `temporal_method`), at TEMPORAL_M_BASE + index.
+    pub const TEMPORAL_DURATION_METHODS: &[&str] =
+        &["with", "negated", "abs", "toString", "toJSON", "valueOf"];
+    pub const TEMPORAL_M_BASE: u16 = 400;
+    pub const TEMPORAL_DURATION_FROM: u16 = 410;
+    pub const TEMPORAL_DURATION_COMPARE: u16 = 411;
+    /// Field names of a Temporal.Duration, in slot order.
+    pub const DURATION_FIELDS: [&str; 10] = [
+        "years", "months", "weeks", "days", "hours", "minutes", "seconds",
+        "milliseconds", "microseconds", "nanoseconds",
+    ];
     // RegExp.prototype methods.
     pub const REGEXP_TEST: u16 = 326;
     pub const REGEXP_EXEC: u16 = 327;
@@ -626,6 +638,10 @@ pub struct Vm<'p> {
     dataview_proto: u32,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
+    /// The `Temporal` namespace object + `Temporal.Duration` ctor/prototype.
+    temporal_ns: u32,
+    duration_ctor: u32,
+    duration_proto: u32,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -763,6 +779,9 @@ impl<'p> Vm<'p> {
             dataview_ctor: 0,
             dataview_proto: 0,
             proxy_ctor: 0,
+            temporal_ns: 0,
+            duration_ctor: 0,
+            duration_proto: 0,
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -5531,6 +5550,35 @@ impl<'p> Vm<'p> {
             pm.define("revocable", revocable, method_attr);
             pm.is_ctor = true;
             self.proxy_ctor = self.heap.alloc(HeapObj::Object(pm));
+            // `Temporal` namespace + `Temporal.Duration`.
+            let dur_methods: Vec<(&str, u16)> = native::TEMPORAL_DURATION_METHODS
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, native::TEMPORAL_M_BASE + i as u16))
+                .collect();
+            let duration_proto = build(self, &dur_methods, None);
+            self.proto_of.insert(duration_proto, Value::heap(obj_proto));
+            self.duration_proto = duration_proto;
+            let dfrom = Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_DURATION_FROM)));
+            let dcompare = Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_DURATION_COMPARE)));
+            let dname = self.alloc_str("Duration".to_string());
+            let dtag = self.alloc_str("Temporal.Duration".to_string());
+            let mut dm = ObjMap::new();
+            dm.define("prototype", Value::heap(duration_proto), proto_attr);
+            dm.define("from", dfrom, method_attr);
+            dm.define("compare", dcompare, method_attr);
+            dm.define("name", dname, fn_attr);
+            dm.define("length", Value::num(0.0), fn_attr);
+            dm.is_ctor = true;
+            let duration_ctor = self.heap.alloc(HeapObj::Object(dm));
+            self.duration_ctor = duration_ctor;
+            if let HeapObj::Object(p) = self.heap.get_mut(duration_proto) {
+                p.define("constructor", Value::heap(duration_ctor), method_attr);
+                p.define("@@toStringTag", dtag, fn_attr);
+            }
+            let mut tn = ObjMap::new();
+            tn.define("Duration", Value::heap(duration_ctor), method_attr);
+            self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
             if let HeapObj::Object(m) = self.heap.get_mut(dataview_proto) {
@@ -5640,6 +5688,7 @@ impl<'p> Vm<'p> {
                 "ArrayBuffer" => Some(self.arraybuffer_ctor),
                 "DataView" => Some(self.dataview_ctor),
                 "Proxy" => Some(self.proxy_ctor),
+                "Temporal" => Some(self.temporal_ns),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -6460,6 +6509,40 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            _ if (TEMPORAL_M_BASE..TEMPORAL_M_BASE + TEMPORAL_DURATION_METHODS.len() as u16)
+                .contains(&id) =>
+            {
+                let m = TEMPORAL_DURATION_METHODS[(id - TEMPORAL_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 0, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.Duration.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            TEMPORAL_DURATION_FROM => {
+                let f = self.to_duration(a0)?;
+                self.make_duration(f)
+            }
+            TEMPORAL_DURATION_COMPARE => {
+                let fa = self.to_duration(a0)?;
+                let fb = self.to_duration(a1)?;
+                // Approximate total (24h days, 7-day weeks; y/mo need relativeTo).
+                let tot = |f: &[i64; 10]| -> i128 {
+                    ((f[2] * 7 + f[3]) as i128) * 86_400_000_000_000
+                        + (f[4] as i128) * 3_600_000_000_000
+                        + (f[5] as i128) * 60_000_000_000
+                        + (f[6] as i128) * 1_000_000_000
+                        + (f[7] as i128) * 1_000_000
+                        + (f[8] as i128) * 1_000
+                        + (f[9] as i128)
+                };
+                let (a, b) = (tot(&fa), tot(&fb));
+                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+            }
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -7167,6 +7250,18 @@ impl<'p> Vm<'p> {
                 "byteOffset" => Value::num(byte_offset as f64),
                 "buffer" => Value::heap(buffer),
                 _ => self.proto_member(self.dataview_proto, key),
+            });
+        }
+        // Temporal.Duration: field getters + sign/blank; methods via the prototype.
+        if let HeapObj::Temporal { kind: 0, .. } = self.heap.get(obj.heap_index()) {
+            let f = self.duration_fields(obj.heap_index()).unwrap_or([0; 10]);
+            if let Some(i) = native::DURATION_FIELDS.iter().position(|n| *n == key) {
+                return Ok(Value::num(f[i] as f64));
+            }
+            return Ok(match key {
+                "sign" => Value::num(Self::duration_sign(&f) as f64),
+                "blank" => Value::bool(f.iter().all(|&x| x == 0)),
+                _ => self.proto_member(self.duration_proto, key),
             });
         }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
@@ -7954,6 +8049,11 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let idx = recv.heap_index();
+        // Temporal receivers route to their own dispatch (so valueOf throws and
+        // toString gives the ISO string, not the generic Object behavior).
+        if matches!(self.heap.get(idx), HeapObj::Temporal { .. }) {
+            return self.temporal_method(idx, name, args);
+        }
         // ── Function.prototype.call / apply / bind (callable receivers) ──
         if self.is_callable(recv) {
             match name {
@@ -9223,6 +9323,149 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(idx))
     }
 
+    // ── Temporal.Duration ──
+
+    fn make_duration(&mut self, f: [i64; 10]) -> Value {
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 0, fields: f.to_vec() });
+        if self.duration_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.duration_proto));
+        }
+        Value::heap(idx)
+    }
+
+    fn duration_fields(&self, idx: u32) -> Option<[i64; 10]> {
+        match self.heap.get(idx) {
+            HeapObj::Temporal { kind: 0, fields } => {
+                let mut f = [0i64; 10];
+                for (i, s) in f.iter_mut().enumerate() {
+                    *s = *fields.get(i).unwrap_or(&0);
+                }
+                Some(f)
+            }
+            _ => None,
+        }
+    }
+
+    /// All non-zero fields must share a sign (else RangeError).
+    fn validate_duration(&self, f: &[i64; 10]) -> Result<(), Thrown> {
+        let mut sign = 0i64;
+        for &x in f {
+            let s = x.signum();
+            if s != 0 {
+                if sign == 0 {
+                    sign = s;
+                } else if s != sign {
+                    return Err(Thrown(
+                        "RangeError: mixed-sign values not allowed as duration fields".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `new Temporal.Duration(y, mo, w, d, h, mi, s, ms, us, ns)` — integer fields.
+    fn build_duration(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let mut f = [0i64; 10];
+        for (i, slot) in f.iter_mut().enumerate() {
+            let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
+            if v != Value::UNDEFINED {
+                let n = self.to_number(v)?;
+                if !n.is_finite() || n.fract() != 0.0 {
+                    return Err(Thrown(
+                        "RangeError: Temporal.Duration fields must be integers".into(),
+                    ));
+                }
+                *slot = n as i64;
+            }
+        }
+        self.validate_duration(&f)?;
+        Ok(self.make_duration(f))
+    }
+
+    /// ToTemporalDuration: a Duration clones; an object reads its duration fields;
+    /// a string parses an ISO-8601 duration.
+    fn to_duration(&mut self, v: Value) -> Result<[i64; 10], Thrown> {
+        if let Some(idx) = (v.is_heap()).then(|| v.heap_index()) {
+            if let Some(f) = self.duration_fields(idx) {
+                return Ok(f);
+            }
+            if self.heap.is_str_like(idx) {
+                let s = self.heap.str_cow(idx).unwrap().into_owned();
+                return parse_iso_duration(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid duration string '{s}'")));
+            }
+            if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+                let mut f = [0i64; 10];
+                let mut any = false;
+                for (i, name) in native::DURATION_FIELDS.iter().enumerate() {
+                    let pv = self.get_prop(v, name)?;
+                    if pv != Value::UNDEFINED {
+                        any = true;
+                        let n = self.to_number(pv)?;
+                        if !n.is_finite() || n.fract() != 0.0 {
+                            return Err(Thrown(
+                                "RangeError: Temporal.Duration fields must be integers".into(),
+                            ));
+                        }
+                        f[i] = n as i64;
+                    }
+                }
+                if !any {
+                    return Err(Thrown(
+                        "TypeError: object is not a valid Temporal.Duration-like".into(),
+                    ));
+                }
+                self.validate_duration(&f)?;
+                return Ok(f);
+            }
+        }
+        Err(Thrown("TypeError: cannot convert value to a Temporal.Duration".into()))
+    }
+
+    fn duration_sign(f: &[i64; 10]) -> i64 {
+        f.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0)
+    }
+
+    /// `Temporal.Duration.prototype` methods + getters not handled inline.
+    fn temporal_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let f = match self.duration_fields(idx) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "negated" => Ok(Some(self.make_duration(f.map(|x| -x)))),
+            "abs" => Ok(Some(self.make_duration(f.map(|x| x.abs())))),
+            "with" => {
+                // Override the supplied fields (a plain partial-duration object).
+                let mut nf = f;
+                let mut any = false;
+                for (i, name) in native::DURATION_FIELDS.iter().enumerate() {
+                    let pv = self.get_prop(a0, name)?;
+                    if pv != Value::UNDEFINED {
+                        any = true;
+                        let n = self.to_number(pv)?;
+                        if !n.is_finite() || n.fract() != 0.0 {
+                            return Err(Thrown("RangeError: Duration fields must be integers".into()));
+                        }
+                        nf[i] = n as i64;
+                    }
+                }
+                if !any {
+                    return Err(Thrown("TypeError: with() requires a partial Duration object".into()));
+                }
+                self.validate_duration(&nf)?;
+                Ok(Some(self.make_duration(nf)))
+            }
+            "toString" | "toJSON" => Ok(Some(self.alloc_str(duration_to_string(&f)))),
+            "valueOf" => {
+                Err(Thrown("TypeError: Called Temporal.Duration.prototype.valueOf".into()))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// `new Proxy(target, handler)` — both must be objects.
     fn make_proxy(&mut self, target: Value, handler: Value) -> Result<Value, Thrown> {
         if !self.is_object_value(target) || !self.is_object_value(handler) {
@@ -9848,6 +10091,9 @@ impl<'p> Vm<'p> {
                 args.first().copied().unwrap_or(Value::UNDEFINED),
                 args.get(1).copied().unwrap_or(Value::UNDEFINED),
             );
+        }
+        if ci == self.duration_ctor && ci != 0 {
+            return self.build_duration(args);
         }
         // Constructing through a Proxy: `construct` trap (or construct the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(ci) {
@@ -12152,6 +12398,14 @@ impl<'p> Vm<'p> {
         } else if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::Proxy { target, .. } => return self.display(*target),
+                HeapObj::Temporal { kind: 0, fields } => {
+                    let mut f = [0i64; 10];
+                    for (i, s) in f.iter_mut().enumerate() {
+                        *s = *fields.get(i).unwrap_or(&0);
+                    }
+                    duration_to_string(&f)
+                }
+                HeapObj::Temporal { .. } => "[object Temporal]".into(),
                 HeapObj::Str(s) => s.bytes.clone(),
                 HeapObj::Cons { .. } => {
                     let mut out = String::new();
@@ -12269,6 +12523,14 @@ impl<'p> Vm<'p> {
                 let t = *target;
                 return self.inspect_nested(t);
             }
+            HeapObj::Temporal { kind: 0, fields } => {
+                let mut f = [0i64; 10];
+                for (i, s) in f.iter_mut().enumerate() {
+                    *s = *fields.get(i).unwrap_or(&0);
+                }
+                format!("Temporal.Duration <{}>", duration_to_string(&f))
+            }
+            HeapObj::Temporal { .. } => "[object Temporal]".into(),
             HeapObj::Str(s) => format!("'{}'", s.bytes),
             HeapObj::Cons { .. } => {
                 let mut out = String::new();
@@ -12885,6 +13147,151 @@ fn parse_bigint_str(s: &str) -> Option<i128> {
         body.parse::<i128>().ok()?
     };
     Some(if neg { -v } else { v })
+}
+
+/// ISO-8601 serialization of a Temporal.Duration (`P1Y2M3DT4H5.5S`). ms/us/ns
+/// fold into fractional seconds. All-zero → "PT0S".
+fn duration_to_string(f: &[i64; 10]) -> String {
+    let sign = f.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0);
+    let a: Vec<i128> = f.iter().map(|x| (*x as i128).abs()).collect();
+    let (y, mo, w, d, h, mi) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    let total_ns = a[6] * 1_000_000_000 + a[7] * 1_000_000 + a[8] * 1_000 + a[9];
+    let whole_s = total_ns / 1_000_000_000;
+    let frac_ns = (total_ns % 1_000_000_000) as u64;
+    let mut out = String::new();
+    if sign < 0 {
+        out.push('-');
+    }
+    out.push('P');
+    if y != 0 {
+        out.push_str(&format!("{y}Y"));
+    }
+    if mo != 0 {
+        out.push_str(&format!("{mo}M"));
+    }
+    if w != 0 {
+        out.push_str(&format!("{w}W"));
+    }
+    if d != 0 {
+        out.push_str(&format!("{d}D"));
+    }
+    let has_time = h != 0 || mi != 0 || whole_s != 0 || frac_ns != 0;
+    if has_time {
+        out.push('T');
+        if h != 0 {
+            out.push_str(&format!("{h}H"));
+        }
+        if mi != 0 {
+            out.push_str(&format!("{mi}M"));
+        }
+        if whole_s != 0 || frac_ns != 0 {
+            if frac_ns == 0 {
+                out.push_str(&format!("{whole_s}S"));
+            } else {
+                let frac = format!("{frac_ns:09}");
+                out.push_str(&format!("{whole_s}.{}S", frac.trim_end_matches('0')));
+            }
+        }
+    }
+    if out == "P" || out == "-P" {
+        return "PT0S".to_string();
+    }
+    out
+}
+
+/// Parse an ISO-8601 duration string into `[y,mo,w,d,h,mi,s,ms,us,ns]`. Handles
+/// integer date/time units and a fractional seconds field. `None` if malformed.
+fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
+    let s = s.trim();
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => (-1i64, r),
+        None => (1, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let rest = rest.strip_prefix(['P', 'p'])?;
+    let mut f = [0i64; 10];
+    let (date_s, time_s) = match rest.find(['T', 't']) {
+        Some(i) => (&rest[..i], &rest[i + 1..]),
+        None => (rest, ""),
+    };
+    let mut saw = false;
+    // Date units Y/M/W/D.
+    let mut num = String::new();
+    for c in date_s.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+        } else {
+            let n: i64 = num.parse().ok()?;
+            num.clear();
+            let slot = match c {
+                'Y' | 'y' => 0,
+                'M' => 1,
+                'W' | 'w' => 2,
+                'D' | 'd' => 3,
+                _ => return None,
+            };
+            f[slot] = n;
+            saw = true;
+        }
+    }
+    if !num.is_empty() {
+        return None;
+    }
+    // Time units H/M/S (S may have a fraction → ms/us/ns).
+    if !time_s.is_empty() {
+        let mut num = String::new();
+        let mut frac = String::new();
+        let mut in_frac = false;
+        for c in time_s.chars() {
+            if c.is_ascii_digit() {
+                if in_frac {
+                    frac.push(c);
+                } else {
+                    num.push(c);
+                }
+            } else if c == '.' || c == ',' {
+                in_frac = true;
+            } else {
+                let n: i64 = num.parse().ok()?;
+                let slot = match c {
+                    'H' | 'h' => 4,
+                    'M' => 5,
+                    'S' | 's' => 6,
+                    _ => return None,
+                };
+                f[slot] = n;
+                saw = true;
+                if !frac.is_empty() {
+                    if !matches!(c, 'S' | 's') {
+                        return None; // only seconds-fraction supported
+                    }
+                    let mut fr = frac.clone();
+                    while fr.len() < 9 {
+                        fr.push('0');
+                    }
+                    fr.truncate(9);
+                    let ns: i64 = fr.parse().ok()?;
+                    f[7] = ns / 1_000_000;
+                    f[8] = (ns / 1_000) % 1_000;
+                    f[9] = ns % 1_000;
+                }
+                num.clear();
+                frac.clear();
+                in_frac = false;
+            }
+        }
+        if !num.is_empty() || in_frac {
+            return None;
+        }
+    }
+    if !saw {
+        return None;
+    }
+    if sign < 0 {
+        for x in f.iter_mut() {
+            *x = -*x;
+        }
+    }
+    Some(f)
 }
 
 /// Encode `f` (already ToNumber'd) into a TypedArray element's little-endian

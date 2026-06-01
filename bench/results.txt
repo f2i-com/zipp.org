@@ -7,14 +7,14 @@ object: OK (160000400000)
 sort: OK (0 1000 1999)
 ALL_CORRECT=1
 
-startup(ms): node=241  zipp=22
+startup(ms): node=242  zipp=21
 
 bench        node_cmp     zipp_cmp      ratio       node_e2e       zipp_e2e
 --------      -------      -------      -----        -------        -------
-fib               6ms          4ms       0.7x          247ms           26ms
-loop             29ms         26ms       0.9x          270ms           48ms
-array             4ms          2ms       0.5x          245ms           24ms
-string            1ms          1ms       1.0x          242ms           22ms
-object            2ms          1ms       0.5x          243ms           23ms
-sort              1ms          1ms       1.0x          241ms           22ms
+fib               6ms          6ms       1.0x          248ms           27ms
+loop             28ms         29ms       1.0x          270ms           50ms
+array             2ms          2ms       1.0x          244ms           23ms
+string            1ms          1ms       1.0x          241ms           22ms
+object            3ms          2ms       0.7x          245ms           23ms
+sort              1ms          1ms       1.0x          242ms           22ms
 DONE

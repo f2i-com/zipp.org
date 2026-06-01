@@ -403,6 +403,10 @@ pub enum HeapObj {
     /// A JS `Proxy`: property/call operations route through `handler`'s traps (or
     /// fall through to `target`). `revoked` cuts it off (every op then throws).
     Proxy { target: Value, handler: Value, revoked: bool },
+    /// A `Temporal.*` value. `kind` selects the type (0=Duration, 1=PlainDate,
+    /// 2=PlainTime, 3=PlainDateTime, …); `fields` holds its integer slots in a
+    /// per-kind layout (Duration: y,mo,w,d,h,mi,s,ms,us,ns; PlainDate: isoY,isoM,isoD).
+    Temporal { kind: u8, fields: Vec<i64> },
     /// A JS `BigInt` primitive. Stored as `i128` (covers the common test262
     /// magnitudes; true arbitrary precision is a later refinement). Compared by
     /// VALUE (`1n === 1n`), not identity; `typeof` is "bigint".
