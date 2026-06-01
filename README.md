@@ -520,8 +520,8 @@ byte-identical to node):
 | 2M `arr.push(i)` loop | 18.5 ms | 10.5 ms | **0.57× (beats V8)** |
 | 100k comparator sort | 10.2 ms | 7.4 ms | **0.73× (beats V8)** |
 | 50M integer loop | 27.4 ms | 26.4 ms | **0.97× (beats V8)** |
-| 200k `charCodeAt` scan loop | 2.2 ms | 2.9 ms | 1.28× (sub-3ms) |
-| 200k `s[i]===c` scan loop | 2.3 ms | 2.9 ms | 1.27× (sub-3ms) |
+| 200k `charCodeAt` scan loop | 2.2 ms | 2.2 ms | **~1.0× (parity)** |
+| 200k `s[i]===c` scan loop | 2.2 ms | 2.3 ms | **~1.0× (parity)** |
 | 4M object field read/write | 5.1 ms | 5.1 ms | **1.01× (parity)** |
 | 100k string concat + scan | 6.7 ms | 1.7 ms | **0.25× (4× faster)** |
 | 1M string concat (`s += …`) | 27.5 ms | 5.6 ms | **0.20× (5× faster)** |
@@ -537,8 +537,10 @@ O(n log n) merge sort), and now **beats V8 on the integer loop** (native int64 O
 JIT; integer `%` also compiles in-region via `idiv`, so `i % k` loops JIT too).
 **String scans now JIT too:** both `s.charCodeAt(i)===n` and `s[i]==="c"` compile
 in the OSR region (the region's `===` is polymorphic — numeric operands compare as
-f64, interned single-char strings compare by NaN-boxed bits), turning a former ~20×
-gap into ~1.3× (sub-3ms absolute). **Self-recursion now beats V8:**
+f64, interned single-char strings compare by NaN-boxed bits); hoisting the
+loop-invariant `s.length` out of the region (it's re-derived, not a cached slot, so
+it otherwise cost a helper call per iteration) closed a former ~20× gap to parity.
+**Self-recursion now beats V8:**
 a recursive call compiles to a direct native call to the function's own entry (an
 inline depth guard bounds the native stack; runaway recursion still deopts to a
 catchable `RangeError`). On top of that, a function whose base case returns its
@@ -560,8 +562,10 @@ aliasing proof falls back to the safe rope. **Object field access is at
 parity (~1.0×):** non-escaping loop objects are scalar-replaced (SROA) so fields
 become registers, and a dead-code pass drops the now-unused object-ref loads SROA
 leaves behind (which also frees register homes, keeping the loop on the higher-ILP
-allocation path). It still trails on the sub-3ms string-scan loops (absolute times
-under 3 ms). **Startup is ~10× faster** (≈21 ms vs ≈218 ms — no V8
+allocation path). zipp now **beats V8 on 11 of these 13 workloads** and is at
+parity on the other two (the `s[i]` scan and object field access, both within
+measurement noise) — nothing in the suite clearly trails V8. **Startup is ~10×
+faster** (≈21 ms vs ≈218 ms — no V8
 snapshot/warmup), so end-to-end (incl. startup) zipp finishes every benchmark
 first. Run `bench/run.sh` to reproduce.
 
