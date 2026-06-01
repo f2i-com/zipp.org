@@ -2067,18 +2067,25 @@ impl<'a> FnCompiler<'a> {
         // captures the binding (the value is present by then).
         let catch_start = self.here();
         self.push_scope();
-        let (e_reg, e_name) = match &handler.param {
+        // The VM deposits the thrown value into `e_reg`. For `catch (id)` that IS
+        // the binding; for `catch ([a,b])` / `catch ({e})` it's a scratch slot we
+        // destructure into the pattern's bindings.
+        let (e_reg, e_name, pattern) = match &handler.param {
             Some(p) => match &p.pattern {
                 ox::BindingPattern::BindingIdentifier(id) => {
-                    (self.declare_local_no_box(id.name.as_str()), Some(id.name.to_string()))
+                    (self.declare_local_no_box(id.name.as_str()), Some(id.name.to_string()), None)
                 }
-                _ => return Err("catch destructuring not in the zipp-vm subset yet".into()),
+                pat => (self.declare_local_no_box("<catch.val>"), None, Some(pat)),
             },
-            None => (self.declare_local_no_box("<catch.ignored>"), None),
+            None => (self.declare_local_no_box("<catch.ignored>"), None, None),
         };
         if let Instr::PushHandler { catch_target, catch_reg } = &mut self.code[push_at as usize] {
             *catch_target = catch_start;
             *catch_reg = e_reg;
+        }
+        if let Some(pat) = pattern {
+            self.declare_pattern(pat)?;
+            self.extract_pattern(pat, e_reg)?;
         }
         if let Some(n) = &e_name {
             if self.captured.contains(n) {
