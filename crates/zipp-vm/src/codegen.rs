@@ -67,6 +67,19 @@ const INT_TAG: u64 = 0x7FF9_0000_0000_0000;
 /// Top-16 pattern that identifies an Int (the high 16 bits of `INT_TAG`).
 const INT_TAG_HI: u32 = 0x7FF9;
 
+/// NaN-box tag range for the polymorphic region `===` (mirror of value.rs):
+/// a Value's high-16 in `[TAG_LO, TAG_HI]` is a tagged form (Int/Bool/Null/
+/// Undefined/Heap); anything else is a double. `TAG_HEAP_HI` is the Heap tag.
+const TAG_LO: u32 = 0x7FF9;
+const TAG_HI: u32 = 0x7FFD;
+const TAG_HEAP_HI: u32 = 0x7FFD;
+/// Low 48 bits of a Value = a heap index (when the tag is Heap).
+const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+/// First non-interned heap index: indices `< 129` are the interned single-ASCII
+/// chars (0..128) + the empty string (128); user objects start here. A heap
+/// value `>=` this needs full `strict_eq` (the region bits-compare bails on it).
+const USER_OBJ_START: i32 = 129;
+
 /// Win64 addresses of the heap helpers (vm.rs), passed from the interpreter into
 /// `Jit::compile_region`. The inline-cache base site index is assigned inside
 /// `compile_region` (not here), then bundled into `HeapHelpers` for codegen.
@@ -1600,9 +1613,13 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
                 }
             }
             Instr::LoadConst { idx, .. } => {
-                // Only numeric constants are representable in the f64 region.
+                // Numeric constants run in the f64 region; a single-ASCII-char
+                // string constant is resolvable to its interned slot (for
+                // `s[i] === "x"` scans). Anything else (multi-char / non-ASCII
+                // string, etc.) rejects the region.
                 match proto.constants.get(idx as usize) {
                     Some(c) if c.is_number() => {}
+                    Some(&c) if single_char_const_bits(proto, c).is_some() => {}
                     _ => return false,
                 }
             }
@@ -3070,7 +3087,11 @@ fn compile_region_mem(
                 );
             }
             Instr::LoadConst { dst, idx } => {
-                let bits = proto.constants[idx as usize].bits();
+                // A single-ASCII-char string constant materialises as its
+                // INTERNED slot (the same boxed Value `s[i]` yields), so a later
+                // `=== "x"` is a bits compare; numeric/other consts use raw bits.
+                let c = proto.constants[idx as usize];
+                let bits = single_char_const_bits(proto, c).unwrap_or_else(|| c.bits());
                 dynasm!(ops
                     ; mov rax, QWORD bits as i64
                     ; mov [rbx + dreg(dst)], rax
@@ -3123,8 +3144,11 @@ fn compile_region_mem(
             Instr::Le { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Le),
             Instr::Gt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Gt),
             Instr::Ge { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Ge),
-            Instr::Eq { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Eq),
-            Instr::Ne { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Ne),
+            // `===` / `!==` are polymorphic: numeric operands compare as f64,
+            // interned single-char strings / Int / Bool / Null / Undefined
+            // compare by bits, non-interned heap operands bail to the interpreter.
+            Instr::Eq { dst, a, b } => region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, false),
+            Instr::Ne { dst, a, b } => region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, true),
             Instr::Jump { target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
                 dynasm!(ops ; jmp => t);
@@ -3423,6 +3447,129 @@ fn dbinop(
 /// `regs[dst] = (regs[a] <cmp> regs[b]) as Bool` using f64 ordered comparison
 /// (NaN compares false for </<=/>/>=/==, true for !=). Guards both are numbers.
 #[allow(clippy::too_many_arguments)]
+/// If `c` is a "pending string" constant (`Value::heap(STRING_CONST_BIT | si)`,
+/// the form the compiler emits for a string literal) whose text is exactly ONE
+/// ASCII byte, return that char's INTERNED Value bits (`Value::heap(byte)` —
+/// single ASCII chars live at heap index == their byte; see `Heap::new`). This
+/// lets the region materialise `"7"` as the same boxed value `s[i]` yields, so
+/// `s[i] === "7"` is a bits compare. Returns `None` for numeric / multi-char /
+/// non-ASCII / non-string constants (the region handles numbers; others decline).
+fn single_char_const_bits(proto: &FuncProto, c: Value) -> Option<u64> {
+    if !c.is_heap() {
+        return None;
+    }
+    let raw = c.heap_index();
+    if raw & crate::vm::STRING_CONST_BIT == 0 {
+        return None; // a real heap value, not a pending string constant
+    }
+    let si = (raw & !crate::vm::STRING_CONST_BIT) as usize;
+    let bytes = proto.string_constants.get(si)?.as_bytes();
+    if bytes.len() == 1 && bytes[0] < 128 {
+        Some(Value::heap(bytes[0] as u32).bits())
+    } else {
+        None
+    }
+}
+
+/// Polymorphic strict `===` / `!==` (`ne` selects `!==`) for the region's MEMORY
+/// path. Operand types are unknown at compile time, so the emitted code branches
+/// at runtime:
+///   1. EITHER operand is a DOUBLE (NaN-box high16 ∉ [TAG_LO, TAG_HI]) → the f64
+///      numeric compare (identical to `dcmp` Eq/Ne) — keeps `0.5===0.5`,
+///      `NaN!==NaN`, `0===-0` correct, and bails on a num-vs-non-num operand mix.
+///   2. else EITHER operand is HEAP (high16 == 0x7FFD) with index ≥ 129 (a
+///      multi-char string or a user object — NOT an interned single-char/empty
+///      string) → BAIL to the interpreter (those need full `strict_eq`; raw bits
+///      would wrongly distinguish equal-content strings).
+///   3. else → 64-bit BITS equality. Exactly JS `===` for Int, Bool, Null,
+///      Undefined, and interned single-char/empty strings (indices < 129). This
+///      is the `s[i] === "7"` and `charCodeAt === 55` hot path (call-free).
+#[allow(clippy::too_many_arguments)]
+fn region_poly_eq(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    epilogue: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+    ne: bool,
+) {
+    let numeric = ops.new_dynamic_label();
+    let a_not_heap = ops.new_dynamic_label();
+    let do_bits = ops.new_dynamic_label();
+    let store = ops.new_dynamic_label();
+    // rax = a_bits, rcx = b_bits (kept live across the type checks).
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(a)]
+        ; mov rcx, [rbx + dreg(b)]
+        // is a a double?  high16 = rax>>48; double ⇔ (high16 - TAG_LO) > (TAG_HI-TAG_LO)
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; sub edx, TAG_LO as i32
+        ; cmp edx, (TAG_HI - TAG_LO) as i32
+        ; ja => numeric                       // a is a double (tag out of tagged range)
+        // is b a double?
+        ; mov rdx, rcx
+        ; shr rdx, 48
+        ; sub edx, TAG_LO as i32
+        ; cmp edx, (TAG_HI - TAG_LO) as i32
+        ; ja => numeric                       // b is a double
+        // Neither is a double. Bail if EITHER is a heap value with index ≥ 129
+        // (a non-interned string / object — needs full strict_eq).
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; cmp edx, TAG_HEAP_HI as i32
+        ; jne => a_not_heap
+        ; mov rdx, rax
+        ; mov r9, QWORD PAYLOAD_MASK as i64
+        ; and rdx, r9
+        ; cmp rdx, USER_OBJ_START as i32
+        ; jae => bail                          // a is a non-interned heap value
+        ; => a_not_heap
+        ; mov rdx, rcx
+        ; shr rdx, 48
+        ; cmp edx, TAG_HEAP_HI as i32
+        ; jne => do_bits
+        ; mov rdx, rcx
+        ; mov r9, QWORD PAYLOAD_MASK as i64
+        ; and rdx, r9
+        ; cmp rdx, USER_OBJ_START as i32
+        ; jae => bail                          // b is a non-interned heap value
+        ; jmp => do_bits
+    );
+    // ── numeric path (a or b is a double): f64 compare, identical to dcmp. ──
+    dynasm!(ops ; => numeric);
+    load_num_xmm(ops, a, 0, bail);
+    load_num_xmm(ops, b, 1, bail);
+    if ne {
+        dynasm!(ops ; ucomisd xmm0, xmm1 ; setne al ; setp cl ; or al, cl);
+    } else {
+        dynasm!(ops ; ucomisd xmm0, xmm1 ; sete al ; setnp cl ; and al, cl);
+    }
+    dynasm!(ops ; jmp => store);
+    // ── bits path: result = (a_bits <op> b_bits) as Bool. ──
+    dynasm!(ops
+        ; => do_bits
+        ; mov rax, [rbx + dreg(a)]
+        ; mov rcx, [rbx + dreg(b)]
+        ; cmp rax, rcx
+    );
+    if ne {
+        dynasm!(ops ; setne al);
+    } else {
+        dynasm!(ops ; sete al);
+    }
+    dynasm!(ops
+        ; => store
+        ; movzx rax, al
+        ; mov r8, QWORD BOOL_TAG as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+    );
+    emit_region_bail(ops, ip, bail, epilogue);
+}
+
 fn dcmp(
     ops: &mut dynasmrt::x64::Assembler,
     ip: usize,

@@ -5984,7 +5984,23 @@ pub(crate) extern "win64" fn jit_get_index(
             Some(i) if i < items.len() => items[i].bits(),
             _ => Value::UNDEFINED.bits(),
         },
-        _ => crate::codegen::SELF_CALL_DEOPT, // strings etc → interpreter
+        // Flat ASCII string `s[i]`: mirror the interpreter's get_index Str path
+        // EXACTLY (vm.rs `get_index`, the `js.ascii` branch). The i-th char is
+        // the i-th byte, and a single ASCII char is interned at heap index ==
+        // its byte (Heap::new), so the result is that interned slot. In range →
+        // that slot; out of range → undefined. Only the O(1)-and-identical
+        // flat-ASCII case is handled; a non-ASCII string (char-walk) or a rope
+        // `Cons` (must flatten first, a &mut op) deopts to the interpreter. A
+        // negative/fractional/non-integer key (`array_index` → None) also defers
+        // (the interpreter handles `s["length"]`, methods, etc.).
+        HeapObj::Str(s) if s.ascii => match array_index(key) {
+            Some(i) => match s.bytes.as_bytes().get(i) {
+                Some(&b) => Value::heap(b as u32).bits(),
+                None => Value::UNDEFINED.bits(),
+            },
+            None => crate::codegen::SELF_CALL_DEOPT,
+        },
+        _ => crate::codegen::SELF_CALL_DEOPT, // non-ASCII str / rope / other → interpreter
     }
 }
 
