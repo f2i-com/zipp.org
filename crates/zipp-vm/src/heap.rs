@@ -29,6 +29,9 @@ pub struct ObjMap {
     /// object literal. Own properties (the fields) live in `keys`/`vals`;
     /// methods are resolved through the class, so they stay non-enumerable.
     pub class: Option<u32>,
+    /// `[[Extensible]]`: whether new own properties may be added. Cleared by
+    /// `Object.preventExtensions`/`seal`/`freeze`. Default `true`.
+    pub extensible: bool,
 }
 
 /// One property's attributes — the ECMAScript property-descriptor flags plus an
@@ -54,7 +57,36 @@ impl PropAttr {
 
 impl ObjMap {
     pub fn new() -> ObjMap {
-        ObjMap { keys: Vec::new(), vals: Vec::new(), attrs: Vec::new(), class: None }
+        ObjMap { keys: Vec::new(), vals: Vec::new(), attrs: Vec::new(), class: None, extensible: true }
+    }
+
+    /// `Object.isSealed`: not extensible and every own property non-configurable.
+    pub fn is_sealed(&self) -> bool {
+        !self.extensible && self.attrs.iter().all(|a| !a.configurable)
+    }
+
+    /// `Object.isFrozen`: sealed and every own data property non-writable.
+    pub fn is_frozen(&self) -> bool {
+        !self.extensible && self.attrs.iter().all(|a| !a.configurable && (a.accessor || !a.writable))
+    }
+
+    /// `Object.seal`: clear extensibility and make every own property non-configurable.
+    pub fn seal(&mut self) {
+        self.extensible = false;
+        for a in &mut self.attrs {
+            a.configurable = false;
+        }
+    }
+
+    /// `Object.freeze`: seal, and make every own data property non-writable too.
+    pub fn freeze(&mut self) {
+        self.extensible = false;
+        for a in &mut self.attrs {
+            a.configurable = false;
+            if !a.accessor {
+                a.writable = false;
+            }
+        }
     }
 
     pub fn pos(&self, key: &str) -> Option<usize> {

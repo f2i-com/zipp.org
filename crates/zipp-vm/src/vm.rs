@@ -133,6 +133,13 @@ mod native {
     pub const OBJ_SET_PROTO_OF: u16 = 33;
     pub const OBJ_GET_OWN_SYMBOLS: u16 = 34;
     pub const OBJ_GET_OWN_DESCS: u16 = 35;
+    // Integrity traits.
+    pub const OBJ_FREEZE: u16 = 36;
+    pub const OBJ_IS_FROZEN: u16 = 37;
+    pub const OBJ_SEAL: u16 = 38;
+    pub const OBJ_IS_SEALED: u16 = 39;
+    pub const OBJ_PREVENT_EXT: u16 = 40;
+    pub const OBJ_IS_EXT: u16 = 41;
 
     /// First native id for a prototype method (`Array.prototype.map` etc.). Method
     /// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
@@ -4329,6 +4336,12 @@ impl<'p> Vm<'p> {
                 ("setPrototypeOf", OBJ_SET_PROTO_OF),
                 ("getOwnPropertySymbols", OBJ_GET_OWN_SYMBOLS),
                 ("getOwnPropertyDescriptors", OBJ_GET_OWN_DESCS),
+                ("freeze", OBJ_FREEZE),
+                ("isFrozen", OBJ_IS_FROZEN),
+                ("seal", OBJ_SEAL),
+                ("isSealed", OBJ_IS_SEALED),
+                ("preventExtensions", OBJ_PREVENT_EXT),
+                ("isExtensible", OBJ_IS_EXT),
             ],
             Some(obj_proto),
         );
@@ -4523,6 +4536,60 @@ impl<'p> Vm<'p> {
                     map.set(&ks, desc);
                 }
                 Value::heap(self.heap.alloc(HeapObj::Object(map)))
+            }
+            // Integrity traits. Non-object arguments pass through unchanged
+            // (freeze/seal/preventExtensions) or report as already-locked
+            // (isFrozen/isSealed -> true, isExtensible -> false), per ES2015+.
+            OBJ_FREEZE => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if o.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                        m.freeze();
+                    }
+                }
+                o
+            }
+            OBJ_SEAL => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if o.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                        m.seal();
+                    }
+                }
+                o
+            }
+            OBJ_PREVENT_EXT => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if o.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                        m.extensible = false;
+                    }
+                }
+                o
+            }
+            OBJ_IS_FROZEN => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let frozen = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
+                    Some(HeapObj::Object(m)) => m.is_frozen(),
+                    _ => true,
+                };
+                Value::bool(frozen)
+            }
+            OBJ_IS_SEALED => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let sealed = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
+                    Some(HeapObj::Object(m)) => m.is_sealed(),
+                    _ => true,
+                };
+                Value::bool(sealed)
+            }
+            OBJ_IS_EXT => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let ext = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
+                    Some(HeapObj::Object(m)) => m.extensible,
+                    _ => false,
+                };
+                Value::bool(ext)
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
             PROMISE_RESOLVE => {
@@ -4893,6 +4960,18 @@ impl<'p> Vm<'p> {
                 if make_cfg || change_enum || change_kind || make_writable || change_frozen_value {
                     return Err(Thrown(format!("TypeError: Cannot redefine property: {key}")));
                 }
+            }
+        }
+        // Defining a brand-new property requires the object to be extensible.
+        if existing.is_none() {
+            let extensible = match self.heap.get(idx) {
+                HeapObj::Object(m) => m.extensible,
+                _ => true,
+            };
+            if !extensible {
+                return Err(Thrown(format!(
+                    "TypeError: Cannot define property {key}, object is not extensible"
+                )));
             }
         }
         let attr = PropAttr {
@@ -5586,7 +5665,14 @@ impl<'p> Vm<'p> {
         }
         let mut added = false;
         match self.heap.get_mut(idx) {
-            HeapObj::Object(map) => added = map.set(key, val),
+            HeapObj::Object(map) => {
+                // A non-extensible object rejects NEW own properties (sloppy no-op);
+                // existing writable data properties still accept writes.
+                if map.pos(key).is_none() && !map.extensible {
+                    return Ok(());
+                }
+                added = map.set(key, val);
+            }
             // Static-member assignment on a class value (`C.x = …`).
             HeapObj::Class(c) => {
                 c.statics.set(key, val);
