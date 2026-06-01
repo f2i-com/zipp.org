@@ -231,7 +231,8 @@ mod native {
         ("padStart", 1, 1), ("repeat", 1, 1), ("replace", 1, 2), ("replaceAll", 1, 2),
         ("slice", 1, 2), ("split", 1, 2), ("startsWith", 1, 1), ("substring", 1, 2),
         ("toLowerCase", 1, 0), ("toUpperCase", 1, 0), ("trim", 1, 0), ("trimEnd", 1, 0),
-        ("trimStart", 1, 0),
+        ("trimStart", 1, 0), ("concat", 1, 1), ("substr", 1, 2), ("localeCompare", 1, 1),
+        ("normalize", 1, 0), ("isWellFormed", 1, 0), ("toWellFormed", 1, 0),
         // Number.prototype (kind 2 → number_method, receiver is a number value).
         ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0), ("toLocaleString", 2, 0),
         // Set.prototype (kind 3 → set_method on the Set receiver).
@@ -8805,6 +8806,61 @@ impl<'p> Vm<'p> {
             "trimEnd" => Ok(Some(self.alloc_str(s.trim_end().to_string()))),
             "startsWith" => Ok(Some(Value::bool(s.starts_with(&self.display(arg0))))),
             "endsWith" => Ok(Some(Value::bool(s.ends_with(&self.display(arg0))))),
+            "concat" => {
+                let mut out = s.clone();
+                for a in args {
+                    out.push_str(&self.display(*a));
+                }
+                Ok(Some(self.alloc_str(out)))
+            }
+            "substr" => {
+                // Legacy substr(start, length); negative start counts from the end.
+                let chars: Vec<char> = s.chars().collect();
+                let len = chars.len() as i64;
+                let sr = if args.is_empty() { 0.0 } else { arg0.as_f64() };
+                let mut start = if sr.is_nan() { 0 } else { sr as i64 };
+                if start < 0 {
+                    start = (len + start).max(0);
+                }
+                let start = start.min(len) as usize;
+                let avail = chars.len() - start;
+                let count = if args.len() < 2 || args[1] == Value::UNDEFINED {
+                    avail
+                } else {
+                    let c = args[1].as_f64();
+                    if c.is_nan() || c < 0.0 { 0 } else { (c as usize).min(avail) }
+                };
+                let sub: String = chars[start..start + count].iter().collect();
+                Ok(Some(self.alloc_str(sub)))
+            }
+            "localeCompare" => {
+                // No Intl: a code-unit ordinal comparison (the default approximation).
+                let other = self.display(arg0);
+                let ord = match s.as_str().cmp(other.as_str()) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                Ok(Some(Value::int(ord)))
+            }
+            "normalize" => {
+                // Validate the form; engine strings are already normalized for ASCII
+                // (full Unicode normalization isn't modelled).
+                let form = if args.is_empty() || arg0 == Value::UNDEFINED {
+                    "NFC".to_string()
+                } else {
+                    self.display(arg0)
+                };
+                if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+                    return Err(Thrown(
+                        "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.".into(),
+                    ));
+                }
+                Ok(Some(self.alloc_str(s.clone())))
+            }
+            // Engine strings are valid UTF-8 (no lone surrogates), so always well-formed.
+            "isWellFormed" => Ok(Some(Value::bool(true))),
+            "toWellFormed" => Ok(Some(self.alloc_str(s.clone()))),
             "padStart" | "padEnd" => {
                 let cur = char_len(&s);
                 let t = arg0.as_f64();
