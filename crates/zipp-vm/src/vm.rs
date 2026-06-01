@@ -162,6 +162,14 @@ mod native {
     pub const JSON_PARSE: u16 = 58;
     pub const JSON_STRINGIFY: u16 = 59;
     pub const MATH_RANDOM: u16 = 60;
+    // WeakMap/WeakSet methods (290+, clear of PROTO 64-190 and MATH 256-289).
+    pub const WM_GET: u16 = 290;
+    pub const WM_SET: u16 = 291;
+    pub const WM_HAS: u16 = 292;
+    pub const WM_DELETE: u16 = 293;
+    pub const WS_ADD: u16 = 294;
+    pub const WS_HAS: u16 = 295;
+    pub const WS_DELETE: u16 = 296;
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -317,6 +325,13 @@ mod native {
             JSON_PARSE => ("parse", 2),
             JSON_STRINGIFY => ("stringify", 3),
             MATH_RANDOM => ("random", 0),
+            WM_GET => ("get", 1),
+            WM_SET => ("set", 2),
+            WM_HAS => ("has", 1),
+            WM_DELETE => ("delete", 1),
+            WS_ADD => ("add", 1),
+            WS_HAS => ("has", 1),
+            WS_DELETE => ("delete", 1),
             _ => return None,
         })
     }
@@ -409,6 +424,9 @@ pub struct Vm<'p> {
     /// method-as-value access (`(5).toFixed`, `true.toString`). 0 until set up.
     num_proto: u32,
     bool_proto: u32,
+    /// `WeakMap`/`WeakSet`.prototype — instances delegate method-as-value access here.
+    weakmap_proto: u32,
+    weakset_proto: u32,
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
@@ -495,6 +513,8 @@ impl<'p> Vm<'p> {
             promise_proto: 0,
             num_proto: 0,
             bool_proto: 0,
+            weakmap_proto: 0,
+            weakset_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1746,6 +1766,54 @@ impl<'p> Vm<'p> {
                             }
                         }
                         let s = Value::heap(self.heap.alloc(HeapObj::Set(items)));
+                        self.set(base, dst, s);
+                        ip += 1;
+                    }
+                    Instr::NewWeakMap { dst, src } => {
+                        let (mut keys, mut vals): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+                        if let Some(s) = src {
+                            let sv = self.get(base, s);
+                            if !sv.is_nullish() {
+                                for e in self.iterate_to_vec(sv)? {
+                                    let k = self.get_index(e, Value::int(0))?;
+                                    let v = self.get_index(e, Value::int(1))?;
+                                    if !self.is_object_value(k) {
+                                        return Err(Thrown(
+                                            "TypeError: Invalid value used as weak map key".into(),
+                                        ));
+                                    }
+                                    match keys.iter().position(|kk| self.same_value_zero(*kk, k)) {
+                                        Some(i) => vals[i] = v,
+                                        None => {
+                                            keys.push(k);
+                                            vals.push(v);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let m = Value::heap(self.heap.alloc(HeapObj::WeakMap { keys, vals }));
+                        self.set(base, dst, m);
+                        ip += 1;
+                    }
+                    Instr::NewWeakSet { dst, src } => {
+                        let mut items: Vec<Value> = Vec::new();
+                        if let Some(s) = src {
+                            let sv = self.get(base, s);
+                            if !sv.is_nullish() {
+                                for e in self.iterate_to_vec(sv)? {
+                                    if !self.is_object_value(e) {
+                                        return Err(Thrown(
+                                            "TypeError: Invalid value used in weak set".into(),
+                                        ));
+                                    }
+                                    if !items.iter().any(|x| self.same_value_zero(*x, e)) {
+                                        items.push(e);
+                                    }
+                                }
+                            }
+                        }
+                        let s = Value::heap(self.heap.alloc(HeapObj::WeakSet(items)));
                         self.set(base, dst, s);
                         ip += 1;
                     }
@@ -4594,6 +4662,19 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
+        // `WeakMap`/`WeakSet`: distinct prototypes (get/set/has/delete, add/has/delete
+        // — deliberately NO size/keys/values/iteration). Construction is compile-lowered
+        // to NewWeakMap/NewWeakSet.
+        let weakmap_proto = build(
+            self,
+            &[("get", WM_GET), ("set", WM_SET), ("has", WM_HAS), ("delete", WM_DELETE)],
+            None,
+        );
+        let weakset_proto = build(self, &[("add", WS_ADD), ("has", WS_HAS), ("delete", WS_DELETE)], None);
+        self.weakmap_proto = weakmap_proto;
+        self.weakset_proto = weakset_proto;
+        let weakmap_ctor = build(self, &[], Some(weakmap_proto));
+        let weakset_ctor = build(self, &[], Some(weakset_proto));
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
         let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
@@ -4647,6 +4728,8 @@ impl<'p> Vm<'p> {
                 "Reflect" => Some(reflect_ctor),
                 "JSON" => Some(json_ctor),
                 "Math" => Some(math_ctor),
+                "WeakMap" => Some(weakmap_ctor),
+                "WeakSet" => Some(weakset_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -4657,7 +4740,7 @@ impl<'p> Vm<'p> {
                 if matches!(self.heap.get(v), HeapObj::Object(m) if m.is_ctor) {
                     let len = match name.as_str() {
                         "Date" => 7.0,
-                        "Map" | "Set" => 0.0,
+                        "Map" | "Set" | "WeakMap" | "WeakSet" => 0.0,
                         _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise
                     };
                     let nm = self.alloc_str(name.clone());
@@ -5096,6 +5179,14 @@ impl<'p> Vm<'p> {
                 let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
                 Value::num((r >> 11) as f64 / (1u64 << 53) as f64)
             }
+            // WeakMap/WeakSet methods (brand-checked + object-key validated inside).
+            WM_GET => self.weakmap_method(this, "get", args)?,
+            WM_SET => self.weakmap_method(this, "set", args)?,
+            WM_HAS => self.weakmap_method(this, "has", args)?,
+            WM_DELETE => self.weakmap_method(this, "delete", args)?,
+            WS_ADD => self.weakset_method(this, "add", args)?,
+            WS_HAS => self.weakset_method(this, "has", args)?,
+            WS_DELETE => self.weakset_method(this, "delete", args)?,
             // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
             // form is compile-lowered to MathOp; these back the value form.
             _ if native::math_method(id).is_some() => {
@@ -5805,6 +5896,8 @@ impl<'p> Vm<'p> {
             // (`new Map().set`, `d.getHours`) → the corresponding prototype.
             HeapObj::Map { .. } => Ok(self.proto_member(self.map_proto, key)),
             HeapObj::Set(_) => Ok(self.proto_member(self.set_proto, key)),
+            HeapObj::WeakMap { .. } => Ok(self.proto_member(self.weakmap_proto, key)),
+            HeapObj::WeakSet(_) => Ok(self.proto_member(self.weakset_proto, key)),
             HeapObj::Date(_) => Ok(self.proto_member(self.date_proto, key)),
             HeapObj::Promise { .. } => Ok(self.proto_member(self.promise_proto, key)),
             // Functions / natives / bound functions: own props set on them
@@ -6461,6 +6554,10 @@ impl<'p> Vm<'p> {
     /// unknown method (→ TypeError at the call site). `forEach` snapshots the
     /// entries before invoking the callback (which may mutate the map).
     fn map_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        // Brand check: `Map.prototype.<m>.call(x)` requires x to have [[MapData]].
+        if !matches!(self.heap.get(idx), HeapObj::Map { .. }) {
+            return Err(Thrown(format!("TypeError: Map.prototype.{name} called on incompatible receiver")));
+        }
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
@@ -6563,9 +6660,124 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `WeakMap.prototype.{get,set,has,delete}`. Brand-checked (the receiver must be
+    /// a WeakMap, so `WeakMap.prototype.set.call(aMap)` throws) and keys must be
+    /// objects. No GC, so entries are held strongly (unobservable without GC).
+    fn weakmap_method(&mut self, this: Value, name: &str, args: &[Value]) -> Result<Value, Thrown> {
+        if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::WeakMap { .. }) {
+            return Err(Thrown(format!(
+                "TypeError: WeakMap.prototype.{name} called on incompatible receiver"
+            )));
+        }
+        let idx = this.heap_index();
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "get" => {
+                let v = match self.heap.get(idx) {
+                    HeapObj::WeakMap { keys, vals } => {
+                        keys.iter().position(|k| self.same_value_zero(*k, a0)).map(|i| vals[i])
+                    }
+                    _ => None,
+                };
+                Ok(v.unwrap_or(Value::UNDEFINED))
+            }
+            "has" => {
+                let found = match self.heap.get(idx) {
+                    HeapObj::WeakMap { keys, .. } => keys.iter().any(|k| self.same_value_zero(*k, a0)),
+                    _ => false,
+                };
+                Ok(Value::bool(found))
+            }
+            "set" => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Invalid value used as weak map key".into()));
+                }
+                let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let pos = match self.heap.get(idx) {
+                    HeapObj::WeakMap { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),
+                    _ => None,
+                };
+                if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
+                    match pos {
+                        Some(i) => vals[i] = val,
+                        None => {
+                            keys.push(a0);
+                            vals.push(val);
+                        }
+                    }
+                }
+                Ok(this) // chainable
+            }
+            "delete" => {
+                let pos = match self.heap.get(idx) {
+                    HeapObj::WeakMap { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),
+                    _ => None,
+                };
+                if let (Some(i), HeapObj::WeakMap { keys, vals }) = (pos, self.heap.get_mut(idx)) {
+                    keys.remove(i);
+                    vals.remove(i);
+                    return Ok(Value::bool(true));
+                }
+                Ok(Value::bool(false))
+            }
+            _ => Ok(Value::UNDEFINED),
+        }
+    }
+
+    /// `WeakSet.prototype.{add,has,delete}`. Brand-checked; values must be objects.
+    fn weakset_method(&mut self, this: Value, name: &str, args: &[Value]) -> Result<Value, Thrown> {
+        if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::WeakSet(_)) {
+            return Err(Thrown(format!(
+                "TypeError: WeakSet.prototype.{name} called on incompatible receiver"
+            )));
+        }
+        let idx = this.heap_index();
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "has" => {
+                let found = match self.heap.get(idx) {
+                    HeapObj::WeakSet(items) => items.iter().any(|v| self.same_value_zero(*v, a0)),
+                    _ => false,
+                };
+                Ok(Value::bool(found))
+            }
+            "add" => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Invalid value used in weak set".into()));
+                }
+                let present = match self.heap.get(idx) {
+                    HeapObj::WeakSet(items) => items.iter().any(|v| self.same_value_zero(*v, a0)),
+                    _ => true,
+                };
+                if !present {
+                    if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
+                        items.push(a0);
+                    }
+                }
+                Ok(this) // chainable
+            }
+            "delete" => {
+                let pos = match self.heap.get(idx) {
+                    HeapObj::WeakSet(items) => items.iter().position(|v| self.same_value_zero(*v, a0)),
+                    _ => None,
+                };
+                if let (Some(i), HeapObj::WeakSet(items)) = (pos, self.heap.get_mut(idx)) {
+                    items.remove(i);
+                    return Ok(Value::bool(true));
+                }
+                Ok(Value::bool(false))
+            }
+            _ => Ok(Value::UNDEFINED),
+        }
+    }
+
     /// `Set.prototype.*`. `idx` is the Set's heap index. `keys`/`values`/`entries`
     /// return arrays (the iterator approximation).
     fn set_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        // Brand check: `Set.prototype.<m>.call(x)` requires x to have [[SetData]].
+        if !matches!(self.heap.get(idx), HeapObj::Set(_)) {
+            return Err(Thrown(format!("TypeError: Set.prototype.{name} called on incompatible receiver")));
+        }
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
@@ -8744,6 +8956,8 @@ impl<'p> Vm<'p> {
                 HeapObj::Class(c) => format!("class {} {{ }}", c.name),
                 HeapObj::Map { .. } => "[object Map]".into(),
                 HeapObj::Set(_) => "[object Set]".into(),
+                HeapObj::WeakMap { .. } => "[object WeakMap]".into(),
+                HeapObj::WeakSet(_) => "[object WeakSet]".into(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -8861,6 +9075,8 @@ impl<'p> Vm<'p> {
                 let parts: Vec<String> = items.iter().map(|v| self.inspect_nested(*v)).collect();
                 format!("Set({}) {{ {} }}", items.len(), parts.join(", "))
             }
+            HeapObj::WeakMap { .. } => "WeakMap { <items unknown> }".into(),
+            HeapObj::WeakSet(_) => "WeakSet { <items unknown> }".into(),
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
             HeapObj::Promise { state, result, .. } => match state {

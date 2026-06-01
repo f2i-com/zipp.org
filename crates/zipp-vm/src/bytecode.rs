@@ -179,6 +179,10 @@ pub enum Instr {
     NewMap { dst: Reg, src: Option<Reg> },
     /// `dst = new Set(src?)` — build a Set from an optional iterable of values.
     NewSet { dst: Reg, src: Option<Reg> },
+    /// `dst = new WeakMap(src?)` / `new WeakSet(src?)` — like NewMap/NewSet but a
+    /// distinct WeakMap/WeakSet type, and keys/values must be objects.
+    NewWeakMap { dst: Reg, src: Option<Reg> },
+    NewWeakSet { dst: Reg, src: Option<Reg> },
     /// `dst = new Promise(executor)` — alloc a pending promise, call `executor`
     /// with its (resolve, reject) functions; a throwing executor rejects it.
     NewPromise { dst: Reg, executor: Reg },

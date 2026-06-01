@@ -2606,8 +2606,9 @@ impl<'a> FnCompiler<'a> {
                         self.next_reg -= 1; // reclaim executor temp
                         return Ok(dst);
                     }
-                    // `new Map(iter?)` / `new Set(iter?)`.
-                    if id.name == "Map" || id.name == "Set" {
+                    // `new Map(iter?)` / `new Set(iter?)` / `new WeakMap(iter?)` /
+                    // `new WeakSet(iter?)`.
+                    if matches!(id.name.as_str(), "Map" | "Set" | "WeakMap" | "WeakSet") {
                         let src = match n.arguments.first().and_then(|a| a.as_expression()) {
                             Some(e) => {
                                 let t = self.temp();
@@ -2619,10 +2620,11 @@ impl<'a> FnCompiler<'a> {
                             }
                             None => None,
                         };
-                        self.emit(if id.name == "Set" {
-                            Instr::NewSet { dst, src }
-                        } else {
-                            Instr::NewMap { dst, src }
+                        self.emit(match id.name.as_str() {
+                            "Set" => Instr::NewSet { dst, src },
+                            "Map" => Instr::NewMap { dst, src },
+                            "WeakSet" => Instr::NewWeakSet { dst, src },
+                            _ => Instr::NewWeakMap { dst, src },
                         });
                         if src.is_some() {
                             self.next_reg -= 1; // reclaim the src temp

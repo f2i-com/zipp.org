@@ -369,6 +369,12 @@ pub enum HeapObj {
     Map { keys: Vec<Value>, vals: Vec<Value> },
     /// A JS `Set`: insertion-ordered unique values (SameValueZero equality).
     Set(Vec<Value>),
+    /// A JS `WeakMap`: like `Map` but keys must be objects and there is no
+    /// iteration/size (a distinct type so the [[WeakMapData]] brand check works —
+    /// `WeakMap.prototype.set.call(aMap)` must throw). No GC, so refs stay strong.
+    WeakMap { keys: Vec<Value>, vals: Vec<Value> },
+    /// A JS `WeakSet`: like `Set` but values must be objects, no iteration/size.
+    WeakSet(Vec<Value>),
     /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
     /// `ctor` is the func id that runs instance field initializers then the user
     /// constructor (or `None`); `methods` maps each instance method name to its
