@@ -862,6 +862,14 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    // In-place string append (emitter proved `a` uniquely owned).
+                    Instr::StrAppendInPlace { dst, a, b } => {
+                        let av = self.get(base, a);
+                        let bv = self.get(base, b);
+                        let r = self.str_append_inplace(av, bv);
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::Sub { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
@@ -1587,6 +1595,7 @@ impl<'p> Vm<'p> {
                                         array_push: jit_array_push as usize,
                                         char_code_at: jit_char_code_at as usize,
                                         concat: jit_concat as usize,
+                                        str_append: jit_str_append as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
@@ -5680,6 +5689,52 @@ impl<'p> Vm<'p> {
         Ok(Value::num(self.to_number(va)? + self.to_number(vb)?))
     }
 
+    /// `acc + val` as a string append that MUTATES `acc`'s buffer in place when
+    /// `acc` is a uniquely-owned, non-interned flat string (`Str` at a user heap
+    /// index). Otherwise — `acc` is the interned `""`/single-char (first append),
+    /// a rope, or not a string — it allocates a FRESH non-interned flat string
+    /// `display(acc) + display(val)` (never interned, so the NEXT append mutates
+    /// it). Correctness rests on the emitter's linearity proof: the only reference
+    /// to the mutated buffer is the accumulator itself, so the mutation is
+    /// unobservable. Returns the (possibly unchanged) accumulator Value.
+    pub(crate) fn str_append_inplace(&mut self, acc: Value, val: Value) -> Value {
+        let mutable = acc.is_heap()
+            && acc.heap_index() > crate::heap::INTERN_EMPTY
+            && matches!(self.heap.get(acc.heap_index()), HeapObj::Str(_));
+        // Fast path: appending a single decimal digit (the `s += i%10` shape) —
+        // no temporary allocation for the value's string form.
+        if mutable && val.is_int() {
+            let n = val.as_int();
+            if (0..=9).contains(&n) {
+                if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
+                    js.bytes.push((b'0' + n as u8) as char);
+                    js.char_len += 1;
+                    return acc;
+                }
+            }
+        }
+        // General: materialise `val`'s string form (same coercion as `+`).
+        let ri = self.to_str_idx(val);
+        let add: String = self.heap.str_cow(ri).map(|c| c.into_owned()).unwrap_or_default();
+        if mutable {
+            if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
+                let cl = add.chars().count();
+                let asc = add.is_ascii();
+                js.bytes.push_str(&add);
+                js.char_len += cl;
+                js.ascii &= asc;
+                return acc;
+            }
+        }
+        // Fresh buffer (first append / interned / rope acc): flatten acc + add into
+        // a NON-interned `Str` (bypass `alloc_str`'s interning so it's mutable next).
+        let li = self.to_str_idx(acc);
+        let mut s: String =
+            self.heap.str_cow(li).map(|c| c.into_owned()).unwrap_or_default();
+        s.push_str(&add);
+        Value::heap(self.heap.alloc(HeapObj::Str(crate::heap::JsStr::new(s))))
+    }
+
     /// Heap index of a string-like object representing `v`: `v`'s own index when
     /// it is already a string (flat or rope), else a freshly allocated flat
     /// string from `v`'s string coercion. Used to build rope children.
@@ -6276,6 +6331,26 @@ pub(crate) extern "win64" fn jit_concat(
         Ok(v) => v.bits(),
         Err(_) => crate::codegen::SELF_CALL_DEOPT,
     }
+}
+
+/// `dst = a + b` for the OSR region's `StrAppendInPlace` op: appends into `a`'s
+/// buffer in place when uniquely owned (see `str_append_inplace`). Never deopts
+/// (string append doesn't throw); always returns the result bits.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_append(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+) -> u64 {
+    let a = Value::from_bits(a_bits);
+    let b = Value::from_bits(b_bits);
+    // SAFETY: exclusive view to mutate/allocate the string; the running region
+    // holds no conflicting borrow (reg file / globals base only).
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.str_append_inplace(a, b).bits()
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

@@ -74,6 +74,18 @@ pub enum Instr {
     /// mis-applied hint can only change performance, never results.
     StrConcat { dst: Reg, a: Reg, b: Reg },
 
+    /// `dst = a + b`, computed by appending `b`'s string form into `a`'s buffer
+    /// IN PLACE when `a` is a uniquely-owned mutable string (else a fresh string).
+    /// Emitted by the compile pass ONLY for a string accumulator it has PROVEN
+    /// linear — `a` (a global) is built solely by this loop, never aliased during
+    /// the build (no other read/store, no calls/heap ops in the loop, loop not
+    /// nested, top-level so it runs once). Under that proof the in-place mutation
+    /// is unobservable, turning a 1M-element `s += …` build from ~1M rope-node
+    /// allocations into amortized buffer growth. Unlike `StrConcat`/`Add`, this is
+    /// NOT semantics-preserving in general (it mutates) — correct ONLY under the
+    /// linearity proof the emitter guarantees.
+    StrAppendInPlace { dst: Reg, a: Reg, b: Reg },
+
     // ── comparisons → boolean ──
     Lt { dst: Reg, a: Reg, b: Reg },
     Le { dst: Reg, a: Reg, b: Reg },

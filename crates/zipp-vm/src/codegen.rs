@@ -101,6 +101,8 @@ pub struct HeapHelperAddrs {
     pub char_code_at: usize,
     /// Helper for `a + b` (`StrConcat`) — returns the result bits, or deopt.
     pub concat: usize,
+    /// Helper for in-place `a + b` (`StrAppendInPlace`) — returns the result bits.
+    pub str_append: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -420,6 +422,7 @@ impl Jit {
             array_push: heap_helpers.array_push,
             char_code_at: heap_helpers.char_code_at,
             concat: heap_helpers.concat,
+            str_append: heap_helpers.str_append,
             ic_base_idx,
         };
         match compile_region(proto, start, end, globals_base_helper, helpers) {
@@ -657,6 +660,7 @@ fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::LoadGlobal { dst, .. }
         | Instr::GetProp { dst, .. }
         | Instr::StrConcat { dst, .. }
+        | Instr::StrAppendInPlace { dst, .. }
         | Instr::Call { dst, .. } => Some(dst),
         _ => None,
     }
@@ -1843,9 +1847,10 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::GetIndex { .. }
             | Instr::SetIndex { .. }
             // String concat (`s += …`) — handled by the MEMORY path via the
-            // `jit_concat` win64 helper (the numeric int/regalloc paths don't
-            // list it, so they decline and the region takes the mem path).
+            // `jit_concat` / `jit_str_append` win64 helpers (the numeric
+            // int/regalloc paths don't list them, so they decline → mem path).
             | Instr::StrConcat { .. }
+            | Instr::StrAppendInPlace { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
             // A whitelist of cheap, fixed-arity builtin method calls — handled by
@@ -1875,7 +1880,9 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
     // `StrConcat`'s helper allocates (growing the heap's parallel version array),
     // which would invalidate the pinned version-array pointer (`r13`) that a
     // `GetProp`/`SetProp` inline cache relies on. Forbid the two in one region.
-    let has_concat = code[s..=e].iter().any(|i| matches!(i, Instr::StrConcat { .. }));
+    let has_concat = code[s..=e]
+        .iter()
+        .any(|i| matches!(i, Instr::StrConcat { .. } | Instr::StrAppendInPlace { .. }));
     let has_prop = code[s..=e]
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
@@ -1907,6 +1914,8 @@ struct HeapHelpers {
     char_code_at: usize,
     /// Helper for `a + b` (`StrConcat`).
     concat: usize,
+    /// Helper for in-place `a + b` (`StrAppendInPlace`).
+    str_append: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -2439,6 +2448,7 @@ fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::Div { a, b, .. }
         | Instr::Mod { a, b, .. }
         | Instr::StrConcat { a, b, .. }
+        | Instr::StrAppendInPlace { a, b, .. }
         | Instr::Lt { a, b, .. }
         | Instr::Le { a, b, .. }
         | Instr::Gt { a, b, .. }
@@ -3716,6 +3726,20 @@ fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::StrAppendInPlace { dst, a, b } => {
+                // In-place `dst = a + b` via `jit_str_append` (mutates a's buffer
+                // when uniquely owned — the emitter proved linearity). Never
+                // deopts, but uses the same ABI; allocates/grows the heap, so
+                // (like StrConcat) region_can_compile keeps GetProp/SetProp out.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // a (accumulator) bits
+                    ; mov r8, [rbx + dreg(b)]             // b (appended) bits
+                    ; mov rax, QWORD heap.str_append as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
+                );
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 // Resume interpreting at this ip so the interpreter performs the
