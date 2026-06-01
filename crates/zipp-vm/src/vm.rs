@@ -405,6 +405,10 @@ pub struct Vm<'p> {
     set_proto: u32,
     date_proto: u32,
     promise_proto: u32,
+    /// `Number`/`Boolean`.prototype — number/boolean PRIMITIVES delegate here for
+    /// method-as-value access (`(5).toFixed`, `true.toString`). 0 until set up.
+    num_proto: u32,
+    bool_proto: u32,
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
@@ -489,6 +493,8 @@ impl<'p> Vm<'p> {
             set_proto: 0,
             date_proto: 0,
             promise_proto: 0,
+            num_proto: 0,
+            bool_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -4479,6 +4485,8 @@ impl<'p> Vm<'p> {
         self.map_proto = map_proto;
         self.date_proto = date_proto;
         self.promise_proto = promise_proto;
+        self.num_proto = num_proto;
+        self.bool_proto = bool_proto;
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -5607,6 +5615,14 @@ impl<'p> Vm<'p> {
                     "TypeError: Cannot read properties of {} (reading '{key}')",
                     if obj.is_null() { "null" } else { "undefined" }
                 )));
+            }
+            // A number/boolean PRIMITIVE delegates method-as-value access to
+            // Number/Boolean.prototype (`(5).toFixed`, `true.valueOf`).
+            if obj.is_number() {
+                return Ok(self.proto_member(self.num_proto, key));
+            }
+            if obj.is_bool() {
+                return Ok(self.proto_member(self.bool_proto, key));
             }
             return Ok(Value::UNDEFINED);
         }
