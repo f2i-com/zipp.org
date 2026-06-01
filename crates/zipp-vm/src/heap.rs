@@ -375,6 +375,9 @@ pub enum HeapObj {
     WeakMap { keys: Vec<Value>, vals: Vec<Value> },
     /// A JS `WeakSet`: like `Set` but values must be objects, no iteration/size.
     WeakSet(Vec<Value>),
+    /// A JS `WeakRef`: a weak reference to an object. No GC, so `deref()` always
+    /// returns the (still-live) target.
+    WeakRef(Value),
     /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
     /// `ctor` is the func id that runs instance field initializers then the user
     /// constructor (or `None`); `methods` maps each instance method name to its

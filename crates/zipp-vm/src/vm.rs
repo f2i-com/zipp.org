@@ -170,6 +170,7 @@ mod native {
     pub const WS_ADD: u16 = 294;
     pub const WS_HAS: u16 = 295;
     pub const WS_DELETE: u16 = 296;
+    pub const WR_DEREF: u16 = 297;
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -332,6 +333,7 @@ mod native {
             WS_ADD => ("add", 1),
             WS_HAS => ("has", 1),
             WS_DELETE => ("delete", 1),
+            WR_DEREF => ("deref", 0),
             _ => return None,
         })
     }
@@ -424,9 +426,10 @@ pub struct Vm<'p> {
     /// method-as-value access (`(5).toFixed`, `true.toString`). 0 until set up.
     num_proto: u32,
     bool_proto: u32,
-    /// `WeakMap`/`WeakSet`.prototype — instances delegate method-as-value access here.
+    /// `WeakMap`/`WeakSet`/`WeakRef`.prototype — instances delegate here.
     weakmap_proto: u32,
     weakset_proto: u32,
+    weakref_proto: u32,
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
@@ -515,6 +518,7 @@ impl<'p> Vm<'p> {
             bool_proto: 0,
             weakmap_proto: 0,
             weakset_proto: 0,
+            weakref_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1815,6 +1819,17 @@ impl<'p> Vm<'p> {
                         }
                         let s = Value::heap(self.heap.alloc(HeapObj::WeakSet(items)));
                         self.set(base, dst, s);
+                        ip += 1;
+                    }
+                    Instr::NewWeakRef { dst, target } => {
+                        let t = self.get(base, target);
+                        if !self.is_object_value(t) {
+                            return Err(Thrown(
+                                "TypeError: WeakRef: target must be an object".into(),
+                            ));
+                        }
+                        let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));
+                        self.set(base, dst, wr);
                         ip += 1;
                     }
                     Instr::NewPromise { dst, executor } => {
@@ -4681,10 +4696,13 @@ impl<'p> Vm<'p> {
             None,
         );
         let weakset_proto = build(self, &[("add", WS_ADD), ("has", WS_HAS), ("delete", WS_DELETE)], None);
+        let weakref_proto = build(self, &[("deref", WR_DEREF)], None);
         self.weakmap_proto = weakmap_proto;
         self.weakset_proto = weakset_proto;
+        self.weakref_proto = weakref_proto;
         let weakmap_ctor = build(self, &[], Some(weakmap_proto));
         let weakset_ctor = build(self, &[], Some(weakset_proto));
+        let weakref_ctor = build(self, &[], Some(weakref_proto));
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
         let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
@@ -4740,6 +4758,7 @@ impl<'p> Vm<'p> {
                 "Math" => Some(math_ctor),
                 "WeakMap" => Some(weakmap_ctor),
                 "WeakSet" => Some(weakset_ctor),
+                "WeakRef" => Some(weakref_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -5197,6 +5216,16 @@ impl<'p> Vm<'p> {
             WS_ADD => self.weakset_method(this, "add", args)?,
             WS_HAS => self.weakset_method(this, "has", args)?,
             WS_DELETE => self.weakset_method(this, "delete", args)?,
+            WR_DEREF => {
+                match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::WeakRef(t)) => *t, // no GC → target always live
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: WeakRef.prototype.deref called on incompatible receiver".into(),
+                        ))
+                    }
+                }
+            }
             // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
             // form is compile-lowered to MathOp; these back the value form.
             _ if native::math_method(id).is_some() => {
@@ -5473,6 +5502,7 @@ impl<'p> Vm<'p> {
             HeapObj::Set(_) => self.set_proto,
             HeapObj::WeakMap { .. } => self.weakmap_proto,
             HeapObj::WeakSet(_) => self.weakset_proto,
+            HeapObj::WeakRef(_) => self.weakref_proto,
             HeapObj::Date(_) => self.date_proto,
             HeapObj::Promise { .. } => self.promise_proto,
             _ => 0,
@@ -5922,6 +5952,7 @@ impl<'p> Vm<'p> {
             HeapObj::Set(_) => Ok(self.proto_member(self.set_proto, key)),
             HeapObj::WeakMap { .. } => Ok(self.proto_member(self.weakmap_proto, key)),
             HeapObj::WeakSet(_) => Ok(self.proto_member(self.weakset_proto, key)),
+            HeapObj::WeakRef(_) => Ok(self.proto_member(self.weakref_proto, key)),
             HeapObj::Date(_) => Ok(self.proto_member(self.date_proto, key)),
             HeapObj::Promise { .. } => Ok(self.proto_member(self.promise_proto, key)),
             // Functions / natives / bound functions: own props set on them
@@ -8982,6 +9013,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Set(_) => "[object Set]".into(),
                 HeapObj::WeakMap { .. } => "[object WeakMap]".into(),
                 HeapObj::WeakSet(_) => "[object WeakSet]".into(),
+                HeapObj::WeakRef(_) => "[object WeakRef]".into(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -9101,6 +9133,7 @@ impl<'p> Vm<'p> {
             }
             HeapObj::WeakMap { .. } => "WeakMap { <items unknown> }".into(),
             HeapObj::WeakSet(_) => "WeakSet { <items unknown> }".into(),
+            HeapObj::WeakRef(_) => "WeakRef {}".into(),
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
             HeapObj::Promise { state, result, .. } => match state {

@@ -183,6 +183,8 @@ pub enum Instr {
     /// distinct WeakMap/WeakSet type, and keys/values must be objects.
     NewWeakMap { dst: Reg, src: Option<Reg> },
     NewWeakSet { dst: Reg, src: Option<Reg> },
+    /// `dst = new WeakRef(target)` — target must be an object.
+    NewWeakRef { dst: Reg, target: Reg },
     /// `dst = new Promise(executor)` — alloc a pending promise, call `executor`
     /// with its (resolve, reject) functions; a throwing executor rejects it.
     NewPromise { dst: Reg, executor: Reg },

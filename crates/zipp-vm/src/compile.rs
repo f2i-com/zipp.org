@@ -2631,6 +2631,23 @@ impl<'a> FnCompiler<'a> {
                         }
                         return Ok(dst);
                     }
+                    // `new WeakRef(target)` — target required (the op validates it's
+                    // an object).
+                    if id.name == "WeakRef" {
+                        let target = self.temp();
+                        match n.arguments.first().and_then(|a| a.as_expression()) {
+                            Some(e) => {
+                                let v = self.expr_into(e, target)?;
+                                if v != target {
+                                    self.emit(Instr::Move { dst: target, src: v });
+                                }
+                            }
+                            None => self.emit(Instr::LoadUndefined { dst: target }),
+                        }
+                        self.emit(Instr::NewWeakRef { dst, target });
+                        self.next_reg -= 1; // reclaim target temp
+                        return Ok(dst);
+                    }
                     // `new Date(...)`.
                     if id.name == "Date" {
                         let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
