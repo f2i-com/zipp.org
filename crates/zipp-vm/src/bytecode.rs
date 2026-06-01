@@ -281,6 +281,9 @@ pub enum Instr {
     /// indexes the canonical error list (0=Error, 1=TypeError, …, 7=AggregateError);
     /// `arg` (when present) is coerced to the `message` string.
     NewError { dst: Reg, kind: u8, arg: Option<Reg> },
+    /// `dst = Symbol(desc?)` — a fresh unique Symbol primitive. `desc` (when present)
+    /// is coerced to a string description (undefined → no description).
+    MakeSymbol { dst: Reg, desc: Option<Reg> },
     /// `dst = <array of obj's own enumerable string keys>` — drives `for-in`.
     /// For an array, the keys are the index strings "0".."len-1".
     ObjectKeys { dst: Reg, obj: Reg },

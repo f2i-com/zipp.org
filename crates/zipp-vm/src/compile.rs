@@ -2805,21 +2805,9 @@ impl<'a> FnCompiler<'a> {
                     return Ok(dst);
                 }
             }
-            // Well-known symbols map to a reserved string key (no real Symbol
-            // type): `Symbol.iterator` → "@@iterator". Lets `obj[Symbol.iterator]`
-            // and `{ [Symbol.iterator]() {} }` define/read the iteration method.
-            if o.name == "Symbol" {
-                let wk = match m.property.name.as_str() {
-                    "iterator" => Some("@@iterator"),
-                    "asyncIterator" => Some("@@asyncIterator"),
-                    _ => None,
-                };
-                if let Some(s) = wk {
-                    let idx = self.add_string_const(s);
-                    self.emit(Instr::LoadConst { dst, idx });
-                    return Ok(dst);
-                }
-            }
+            // `Symbol.iterator` etc. are now real Symbol VALUES — they resolve as
+            // ordinary property reads of the `Symbol` global (whose key_of maps to
+            // the engine's `@@iterator` convention, so iteration is unchanged).
         }
         let obj = self.expr(&m.object)?;
         if m.optional {
@@ -4059,6 +4047,28 @@ impl<'a> FnCompiler<'a> {
                 return self.build_error(kind, &c.arguments, dst);
             }
         }
+        // `Symbol(desc?)` → a fresh Symbol primitive (MakeSymbol op). `Symbol` is
+        // not constructable, so only the call form is lowered here.
+        if let ox::Expression::Identifier(id) = &c.callee {
+            if id.name == "Symbol" {
+                let desc = match c.arguments.first().and_then(|a| a.as_expression()) {
+                    Some(e) => {
+                        let t = self.temp();
+                        let v = self.expr_into(e, t)?;
+                        if v != t {
+                            self.emit(Instr::Move { dst: t, src: v });
+                        }
+                        Some(t)
+                    }
+                    None => None,
+                };
+                self.emit(Instr::MakeSymbol { dst, desc });
+                if desc.is_some() {
+                    self.next_reg -= 1;
+                }
+                return Ok(dst);
+            }
+        }
         // Number(x) / parseInt(s,radix) / parseFloat(s) → GlobalFn op.
         if let ox::Expression::Identifier(id) = &c.callee {
             if let Some(op) = crate::bytecode::GlobalFn::from_name(&id.name) {
@@ -4436,10 +4446,10 @@ fn class_key_name(key: &ox::PropertyKey) -> R<String> {
         ox::PropertyKey::StaticMemberExpression(m) => {
             if let ox::Expression::Identifier(o) = &m.object {
                 if o.name == "Symbol" {
-                    match m.property.name.as_str() {
-                        "iterator" => return Ok("@@iterator".into()),
-                        "asyncIterator" => return Ok("@@asyncIterator".into()),
-                        _ => {}
+                    // Well-known symbols use the `@@<name>` key convention (matching
+                    // the VM's `key_of`), so `[Symbol.toPrimitive]() {}` etc. work.
+                    if let Some(k) = well_known_symbol_key(m.property.name.as_str()) {
+                        return Ok(k.into());
                     }
                 }
             }
@@ -4558,6 +4568,30 @@ fn collect_hoisted_vars(s: &ox::Statement, out: &mut std::collections::HashSet<S
         S::WithStatement(w) => collect_hoisted_vars(&w.body, out),
         _ => {}
     }
+}
+
+/// The internal property key for a well-known symbol (`Symbol.<name>`), matching
+/// the VM's `WELL_KNOWN_SYMBOLS` / `key_of` convention. `None` for non-well-known
+/// names (a computed `[Symbol.foo]` that isn't a known symbol stays unsupported).
+fn well_known_symbol_key(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "iterator" => "@@iterator",
+        "asyncIterator" => "@@asyncIterator",
+        "toPrimitive" => "@@toPrimitive",
+        "toStringTag" => "@@toStringTag",
+        "hasInstance" => "@@hasInstance",
+        "isConcatSpreadable" => "@@isConcatSpreadable",
+        "species" => "@@species",
+        "match" => "@@match",
+        "matchAll" => "@@matchAll",
+        "replace" => "@@replace",
+        "search" => "@@search",
+        "split" => "@@split",
+        "unscopables" => "@@unscopables",
+        "dispose" => "@@dispose",
+        "asyncDispose" => "@@asyncDispose",
+        _ => return None,
+    })
 }
 
 /// The canonical index of an error constructor name (parallel to the VM's

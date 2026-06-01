@@ -387,6 +387,13 @@ pub enum HeapObj {
     /// wrapped primitive ([[PrimitiveValue]]). `typeof` is "object"; valueOf returns
     /// the value; the kind's prototype provides the methods.
     Boxed { kind: u8, value: Value },
+    /// A JS `Symbol` primitive. Identity is the heap index (so `===` and use as a
+    /// property key dedupe correctly). `desc` is the description (a string Value or
+    /// UNDEFINED). `prop_key` is the internal string under which the symbol is
+    /// stored as an object property — `"@@iterator"` etc. for the well-known
+    /// symbols (matching the engine's existing iterator-key convention) and
+    /// `"@@sym:N"` for user symbols. `typeof` is "symbol".
+    Symbol { desc: Value, prop_key: String },
     /// A built-in iterator (Array/Map/Set `entries()`/`keys()`/`values()` and the
     /// default `@@iterator`). A snapshot of the values to yield plus a cursor;
     /// `proto` is its prototype heap index (%ArrayIteratorPrototype% etc., distinct

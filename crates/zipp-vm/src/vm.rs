@@ -203,6 +203,31 @@ mod native {
         "Error", "TypeError", "RangeError", "SyntaxError",
         "ReferenceError", "EvalError", "URIError", "AggregateError",
     ];
+    // Symbol: the static methods + Symbol.prototype methods as first-class values.
+    pub const SYMBOL_FOR: u16 = 318;
+    pub const SYMBOL_KEY_FOR: u16 = 319;
+    pub const SYMBOL_TO_STRING: u16 = 320; // Symbol.prototype.toString
+    pub const SYMBOL_VALUE_OF: u16 = 321; // Symbol.prototype.valueOf
+    /// The well-known symbols, as `(JS property name on `Symbol`, internal prop_key)`.
+    /// The prop_key is the string the symbol uses as an object key — `@@iterator`
+    /// etc. match the engine's existing iterator convention so iteration is unchanged.
+    pub const WELL_KNOWN_SYMBOLS: &[(&str, &str)] = &[
+        ("iterator", "@@iterator"),
+        ("asyncIterator", "@@asyncIterator"),
+        ("toPrimitive", "@@toPrimitive"),
+        ("toStringTag", "@@toStringTag"),
+        ("hasInstance", "@@hasInstance"),
+        ("isConcatSpreadable", "@@isConcatSpreadable"),
+        ("species", "@@species"),
+        ("match", "@@match"),
+        ("matchAll", "@@matchAll"),
+        ("replace", "@@replace"),
+        ("search", "@@search"),
+        ("split", "@@split"),
+        ("unscopables", "@@unscopables"),
+        ("dispose", "@@dispose"),
+        ("asyncDispose", "@@asyncDispose"),
+    ];
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -318,6 +343,10 @@ mod native {
             PROTO_VALUE_OF => ("valueOf", 0),
             PROTO_TO_STRING => ("toString", 0),
             ERROR_TO_STRING => ("toString", 0),
+            SYMBOL_FOR => ("for", 1),
+            SYMBOL_KEY_FOR => ("keyFor", 1),
+            SYMBOL_TO_STRING => ("toString", 0),
+            SYMBOL_VALUE_OF => ("valueOf", 0),
             FN_CALL => ("call", 1),
             FN_APPLY => ("apply", 2),
             FN_BIND => ("bind", 1),
@@ -497,6 +526,19 @@ pub struct Vm<'p> {
     /// indexed the same way. Stored on each proto as `.constructor` and used by the
     /// runtime `new (TypeError)()` / `Reflect.construct` path.
     error_ctors: [u32; 8],
+    /// `Symbol.prototype` heap index (toString/valueOf/description) and the `Symbol`
+    /// constructor object heap index (callable, NOT constructable). 0 until setup.
+    symbol_proto: u32,
+    symbol_ctor: u32,
+    /// Monotonic counter giving each `Symbol()` a unique internal property key
+    /// (`@@sym:N`), so distinct symbols never collide as object keys.
+    symbol_counter: u64,
+    /// The `Symbol.for` global registry: registry key string → the shared Symbol.
+    symbol_registry: std::collections::HashMap<String, Value>,
+    /// Internal prop_key (`@@iterator`, `@@sym:N`, …) → the Symbol value, so a
+    /// symbol-keyed own property can be reflected back to its Symbol by
+    /// `Object.getOwnPropertySymbols`.
+    symbol_keys: std::collections::HashMap<String, Value>,
     /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
     /// iterators (and the default array `@@iterator`). 0 until set up.
     array_iter_proto: u32,
@@ -609,6 +651,11 @@ impl<'p> Vm<'p> {
             finreg_proto: 0,
             error_protos: [0; 8],
             error_ctors: [0; 8],
+            symbol_proto: 0,
+            symbol_ctor: 0,
+            symbol_counter: 0,
+            symbol_registry: std::collections::HashMap::new(),
+            symbol_keys: std::collections::HashMap::new(),
             array_iter_proto: 0,
             map_iter_proto: 0,
             set_iter_proto: 0,
@@ -2170,7 +2217,7 @@ impl<'p> Vm<'p> {
                             S::PromiseRace => self.promise_combine(crate::heap::CombKind::Race, a0)?,
                             S::PromiseAny => self.promise_combine(crate::heap::CombKind::Any, a0)?,
                             S::ObjectDefineProperty => {
-                                let key = self.display(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                                let key = self.key_of(args.get(1).copied().unwrap_or(Value::UNDEFINED));
                                 let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                                 self.object_define_property(a0, &key, desc)?;
                                 a0
@@ -2181,7 +2228,7 @@ impl<'p> Vm<'p> {
                                 a0
                             }
                             S::ObjectGetOwnPropertyDescriptor => {
-                                let key = self.display(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                                let key = self.key_of(args.get(1).copied().unwrap_or(Value::UNDEFINED));
                                 self.object_get_own_property_descriptor(a0, &key)
                             }
                             S::ObjectGetOwnPropertyNames => self.object_own_property_names(a0),
@@ -2343,7 +2390,7 @@ impl<'p> Vm<'p> {
                                     .keys
                                     .iter()
                                     .zip(map.attrs.iter())
-                                    .filter(|(k, a)| a.enumerable && !is_private_key(k))
+                                    .filter(|(k, a)| a.enumerable && !is_hidden_key(k))
                                     .map(|(k, _)| k.clone())
                                     .collect(),
                                 HeapObj::Array(items) => {
@@ -2507,6 +2554,24 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::MakeSymbol { dst, desc } => {
+                        // `Symbol(desc)`: description is ToString(desc) unless absent/undefined.
+                        let d = match desc {
+                            Some(r) => {
+                                let v = self.get(base, r);
+                                if v == Value::UNDEFINED {
+                                    Value::UNDEFINED
+                                } else {
+                                    let s = self.to_js_string(v)?;
+                                    self.alloc_str(s)
+                                }
+                            }
+                            None => Value::UNDEFINED,
+                        };
+                        let sym = self.make_symbol(d);
+                        self.set(base, dst, sym);
+                        ip += 1;
+                    }
                     Instr::GetIndex { dst, obj, key } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
@@ -2551,7 +2616,7 @@ impl<'p> Vm<'p> {
                     Instr::DeleteIndex { dst, obj, key } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
-                        let ks = self.display(k); // ToPropertyKey (string form)
+                        let ks = self.key_of(k); // ToPropertyKey (symbol → its prop_key)
                         let r = self.delete_prop(o, &ks);
                         self.set(base, dst, r);
                         ip += 1;
@@ -4318,7 +4383,7 @@ impl<'p> Vm<'p> {
                     self.display(obj)
                 )));
             }
-            let k = self.display(key);
+            let k = self.key_of(key);
             return self.get_prop(obj, &k);
         }
         // A boxed String indexes its wrapped string (chars / length); a boxed
@@ -4328,7 +4393,7 @@ impl<'p> Vm<'p> {
             if k == 0 {
                 return self.get_index(v, key);
             }
-            let key_s = self.display(key);
+            let key_s = self.key_of(key);
             return self.get_prop(obj, &key_s);
         }
         // Object / callable / class index access is property access: delegate to
@@ -4353,7 +4418,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::WeakRef(_)
                 | HeapObj::FinalizationRegistry { .. }
         ) {
-            let k = self.display(key);
+            let k = self.key_of(key);
             return self.get_prop(obj, &k);
         }
         match self.heap.get(obj.heap_index()) {
@@ -4368,14 +4433,14 @@ impl<'p> Vm<'p> {
                 }
                 // Non-int key on an array: "length", else resolve via the prototype
                 // (a computed method name / `@@iterator`, mirroring dot access).
-                let k = self.display(key);
+                let k = self.key_of(key);
                 if k == "length" {
                     return Ok(len_value(items.len()));
                 }
                 self.get_prop(obj, &k)
             }
             HeapObj::Object(map) => {
-                let k = self.display(key);
+                let k = self.key_of(key);
                 Ok(map.get(&k).unwrap_or(Value::UNDEFINED))
             }
             HeapObj::Str(s) => {
@@ -4405,7 +4470,7 @@ impl<'p> Vm<'p> {
                 // Non-numeric key: `s["length"]`, else resolve via String.prototype
                 // (a computed method name / `@@iterator`), mirroring dot access.
                 let char_len = s.char_len;
-                let k = self.display(key);
+                let k = self.key_of(key);
                 if k == "length" {
                     return Ok(len_value(char_len));
                 }
@@ -4422,7 +4487,7 @@ impl<'p> Vm<'p> {
                     return Ok(Value::UNDEFINED);
                 }
                 // Non-numeric key (`map[Symbol.iterator]`, `map["set"]`): via prototype.
-                let k = self.display(key);
+                let k = self.key_of(key);
                 self.get_prop(obj, &k)
             }
             HeapObj::Set(items) => {
@@ -4432,7 +4497,7 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(Value::UNDEFINED);
                 }
-                let k = self.display(key);
+                let k = self.key_of(key);
                 self.get_prop(obj, &k)
             }
             _ => Ok(Value::UNDEFINED),
@@ -4455,7 +4520,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::Native(_)
         ) {
-            let k = self.display(key);
+            let k = self.key_of(key);
             return self.set_prop(obj, &k, val);
         }
         match self.heap.get_mut(idx) {
@@ -4472,7 +4537,7 @@ impl<'p> Vm<'p> {
                 Ok(())
             }
             HeapObj::Object(_) => {
-                let k = self.display(key);
+                let k = self.key_of(key);
                 let mut added = false;
                 if let HeapObj::Object(map) = self.heap.get_mut(idx) {
                     added = map.set(&k, val);
@@ -5037,6 +5102,51 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // `Symbol`: a callable-but-NOT-constructable function object (typeof
+        // "function" via the type_of special case; `new Symbol()` throws because
+        // it's not is_ctor). The well-known symbols (iterator/toPrimitive/…) are
+        // real Symbol VALUES whose property-key form is the engine's `@@`-prefixed
+        // key, so symbol-keyed access and iteration use one unified mechanism.
+        {
+            let symbol_proto = build(
+                self,
+                &[("toString", SYMBOL_TO_STRING), ("valueOf", SYMBOL_VALUE_OF)],
+                None,
+            );
+            self.proto_of.insert(symbol_proto, Value::heap(obj_proto));
+            self.symbol_proto = symbol_proto;
+            let fn_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let for_v = Value::heap(self.heap.alloc(HeapObj::Native(SYMBOL_FOR)));
+            let keyfor_v = Value::heap(self.heap.alloc(HeapObj::Native(SYMBOL_KEY_FOR)));
+            let name_v = self.alloc_str("Symbol".to_string());
+            let mut m = ObjMap::new();
+            m.define("prototype", Value::heap(symbol_proto), proto_attr);
+            m.define("for", for_v, method_attr);
+            m.define("keyFor", keyfor_v, method_attr);
+            m.define("name", name_v, fn_attr);
+            m.define("length", Value::num(0.0), fn_attr);
+            let symbol_ctor = self.heap.alloc(HeapObj::Object(m));
+            self.symbol_ctor = symbol_ctor;
+            // Symbol.prototype.constructor === Symbol.
+            if let HeapObj::Object(p) = self.heap.get_mut(symbol_proto) {
+                p.define("constructor", Value::heap(symbol_ctor), method_attr);
+            }
+            // Well-known symbols: real symbols (non-writable/enum/configurable own
+            // props of Symbol), each with its fixed `@@`-prefixed key + description.
+            for &(jsname, prop_key) in native::WELL_KNOWN_SYMBOLS {
+                let desc = self.alloc_str(format!("Symbol.{jsname}"));
+                let sym = self.make_named_symbol(desc, prop_key);
+                if let HeapObj::Object(mm) = self.heap.get_mut(symbol_ctor) {
+                    mm.define(jsname, sym, proto_attr);
+                }
+            }
+        }
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
         let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
@@ -5107,6 +5217,7 @@ impl<'p> Vm<'p> {
                 "EvalError" => Some(self.error_ctors[5]),
                 "URIError" => Some(self.error_ctors[6]),
                 "AggregateError" => Some(self.error_ctors[7]),
+                "Symbol" => Some(self.symbol_ctor),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -5157,7 +5268,7 @@ impl<'p> Vm<'p> {
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         Ok(match id {
             OBJ_DEFINE_PROPERTY => {
-                let key = self.display(a1);
+                let key = self.key_of(a1);
                 self.object_define_property(a0, &key, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
                 a0
             }
@@ -5166,7 +5277,7 @@ impl<'p> Vm<'p> {
                 a0
             }
             OBJ_GET_OWN_DESC => {
-                let key = self.display(a1);
+                let key = self.key_of(a1);
                 self.object_get_own_property_descriptor(a0, &key)
             }
             OBJ_GET_OWN_NAMES => self.object_own_property_names(a0),
@@ -5185,8 +5296,8 @@ impl<'p> Vm<'p> {
                 }
                 o
             }
-            PROTO_HAS_OWN => Value::bool(self.has_own_property(this, &self.display(a0))),
-            PROTO_PROP_ENUM => Value::bool(self.own_is_enumerable(this, &self.display(a0))),
+            PROTO_HAS_OWN => Value::bool(self.has_own_property(this, &self.key_of(a0))),
+            PROTO_PROP_ENUM => Value::bool(self.own_is_enumerable(this, &self.key_of(a0))),
             PROTO_IS_PROTO_OF => Value::bool(self.is_prototype_of(this, a0)),
             PROTO_VALUE_OF => this,
             PROTO_TO_STRING => self.alloc_str("[object Object]".to_string()),
@@ -5206,6 +5317,63 @@ impl<'p> Vm<'p> {
                     format!("{name}: {msg}")
                 };
                 self.alloc_str(s)
+            }
+            SYMBOL_TO_STRING => {
+                // `Symbol.prototype.toString` → "Symbol(description)".
+                let desc = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Symbol { desc, .. }) => *desc,
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: Symbol.prototype.toString requires that 'this' be a Symbol"
+                                .into(),
+                        ))
+                    }
+                };
+                let d = if desc == Value::UNDEFINED { String::new() } else { self.display(desc) };
+                self.alloc_str(format!("Symbol({d})"))
+            }
+            SYMBOL_VALUE_OF => {
+                // `Symbol.prototype.valueOf` → the Symbol primitive itself.
+                if matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Symbol { .. })
+                ) {
+                    this
+                } else {
+                    return Err(Thrown(
+                        "TypeError: Symbol.prototype.valueOf requires that 'this' be a Symbol".into(),
+                    ));
+                }
+            }
+            SYMBOL_FOR => {
+                // `Symbol.for(key)`: shared registry symbol for the ToString(key).
+                let key = self.to_js_string(a0)?;
+                if let Some(&sym) = self.symbol_registry.get(&key) {
+                    sym
+                } else {
+                    let desc = self.alloc_str(key.clone());
+                    let prop_key = format!("@@for:{key}");
+                    let sym = self.make_named_symbol(desc, &prop_key);
+                    self.symbol_registry.insert(key, sym);
+                    sym
+                }
+            }
+            SYMBOL_KEY_FOR => {
+                // `Symbol.keyFor(sym)`: the registry key for a registered symbol, else undefined.
+                if !matches!(
+                    a0.is_heap().then(|| self.heap.get(a0.heap_index())),
+                    Some(HeapObj::Symbol { .. })
+                ) {
+                    return Err(Thrown(
+                        "TypeError: Symbol.keyFor requires that the argument be a Symbol".into(),
+                    ));
+                }
+                let key =
+                    self.symbol_registry.iter().find(|(_, v)| v.bits() == a0.bits()).map(|(k, _)| k.clone());
+                match key {
+                    Some(k) => self.alloc_str(k),
+                    None => Value::UNDEFINED,
+                }
             }
             FN_CALL => {
                 let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
@@ -5260,7 +5428,23 @@ impl<'p> Vm<'p> {
                 }
                 o
             }
-            OBJ_GET_OWN_SYMBOLS => Value::heap(self.heap.alloc(HeapObj::Array(Vec::new()))),
+            OBJ_GET_OWN_SYMBOLS => {
+                // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
+                // back to their Symbol values via the prop_key registry.
+                let mut syms: Vec<Value> = Vec::new();
+                if a0.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
+                        let keys: Vec<String> =
+                            m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect();
+                        for k in keys {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
+                    }
+                }
+                Value::heap(self.heap.alloc(HeapObj::Array(syms)))
+            }
             OBJ_FROM_ENTRIES => {
                 let src = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let entries = if src.is_heap() { self.iterate_to_vec(src)? } else { Vec::new() };
@@ -5451,7 +5635,7 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: Reflect.set called on non-object".into()));
                 }
                 let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                let key = self.display(a1);
+                let key = self.key_of(a1);
                 // success = not blocked by a non-writable own data property, an
                 // accessor without a setter, or a new key on a non-extensible object.
                 let ok = match self.heap.get(a0.heap_index()) {
@@ -5482,7 +5666,7 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.deleteProperty called on non-object".into()));
                 }
-                let key = self.display(a1);
+                let key = self.key_of(a1);
                 self.delete_prop(a0, &key)
             }
             REFLECT_OWN_KEYS => {
@@ -5517,7 +5701,7 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(desc) {
                     return Err(Thrown("TypeError: Property description must be an object".into()));
                 }
-                let key = self.display(a1);
+                let key = self.key_of(a1);
                 // Reflect.defineProperty returns false (not throw) when the definition
                 // is rejected (non-configurable redefine, non-extensible new key).
                 match self.object_define_property(a0, &key, desc) {
@@ -5531,7 +5715,7 @@ impl<'p> Vm<'p> {
                         "TypeError: Reflect.getOwnPropertyDescriptor called on non-object".into(),
                     ));
                 }
-                let key = self.display(a1);
+                let key = self.key_of(a1);
                 self.object_get_own_property_descriptor(a0, &key)
             }
             REFLECT_IS_EXT => {
@@ -5778,7 +5962,7 @@ impl<'p> Vm<'p> {
                     .cloned()
                     .zip(m.vals.iter().copied())
                     .zip(m.attrs.iter())
-                    .filter(|((k, _), a)| a.enumerable && !is_private_key(k))
+                    .filter(|((k, _), a)| a.enumerable && !is_hidden_key(k))
                     .map(|(kv, _)| kv)
                     .collect(),
                 HeapObj::Array(items) => {
@@ -5913,7 +6097,7 @@ impl<'p> Vm<'p> {
             match self.heap.get(idx) {
                 // Private names (stored as "#x") are not reflectable own properties.
                 HeapObj::Object(m) => {
-                    keys.extend(m.keys.iter().filter(|k| !is_private_key(k)).cloned())
+                    keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned())
                 }
                 HeapObj::Array(items) => {
                     for i in 0..items.len() {
@@ -5928,14 +6112,14 @@ impl<'p> Vm<'p> {
                     if has_name {
                         keys.push("name".to_string());
                     }
-                    keys.extend(c.statics.keys.iter().filter(|k| !is_private_key(k)).cloned());
+                    keys.extend(c.statics.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
                     for (n, _) in &c.static_getters {
-                        if !is_private_key(n) && !keys.iter().any(|k| k == n) {
+                        if !is_hidden_key(n) && !keys.iter().any(|k| k == n) {
                             keys.push(n.clone());
                         }
                     }
                     for (n, _) in &c.static_setters {
-                        if !is_private_key(n) && !keys.iter().any(|k| k == n) {
+                        if !is_hidden_key(n) && !keys.iter().any(|k| k == n) {
                             keys.push(n.clone());
                         }
                     }
@@ -5948,7 +6132,7 @@ impl<'p> Vm<'p> {
                         keys.push("name".to_string());
                     }
                     if let Some(m) = self.fn_props.get(&idx) {
-                        keys.extend(m.keys.iter().filter(|k| !is_private_key(k)).cloned());
+                        keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
                     }
                 }
                 _ => {}
@@ -6463,6 +6647,14 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Date(_) => Ok(self.proto_member(self.date_proto, key)),
             HeapObj::Promise { .. } => Ok(self.proto_member(self.promise_proto, key)),
+            // A Symbol: `.description` reads the wrapped description; methods
+            // (toString/valueOf/constructor) resolve through Symbol.prototype.
+            HeapObj::Symbol { desc, .. } => {
+                if key == "description" {
+                    return Ok(*desc);
+                }
+                Ok(self.proto_member(self.symbol_proto, key))
+            }
             // Functions / natives / bound functions: own props set on them
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
             _ if matches!(
@@ -6616,6 +6808,7 @@ impl<'p> Vm<'p> {
                 Some(json_quote(&s))
             }
             HeapObj::Func(_) | HeapObj::Closure { .. } => None, // functions are omitted
+            HeapObj::Symbol { .. } => None,                    // symbols are omitted by JSON
             HeapObj::Array(items) => {
                 let items = items.clone(); // release the heap borrow before recursing
                 if items.is_empty() {
@@ -6634,6 +6827,10 @@ impl<'p> Vm<'p> {
                 let sep = if indent.is_empty() { ":" } else { ": " };
                 let mut parts = Vec::new();
                 for (k, val) in keys.iter().zip(vals.iter()) {
+                    // Symbol-keyed (and private) properties are skipped by JSON.
+                    if is_hidden_key(k) {
+                        continue;
+                    }
                     if let Some(vs) = self.json_value(*val, indent, depth + 1) {
                         parts.push(format!("{}{}{}", json_quote(k), sep, vs));
                     }
@@ -6775,10 +6972,14 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::BoundResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
+                HeapObj::Symbol { .. } => "symbol",
                 // The built-in constructor globals (Object/Array/Map/…) are callable.
                 HeapObj::Object(m) if m.is_ctor => "function",
                 // %Function.prototype% is itself a (no-op) callable function.
                 HeapObj::Object(_) if v.heap_index() == self.fn_proto && self.fn_proto != 0 => "function",
+                // `Symbol` is callable (typeof "function") but NOT a constructor
+                // (so `new Symbol()` throws and IsConstructor is false).
+                HeapObj::Object(_) if v.heap_index() == self.symbol_ctor && self.symbol_ctor != 0 => "function",
                 _ => "object", // Array, ordinary Object, namespace globals
             }
         } else {
@@ -7070,11 +7271,11 @@ impl<'p> Vm<'p> {
         // ── Object.prototype methods (available on every object) ──
         match name {
             "hasOwnProperty" => {
-                let key = self.display(args.first().copied().unwrap_or(Value::UNDEFINED));
+                let key = self.key_of(args.first().copied().unwrap_or(Value::UNDEFINED));
                 return Ok(Some(Value::bool(self.has_own_property(recv, &key))));
             }
             "propertyIsEnumerable" => {
-                let key = self.display(args.first().copied().unwrap_or(Value::UNDEFINED));
+                let key = self.key_of(args.first().copied().unwrap_or(Value::UNDEFINED));
                 return Ok(Some(Value::bool(self.own_is_enumerable(recv, &key))));
             }
             "isPrototypeOf" => {
@@ -7550,7 +7751,7 @@ impl<'p> Vm<'p> {
         let idx = obj.heap_index();
         match self.heap.get(idx) {
             HeapObj::Object(map) => {
-                let k = self.display(key);
+                let k = self.key_of(key);
                 if map.get(&k).is_some() {
                     return true;
                 }
@@ -7587,7 +7788,7 @@ impl<'p> Vm<'p> {
             // Static members (data + `static get`/`set` accessors) are own
             // properties of the class value and are inherited up the chain.
             HeapObj::Class(_) => {
-                let k = self.display(key);
+                let k = self.key_of(key);
                 let mut cur = Some(idx);
                 while let Some(cidx) = cur {
                     match self.heap.get(cidx) {
@@ -7683,6 +7884,38 @@ impl<'p> Vm<'p> {
             self.proto_of.insert(obj, Value::heap(p));
         }
         Value::heap(obj)
+    }
+
+    /// Allocate a fresh unique `Symbol` with description `desc` (a string Value or
+    /// UNDEFINED) and a unique internal prop_key (`@@sym:N`). Recorded in
+    /// `symbol_keys` so the symbol can be reflected from an own property key.
+    fn make_symbol(&mut self, desc: Value) -> Value {
+        self.symbol_counter += 1;
+        let prop_key = format!("@@sym:{}", self.symbol_counter);
+        let v = Value::heap(self.heap.alloc(HeapObj::Symbol { desc, prop_key: prop_key.clone() }));
+        self.symbol_keys.insert(prop_key, v);
+        v
+    }
+
+    /// Allocate a symbol with a FIXED prop_key (well-known `@@iterator` etc., or a
+    /// `Symbol.for` registry key) — so distinct call sites share the same key.
+    fn make_named_symbol(&mut self, desc: Value, prop_key: &str) -> Value {
+        let v = Value::heap(
+            self.heap.alloc(HeapObj::Symbol { desc, prop_key: prop_key.to_string() }),
+        );
+        self.symbol_keys.insert(prop_key.to_string(), v);
+        v
+    }
+
+    /// Coerce a Value used as a PROPERTY KEY to its string form: a Symbol → its
+    /// internal `prop_key` (`@@iterator` / `@@sym:N`), anything else → `display`.
+    fn key_of(&self, key: Value) -> String {
+        if key.is_heap() {
+            if let HeapObj::Symbol { prop_key, .. } = self.heap.get(key.heap_index()) {
+                return prop_key.clone();
+            }
+        }
+        self.display(key)
     }
 
     /// `new <class>(args)`: build a plain object, install the class's methods as
@@ -9461,6 +9694,12 @@ impl<'p> Vm<'p> {
         if !v.is_heap() || self.heap.is_str_like(v.heap_index()) {
             return Ok(self.display(v));
         }
+        // ToString of a Symbol is a TypeError (use `.toString()` / `String(sym)`
+        // explicitly instead — but even `String(sym)` routes through the dedicated
+        // path, not this coercion).
+        if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
+            return Err(Thrown("TypeError: Cannot convert a Symbol value to a string".into()));
+        }
         for name in ["toString", "valueOf"] {
             let f = self.get_prop(v, name)?;
             if f.is_heap() && self.heap.as_callable(f.heap_index()).is_some() {
@@ -9593,6 +9832,13 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn add_values(&mut self, va: Value, vb: Value) -> Result<Value, Thrown> {
         let (va, vb) = (self.unwrap_boxed(va), self.unwrap_boxed(vb));
+        // A Symbol operand can't be added: ToString (string side) and ToNumber
+        // (numeric side) both throw for a Symbol.
+        for v in [va, vb] {
+            if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
+                return Err(Thrown("TypeError: Cannot convert a Symbol value to a string".into()));
+            }
+        }
         // Fast path: int + int with overflow check.
         if va.is_int() && vb.is_int() {
             return Ok(match va.as_int().checked_add(vb.as_int()) {
@@ -9787,6 +10033,10 @@ impl<'p> Vm<'p> {
         if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
             return self.to_number(*value);
         }
+        // ToNumber of a Symbol is a TypeError.
+        if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
+            return Err(Thrown("TypeError: Cannot convert a Symbol value to a number".into()));
+        }
         if let Some(s) = self.heap.str_cow(v.heap_index()) {
             let t = s.trim();
             if t.is_empty() {
@@ -9845,6 +10095,12 @@ impl<'p> Vm<'p> {
                 HeapObj::Iterator { .. } => "[object Array Iterator]".into(),
                 // A boxed primitive stringifies as its wrapped value (ToString).
                 HeapObj::Boxed { value, .. } => self.display(*value),
+                // ToString of a Symbol actually throws (see `to_js_string`); this
+                // infallible debug form is "Symbol(desc)".
+                HeapObj::Symbol { desc, .. } => {
+                    let d = if *desc == Value::UNDEFINED { String::new() } else { self.display(*desc) };
+                    format!("Symbol({d})")
+                }
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -9974,6 +10230,10 @@ impl<'p> Vm<'p> {
                     1 => format!("[Number: {inner}]"),
                     _ => format!("[Boolean: {inner}]"),
                 }
+            }
+            HeapObj::Symbol { desc, .. } => {
+                let d = if *desc == Value::UNDEFINED { String::new() } else { self.display(*desc) };
+                format!("Symbol({d})")
             }
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
@@ -10461,6 +10721,15 @@ fn norm_index(i: i32, len: i32) -> i32 {
 /// access reads them directly.
 fn is_private_key(k: &str) -> bool {
     k.starts_with('#')
+}
+
+#[inline]
+/// A key hidden from STRING enumeration (for-in, Object.keys/values/entries,
+/// getOwnPropertyNames, JSON): a private name (`#name`) or a symbol's internal
+/// key (`@@iterator`, `@@sym:N`). Symbol keys are still reachable by
+/// getOwnPropertyDescriptor and surfaced by getOwnPropertySymbols.
+fn is_hidden_key(k: &str) -> bool {
+    k.starts_with('#') || k.starts_with("@@")
 }
 
 fn len_value(n: usize) -> Value {
