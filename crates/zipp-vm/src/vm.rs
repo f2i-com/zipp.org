@@ -399,6 +399,12 @@ pub struct Vm<'p> {
     /// `String.prototype` — primitive string values delegate here for method
     /// access (`"x".charAt`, `"x".slice`, …, as values), 0 until `setup_globals`.
     str_proto: u32,
+    /// `Map`/`Set`/`Date`/`Promise`.prototype — instances delegate here for
+    /// method access as VALUES (`new Map().set`, `d.getHours`). 0 until set up.
+    map_proto: u32,
+    set_proto: u32,
+    date_proto: u32,
+    promise_proto: u32,
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
@@ -479,6 +485,10 @@ impl<'p> Vm<'p> {
             fn_proto: 0,
             arr_proto: 0,
             str_proto: 0,
+            map_proto: 0,
+            set_proto: 0,
+            date_proto: 0,
+            promise_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -4463,6 +4473,12 @@ impl<'p> Vm<'p> {
         let bool_proto = build(self, &bool_methods, None);
         let date_proto = build(self, &date_methods, None);
         let promise_proto = build(self, &promise_methods, None);
+        // Store the proto indices so Map/Set/Date/Promise instances can delegate
+        // method-as-value access to them (get_prop), mirroring arr_proto/str_proto.
+        self.set_proto = set_proto;
+        self.map_proto = map_proto;
+        self.date_proto = date_proto;
+        self.promise_proto = promise_proto;
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -5733,6 +5749,12 @@ impl<'p> Vm<'p> {
             // `map.size` / `set.size` — an accessor property, not a method.
             HeapObj::Map { keys, .. } if key == "size" => Ok(len_value(keys.len())),
             HeapObj::Set(items) if key == "size" => Ok(len_value(items.len())),
+            // A method as a VALUE on a Map/Set/Date/Promise instance
+            // (`new Map().set`, `d.getHours`) → the corresponding prototype.
+            HeapObj::Map { .. } => Ok(self.proto_member(self.map_proto, key)),
+            HeapObj::Set(_) => Ok(self.proto_member(self.set_proto, key)),
+            HeapObj::Date(_) => Ok(self.proto_member(self.date_proto, key)),
+            HeapObj::Promise { .. } => Ok(self.proto_member(self.promise_proto, key)),
             // Functions / natives / bound functions: own props set on them
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
             _ if matches!(
