@@ -5158,6 +5158,33 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // Wire each built-in prototype's `constructor` back to its constructor
+        // (`Array.prototype.constructor === Array`, `p.constructor === Promise`,
+        // `(5).constructor === Number`, …) — a fundamental invariant assertions
+        // rely on. Writable, non-enumerable, configurable (the spec descriptor).
+        for (proto, ctor) in [
+            (self.obj_proto, object_ctor),
+            (self.arr_proto, array_ctor),
+            (self.fn_proto, function_ctor),
+            (self.str_proto, string_ctor),
+            (self.num_proto, number_ctor),
+            (self.bool_proto, boolean_ctor),
+            (self.set_proto, set_ctor),
+            (self.map_proto, map_ctor),
+            (self.date_proto, date_ctor),
+            (self.promise_proto, promise_ctor),
+            (self.weakmap_proto, weakmap_ctor),
+            (self.weakset_proto, weakset_ctor),
+            (self.weakref_proto, weakref_ctor),
+            (self.finreg_proto, finreg_ctor),
+        ] {
+            if proto != 0 {
+                let cv = Value::heap(ctor);
+                if let HeapObj::Object(m) = self.heap.get_mut(proto) {
+                    m.define("constructor", cv, method_attr);
+                }
+            }
+        }
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
         let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
