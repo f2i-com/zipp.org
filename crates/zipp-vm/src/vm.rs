@@ -856,6 +856,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    // Identical to `Add` — a JIT routing hint only (see bytecode).
+                    Instr::StrConcat { dst, a, b } => {
+                        let r = self.add(base, a, b)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::Sub { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
@@ -1580,6 +1586,7 @@ impl<'p> Vm<'p> {
                                         set_index: jit_set_index as usize,
                                         array_push: jit_array_push as usize,
                                         char_code_at: jit_char_code_at as usize,
+                                        concat: jit_concat as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
@@ -5645,6 +5652,13 @@ impl<'p> Vm<'p> {
     fn add(&mut self, base: usize, a: u16, b: u16) -> Result<Value, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
+        self.add_values(va, vb)
+    }
+
+    /// The `+` operator on two already-fetched Values (shared by the interpreter's
+    /// `Add`/`StrConcat` and the JIT's `jit_concat` helper).
+    #[inline]
+    pub(crate) fn add_values(&mut self, va: Value, vb: Value) -> Result<Value, Thrown> {
         // Fast path: int + int with overflow check.
         if va.is_int() && vb.is_int() {
             return Ok(match va.as_int().checked_add(vb.as_int()) {
@@ -6235,6 +6249,32 @@ pub(crate) extern "win64" fn jit_char_code_at(
             }
         }
         _ => crate::codegen::SELF_CALL_DEOPT, // rope/non-string → interpreter
+    }
+}
+
+/// `dst = a + b` for the OSR region's `StrConcat` op: the `+` operator (rope
+/// concat or numeric add) on two boxed Values, returning the result bits. A
+/// throwing coercion (only possible for exotic operands a `StrConcat` hint
+/// shouldn't target) returns `SELF_CALL_DEOPT` so the region bails and the
+/// interpreter redoes it (raising the throw properly).
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_concat(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+) -> u64 {
+    let a = Value::from_bits(a_bits);
+    let b = Value::from_bits(b_bits);
+    // SAFETY: exclusive view to allocate the rope node; the running region holds
+    // no conflicting borrow (it touches only the reg file / globals base, and the
+    // heap grows in a separate field).
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    match vm.add_values(a, b) {
+        Ok(v) => v.bits(),
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
     }
 }
 

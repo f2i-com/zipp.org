@@ -52,9 +52,94 @@ struct EnclosingFn {
 }
 
 /// Compile a parsed program into bytecode.
+/// Is constant Value `v` a (pending) string literal? String constants are encoded
+/// as `Value::heap(STRING_CONST_BIT | si)` (see `add_string_const`).
+fn is_string_const(v: Value) -> bool {
+    v.is_heap() && (v.heap_index() & STRING_CONST_BIT) != 0
+}
+
+/// Does global slot `g`'s last write BEFORE `before` initialise it to a string
+/// literal? Recognises the `s = "…"` shape the compiler emits as an adjacent
+/// `LoadConst{dst:r}; StoreGlobal{idx:g, src:r}`.
+fn global_inits_string(code: &[Instr], constants: &[Value], g: u32, before: usize) -> bool {
+    let mut store_ip = None;
+    for (ip, instr) in code.iter().enumerate().take(before) {
+        if let Instr::StoreGlobal { idx, .. } = *instr {
+            if idx == g {
+                store_ip = Some(ip);
+            }
+        }
+    }
+    let sp = match store_ip {
+        Some(s) if s >= 1 => s,
+        _ => return false,
+    };
+    let src = match code[sp] {
+        Instr::StoreGlobal { src, .. } => src,
+        _ => return false,
+    };
+    match code[sp - 1] {
+        Instr::LoadConst { dst, idx } if dst == src => {
+            constants.get(idx as usize).copied().map(is_string_const).unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Rewrite `Add` → `StrConcat` (a JIT routing hint, semantically identical) for a
+/// string-accumulator loop: a back-edge loop containing `g = g + b` (a global `g`
+/// loaded, added to, and stored back) where `g` is initialised to a string
+/// literal before the loop. This lets the hot `s += …` loop JIT its control flow
+/// in the helper-call OSR region instead of running fully interpreted. Restricting
+/// to a string init keeps NUMERIC accumulators (`sum += x`) on the faster integer
+/// region. Safe regardless of accuracy: `StrConcat` ≡ `Add` at runtime.
+fn rewrite_string_accumulators(f: &mut FuncProto) {
+    let n = f.code.len();
+    let mut rewrites: Vec<usize> = Vec::new();
+    for j in 0..n {
+        let start = match f.code[j] {
+            Instr::Jump { target } if (target as usize) < j => target as usize,
+            _ => continue,
+        };
+        for k in start..=j {
+            let (dst, a) = match f.code[k] {
+                Instr::Add { dst, a, .. } => (dst, a),
+                _ => continue,
+            };
+            // result `dst` stored back to some global `g` in the body
+            let g = (start..=j).find_map(|m| match f.code[m] {
+                Instr::StoreGlobal { idx, src } if src == dst => Some(idx),
+                _ => None,
+            });
+            let g = match g {
+                Some(g) => g,
+                None => continue,
+            };
+            // operand `a` loaded from that same global `g` in the body
+            let a_from_g = (start..=j).any(|m| {
+                matches!(f.code[m], Instr::LoadGlobal { dst: ld, idx } if ld == a && idx == g)
+            });
+            if !a_from_g {
+                continue;
+            }
+            if global_inits_string(&f.code, &f.constants, g, start) {
+                rewrites.push(k);
+            }
+        }
+    }
+    for k in rewrites {
+        if let Instr::Add { dst, a, b } = f.code[k] {
+            f.code[k] = Instr::StrConcat { dst, a, b };
+        }
+    }
+}
+
 pub fn compile_program(prog: &ox::Program) -> R<Program> {
     let mut c = Compiler::new();
     c.compile(prog)?;
+    for f in &mut c.functions {
+        rewrite_string_accumulators(f);
+    }
     Ok(Program {
         functions: c.functions,
         global_count: c.globals.len() as u32,

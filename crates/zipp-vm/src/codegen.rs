@@ -99,6 +99,8 @@ pub struct HeapHelperAddrs {
     pub array_push: usize,
     /// Helper for `str.charCodeAt(i)` — returns the char code / NaN, or deopt.
     pub char_code_at: usize,
+    /// Helper for `a + b` (`StrConcat`) — returns the result bits, or deopt.
+    pub concat: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -417,6 +419,7 @@ impl Jit {
             set_index: heap_helpers.set_index,
             array_push: heap_helpers.array_push,
             char_code_at: heap_helpers.char_code_at,
+            concat: heap_helpers.concat,
             ic_base_idx,
         };
         match compile_region(proto, start, end, globals_base_helper, helpers) {
@@ -653,6 +656,7 @@ fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::Ne { dst, .. }
         | Instr::LoadGlobal { dst, .. }
         | Instr::GetProp { dst, .. }
+        | Instr::StrConcat { dst, .. }
         | Instr::Call { dst, .. } => Some(dst),
         _ => None,
     }
@@ -1838,6 +1842,10 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             // MEMORY path via win64 helpers (the int/regalloc paths decline).
             | Instr::GetIndex { .. }
             | Instr::SetIndex { .. }
+            // String concat (`s += …`) — handled by the MEMORY path via the
+            // `jit_concat` win64 helper (the numeric int/regalloc paths don't
+            // list it, so they decline and the region takes the mem path).
+            | Instr::StrConcat { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
             // A whitelist of cheap, fixed-arity builtin method calls — handled by
@@ -1864,6 +1872,16 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             _ => return false,
         }
     }
+    // `StrConcat`'s helper allocates (growing the heap's parallel version array),
+    // which would invalidate the pinned version-array pointer (`r13`) that a
+    // `GetProp`/`SetProp` inline cache relies on. Forbid the two in one region.
+    let has_concat = code[s..=e].iter().any(|i| matches!(i, Instr::StrConcat { .. }));
+    let has_prop = code[s..=e]
+        .iter()
+        .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
+    if has_concat && has_prop {
+        return false;
+    }
     true
 }
 
@@ -1887,6 +1905,8 @@ struct HeapHelpers {
     array_push: usize,
     /// Helper for `str.charCodeAt(i)`.
     char_code_at: usize,
+    /// Helper for `a + b` (`StrConcat`).
+    concat: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -2418,6 +2438,7 @@ fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::Mul { a, b, .. }
         | Instr::Div { a, b, .. }
         | Instr::Mod { a, b, .. }
+        | Instr::StrConcat { a, b, .. }
         | Instr::Lt { a, b, .. }
         | Instr::Le { a, b, .. }
         | Instr::Gt { a, b, .. }
@@ -3428,6 +3449,48 @@ fn compile_region_mem(
             Instr::Sub { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Sub),
             Instr::Mul { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Mul),
             Instr::Div { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div),
+            Instr::Mod { dst, a, b } => {
+                // `a % b` for INTEGER-valued operands via i64 idiv (exact, and the
+                // remainder takes the dividend's sign — JS `%` for integers).
+                // Non-integer operands or `% 0` bail to the interpreter (true fmod
+                // / NaN). xmm2/rax/rcx/rdx are scratch in this memory path.
+                load_num_xmm(&mut ops, a, 0, bail); // xmm0 = a
+                load_num_xmm(&mut ops, b, 1, bail); // xmm1 = b
+                let as_dbl = ops.new_dynamic_label();
+                let mod_done = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; cvttsd2si rax, xmm0            // a → i64 (trunc toward 0)
+                    ; cvttsd2si rcx, xmm1            // b → i64
+                    ; test rcx, rcx
+                    ; jz => bail                     // % 0 → NaN (interp)
+                    ; cvtsi2sd xmm2, rax
+                    ; ucomisd xmm2, xmm0
+                    ; jne => bail                    // a not integer-valued → fmod
+                    ; cvtsi2sd xmm2, rcx
+                    ; ucomisd xmm2, xmm1
+                    ; jne => bail                    // b not integer-valued → fmod
+                    ; cqo                            // sign-extend rax into rdx:rax
+                    ; idiv rcx                       // rdx = a % b (i64 remainder)
+                    // Box the remainder as an Int Value when it fits i32 (it does
+                    // for any |b| ≤ 2^31). Keeping it Int — not a double — means a
+                    // downstream `s += (i%k)` concat hits the interned-digit fast
+                    // path instead of allocating a string per element.
+                    ; movsxd r8, edx
+                    ; cmp r8, rdx
+                    ; jne => as_dbl
+                    ; mov r8, QWORD INT_TAG as i64
+                    ; mov eax, edx                   // zero-extend i32 payload
+                    ; or rax, r8
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => mod_done
+                    ; => as_dbl
+                    ; cvtsi2sd xmm0, rdx             // large remainder → double Value
+                    ; movq rax, xmm0
+                    ; mov [rbx + dreg(dst)], rax
+                    ; => mod_done
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::AddInt { dst, a, imm } => {
                 // a + imm in f64: load a, materialise imm as a double, addsd.
                 load_num_xmm(&mut ops, a, 0, bail);
@@ -3626,6 +3689,26 @@ fn compile_region_mem(
                     ; mov rdx, [rbx + dreg(obj)]          // receiver bits
                     ; mov r8, [rbx + dreg(arg_base)]      // arg0 bits
                     ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::StrConcat { dst, a, b } => {
+                // `dst = a + b` via the win64 `jit_concat` helper (rope concat or
+                // numeric add). Same ABI as the method helpers: vm + two operand
+                // bits in, result bits out, deopt sentinel → bail. The helper
+                // allocates, so the version-array pointer (r13) may move — safe
+                // here because region_can_compile forbids GetProp/SetProp (the
+                // only r13 users) alongside StrConcat.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]            // a bits
+                    ; mov r8, [rbx + dreg(b)]             // b bits
+                    ; mov rax, QWORD heap.concat as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10

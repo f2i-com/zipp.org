@@ -65,6 +65,15 @@ pub enum Instr {
     /// `dst = a + <int immediate>` — the canonical `i + 1`, `n - 1` shape.
     AddInt { dst: Reg, a: Reg, imm: i32 },
 
+    /// `dst = a + b` — SEMANTICALLY IDENTICAL to `Add` (same operator, same
+    /// coercion). A pure JIT routing hint emitted by a compile pass for the
+    /// `s = s + x` string-accumulator shape: it routes the op to the helper-call
+    /// (memory) OSR region instead of the numeric region, so a hot `s += …` loop
+    /// JITs its control flow natively and calls a concat helper per step rather
+    /// than running fully interpreted. Because the semantics equal `Add`, a
+    /// mis-applied hint can only change performance, never results.
+    StrConcat { dst: Reg, a: Reg, b: Reg },
+
     // ── comparisons → boolean ──
     Lt { dst: Reg, a: Reg, b: Reg },
     Le { dst: Reg, a: Reg, b: Reg },
