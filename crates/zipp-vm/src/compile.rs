@@ -3250,6 +3250,11 @@ impl<'a> FnCompiler<'a> {
             ) {
                 continue;
             }
+            // A parameter-level default (`function f([a,b] = [1,2])`) applies to the
+            // incoming argument register when it's undefined, BEFORE destructuring.
+            if let Some(default) = &item.initializer {
+                self.apply_default_in_place((i + 1) as Reg, default)?;
+            }
             self.declare_pattern(&item.pattern)?;
             let save = self.next_reg;
             self.extract_pattern(&item.pattern, (i + 1) as Reg)?;
