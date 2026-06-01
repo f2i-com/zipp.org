@@ -297,6 +297,7 @@ pub fn compile_program(prog: &ox::Program) -> R<Program> {
         functions: c.functions,
         global_count: c.globals.len() as u32,
         classes: c.classes,
+        global_names: c.globals,
     })
 }
 

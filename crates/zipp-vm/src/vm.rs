@@ -93,6 +93,40 @@ enum Microtask {
     AsyncResume { activation: u32, input: Resume },
 }
 
+/// Native (built-in) function ids — the discriminant carried by `HeapObj::Native`.
+/// Each maps to an arm of `Vm::call_native`.
+mod native {
+    pub const OBJ_DEFINE_PROPERTY: u16 = 1;
+    pub const OBJ_DEFINE_PROPERTIES: u16 = 2;
+    pub const OBJ_GET_OWN_DESC: u16 = 3;
+    pub const OBJ_GET_OWN_NAMES: u16 = 4;
+    pub const OBJ_GET_PROTO: u16 = 5;
+    pub const OBJ_KEYS: u16 = 6;
+    pub const OBJ_VALUES: u16 = 7;
+    pub const OBJ_ENTRIES: u16 = 8;
+    pub const OBJ_ASSIGN: u16 = 9;
+    pub const OBJ_CREATE: u16 = 10;
+    pub const PROTO_HAS_OWN: u16 = 11;
+    pub const PROTO_PROP_ENUM: u16 = 12;
+    pub const PROTO_IS_PROTO_OF: u16 = 13;
+    pub const PROTO_VALUE_OF: u16 = 14;
+    pub const PROTO_TO_STRING: u16 = 15;
+    pub const FN_CALL: u16 = 16;
+    pub const FN_APPLY: u16 = 17;
+    pub const FN_BIND: u16 = 18;
+    pub const ARR_IS_ARRAY: u16 = 19;
+    pub const ARR_FROM: u16 = 20;
+    pub const ARR_OF: u16 = 21;
+}
+
+/// What `object_enum_own` collects.
+#[derive(Clone, Copy)]
+enum EnumWhat {
+    Keys,
+    Values,
+    Entries,
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
@@ -143,6 +177,13 @@ pub struct Vm<'p> {
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
     proto_of: std::collections::HashMap<u32, Value>,
+    /// Heap indices of the built-in prototype objects (`Object.prototype`,
+    /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
+    /// the [[Prototype]] for plain objects / functions / arrays so their methods
+    /// resolve as values and `getPrototypeOf` returns them. 0 until set up.
+    obj_proto: u32,
+    fn_proto: u32,
+    arr_proto: u32,
     /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
     /// program's random sequence is reproducible run-to-run (and JIT-on == off).
     rng_state: u64,
@@ -214,6 +255,9 @@ impl<'p> Vm<'p> {
             template_raws: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),
             proto_of: std::collections::HashMap::new(),
+            obj_proto: 0,
+            fn_proto: 0,
+            arr_proto: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
@@ -509,6 +553,10 @@ impl<'p> Vm<'p> {
 
     /// Run the top-level function (id 0) to completion.
     pub fn run(&mut self) -> Result<Value, Thrown> {
+        // Inject the built-in global objects (Object/Array/Function + their
+        // prototypes) into their reserved slots BEFORE hoisting, so a user
+        // declaration of the same name shadows the builtin.
+        self.setup_globals();
         // Materialise function objects for every top-level function into the
         // globals that the compiler reserved for them. The compiler records,
         // per function, the global slot its name binds to (or u32::MAX if it is
@@ -554,6 +602,10 @@ impl<'p> Vm<'p> {
                 let mut all = bargs.clone();
                 all.extend_from_slice(args);
                 return self.call_value(t, th, &all);
+            }
+            if let HeapObj::Native(id) = self.heap.get(callee.heap_index()) {
+                let id = *id;
+                return self.call_native(id, this, args);
             }
         }
         // A native resolve/reject function settles its bound promise.
@@ -1952,9 +2004,12 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
-                            // A bound function: run it (via call_value, which fixes
-                            // `this` and prepends the bound args) and store the result.
-                            if matches!(self.heap.get(callee_v.heap_index()), HeapObj::Bound { .. }) {
+                            // A bound or native function: run via call_value (fixes
+                            // `this`/prepends bound args, or dispatches the builtin).
+                            if matches!(
+                                self.heap.get(callee_v.heap_index()),
+                                HeapObj::Bound { .. } | HeapObj::Native(_)
+                            ) {
                                 let argv: Vec<Value> =
                                     (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                                 let r = self.call_value(callee_v, Value::UNDEFINED, &argv)?;
@@ -2032,9 +2087,24 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        // Otherwise the property must resolve to a user function
-                        // (a method on an object); call it with `this = recv`.
+                        // Otherwise the property must resolve to a function; call it
+                        // with `this = recv`.
                         let prop = self.get_prop(recv, key)?;
+                        // A native or bound method value (e.g. inherited from a
+                        // prototype) is invoked via call_value with this = recv.
+                        if prop.is_heap()
+                            && matches!(
+                                self.heap.get(prop.heap_index()),
+                                HeapObj::Native(_) | HeapObj::Bound { .. }
+                            )
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let r = self.call_value(prop, recv, &argv)?;
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
                         let (fid, closure) = self.resolve_callable(prop)?;
                         // A generator method returns a Generator object, unrun.
                         if self.program.functions[fid as usize].is_generator {
@@ -3588,6 +3658,200 @@ impl<'p> Vm<'p> {
         Some(Value::heap(p))
     }
 
+    /// Build the built-in global object graph (Object/Array/Function + their
+    /// prototypes, with methods as native function VALUES) and inject it into the
+    /// global slots the compiler reserved for those free identifiers. Makes
+    /// `Array.isArray`, `Object.defineProperty`, `Function.prototype.call`, etc.
+    /// usable as first-class values (what the test262 harness binds).
+    fn setup_globals(&mut self) {
+        use native::*;
+        // A built-in method property: a native function, non-enumerable but
+        // writable + configurable (matching built-in method descriptors).
+        let method_attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let proto_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let mut build = |vm: &mut Self, methods: &[(&str, u16)], protolink: Option<u32>| -> u32 {
+            let mut m = ObjMap::new();
+            for &(name, id) in methods {
+                let nv = Value::heap(vm.heap.alloc(HeapObj::Native(id)));
+                m.define(name, nv, method_attr);
+            }
+            if let Some(p) = protolink {
+                m.define("prototype", Value::heap(p), proto_attr);
+            }
+            vm.heap.alloc(HeapObj::Object(m))
+        };
+        // Prototypes.
+        self.obj_proto = build(
+            self,
+            &[
+                ("hasOwnProperty", PROTO_HAS_OWN),
+                ("propertyIsEnumerable", PROTO_PROP_ENUM),
+                ("isPrototypeOf", PROTO_IS_PROTO_OF),
+                ("valueOf", PROTO_VALUE_OF),
+                ("toString", PROTO_TO_STRING),
+            ],
+            None,
+        );
+        self.fn_proto = build(
+            self,
+            &[("call", FN_CALL), ("apply", FN_APPLY), ("bind", FN_BIND)],
+            None,
+        );
+        self.arr_proto = build(self, &[], None);
+        // Constructors.
+        let obj_proto = self.obj_proto;
+        let arr_proto = self.arr_proto;
+        let fn_proto = self.fn_proto;
+        let object_ctor = build(
+            self,
+            &[
+                ("defineProperty", OBJ_DEFINE_PROPERTY),
+                ("defineProperties", OBJ_DEFINE_PROPERTIES),
+                ("getOwnPropertyDescriptor", OBJ_GET_OWN_DESC),
+                ("getOwnPropertyNames", OBJ_GET_OWN_NAMES),
+                ("getPrototypeOf", OBJ_GET_PROTO),
+                ("keys", OBJ_KEYS),
+                ("values", OBJ_VALUES),
+                ("entries", OBJ_ENTRIES),
+                ("assign", OBJ_ASSIGN),
+                ("create", OBJ_CREATE),
+            ],
+            Some(obj_proto),
+        );
+        let array_ctor = build(self, &[("isArray", ARR_IS_ARRAY), ("from", ARR_FROM), ("of", ARR_OF)], Some(arr_proto));
+        let function_ctor = build(self, &[], Some(fn_proto));
+        // Inject into the reserved global slots (collect first to end the program
+        // borrow before mutating `self.globals`).
+        let mut sets: Vec<(usize, u32)> = Vec::new();
+        for (slot, name) in self.program.global_names.iter().enumerate() {
+            let v = match name.as_str() {
+                "Object" => Some(object_ctor),
+                "Array" => Some(array_ctor),
+                "Function" => Some(function_ctor),
+                _ => None,
+            };
+            if let Some(v) = v {
+                sets.push((slot, v));
+            }
+        }
+        for (slot, v) in sets {
+            if slot < self.globals.len() {
+                self.globals[slot] = Value::heap(v);
+            }
+        }
+    }
+
+    /// Invoke a native (built-in) function by id with `this` and `args`. Backs
+    /// first-class builtin values (`Object.defineProperty`, `Array.isArray`,
+    /// `Object.prototype.hasOwnProperty`, `Function.prototype.call`, …).
+    fn call_native(&mut self, id: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        use native::*;
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        Ok(match id {
+            OBJ_DEFINE_PROPERTY => {
+                let key = self.display(a1);
+                self.object_define_property(a0, &key, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+                a0
+            }
+            OBJ_DEFINE_PROPERTIES => {
+                self.object_define_properties(a0, a1)?;
+                a0
+            }
+            OBJ_GET_OWN_DESC => {
+                let key = self.display(a1);
+                self.object_get_own_property_descriptor(a0, &key)
+            }
+            OBJ_GET_OWN_NAMES => self.object_own_property_names(a0),
+            OBJ_GET_PROTO => self.object_get_prototype_of(a0),
+            OBJ_KEYS => self.object_enum_own(a0, EnumWhat::Keys),
+            OBJ_VALUES => self.object_enum_own(a0, EnumWhat::Values),
+            OBJ_ENTRIES => self.object_enum_own(a0, EnumWhat::Entries),
+            OBJ_ASSIGN => self.object_assign(args)?,
+            OBJ_CREATE => {
+                let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                if a0 != Value::UNDEFINED {
+                    self.proto_of.insert(o.heap_index(), a0);
+                }
+                if a1 != Value::UNDEFINED {
+                    self.object_define_properties(o, a1)?;
+                }
+                o
+            }
+            PROTO_HAS_OWN => Value::bool(self.has_own_property(this, &self.display(a0))),
+            PROTO_PROP_ENUM => Value::bool(self.own_is_enumerable(this, &self.display(a0))),
+            PROTO_IS_PROTO_OF => Value::bool(self.is_prototype_of(this, a0)),
+            PROTO_VALUE_OF => this,
+            PROTO_TO_STRING => self.alloc_str("[object Object]".to_string()),
+            FN_CALL => {
+                let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
+                self.call_value(this, a0, rest)?
+            }
+            FN_APPLY => {
+                let callargs = if a1.is_heap() { self.iterate_to_vec(a1)? } else { Vec::new() };
+                self.call_value(this, a0, &callargs)?
+            }
+            FN_BIND => {
+                let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+                Value::heap(self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound }))
+            }
+            ARR_IS_ARRAY => {
+                Value::bool(a0.is_heap() && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_)))
+            }
+            ARR_FROM => self.array_from(a0, a1)?,
+            ARR_OF => Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec()))),
+            _ => Value::UNDEFINED,
+        })
+    }
+
+    /// Own ENUMERABLE keys / values / [k,v] entries of `obj` as an array (the
+    /// shared core of `Object.keys`/`values`/`entries`).
+    fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Value {
+        let pairs: Vec<(String, Value)> = if obj.is_heap() {
+            match self.heap.get(obj.heap_index()) {
+                HeapObj::Object(m) => m
+                    .keys
+                    .iter()
+                    .cloned()
+                    .zip(m.vals.iter().copied())
+                    .zip(m.attrs.iter())
+                    .filter(|(_, a)| a.enumerable)
+                    .map(|(kv, _)| kv)
+                    .collect(),
+                HeapObj::Array(items) => {
+                    items.iter().enumerate().map(|(i, v)| (i.to_string(), *v)).collect()
+                }
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let out: Vec<Value> = pairs
+            .into_iter()
+            .map(|(k, v)| match what {
+                EnumWhat::Keys => self.alloc_str(k),
+                EnumWhat::Values => v,
+                EnumWhat::Entries => {
+                    let ks = self.alloc_str(k);
+                    Value::heap(self.heap.alloc(HeapObj::Array(vec![ks, v])))
+                }
+            })
+            .collect();
+        Value::heap(self.heap.alloc(HeapObj::Array(out)))
+    }
+
     /// Build a data property descriptor object `{value, writable, enumerable,
     /// configurable}` (for `Object.getOwnPropertyDescriptor`).
     fn make_data_descriptor(&mut self, value: Value, w: bool, e: bool, c: bool) -> Value {
@@ -3677,16 +3941,35 @@ impl<'p> Vm<'p> {
         if let Some(&p) = self.proto_of.get(&idx) {
             return p;
         }
-        let class = match self.heap.get(idx) {
-            HeapObj::Object(m) => m.class,
-            _ => None,
-        };
-        if let Some(cidx) = class {
-            if let Some(p) = self.prototype_of(Value::heap(cidx)) {
-                return p;
-            }
+        if idx == self.obj_proto {
+            return Value::NULL; // Object.prototype's [[Prototype]] is null
         }
-        Value::NULL
+        // kind: 0=plain/instance object, 1=callable, 2=array, 3=other.
+        let (class, kind) = match self.heap.get(idx) {
+            HeapObj::Object(m) => (m.class, 0u8),
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                (None, 1)
+            }
+            HeapObj::Array(_) => (None, 2),
+            _ => (None, 3),
+        };
+        match kind {
+            0 => {
+                if let Some(cidx) = class {
+                    if let Some(p) = self.prototype_of(Value::heap(cidx)) {
+                        return p;
+                    }
+                }
+                if self.obj_proto != 0 {
+                    Value::heap(self.obj_proto)
+                } else {
+                    Value::NULL
+                }
+            }
+            1 if self.fn_proto != 0 => Value::heap(self.fn_proto),
+            2 if self.arr_proto != 0 => Value::heap(self.arr_proto),
+            _ => Value::NULL,
+        }
     }
 
     /// Read a property-descriptor object's fields (present-or-absent) for
@@ -3930,7 +4213,22 @@ impl<'p> Vm<'p> {
                 if let Some(g) = getter {
                     return self.call_value(g, obj, &[]);
                 }
-                Ok(Value::UNDEFINED)
+                // Own + class miss: delegate to the object's prototype
+                // (Object.prototype's hasOwnProperty/toString/… as values), or an
+                // explicit `Object.create` prototype.
+                let proto = self
+                    .proto_of
+                    .get(&obj.heap_index())
+                    .copied()
+                    .filter(|p| p.is_heap())
+                    .or_else(|| {
+                        (self.obj_proto != 0 && obj.heap_index() != self.obj_proto)
+                            .then(|| Value::heap(self.obj_proto))
+                    });
+                match proto {
+                    Some(p) => self.get_prop(p, key),
+                    None => Ok(Value::UNDEFINED),
+                }
             }
             // Static members are own properties of the class value; statics are
             // inherited, so walk the `extends` chain (`C.method`, `Sub.parentStatic`).
@@ -3955,6 +4253,21 @@ impl<'p> Vm<'p> {
             // `map.size` / `set.size` — an accessor property, not a method.
             HeapObj::Map { keys, .. } if key == "size" => Ok(len_value(keys.len())),
             HeapObj::Set(items) if key == "size" => Ok(len_value(items.len())),
+            // Functions / natives / bound functions delegate to Function.prototype
+            // (its own methods `call`/`apply`/`bind`) for value-level access.
+            _ if self.fn_proto != 0
+                && matches!(
+                    self.heap.get(obj.heap_index()),
+                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+                ) =>
+            {
+                if let HeapObj::Object(m) = self.heap.get(self.fn_proto) {
+                    if let Some(v) = m.get(key) {
+                        return Ok(v);
+                    }
+                }
+                Ok(Value::UNDEFINED)
+            }
             _ => Ok(Value::UNDEFINED),
         }
     }
@@ -4907,7 +5220,7 @@ impl<'p> Vm<'p> {
         v.is_heap()
             && matches!(
                 self.heap.get(v.heap_index()),
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
             )
     }
 
@@ -6424,7 +6737,9 @@ impl<'p> Vm<'p> {
                     self.heap.write_str(v.heap_index(), &mut out);
                     out
                 }
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } => "function".into(),
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                    "function".into()
+                }
                 HeapObj::Cell(inner) => self.display(*inner),
                 HeapObj::Array(items) => items
                     .iter()
@@ -6503,6 +6818,7 @@ impl<'p> Vm<'p> {
             HeapObj::Func(id) => self.func_label(*id),
             HeapObj::Closure { func, .. } => self.func_label(*func),
             HeapObj::Bound { .. } => "[Function: bound]".into(),
+            HeapObj::Native(_) => "[Function (native)]".into(),
             HeapObj::Cell(inner) => self.inspect_nested(*inner),
             HeapObj::Array(items) => {
                 if items.is_empty() {

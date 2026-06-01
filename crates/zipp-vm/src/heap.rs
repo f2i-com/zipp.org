@@ -255,6 +255,11 @@ pub enum HeapObj {
     /// A bound function (`fn.bind(thisArg, ...boundArgs)`): calling it invokes
     /// `target` with `this` fixed to `this` and `args` prepended to the call args.
     Bound { target: Value, this: Value, args: Vec<Value> },
+    /// A built-in (native) function value, identified by a small id (see the
+    /// `native` ids in vm.rs). Callable as a first-class value — this is what backs
+    /// `Object.defineProperty`, `Array.isArray`, `Object.prototype.hasOwnProperty`,
+    /// `Function.prototype.call`, etc. when accessed as values (not just called).
+    Native(u16),
     /// A dense array.
     Array(Vec<Value>),
     /// A plain object.

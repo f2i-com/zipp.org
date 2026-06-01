@@ -552,6 +552,9 @@ pub struct Program {
     pub functions: Vec<FuncProto>,
     pub global_count: u32,
     pub classes: Vec<ClassDef>,
+    /// Global slot names, indexed by slot. Lets the VM populate slots for free
+    /// builtin identifiers (`Object`, `Array`, `Function`, …) at startup.
+    pub global_names: Vec<String>,
 }
 
 /// A compiled class: the constructor func id (runs field inits + user ctor body),
