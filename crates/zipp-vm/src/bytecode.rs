@@ -394,9 +394,11 @@ pub struct FuncProto {
 #[derive(Clone, Copy, Debug)]
 pub enum MathFn {
     Abs, Floor, Ceil, Round, Trunc, Sign, Sqrt, Cbrt,
-    Exp, Log, Log2, Log10,
+    Exp, Log, Log2, Log10, Expm1, Log1p,
     Sin, Cos, Tan, Asin, Acos, Atan,
-    Pow, Atan2,
+    Sinh, Cosh, Tanh, Asinh, Acosh, Atanh,
+    Clz32, Fround,
+    Pow, Atan2, Imul,
     Min, Max, Hypot,
 }
 
@@ -408,9 +410,13 @@ impl MathFn {
             "abs" => Abs, "floor" => Floor, "ceil" => Ceil, "round" => Round,
             "trunc" => Trunc, "sign" => Sign, "sqrt" => Sqrt, "cbrt" => Cbrt,
             "exp" => Exp, "log" => Log, "log2" => Log2, "log10" => Log10,
+            "expm1" => Expm1, "log1p" => Log1p,
             "sin" => Sin, "cos" => Cos, "tan" => Tan,
             "asin" => Asin, "acos" => Acos, "atan" => Atan,
-            "pow" => Pow, "atan2" => Atan2,
+            "sinh" => Sinh, "cosh" => Cosh, "tanh" => Tanh,
+            "asinh" => Asinh, "acosh" => Acosh, "atanh" => Atanh,
+            "clz32" => Clz32, "fround" => Fround,
+            "pow" => Pow, "atan2" => Atan2, "imul" => Imul,
             "min" => Min, "max" => Max, "hypot" => Hypot,
             _ => return None,
         })

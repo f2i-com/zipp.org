@@ -5124,6 +5124,8 @@ impl<'p> Vm<'p> {
             }
             M::Pow => arg(0)?.powf(arg(1)?),
             M::Atan2 => arg(0)?.atan2(arg(1)?),
+            // Math.imul(a,b): ToUint32 multiply, result as signed int32.
+            M::Imul => (to_uint32(arg(0)?).wrapping_mul(to_uint32(arg(1)?)) as i32) as f64,
             _ => math_unary(op, arg(0)?),
         })
     }
@@ -8682,10 +8684,21 @@ fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
         M::Asin => x.asin(),
         M::Acos => x.acos(),
         M::Atan => x.atan(),
-        // Pow/Atan2/Min/Max/Hypot aren't unary; degrade gracefully.
+        M::Expm1 => x.exp_m1(),
+        M::Log1p => x.ln_1p(),
+        M::Sinh => x.sinh(),
+        M::Cosh => x.cosh(),
+        M::Tanh => x.tanh(),
+        M::Asinh => x.asinh(),
+        M::Acosh => x.acosh(),
+        M::Atanh => x.atanh(),
+        // Math.clz32: leading zeros of ToUint32(x). Math.fround: round to f32.
+        M::Clz32 => to_uint32(x).leading_zeros() as f64,
+        M::Fround => x as f32 as f64,
+        // Pow/Atan2/Imul/Min/Max/Hypot aren't unary; degrade gracefully.
         M::Min | M::Max => x,
         M::Hypot => x.abs(),
-        M::Pow | M::Atan2 => f64::NAN,
+        M::Pow | M::Atan2 | M::Imul => f64::NAN,
     }
 }
 
