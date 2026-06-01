@@ -140,6 +140,11 @@ pub enum Instr {
     /// the next element to `value_dst` and a bool to `done_dst`. Throws if `iter`
     /// is not iterable.
     IterNext { value_dst: Reg, done_dst: Reg, iter: Reg, idx: Reg },
+    /// `for await` step: writes the next RESULT to `dst` — a Promise (async
+    /// iterator / async generator), or a `{value, done}` object (sync iterable,
+    /// positional via the `idx` cursor). The loop then `await`s `dst`, so a sync
+    /// `{value,done}` passes straight through and an async one suspends.
+    ForAwaitNext { dst: Reg, iter: Reg, idx: Reg },
     /// `super(args…)`: run the lexical superclass's constructor contribution on
     /// the current `this` (reg 0). `home_class_id` is the class the method belongs
     /// to; its runtime `ClassData.parent` is the superclass to invoke (so an

@@ -2267,6 +2267,9 @@ impl<'a> FnCompiler<'a> {
     /// (Generic iterables/iterators are not in the subset; arrays and strings
     /// cover the corpus and common code.)
     fn for_of_statement(&mut self, f: &ox::ForOfStatement) -> R<()> {
+        if f.r#await && !self.in_async {
+            return Err("`for await` is only valid in an async function".into());
+        }
         self.push_scope();
 
         // A `for (let [a,b] of …)` / `for (let {x} of …)` head destructures each
@@ -2290,7 +2293,8 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::Move { dst: iter_reg, src: v });
         }
         // Resolve a custom iterable's `@@iterator` to its iterator object; arrays/
-        // strings/Map/Set/generators pass through and iterate positionally.
+        // strings/Map/Set/generators/async-generators pass through. `for await`
+        // additionally awaits each step's result (see ForAwaitNext below).
         self.emit(Instr::GetIterator { dst: iter_reg, src: iter_reg });
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
@@ -2320,9 +2324,27 @@ impl<'a> FnCompiler<'a> {
         } else {
             var_reg
         };
-        self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter: iter_reg, idx: idx_reg });
-        let jdone = self.here();
-        self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
+        let jdone = if f.r#await {
+            // `r = await <next step>; done = r.done; value = r.value`. ForAwaitNext
+            // yields a Promise (async iterator) or a {value,done} (sync) — awaiting
+            // suspends on the former and passes the latter straight through.
+            let step = self.alloc_reg();
+            self.emit(Instr::ForAwaitNext { dst: step, iter: iter_reg, idx: idx_reg });
+            let r = self.alloc_reg();
+            self.emit(Instr::Await { dst: r, val: step });
+            let done_name = self.string_name("done");
+            self.emit(Instr::GetProp { dst: done, obj: r, name: done_name });
+            let j = self.here();
+            self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
+            let value_name = self.string_name("value");
+            self.emit(Instr::GetProp { dst: elem, obj: r, name: value_name });
+            j
+        } else {
+            self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter: iter_reg, idx: idx_reg });
+            let j = self.here();
+            self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
+            j
+        };
         if let Some(p) = pattern {
             self.extract_pattern(p, elem)?;
         } else if let Some(tgt) = assign_tgt {
