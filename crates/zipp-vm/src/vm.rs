@@ -7770,17 +7770,31 @@ impl<'p> Vm<'p> {
         let n = recv.as_f64();
         match name {
             "toFixed" => {
-                let digits = args.first().map(|a| a.as_f64() as usize).unwrap_or(0).min(100);
-                Ok(Some(self.alloc_str(to_fixed(n, digits))))
+                let d = args.first().map(|a| a.as_f64()).unwrap_or(0.0);
+                if !d.is_finite() || d < 0.0 || d > 100.0 {
+                    return Err(Thrown(
+                        "RangeError: toFixed() digits argument must be between 0 and 100".into(),
+                    ));
+                }
+                Ok(Some(self.alloc_str(to_fixed(n, d as usize))))
             }
             "toString" => {
-                let radix = args.first().map(|a| a.as_f64() as u32).unwrap_or(10);
-                // Base 10 (or a default/out-of-range radix) uses the engine's
-                // canonical rendering; 2..=36 do an integer-radix conversion.
-                if radix == 10 || !(2..=36).contains(&radix) {
+                // An absent/undefined radix defaults to 10; otherwise it must be 2..36.
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if arg == Value::UNDEFINED {
+                    return Ok(Some(self.alloc_str(self.display(recv))));
+                }
+                let rf = arg.as_f64();
+                let r = if rf.is_nan() { 0i64 } else { rf.trunc() as i64 };
+                if !(2..=36).contains(&r) {
+                    return Err(Thrown(
+                        "RangeError: toString() radix must be between 2 and 36".into(),
+                    ));
+                }
+                if r == 10 {
                     Ok(Some(self.alloc_str(self.display(recv))))
                 } else {
-                    Ok(Some(self.alloc_str(num_to_radix(n, radix))))
+                    Ok(Some(self.alloc_str(num_to_radix(n, r as u32))))
                 }
             }
             "valueOf" => Ok(Some(recv)),
@@ -8767,6 +8781,12 @@ impl<'p> Vm<'p> {
                 if n < 0.0 || !n.is_finite() {
                     return Err(Thrown("RangeError: Invalid count value".into()));
                 }
+                // Bound the result (an unbounded build would hang / OOM) — a too-long
+                // string is a RangeError per spec. (Empty string repeats to "" for any
+                // count, so its length is always 0 — no bound needed.)
+                if n * (s.len() as f64) > (1u64 << 28) as f64 {
+                    return Err(Thrown("RangeError: Invalid string length".into()));
+                }
                 Ok(Some(self.alloc_str(s.repeat(n as usize))))
             }
             "split" => {
@@ -8789,6 +8809,9 @@ impl<'p> Vm<'p> {
                 let cur = char_len(&s);
                 let t = arg0.as_f64();
                 let target = if t.is_finite() && t > 0.0 { t as usize } else { 0 };
+                if target as u64 > (1u64 << 28) {
+                    return Err(Thrown("RangeError: Invalid string length".into()));
+                }
                 if cur >= target {
                     return Ok(Some(self.alloc_str(s.clone())));
                 }
