@@ -1892,6 +1892,79 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
     true
 }
 
+/// Detect a loop-invariant `g.length` to hoist out of a memory-path region: a
+/// `GetProp{obj, name:"length"}` whose object is loaded from a global `g` that the
+/// region never mutates (no `StoreGlobal(g)`, and no length-changing op anywhere —
+/// `push`, `SetIndex`, `SetProp`). Then `g.length` is the same every iteration, so
+/// it can be computed ONCE in the prologue rather than re-read (a helper call) per
+/// iteration — the `for (i < s.length)` / `for (i < a.length)` idiom. Returns
+/// `(get_ip, dst_reg, global_slot, name_idx)`, or `None` if no single such GetProp
+/// qualifies (only the unique-GetProp case is hoisted, to keep it simple/safe).
+fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Option<(usize, u16, u32, u32)> {
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    // The region must not change any container's length.
+    for instr in &code[s..=e] {
+        match instr {
+            Instr::SetIndex { .. } | Instr::SetProp { .. } => return None,
+            Instr::CallMethod { name, .. } => {
+                if proto.string_constants.get(*name as usize).map(|s| s.as_str()) == Some("push") {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Exactly one `GetProp(_, "length")` in the region.
+    let mut found: Option<(usize, u16, u16)> = None; // (ip, dst, obj)
+    for ip in s..=e {
+        if let Instr::GetProp { dst, obj, name } = code[ip] {
+            if proto.string_constants.get(name as usize).map(|s| s.as_str()) == Some("length") {
+                if found.is_some() {
+                    return None; // more than one — bail
+                }
+                found = Some((ip, dst, obj));
+            }
+        }
+    }
+    let (get_ip, dst, obj) = found?;
+    // `dst` must be written ONLY by this GetProp in the region.
+    for ip in s..=e {
+        if ip != get_ip && writes_reg(&code[ip]) == Some(dst) {
+            return None;
+        }
+    }
+    // `obj` must be defined in the region only by `LoadGlobal(g)` (same `g`), and
+    // `g` never stored in the region.
+    let mut g: Option<u32> = None;
+    for ip in s..=e {
+        match code[ip] {
+            Instr::LoadGlobal { dst: ld, idx } if ld == obj => {
+                if g.is_some() && g != Some(idx) {
+                    return None; // obj loaded from two different globals
+                }
+                g = Some(idx);
+            }
+            Instr::StoreGlobal { idx, .. } => {
+                if Some(idx) == g {
+                    return None; // g mutated in the loop
+                }
+            }
+            _ => {
+                // `obj` defined by something other than LoadGlobal → not a global.
+                if writes_reg(&code[ip]) == Some(obj) {
+                    return None;
+                }
+            }
+        }
+    }
+    let name_idx = match code[get_ip] {
+        Instr::GetProp { name, .. } => name,
+        _ => return None,
+    };
+    g.map(|g| (get_ip, dst, g, name_idx))
+}
+
 /// Addresses of the win64 heap helpers (vm.rs), the COMPILING function's id, and
 /// the inline-cache base site index — threaded to the memory path so `GetProp`/
 /// `SetProp` emit a call-free monomorphic inline cache (miss → helper).
@@ -3382,6 +3455,9 @@ fn compile_region_mem(
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
     let mut exit_stubs: FxHashMap<u32, dynasmrt::DynamicLabel> = FxHashMap::default();
     let epilogue = ops.new_dynamic_label();
+    // Resume in the interpreter at the loop header if the hoisted `.length`
+    // compute deopts at entry (`g` isn't a string/array).
+    let entry_len_bail = ops.new_dynamic_label();
     let lbl = |ip: u32, in_region: &[dynasmrt::DynamicLabel]| in_region[(ip - start) as usize];
 
     // ── prologue ── save callee-saved, stash inputs, fetch globals base, jump to
@@ -3409,12 +3485,43 @@ fn compile_region_mem(
         ; mov rax, QWORD heap.ic_base as i64
         ; call rax
         ; mov r14, rax                    // pinned inline-cache table base
-        ; jmp => lbl(start, &in_region)
     );
+
+    // ── loop-invariant `g.length` hoist ── compute it ONCE here (reusing the
+    // GetProp miss helper, which returns string/array `.length` directly) instead
+    // of a helper call every iteration. The body skips the hoisted GetProp, so its
+    // dst keeps this value. If `g` isn't a string/array at entry the helper deopts
+    // → resume the loop in the interpreter (it recomputes `.length` correctly).
+    let hoisted_len = hoistable_length(proto, start, end);
+    if let Some((_get_ip, dst, g, name_idx)) = hoisted_len {
+        let packed = ((heap.func_id as u64) << 32) | name_idx as u64;
+        dynasm!(ops
+            ; mov rdx, [r12 + (g as i32) * 8]     // obj bits = globals[g]
+            ; mov rcx, rdi                         // vm
+            ; mov r8d, 0                           // site_idx (unused for .length)
+            ; mov r9, QWORD packed as i64
+            ; mov rax, QWORD heap.get_prop_miss as i64
+            ; call rax
+            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => entry_len_bail
+            ; mov [rbx + dreg(dst)], rax
+        );
+    }
+    dynasm!(ops ; jmp => lbl(start, &in_region));
 
     // The k-th GetProp/SetProp in the region uses inline-cache site `ic_site`.
     let mut ic_site = heap.ic_base_idx;
     for ip in s..=e {
+        // Skip the hoisted `.length` GetProp — its dst already holds the value
+        // (computed once in the prologue). The label is still emitted so jumps
+        // into this ip resolve; the op itself is elided.
+        if let Some((get_ip, ..)) = hoisted_len {
+            if ip == get_ip {
+                dynasm!(ops ; => lbl(ip as u32, &in_region));
+                continue;
+            }
+        }
         let ipl = lbl(ip as u32, &in_region);
         dynasm!(ops ; => ipl);
         let bail = ops.new_dynamic_label();
@@ -3751,6 +3858,15 @@ fn compile_region_mem(
             }
             _ => return None, // region_can_compile already filtered; defensive
         }
+    }
+
+    // Hoisted-`.length` deopt landing: resume the loop in the interpreter.
+    if hoisted_len.is_some() {
+        dynasm!(ops
+            ; => entry_len_bail
+            ; mov DWORD [rsi], start as i32
+            ; jmp => epilogue
+        );
     }
 
     // ── exit stubs ── one per distinct out-of-region jump target: record the
