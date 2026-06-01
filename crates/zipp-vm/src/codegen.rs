@@ -1836,6 +1836,14 @@ struct RegionPlan {
     /// live-in. Their body occurrences are skipped (the home already holds them).
     hoist_ips: Vec<usize>,
     hoisted: FxHashSet<u16>,
+    /// Registers DEFINED in the region but NEVER used as an operand (dead). All
+    /// int-region ops are pure value computations (no side effects — heap/call ops
+    /// decline the region), so a dead-dst op produces a value nothing reads and is
+    /// skipped during body emission. The common source is object SROA, which
+    /// neutralises the (now-unused) object-ref `LoadGlobal`s to `LoadInt 0`: that's
+    /// ~7 dead ops/iteration in the object benchmark, and dropping them also frees
+    /// their xmm homes (often taking the loop off the slower home-reuse path).
+    dead: FxHashSet<u16>,
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops
@@ -2061,6 +2069,19 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
             used.insert(u);
         }
     }
+    // ── dead-code elimination ── a register written in the region but never read
+    // (not in `used`) is dead. Every int-region op is a pure value computation, so
+    // its defining op produces a result nothing observes and can be skipped — and
+    // the reg dropped from home allocation. Drop dead regs from `reg_order` so they
+    // consume no xmm home and don't count toward the pool-overflow check (which can
+    // flip the loop to the slower home-reuse path). `dead` excludes loop-carried
+    // (live-in) regs — those are read across iterations even if not within one.
+    let dead: FxHashSet<u16> = reg_order
+        .iter()
+        .copied()
+        .filter(|r| !used.contains(r) && first_seen.get(r) != Some(&false))
+        .collect();
+    reg_order.retain(|r| !dead.contains(r));
     let mut hoist_ips: Vec<usize> = Vec::new();
     let mut hoisted: FxHashSet<u16> = FxHashSet::default();
     for (&r, &ip) in &const_def_ip {
@@ -2210,6 +2231,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
         globs,
         hoist_ips,
         hoisted,
+        dead,
     })
 }
 
@@ -2429,6 +2451,13 @@ fn compile_region_regalloc(
         // no-op (fall through to the next ip, its label preserved for jumps).
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
             if plan.hoisted.contains(&dst) {
+                continue;
+            }
+        }
+        // Dead-code elimination: skip a pure op whose result is never read (see
+        // plan_region `dead`). Sound — every regalloc-region op is side-effect-free.
+        if let Some(d) = writes_reg(&proto.code[ip]) {
+            if plan.dead.contains(&d) {
                 continue;
             }
         }
@@ -2693,6 +2722,16 @@ fn compile_region_int(
         dynasm!(ops ; => lbl(ip as u32, &in_region));
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
             if plan.hoisted.contains(&dst) {
+                continue;
+            }
+        }
+        // Dead-code elimination: skip a pure value op whose result is never read
+        // (a `dead` reg — see plan_region). All int-region ops are side-effect-free
+        // (heap/calls decline the region), so this is sound. The label was already
+        // emitted above so any jump still resolves. NOTE: jumps/stores/returns
+        // aren't reg-defs, so `writes_reg` returns None for them — never skipped.
+        if let Some(d) = writes_reg(&proto.code[ip]) {
+            if plan.dead.contains(&d) {
                 continue;
             }
         }
