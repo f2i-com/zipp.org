@@ -546,6 +546,16 @@ impl<'p> Vm<'p> {
     /// calling itself) does NOT — it stays on the frame stack. The frame cap
     /// still bounds total depth.
     fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        // A bound function: invoke its target with the fixed `this` and the bound
+        // arguments prepended (handles bind-of-bind by recursing).
+        if callee.is_heap() {
+            if let HeapObj::Bound { target, this: bthis, args: bargs } = self.heap.get(callee.heap_index()) {
+                let (t, th) = (*target, *bthis);
+                let mut all = bargs.clone();
+                all.extend_from_slice(args);
+                return self.call_value(t, th, &all);
+            }
+        }
         // A native resolve/reject function settles its bound promise.
         if callee.is_heap() {
             if let HeapObj::BoundResolver { promise, is_reject } = self.heap.get(callee.heap_index()) {
@@ -1939,6 +1949,16 @@ impl<'p> Vm<'p> {
                                     self.resolve(p, arg);
                                 }
                                 self.set(base, dst, Value::UNDEFINED);
+                                ip += 1;
+                                continue;
+                            }
+                            // A bound function: run it (via call_value, which fixes
+                            // `this` and prepends the bound args) and store the result.
+                            if matches!(self.heap.get(callee_v.heap_index()), HeapObj::Bound { .. }) {
+                                let argv: Vec<Value> =
+                                    (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                                let r = self.call_value(callee_v, Value::UNDEFINED, &argv)?;
+                                self.set(base, dst, r);
                                 ip += 1;
                                 continue;
                             }
@@ -4363,6 +4383,53 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let idx = recv.heap_index();
+        // ── Function.prototype.call / apply / bind (callable receivers) ──
+        if self.is_callable(recv) {
+            match name {
+                "call" => {
+                    let this = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
+                    return Ok(Some(self.call_value(recv, this, rest)?));
+                }
+                "apply" => {
+                    let this = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let arr = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                    let callargs = if arr.is_heap() { self.iterate_to_vec(arr)? } else { Vec::new() };
+                    return Ok(Some(self.call_value(recv, this, &callargs)?));
+                }
+                "bind" => {
+                    let this = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+                    let b = self.heap.alloc(HeapObj::Bound { target: recv, this, args: bound });
+                    return Ok(Some(Value::heap(b)));
+                }
+                _ => {}
+            }
+        }
+        // ── Object.prototype methods (available on every object) ──
+        match name {
+            "hasOwnProperty" => {
+                let key = self.display(args.first().copied().unwrap_or(Value::UNDEFINED));
+                return Ok(Some(Value::bool(self.has_own_property(recv, &key))));
+            }
+            "propertyIsEnumerable" => {
+                let key = self.display(args.first().copied().unwrap_or(Value::UNDEFINED));
+                return Ok(Some(Value::bool(self.own_is_enumerable(recv, &key))));
+            }
+            "isPrototypeOf" => {
+                let target = args.first().copied().unwrap_or(Value::UNDEFINED);
+                return Ok(Some(Value::bool(self.is_prototype_of(recv, target))));
+            }
+            "valueOf" => return Ok(Some(recv)), // default valueOf returns the object
+            "toString" => {
+                // Generic `Object.prototype.toString` for a plain object; arrays /
+                // numbers / dates etc. have their own toString in the type dispatch.
+                if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+                    return Ok(Some(self.alloc_str("[object Object]".to_string())));
+                }
+            }
+            _ => {}
+        }
         match self.heap.get(idx) {
             HeapObj::Array(_) => self.array_method(idx, name, args),
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
@@ -4838,7 +4905,59 @@ impl<'p> Vm<'p> {
     /// Whether `v` is a user-callable value (function or closure).
     fn is_callable(&self, v: Value) -> bool {
         v.is_heap()
-            && matches!(self.heap.get(v.heap_index()), HeapObj::Func(_) | HeapObj::Closure { .. })
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
+            )
+    }
+
+    /// `obj.hasOwnProperty(key)` — own data/accessor property, array index/length,
+    /// or string index/length.
+    fn has_own_property(&self, obj: Value, key: &str) -> bool {
+        if !obj.is_heap() {
+            return false;
+        }
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Object(m) => m.pos(key).is_some(),
+            HeapObj::Array(items) => {
+                key == "length" || key.parse::<usize>().map_or(false, |i| i < items.len())
+            }
+            HeapObj::Str(s) => {
+                key == "length" || key.parse::<usize>().map_or(false, |i| i < s.char_len)
+            }
+            HeapObj::Cons { len, .. } => {
+                key == "length" || key.parse::<usize>().map_or(false, |i| i < *len)
+            }
+            _ => false,
+        }
+    }
+
+    /// `obj.propertyIsEnumerable(key)` — true if `key` is an own enumerable
+    /// property. Array indices are enumerable; `length` is not.
+    fn own_is_enumerable(&self, obj: Value, key: &str) -> bool {
+        if !obj.is_heap() {
+            return false;
+        }
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Object(m) => m.pos(key).map_or(false, |i| m.attrs[i].enumerable),
+            HeapObj::Array(items) => key.parse::<usize>().map_or(false, |i| i < items.len()),
+            _ => false,
+        }
+    }
+
+    /// `proto.isPrototypeOf(obj)` — is `proto` anywhere in `obj`'s prototype chain?
+    fn is_prototype_of(&mut self, proto: Value, obj: Value) -> bool {
+        let mut cur = self.object_get_prototype_of(obj);
+        for _ in 0..10_000 {
+            if !cur.is_heap() {
+                return false;
+            }
+            if cur == proto {
+                return true;
+            }
+            cur = self.object_get_prototype_of(cur);
+        }
+        false
     }
 
     /// Resolve an iterable's iterator: a plain object with a `@@iterator` method
@@ -5359,8 +5478,13 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::UNDEFINED))
             }
-            "join" => {
-                let sep = if args.is_empty() { ",".to_string() } else { self.display(arg0) };
+            // `Array.prototype.toString()` is `join()` with the default "," sep.
+            "join" | "toString" => {
+                let sep = if name == "toString" || args.is_empty() {
+                    ",".to_string()
+                } else {
+                    self.display(arg0)
+                };
                 let snapshot = self.array_snapshot(idx);
                 let parts: Vec<String> = snapshot
                     .iter()
@@ -6300,7 +6424,7 @@ impl<'p> Vm<'p> {
                     self.heap.write_str(v.heap_index(), &mut out);
                     out
                 }
-                HeapObj::Func(_) | HeapObj::Closure { .. } => "function".into(),
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } => "function".into(),
                 HeapObj::Cell(inner) => self.display(*inner),
                 HeapObj::Array(items) => items
                     .iter()
@@ -6378,6 +6502,7 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Func(id) => self.func_label(*id),
             HeapObj::Closure { func, .. } => self.func_label(*func),
+            HeapObj::Bound { .. } => "[Function: bound]".into(),
             HeapObj::Cell(inner) => self.inspect_nested(*inner),
             HeapObj::Array(items) => {
                 if items.is_empty() {

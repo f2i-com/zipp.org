@@ -252,6 +252,9 @@ pub enum HeapObj {
     Closure { func: u32, upvalues: Vec<u32> },
     /// A boxed mutable variable cell (an upvalue's storage).
     Cell(Value),
+    /// A bound function (`fn.bind(thisArg, ...boundArgs)`): calling it invokes
+    /// `target` with `this` fixed to `this` and `args` prepended to the call args.
+    Bound { target: Value, this: Value, args: Vec<Value> },
     /// A dense array.
     Array(Vec<Value>),
     /// A plain object.
