@@ -3794,6 +3794,24 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // Host `print(...)` → Print to stdout. JS shells (and the test262
+        // `doneprintHandle.js` harness, which calls `print('Test262:Async…')` to
+        // signal async-test completion) expect it as a global. Yield to a lexical
+        // `print` binding (local/param/upvalue) if the program defined one.
+        if let ox::Expression::Identifier(id) = &c.callee {
+            if id.name == "print"
+                && !matches!(
+                    self.resolve("print"),
+                    Binding::Local(_) | Binding::LocalCell(_) | Binding::Upvalue(_)
+                )
+            {
+                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                self.emit(Instr::Print { arg_base, argc, to_stderr: false });
+                self.emit(Instr::LoadUndefined { dst });
+                return Ok(dst);
+            }
+        }
+
         // Clock idioms: `performance.now()` and `Date.now()` → Now opcode. They
         // have no real global object in the subset, so recognise the call shape.
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
