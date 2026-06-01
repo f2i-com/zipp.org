@@ -5574,6 +5574,16 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // The type prototypes (Array/String/Number/Map/…) inherit from
+        // Object.prototype, so a method-as-value miss falls back there:
+        // `[].hasOwnProperty`, `(5).isPrototypeOf`, etc.
+        if self.obj_proto != 0 && proto != self.obj_proto {
+            if let HeapObj::Object(m) = self.heap.get(self.obj_proto) {
+                if let Some(v) = m.get(key) {
+                    return v;
+                }
+            }
+        }
         Value::UNDEFINED
     }
 
