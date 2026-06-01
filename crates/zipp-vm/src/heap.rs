@@ -378,6 +378,10 @@ pub enum HeapObj {
     /// A JS `WeakRef`: a weak reference to an object. No GC, so `deref()` always
     /// returns the (still-live) target.
     WeakRef(Value),
+    /// A JS `FinalizationRegistry`: holds a cleanup callback and the live
+    /// unregister tokens. No GC, so cleanup never fires (spec-permitted); only
+    /// `register`/`unregister` are observable. `tokens` tracks unregister tokens.
+    FinalizationRegistry { cleanup: Value, tokens: Vec<Value> },
     /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
     /// `ctor` is the func id that runs instance field initializers then the user
     /// constructor (or `None`); `methods` maps each instance method name to its

@@ -171,6 +171,8 @@ mod native {
     pub const WS_HAS: u16 = 295;
     pub const WS_DELETE: u16 = 296;
     pub const WR_DEREF: u16 = 297;
+    pub const FR_REGISTER: u16 = 298;
+    pub const FR_UNREGISTER: u16 = 299;
     // Math methods as first-class values: id = MATH_METHOD_BASE + index into
     // MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
     // PROTO_METHODS id range (64 + ~127) to avoid collision.
@@ -334,6 +336,8 @@ mod native {
             WS_HAS => ("has", 1),
             WS_DELETE => ("delete", 1),
             WR_DEREF => ("deref", 0),
+            FR_REGISTER => ("register", 2),
+            FR_UNREGISTER => ("unregister", 1),
             _ => return None,
         })
     }
@@ -430,6 +434,7 @@ pub struct Vm<'p> {
     weakmap_proto: u32,
     weakset_proto: u32,
     weakref_proto: u32,
+    finreg_proto: u32,
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
@@ -519,6 +524,7 @@ impl<'p> Vm<'p> {
             weakmap_proto: 0,
             weakset_proto: 0,
             weakref_proto: 0,
+            finreg_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1830,6 +1836,19 @@ impl<'p> Vm<'p> {
                         }
                         let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));
                         self.set(base, dst, wr);
+                        ip += 1;
+                    }
+                    Instr::NewFinalizationRegistry { dst, cleanup } => {
+                        let cb = self.get(base, cleanup);
+                        if self.type_of(cb) != "function" {
+                            return Err(Thrown(
+                                "TypeError: FinalizationRegistry: cleanup callback must be callable".into(),
+                            ));
+                        }
+                        let fr = Value::heap(
+                            self.heap.alloc(HeapObj::FinalizationRegistry { cleanup: cb, tokens: Vec::new() }),
+                        );
+                        self.set(base, dst, fr);
                         ip += 1;
                     }
                     Instr::NewPromise { dst, executor } => {
@@ -4697,12 +4716,15 @@ impl<'p> Vm<'p> {
         );
         let weakset_proto = build(self, &[("add", WS_ADD), ("has", WS_HAS), ("delete", WS_DELETE)], None);
         let weakref_proto = build(self, &[("deref", WR_DEREF)], None);
+        let finreg_proto = build(self, &[("register", FR_REGISTER), ("unregister", FR_UNREGISTER)], None);
         self.weakmap_proto = weakmap_proto;
         self.weakset_proto = weakset_proto;
         self.weakref_proto = weakref_proto;
+        self.finreg_proto = finreg_proto;
         let weakmap_ctor = build(self, &[], Some(weakmap_proto));
         let weakset_ctor = build(self, &[], Some(weakset_proto));
         let weakref_ctor = build(self, &[], Some(weakref_proto));
+        let finreg_ctor = build(self, &[], Some(finreg_proto));
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
         let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
@@ -4759,6 +4781,7 @@ impl<'p> Vm<'p> {
                 "WeakMap" => Some(weakmap_ctor),
                 "WeakSet" => Some(weakset_ctor),
                 "WeakRef" => Some(weakref_ctor),
+                "FinalizationRegistry" => Some(finreg_ctor),
                 "globalThis" => Some(global_this),
                 _ => None,
             };
@@ -5226,6 +5249,8 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            FR_REGISTER => self.finreg_method(this, "register", args)?,
+            FR_UNREGISTER => self.finreg_method(this, "unregister", args)?,
             // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
             // form is compile-lowered to MathOp; these back the value form.
             _ if native::math_method(id).is_some() => {
@@ -5503,6 +5528,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakMap { .. } => self.weakmap_proto,
             HeapObj::WeakSet(_) => self.weakset_proto,
             HeapObj::WeakRef(_) => self.weakref_proto,
+            HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
             HeapObj::Date(_) => self.date_proto,
             HeapObj::Promise { .. } => self.promise_proto,
             _ => 0,
@@ -5953,6 +5979,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakMap { .. } => Ok(self.proto_member(self.weakmap_proto, key)),
             HeapObj::WeakSet(_) => Ok(self.proto_member(self.weakset_proto, key)),
             HeapObj::WeakRef(_) => Ok(self.proto_member(self.weakref_proto, key)),
+            HeapObj::FinalizationRegistry { .. } => Ok(self.proto_member(self.finreg_proto, key)),
             HeapObj::Date(_) => Ok(self.proto_member(self.date_proto, key)),
             HeapObj::Promise { .. } => Ok(self.proto_member(self.promise_proto, key)),
             // Functions / natives / bound functions: own props set on them
@@ -6821,6 +6848,59 @@ impl<'p> Vm<'p> {
                     return Ok(Value::bool(true));
                 }
                 Ok(Value::bool(false))
+            }
+            _ => Ok(Value::UNDEFINED),
+        }
+    }
+
+    /// `FinalizationRegistry.prototype.{register,unregister}`. No GC, so cleanup
+    /// never fires; only the register/unregister bookkeeping (+ arg validation) is
+    /// observable. `tokens` tracks live unregister tokens for `unregister`.
+    fn finreg_method(&mut self, this: Value, name: &str, args: &[Value]) -> Result<Value, Thrown> {
+        if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::FinalizationRegistry { .. }) {
+            return Err(Thrown(format!(
+                "TypeError: FinalizationRegistry.prototype.{name} called on incompatible receiver"
+            )));
+        }
+        let idx = this.heap_index();
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "register" => {
+                let held = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let token = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: FinalizationRegistry.register: target must be an object".into()));
+                }
+                if self.same_value(a0, held) {
+                    return Err(Thrown(
+                        "TypeError: FinalizationRegistry.register: target and held value must not be the same".into(),
+                    ));
+                }
+                if token != Value::UNDEFINED && !self.is_object_value(token) {
+                    return Err(Thrown(
+                        "TypeError: FinalizationRegistry.register: unregister token must be an object".into(),
+                    ));
+                }
+                if self.is_object_value(token) {
+                    if let HeapObj::FinalizationRegistry { tokens, .. } = self.heap.get_mut(idx) {
+                        tokens.push(token);
+                    }
+                }
+                Ok(Value::UNDEFINED)
+            }
+            "unregister" => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: FinalizationRegistry.unregister: token must be an object".into(),
+                    ));
+                }
+                let mut removed = false;
+                if let HeapObj::FinalizationRegistry { tokens, .. } = self.heap.get_mut(idx) {
+                    let before = tokens.len();
+                    tokens.retain(|t| *t != a0); // object identity = Value bit-equality
+                    removed = tokens.len() != before;
+                }
+                Ok(Value::bool(removed))
             }
             _ => Ok(Value::UNDEFINED),
         }
@@ -9014,6 +9094,7 @@ impl<'p> Vm<'p> {
                 HeapObj::WeakMap { .. } => "[object WeakMap]".into(),
                 HeapObj::WeakSet(_) => "[object WeakSet]".into(),
                 HeapObj::WeakRef(_) => "[object WeakRef]".into(),
+                HeapObj::FinalizationRegistry { .. } => "[object FinalizationRegistry]".into(),
                 HeapObj::Generator { .. } => "[object Generator]".into(),
                 HeapObj::AsyncGenerator(_) => "[object AsyncGenerator]".into(),
                 HeapObj::Promise { .. } => "[object Promise]".into(),
@@ -9134,6 +9215,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakMap { .. } => "WeakMap { <items unknown> }".into(),
             HeapObj::WeakSet(_) => "WeakSet { <items unknown> }".into(),
             HeapObj::WeakRef(_) => "WeakRef {}".into(),
+            HeapObj::FinalizationRegistry { .. } => "FinalizationRegistry {}".into(),
             HeapObj::Generator { .. } => "Object [Generator] {}".into(),
             HeapObj::AsyncGenerator(_) => "Object [AsyncGenerator] {}".into(),
             HeapObj::Promise { state, result, .. } => match state {

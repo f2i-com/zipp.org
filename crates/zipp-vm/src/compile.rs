@@ -2648,6 +2648,22 @@ impl<'a> FnCompiler<'a> {
                         self.next_reg -= 1; // reclaim target temp
                         return Ok(dst);
                     }
+                    // `new FinalizationRegistry(cleanupCallback)`.
+                    if id.name == "FinalizationRegistry" {
+                        let cleanup = self.temp();
+                        match n.arguments.first().and_then(|a| a.as_expression()) {
+                            Some(e) => {
+                                let v = self.expr_into(e, cleanup)?;
+                                if v != cleanup {
+                                    self.emit(Instr::Move { dst: cleanup, src: v });
+                                }
+                            }
+                            None => self.emit(Instr::LoadUndefined { dst: cleanup }),
+                        }
+                        self.emit(Instr::NewFinalizationRegistry { dst, cleanup });
+                        self.next_reg -= 1; // reclaim cleanup temp
+                        return Ok(dst);
+                    }
                     // `new Date(...)`.
                     if id.name == "Date" {
                         let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
