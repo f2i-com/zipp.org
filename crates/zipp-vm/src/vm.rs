@@ -228,6 +228,9 @@ pub struct Vm<'p> {
     obj_proto: u32,
     fn_proto: u32,
     arr_proto: u32,
+    /// `String.prototype` — primitive string values delegate here for method
+    /// access (`"x".charAt`, `"x".slice`, …, as values), 0 until `setup_globals`.
+    str_proto: u32,
     /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
     /// program's random sequence is reproducible run-to-run (and JIT-on == off).
     rng_state: u64,
@@ -304,6 +307,7 @@ impl<'p> Vm<'p> {
             obj_proto: 0,
             fn_proto: 0,
             arr_proto: 0,
+            str_proto: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit: crate::codegen::Jit::new(),
@@ -4231,7 +4235,8 @@ impl<'p> Vm<'p> {
             }
         }
         self.arr_proto = build(self, &arr_methods, None);
-        let str_proto = build(self, &str_methods, None);
+        self.str_proto = build(self, &str_methods, None);
+        let str_proto = self.str_proto;
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -4751,6 +4756,20 @@ impl<'p> Vm<'p> {
     /// The `(name, length)` of a callable value (function, closure, or class) for
     /// its `.name`/`.length` properties — `None` for non-callables. A synthetic
     /// proto name (`<arrow>`, `<script>`, …) reads as the empty string (anonymous).
+    /// Look up `key` on a built-in prototype object (`arr_proto`/`str_proto`),
+    /// returning the method value (or undefined). Lets primitive array/string
+    /// values expose their methods as first-class values.
+    fn proto_member(&self, proto: u32, key: &str) -> Value {
+        if proto != 0 {
+            if let HeapObj::Object(m) = self.heap.get(proto) {
+                if let Some(v) = m.get(key) {
+                    return v;
+                }
+            }
+        }
+        Value::UNDEFINED
+    }
+
     fn callable_name_length(&self, obj: Value) -> Option<(String, i32)> {
         let clean = |n: &str| -> String {
             if n.starts_with('<') { String::new() } else { n.to_string() }
@@ -4847,21 +4866,22 @@ impl<'p> Vm<'p> {
                     // A tagged-template strings array's `.raw` (side table).
                     Ok(self.template_raws.get(&obj.heap_index()).copied().unwrap_or(Value::UNDEFINED))
                 } else {
-                    Ok(Value::UNDEFINED)
+                    // A method as a VALUE (`arr.map`, `arr.slice`, …) → Array.prototype.
+                    Ok(self.proto_member(self.arr_proto, key))
                 }
             }
             HeapObj::Str(s) => {
                 if key == "length" {
                     Ok(len_value(s.char_len))
                 } else {
-                    Ok(Value::UNDEFINED)
+                    Ok(self.proto_member(self.str_proto, key))
                 }
             }
             HeapObj::Cons { len, .. } => {
                 if key == "length" {
                     Ok(len_value(*len))
                 } else {
-                    Ok(Value::UNDEFINED)
+                    Ok(self.proto_member(self.str_proto, key))
                 }
             }
             HeapObj::Object(map) => {
