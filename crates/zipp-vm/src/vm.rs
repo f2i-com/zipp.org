@@ -8321,6 +8321,109 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The heap index if `v` is a RegExp, else None.
+    fn as_regexp(&self, v: Value) -> Option<u32> {
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::RegExp { .. }) {
+            Some(v.heap_index())
+        } else {
+            None
+        }
+    }
+
+    /// Coerce a `String.prototype.match`/`search` argument to a RegExp: a RegExp
+    /// passes through; anything else becomes `new RegExp(arg)`.
+    fn to_regexp_arg(&mut self, v: Value) -> Result<u32, Thrown> {
+        if let Some(i) = self.as_regexp(v) {
+            return Ok(i);
+        }
+        let p = if v.is_undefined() { self.alloc_str(String::new()) } else { v };
+        Ok(self.build_regexp(p, Value::UNDEFINED)?.heap_index())
+    }
+
+    /// Expand a `String.prototype.replace` string template against a match: `$&`
+    /// (whole), `` $` ``/`$'` (pre/post), `$N`/`$NN` (group), `$<name>` (named), `$$`.
+    fn expand_replacement(
+        &self,
+        tmpl: &str,
+        whole: &str,
+        groups: &[Option<String>],
+        named: &[(String, Option<String>)],
+        pre: &str,
+        post: &str,
+    ) -> String {
+        let mut out = String::with_capacity(tmpl.len());
+        let bytes = tmpl.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'$' && i + 1 < bytes.len() {
+                let c = bytes[i + 1];
+                match c {
+                    b'$' => {
+                        out.push('$');
+                        i += 2;
+                    }
+                    b'&' => {
+                        out.push_str(whole);
+                        i += 2;
+                    }
+                    b'`' => {
+                        out.push_str(pre);
+                        i += 2;
+                    }
+                    b'\'' => {
+                        out.push_str(post);
+                        i += 2;
+                    }
+                    b'<' => {
+                        if let Some(end) = tmpl[i + 2..].find('>') {
+                            let name = &tmpl[i + 2..i + 2 + end];
+                            if let Some((_, Some(g))) = named.iter().find(|(n, _)| n == name) {
+                                out.push_str(g);
+                            }
+                            i += 2 + end + 1;
+                        } else {
+                            out.push('$');
+                            i += 1;
+                        }
+                    }
+                    b'0'..=b'9' => {
+                        // One or two digits; prefer the two-digit group if valid.
+                        let d1 = (c - b'0') as usize;
+                        let two = if i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit() {
+                            Some(d1 * 10 + (bytes[i + 2] - b'0') as usize)
+                        } else {
+                            None
+                        };
+                        if let Some(n) = two.filter(|&n| n >= 1 && n <= groups.len()) {
+                            if let Some(g) = &groups[n - 1] {
+                                out.push_str(g);
+                            }
+                            i += 3;
+                        } else if d1 >= 1 && d1 <= groups.len() {
+                            if let Some(g) = &groups[d1 - 1] {
+                                out.push_str(g);
+                            }
+                            i += 2;
+                        } else {
+                            out.push('$');
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        out.push('$');
+                        i += 1;
+                    }
+                }
+            } else {
+                // copy one UTF-8 char
+                let ch = tmpl[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
     /// RegExp instance property reads: `lastIndex`, `source` (empty → "(?:)"),
     /// `flags`, and the per-flag booleans; methods delegate to RegExp.prototype.
     fn regexp_get_prop(
@@ -8420,6 +8523,60 @@ impl<'p> Vm<'p> {
             self.set_regexp_last_index(re_idx, byte_to_char(&input, mend));
         }
         Ok(Value::heap(arr_idx))
+    }
+
+    /// Regex-backed `String.prototype.replace`/`replaceAll`. `repl` is a function
+    /// (called `(match, ...groups, offset, input)`) or a template string (`$&`/`$N`/…).
+    fn regex_replace(&mut self, s: &str, re: u32, repl: Value, global: bool) -> Result<String, Thrown> {
+        let matches: Vec<regress::Match> = match self.heap.get(re) {
+            HeapObj::RegExp { regex, .. } => {
+                if global {
+                    regex.find_iter(s).collect()
+                } else {
+                    regex.find(s).into_iter().collect()
+                }
+            }
+            _ => Vec::new(),
+        };
+        let callable = repl.is_heap() && self.heap.as_callable(repl.heap_index()).is_some();
+        let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
+        let mut out = String::new();
+        let mut last = 0usize;
+        for m in &matches {
+            let (st, en) = (m.start(), m.end());
+            if st < last {
+                continue;
+            }
+            out.push_str(&s[last..st]);
+            let whole = s[m.range()].to_string();
+            if callable {
+                let mut argv = vec![self.alloc_str(whole)];
+                for cap in &m.captures {
+                    argv.push(match cap {
+                        Some(r) => self.alloc_str(s[r.clone()].to_string()),
+                        None => Value::UNDEFINED,
+                    });
+                }
+                argv.push(Value::num(byte_to_char(s, st) as f64));
+                argv.push(self.alloc_str(s.to_string()));
+                let r = self.call_value(repl, Value::UNDEFINED, &argv)?;
+                let rs = self.to_js_string(r)?;
+                out.push_str(&rs);
+            } else {
+                let groups: Vec<Option<String>> =
+                    m.captures.iter().map(|c| c.as_ref().map(|r| s[r.clone()].to_string())).collect();
+                let named: Vec<(String, Option<String>)> = m
+                    .named_groups()
+                    .map(|(n, r)| (n.to_string(), r.map(|r| s[r].to_string())))
+                    .collect();
+                let rep =
+                    self.expand_replacement(&repl_str, &whole, &groups, &named, &s[..st], &s[en..]);
+                out.push_str(&rep);
+            }
+            last = en;
+        }
+        out.push_str(&s[last..]);
+        Ok(out)
     }
 
     /// A binary arithmetic/bitwise op where at least one operand might be a BigInt.
@@ -10040,6 +10197,89 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
                 Ok(Some(self.alloc_str(s.repeat(n as usize))))
+            }
+            "search" => {
+                let re = self.to_regexp_arg(arg0)?;
+                let found = match self.heap.get(re) {
+                    HeapObj::RegExp { regex, .. } => regex.find(&s),
+                    _ => None,
+                };
+                Ok(Some(match found {
+                    Some(m) => Value::num(byte_to_char(&s, m.start()) as f64),
+                    None => Value::int(-1),
+                }))
+            }
+            "match" => {
+                let re = self.to_regexp_arg(arg0)?;
+                let global =
+                    matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
+                if global {
+                    let strs: Vec<String> = match self.heap.get(re) {
+                        HeapObj::RegExp { regex, .. } => {
+                            regex.find_iter(&s).map(|m| s[m.range()].to_string()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    self.set_regexp_last_index(re, 0);
+                    if strs.is_empty() {
+                        return Ok(Some(Value::NULL));
+                    }
+                    let elems: Vec<Value> = strs.into_iter().map(|m| self.alloc_str(m)).collect();
+                    Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(elems)))))
+                } else {
+                    let r = self.regexp_exec(re, Value::heap(idx))?;
+                    Ok(Some(r))
+                }
+            }
+            "split" if self.as_regexp(arg0).is_some() => {
+                let re = self.as_regexp(arg0).unwrap();
+                let limit = match args.get(1) {
+                    Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+                    _ => usize::MAX,
+                };
+                let spans: Vec<(usize, usize)> = match self.heap.get(re) {
+                    HeapObj::RegExp { regex, .. } => {
+                        regex.find_iter(&s).map(|m| (m.start(), m.end())).collect()
+                    }
+                    _ => Vec::new(),
+                };
+                let mut parts: Vec<Value> = Vec::new();
+                let mut last = 0usize;
+                for (st, en) in spans {
+                    if parts.len() >= limit {
+                        break;
+                    }
+                    if st < last || (st == en && st == last) {
+                        continue; // skip overlapping / empty-at-cursor matches
+                    }
+                    parts.push(self.alloc_str(s[last..st].to_string()));
+                    last = en;
+                }
+                if parts.len() < limit {
+                    parts.push(self.alloc_str(s[last..].to_string()));
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(parts)))))
+            }
+            "replace" if self.as_regexp(arg0).is_some() => {
+                let re = self.as_regexp(arg0).unwrap();
+                let global =
+                    matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
+                let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let out = self.regex_replace(&s, re, repl, global)?;
+                Ok(Some(self.alloc_str(out)))
+            }
+            "replaceAll" if self.as_regexp(arg0).is_some() => {
+                let re = self.as_regexp(arg0).unwrap();
+                let global =
+                    matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
+                if !global {
+                    return Err(Thrown(
+                        "TypeError: replaceAll must be called with a global RegExp".into(),
+                    ));
+                }
+                let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let out = self.regex_replace(&s, re, repl, true)?;
+                Ok(Some(self.alloc_str(out)))
             }
             "split" => {
                 let sep = self.display(arg0);
