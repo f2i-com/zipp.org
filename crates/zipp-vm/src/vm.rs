@@ -117,6 +117,8 @@ mod native {
     pub const ARR_IS_ARRAY: u16 = 19;
     pub const ARR_FROM: u16 = 20;
     pub const ARR_OF: u16 = 21;
+    pub const ARR_JOIN: u16 = 22;
+    pub const ARR_PUSH: u16 = 23;
 }
 
 /// What `object_enum_own` collects.
@@ -177,6 +179,10 @@ pub struct Vm<'p> {
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
     proto_of: std::collections::HashMap<u32, Value>,
+    /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
+    /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
+    /// so their (rare) own props live here.
+    fn_props: std::collections::HashMap<u32, ObjMap>,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods
@@ -255,6 +261,7 @@ impl<'p> Vm<'p> {
             template_raws: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),
             proto_of: std::collections::HashMap::new(),
+            fn_props: std::collections::HashMap::new(),
             obj_proto: 0,
             fn_proto: 0,
             arr_proto: 0,
@@ -2605,6 +2612,14 @@ impl<'p> Vm<'p> {
             let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
             self.regs[new_base + rreg as usize] = arr;
         }
+        // `arguments`: an array of ALL actual args (a function that references it).
+        if let Some(areg) = self.program.functions[func_id as usize].arguments_reg {
+            let argsv: Vec<Value> = (0..argc as usize)
+                .map(|i| self.regs[caller_base + arg_base as usize + i])
+                .collect();
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(argsv)));
+            self.regs[new_base + areg as usize] = arr;
+        }
 
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
@@ -3709,7 +3724,7 @@ impl<'p> Vm<'p> {
             &[("call", FN_CALL), ("apply", FN_APPLY), ("bind", FN_BIND)],
             None,
         );
-        self.arr_proto = build(self, &[], None);
+        self.arr_proto = build(self, &[("join", ARR_JOIN), ("push", ARR_PUSH)], None);
         // Constructors.
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
@@ -3812,6 +3827,15 @@ impl<'p> Vm<'p> {
             }
             ARR_FROM => self.array_from(a0, a1)?,
             ARR_OF => Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec()))),
+            // `Array.prototype.{join,push}` as values: `this` is the receiver array.
+            ARR_JOIN | ARR_PUSH => {
+                let m = if id == ARR_JOIN { "join" } else { "push" };
+                if this.is_heap() && matches!(self.heap.get(this.heap_index()), HeapObj::Array(_)) {
+                    self.array_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                } else {
+                    Value::UNDEFINED
+                }
+            }
             _ => Value::UNDEFINED,
         })
     }
@@ -4253,17 +4277,23 @@ impl<'p> Vm<'p> {
             // `map.size` / `set.size` — an accessor property, not a method.
             HeapObj::Map { keys, .. } if key == "size" => Ok(len_value(keys.len())),
             HeapObj::Set(items) if key == "size" => Ok(len_value(items.len())),
-            // Functions / natives / bound functions delegate to Function.prototype
-            // (its own methods `call`/`apply`/`bind`) for value-level access.
-            _ if self.fn_proto != 0
-                && matches!(
-                    self.heap.get(obj.heap_index()),
-                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
-                ) =>
+            // Functions / natives / bound functions: own props set on them
+            // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
+            _ if matches!(
+                self.heap.get(obj.heap_index()),
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+            ) =>
             {
-                if let HeapObj::Object(m) = self.heap.get(self.fn_proto) {
+                if let Some(m) = self.fn_props.get(&obj.heap_index()) {
                     if let Some(v) = m.get(key) {
                         return Ok(v);
+                    }
+                }
+                if self.fn_proto != 0 {
+                    if let HeapObj::Object(m) = self.heap.get(self.fn_proto) {
+                        if let Some(v) = m.get(key) {
+                            return Ok(v);
+                        }
                     }
                 }
                 Ok(Value::UNDEFINED)
@@ -4610,6 +4640,15 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
+        }
+        // A function value's own property (`fn.x = …`, e.g. `assert.sameValue`)
+        // lives in a side table (functions carry no inline property map).
+        if matches!(
+            self.heap.get(idx),
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+        ) {
+            self.fn_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            return Ok(());
         }
         let mut added = false;
         match self.heap.get_mut(idx) {

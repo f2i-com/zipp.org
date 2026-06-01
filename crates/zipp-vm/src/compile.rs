@@ -396,6 +396,9 @@ impl Compiler {
         fc.is_script = is_script;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
+        if !is_script {
+            fc.reserve_arguments(); // non-arrow functions bind `arguments`
+        }
 
         // Apply default parameter values (`function f(x = expr)`) before the body:
         // for each defaulted param, `if (x === undefined) x = expr`.
@@ -434,6 +437,7 @@ impl Compiler {
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
+            arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator,
             is_async,
             constants: fc.constants,
@@ -475,6 +479,7 @@ impl Compiler {
         fc.super_class = super_class;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
+        fc.reserve_arguments(); // class methods/ctors bind `arguments`
         if let Some(pa) = params_ast {
             fc.emit_param_defaults(pa)?;
             fc.bind_pattern_params(pa)?;
@@ -512,6 +517,7 @@ impl Compiler {
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
+            arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator,
             is_async,
             constants: fc.constants,
@@ -569,6 +575,7 @@ impl Compiler {
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
             rest_reg: fc.rest_reg,
+            arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator: false,
             is_async: a.r#async,
             constants: fc.constants,
@@ -613,6 +620,7 @@ fn placeholder(name: &str) -> FuncProto {
         reg_count: 0,
         param_count: 0,
         rest_reg: None,
+        arguments_reg: None,
         is_generator: false,
         is_async: false,
         constants: Vec::new(),
@@ -635,6 +643,10 @@ struct FnCompiler<'a> {
     max_reg: Reg,
     /// Register holding the rest-parameter array, if this function has one.
     rest_reg: Option<Reg>,
+    /// Register reserved for the `arguments` object (non-arrow functions), and
+    /// whether the body actually referenced `arguments` (gates building it).
+    arguments_reg: Option<Reg>,
+    uses_arguments: bool,
     /// When compiling a class method/constructor whose class `extends P`, the
     /// class_id of `P` — so `super(…)` / `super.m(…)` resolve to its members.
     super_class: Option<u32>,
@@ -709,6 +721,8 @@ impl<'a> FnCompiler<'a> {
             next_reg: 0,
             max_reg: 0,
             rest_reg: None,
+            arguments_reg: None,
+            uses_arguments: false,
             super_class: None,
             in_generator: false,
             in_async: false,
@@ -749,6 +763,16 @@ impl<'a> FnCompiler<'a> {
             }
         }
         fc
+    }
+
+    /// Reserve the `arguments` register (right after `this`/params/rest) for a
+    /// non-arrow function and bind the name in scope, so a body reference to
+    /// `arguments` resolves to it. Arrows/scripts don't call this (they inherit /
+    /// have no `arguments`).
+    fn reserve_arguments(&mut self) {
+        let r = self.alloc_reg();
+        self.scopes[0].push(("arguments".to_string(), r));
+        self.arguments_reg = Some(r);
     }
 
     /// Snapshot this function's environment for a nested function to capture
@@ -837,6 +861,9 @@ impl<'a> FnCompiler<'a> {
     /// Resolve a name to a local register (plain or cell-backed), an upvalue, or
     /// a global slot. Upvalue resolution lazily threads captures up the chain.
     fn resolve(&mut self, name: &str) -> Binding {
+        if name == "arguments" {
+            self.uses_arguments = true; // request the call-time `arguments` array
+        }
         for scope in self.scopes.iter().rev() {
             for (n, r) in scope.iter().rev() {
                 if n == name {

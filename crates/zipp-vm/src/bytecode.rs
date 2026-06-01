@@ -346,6 +346,10 @@ pub struct FuncProto {
     /// or `None`. The VM gathers args beyond `param_count` into a fresh array
     /// and stores it here at call setup. Always `param_count + 1` when present.
     pub rest_reg: Option<u16>,
+    /// Register receiving the `arguments` object (an array of all actual args),
+    /// built at call setup, when the (non-arrow) function references `arguments`.
+    /// `None` if unused.
+    pub arguments_reg: Option<u16>,
     /// True for a `function*` generator body: calling it builds a suspended
     /// Generator object instead of running, and it is never whole-function JITed.
     pub is_generator: bool,
