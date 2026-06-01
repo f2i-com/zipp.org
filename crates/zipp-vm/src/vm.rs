@@ -2399,6 +2399,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, it);
                         ip += 1;
                     }
+                    Instr::GetAsyncIterator { dst, src } => {
+                        let s = self.get(base, src);
+                        let it = self.get_async_iterator(s)?;
+                        self.set(base, dst, it);
+                        ip += 1;
+                    }
                     Instr::IterToArray { dst, src, count } => {
                         let s = self.get(base, src);
                         let a = self.iter_to_array(s, count)?;
@@ -6154,6 +6160,24 @@ impl<'p> Vm<'p> {
             let m = self.get_prop(v, "@@iterator")?;
             if self.is_callable(m) {
                 return self.call_value(m, v, &[]);
+            }
+        }
+        Ok(v)
+    }
+
+    /// `for await`: resolve the ASYNC iterator. An async generator is its own
+    /// iterator; a plain object uses `@@asyncIterator` (an async iterable) or, as
+    /// the spec's async-from-sync fallback, `@@iterator`; everything else (arrays,
+    /// strings, Map/Set, sync generators) passes through (ForAwaitNext drives it).
+    fn get_async_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            let am = self.get_prop(v, "@@asyncIterator")?;
+            if self.is_callable(am) {
+                return self.call_value(am, v, &[]);
+            }
+            let sm = self.get_prop(v, "@@iterator")?;
+            if self.is_callable(sm) {
+                return self.call_value(sm, v, &[]);
             }
         }
         Ok(v)

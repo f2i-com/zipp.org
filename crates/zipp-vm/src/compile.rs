@@ -2292,10 +2292,14 @@ impl<'a> FnCompiler<'a> {
         if v != iter_reg {
             self.emit(Instr::Move { dst: iter_reg, src: v });
         }
-        // Resolve a custom iterable's `@@iterator` to its iterator object; arrays/
-        // strings/Map/Set/generators/async-generators pass through. `for await`
-        // additionally awaits each step's result (see ForAwaitNext below).
-        self.emit(Instr::GetIterator { dst: iter_reg, src: iter_reg });
+        // Resolve the iterator. `for await` uses the ASYNC iterator (@@asyncIterator
+        // → @@iterator fallback); plain `for of` uses @@iterator. Built-ins/async
+        // generators pass through and are driven by IterNext / ForAwaitNext.
+        if f.r#await {
+            self.emit(Instr::GetAsyncIterator { dst: iter_reg, src: iter_reg });
+        } else {
+            self.emit(Instr::GetIterator { dst: iter_reg, src: iter_reg });
+        }
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
