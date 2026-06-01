@@ -2175,13 +2175,16 @@ impl<'a> FnCompiler<'a> {
         self.push_scope();
 
         // A `for (let [a,b] of …)` / `for (let {x} of …)` head destructures each
-        // element; a plain `for (let x of …)` binds it to one variable.
+        // element; a plain `for (let x of …)` binds it to one variable. A head
+        // that's NOT a declaration (`for (x of …)`, `for ([a,b] of …)`,
+        // `for (obj.k of …)`) ASSIGNS each element to an existing target.
         let decl_pat = match &f.left {
             ox::ForStatementLeft::VariableDeclaration(d) => Some(&d.declarations[0].id),
             _ => None,
         };
         let pattern =
             decl_pat.filter(|p| !matches!(p, ox::BindingPattern::BindingIdentifier(_)));
+        let assign_tgt = f.left.as_assignment_target();
 
         // Evaluate the iterable into a stable scratch local; `idx` is the cursor
         // IterNext advances for array/string/Map/Set (ignored for a generator,
@@ -2197,14 +2200,15 @@ impl<'a> FnCompiler<'a> {
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
-        // The loop binding: either a destructuring pattern's leaves, or a single
-        // (possibly cell-boxed) variable.
-        let (var_reg, var_is_cell) = match pattern {
-            Some(p) => {
+        // The loop binding: a destructuring pattern's leaves, an assignment to an
+        // existing target, or a single (possibly cell-boxed) declared variable.
+        let (var_reg, var_is_cell) = match (pattern, assign_tgt) {
+            (Some(p), _) => {
                 self.declare_pattern(p)?;
                 (0, false)
             }
-            None => {
+            (None, Some(_)) => (0, false), // assignment target: nothing to declare
+            (None, None) => {
                 let var_name = for_left_name(&f.left)?;
                 let r = self.declare_local(&var_name);
                 (r, self.cell_regs.contains(&r))
@@ -2215,13 +2219,19 @@ impl<'a> FnCompiler<'a> {
         let save = self.next_reg;
         let done = self.alloc_reg();
         // Write the element straight into a plain-local loop var; use a temp for a
-        // destructuring pattern or a cell-boxed var (bound right after).
-        let elem = if pattern.is_some() || var_is_cell { self.alloc_reg() } else { var_reg };
+        // destructuring pattern, an assignment target, or a cell-boxed var.
+        let elem = if pattern.is_some() || assign_tgt.is_some() || var_is_cell {
+            self.alloc_reg()
+        } else {
+            var_reg
+        };
         self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter: iter_reg, idx: idx_reg });
         let jdone = self.here();
         self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
         if let Some(p) = pattern {
             self.extract_pattern(p, elem)?;
+        } else if let Some(tgt) = assign_tgt {
+            self.assign_target(tgt, elem)?;
         } else if var_is_cell {
             // Per-iteration binding: a FRESH cell each iteration so a closure in
             // the body captures THIS element, not the last one (for-of let).
@@ -2250,7 +2260,15 @@ impl<'a> FnCompiler<'a> {
     /// keys (or an array's index strings), via the ObjectKeys op + an index loop.
     fn for_in_statement(&mut self, f: &ox::ForInStatement) -> R<()> {
         self.push_scope();
-        let var_name = for_left_name(&f.left)?;
+        // Mirror for-of: `for (let k in …)` declares, `for (let [a,b] in …)`
+        // destructures, `for (k in …)` / `for (obj.k in …)` assigns to a target.
+        let decl_pat = match &f.left {
+            ox::ForStatementLeft::VariableDeclaration(d) => Some(&d.declarations[0].id),
+            _ => None,
+        };
+        let pattern =
+            decl_pat.filter(|p| !matches!(p, ox::BindingPattern::BindingIdentifier(_)));
+        let assign_tgt = f.left.as_assignment_target();
 
         let obj_reg = self.declare_local("<forin.obj>");
         let v = self.expr_into(&f.right, obj_reg)?;
@@ -2264,8 +2282,18 @@ impl<'a> FnCompiler<'a> {
         let idx_reg = self.declare_local("<forin.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
-        let var_reg = self.declare_local(&var_name);
-        let var_is_cell = self.cell_regs.contains(&var_reg);
+        let (var_reg, var_is_cell) = match (pattern, assign_tgt) {
+            (Some(p), _) => {
+                self.declare_pattern(p)?;
+                (0, false)
+            }
+            (None, Some(_)) => (0, false),
+            (None, None) => {
+                let var_name = for_left_name(&f.left)?;
+                let r = self.declare_local(&var_name);
+                (r, self.cell_regs.contains(&r))
+            }
+        };
 
         let top = self.here();
         let cond = self.temp();
@@ -2274,13 +2302,24 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::JumpIfFalse { cond, target: 0 });
         self.next_reg -= 1;
 
-        if var_is_cell {
-            // Per-iteration binding: a FRESH cell each iteration (for-in let).
-            self.emit(Instr::GetIndex { dst: var_reg, obj: keys_reg, key: idx_reg });
-            self.emit(Instr::MakeCell { reg: var_reg });
+        let save = self.next_reg;
+        // Read the current key into a temp (pattern / assignment target) or
+        // straight into the loop var (a per-iteration cell var is boxed after).
+        let key_dst = if pattern.is_some() || assign_tgt.is_some() {
+            self.alloc_reg()
         } else {
-            self.emit(Instr::GetIndex { dst: var_reg, obj: keys_reg, key: idx_reg });
+            var_reg
+        };
+        self.emit(Instr::GetIndex { dst: key_dst, obj: keys_reg, key: idx_reg });
+        if let Some(p) = pattern {
+            self.extract_pattern(p, key_dst)?;
+        } else if let Some(tgt) = assign_tgt {
+            self.assign_target(tgt, key_dst)?;
+        } else if var_is_cell {
+            // Per-iteration binding: a FRESH cell each iteration (for-in let).
+            self.emit(Instr::MakeCell { reg: var_reg });
         }
+        self.next_reg = save;
 
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
         self.stmt(&f.body)?;
