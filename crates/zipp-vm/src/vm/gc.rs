@@ -174,6 +174,9 @@ impl Vm<'_> {
         for v in self.template_raws.values() {
             root_val!(*v);
         }
+        for v in self.zdt_tz.values() {
+            root_val!(*v);
+        }
         for v in self.symbol_registry.values() {
             root_val!(*v);
         }
@@ -215,6 +218,7 @@ impl Vm<'_> {
         self.prototypes.retain(|&k, _| marks[k as usize]);
         self.fn_props.retain(|&k, _| marks[k as usize]);
         self.arr_props.retain(|&k, _| marks[k as usize]);
+        self.zdt_tz.retain(|&k, _| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
         let _ = free_before;

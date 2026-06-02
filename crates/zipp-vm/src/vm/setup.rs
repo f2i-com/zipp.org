@@ -1029,6 +1029,32 @@ impl<'p> Vm<'p> {
                 p.define("constructor", Value::heap(plainmonthday_ctor), method_attr);
                 p.define("@@toStringTag", pmdtag, fn_attr);
             }
+            // Temporal.ZonedDateTime
+            let zdt_methods: Vec<(&str, u16)> = native::ZONEDDATETIME_METHODS
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, native::ZDT_M_BASE + i as u16))
+                .collect();
+            let zoneddatetime_proto = build(self, &zdt_methods, None);
+            self.proto_of.insert(zoneddatetime_proto, Value::heap(obj_proto));
+            self.zoneddatetime_proto = zoneddatetime_proto;
+            let zdtfrom = Value::heap(self.heap.alloc(HeapObj::Native(native::ZDT_FROM)));
+            let zdtcompare = Value::heap(self.heap.alloc(HeapObj::Native(native::ZDT_COMPARE)));
+            let zdtname = self.alloc_str("ZonedDateTime".to_string());
+            let zdttag = self.alloc_str("Temporal.ZonedDateTime".to_string());
+            let mut zdtm = ObjMap::new();
+            zdtm.define("prototype", Value::heap(zoneddatetime_proto), proto_attr);
+            zdtm.define("from", zdtfrom, method_attr);
+            zdtm.define("compare", zdtcompare, method_attr);
+            zdtm.define("name", zdtname, fn_attr);
+            zdtm.define("length", Value::num(2.0), fn_attr);
+            zdtm.is_ctor = true;
+            let zoneddatetime_ctor = self.heap.alloc(HeapObj::Object(zdtm));
+            self.zoneddatetime_ctor = zoneddatetime_ctor;
+            if let HeapObj::Object(p) = self.heap.get_mut(zoneddatetime_proto) {
+                p.define("constructor", Value::heap(zoneddatetime_ctor), method_attr);
+                p.define("@@toStringTag", zdttag, fn_attr);
+            }
             // Temporal.Now (a namespace object, not a constructor).
             let nowtag = self.alloc_str("Temporal.Now".to_string());
             let mut nown = ObjMap::new();
@@ -1052,13 +1078,14 @@ impl<'p> Vm<'p> {
             tn.define("Instant", Value::heap(instant_ctor), method_attr);
             tn.define("PlainYearMonth", Value::heap(plainyearmonth_ctor), method_attr);
             tn.define("PlainMonthDay", Value::heap(plainmonthday_ctor), method_attr);
+            tn.define("ZonedDateTime", Value::heap(zoneddatetime_ctor), method_attr);
             tn.define("Now", Value::heap(now_ns), method_attr);
             self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
             // Register each Temporal type's field getters as accessor properties on
             // its prototype (the value still resolves via get_member's fast path;
             // this gives `getOwnPropertyDescriptor(Type.prototype, field).get` a real
             // function and brand-checks when invoked on the wrong receiver).
-            let temporal_getter_sets: [(u32, &[&str]); 7] = [
+            let temporal_getter_sets: [(u32, &[&str]); 8] = [
                 (self.duration_proto, native::TEMP_G_DURATION),
                 (self.plaindate_proto, native::TEMP_G_PLAINDATE),
                 (self.plaintime_proto, native::TEMP_G_PLAINTIME),
@@ -1066,6 +1093,7 @@ impl<'p> Vm<'p> {
                 (self.instant_proto, native::TEMP_G_INSTANT),
                 (self.plainyearmonth_proto, native::TEMP_G_PLAINYEARMONTH),
                 (self.plainmonthday_proto, native::TEMP_G_PLAINMONTHDAY),
+                (self.zoneddatetime_proto, native::TEMP_G_ZONEDDATETIME),
             ];
             let getter_attr = PropAttr {
                 writable: false,

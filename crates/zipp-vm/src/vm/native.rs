@@ -270,6 +270,17 @@ pub const PLAINMONTHDAY_METHODS: &[&str] = &[
 ];
 pub const PMD_M_BASE: u16 = 528;
 pub const PLAINMONTHDAY_FROM: u16 = 536;
+/// Temporal.ZonedDateTime.prototype methods at ZDT_M_BASE + index. Instance is
+/// HeapObj::Temporal kind 7, fields [epochNs hi, epochNs lo, offsetNanoseconds];
+/// the time-zone id is the heap string in `zdt_tz[idx]`.
+pub const ZONEDDATETIME_METHODS: &[&str] = &[
+    "with", "withPlainTime", "withTimeZone", "withCalendar", "add", "subtract", "until",
+    "since", "round", "equals", "toString", "toJSON", "toLocaleString", "valueOf",
+    "startOfDay", "toInstant", "toPlainDate", "toPlainTime", "toPlainDateTime", "getISOFields",
+];
+pub const ZDT_M_BASE: u16 = 600;
+pub const ZDT_FROM: u16 = 640;
+pub const ZDT_COMPARE: u16 = 641;
 /// Temporal.Now namespace methods.
 pub const NOW_INSTANT: u16 = 540;
 pub const NOW_PLAINDATETIME_ISO: u16 = 541;
@@ -338,7 +349,15 @@ pub const TEMPORAL_GETTER_FIELDS: &[&str] = &[
     "dayOfYear", "weekOfYear", "daysInWeek", "daysInMonth", "daysInYear", "monthsInYear",
     "inLeapYear", "monthCode", "calendarId", "hour", "minute", "second", "millisecond",
     "microsecond", "nanosecond", "epochMilliseconds", "epochNanoseconds", "epochSeconds",
-    "epochMicroseconds", "era", "eraYear",
+    "epochMicroseconds", "era", "eraYear", "timeZoneId", "offset", "offsetNanoseconds",
+    "hoursInDay",
+];
+pub const TEMP_G_ZONEDDATETIME: &[&str] = &[
+    "calendarId", "timeZoneId", "year", "month", "monthCode", "day", "hour", "minute",
+    "second", "millisecond", "microsecond", "nanosecond", "epochSeconds", "epochMilliseconds",
+    "epochMicroseconds", "epochNanoseconds", "dayOfWeek", "dayOfYear", "weekOfYear",
+    "hoursInDay", "daysInWeek", "daysInMonth", "daysInYear", "monthsInYear", "inLeapYear",
+    "offset", "offsetNanoseconds", "era", "eraYear",
 ];
 // Per-prototype getter sets (match the get_member field computations).
 pub const TEMP_G_DURATION: &[&str] = &[
@@ -531,11 +550,13 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         (INST_M_BASE, INSTANT_METHODS),
         (PYM_M_BASE, PLAINYEARMONTH_METHODS),
         (PMD_M_BASE, PLAINMONTHDAY_METHODS),
+        (ZDT_M_BASE, ZONEDDATETIME_METHODS),
     ] {
         if (base..base + methods.len() as u16).contains(&id) {
             let m = methods[(id - base) as usize];
             let len: u8 = match m {
-                "with" | "add" | "subtract" | "until" | "since" | "round" | "equals" => 1,
+                "with" | "add" | "subtract" | "until" | "since" | "round" | "equals"
+                | "withPlainTime" | "withTimeZone" | "withCalendar" => 1,
                 _ => 0,
             };
             return Some((m, len));
@@ -694,9 +715,11 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         // Temporal static methods: from (length 1), compare (length 2), and
         // Instant.fromEpoch* (length 1).
         TEMPORAL_DURATION_FROM | PLAINDATE_FROM | PLAINTIME_FROM | PLAINDATETIME_FROM
-        | INST_FROM | PLAINYEARMONTH_FROM | PLAINMONTHDAY_FROM => ("from", 1),
+        | INST_FROM | PLAINYEARMONTH_FROM | PLAINMONTHDAY_FROM | ZDT_FROM => ("from", 1),
         TEMPORAL_DURATION_COMPARE | PLAINDATE_COMPARE | PLAINTIME_COMPARE
-        | PLAINDATETIME_COMPARE | INST_COMPARE | PLAINYEARMONTH_COMPARE => ("compare", 2),
+        | PLAINDATETIME_COMPARE | INST_COMPARE | PLAINYEARMONTH_COMPARE | ZDT_COMPARE => {
+            ("compare", 2)
+        }
         INST_FROM_EPOCH_MS => ("fromEpochMilliseconds", 1),
         INST_FROM_EPOCH_NS => ("fromEpochNanoseconds", 1),
         INST_FROM_EPOCH_SEC => ("fromEpochSeconds", 1),

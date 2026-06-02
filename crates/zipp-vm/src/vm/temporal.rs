@@ -120,6 +120,7 @@ impl<'p> Vm<'p> {
             HeapObj::Temporal { kind: 4, .. } => self.instant_method(idx, name, args),
             HeapObj::Temporal { kind: 5, .. } => self.plain_year_month_method(idx, name, args),
             HeapObj::Temporal { kind: 6, .. } => self.plain_month_day_method(idx, name, args),
+            HeapObj::Temporal { kind: 7, .. } => self.zoned_date_time_method(idx, name, args),
             _ => Ok(None),
         }
     }
@@ -1056,6 +1057,107 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `new Temporal.ZonedDateTime(epochNanoseconds, timeZone[, calendar])`. The
+    /// instant is `fields = [ns hi, ns lo, offsetNanoseconds]` and the time-zone id
+    /// is held in `zdt_tz` (GC-traced). Stage 1: UTC + numeric-offset zones carry a
+    /// real offset; a named zone is accepted with offset 0 (no tz database yet).
+    pub(crate) fn make_zoned_date_time(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let _gc = self.gc_lock_guard();
+        let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+        if ns.abs() > 8_640_000_000_000_000_000_000 {
+            return Err(Thrown("RangeError: ZonedDateTime outside the supported range".into()));
+        }
+        let tzarg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        if tzarg == Value::UNDEFINED {
+            return Err(Thrown("TypeError: Temporal.ZonedDateTime requires a time zone".into()));
+        }
+        let tzstr = self.to_js_string(tzarg)?;
+        let (id, offset_ns) = parse_time_zone(&tzstr)
+            .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{tzstr}\"")))?;
+        let hi = (ns >> 64) as i64;
+        let lo = ns as i64;
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 7, fields: vec![hi, lo, offset_ns] });
+        if self.zoneddatetime_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.zoneddatetime_proto));
+        }
+        let idv = self.alloc_str(id);
+        self.zdt_tz.insert(idx, idv);
+        Ok(Value::heap(idx))
+    }
+
+    /// The epoch nanoseconds of a ZonedDateTime instance.
+    pub(crate) fn zdt_epoch_ns(&self, idx: u32) -> Option<i128> {
+        match self.heap.get(idx) {
+            HeapObj::Temporal { kind: 7, fields } => {
+                Some(((fields[0] as i128) << 64) | ((fields[1] as u64) as i128))
+            }
+            _ => None,
+        }
+    }
+
+    /// The UTC offset (nanoseconds) of a ZonedDateTime instance.
+    pub(crate) fn zdt_offset_ns(&self, idx: u32) -> i64 {
+        match self.heap.get(idx) {
+            HeapObj::Temporal { kind: 7, fields } => fields.get(2).copied().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// Local broadcast wall-clock fields [y,mo,d,h,mi,s,ms,us,ns] for a ZDT.
+    pub(crate) fn zdt_local(&self, idx: u32) -> [i64; 9] {
+        let epoch = self.zdt_epoch_ns(idx).unwrap_or(0);
+        let local = epoch + self.zdt_offset_ns(idx) as i128;
+        let days = local.div_euclid(DAY_NS) as i64;
+        let (y, mo, d) = epoch_days_to_iso(days);
+        let t = ns_to_time(local.rem_euclid(DAY_NS));
+        [y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]]
+    }
+
+    /// `Temporal.ZonedDateTime.prototype` methods (stage 1: valueOf throws,
+    /// toJSON/toString format; arithmetic not yet implemented).
+    pub(crate) fn zoned_date_time_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        _args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        match name {
+            "valueOf" => Err(Thrown(
+                "TypeError: Called Temporal.ZonedDateTime.prototype.valueOf which always throws"
+                    .into(),
+            )),
+            "toString" | "toJSON" | "toLocaleString" => {
+                let s = self.zdt_to_string(idx);
+                Ok(Some(self.alloc_str(s)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// ISO string for a ZonedDateTime: `YYYY-MM-DDTHH:MM:SS<offset>[<tzid>]`.
+    pub(crate) fn zdt_to_string(&self, idx: u32) -> String {
+        let f = self.zdt_local(idx);
+        let off = self.zdt_offset_ns(idx);
+        let offset = format_offset(off);
+        let tz = self
+            .zdt_tz
+            .get(&idx)
+            .and_then(|v| self.heap.str_cow(v.heap_index()).map(|s| s.into_owned()))
+            .unwrap_or_else(|| "UTC".to_string());
+        let mut frac = String::new();
+        let sub = f[6] * 1_000_000 + f[7] * 1_000 + f[8];
+        if sub != 0 {
+            frac = format!(".{:09}", sub);
+            while frac.ends_with('0') {
+                frac.pop();
+            }
+        }
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{}[{}]",
+            f[0], f[1], f[2], f[3], f[4], f[5], frac, offset, tz
+        )
+    }
+
     pub(crate) fn to_instant_ns(&mut self, v: Value) -> Result<i128, Thrown> {
         if v.is_heap() {
             if let Some(ns) = self.instant_ns(v.heap_index()) {
@@ -1416,4 +1518,47 @@ impl<'p> Vm<'p> {
 
     // ── Intl ──
 
+}
+
+/// Parse a Temporal time-zone argument into a (normalized id, offset-ns) pair.
+/// Stage 1: "UTC" and numeric offsets (±HH:MM[:SS]) carry a real offset; a named
+/// IANA-style id ("Area/Location") is accepted with offset 0 (no tz database yet).
+fn parse_time_zone(s: &str) -> Option<(String, i64)> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if t.eq_ignore_ascii_case("UTC") {
+        return Some(("UTC".to_string(), 0));
+    }
+    let b = t.as_bytes();
+    if b[0] == b'+' || b[0] == b'-' {
+        let sign: i64 = if b[0] == b'-' { -1 } else { 1 };
+        let parts: Vec<&str> = t[1..].split(':').collect();
+        let hh: i64 = parts.first()?.parse().ok()?;
+        let mm: i64 = parts.get(1).map_or(Some(0), |p| p.parse().ok())?;
+        let ss: i64 = parts.get(2).map_or(Some(0), |p| p.parse().ok())?;
+        if hh > 23 || mm > 59 || ss > 59 {
+            return None;
+        }
+        let off = sign * (hh * 3600 + mm * 60 + ss) * 1_000_000_000;
+        return Some((t.to_string(), off));
+    }
+    // A named zone like "America/New_York" or "Europe/London": accept the id.
+    if t.contains('/') || t.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
+        return Some((t.to_string(), 0));
+    }
+    None
+}
+
+/// Format a UTC offset (nanoseconds) as `±HH:MM` (or `±HH:MM:SS` when needed).
+fn format_offset(ns: i64) -> String {
+    let sign = if ns < 0 { '-' } else { '+' };
+    let total = ns.abs() / 1_000_000_000;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if s == 0 {
+        format!("{sign}{h:02}:{m:02}")
+    } else {
+        format!("{sign}{h:02}:{m:02}:{s:02}")
+    }
 }

@@ -102,6 +102,9 @@ impl<'p> Vm<'p> {
             };
             return self.make_plain_month_day(m, d, ry);
         }
+        if ci == self.zoneddatetime_ctor && ci != 0 {
+            return self.make_zoned_date_time(args);
+        }
         // Intl.<service> constructors.
         if self.intl_ctors[0] != 0 {
             if let Some(kind) = self.intl_ctors.iter().position(|&c| c == ci) {

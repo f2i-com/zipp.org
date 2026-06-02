@@ -258,6 +258,13 @@ pub struct Vm<'p> {
     plainyearmonth_proto: u32,
     plainmonthday_ctor: u32,
     plainmonthday_proto: u32,
+    zoneddatetime_ctor: u32,
+    zoneddatetime_proto: u32,
+    /// `Temporal.ZonedDateTime` time-zone id per instance heap index (the id is a
+    /// heap string, kept here so it's GC-traced — the `Temporal{fields:Vec<i64>}`
+    /// layout can't hold a heap reference). The instance's `fields` are
+    /// `[epochNs hi, epochNs lo, offsetNanoseconds]`.
+    zdt_tz: std::collections::HashMap<u32, Value>,
     intl_ns: u32,
     intl_ctors: [u32; 10],
     intl_protos: [u32; 10],

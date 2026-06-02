@@ -1640,6 +1640,25 @@ impl<'p> Vm<'p> {
                 }
                 self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
             }
+            _ if (ZDT_M_BASE..ZDT_M_BASE + ZONEDDATETIME_METHODS.len() as u16).contains(&id) => {
+                let m = ZONEDDATETIME_METHODS[(id - ZDT_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 7, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.ZonedDateTime.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                match self.temporal_method(this.heap_index(), m, args)? {
+                    Some(v) => v,
+                    None => {
+                        return Err(Thrown(format!(
+                            "TypeError: Temporal.ZonedDateTime.prototype.{m} is not yet supported"
+                        )))
+                    }
+                }
+            }
             PLAINMONTHDAY_FROM => {
                 let reject = self.read_overflow(a1)?;
                 let (ry, m, d) = self.to_plain_month_day_overflow(a0, reject)?;

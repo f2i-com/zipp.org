@@ -948,6 +948,61 @@ impl<'p> Vm<'p> {
                 _ => self.proto_member(self.plainmonthday_proto, key),
             });
         }
+        // Temporal.ZonedDateTime getters; methods via the prototype.
+        if let HeapObj::Temporal { kind: 7, .. } = self.heap.get(obj.heap_index()) {
+            let idx = obj.heap_index();
+            let f = self.zdt_local(idx); // [y,mo,d,h,mi,s,ms,us,ns]
+            let (y, m, d) = (f[0], f[1], f[2]);
+            let epoch = self.zdt_epoch_ns(idx).unwrap_or(0);
+            let off = self.zdt_offset_ns(idx);
+            return Ok(match key {
+                "year" => Value::num(y as f64),
+                "month" => Value::num(m as f64),
+                "day" => Value::num(d as f64),
+                "hour" => Value::num(f[3] as f64),
+                "minute" => Value::num(f[4] as f64),
+                "second" => Value::num(f[5] as f64),
+                "millisecond" => Value::num(f[6] as f64),
+                "microsecond" => Value::num(f[7] as f64),
+                "nanosecond" => Value::num(f[8] as f64),
+                "dayOfWeek" => Value::num(iso_day_of_week(y, m, d) as f64),
+                "dayOfYear" => {
+                    Value::num((iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1) as f64)
+                }
+                "weekOfYear" => Value::num(iso_week_of_year(y, m, d) as f64),
+                "daysInMonth" => Value::num(days_in_month(y, m) as f64),
+                "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
+                "daysInWeek" => Value::num(7.0),
+                "monthsInYear" => Value::num(12.0),
+                "hoursInDay" => Value::num(24.0),
+                "inLeapYear" => Value::bool(is_leap_year(y)),
+                "monthCode" => self.alloc_str(format!("M{m:02}")),
+                "calendarId" => self.alloc_str("iso8601".to_string()),
+                "era" | "eraYear" => Value::UNDEFINED,
+                "epochSeconds" => Value::num((epoch / 1_000_000_000) as f64),
+                "epochMilliseconds" => Value::num((epoch / 1_000_000) as f64),
+                "epochMicroseconds" => self.make_bigint(epoch / 1_000),
+                "epochNanoseconds" => self.make_bigint(epoch),
+                "offsetNanoseconds" => Value::num(off as f64),
+                "offset" => {
+                    let sign = if off < 0 { '-' } else { '+' };
+                    let tot = off.abs() / 1_000_000_000;
+                    let (h, mi, s) = (tot / 3600, (tot % 3600) / 60, tot % 60);
+                    let str = if s == 0 {
+                        format!("{sign}{h:02}:{mi:02}")
+                    } else {
+                        format!("{sign}{h:02}:{mi:02}:{s:02}")
+                    };
+                    self.alloc_str(str)
+                }
+                "timeZoneId" => self
+                    .zdt_tz
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or_else(|| Value::UNDEFINED),
+                _ => self.proto_member(self.zoneddatetime_proto, key),
+            });
+        }
         // Intl.* instance: resolve the key on its prototype chain (service proto →
         // Object.prototype), invoking accessor getters (Locale subtags, format/
         // compare) with this = the instance.
