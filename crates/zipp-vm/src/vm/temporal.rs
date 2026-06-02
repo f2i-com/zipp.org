@@ -1203,7 +1203,17 @@ impl<'p> Vm<'p> {
         };
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "toString" | "toJSON" => Ok(Some(self.alloc_str(year_month_string(y, m)))),
+            "toJSON" => Ok(Some(self.alloc_str(year_month_string(y, m)))),
+            "toString" => {
+                // calendarName "always"/"critical" includes the reference ISO day.
+                let suf = self.calendar_name_suffix(a0)?;
+                let s = if suf.is_empty() {
+                    year_month_string(y, m)
+                } else {
+                    format!("{}{}", iso_date_string(y, m, _ref), suf)
+                };
+                Ok(Some(self.alloc_str(s)))
+            }
             "valueOf" => {
                 Err(Thrown("TypeError: Called Temporal.PlainYearMonth.prototype.valueOf".into()))
             }
@@ -1335,7 +1345,17 @@ impl<'p> Vm<'p> {
         };
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "toString" | "toJSON" => Ok(Some(self.alloc_str(format!("{m:02}-{d:02}")))),
+            "toJSON" => Ok(Some(self.alloc_str(format!("{m:02}-{d:02}")))),
+            "toString" => {
+                // calendarName "always"/"critical" includes the reference ISO year.
+                let suf = self.calendar_name_suffix(a0)?;
+                let s = if suf.is_empty() {
+                    format!("{m:02}-{d:02}")
+                } else {
+                    format!("{}{}", iso_date_string(ry, m, d), suf)
+                };
+                Ok(Some(self.alloc_str(s)))
+            }
             "valueOf" => {
                 Err(Thrown("TypeError: Called Temporal.PlainMonthDay.prototype.valueOf".into()))
             }
