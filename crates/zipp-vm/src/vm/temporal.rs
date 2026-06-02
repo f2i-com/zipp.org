@@ -185,7 +185,34 @@ impl<'p> Vm<'p> {
 
     /// ToTemporalDate: a PlainDate clones; a string parses; an object reads year/
     /// month/day (PlainDateTime also has these — accepted).
+    /// Read the `overflow` option: false = "constrain" (the default), true =
+    /// "reject". Any other value is a RangeError.
+    pub(crate) fn read_overflow(&mut self, options: Value) -> Result<bool, Thrown> {
+        if options == Value::UNDEFINED {
+            return Ok(false);
+        }
+        let v = self.get_prop(options, "overflow")?;
+        if v == Value::UNDEFINED {
+            return Ok(false);
+        }
+        match self.to_js_string(v)?.as_str() {
+            "constrain" => Ok(false),
+            "reject" => Ok(true),
+            other => Err(Thrown(format!("RangeError: invalid overflow value: {other}"))),
+        }
+    }
+
     pub(crate) fn to_plain_date(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
+        self.to_plain_date_overflow(v, false)
+    }
+
+    /// ToTemporalDate with an overflow mode (constrain clamps; reject throws on
+    /// out-of-range fields). A real PlainDate clones; a string parses.
+    pub(crate) fn to_plain_date_overflow(
+        &mut self,
+        v: Value,
+        reject: bool,
+    ) -> Result<(i64, i64, i64), Thrown> {
         if v.is_heap() {
             if let Some(t) = self.plain_date_fields(v.heap_index()) {
                 return Ok(t);
@@ -202,10 +229,15 @@ impl<'p> Vm<'p> {
                 if yv == Value::UNDEFINED || mv == Value::UNDEFINED || dv == Value::UNDEFINED {
                     return Err(Thrown("TypeError: PlainDate-like requires year, month, day".into()));
                 }
-                let (y, m, d) =
+                let (y, mut m, mut d) =
                     (self.to_number(yv)? as i64, self.to_number(mv)? as i64, self.to_number(dv)? as i64);
-                if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
-                    return Err(Thrown("RangeError: invalid date fields".into()));
+                if reject {
+                    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+                        return Err(Thrown("RangeError: invalid date fields".into()));
+                    }
+                } else {
+                    m = m.clamp(1, 12);
+                    d = d.clamp(1, days_in_month(y, m));
                 }
                 return Ok((y, m, d));
             }
@@ -244,9 +276,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool((y, m, d) == other)))
             }
             "with" => {
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let ny = self.opt_int_field(a0, "year")?.unwrap_or(y);
-                let nm = self.opt_int_field(a0, "month")?.unwrap_or(m);
-                let nd = self.opt_int_field(a0, "day")?.unwrap_or(d);
+                let mut nm = self.opt_int_field(a0, "month")?.unwrap_or(m);
+                let mut nd = self.opt_int_field(a0, "day")?.unwrap_or(d);
+                if !reject {
+                    nm = nm.clamp(1, 12);
+                    nd = nd.clamp(1, days_in_month(ny, nm));
+                }
                 Ok(Some(self.make_plain_date(ny, nm, nd)?))
             }
             "add" | "subtract" => {
@@ -337,6 +374,14 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn to_plain_time(&mut self, v: Value) -> Result<[i64; 6], Thrown> {
+        self.to_plain_time_overflow(v, false)
+    }
+
+    pub(crate) fn to_plain_time_overflow(
+        &mut self,
+        v: Value,
+        reject: bool,
+    ) -> Result<[i64; 6], Thrown> {
         if v.is_heap() {
             if let Some(f) = self.plain_time_fields(v.heap_index()) {
                 return Ok(f);
@@ -349,10 +394,18 @@ impl<'p> Vm<'p> {
             if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
                 let names =
                     ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+                let maxes = [23, 59, 59, 999, 999, 999];
                 let mut f = [0i64; 6];
                 for (i, nm) in names.iter().enumerate() {
                     if let Some(x) = self.opt_int_field(v, nm)? {
-                        f[i] = x;
+                        if reject {
+                            if x < 0 || x > maxes[i] {
+                                return Err(Thrown(format!("RangeError: {nm} out of range")));
+                            }
+                            f[i] = x;
+                        } else {
+                            f[i] = x.clamp(0, maxes[i]);
+                        }
                     }
                 }
                 return Ok(f);
@@ -375,13 +428,15 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool(f == o)))
             }
             "with" => {
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let names =
                     ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+                let maxes = [23, 59, 59, 999, 999, 999];
                 let mut nf = f;
                 let mut any = false;
                 for (i, nm) in names.iter().enumerate() {
                     if let Some(x) = self.opt_int_field(a0, nm)? {
-                        nf[i] = x;
+                        nf[i] = if reject { x } else { x.clamp(0, maxes[i]) };
                         any = true;
                     }
                 }
@@ -488,6 +543,14 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn to_plain_date_time(&mut self, v: Value) -> Result<[i64; 9], Thrown> {
+        self.to_plain_date_time_overflow(v, false)
+    }
+
+    pub(crate) fn to_plain_date_time_overflow(
+        &mut self,
+        v: Value,
+        reject: bool,
+    ) -> Result<[i64; 9], Thrown> {
         if v.is_heap() {
             if let Some(f) = self.pdt_fields(v.heap_index()) {
                 return Ok(f);
@@ -518,6 +581,24 @@ impl<'p> Vm<'p> {
                 if !have_date.iter().all(|&b| b) {
                     return Err(Thrown("TypeError: PlainDateTime-like requires year, month, day".into()));
                 }
+                // date: month/day; time: hour..nanosecond (maxes 23/59/59/999/999/999).
+                let maxes = [23, 59, 59, 999, 999, 999];
+                if reject {
+                    if !(1..=12).contains(&f[1]) || f[2] < 1 || f[2] > days_in_month(f[0], f[1]) {
+                        return Err(Thrown("RangeError: invalid date fields".into()));
+                    }
+                    for (i, &mx) in maxes.iter().enumerate() {
+                        if f[3 + i] < 0 || f[3 + i] > mx {
+                            return Err(Thrown("RangeError: time field out of range".into()));
+                        }
+                    }
+                } else {
+                    f[1] = f[1].clamp(1, 12);
+                    f[2] = f[2].clamp(1, days_in_month(f[0], f[1]));
+                    for (i, &mx) in maxes.iter().enumerate() {
+                        f[3 + i] = f[3 + i].clamp(0, mx);
+                    }
+                }
                 return Ok(f);
             }
         }
@@ -547,6 +628,7 @@ impl<'p> Vm<'p> {
             "toPlainDate" => Ok(Some(self.make_plain_date(date[0], date[1], date[2])?)),
             "toPlainTime" => Ok(Some(self.make_plain_time(time)?)),
             "with" => {
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let names = [
                     "year", "month", "day", "hour", "minute", "second", "millisecond",
                     "microsecond", "nanosecond",
@@ -561,6 +643,14 @@ impl<'p> Vm<'p> {
                 }
                 if !any {
                     return Err(Thrown("TypeError: with() requires a partial object".into()));
+                }
+                if !reject {
+                    nf[1] = nf[1].clamp(1, 12);
+                    nf[2] = nf[2].clamp(1, days_in_month(nf[0], nf[1]));
+                    let maxes = [23, 59, 59, 999, 999, 999];
+                    for (i, &mx) in maxes.iter().enumerate() {
+                        nf[3 + i] = nf[3 + i].clamp(0, mx);
+                    }
                 }
                 Ok(Some(self.make_plain_date_time(nf)?))
             }
@@ -781,6 +871,14 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn to_plain_year_month(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
+        self.to_plain_year_month_overflow(v, false)
+    }
+
+    pub(crate) fn to_plain_year_month_overflow(
+        &mut self,
+        v: Value,
+        reject: bool,
+    ) -> Result<(i64, i64, i64), Thrown> {
         if v.is_heap() {
             if let Some(t) = self.pym_fields(v.heap_index()) {
                 return Ok(t);
@@ -799,9 +897,13 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let y = self.to_number(yv)? as i64;
-                let m = m.unwrap();
-                if !(1..=12).contains(&m) {
-                    return Err(Thrown("RangeError: month out of range".into()));
+                let mut m = m.unwrap();
+                if reject {
+                    if !(1..=12).contains(&m) {
+                        return Err(Thrown("RangeError: month out of range".into()));
+                    }
+                } else {
+                    m = m.clamp(1, 12);
                 }
                 return Ok((y, m, 1));
             }
@@ -840,8 +942,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool((y, m) == (o.0, o.1))))
             }
             "with" => {
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let ny = self.opt_int_field(a0, "year")?.unwrap_or(y);
-                let nm = self.read_month_field(a0)?.unwrap_or(m);
+                let mut nm = self.read_month_field(a0)?.unwrap_or(m);
+                if !reject {
+                    nm = nm.clamp(1, 12);
+                }
                 Ok(Some(self.make_plain_year_month(ny, nm, 1)?))
             }
             "add" | "subtract" => {
@@ -906,6 +1012,14 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn to_plain_month_day(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
+        self.to_plain_month_day_overflow(v, false)
+    }
+
+    pub(crate) fn to_plain_month_day_overflow(
+        &mut self,
+        v: Value,
+        reject: bool,
+    ) -> Result<(i64, i64, i64), Thrown> {
         if v.is_heap() {
             if let Some(t) = self.pmd_fields(v.heap_index()) {
                 return Ok(t);
@@ -923,10 +1037,15 @@ impl<'p> Vm<'p> {
                         "TypeError: PlainMonthDay-like requires month and day".into(),
                     ));
                 }
-                let m = m.unwrap();
-                let d = self.to_number(dv)? as i64;
-                if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
-                    return Err(Thrown("RangeError: month-day out of range".into()));
+                let mut m = m.unwrap();
+                let mut d = self.to_number(dv)? as i64;
+                if reject {
+                    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
+                        return Err(Thrown("RangeError: month-day out of range".into()));
+                    }
+                } else {
+                    m = m.clamp(1, 12);
+                    d = d.clamp(1, days_in_month(1972, m));
                 }
                 return Ok((1972, m, d));
             }
@@ -955,8 +1074,13 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool((ry, m, d) == o)))
             }
             "with" => {
-                let nm = self.read_month_field(a0)?.unwrap_or(m);
-                let nd = self.opt_int_field(a0, "day")?.unwrap_or(d);
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let mut nm = self.read_month_field(a0)?.unwrap_or(m);
+                let mut nd = self.opt_int_field(a0, "day")?.unwrap_or(d);
+                if !reject {
+                    nm = nm.clamp(1, 12);
+                    nd = nd.clamp(1, days_in_month(ry, nm));
+                }
                 Ok(Some(self.make_plain_month_day(nm, nd, ry)?))
             }
             "toPlainDate" => {

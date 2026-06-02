@@ -826,7 +826,8 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
             }
             PLAINDATE_FROM => {
-                let (y, m, d) = self.to_plain_date(a0)?;
+                let reject = self.read_overflow(a1)?;
+                let (y, m, d) = self.to_plain_date_overflow(a0, reject)?;
                 self.make_plain_date(y, m, d)?
             }
             PLAINDATE_COMPARE => {
@@ -849,7 +850,8 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
             }
             PLAINTIME_FROM => {
-                let f = self.to_plain_time(a0)?;
+                let reject = self.read_overflow(a1)?;
+                let f = self.to_plain_time_overflow(a0, reject)?;
                 self.make_plain_time(f)?
             }
             PLAINTIME_COMPARE => {
@@ -871,7 +873,8 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
             }
             PLAINDATETIME_FROM => {
-                let f = self.to_plain_date_time(a0)?;
+                let reject = self.read_overflow(a1)?;
+                let f = self.to_plain_date_time_overflow(a0, reject)?;
                 self.make_plain_date_time(f)?
             }
             PLAINDATETIME_COMPARE => {
@@ -933,7 +936,8 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
             }
             PLAINYEARMONTH_FROM => {
-                let (y, m, rd) = self.to_plain_year_month(a0)?;
+                let reject = self.read_overflow(a1)?;
+                let (y, m, rd) = self.to_plain_year_month_overflow(a0, reject)?;
                 self.make_plain_year_month(y, m, rd)?
             }
             PLAINYEARMONTH_COMPARE => {
@@ -956,7 +960,8 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
             }
             PLAINMONTHDAY_FROM => {
-                let (ry, m, d) = self.to_plain_month_day(a0)?;
+                let reject = self.read_overflow(a1)?;
+                let (ry, m, d) = self.to_plain_month_day_overflow(a0, reject)?;
                 self.make_plain_month_day(m, d, ry)?
             }
             // Temporal.Now — no timezone DB, so everything reports UTC.
