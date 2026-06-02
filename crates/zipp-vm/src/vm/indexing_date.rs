@@ -272,7 +272,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn date_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         let ms = match self.heap.get(idx) {
             HeapObj::Date(m) => *m,
-            _ => return Ok(None),
+            // thisTimeValue brand check: every Date.prototype method requires a
+            // Date receiver (reached here only via the method-as-value path with a
+            // non-Date `this`; the direct dispatch already matched HeapObj::Date).
+            _ => return Err(Thrown("TypeError: this is not a Date object".into())),
         };
         let p = date_parts(ms); // (year, month0, day, hour, min, sec, ms, weekday)
         let field = |v: i64| if ms.is_nan() { Value::num(f64::NAN) } else { Value::num(v as f64) };

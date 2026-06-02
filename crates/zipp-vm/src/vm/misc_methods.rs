@@ -81,11 +81,29 @@ impl<'p> Vm<'p> {
     /// for an unrecognised name (the caller then treats it as a missing property
     /// → TypeError, matching JS).
     pub(crate) fn number_method(&mut self, recv: Value, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
-        let n = recv.as_f64();
+        // thisNumberValue brand check: a Number primitive uses its value; the
+        // Number.prototype object itself has [[NumberData]] = +0; anything else
+        // (a String/object via `Number.prototype.toString.call(x)`) is a TypeError.
+        let n = if recv.is_number() {
+            recv.as_f64()
+        } else if recv.is_heap() && recv.heap_index() == self.num_proto {
+            0.0
+        } else {
+            return Err(Thrown(
+                "TypeError: Number.prototype method called on a non-Number".into(),
+            ));
+        };
+        let nv = if recv.is_number() { recv } else { Value::num(n) };
+        // ToIntegerOrInfinity(ToNumber(arg)): coerce (valueOf/string), truncate;
+        // NaN -> 0. Absent arg behaves as `undefined` -> NaN -> 0.
+        let mut int_arg = |vm: &mut Self, i: usize| -> Result<f64, Thrown> {
+            let raw = vm.to_number_coerce(args.get(i).copied().unwrap_or(Value::UNDEFINED))?;
+            Ok(if raw.is_nan() { 0.0 } else { raw.trunc() })
+        };
         match name {
             "toFixed" => {
-                let d = args.first().map(|a| a.as_f64()).unwrap_or(0.0);
-                if !d.is_finite() || d < 0.0 || d > 100.0 {
+                let d = int_arg(self, 0)?;
+                if d < 0.0 || d > 100.0 {
                     return Err(Thrown(
                         "RangeError: toFixed() digits argument must be between 0 and 100".into(),
                     ));
@@ -93,34 +111,34 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(to_fixed(n, d as usize))))
             }
             "toString" => {
-                // An absent/undefined radix defaults to 10; otherwise it must be 2..36.
+                // An absent/undefined radix defaults to 10; otherwise it is
+                // ToIntegerOrInfinity(ToNumber(radix)) and must be 2..36.
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if arg == Value::UNDEFINED {
-                    return Ok(Some(self.alloc_str(self.display(recv))));
+                    return Ok(Some(self.alloc_str(self.display(nv))));
                 }
-                let rf = arg.as_f64();
-                let r = if rf.is_nan() { 0i64 } else { rf.trunc() as i64 };
+                let r = int_arg(self, 0)? as i64;
                 if !(2..=36).contains(&r) {
                     return Err(Thrown(
                         "RangeError: toString() radix must be between 2 and 36".into(),
                     ));
                 }
                 if r == 10 {
-                    Ok(Some(self.alloc_str(self.display(recv))))
+                    Ok(Some(self.alloc_str(self.display(nv))))
                 } else {
                     Ok(Some(self.alloc_str(num_to_radix(n, r as u32))))
                 }
             }
-            "valueOf" => Ok(Some(recv)),
+            "valueOf" => Ok(Some(nv)),
             // No Intl: toLocaleString() behaves like the default base-10 toString().
-            "toLocaleString" => Ok(Some(self.alloc_str(self.display(recv)))),
+            "toLocaleString" => Ok(Some(self.alloc_str(self.display(nv)))),
             "toExponential" => {
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let digits = if arg == Value::UNDEFINED {
                     None
                 } else {
-                    let d = arg.as_f64();
-                    if !d.is_finite() || d < 0.0 || d > 100.0 {
+                    let d = int_arg(self, 0)?;
+                    if d < 0.0 || d > 100.0 {
                         return Err(Thrown(
                             "RangeError: toExponential() argument must be between 0 and 100".into(),
                         ));
@@ -132,10 +150,10 @@ impl<'p> Vm<'p> {
             "toPrecision" => {
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if arg == Value::UNDEFINED {
-                    return Ok(Some(self.alloc_str(self.display(recv))));
+                    return Ok(Some(self.alloc_str(self.display(nv))));
                 }
-                let p = arg.as_f64();
-                if !p.is_finite() || p < 1.0 || p > 100.0 {
+                let p = int_arg(self, 0)?;
+                if p < 1.0 || p > 100.0 {
                     return Err(Thrown(
                         "RangeError: toPrecision() argument must be between 1 and 100".into(),
                     ));
