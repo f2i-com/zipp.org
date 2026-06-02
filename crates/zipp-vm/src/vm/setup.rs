@@ -101,9 +101,28 @@ impl<'p> Vm<'p> {
                 ("valueOf", PROTO_VALUE_OF),
                 ("toString", PROTO_TO_STRING),
                 ("toLocaleString", PROTO_TO_LOCALE_STRING),
+                ("__defineGetter__", OBJPROTO_DEFINE_GETTER),
+                ("__defineSetter__", OBJPROTO_DEFINE_SETTER),
+                ("__lookupGetter__", OBJPROTO_LOOKUP_GETTER),
+                ("__lookupSetter__", OBJPROTO_LOOKUP_SETTER),
             ],
             None,
         );
+        // `Object.prototype.__proto__` is an accessor (get/set the prototype).
+        {
+            let pg = Value::heap(self.heap.alloc(HeapObj::Native(OBJPROTO_PROTO_GET)));
+            let ps = Value::heap(self.heap.alloc(HeapObj::Native(OBJPROTO_PROTO_SET)));
+            let acc = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: ps,
+            };
+            if let HeapObj::Object(m) = self.heap.get_mut(self.obj_proto) {
+                m.define("__proto__", pg, acc);
+            }
+        }
         self.fn_proto = build(
             self,
             &[("call", FN_CALL), ("apply", FN_APPLY), ("bind", FN_BIND)],

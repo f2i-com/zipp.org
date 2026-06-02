@@ -670,6 +670,34 @@ impl<'p> Vm<'p> {
                 Value::NULL
             }
             DOLLAR262_GC => Value::UNDEFINED,
+            // Object.prototype Annex-B accessor helpers.
+            OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {
+                if !self.is_callable(a1) {
+                    return Err(Thrown(
+                        "TypeError: Object.prototype.__define[GS]etter__: expecting a function".into(),
+                    ));
+                }
+                let key = self.key_of(a0);
+                let mut d = ObjMap::new();
+                d.set(if id == OBJPROTO_DEFINE_GETTER { "get" } else { "set" }, a1);
+                d.set("enumerable", Value::bool(true));
+                d.set("configurable", Value::bool(true));
+                let desc = Value::heap(self.heap.alloc(HeapObj::Object(d)));
+                self.object_define_property(this, &key, desc)?;
+                Value::UNDEFINED
+            }
+            OBJPROTO_LOOKUP_GETTER | OBJPROTO_LOOKUP_SETTER => {
+                let key = self.key_of(a0);
+                self.lookup_accessor(this, &key, id == OBJPROTO_LOOKUP_SETTER)
+            }
+            OBJPROTO_PROTO_GET => self.object_get_prototype_of(this),
+            OBJPROTO_PROTO_SET => {
+                // Only an object or null changes the prototype; primitives are ignored.
+                if this.is_heap() && (self.is_object_value(a0) || a0 == Value::NULL) {
+                    self.proto_of.insert(this.heap_index(), a0);
+                }
+                Value::UNDEFINED
+            }
             ITER_TAG_GET => self.alloc_str("Iterator".to_string()),
             ITER_TAG_SET => {
                 if this.is_heap() && this.heap_index() == self.iterator_proto_root {

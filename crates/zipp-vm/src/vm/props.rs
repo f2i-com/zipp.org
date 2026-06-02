@@ -202,6 +202,32 @@ impl<'p> Vm<'p> {
     /// `Object.getPrototypeOf(obj)` — the prototype: a class instance's is its
     /// class's `.prototype`; an `Object.create`d object's is the recorded proto;
     /// otherwise `null` (a plain object's real `Object.prototype` isn't modelled).
+    /// Walk `this`'s prototype chain for an own accessor property `key`, returning
+    /// its getter (or setter if `want_setter`). Stops at the first own property
+    /// (returning undefined for a data property). Backs `__lookupGetter__`/Setter.
+    pub(crate) fn lookup_accessor(&mut self, this: Value, key: &str, want_setter: bool) -> Value {
+        let mut cur = this;
+        for _ in 0..10_000 {
+            if !cur.is_heap() {
+                break;
+            }
+            if let HeapObj::Object(m) = self.heap.get(cur.heap_index()) {
+                if let Some(i) = m.pos(key) {
+                    let attr = m.attrs[i];
+                    if attr.accessor {
+                        return if want_setter { attr.setter } else { m.vals[i] };
+                    }
+                    return Value::UNDEFINED;
+                }
+            }
+            cur = self.object_get_prototype_of(cur);
+            if cur == Value::NULL {
+                break;
+            }
+        }
+        Value::UNDEFINED
+    }
+
     pub(crate) fn object_get_prototype_of(&mut self, obj: Value) -> Value {
         if !obj.is_heap() {
             return Value::NULL;

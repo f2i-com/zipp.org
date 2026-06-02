@@ -100,6 +100,13 @@ pub const ITER_CTOR_SET: u16 = 617;
 // The test262 `$262` host object.
 pub const DOLLAR262_DETACH: u16 = 620;
 pub const DOLLAR262_GC: u16 = 621;
+// Object.prototype Annex-B accessor helpers + __proto__.
+pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
+pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
+pub const OBJPROTO_LOOKUP_GETTER: u16 = 624;
+pub const OBJPROTO_LOOKUP_SETTER: u16 = 625;
+pub const OBJPROTO_PROTO_GET: u16 = 626;
+pub const OBJPROTO_PROTO_SET: u16 = 627;
 pub const PROTO_TO_LOCALE_STRING: u16 = 302; // Object.prototype.toLocaleString
 // Number static methods as first-class values (the CALL form is a StaticFn).
 pub const NUM_IS_INTEGER: u16 = 303;
@@ -524,6 +531,10 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         ITER_HELPER_NEXT => ("next", 0),
         ITER_HELPER_RETURN => ("return", 0),
         ITER_FROM => ("from", 1),
+        OBJPROTO_DEFINE_GETTER => ("__defineGetter__", 2),
+        OBJPROTO_DEFINE_SETTER => ("__defineSetter__", 2),
+        OBJPROTO_LOOKUP_GETTER => ("__lookupGetter__", 1),
+        OBJPROTO_LOOKUP_SETTER => ("__lookupSetter__", 1),
         PROTO_TO_LOCALE_STRING => ("toLocaleString", 0),
         NUM_IS_INTEGER => ("isInteger", 1),
         NUM_IS_NAN => ("isNaN", 1),
