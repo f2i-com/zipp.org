@@ -270,6 +270,17 @@ mod native {
     pub const PDT_M_BASE: u16 = 472;
     pub const PLAINDATETIME_FROM: u16 = 490;
     pub const PLAINDATETIME_COMPARE: u16 = 491;
+    /// Temporal.Instant.prototype methods at INST_M_BASE + index.
+    pub const INSTANT_METHODS: &[&str] = &[
+        "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON", "valueOf",
+    ];
+    pub const INST_M_BASE: u16 = 492;
+    pub const INST_FROM: u16 = 505;
+    pub const INST_FROM_EPOCH_MS: u16 = 506;
+    pub const INST_FROM_EPOCH_NS: u16 = 507;
+    pub const INST_FROM_EPOCH_SEC: u16 = 508;
+    pub const INST_FROM_EPOCH_US: u16 = 509;
+    pub const INST_COMPARE: u16 = 510;
     /// Field names of a Temporal.Duration, in slot order.
     pub const DURATION_FIELDS: [&str; 10] = [
         "years", "months", "weeks", "days", "hours", "minutes", "seconds",
@@ -672,6 +683,8 @@ pub struct Vm<'p> {
     plaintime_proto: u32,
     plaindatetime_ctor: u32,
     plaindatetime_proto: u32,
+    instant_ctor: u32,
+    instant_proto: u32,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -818,6 +831,8 @@ impl<'p> Vm<'p> {
             plaintime_proto: 0,
             plaindatetime_ctor: 0,
             plaindatetime_proto: 0,
+            instant_ctor: 0,
+            instant_proto: 0,
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -5690,11 +5705,45 @@ impl<'p> Vm<'p> {
                 p.define("constructor", Value::heap(plaindatetime_ctor), method_attr);
                 p.define("@@toStringTag", pdttag, fn_attr);
             }
+            // Temporal.Instant
+            let inst_methods: Vec<(&str, u16)> = native::INSTANT_METHODS
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, native::INST_M_BASE + i as u16))
+                .collect();
+            let instant_proto = build(self, &inst_methods, None);
+            self.proto_of.insert(instant_proto, Value::heap(obj_proto));
+            self.instant_proto = instant_proto;
+            let iname = self.alloc_str("Instant".to_string());
+            let itag = self.alloc_str("Temporal.Instant".to_string());
+            let mut im = ObjMap::new();
+            im.define("prototype", Value::heap(instant_proto), proto_attr);
+            for (n, id) in [
+                ("from", INST_FROM),
+                ("fromEpochMilliseconds", INST_FROM_EPOCH_MS),
+                ("fromEpochNanoseconds", INST_FROM_EPOCH_NS),
+                ("fromEpochSeconds", INST_FROM_EPOCH_SEC),
+                ("fromEpochMicroseconds", INST_FROM_EPOCH_US),
+                ("compare", INST_COMPARE),
+            ] {
+                let v = Value::heap(self.heap.alloc(HeapObj::Native(id)));
+                im.define(n, v, method_attr);
+            }
+            im.define("name", iname, fn_attr);
+            im.define("length", Value::num(1.0), fn_attr);
+            im.is_ctor = true;
+            let instant_ctor = self.heap.alloc(HeapObj::Object(im));
+            self.instant_ctor = instant_ctor;
+            if let HeapObj::Object(p) = self.heap.get_mut(instant_proto) {
+                p.define("constructor", Value::heap(instant_ctor), method_attr);
+                p.define("@@toStringTag", itag, fn_attr);
+            }
             let mut tn = ObjMap::new();
             tn.define("Duration", Value::heap(duration_ctor), method_attr);
             tn.define("PlainDate", Value::heap(plaindate_ctor), method_attr);
             tn.define("PlainTime", Value::heap(plaintime_ctor), method_attr);
             tn.define("PlainDateTime", Value::heap(plaindatetime_ctor), method_attr);
+            tn.define("Instant", Value::heap(instant_ctor), method_attr);
             self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
@@ -6730,6 +6779,43 @@ impl<'p> Vm<'p> {
                     + time_to_ns(&[b[3], b[4], b[5], b[6], b[7], b[8]]);
                 Value::num(if an < bn { -1.0 } else if an > bn { 1.0 } else { 0.0 })
             }
+            _ if (INST_M_BASE..INST_M_BASE + INSTANT_METHODS.len() as u16).contains(&id) => {
+                let m = INSTANT_METHODS[(id - INST_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 4, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.Instant.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            INST_FROM => {
+                let ns = self.to_instant_ns(a0)?;
+                self.make_instant(ns)?
+            }
+            INST_FROM_EPOCH_MS => {
+                let ns = (self.to_number(a0)? as i128) * 1_000_000;
+                self.make_instant(ns)?
+            }
+            INST_FROM_EPOCH_SEC => {
+                let ns = (self.to_number(a0)? as i128) * 1_000_000_000;
+                self.make_instant(ns)?
+            }
+            INST_FROM_EPOCH_NS => {
+                let ns = self.to_bigint(a0)?;
+                self.make_instant(ns)?
+            }
+            INST_FROM_EPOCH_US => {
+                let ns = self.to_bigint(a0)? * 1_000;
+                self.make_instant(ns)?
+            }
+            INST_COMPARE => {
+                let a = self.to_instant_ns(a0)?;
+                let b = self.to_instant_ns(a1)?;
+                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+            }
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -7514,6 +7600,17 @@ impl<'p> Vm<'p> {
                 "monthCode" => self.alloc_str(format!("M{m:02}")),
                 "calendarId" => self.alloc_str("iso8601".to_string()),
                 _ => self.proto_member(self.plaindatetime_proto, key),
+            });
+        }
+        // Temporal.Instant getters; methods via the prototype.
+        if let HeapObj::Temporal { kind: 4, .. } = self.heap.get(obj.heap_index()) {
+            let ns = self.instant_ns(obj.heap_index()).unwrap_or(0);
+            return Ok(match key {
+                "epochMilliseconds" => Value::num((ns / 1_000_000) as f64),
+                "epochNanoseconds" => self.make_bigint(ns),
+                "epochSeconds" => Value::num((ns / 1_000_000_000) as f64),
+                "epochMicroseconds" => self.make_bigint(ns / 1_000),
+                _ => self.proto_member(self.instant_proto, key),
             });
         }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
@@ -9686,6 +9783,7 @@ impl<'p> Vm<'p> {
             HeapObj::Temporal { kind: 1, .. } => self.plain_date_method(idx, name, args),
             HeapObj::Temporal { kind: 2, .. } => self.plain_time_method(idx, name, args),
             HeapObj::Temporal { kind: 3, .. } => self.plain_date_time_method(idx, name, args),
+            HeapObj::Temporal { kind: 4, .. } => self.instant_method(idx, name, args),
             _ => Ok(None),
         }
     }
@@ -10166,6 +10264,90 @@ impl<'p> Vm<'p> {
                 }
                 o.set("calendar", cal);
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(o)))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    // ── Temporal.Instant ──
+
+    fn make_instant(&mut self, ns: i128) -> Result<Value, Thrown> {
+        if ns.abs() > 8_640_000_000_000_000_000_000 {
+            return Err(Thrown("RangeError: Instant outside the supported range".into()));
+        }
+        let hi = (ns >> 64) as i64;
+        let lo = ns as i64;
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 4, fields: vec![hi, lo] });
+        if self.instant_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.instant_proto));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    fn instant_ns(&self, idx: u32) -> Option<i128> {
+        match self.heap.get(idx) {
+            HeapObj::Temporal { kind: 4, fields } => {
+                Some(((fields[0] as i128) << 64) | ((fields[1] as u64) as i128))
+            }
+            _ => None,
+        }
+    }
+
+    fn to_instant_ns(&mut self, v: Value) -> Result<i128, Thrown> {
+        if v.is_heap() {
+            if let Some(ns) = self.instant_ns(v.heap_index()) {
+                return Ok(ns);
+            }
+            if self.heap.is_str_like(v.heap_index()) {
+                let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                return instant_str_to_ns(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid instant string '{s}'")));
+            }
+        }
+        Err(Thrown("TypeError: cannot convert value to a Temporal.Instant".into()))
+    }
+
+    fn instant_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let ns = match self.instant_ns(idx) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "toString" | "toJSON" => Ok(Some(self.alloc_str(instant_to_string(ns)))),
+            "valueOf" => Err(Thrown("TypeError: Called Temporal.Instant.prototype.valueOf".into())),
+            "equals" => {
+                let o = self.to_instant_ns(a0)?;
+                Ok(Some(Value::bool(ns == o)))
+            }
+            "add" | "subtract" => {
+                let dur = self.to_duration(a0)?;
+                if dur[0] != 0 || dur[1] != 0 || dur[2] != 0 || dur[3] != 0 {
+                    return Err(Thrown(
+                        "RangeError: Instant arithmetic does not accept calendar (date) units".into(),
+                    ));
+                }
+                let sign: i128 = if name == "add" { 1 } else { -1 };
+                let dns = ((dur[4] as i128) * 3_600_000_000_000
+                    + (dur[5] as i128) * 60_000_000_000
+                    + (dur[6] as i128) * 1_000_000_000
+                    + (dur[7] as i128) * 1_000_000
+                    + (dur[8] as i128) * 1_000
+                    + (dur[9] as i128))
+                    * sign;
+                Ok(Some(self.make_instant(ns + dns)?))
+            }
+            "until" | "since" => {
+                let o = self.to_instant_ns(a0)?;
+                let diff = if name == "until" { o - ns } else { ns - o };
+                let s = (diff / 1_000_000_000) as i64;
+                let sub = (diff % 1_000_000_000) as i64;
+                let mut df = [0i64; 10];
+                df[6] = s;
+                df[7] = sub / 1_000_000;
+                df[8] = (sub / 1_000) % 1_000;
+                df[9] = sub % 1_000;
+                Ok(Some(self.make_duration(df)))
             }
             _ => Ok(None),
         }
@@ -10826,6 +11008,10 @@ impl<'p> Vm<'p> {
                 }
             }
             return self.make_plain_date_time(f);
+        }
+        if ci == self.instant_ctor && ci != 0 {
+            let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+            return self.make_instant(ns);
         }
         // Constructing through a Proxy: `construct` trap (or construct the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(ci) {
@@ -13155,6 +13341,10 @@ impl<'p> Vm<'p> {
                         time_string(&[g(3), g(4), g(5), g(6), g(7), g(8)])
                     )
                 }
+                HeapObj::Temporal { kind: 4, fields } => {
+                    let ns = ((fields[0] as i128) << 64) | ((fields[1] as u64) as i128);
+                    instant_to_string(ns)
+                }
                 HeapObj::Temporal { .. } => "[object Temporal]".into(),
                 HeapObj::Str(s) => s.bytes.clone(),
                 HeapObj::Cons { .. } => {
@@ -14078,6 +14268,69 @@ fn parse_iso_datetime(s: &str) -> Option<[i64; 9]> {
         _ => [0; 6],
     };
     Some([y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]])
+}
+
+/// Nanoseconds in a day.
+const DAY_NS: i128 = 86_400_000_000_000;
+
+/// Epoch-nanoseconds → "YYYY-MM-DDTHH:MM:SSZ" (UTC).
+fn instant_to_string(ns: i128) -> String {
+    let days = ns.div_euclid(DAY_NS) as i64;
+    let rem = ns.rem_euclid(DAY_NS);
+    let (y, m, d) = epoch_days_to_iso(days);
+    let t = ns_to_time(rem);
+    // Instant.toString always shows whole seconds (sub-second only if present).
+    let base = format!("{:02}:{:02}:{:02}", t[0], t[1], t[2]);
+    let sub = t[3] * 1_000_000 + t[4] * 1_000 + t[5];
+    let time = if sub == 0 {
+        base
+    } else {
+        let frac = format!("{sub:09}");
+        format!("{base}.{}", frac.trim_end_matches('0'))
+    };
+    format!("{}T{}Z", iso_date_string(y, m, d), time)
+}
+
+/// Parse "+HH:MM"/"-HH:MM"/"+HHMM"/"Z" UTC offset → nanoseconds (Z → 0).
+fn parse_offset_ns(s: &str) -> Option<i128> {
+    if matches!(s, "Z" | "z") {
+        return Some(0);
+    }
+    let sign: i128 = match s.as_bytes().first() {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return None,
+    };
+    let body = &s[1..];
+    let digits: String = body.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 2 {
+        return None;
+    }
+    let h: i128 = digits[..2].parse().ok()?;
+    let mi: i128 = if digits.len() >= 4 { digits[2..4].parse().ok()? } else { 0 };
+    Some(sign * (h * 3_600_000_000_000 + mi * 60_000_000_000))
+}
+
+/// Parse an ISO instant string ("…Z" or "…±HH:MM") → epoch nanoseconds (UTC).
+fn instant_str_to_ns(s: &str) -> Option<i128> {
+    let s = s.trim();
+    let tpos = s.find(['T', 't'])?;
+    let after_t = &s[tpos + 1..];
+    // Locate the offset/Z that ends the time part.
+    let (dt_part, off): (&str, Option<&str>) = if let Some(z) = after_t.find(['Z', 'z']) {
+        (&s[..tpos + 1 + z], Some("Z"))
+    } else if let Some(rel) = after_t.find('+') {
+        (&s[..tpos + 1 + rel], Some(&after_t[rel..]))
+    } else if let Some(rel) = after_t.find('-') {
+        (&s[..tpos + 1 + rel], Some(&after_t[rel..]))
+    } else {
+        return None; // an Instant string must carry a UTC designator
+    };
+    let dt = parse_iso_datetime(dt_part)?;
+    let mut ns = (iso_to_epoch_days(dt[0], dt[1], dt[2]) as i128) * DAY_NS
+        + time_to_ns(&[dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]]);
+    ns -= parse_offset_ns(off?)?;
+    Some(ns)
 }
 
 /// "YYYY-MM-DD" (expanded ±YYYYYY for years outside 0..9999).
