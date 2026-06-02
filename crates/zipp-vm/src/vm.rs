@@ -301,6 +301,39 @@ mod native {
     pub const NOW_PLAINDATE_ISO: u16 = 542;
     pub const NOW_PLAINTIME_ISO: u16 = 543;
     pub const NOW_TIMEZONE_ID: u16 = 544;
+    /// Intl namespace + per-service method native ids.
+    pub const INTL_GET_CANONICAL_LOCALES: u16 = 560;
+    pub const INTL_SUPPORTED_VALUES_OF: u16 = 561;
+    pub const INTL_RESOLVED_OPTIONS: u16 = 562;
+    pub const INTL_SUPPORTED_LOCALES_OF: u16 = 563;
+    pub const INTL_NF_FORMAT: u16 = 564;
+    pub const INTL_NF_FORMAT_TO_PARTS: u16 = 565;
+    pub const INTL_DTF_FORMAT: u16 = 566;
+    pub const INTL_DTF_FORMAT_TO_PARTS: u16 = 567;
+    pub const INTL_COLLATOR_COMPARE: u16 = 568;
+    pub const INTL_PLURAL_SELECT: u16 = 569;
+    pub const INTL_LIST_FORMAT: u16 = 570;
+    pub const INTL_LIST_FORMAT_TO_PARTS: u16 = 571;
+    pub const INTL_RTF_FORMAT: u16 = 572;
+    pub const INTL_RTF_FORMAT_TO_PARTS: u16 = 573;
+    pub const INTL_DISPLAYNAMES_OF: u16 = 574;
+    pub const INTL_LOCALE_TOSTRING: u16 = 575;
+    pub const INTL_LOCALE_MAXIMIZE: u16 = 576;
+    pub const INTL_LOCALE_MINIMIZE: u16 = 577;
+    pub const INTL_SEGMENTER_SEGMENT: u16 = 578;
+    pub const INTL_DURATION_FORMAT: u16 = 579;
+    pub const INTL_PLURAL_SELECT_RANGE: u16 = 580;
+    /// Intl service kinds (index into VM.intl_ctors / intl_protos).
+    pub const INTL_NUMBERFORMAT: u8 = 0;
+    pub const INTL_DATETIMEFORMAT: u8 = 1;
+    pub const INTL_COLLATOR: u8 = 2;
+    pub const INTL_PLURALRULES: u8 = 3;
+    pub const INTL_LISTFORMAT: u8 = 4;
+    pub const INTL_RELATIVETIMEFORMAT: u8 = 5;
+    pub const INTL_SEGMENTER: u8 = 6;
+    pub const INTL_LOCALE: u8 = 7;
+    pub const INTL_DISPLAYNAMES: u8 = 8;
+    pub const INTL_DURATIONFORMAT: u8 = 9;
     /// Field names of a Temporal.Duration, in slot order.
     pub const DURATION_FIELDS: [&str; 10] = [
         "years", "months", "weeks", "days", "hours", "minutes", "seconds",
@@ -709,6 +742,9 @@ pub struct Vm<'p> {
     plainyearmonth_proto: u32,
     plainmonthday_ctor: u32,
     plainmonthday_proto: u32,
+    intl_ns: u32,
+    intl_ctors: [u32; 10],
+    intl_protos: [u32; 10],
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -861,6 +897,9 @@ impl<'p> Vm<'p> {
             plainyearmonth_proto: 0,
             plainmonthday_ctor: 0,
             plainmonthday_proto: 0,
+            intl_ns: 0,
+            intl_ctors: [0; 10],
+            intl_protos: [0; 10],
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -1249,6 +1288,22 @@ impl<'p> Vm<'p> {
         // %Function.prototype% is itself a callable that returns undefined.
         if callee.is_heap() && self.fn_proto != 0 && callee.heap_index() == self.fn_proto {
             return Ok(Value::UNDEFINED);
+        }
+        // An Intl constructor invoked without `new`: NumberFormat/DateTimeFormat/
+        // Collator are spec'd to construct anyway; the other Intl services throw.
+        if self.intl_ctors[0] != 0 && callee.is_heap() {
+            let ci = callee.heap_index();
+            if let Some(kind) = self.intl_ctors.iter().position(|&c| c == ci) {
+                if matches!(
+                    kind as u8,
+                    native::INTL_NUMBERFORMAT | native::INTL_DATETIMEFORMAT | native::INTL_COLLATOR
+                ) {
+                    return self.construct(callee, args);
+                }
+                return Err(Thrown(
+                    "TypeError: Constructor Intl service requires 'new'".into(),
+                ));
+            }
         }
         let (func_id, closure) = self.resolve_callable(callee)?;
         let (is_gen, is_async) = {
@@ -2986,6 +3041,18 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
+                        // A built-in constructor object invoked as a function
+                        // (e.g. an Intl service ctor without `new`).
+                        if callee_v.is_heap()
+                            && matches!(self.heap.get(callee_v.heap_index()), HeapObj::Object(m) if m.is_ctor)
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let r = self.call_value(callee_v, Value::UNDEFINED, &argv)?;
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
                         let (fid, closure) = self.resolve_callable(callee_v)?;
                         // An `async function*` returns an AsyncGenerator (checked
                         // before the plain-generator/async cases since it is both).
@@ -3070,6 +3137,31 @@ impl<'p> Vm<'p> {
                         // Otherwise the property must resolve to a function; call it
                         // with `this = recv`.
                         let prop = self.get_prop(recv, key)?;
+                        // A built-in constructor object used as a method value
+                        // (e.g. `Intl.NumberFormat(...)` without `new`): route via
+                        // call_value, which handles construct-without-new / throws.
+                        if prop.is_heap()
+                            && matches!(self.heap.get(prop.heap_index()), HeapObj::Object(m) if m.is_ctor)
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let r = self.call_value(prop, Value::UNDEFINED, &argv)?;
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
+                        // A built-in constructor object used as a computed method
+                        // value (e.g. `Intl["NumberFormat"](...)` without `new`).
+                        if prop.is_heap()
+                            && matches!(self.heap.get(prop.heap_index()), HeapObj::Object(m) if m.is_ctor)
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let r = self.call_value(prop, Value::UNDEFINED, &argv)?;
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
                         // A native or bound method value (e.g. inherited from a
                         // prototype) is invoked via call_value with this = recv.
                         if prop.is_heap()
@@ -5841,6 +5933,146 @@ impl<'p> Vm<'p> {
             tn.define("PlainMonthDay", Value::heap(plainmonthday_ctor), method_attr);
             tn.define("Now", Value::heap(now_ns), method_attr);
             self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
+            // ── Intl namespace + service constructors ──
+            let intl_services: Vec<(u8, &str, f64, Vec<(&str, u16)>, bool)> = vec![
+                (
+                    native::INTL_NUMBERFORMAT,
+                    "NumberFormat",
+                    0.0,
+                    vec![
+                        ("format", INTL_NF_FORMAT),
+                        ("formatToParts", INTL_NF_FORMAT_TO_PARTS),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+                (
+                    native::INTL_DATETIMEFORMAT,
+                    "DateTimeFormat",
+                    0.0,
+                    vec![
+                        ("format", INTL_DTF_FORMAT),
+                        ("formatToParts", INTL_DTF_FORMAT_TO_PARTS),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+                (
+                    native::INTL_COLLATOR,
+                    "Collator",
+                    0.0,
+                    vec![
+                        ("compare", INTL_COLLATOR_COMPARE),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+                (
+                    native::INTL_PLURALRULES,
+                    "PluralRules",
+                    0.0,
+                    vec![
+                        ("select", INTL_PLURAL_SELECT),
+                        ("selectRange", INTL_PLURAL_SELECT_RANGE),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+                (
+                    native::INTL_LISTFORMAT,
+                    "ListFormat",
+                    0.0,
+                    vec![
+                        ("format", INTL_LIST_FORMAT),
+                        ("formatToParts", INTL_LIST_FORMAT_TO_PARTS),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+                (
+                    native::INTL_RELATIVETIMEFORMAT,
+                    "RelativeTimeFormat",
+                    0.0,
+                    vec![
+                        ("format", INTL_RTF_FORMAT),
+                        ("formatToParts", INTL_RTF_FORMAT_TO_PARTS),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+                (
+                    native::INTL_SEGMENTER,
+                    "Segmenter",
+                    0.0,
+                    vec![
+                        ("segment", INTL_SEGMENTER_SEGMENT),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+                (
+                    native::INTL_LOCALE,
+                    "Locale",
+                    1.0,
+                    vec![
+                        ("toString", INTL_LOCALE_TOSTRING),
+                        ("maximize", INTL_LOCALE_MAXIMIZE),
+                        ("minimize", INTL_LOCALE_MINIMIZE),
+                    ],
+                    false,
+                ),
+                (
+                    native::INTL_DISPLAYNAMES,
+                    "DisplayNames",
+                    2.0,
+                    vec![
+                        ("of", INTL_DISPLAYNAMES_OF),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+                (
+                    native::INTL_DURATIONFORMAT,
+                    "DurationFormat",
+                    0.0,
+                    vec![
+                        ("format", INTL_DURATION_FORMAT),
+                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
+                    ],
+                    true,
+                ),
+            ];
+            let mut intl_ns_map = ObjMap::new();
+            for (kind, name, len, methods, slo) in intl_services {
+                let proto = build(self, &methods, None);
+                self.proto_of.insert(proto, Value::heap(obj_proto));
+                self.intl_protos[kind as usize] = proto;
+                let statics: Vec<(&str, u16)> = if slo {
+                    vec![("supportedLocalesOf", INTL_SUPPORTED_LOCALES_OF)]
+                } else {
+                    vec![]
+                };
+                let ctor = build(self, &statics, Some(proto));
+                self.intl_ctors[kind as usize] = ctor;
+                let nm = self.alloc_str(name.to_string());
+                let tag = self.alloc_str(format!("Intl.{name}"));
+                if let HeapObj::Object(m) = self.heap.get_mut(ctor) {
+                    m.define("name", nm, fn_attr);
+                    m.define("length", Value::num(len), fn_attr);
+                }
+                if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                    p.define("constructor", Value::heap(ctor), method_attr);
+                    p.define("@@toStringTag", tag, fn_attr);
+                }
+                intl_ns_map.define(name, Value::heap(ctor), method_attr);
+            }
+            let gcl = Value::heap(self.heap.alloc(HeapObj::Native(INTL_GET_CANONICAL_LOCALES)));
+            intl_ns_map.define("getCanonicalLocales", gcl, method_attr);
+            let svo = Value::heap(self.heap.alloc(HeapObj::Native(INTL_SUPPORTED_VALUES_OF)));
+            intl_ns_map.define("supportedValuesOf", svo, method_attr);
+            let intltag = self.alloc_str("Intl".to_string());
+            intl_ns_map.define("@@toStringTag", intltag, fn_attr);
+            self.intl_ns = self.heap.alloc(HeapObj::Object(intl_ns_map));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
             if let HeapObj::Object(m) = self.heap.get_mut(dataview_proto) {
@@ -5951,6 +6183,7 @@ impl<'p> Vm<'p> {
                 "DataView" => Some(self.dataview_ctor),
                 "Proxy" => Some(self.proxy_ctor),
                 "Temporal" => Some(self.temporal_ns),
+                "Intl" => Some(self.intl_ns),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -6973,6 +7206,183 @@ impl<'p> Vm<'p> {
                 self.make_plain_time(ns_to_time(ns.rem_euclid(DAY_NS)))?
             }
             NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
+            // ── Intl ──
+            INTL_GET_CANONICAL_LOCALES => {
+                let list = self.canonicalize_locale_list(a0)?;
+                let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
+                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+            }
+            INTL_SUPPORTED_VALUES_OF => {
+                let key = self.to_js_string(a0)?;
+                let vals: &[&str] = match key.as_str() {
+                    "calendar" => &["gregory", "iso8601"],
+                    "collation" => &["default"],
+                    "currency" => &["USD", "EUR", "GBP", "JPY"],
+                    "numberingSystem" => &["latn"],
+                    "timeZone" => &["UTC"],
+                    "unit" => &["meter", "second", "byte"],
+                    _ => {
+                        return Err(Thrown(format!(
+                            "RangeError: invalid key for supportedValuesOf: {key}"
+                        )))
+                    }
+                };
+                let items: Vec<Value> = vals.iter().map(|s| self.alloc_str(s.to_string())).collect();
+                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+            }
+            INTL_SUPPORTED_LOCALES_OF => {
+                let list = self.canonicalize_locale_list(a0)?;
+                let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
+                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+            }
+            INTL_RESOLVED_OPTIONS => {
+                let resolved = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Intl { resolved, .. }) => *resolved,
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: resolvedOptions called on an incompatible receiver".into(),
+                        ))
+                    }
+                };
+                self.clone_plain_object(resolved)
+            }
+            INTL_NF_FORMAT => {
+                let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "format")?;
+                self.intl_number_format(resolved, a0)?
+            }
+            INTL_NF_FORMAT_TO_PARTS => {
+                let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "formatToParts")?;
+                let formatted = self.intl_number_format(resolved, a0)?;
+                let mut part = ObjMap::new();
+                let ty = self.alloc_str("integer".to_string());
+                part.set("type", ty);
+                part.set("value", formatted);
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+            }
+            INTL_DTF_FORMAT => {
+                let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "format")?;
+                let ms = if a0 == Value::UNDEFINED {
+                    (Self::now_epoch_ns() / 1_000_000) as f64
+                } else {
+                    self.to_number(a0)?
+                };
+                let s = self.dtf_format(resolved, ms);
+                self.alloc_str(s)
+            }
+            INTL_DTF_FORMAT_TO_PARTS => {
+                let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "formatToParts")?;
+                let ms = if a0 == Value::UNDEFINED {
+                    (Self::now_epoch_ns() / 1_000_000) as f64
+                } else {
+                    self.to_number(a0)?
+                };
+                let s = self.dtf_format(resolved, ms);
+                let mut part = ObjMap::new();
+                let ty = self.alloc_str("literal".to_string());
+                part.set("type", ty);
+                let sv = self.alloc_str(s);
+                part.set("value", sv);
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+            }
+            INTL_COLLATOR_COMPARE => {
+                let _ = self.intl_this(this, INTL_COLLATOR, "compare")?;
+                let a = self.to_js_string(a0)?;
+                let b = self.to_js_string(a1)?;
+                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+            }
+            INTL_PLURAL_SELECT => {
+                let _ = self.intl_this(this, INTL_PLURALRULES, "select")?;
+                let n = self.to_number(a0)?;
+                let cat = if n == 1.0 { "one" } else { "other" };
+                self.alloc_str(cat.to_string())
+            }
+            INTL_PLURAL_SELECT_RANGE => {
+                let _ = self.intl_this(this, INTL_PLURALRULES, "selectRange")?;
+                self.alloc_str("other".to_string())
+            }
+            INTL_LIST_FORMAT => {
+                let resolved = self.intl_this(this, INTL_LISTFORMAT, "format")?;
+                let items = self.iterate_to_vec(a0)?;
+                let mut strs: Vec<String> = Vec::with_capacity(items.len());
+                for v in items {
+                    strs.push(self.to_js_string(v)?);
+                }
+                let t = self.display(self.intl_slot(resolved, "type"));
+                let conj = if t == "disjunction" { "or" } else { "and" };
+                let s = format_list_en(&strs, conj);
+                self.alloc_str(s)
+            }
+            INTL_LIST_FORMAT_TO_PARTS => {
+                let resolved = self.intl_this(this, INTL_LISTFORMAT, "formatToParts")?;
+                let items = self.iterate_to_vec(a0)?;
+                let mut strs: Vec<String> = Vec::with_capacity(items.len());
+                for v in items {
+                    strs.push(self.to_js_string(v)?);
+                }
+                let t = self.display(self.intl_slot(resolved, "type"));
+                let conj = if t == "disjunction" { "or" } else { "and" };
+                let s = format_list_en(&strs, conj);
+                let mut part = ObjMap::new();
+                let ty = self.alloc_str("literal".to_string());
+                part.set("type", ty);
+                let sv = self.alloc_str(s);
+                part.set("value", sv);
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+            }
+            INTL_RTF_FORMAT | INTL_RTF_FORMAT_TO_PARTS => {
+                let _ = self.intl_this(this, INTL_RELATIVETIMEFORMAT, "format")?;
+                let v = self.to_number(a0)?;
+                let unit = self.to_js_string(a1)?;
+                let s = format_relative_time_en(v, &unit);
+                if id == INTL_RTF_FORMAT {
+                    self.alloc_str(s)
+                } else {
+                    let mut part = ObjMap::new();
+                    let ty = self.alloc_str("literal".to_string());
+                    part.set("type", ty);
+                    let sv = self.alloc_str(s);
+                    part.set("value", sv);
+                    let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                    Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+                }
+            }
+            INTL_DISPLAYNAMES_OF => {
+                let resolved = self.intl_this(this, INTL_DISPLAYNAMES, "of")?;
+                let code = self.to_js_string(a0)?;
+                let fb = self.display(self.intl_slot(resolved, "fallback"));
+                if fb == "none" {
+                    Value::UNDEFINED
+                } else {
+                    self.alloc_str(code)
+                }
+            }
+            INTL_LOCALE_TOSTRING => {
+                let resolved = self.intl_this(this, INTL_LOCALE, "toString")?;
+                self.intl_slot(resolved, "baseName")
+            }
+            INTL_LOCALE_MAXIMIZE | INTL_LOCALE_MINIMIZE => {
+                let resolved = self.intl_this(this, INTL_LOCALE, "maximize")?;
+                let bn = self.intl_slot(resolved, "baseName");
+                self.make_locale(bn, Value::UNDEFINED)?
+            }
+            INTL_SEGMENTER_SEGMENT => {
+                let _ = self.intl_this(this, INTL_SEGMENTER, "segment")?;
+                // Minimal Segments object (full grapheme/word segmentation TBD).
+                let s = self.to_js_string(a0)?;
+                let mut o = ObjMap::new();
+                let sv = self.alloc_str(s);
+                o.set("@@seginput", sv);
+                Value::heap(self.heap.alloc(HeapObj::Object(o)))
+            }
+            INTL_DURATION_FORMAT => {
+                let _ = self.intl_this(this, INTL_DURATIONFORMAT, "format")?;
+                let dur = self.to_duration(a0)?;
+                let s = format_duration_en(&dur);
+                self.alloc_str(s)
+            }
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -7795,6 +8205,22 @@ impl<'p> Vm<'p> {
                 "calendarId" => self.alloc_str("iso8601".to_string()),
                 _ => self.proto_member(self.plainmonthday_proto, key),
             });
+        }
+        // Intl.* instance: Locale exposes parsed subtags via prototype getters that
+        // read the instance's internal slots; every other service delegates to its
+        // prototype (resolvedOptions/format/… are prototype methods).
+        if let HeapObj::Intl { kind, resolved } = self.heap.get(obj.heap_index()) {
+            let (kind, resolved) = (*kind, *resolved);
+            if kind == native::INTL_LOCALE
+                && matches!(
+                    key,
+                    "baseName" | "language" | "script" | "region" | "calendar" | "caseFirst"
+                        | "collation" | "hourCycle" | "numeric" | "numberingSystem"
+                )
+            {
+                return Ok(self.intl_slot(resolved, key));
+            }
+            return Ok(self.proto_member(self.intl_protos[kind as usize], key));
         }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
         // match so an accessor's getter can be invoked outside the heap borrow.
@@ -10766,6 +11192,590 @@ impl<'p> Vm<'p> {
         }
     }
 
+    // ── Intl ──
+
+    /// Read an internal slot stored on an Intl instance's `resolved` object.
+    fn intl_slot(&self, resolved: u32, key: &str) -> Value {
+        if let HeapObj::Object(m) = self.heap.get(resolved) {
+            if let Some(i) = m.pos(key) {
+                return m.vals[i];
+            }
+        }
+        Value::UNDEFINED
+    }
+
+    /// Brand-check `this` as an Intl instance of `kind`; return its `resolved` idx.
+    fn intl_this(&self, this: Value, kind: u8, m: &str) -> Result<u32, Thrown> {
+        if this.is_heap() {
+            if let HeapObj::Intl { kind: k, resolved } = self.heap.get(this.heap_index()) {
+                if *k == kind {
+                    return Ok(*resolved);
+                }
+            }
+        }
+        Err(Thrown(format!("TypeError: {m} called on an incompatible receiver")))
+    }
+
+    /// Shallow-copy an object's own enumerable data properties into a fresh object
+    /// (preserving insertion order) — used by resolvedOptions().
+    fn clone_plain_object(&mut self, src: u32) -> Value {
+        let pairs: Vec<(String, Value)> = match self.heap.get(src) {
+            HeapObj::Object(m) => (0..m.keys.len())
+                .filter(|&i| !m.attrs[i].accessor)
+                .map(|i| (m.keys[i].clone(), m.vals[i]))
+                .collect(),
+            _ => vec![],
+        };
+        let mut o = ObjMap::new();
+        for (k, v) in pairs {
+            o.set(&k, v);
+        }
+        Value::heap(self.heap.alloc(HeapObj::Object(o)))
+    }
+
+    /// CanonicalizeLocaleList(locales) → the requested tags (canonical). Accepts
+    /// undefined (→ empty), a string, an Intl.Locale, or an array of those.
+    fn canonicalize_locale_list(&mut self, locales: Value) -> Result<Vec<String>, Thrown> {
+        let mut out: Vec<String> = vec![];
+        let mut push_tag = |out: &mut Vec<String>, s: &str| -> Result<(), Thrown> {
+            match canonicalize_locale(s) {
+                Some(c) => {
+                    if !out.contains(&c) {
+                        out.push(c);
+                    }
+                    Ok(())
+                }
+                None => Err(Thrown(format!("RangeError: Incorrect locale information: {s}"))),
+            }
+        };
+        if locales == Value::UNDEFINED {
+            return Ok(out);
+        }
+        // A bare string is treated as a one-element list.
+        if locales.is_heap() {
+            if let HeapObj::Intl { kind: native::INTL_LOCALE, resolved } =
+                *self.heap.get(locales.heap_index())
+            {
+                let bn = self.intl_slot(resolved, "baseName");
+                let s = self.display(bn);
+                push_tag(&mut out, &s)?;
+                return Ok(out);
+            }
+            if self.heap.is_str_like(locales.heap_index()) {
+                let s = self.heap.str_cow(locales.heap_index()).unwrap().into_owned();
+                push_tag(&mut out, &s)?;
+                return Ok(out);
+            }
+        } else if !locales.is_heap() {
+            // primitive non-string → ToObject would make a wrapper with no indices.
+            return Ok(out);
+        }
+        // Array-like: read length then each element.
+        let len_v = self.get_prop(locales, "length")?;
+        let len = self.to_number(len_v)?.max(0.0) as usize;
+        for i in 0..len {
+            let el = self.get_index(locales, Value::int(i as i32))?;
+            if el == Value::UNDEFINED {
+                continue;
+            }
+            if el.is_heap() {
+                if let HeapObj::Intl { kind: native::INTL_LOCALE, resolved } =
+                    *self.heap.get(el.heap_index())
+                {
+                    let bn = self.intl_slot(resolved, "baseName");
+                    let s = self.display(bn);
+                    push_tag(&mut out, &s)?;
+                    continue;
+                }
+            }
+            if !el.is_heap() || !self.heap.is_str_like(el.heap_index()) {
+                if !matches!(self.heap.get(el.heap_index()), HeapObj::Object(_)) {
+                    return Err(Thrown(
+                        "TypeError: locale list elements must be strings or objects".into(),
+                    ));
+                }
+            }
+            let s = self.to_js_string(el)?;
+            push_tag(&mut out, &s)?;
+        }
+        Ok(out)
+    }
+
+    /// Pick the resolved locale: the first requested tag (we "support" all), else
+    /// the default "en".
+    fn resolve_locale(&mut self, locales: Value) -> Result<String, Thrown> {
+        let list = self.canonicalize_locale_list(locales)?;
+        Ok(list.into_iter().next().unwrap_or_else(|| "en".to_string()))
+    }
+
+    /// Read a string option (returns `default` if undefined); validates against
+    /// `allowed` when non-empty (→ RangeError).
+    fn opt_string(
+        &mut self,
+        options: Value,
+        key: &str,
+        default: &str,
+        allowed: &[&str],
+    ) -> Result<String, Thrown> {
+        if options == Value::UNDEFINED {
+            return Ok(default.to_string());
+        }
+        let v = self.get_prop(options, key)?;
+        if v == Value::UNDEFINED {
+            return Ok(default.to_string());
+        }
+        let s = self.to_js_string(v)?;
+        if !allowed.is_empty() && !allowed.contains(&s.as_str()) {
+            return Err(Thrown(format!("RangeError: Value {s} out of range for option {key}")));
+        }
+        Ok(s)
+    }
+
+    /// Read an integer option clamped to [min,max] (returns `default` if undefined).
+    fn opt_int(
+        &mut self,
+        options: Value,
+        key: &str,
+        default: i64,
+        min: i64,
+        max: i64,
+    ) -> Result<i64, Thrown> {
+        if options == Value::UNDEFINED {
+            return Ok(default);
+        }
+        let v = self.get_prop(options, key)?;
+        if v == Value::UNDEFINED {
+            return Ok(default);
+        }
+        let n = self.to_number(v)?;
+        if n.is_nan() || n < min as f64 || n > max as f64 {
+            return Err(Thrown(format!("RangeError: {key} value is out of range")));
+        }
+        Ok(n as i64)
+    }
+
+    /// `new Intl.<service>(locales, options)` → build resolved options + instance.
+    fn make_intl(&mut self, kind: u8, locales: Value, options: Value) -> Result<Value, Thrown> {
+        use native::*;
+        // options must be undefined or coercible to object (per spec GetOptionsObject).
+        if options != Value::UNDEFINED && !self.is_object_value(options) {
+            // Collator/NumberFormat/DateTimeFormat use ToObject; Locale's 2nd arg too.
+            // A primitive options arg is a TypeError for these services.
+            return Err(Thrown("TypeError: Options must be an object or undefined".into()));
+        }
+        if kind == INTL_LOCALE {
+            return self.make_locale(locales, options);
+        }
+        let locale = self.resolve_locale(locales)?;
+        let loc = self.alloc_str(locale.clone());
+        let mut r = ObjMap::new();
+        r.set("locale", loc);
+        match kind {
+            INTL_NUMBERFORMAT => {
+                let ns = self.alloc_str("latn".to_string());
+                r.set("numberingSystem", ns);
+                let style = self.opt_string(
+                    options,
+                    "style",
+                    "decimal",
+                    &["decimal", "percent", "currency", "unit"],
+                )?;
+                let sv = self.alloc_str(style.clone());
+                r.set("style", sv);
+                if style == "currency" {
+                    let cur = self.opt_string(options, "currency", "", &[])?;
+                    if cur.is_empty() {
+                        return Err(Thrown(
+                            "TypeError: currency must be provided for style 'currency'".into(),
+                        ));
+                    }
+                    let cv = self.alloc_str(cur.to_uppercase());
+                    r.set("currency", cv);
+                    let cd = self.opt_string(
+                        options,
+                        "currencyDisplay",
+                        "symbol",
+                        &["symbol", "narrowSymbol", "code", "name"],
+                    )?;
+                    let cdv = self.alloc_str(cd);
+                    r.set("currencyDisplay", cdv);
+                }
+                let min_int = self.opt_int(options, "minimumIntegerDigits", 1, 1, 21)?;
+                let def_min_frac = if style == "currency" { 2 } else { 0 };
+                let def_max_frac = if style == "currency" {
+                    2
+                } else if style == "percent" {
+                    0
+                } else {
+                    3
+                };
+                let min_frac =
+                    self.opt_int(options, "minimumFractionDigits", def_min_frac, 0, 100)?;
+                let max_frac = self
+                    .opt_int(options, "maximumFractionDigits", def_max_frac.max(min_frac), 0, 100)?;
+                r.set("minimumIntegerDigits", Value::num(min_int as f64));
+                r.set("minimumFractionDigits", Value::num(min_frac as f64));
+                r.set("maximumFractionDigits", Value::num(max_frac as f64));
+                let ug = self.opt_string(
+                    options,
+                    "useGrouping",
+                    "auto",
+                    &["auto", "always", "min2", "true", "false"],
+                )?;
+                // ES2023 useGrouping is a string|boolean; echo "auto"/"always" as given.
+                let ugv = self.alloc_str(ug);
+                r.set("useGrouping", ugv);
+                let notation = self.opt_string(
+                    options,
+                    "notation",
+                    "standard",
+                    &["standard", "scientific", "engineering", "compact"],
+                )?;
+                let nv = self.alloc_str(notation);
+                r.set("notation", nv);
+                let sd = self.opt_string(
+                    options,
+                    "signDisplay",
+                    "auto",
+                    &["auto", "never", "always", "exceptZero", "negative"],
+                )?;
+                let sdv = self.alloc_str(sd);
+                r.set("signDisplay", sdv);
+            }
+            INTL_DATETIMEFORMAT => {
+                let ns = self.alloc_str("latn".to_string());
+                r.set("numberingSystem", ns);
+                let cal = self.alloc_str("gregory".to_string());
+                r.set("calendar", cal);
+                let tz = self.opt_string(options, "timeZone", "UTC", &[])?;
+                let tzv = self.alloc_str(tz);
+                r.set("timeZone", tzv);
+                // If no explicit date/time components and no dateStyle/timeStyle,
+                // default to year/month/day.
+                let comps = [
+                    ("weekday", &["narrow", "short", "long"][..]),
+                    ("era", &["narrow", "short", "long"][..]),
+                    ("year", &["2-digit", "numeric"][..]),
+                    ("month", &["2-digit", "numeric", "narrow", "short", "long"][..]),
+                    ("day", &["2-digit", "numeric"][..]),
+                    ("hour", &["2-digit", "numeric"][..]),
+                    ("minute", &["2-digit", "numeric"][..]),
+                    ("second", &["2-digit", "numeric"][..]),
+                ];
+                let mut any = false;
+                let mut vals: Vec<(&str, String)> = vec![];
+                for (name, allowed) in comps {
+                    let v = self.opt_string(options, name, "", allowed)?;
+                    if !v.is_empty() {
+                        any = true;
+                        vals.push((name, v));
+                    }
+                }
+                let date_style = self.opt_string(
+                    options,
+                    "dateStyle",
+                    "",
+                    &["full", "long", "medium", "short"],
+                )?;
+                let time_style = self.opt_string(
+                    options,
+                    "timeStyle",
+                    "",
+                    &["full", "long", "medium", "short"],
+                )?;
+                if !date_style.is_empty() {
+                    let v = self.alloc_str(date_style);
+                    r.set("dateStyle", v);
+                }
+                if !time_style.is_empty() {
+                    let v = self.alloc_str(time_style);
+                    r.set("timeStyle", v);
+                }
+                if !any && r.pos("dateStyle").is_none() && r.pos("timeStyle").is_none() {
+                    vals = vec![
+                        ("year", "numeric".to_string()),
+                        ("month", "numeric".to_string()),
+                        ("day", "numeric".to_string()),
+                    ];
+                }
+                for (name, v) in vals {
+                    let vv = self.alloc_str(v);
+                    r.set(name, vv);
+                }
+                let hc = self.opt_string(options, "hour12", "", &[])?;
+                if !hc.is_empty() && r.pos("hour").is_some() {
+                    // (left implicit; hourCycle handling is minimal)
+                }
+            }
+            INTL_COLLATOR => {
+                let usage =
+                    self.opt_string(options, "usage", "sort", &["sort", "search"])?;
+                let uv = self.alloc_str(usage);
+                r.set("usage", uv);
+                let sens = self.opt_string(
+                    options,
+                    "sensitivity",
+                    "variant",
+                    &["base", "accent", "case", "variant"],
+                )?;
+                let sv = self.alloc_str(sens);
+                r.set("sensitivity", sv);
+                r.set("ignorePunctuation", Value::bool(false));
+                let col = self.alloc_str("default".to_string());
+                r.set("collation", col);
+                let nf = if options == Value::UNDEFINED {
+                    false
+                } else {
+                    let v = self.get_prop(options, "numeric")?;
+                    v != Value::UNDEFINED && self.truthy(v)
+                };
+                r.set("numeric", Value::bool(nf));
+                let cf = self.opt_string(
+                    options,
+                    "caseFirst",
+                    "false",
+                    &["upper", "lower", "false"],
+                )?;
+                let cfv = self.alloc_str(cf);
+                r.set("caseFirst", cfv);
+            }
+            INTL_PLURALRULES => {
+                let t = self.opt_string(options, "type", "cardinal", &["cardinal", "ordinal"])?;
+                let tv = self.alloc_str(t);
+                r.set("type", tv);
+                let min_int = self.opt_int(options, "minimumIntegerDigits", 1, 1, 21)?;
+                let min_frac = self.opt_int(options, "minimumFractionDigits", 0, 0, 100)?;
+                let max_frac = self.opt_int(options, "maximumFractionDigits", 3.max(min_frac), 0, 100)?;
+                r.set("minimumIntegerDigits", Value::num(min_int as f64));
+                r.set("minimumFractionDigits", Value::num(min_frac as f64));
+                r.set("maximumFractionDigits", Value::num(max_frac as f64));
+                let ns = self.alloc_str("latn".to_string());
+                r.set("pluralCategories", Value::UNDEFINED); // filled below as array
+                r.set("numberingSystem", ns);
+                let cats = ["one", "other"]
+                    .iter()
+                    .map(|c| self.alloc_str(c.to_string()))
+                    .collect::<Vec<_>>();
+                let arr = Value::heap(self.heap.alloc(HeapObj::Array(cats)));
+                r.set("pluralCategories", arr);
+            }
+            INTL_LISTFORMAT => {
+                let t =
+                    self.opt_string(options, "type", "conjunction", &["conjunction", "disjunction", "unit"])?;
+                let tv = self.alloc_str(t);
+                r.set("type", tv);
+                let st =
+                    self.opt_string(options, "style", "long", &["long", "short", "narrow"])?;
+                let sv = self.alloc_str(st);
+                r.set("style", sv);
+            }
+            INTL_RELATIVETIMEFORMAT => {
+                let st = self.opt_string(options, "style", "long", &["long", "short", "narrow"])?;
+                let sv = self.alloc_str(st);
+                r.set("style", sv);
+                let nm = self.opt_string(options, "numeric", "always", &["always", "auto"])?;
+                let nmv = self.alloc_str(nm);
+                r.set("numeric", nmv);
+                let ns = self.alloc_str("latn".to_string());
+                r.set("numberingSystem", ns);
+            }
+            INTL_SEGMENTER => {
+                let g =
+                    self.opt_string(options, "granularity", "grapheme", &["grapheme", "word", "sentence"])?;
+                let gv = self.alloc_str(g);
+                r.set("granularity", gv);
+            }
+            INTL_DISPLAYNAMES => {
+                // type is required for DisplayNames.
+                let t = self.opt_string(
+                    options,
+                    "type",
+                    "",
+                    &["language", "region", "script", "currency", "calendar", "dateTimeField"],
+                )?;
+                if t.is_empty() {
+                    return Err(Thrown("TypeError: Intl.DisplayNames type option is required".into()));
+                }
+                let tv = self.alloc_str(t);
+                r.set("type", tv);
+                let st = self.opt_string(options, "style", "long", &["long", "short", "narrow"])?;
+                let sv = self.alloc_str(st);
+                r.set("style", sv);
+                let fb = self.opt_string(options, "fallback", "code", &["code", "none"])?;
+                let fbv = self.alloc_str(fb);
+                r.set("fallback", fbv);
+            }
+            INTL_DURATIONFORMAT => {
+                let st =
+                    self.opt_string(options, "style", "short", &["long", "short", "narrow", "digital"])?;
+                let sv = self.alloc_str(st);
+                r.set("style", sv);
+                let ns = self.alloc_str("latn".to_string());
+                r.set("numberingSystem", ns);
+            }
+            _ => {}
+        }
+        let resolved = self.heap.alloc(HeapObj::Object(r));
+        let idx = self.heap.alloc(HeapObj::Intl { kind, resolved });
+        if self.intl_protos[kind as usize] != 0 {
+            self.proto_of.insert(idx, Value::heap(self.intl_protos[kind as usize]));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    /// `new Intl.Locale(tag, options)` — parse the tag into its subtags.
+    fn make_locale(&mut self, tag: Value, options: Value) -> Result<Value, Thrown> {
+        let base = if tag.is_heap() {
+            if let HeapObj::Intl { kind: native::INTL_LOCALE, resolved } =
+                *self.heap.get(tag.heap_index())
+            {
+                self.display(self.intl_slot(resolved, "baseName"))
+            } else if self.heap.is_str_like(tag.heap_index()) {
+                self.heap.str_cow(tag.heap_index()).unwrap().into_owned()
+            } else {
+                return Err(Thrown("TypeError: Locale tag must be a string or Locale".into()));
+            }
+        } else {
+            return Err(Thrown("TypeError: Locale tag must be a string or Locale".into()));
+        };
+        let canon = canonicalize_locale(&base)
+            .ok_or_else(|| Thrown(format!("RangeError: invalid language tag: {base}")))?;
+        // Split off any -u- extension; the leading part is the baseName.
+        let (base_part, _ext) = match canon.split_once("-u-") {
+            Some((b, e)) => (b.to_string(), Some(e.to_string())),
+            None => (canon.clone(), None),
+        };
+        let parts: Vec<&str> = base_part.split('-').collect();
+        let language = parts.first().copied().unwrap_or("und").to_string();
+        let mut script = String::new();
+        let mut region = String::new();
+        for p in &parts[1..] {
+            if p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()) {
+                script = p.to_string();
+            } else if (p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic()))
+                || (p.len() == 3 && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                region = p.to_string();
+            }
+        }
+        let mut r = ObjMap::new();
+        let bn = self.alloc_str(base_part.clone());
+        r.set("baseName", bn);
+        let lv = self.alloc_str(language);
+        r.set("language", lv);
+        r.set(
+            "script",
+            if script.is_empty() { Value::UNDEFINED } else { self.alloc_str(script) },
+        );
+        r.set(
+            "region",
+            if region.is_empty() { Value::UNDEFINED } else { self.alloc_str(region) },
+        );
+        // Options or -u- extension keys can override; read the common ones.
+        for (key, uext) in [
+            ("calendar", "ca"),
+            ("collation", "co"),
+            ("hourCycle", "hc"),
+            ("caseFirst", "kf"),
+            ("numberingSystem", "nu"),
+        ] {
+            let from_opt = if options != Value::UNDEFINED {
+                let v = self.get_prop(options, key)?;
+                if v == Value::UNDEFINED { None } else { Some(self.to_js_string(v)?) }
+            } else {
+                None
+            };
+            let val = from_opt.or_else(|| {
+                _ext.as_ref().and_then(|e| {
+                    let toks: Vec<&str> = e.split('-').collect();
+                    toks.iter().position(|t| *t == uext).and_then(|i| toks.get(i + 1).map(|s| s.to_string()))
+                })
+            });
+            match val {
+                Some(s) => {
+                    let sv = self.alloc_str(s);
+                    r.set(key, sv);
+                }
+                None => {
+                    r.set(key, Value::UNDEFINED);
+                }
+            }
+        }
+        // numeric (kn) → boolean
+        let numeric = if options != Value::UNDEFINED {
+            let v = self.get_prop(options, "numeric")?;
+            if v != Value::UNDEFINED { Some(self.truthy(v)) } else { None }
+        } else {
+            None
+        };
+        r.set("numeric", Value::bool(numeric.unwrap_or(false)));
+        let resolved = self.heap.alloc(HeapObj::Object(r));
+        let idx = self.heap.alloc(HeapObj::Intl { kind: native::INTL_LOCALE, resolved });
+        if self.intl_protos[native::INTL_LOCALE as usize] != 0 {
+            self.proto_of.insert(idx, Value::heap(self.intl_protos[native::INTL_LOCALE as usize]));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    /// Intl.NumberFormat.prototype.format(value).
+    fn intl_number_format(&mut self, resolved: u32, value: Value) -> Result<Value, Thrown> {
+        let n = self.to_number(value)?;
+        let style = self.display(self.intl_slot(resolved, "style"));
+        let min_frac = self.to_number(self.intl_slot(resolved, "minimumFractionDigits"))? as i64;
+        let max_frac = self.to_number(self.intl_slot(resolved, "maximumFractionDigits"))? as i64;
+        let min_int = self.to_number(self.intl_slot(resolved, "minimumIntegerDigits"))? as i64;
+        let ug = self.display(self.intl_slot(resolved, "useGrouping"));
+        let grouping = ug != "false";
+        let s = format_number_intl(n, &style, min_frac, max_frac, min_int, grouping);
+        let out = if style == "percent" {
+            s
+        } else if style == "currency" {
+            let cur = self.display(self.intl_slot(resolved, "currency"));
+            format!("{}{}", currency_symbol(&cur), s)
+        } else {
+            s
+        };
+        Ok(self.alloc_str(out))
+    }
+
+    /// Intl.DateTimeFormat.prototype.format(date) — UTC, en-US conventions.
+    fn dtf_format(&self, resolved: u32, ms: f64) -> String {
+        let total_ms = ms as i128;
+        let days = total_ms.div_euclid(86_400_000) as i64;
+        let (y, mo, d) = epoch_days_to_iso(days);
+        let rem_ns = total_ms.rem_euclid(86_400_000) * 1_000_000;
+        let t = ns_to_time(rem_ns); // [h, mi, s, ms, us, ns]
+        let has = |k: &str| matches!(self.heap.get(resolved), HeapObj::Object(m) if m.pos(k).is_some());
+        let has_date = has("year") || has("month") || has("day") || has("dateStyle") || has("weekday");
+        let has_time = has("hour") || has("minute") || has("second") || has("timeStyle");
+        let date_part = format!("{}/{}/{}", mo, d, y);
+        let mut out = String::new();
+        if has_date {
+            out.push_str(&date_part);
+        }
+        if has_time {
+            let h24 = t[0];
+            let (h12, ap) = if h24 == 0 {
+                (12, "AM")
+            } else if h24 < 12 {
+                (h24, "AM")
+            } else if h24 == 12 {
+                (12, "PM")
+            } else {
+                (h24 - 12, "PM")
+            };
+            let ts = format!("{}:{:02}:{:02}\u{202f}{}", h12, t[1], t[2], ap);
+            if has_date {
+                out.push_str(", ");
+            }
+            out.push_str(&ts);
+        }
+        if out.is_empty() {
+            out = date_part;
+        }
+        out
+    }
+
     /// `new Proxy(target, handler)` — both must be objects.
     fn make_proxy(&mut self, target: Value, handler: Value) -> Result<Value, Thrown> {
         if !self.is_object_value(target) || !self.is_object_value(handler) {
@@ -11445,6 +12455,14 @@ impl<'p> Vm<'p> {
                 _ => 1972,
             };
             return self.make_plain_month_day(m, d, ry);
+        }
+        // Intl.<service> constructors.
+        if self.intl_ctors[0] != 0 {
+            if let Some(kind) = self.intl_ctors.iter().position(|&c| c == ci) {
+                let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                return self.make_intl(kind as u8, locales, options);
+            }
         }
         // Constructing through a Proxy: `construct` trap (or construct the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(ci) {
@@ -13781,6 +14799,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Temporal { kind: 5, fields } => year_month_string(fields[0], fields[1]),
                 HeapObj::Temporal { kind: 6, fields } => format!("{:02}-{:02}", fields[1], fields[2]),
                 HeapObj::Temporal { .. } => "[object Temporal]".into(),
+                HeapObj::Intl { .. } => "[object Object]".into(),
                 HeapObj::Str(s) => s.bytes.clone(),
                 HeapObj::Cons { .. } => {
                     let mut out = String::new();
@@ -13934,6 +14953,13 @@ impl<'p> Vm<'p> {
                 format!("Temporal.PlainMonthDay <{:02}-{:02}>", fields[1], fields[2])
             }
             HeapObj::Temporal { .. } => "[object Temporal]".into(),
+            HeapObj::Intl { kind, .. } => {
+                const NAMES: [&str; 10] = [
+                    "NumberFormat", "DateTimeFormat", "Collator", "PluralRules", "ListFormat",
+                    "RelativeTimeFormat", "Segmenter", "Locale", "DisplayNames", "DurationFormat",
+                ];
+                format!("Intl.{} {{}}", NAMES.get(*kind as usize).copied().unwrap_or("?"))
+            }
             HeapObj::Str(s) => format!("'{}'", s.bytes),
             HeapObj::Cons { .. } => {
                 let mut out = String::new();
@@ -14856,6 +15882,181 @@ fn parse_iso_month_day(s: &str) -> Option<(i64, i64, i64)> {
         return None;
     }
     Some((1972, m, d))
+}
+
+/// Canonicalize a BCP-47 language tag (pragmatic: validates structure, lowercases
+/// the language, Titlecases a 4-letter script subtag, uppercases a 2-letter region;
+/// subtags after a singleton extension are lowercased). Returns None if malformed.
+fn canonicalize_locale(tag: &str) -> Option<String> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = tag.split('-').collect();
+    for p in &parts {
+        if p.is_empty() || p.len() > 8 || !p.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+    }
+    let lang = parts[0];
+    let ll = lang.len();
+    if !(lang.chars().all(|c| c.is_ascii_alphabetic()) && ((2..=3).contains(&ll) || (5..=8).contains(&ll)))
+    {
+        return None;
+    }
+    let mut out = vec![lang.to_ascii_lowercase()];
+    let mut seen_singleton = false;
+    for p in &parts[1..] {
+        if p.len() == 1 {
+            seen_singleton = true;
+            out.push(p.to_ascii_lowercase());
+        } else if seen_singleton {
+            out.push(p.to_ascii_lowercase());
+        } else if p.len() == 4 && p.chars().all(|c| c.is_ascii_alphabetic()) {
+            let s = p.to_ascii_lowercase();
+            out.push(format!("{}{}", s[..1].to_ascii_uppercase(), &s[1..]));
+        } else if (p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic()))
+            || (p.len() == 3 && p.chars().all(|c| c.is_ascii_digit()))
+        {
+            out.push(p.to_ascii_uppercase());
+        } else {
+            out.push(p.to_ascii_lowercase());
+        }
+    }
+    Some(out.join("-"))
+}
+
+/// Format a number for Intl.NumberFormat with grouping + min/max fraction digits.
+/// (en-US conventions: "," grouping, "." decimal; percent multiplies by 100.)
+fn format_number_intl(
+    n: f64,
+    style: &str,
+    min_frac: i64,
+    max_frac: i64,
+    min_int: i64,
+    grouping: bool,
+) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    let neg = n.is_sign_negative() && n != 0.0;
+    let mut x = n.abs();
+    if style == "percent" {
+        x *= 100.0;
+    }
+    if x.is_infinite() {
+        let mut s = "∞".to_string();
+        if style == "percent" {
+            s.push('%');
+        }
+        if neg {
+            s.insert(0, '-');
+        }
+        return s;
+    }
+    let factor = 10f64.powi(max_frac.clamp(0, 100) as i32);
+    let rounded = (x * factor).round() / factor;
+    let s = format!("{:.*}", max_frac.clamp(0, 100) as usize, rounded);
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i.to_string(), f.to_string()),
+        None => (s.clone(), String::new()),
+    };
+    let mut frac = frac_part;
+    while frac.len() as i64 > min_frac && frac.ends_with('0') {
+        frac.pop();
+    }
+    let mut int_digits = int_part;
+    while (int_digits.len() as i64) < min_int {
+        int_digits.insert(0, '0');
+    }
+    let grouped = if grouping && int_digits.len() > 3 {
+        let n = int_digits.len();
+        let first = match n % 3 {
+            0 => 3,
+            r => r,
+        };
+        let mut out = String::from(&int_digits[..first]);
+        let mut i = first;
+        while i < n {
+            out.push(',');
+            out.push_str(&int_digits[i..i + 3]);
+            i += 3;
+        }
+        out
+    } else {
+        int_digits
+    };
+    let mut res = grouped;
+    if !frac.is_empty() {
+        res.push('.');
+        res.push_str(&frac);
+    }
+    if style == "percent" {
+        res.push('%');
+    }
+    if neg {
+        res.insert(0, '-');
+    }
+    res
+}
+
+/// A short currency symbol for the common codes (en-US "symbol" display); unknown
+/// codes fall back to the code plus a non-breaking space.
+fn currency_symbol(code: &str) -> String {
+    match code {
+        "USD" => "$".to_string(),
+        "EUR" => "€".to_string(),
+        "GBP" => "£".to_string(),
+        "JPY" | "CNY" => "¥".to_string(),
+        "INR" => "₹".to_string(),
+        "KRW" => "₩".to_string(),
+        other => format!("{other}\u{a0}"),
+    }
+}
+
+/// en-US list formatting: "a", "a and b", "a, b, and c" (conj = "and"/"or").
+fn format_list_en(items: &[String], conj: &str) -> String {
+    match items.len() {
+        0 => String::new(),
+        1 => items[0].clone(),
+        2 => format!("{} {} {}", items[0], conj, items[1]),
+        n => {
+            let head = items[..n - 1].join(", ");
+            format!("{head}, {conj} {}", items[n - 1])
+        }
+    }
+}
+
+/// en-US relative-time formatting (numeric "always"): "in N units" / "N units ago".
+fn format_relative_time_en(value: f64, unit: &str) -> String {
+    let base = unit.strip_suffix('s').unwrap_or(unit);
+    let n = value.abs();
+    let plural = (n - 1.0).abs() > f64::EPSILON; // anything but exactly 1 → plural
+    let unit_str = if plural { format!("{base}s") } else { base.to_string() };
+    let num = if n.fract() == 0.0 { format!("{}", n as i64) } else { format!("{n}") };
+    if value < 0.0 {
+        format!("{num} {unit_str} ago")
+    } else {
+        format!("in {num} {unit_str}")
+    }
+}
+
+/// Minimal en duration formatting: non-zero fields joined as "N unit, …".
+fn format_duration_en(d: &[i64; 10]) -> String {
+    const NAMES: [&str; 10] = [
+        "yr", "mth", "wk", "day", "hr", "min", "sec", "ms", "μs", "ns",
+    ];
+    let parts: Vec<String> = d
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v != 0)
+        .map(|(i, &v)| format!("{v} {}", NAMES[i]))
+        .collect();
+    if parts.is_empty() {
+        "0 sec".to_string()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// ISO day-of-week: Monday=1 … Sunday=7.

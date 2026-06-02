@@ -407,6 +407,14 @@ pub enum HeapObj {
     /// 2=PlainTime, 3=PlainDateTime, …); `fields` holds its integer slots in a
     /// per-kind layout (Duration: y,mo,w,d,h,mi,s,ms,us,ns; PlainDate: isoY,isoM,isoD).
     Temporal { kind: u8, fields: Vec<i64> },
+    /// An `Intl.*` instance. `kind` selects the service (0=NumberFormat,
+    /// 1=DateTimeFormat, 2=Collator, 3=PluralRules, 4=ListFormat,
+    /// 5=RelativeTimeFormat, 6=Segmenter, 7=Locale, 8=DisplayNames,
+    /// 9=DurationFormat). `resolved` is the heap index of an Object holding the
+    /// instance's resolved options (insertion-ordered, so resolvedOptions() can
+    /// clone it directly); for Locale it also holds the parsed language/region/…
+    /// subtags read back by the prototype getters. `typeof` is "object".
+    Intl { kind: u8, resolved: u32 },
     /// A JS `BigInt` primitive. Stored as `i128` (covers the common test262
     /// magnitudes; true arbitrary precision is a later refinement). Compared by
     /// VALUE (`1n === 1n`), not identity; `typeof` is "bigint".
