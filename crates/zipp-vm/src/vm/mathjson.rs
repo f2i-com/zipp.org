@@ -152,14 +152,16 @@ impl<'p> Vm<'p> {
             HeapObj::Object(map) => {
                 let keys = map.keys.clone();
                 let vals = map.vals.clone();
+                let order = spec_key_order(&keys);
                 let sep = if indent.is_empty() { ":" } else { ": " };
                 let mut parts = Vec::new();
-                for (k, val) in keys.iter().zip(vals.iter()) {
+                for &i in &order {
+                    let k = &keys[i];
                     // Symbol-keyed (and private) properties are skipped by JSON.
                     if is_hidden_key(k) {
                         continue;
                     }
-                    if let Some(vs) = self.json_value(*val, indent, depth + 1) {
+                    if let Some(vs) = self.json_value(vals[i], indent, depth + 1) {
                         parts.push(format!("{}{}{}", json_quote(k), sep, vs));
                     }
                 }

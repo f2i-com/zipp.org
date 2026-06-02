@@ -290,9 +290,10 @@ impl<'p> Vm<'p> {
                     .collect()
             } else {
                 match self.heap.get(src.heap_index()) {
-                    HeapObj::Object(map) => {
-                        map.keys.iter().cloned().zip(map.vals.iter().copied()).collect()
-                    }
+                    HeapObj::Object(map) => spec_key_order(&map.keys)
+                        .into_iter()
+                        .map(|i| (map.keys[i].clone(), map.vals[i]))
+                        .collect(),
                     HeapObj::Array(items) => {
                         items.iter().enumerate().map(|(i, &v)| (i.to_string(), v)).collect()
                     }

@@ -647,11 +647,9 @@ impl<'p> Vm<'p> {
                         // Copy src's own keys except the destructured siblings.
                         let pairs: Vec<(String, Value)> = if s.is_heap() {
                             match self.heap.get(s.heap_index()) {
-                                HeapObj::Object(map) => map
-                                    .keys
-                                    .iter()
-                                    .cloned()
-                                    .zip(map.vals.iter().copied())
+                                HeapObj::Object(map) => spec_key_order(&map.keys)
+                                    .into_iter()
+                                    .map(|i| (map.keys[i].clone(), map.vals[i]))
                                     .filter(|(k, _)| !excluded.iter().any(|e| e == k))
                                     .collect(),
                                 _ => Vec::new(),

@@ -236,6 +236,27 @@ pub(crate) fn parse_float(s: &str) -> f64 {
 /// non-numeric key (those address no dense element → `undefined`). The JIT region
 /// computes loop counters as f64, so `a[i]` arrives here with a double key.
 #[inline]
+/// Indices into `keys` in spec **OrdinaryOwnPropertyKeys** order: integer-index
+/// keys (canonical array indices `0..2^32-1`, e.g. "0"/"7" but not "01"/"-1")
+/// first in ascending numeric order, then every other key in its original
+/// (insertion) order. Symbols/private keys keep their relative position among
+/// "the rest"; callers filter hidden keys separately.
+pub(crate) fn spec_key_order(keys: &[String]) -> Vec<usize> {
+    let mut ints: Vec<(u32, usize)> = Vec::new();
+    let mut rest: Vec<usize> = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        match k.parse::<u32>() {
+            Ok(n) if n != u32::MAX && n.to_string() == *k => ints.push((n, i)),
+            _ => rest.push(i),
+        }
+    }
+    if ints.is_empty() {
+        return rest; // common fast path: no integer keys → original order
+    }
+    ints.sort_unstable_by_key(|&(n, _)| n);
+    ints.into_iter().map(|(_, i)| i).chain(rest).collect()
+}
+
 pub(crate) fn array_index(key: Value) -> Option<usize> {
     if key.is_int() {
         let i = key.as_int();

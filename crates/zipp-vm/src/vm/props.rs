@@ -13,14 +13,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Value {
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
-                HeapObj::Object(m) => m
-                    .keys
-                    .iter()
-                    .cloned()
-                    .zip(m.vals.iter().copied())
-                    .zip(m.attrs.iter())
-                    .filter(|((k, _), a)| a.enumerable && !is_hidden_key(k))
-                    .map(|(kv, _)| kv)
+                HeapObj::Object(m) => spec_key_order(&m.keys)
+                    .into_iter()
+                    .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
+                    .map(|i| (m.keys[i].clone(), m.vals[i]))
                     .collect(),
                 HeapObj::Array(items) => {
                     let mut v: Vec<(String, Value)> =
@@ -165,9 +161,13 @@ impl<'p> Vm<'p> {
             let has_name = self.callable_has_intrinsic(obj, "name");
             match self.heap.get(idx) {
                 // Private names (stored as "#x") are not reflectable own properties.
-                HeapObj::Object(m) => {
-                    keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned())
-                }
+                HeapObj::Object(m) => keys.extend(
+                    spec_key_order(&m.keys)
+                        .into_iter()
+                        .map(|i| &m.keys[i])
+                        .filter(|k| !is_hidden_key(k))
+                        .cloned(),
+                ),
                 HeapObj::Array(items) => {
                     for i in 0..items.len() {
                         keys.push(i.to_string());
