@@ -94,9 +94,9 @@ impl<'p> Vm<'p> {
         match name {
             "indexOf" => {
                 let needle = self.display(arg0);
-                // Optional fromIndex (a char position) to start searching at.
-                let from = if args.len() >= 2 && args[1].is_number() {
-                    args[1].as_f64().max(0.0) as usize
+                // Optional fromIndex (ToInteger, a char position) to start at.
+                let from = if args.len() >= 2 {
+                    self.to_integer_or_zero(args[1])?.max(0) as usize
                 } else {
                     0
                 };
@@ -115,8 +115,10 @@ impl<'p> Vm<'p> {
             "toLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
             "slice" | "substring" => {
                 let len = char_len(&s) as i32;
-                let start = norm_index(if args.is_empty() { 0 } else { arg0.as_f64() as i32 }, len);
-                let end = if args.len() < 2 { len } else { norm_index(args[1].as_f64() as i32, len) };
+                let s0 = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)? as i32 };
+                let e0 = if args.len() < 2 { len } else { self.to_integer_or_zero(args[1])? as i32 };
+                let start = norm_index(s0, len);
+                let end = norm_index(e0, len);
                 let out: String = if start < end {
                     s.chars().skip(start as usize).take((end - start) as usize).collect()
                 } else {
@@ -125,14 +127,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(out)))
             }
             "repeat" => {
-                let n = arg0.as_f64();
-                if n < 0.0 || !n.is_finite() {
+                let n = self.to_integer_or_zero(arg0)?;
+                if n < 0 {
                     return Err(Thrown("RangeError: Invalid count value".into()));
                 }
                 // Bound the result (an unbounded build would hang / OOM) — a too-long
-                // string is a RangeError per spec. (Empty string repeats to "" for any
-                // count, so its length is always 0 — no bound needed.)
-                if n * (s.len() as f64) > (1u64 << 28) as f64 {
+                // string (or count===+Infinity, saturated to i64::MAX here) is a
+                // RangeError per spec. Empty string repeats to "" for any count.
+                if (n as f64) * (s.len() as f64) > (1u64 << 28) as f64 {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
                 Ok(Some(self.alloc_str(s.repeat(n as usize))))
@@ -227,8 +229,26 @@ impl<'p> Vm<'p> {
             "trim" => Ok(Some(self.alloc_str(s.trim().to_string()))),
             "trimStart" => Ok(Some(self.alloc_str(s.trim_start().to_string()))),
             "trimEnd" => Ok(Some(self.alloc_str(s.trim_end().to_string()))),
-            "startsWith" => Ok(Some(Value::bool(s.starts_with(&self.display(arg0))))),
-            "endsWith" => Ok(Some(Value::bool(s.ends_with(&self.display(arg0))))),
+            "startsWith" => {
+                let needle = self.display(arg0);
+                let len = char_len(&s) as i64;
+                let pos =
+                    if args.len() >= 2 { self.to_integer_or_zero(args[1])?.clamp(0, len) } else { 0 }
+                        as usize;
+                let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
+                Ok(Some(Value::bool(s[byte..].starts_with(&needle))))
+            }
+            "endsWith" => {
+                let needle = self.display(arg0);
+                let len = char_len(&s) as i64;
+                let end = if args.len() >= 2 && args[1] != Value::UNDEFINED {
+                    self.to_integer_or_zero(args[1])?.clamp(0, len)
+                } else {
+                    len
+                } as usize;
+                let byte = s.char_indices().nth(end).map(|(b, _)| b).unwrap_or(s.len());
+                Ok(Some(Value::bool(s[..byte].ends_with(&needle))))
+            }
             "concat" => {
                 let mut out = s.clone();
                 for a in args {
@@ -240,8 +260,7 @@ impl<'p> Vm<'p> {
                 // Legacy substr(start, length); negative start counts from the end.
                 let chars: Vec<char> = s.chars().collect();
                 let len = chars.len() as i64;
-                let sr = if args.is_empty() { 0.0 } else { arg0.as_f64() };
-                let mut start = if sr.is_nan() { 0 } else { sr as i64 };
+                let mut start = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)? };
                 if start < 0 {
                     start = (len + start).max(0);
                 }
@@ -250,8 +269,8 @@ impl<'p> Vm<'p> {
                 let count = if args.len() < 2 || args[1] == Value::UNDEFINED {
                     avail
                 } else {
-                    let c = args[1].as_f64();
-                    if c.is_nan() || c < 0.0 { 0 } else { (c as usize).min(avail) }
+                    let c = self.to_integer_or_zero(args[1])?;
+                    if c < 0 { 0 } else { (c as usize).min(avail) }
                 };
                 let sub: String = chars[start..start + count].iter().collect();
                 Ok(Some(self.alloc_str(sub)))
@@ -289,8 +308,8 @@ impl<'p> Vm<'p> {
             "valueOf" | "toString" => Ok(Some(Value::heap(idx))),
             "padStart" | "padEnd" => {
                 let cur = char_len(&s);
-                let t = arg0.as_f64();
-                let target = if t.is_finite() && t > 0.0 { t as usize } else { 0 };
+                let t = self.to_integer_or_zero(arg0)?;
+                let target = if t > 0 { t as usize } else { 0 };
                 if target as u64 > (1u64 << 28) {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
@@ -329,8 +348,15 @@ impl<'p> Vm<'p> {
                 let sc: Vec<char> = s.chars().collect();
                 let nc: Vec<char> = needle.chars().collect();
                 let len = sc.len();
-                let cap = if args.len() >= 2 && args[1].is_number() && !args[1].as_f64().is_nan() {
-                    (args[1].as_f64().max(0.0) as usize).min(len)
+                // position: ToNumber, then NaN -> search the whole string (per
+                // lastIndexOf), else ToInteger clamped to [0, len].
+                let cap = if args.len() >= 2 && args[1] != Value::UNDEFINED {
+                    let np = self.to_number_coerce(args[1])?;
+                    if np.is_nan() {
+                        len
+                    } else {
+                        (np.trunc().max(0.0) as usize).min(len)
+                    }
                 } else {
                     len
                 };
