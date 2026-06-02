@@ -49,19 +49,23 @@ impl<'p> Vm<'p> {
 
     /// `new Temporal.Duration(y, mo, w, d, h, mi, s, ms, us, ns)` — integer fields.
     pub(crate) fn build_duration(&mut self, args: &[Value]) -> Result<Value, Thrown> {
-        let mut f = [0i64; 10];
-        for (i, slot) in f.iter_mut().enumerate() {
+        let mut ff = [0f64; 10];
+        for (i, slot) in ff.iter_mut().enumerate() {
             let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
             if v != Value::UNDEFINED {
-                let n = self.to_number(v)?;
+                let n = self.to_number_coerce(v)?;
                 if !n.is_finite() || n.fract() != 0.0 {
                     return Err(Thrown(
                         "RangeError: Temporal.Duration fields must be integers".into(),
                     ));
                 }
-                *slot = n as i64;
+                *slot = n;
             }
         }
+        if !is_valid_duration(&ff) {
+            return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+        }
+        let f = ff.map(|x| x as i64);
         self.validate_duration(&f)?;
         Ok(self.make_duration(f))
     }
@@ -79,19 +83,19 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid duration string '{s}'")));
             }
             if matches!(self.heap.get(idx), HeapObj::Object(_)) {
-                let mut f = [0i64; 10];
+                let mut ff = [0f64; 10];
                 let mut any = false;
                 for (i, name) in native::DURATION_FIELDS.iter().enumerate() {
                     let pv = self.get_prop(v, name)?;
                     if pv != Value::UNDEFINED {
                         any = true;
-                        let n = self.to_number(pv)?;
+                        let n = self.to_number_coerce(pv)?;
                         if !n.is_finite() || n.fract() != 0.0 {
                             return Err(Thrown(
                                 "RangeError: Temporal.Duration fields must be integers".into(),
                             ));
                         }
-                        f[i] = n as i64;
+                        ff[i] = n;
                     }
                 }
                 if !any {
@@ -99,6 +103,10 @@ impl<'p> Vm<'p> {
                         "TypeError: object is not a valid Temporal.Duration-like".into(),
                     ));
                 }
+                if !is_valid_duration(&ff) {
+                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+                }
+                let f = ff.map(|x| x as i64);
                 self.validate_duration(&f)?;
                 return Ok(f);
             }
@@ -137,22 +145,26 @@ impl<'p> Vm<'p> {
             "abs" => Ok(Some(self.make_duration(f.map(|x| x.abs())))),
             "with" => {
                 // Override the supplied fields (a plain partial-duration object).
-                let mut nf = f;
+                let mut nf = f.map(|x| x as f64);
                 let mut any = false;
                 for (i, name) in native::DURATION_FIELDS.iter().enumerate() {
                     let pv = self.get_prop(a0, name)?;
                     if pv != Value::UNDEFINED {
                         any = true;
-                        let n = self.to_number(pv)?;
+                        let n = self.to_number_coerce(pv)?;
                         if !n.is_finite() || n.fract() != 0.0 {
                             return Err(Thrown("RangeError: Duration fields must be integers".into()));
                         }
-                        nf[i] = n as i64;
+                        nf[i] = n;
                     }
                 }
                 if !any {
                     return Err(Thrown("TypeError: with() requires a partial Duration object".into()));
                 }
+                if !is_valid_duration(&nf) {
+                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+                }
+                let nf = nf.map(|x| x as i64);
                 self.validate_duration(&nf)?;
                 Ok(Some(self.make_duration(nf)))
             }
@@ -636,7 +648,8 @@ impl<'p> Vm<'p> {
         if v == Value::UNDEFINED {
             Ok(None)
         } else {
-            Ok(Some(self.to_number(v)? as i64))
+            // ToNumber honours a user valueOf/toString (ToPrimitive) on objects.
+            Ok(Some(self.to_number_coerce(v)? as i64))
         }
     }
 
@@ -1871,6 +1884,52 @@ impl<'p> Vm<'p> {
 
     // ── Intl ──
 
+}
+
+/// `IsValidDuration` (spec): all fields finite, |years|/|months|/|weeks| < 2^32,
+/// and the combined days+time span is under 2^53 seconds. Operates on the raw
+/// f64 fields so out-of-range magnitudes are caught before any i64 truncation.
+fn is_valid_duration(f: &[f64; 10]) -> bool {
+    if f.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let two_pow_32 = 4_294_967_296.0_f64; // 2^32
+    if f[0].abs() >= two_pow_32 || f[1].abs() >= two_pow_32 || f[2].abs() >= two_pow_32 {
+        return false;
+    }
+    // The bound is abs(days×86400 + h×3600 + m×60 + s + sub-seconds) < 2^53 s.
+    // An f64 estimate decides everything except a thin band around 2^53 where
+    // rounding is ambiguous (e.g. the spec maximum 2^53-1 + 0.999999999 rounds
+    // up to 2^53 in f64); there, recompute the total exactly in i128 ns.
+    let two53 = 9_007_199_254_740_992.0_f64; // 2^53
+    let est = f[3] * 86_400.0
+        + f[4] * 3_600.0
+        + f[5] * 60.0
+        + f[6]
+        + f[7] / 1e3
+        + f[8] / 1e6
+        + f[9] / 1e9;
+    // Margin must exceed the f64 ULP at 2^53 (which is 2.0, so 1.0 would vanish).
+    if est.abs() >= two53 + 16.0 {
+        return false;
+    }
+    if est.abs() <= two53 - 16.0 {
+        return true;
+    }
+    // Ambiguous band. Exact i128 nanosecond total; bail out (reject) if any field
+    // is beyond i64 range, which here can only arise from sign-cancellation (an
+    // invalid mixed-sign duration) and would overflow the i128 products anyway.
+    if f[3..10].iter().any(|x| x.abs() >= 9.0e18) {
+        return false;
+    }
+    let total_ns: i128 = (f[3] as i128) * 86_400_000_000_000
+        + (f[4] as i128) * 3_600_000_000_000
+        + (f[5] as i128) * 60_000_000_000
+        + (f[6] as i128) * 1_000_000_000
+        + (f[7] as i128) * 1_000_000
+        + (f[8] as i128) * 1_000
+        + (f[9] as i128);
+    total_ns.unsigned_abs() < 9_007_199_254_740_992u128 * 1_000_000_000
 }
 
 /// Resolve a calendar string to its canonical id. The ISO-only engine accepts
