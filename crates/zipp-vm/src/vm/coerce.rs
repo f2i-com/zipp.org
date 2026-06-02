@@ -196,7 +196,31 @@ impl<'p> Vm<'p> {
     /// number vs string coerces the string to a number; boolean coerces to a
     /// number; an object vs a primitive coerces the object to its primitive
     /// (here: string coercion, since we have no valueOf). NaN is never equal.
-    pub(crate) fn loose_eq(&self, a: Value, b: Value) -> Result<bool, Thrown> {
+    /// Whether `v` is an OBJECT for abstract-equality purposes — a heap value
+    /// that is not a string/symbol/bigint primitive. (Boxed wrappers count as
+    /// objects; they ToPrimitive to their wrapped value.)
+    fn is_eq_object(&self, v: Value) -> bool {
+        v.is_heap()
+            && !matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+            )
+    }
+
+    pub(crate) fn loose_eq(&mut self, a: Value, b: Value) -> Result<bool, Thrown> {
+        // Object vs primitive (`[1] == 1`, `{} == "[object Object]"`,
+        // `Object('x') == 'x'`): ToPrimitive the object side, then retry. Two
+        // objects fall through to reference equality; object vs null/undefined is
+        // never ToPrimitive'd (handled by the nullish check below).
+        let (a_obj, b_obj) = (self.is_eq_object(a), self.is_eq_object(b));
+        if a_obj && !b_obj && !b.is_nullish() {
+            let pa = self.to_primitive_default(a)?;
+            return self.loose_eq(pa, b);
+        }
+        if b_obj && !a_obj && !a.is_nullish() {
+            let pb = self.to_primitive_default(b)?;
+            return self.loose_eq(a, pb);
+        }
         // BigInt loose equality compares mathematical values across types
         // (`1n == 1`, `1n == "1"`, `1n == true`), so handle it before the generic
         // same-tag/heap shortcuts (two distinct 1n allocations aren't bit-equal).
@@ -569,6 +593,12 @@ impl<'p> Vm<'p> {
     /// the first that yields a primitive; TypeError if neither does. (The
     /// `Symbol.toPrimitive` hook is not consulted yet.)
     pub(crate) fn to_primitive_number(&mut self, v: Value) -> Result<Value, Thrown> {
+        // A boxed primitive wrapper yields its wrapped primitive directly.
+        if v.is_heap() {
+            if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
+                return Ok(*value);
+            }
+        }
         for name in ["valueOf", "toString"] {
             let f = self.get_prop(v, name)?;
             if self.is_callable(f) {
@@ -599,6 +629,11 @@ impl<'p> Vm<'p> {
             HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
         ) {
             return Ok(v);
+        }
+        // A boxed primitive wrapper (String/Number/Boolean/Symbol/BigInt) yields
+        // its wrapped primitive — the built-in valueOf would return the same.
+        if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
+            return Ok(*value);
         }
         let order: [&str; 2] = if matches!(self.heap.get(v.heap_index()), HeapObj::Date(_)) {
             ["toString", "valueOf"]
