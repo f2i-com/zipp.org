@@ -1223,6 +1223,50 @@ impl<'p> Vm<'p> {
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
                 Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
             }
+            "until" | "since" => {
+                // Difference of two ZonedDateTimes (fixed-offset): the difference of
+                // their local wall-clocks. Default largestUnit is "hour".
+                let other = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let oz = self.zoned_date_time_from(other, Value::UNDEFINED)?;
+                let of = self.zdt_local(oz.heap_index());
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let largest = self.opt_string(
+                    opts,
+                    "largestUnit",
+                    "auto",
+                    &[
+                        "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
+                        "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
+                        "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
+                    ],
+                )?;
+                let largest = normalize_unit(&largest, "hour");
+                let f = self.zdt_local(idx);
+                let (dt1, dt2) = if name == "until" { (f, of) } else { (of, f) };
+                let df = difference_datetime(dt1, dt2, &largest);
+                Ok(Some(self.make_duration(df)))
+            }
+            "round" => {
+                let opts = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let (su, inc, mode) = self.read_round_options(
+                    opts,
+                    &[
+                        "day", "hour", "minute", "second", "millisecond", "microsecond",
+                        "nanosecond",
+                    ],
+                )?;
+                let f = self.zdt_local(idx);
+                let time_ns = time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
+                let inc_ns = unit_ns(&su) * inc;
+                let rounded = round_increment(time_ns, inc_ns, &mode);
+                let day_carry = rounded.div_euclid(DAY_NS) as i64;
+                let nt = ns_to_time(rounded.rem_euclid(DAY_NS));
+                let ed = iso_to_epoch_days(f[0], f[1], f[2]) + day_carry;
+                let off = self.zdt_offset_ns(idx);
+                let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
+            }
             "with" => {
                 // Merge date/time fields from the bag over the current local
                 // wall-clock; the zone (and thus offset) is unchanged.
