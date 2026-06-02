@@ -159,6 +159,147 @@ impl<'p> Vm<'p> {
             "valueOf" => {
                 Err(Thrown("TypeError: Called Temporal.Duration.prototype.valueOf".into()))
             }
+            "total" => {
+                // arg: a unit string, or { unit, relativeTo }.
+                let unit_v = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
+                    a0
+                } else if a0 == Value::UNDEFINED {
+                    return Err(Thrown("TypeError: total() requires an options argument".into()));
+                } else {
+                    self.get_prop(a0, "unit")?
+                };
+                if unit_v == Value::UNDEFINED {
+                    return Err(Thrown("RangeError: unit is required".into()));
+                }
+                let unit = normalize_unit(&self.to_js_string(unit_v)?, "");
+                if !DURATION_UNITS.contains(&unit.as_str()) {
+                    return Err(Thrown(format!("RangeError: invalid unit: {unit}")));
+                }
+                // No relativeTo support: years/months/weeks (in the value or as the
+                // requested unit) need a calendar.
+                if f[0] != 0 || f[1] != 0 || f[2] != 0 || matches!(unit.as_str(), "year" | "month" | "week") {
+                    return Err(Thrown(
+                        "RangeError: a relativeTo option is required for years, months, or weeks".into(),
+                    ));
+                }
+                let total_ns = (f[3] as i128) * DAY_NS
+                    + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
+                Ok(Some(Value::num(total_ns as f64 / unit_ns(&unit) as f64)))
+            }
+            "round" => {
+                let (su_v, options) = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
+                    (a0, Value::UNDEFINED)
+                } else if a0 == Value::UNDEFINED {
+                    return Err(Thrown("TypeError: round() requires an options argument".into()));
+                } else {
+                    (self.get_prop(a0, "smallestUnit")?, a0)
+                };
+                let lu_v = if options == Value::UNDEFINED {
+                    Value::UNDEFINED
+                } else {
+                    self.get_prop(options, "largestUnit")?
+                };
+                let su = if su_v == Value::UNDEFINED {
+                    None
+                } else {
+                    let s = normalize_unit(&self.to_js_string(su_v)?, "");
+                    if !DURATION_UNITS.contains(&s.as_str()) {
+                        return Err(Thrown(format!("RangeError: invalid smallestUnit: {s}")));
+                    }
+                    Some(s)
+                };
+                let lu = if lu_v == Value::UNDEFINED {
+                    None
+                } else {
+                    let s = normalize_unit(&self.to_js_string(lu_v)?, "auto");
+                    if s == "auto" {
+                        None
+                    } else if !DURATION_UNITS.contains(&s.as_str()) {
+                        return Err(Thrown(format!("RangeError: invalid largestUnit: {s}")));
+                    } else {
+                        Some(s)
+                    }
+                };
+                if su.is_none() && lu.is_none() {
+                    return Err(Thrown(
+                        "RangeError: at least one of smallestUnit or largestUnit is required".into(),
+                    ));
+                }
+                let cal =
+                    |u: &Option<String>| u.as_deref().is_some_and(|x| matches!(x, "year" | "month" | "week"));
+                if f[0] != 0 || f[1] != 0 || f[2] != 0 || cal(&su) || cal(&lu) {
+                    return Err(Thrown(
+                        "RangeError: a relativeTo option is required for years, months, or weeks".into(),
+                    ));
+                }
+                let inc = if options == Value::UNDEFINED {
+                    1
+                } else {
+                    let v = self.get_prop(options, "roundingIncrement")?;
+                    if v == Value::UNDEFINED {
+                        1
+                    } else {
+                        let n = self.to_number(v)?;
+                        if !n.is_finite() || n < 1.0 || n.fract() != 0.0 {
+                            return Err(Thrown("RangeError: roundingIncrement out of range".into()));
+                        }
+                        n as i128
+                    }
+                };
+                let mode = if options == Value::UNDEFINED {
+                    "halfExpand".to_string()
+                } else {
+                    self.opt_string(
+                        options,
+                        "roundingMode",
+                        "halfExpand",
+                        &[
+                            "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
+                            "halfEven", "halfExpand",
+                        ],
+                    )?
+                };
+                let day_units =
+                    ["day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+                let rank = |u: &str| day_units.iter().position(|&x| x == u).unwrap_or(6) as i32;
+                let smallest = su.unwrap_or_else(|| "nanosecond".to_string());
+                if let Some(max) = max_increment(&smallest) {
+                    if inc >= max || max % inc != 0 {
+                        return Err(Thrown(
+                            "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                        ));
+                    }
+                }
+                let existing =
+                    (3..10).filter(|&i| f[i] != 0).map(|i| (i - 3) as i32).min().unwrap_or(6);
+                let largest =
+                    lu.unwrap_or_else(|| day_units[existing.min(rank(&smallest)) as usize].to_string());
+                let total_ns = (f[3] as i128) * DAY_NS
+                    + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
+                let inc_ns = unit_ns(&smallest) * inc;
+                let rounded = round_increment(total_ns, inc_ns, &mode);
+                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+            }
+            "add" | "subtract" => {
+                let other = self.to_duration(a0)?;
+                let sign = if name == "add" { 1i64 } else { -1 };
+                if f[0] != 0 || f[1] != 0 || f[2] != 0 || other[0] != 0 || other[1] != 0 || other[2] != 0 {
+                    return Err(Thrown(
+                        "RangeError: a relativeTo option is required for years, months, or weeks".into(),
+                    ));
+                }
+                let total_ns = (f[3] as i128) * DAY_NS
+                    + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]])
+                    + sign as i128
+                        * ((other[3] as i128) * DAY_NS
+                            + time_to_ns(&[other[4], other[5], other[6], other[7], other[8], other[9]]));
+                let existing =
+                    |g: &[i64; 10]| (3..10).filter(|&i| g[i] != 0).map(|i| (i - 3) as i32).min().unwrap_or(6);
+                let day_units =
+                    ["day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+                let largest = day_units[existing(&f).min(existing(&other)) as usize];
+                Ok(Some(self.make_duration(balance_duration_ns(total_ns, largest))))
+            }
             _ => Ok(None),
         }
     }

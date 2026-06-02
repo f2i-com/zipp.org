@@ -613,6 +613,12 @@ pub(crate) fn difference_datetime(dt1: [i64; 9], dt2: [i64; 9], largest: &str) -
 }
 
 /// Size of a time/day unit in nanoseconds (used for rounding).
+/// The ten Temporal duration units (singular), largest to smallest.
+pub(crate) const DURATION_UNITS: &[&str] = &[
+    "year", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond",
+    "nanosecond",
+];
+
 pub(crate) fn unit_ns(u: &str) -> i128 {
     match u {
         "day" => DAY_NS,
@@ -623,6 +629,39 @@ pub(crate) fn unit_ns(u: &str) -> i128 {
         "microsecond" => 1_000,
         _ => 1, // nanosecond
     }
+}
+
+/// Decompose a signed nanosecond total into a Duration's day+time fields
+/// [_,_,_,d,h,mi,s,ms,us,ns], from `largest` (day..nanosecond) down. Used by
+/// Duration round/add/subtract without relativeTo (a day is exactly 24h).
+pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> [i64; 10] {
+    let sign = total_ns.signum();
+    let mut n = total_ns.abs();
+    let mut f = [0i64; 10];
+    // (field index, unit size in ns) from day down to nanosecond.
+    let units = [
+        (3usize, DAY_NS),
+        (4, 3_600_000_000_000),
+        (5, 60_000_000_000),
+        (6, 1_000_000_000),
+        (7, 1_000_000),
+        (8, 1_000),
+        (9, 1),
+    ];
+    let start = match largest {
+        "day" => 0,
+        "hour" => 1,
+        "minute" => 2,
+        "second" => 3,
+        "millisecond" => 4,
+        "microsecond" => 5,
+        _ => 6, // nanosecond
+    };
+    for &(slot, sz) in &units[start..] {
+        f[slot] = (n / sz) as i64 * sign as i64;
+        n %= sz;
+    }
+    f
 }
 
 /// Maximum (exclusive) roundingIncrement for a time unit (the count of that unit
