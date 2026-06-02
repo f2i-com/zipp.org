@@ -559,7 +559,9 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::JsonParse { dst, a } => {
-                        let s = self.display(self.get(base, a)); // ToString of the arg
+                        let arg = self.get(base, a);
+                        // ToString (invokes toString/valueOf; throws TypeError for a Symbol).
+                        let s = self.to_js_string(arg)?;
                         let v = self.json_parse(&s)?; // propagates SyntaxError as a throw
                         self.set(base, dst, v);
                         ip += 1;

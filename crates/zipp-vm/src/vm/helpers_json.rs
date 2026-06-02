@@ -130,14 +130,30 @@ pub(crate) fn json_parse_string(src: &str, i: &mut usize) -> Result<String, Thro
 /// Parse a JSON number token at `*i`.
 pub(crate) fn json_parse_number(b: &[u8], i: &mut usize) -> Result<Value, Thrown> {
     let start = *i;
+    let err = || Thrown("SyntaxError: Invalid number in JSON".into());
+    // ECMA-404 number grammar (stricter than Rust's f64 parser):
+    //   number = [ '-' ] int [ frac ] [ exp ]
+    //   int    = '0' | [1-9] digit*        (no leading zeros)
+    //   frac   = '.' digit+                (at least one digit)
+    //   exp    = ('e'|'E') ['+'|'-'] digit+
     if b.get(*i) == Some(&b'-') {
         *i += 1;
     }
-    while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
-        *i += 1;
+    match b.get(*i) {
+        Some(b'0') => *i += 1, // a leading 0 must stand alone (no further digits)
+        Some(c) if c.is_ascii_digit() => {
+            *i += 1;
+            while matches!(b.get(*i), Some(d) if d.is_ascii_digit()) {
+                *i += 1;
+            }
+        }
+        _ => return Err(err()), // missing integer part ("-", ".5", "e1", …)
     }
     if b.get(*i) == Some(&b'.') {
         *i += 1;
+        if !matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
+            return Err(err()); // "1." — fraction needs a digit
+        }
         while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
             *i += 1;
         }
@@ -147,13 +163,16 @@ pub(crate) fn json_parse_number(b: &[u8], i: &mut usize) -> Result<Value, Thrown
         if matches!(b.get(*i), Some(b'+' | b'-')) {
             *i += 1;
         }
+        if !matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
+            return Err(err()); // "1e" — exponent needs a digit
+        }
         while matches!(b.get(*i), Some(c) if c.is_ascii_digit()) {
             *i += 1;
         }
     }
     match std::str::from_utf8(&b[start..*i]).unwrap_or("").parse::<f64>() {
         Ok(n) => Ok(Value::num(n)),
-        Err(_) => Err(Thrown("SyntaxError: Invalid number in JSON".into())),
+        Err(_) => Err(err()),
     }
 }
 

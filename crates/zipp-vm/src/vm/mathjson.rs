@@ -437,13 +437,17 @@ impl<'p> Vm<'p> {
     }
 
     /// InternalizeJSONProperty: walk the parsed tree bottom-up, replacing each
-    /// `holder[key]` with `reviver.call(holder, key, value)`. Children are
-    /// revived before their parent; a child revived to `undefined` is deleted.
+    /// `holder[key]` with `reviver.call(holder, key, value, context)`. Children
+    /// are revived before their parent; a child revived to `undefined` is
+    /// deleted. `src` is this value's parse-source node (ES2025
+    /// json-parse-with-source): a primitive's `context` carries its raw source
+    /// text, an array/object's `context` is an empty object.
     pub(crate) fn internalize_json(
         &mut self,
         holder: Value,
         key: &str,
         reviver: Value,
+        src: Option<&JsonSrc>,
     ) -> Result<Value, Thrown> {
         // Read `holder[key]`, routing a numeric key on an array to its element
         // (`get_prop` only handles named properties).
@@ -479,7 +483,11 @@ impl<'p> Vm<'p> {
                 Kind::Arr(len) => {
                     for i in 0..len {
                         let k = i.to_string();
-                        let nv = self.internalize_json(val, &k, reviver)?;
+                        let child = match src {
+                            Some(JsonSrc::Arr(v)) => v.get(i),
+                            _ => None,
+                        };
+                        let nv = self.internalize_json(val, &k, reviver, child)?;
                         // Array elements: write/clear in place (a deleted element
                         // becomes a hole, which serialises back as `null`).
                         if let HeapObj::Array(items) = self.heap.get_mut(val.heap_index()) {
@@ -491,7 +499,13 @@ impl<'p> Vm<'p> {
                 }
                 Kind::Obj(keys) => {
                     for k in keys {
-                        let nv = self.internalize_json(val, &k, reviver)?;
+                        let child = match src {
+                            Some(JsonSrc::Obj(pairs)) => {
+                                pairs.iter().find(|(pk, _)| pk == &k).map(|(_, s)| s)
+                            }
+                            _ => None,
+                        };
+                        let nv = self.internalize_json(val, &k, reviver, child)?;
                         if nv.is_undefined() {
                             self.delete_property(val, &k)?;
                         } else {
@@ -502,7 +516,134 @@ impl<'p> Vm<'p> {
                 Kind::Other => {}
             }
         }
+        let context = self.make_json_context(src);
         let kv = self.alloc_str(key.to_string());
-        self.call_value(reviver, holder, &[kv, val])
+        self.call_value(reviver, holder, &[kv, val, context])
     }
+
+    /// The reviver `context`: a plain object that, for a primitive parse node,
+    /// carries a `"source"` data property holding the value's raw JSON text.
+    /// An array/object node yields an empty context.
+    fn make_json_context(&mut self, src: Option<&JsonSrc>) -> Value {
+        let ctx = Value::heap(self.heap.alloc(HeapObj::Object(crate::heap::ObjMap::new())));
+        if let Some(JsonSrc::Prim(s)) = src {
+            let sv = self.alloc_str(s.clone());
+            if let HeapObj::Object(m) = self.heap.get_mut(ctx.heap_index()) {
+                m.set("source", sv);
+            }
+        }
+        ctx
+    }
+
+    /// Like [`json_parse`], but also returns a parallel source tree recording the
+    /// raw JSON text of every value (for the parse-with-source reviver context).
+    pub(crate) fn json_parse_with_src(&mut self, src: &str) -> Result<(Value, JsonSrc), Thrown> {
+        let mut i = 0;
+        json_skip_ws(src.as_bytes(), &mut i);
+        let r = self.json_parse_value_src(src, &mut i)?;
+        json_skip_ws(src.as_bytes(), &mut i);
+        if i != src.len() {
+            return Err(Thrown("SyntaxError: Unexpected non-whitespace character after JSON".into()));
+        }
+        Ok(r)
+    }
+
+    fn json_parse_value_src(
+        &mut self,
+        src: &str,
+        i: &mut usize,
+    ) -> Result<(Value, JsonSrc), Thrown> {
+        let b = src.as_bytes();
+        match b.get(*i).copied() {
+            Some(b'{') => self.json_parse_object_src(src, i),
+            Some(b'[') => self.json_parse_array_src(src, i),
+            _ => {
+                // A primitive (string/number/true/false/null): record its exact span.
+                let start = *i;
+                let v = self.json_parse_value(src, i)?;
+                Ok((v, JsonSrc::Prim(src[start..*i].to_string())))
+            }
+        }
+    }
+
+    fn json_parse_array_src(
+        &mut self,
+        src: &str,
+        i: &mut usize,
+    ) -> Result<(Value, JsonSrc), Thrown> {
+        let b = src.as_bytes();
+        *i += 1; // '['
+        let mut items = Vec::new();
+        let mut srcs = Vec::new();
+        json_skip_ws(b, i);
+        if b.get(*i) != Some(&b']') {
+            loop {
+                json_skip_ws(b, i);
+                let (v, s) = self.json_parse_value_src(src, i)?;
+                items.push(v);
+                srcs.push(s);
+                json_skip_ws(b, i);
+                match b.get(*i) {
+                    Some(b',') => *i += 1,
+                    Some(b']') => break,
+                    _ => return Err(Thrown("SyntaxError: Expected ',' or ']' in JSON array".into())),
+                }
+            }
+        }
+        *i += 1; // ']'
+        let av = Value::heap(self.heap.alloc(HeapObj::Array(items)));
+        Ok((av, JsonSrc::Arr(srcs)))
+    }
+
+    fn json_parse_object_src(
+        &mut self,
+        src: &str,
+        i: &mut usize,
+    ) -> Result<(Value, JsonSrc), Thrown> {
+        let b = src.as_bytes();
+        *i += 1; // '{'
+        let mut pairs: Vec<(String, Value)> = Vec::new();
+        let mut srcs: Vec<(String, JsonSrc)> = Vec::new();
+        json_skip_ws(b, i);
+        if b.get(*i) != Some(&b'}') {
+            loop {
+                json_skip_ws(b, i);
+                if b.get(*i) != Some(&b'"') {
+                    return Err(Thrown("SyntaxError: Expected property name string in JSON".into()));
+                }
+                let key = json_parse_string(src, i)?;
+                json_skip_ws(b, i);
+                if b.get(*i) != Some(&b':') {
+                    return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
+                }
+                *i += 1;
+                json_skip_ws(b, i);
+                let (val, s) = self.json_parse_value_src(src, i)?;
+                pairs.push((key.clone(), val));
+                srcs.push((key, s));
+                json_skip_ws(b, i);
+                match b.get(*i) {
+                    Some(b',') => *i += 1,
+                    Some(b'}') => break,
+                    _ => return Err(Thrown("SyntaxError: Expected ',' or '}' in JSON object".into())),
+                }
+            }
+        }
+        *i += 1; // '}'
+        let mut map = crate::heap::ObjMap::new();
+        for (k, v) in pairs {
+            map.set(&k, v);
+        }
+        let ov = Value::heap(self.heap.alloc(HeapObj::Object(map)));
+        Ok((ov, JsonSrc::Obj(srcs)))
+    }
+}
+
+/// A parallel tree to a parsed JSON value recording each node's raw source text,
+/// for the ES2025 parse-with-source reviver `context.source`.
+pub(crate) enum JsonSrc {
+    /// A primitive leaf — the exact JSON text that produced it (e.g. `"1.1"`).
+    Prim(String),
+    Arr(Vec<JsonSrc>),
+    Obj(Vec<(String, JsonSrc)>),
 }

@@ -1046,16 +1046,16 @@ impl<'p> Vm<'p> {
             // these back the value form + reflection.)
             JSON_PARSE => {
                 let s = self.to_js_string(a0)?;
-                let parsed = self.json_parse(&s)?;
                 let reviver = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if self.is_callable(reviver) {
                     let _gc = self.gc_lock_guard();
+                    let (parsed, srctree) = self.json_parse_with_src(&s)?;
                     let mut m = crate::heap::ObjMap::new();
                     m.set("", parsed);
                     let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(m)));
-                    self.internalize_json(wrapper, "", reviver)?
+                    self.internalize_json(wrapper, "", reviver, Some(&srctree))?
                 } else {
-                    parsed
+                    self.json_parse(&s)?
                 }
             }
             JSON_STRINGIFY => {
