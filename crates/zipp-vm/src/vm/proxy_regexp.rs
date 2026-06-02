@@ -352,9 +352,9 @@ impl<'p> Vm<'p> {
     /// Advances `lastIndex` for a global/sticky regex.
     pub(crate) fn regexp_exec(&mut self, re_idx: u32, input_v: Value) -> Result<Value, Thrown> {
         let input = self.to_js_string(input_v)?;
-        let (global, sticky, start_char) = match self.heap.get(re_idx) {
+        let (global, sticky, has_indices, start_char) = match self.heap.get(re_idx) {
             HeapObj::RegExp { flags, last_index, .. } => {
-                (flags.contains('g'), flags.contains('y'), *last_index)
+                (flags.contains('g'), flags.contains('y'), flags.contains('d'), *last_index)
             }
             _ => {
                 return Err(Thrown(
@@ -425,10 +425,53 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
+        // `/d` (hasIndices): an `indices` array of [start,end] char ranges for the
+        // whole match + each capture group, with `.groups` for named groups.
+        let indices_v = if has_indices {
+            let mk = |vm: &mut Self, r: &std::ops::Range<usize>| -> Value {
+                let s = Value::num(byte_to_char(&input, r.start) as f64);
+                let e = Value::num(byte_to_char(&input, r.end) as f64);
+                Value::heap(vm.heap.alloc(HeapObj::Array(vec![s, e])))
+            };
+            let mut idx_elems = vec![mk(self, &(mstart..mend))];
+            for cap in &caps {
+                idx_elems.push(match cap {
+                    Some(r) => mk(self, r),
+                    None => Value::UNDEFINED,
+                });
+            }
+            let idx_groups = if named.is_empty() {
+                Value::UNDEFINED
+            } else {
+                let mut gm = ObjMap::new();
+                for (name, r) in &named {
+                    let v = match r {
+                        Some(r) => mk(self, r),
+                        None => Value::UNDEFINED,
+                    };
+                    gm.set(name, v);
+                }
+                let gidx = self.heap.alloc(HeapObj::Object(gm));
+                self.proto_of.insert(gidx, Value::NULL);
+                Value::heap(gidx)
+            };
+            let indices_arr = self.heap.alloc(HeapObj::Array(idx_elems));
+            self.arr_props.entry(indices_arr).or_insert_with(ObjMap::new).define(
+                "groups",
+                idx_groups,
+                attr,
+            );
+            Value::heap(indices_arr)
+        } else {
+            Value::UNDEFINED
+        };
         let m = self.arr_props.entry(arr_idx).or_insert_with(ObjMap::new);
         m.define("index", index_v, attr);
         m.define("input", input_sv, attr);
         m.define("groups", groups, attr);
+        if has_indices {
+            m.define("indices", indices_v, attr);
+        }
         if stateful {
             self.set_regexp_last_index(re_idx, byte_to_char(&input, mend));
         }
