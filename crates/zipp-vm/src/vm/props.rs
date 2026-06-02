@@ -567,16 +567,26 @@ impl<'p> Vm<'p> {
     /// returning the method value (or undefined). Lets primitive array/string
     /// values expose their methods as first-class values.
     pub(crate) fn proto_member(&self, proto: u32, key: &str) -> Value {
-        if proto != 0 {
-            if let HeapObj::Object(m) = self.heap.get(proto) {
+        // Walk the full prototype chain via `proto_of`. Most type prototypes chain
+        // directly to Object.prototype, but a TypedArray instance's prototype chain
+        // has an intermediate level (`Int8Array.prototype` -> `%TypedArray%.prototype`
+        // -> `Object.prototype`), so a 2-level lookup missed the shared methods.
+        let mut cur = proto;
+        let mut guard = 0u32;
+        while cur != 0 && guard < 64 {
+            guard += 1;
+            if let HeapObj::Object(m) = self.heap.get(cur) {
                 if let Some(v) = m.get(key) {
                     return v;
                 }
             }
+            match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => cur = p.heap_index(),
+                _ => break,
+            }
         }
-        // The type prototypes (Array/String/Number/Map/…) inherit from
-        // Object.prototype, so a method-as-value miss falls back there:
-        // `[].hasOwnProperty`, `(5).isPrototypeOf`, etc.
+        // Type prototypes that don't explicitly record `proto_of` -> Object.prototype
+        // still inherit from it (`[].hasOwnProperty`, `(5).isPrototypeOf`, etc.).
         if self.obj_proto != 0 && proto != self.obj_proto {
             if let HeapObj::Object(m) = self.heap.get(self.obj_proto) {
                 if let Some(v) = m.get(key) {
