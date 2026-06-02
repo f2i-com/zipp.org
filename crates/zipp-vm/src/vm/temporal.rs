@@ -1161,6 +1161,59 @@ impl<'p> Vm<'p> {
                     && self.zdt_tz_id(idx) == self.zdt_tz_id(other.heap_index());
                 Ok(Some(Value::bool(eq)))
             }
+            "withTimeZone" => {
+                // Same instant, different zone.
+                let tzstr = self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                let (id, offset) = parse_time_zone(&tzstr)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{tzstr}\"")))?;
+                let ns = self.zdt_epoch_ns(idx).unwrap_or(0);
+                Ok(Some(self.alloc_zdt(ns, offset, id)))
+            }
+            "withCalendar" => {
+                // ISO 8601 only — accept "iso8601", reject other calendars.
+                let cal = self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                if !cal.eq_ignore_ascii_case("iso8601") {
+                    return Err(Thrown(format!("RangeError: unsupported calendar \"{cal}\"")));
+                }
+                let (ns, off) = (self.zdt_epoch_ns(idx).unwrap_or(0), self.zdt_offset_ns(idx));
+                Ok(Some(self.make_zoned_date_time_raw(ns, off, idx)))
+            }
+            "withPlainTime" => {
+                let tv = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let time = if tv == Value::UNDEFINED {
+                    [0i64; 6]
+                } else {
+                    self.to_plain_time(tv)?
+                };
+                let f = self.zdt_local(idx);
+                let off = self.zdt_offset_ns(idx);
+                let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS + time_to_ns(&time);
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
+            }
+            "with" => {
+                // Merge date/time fields from the bag over the current local
+                // wall-clock; the zone (and thus offset) is unchanged.
+                let bag = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_object_value(bag) {
+                    return Err(Thrown("TypeError: ZonedDateTime.with requires an object".into()));
+                }
+                let mut f = self.zdt_local(idx);
+                let names = [
+                    "year", "month", "day", "hour", "minute", "second", "millisecond",
+                    "microsecond", "nanosecond",
+                ];
+                for (i, nm) in names.iter().enumerate() {
+                    if let Some(x) = self.opt_int_field(bag, nm)? {
+                        f[i] = x;
+                    }
+                }
+                let off = self.zdt_offset_ns(idx);
+                let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
+                    + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
+            }
             _ => Ok(None),
         }
     }
