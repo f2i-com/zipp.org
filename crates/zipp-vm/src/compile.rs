@@ -717,6 +717,12 @@ struct FnCompiler<'a> {
     /// When compiling a class method/constructor whose class `extends P`, the
     /// class_id of `P` — so `super(…)` / `super.m(…)` resolve to its members.
     super_class: Option<u32>,
+    /// When set, `this` resolves to this register instead of reg 0. Used while
+    /// evaluating static field initializers inline at class-definition time,
+    /// where `this` must be the class value (not the enclosing `this`) — without
+    /// moving the init into a non-capturing thunk (which would lose closure over
+    /// the enclosing scope).
+    this_override: Option<Reg>,
     /// True while compiling a `function*` body, so `yield` is allowed.
     in_generator: bool,
     /// True while compiling an `async` body, so `await` is allowed.
@@ -791,6 +797,7 @@ impl<'a> FnCompiler<'a> {
             arguments_reg: None,
             uses_arguments: false,
             super_class: None,
+            this_override: None,
             in_generator: false,
             in_async: false,
             pending_label: None,
@@ -1503,6 +1510,8 @@ impl<'a> FnCompiler<'a> {
         // (in the enclosing scope) right after the class is created.
         for (fname, finit) in &static_fields {
             let save = self.next_reg;
+            // A static field initializer evaluates with `this` = the class.
+            self.this_override = Some(cls);
             let v = match finit {
                 Some(e) => self.expr(e)?,
                 None => {
@@ -1511,6 +1520,7 @@ impl<'a> FnCompiler<'a> {
                     t
                 }
             };
+            self.this_override = None;
             let name_idx = self.string_name(fname);
             self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
             self.next_reg = save;
@@ -1527,8 +1537,10 @@ impl<'a> FnCompiler<'a> {
         // field's key is parked on the class for the ctor's per-instance FieldInit.
         for (key, init, is_static) in &computed_fields {
             let save = self.next_reg;
-            let kr = self.expr(key)?;
+            let kr = self.expr(key)?; // key evaluates with the enclosing `this`
             if *is_static {
+                // …but the value initializer evaluates with `this` = the class.
+                self.this_override = Some(cls);
                 let vr = match init {
                     Some(e) => self.expr(e)?,
                     None => {
@@ -1537,6 +1549,7 @@ impl<'a> FnCompiler<'a> {
                         t
                     }
                 };
+                self.this_override = None;
                 self.emit(Instr::SetIndex { obj: cls, key: kr, val: vr });
             } else {
                 self.emit(Instr::PushFieldKey { class: cls, key: kr });
@@ -2716,8 +2729,9 @@ impl<'a> FnCompiler<'a> {
                 }
             }
             E::ThisExpression(_) => {
-                // `this` lives in register 0 of the current function.
-                Ok(0)
+                // `this` lives in register 0 of the current function, unless a
+                // static field initializer has redirected it to the class value.
+                Ok(self.this_override.unwrap_or(0))
             }
             E::ParenthesizedExpression(p) => self.expr_into(&p.expression, dst),
             E::BinaryExpression(b) => self.binary(b, dst),
