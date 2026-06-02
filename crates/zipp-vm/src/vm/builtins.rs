@@ -221,6 +221,20 @@ impl<'p> Vm<'p> {
         if !matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
             return Ok(None);
         }
+        // ValidateTypedArray: nearly every TypedArray prototype method throws a
+        // TypeError when the underlying buffer is detached (subarray is the one
+        // exception — it just builds another view).
+        if name != "subarray" {
+            let buf = match self.heap.get(idx) {
+                HeapObj::TypedArray { buffer, .. } => *buffer,
+                _ => 0,
+            };
+            if matches!(self.heap.get(buf), HeapObj::ArrayBuffer { detached: true, .. }) {
+                return Err(Thrown(format!(
+                    "TypeError: Cannot perform {name} on a TypedArray with a detached buffer"
+                )));
+            }
+        }
         let (len, kind) = self.ta_len_kind(idx);
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
