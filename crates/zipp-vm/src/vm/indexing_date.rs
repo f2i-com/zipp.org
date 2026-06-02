@@ -202,15 +202,13 @@ impl<'p> Vm<'p> {
                 Ok(())
             }
             HeapObj::Object(_) => {
+                // Route through set_prop so bracket assignment honours property
+                // attributes (writable / accessors / extensibility) exactly like
+                // dot assignment — propertyHelper.js's writability probe uses
+                // `obj[key] = v`, so a raw map.set silently reported every
+                // non-writable property as writable.
                 let k = self.key_of(key);
-                let mut added = false;
-                if let HeapObj::Object(map) = self.heap.get_mut(idx) {
-                    added = map.set(&k, val);
-                }
-                if added {
-                    self.heap.bump_version(idx);
-                }
-                Ok(())
+                self.set_prop(obj, &k, val)
             }
             _ => Ok(()),
         }
