@@ -335,6 +335,30 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `super.key = v`: PutValue on a super reference. If the superclass's
+    /// prototype chain exposes a setter for `key`, invoke it with `this` = the
+    /// receiver; otherwise create/update an own property on the receiver itself
+    /// (the spec sets on the receiver, not the prototype).
+    pub(crate) fn super_set(
+        &mut self,
+        home_class_id: u32,
+        key: &str,
+        this: Value,
+        v: Value,
+    ) -> Result<(), Thrown> {
+        let parent = self
+            .super_parent(home_class_id)
+            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
+        let proto = self.prototype_of(parent).unwrap_or(Value::UNDEFINED);
+        let setter = self.lookup_accessor(proto, key, true);
+        if self.is_callable(setter) {
+            self.call_value(setter, this, &[v])?;
+        } else {
+            self.set_prop(this, key, v)?;
+        }
+        Ok(())
+    }
+
     /// Run a class's constructor contribution on an existing instance `obj` —
     /// for `super(...)` and the implicit-super chain. An explicit ctor runs its
     /// own `super`; an implicit one runs the parent chain then its fields.

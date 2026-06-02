@@ -914,6 +914,22 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    Instr::SuperSet { home_class_id, name, val } => {
+                        let key =
+                            self.program.functions[func_id as usize].string_constants[name as usize].clone();
+                        let this = self.get(base, 0);
+                        let v = self.get(base, val);
+                        self.super_set(home_class_id, &key, this, v)?;
+                        ip += 1;
+                    }
+                    Instr::SuperSetComputed { home_class_id, key, val } => {
+                        let kv = self.get(base, key);
+                        let ks = self.to_property_key(kv)?;
+                        let this = self.get(base, 0);
+                        let v = self.get(base, val);
+                        self.super_set(home_class_id, &ks, this, v)?;
+                        ip += 1;
+                    }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
                         let arr = if argc == 1 && self.get(base, arg_base).is_number() {
                             // `Array(n)` → n empty slots (undefined).

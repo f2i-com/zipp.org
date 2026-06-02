@@ -3888,6 +3888,39 @@ impl<'a> FnCompiler<'a> {
         // Member-target assignment: `obj.x = v` / `arr[i] = v`. Only plain
         // `=` is supported for members in this subset.
         match &a.left {
+            // `super.x = v` / `super.x op= v` / `super.x ??= v`.
+            ox::AssignmentTarget::StaticMemberExpression(m)
+                if matches!(&m.object, ox::Expression::Super(_)) =>
+            {
+                let pid = self.super_class.ok_or("`super.x = …` is only valid in a derived class")?;
+                let name = self.string_name(m.property.name.as_str());
+                if is_logical {
+                    self.emit(Instr::SuperGet { dst, home_class_id: pid, name });
+                    let j = self.emit_logical_skip(a.operator, dst);
+                    let v = self.expr_into(&a.right, dst)?;
+                    if v != dst {
+                        self.emit(Instr::Move { dst, src: v });
+                    }
+                    self.emit(Instr::SuperSet { home_class_id: pid, name, val: dst });
+                    let end = self.here();
+                    self.patch_jump(j, end);
+                } else if matches!(a.operator, Op::Assign) {
+                    let val = self.expr_into(&a.right, dst)?;
+                    if val != dst {
+                        self.emit(Instr::Move { dst, src: val });
+                    }
+                    self.emit(Instr::SuperSet { home_class_id: pid, name, val: dst });
+                } else {
+                    let cur = self.temp();
+                    self.emit(Instr::SuperGet { dst: cur, home_class_id: pid, name });
+                    let rhs = self.expr(&a.right)?;
+                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
+                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                    self.emit(instr);
+                    self.emit(Instr::SuperSet { home_class_id: pid, name, val: dst });
+                }
+                return Ok(dst);
+            }
             ox::AssignmentTarget::StaticMemberExpression(m) => {
                 let obj = self.expr(&m.object)?; // evaluate the receiver once
                 let name = self.string_name(m.property.name.as_str());
@@ -3948,6 +3981,43 @@ impl<'a> FnCompiler<'a> {
                         .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                     self.emit(instr);
                     self.emit(Instr::SetProp { obj, name, val: dst });
+                }
+                return Ok(dst);
+            }
+            // `super[k] = v` / compound / logical.
+            ox::AssignmentTarget::ComputedMemberExpression(m)
+                if matches!(&m.object, ox::Expression::Super(_)) =>
+            {
+                let pid = self.super_class.ok_or("`super[k] = …` is only valid in a derived class")?;
+                let key = self.expr(&m.expression)?;
+                let key_reg = self.alloc_reg();
+                if key != key_reg {
+                    self.emit(Instr::Move { dst: key_reg, src: key });
+                }
+                if is_logical {
+                    self.emit(Instr::SuperGetComputed { dst, home_class_id: pid, key: key_reg });
+                    let j = self.emit_logical_skip(a.operator, dst);
+                    let v = self.expr_into(&a.right, dst)?;
+                    if v != dst {
+                        self.emit(Instr::Move { dst, src: v });
+                    }
+                    self.emit(Instr::SuperSetComputed { home_class_id: pid, key: key_reg, val: dst });
+                    let end = self.here();
+                    self.patch_jump(j, end);
+                } else if matches!(a.operator, Op::Assign) {
+                    let val = self.expr_into(&a.right, dst)?;
+                    if val != dst {
+                        self.emit(Instr::Move { dst, src: val });
+                    }
+                    self.emit(Instr::SuperSetComputed { home_class_id: pid, key: key_reg, val: dst });
+                } else {
+                    let cur = self.temp();
+                    self.emit(Instr::SuperGetComputed { dst: cur, home_class_id: pid, key: key_reg });
+                    let rhs = self.expr(&a.right)?;
+                    let instr = compound_assign_instr(a.operator, dst, cur, rhs)
+                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                    self.emit(instr);
+                    self.emit(Instr::SuperSetComputed { home_class_id: pid, key: key_reg, val: dst });
                 }
                 return Ok(dst);
             }

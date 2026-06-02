@@ -175,6 +175,12 @@ pub enum Instr {
     SuperGetComputed { dst: Reg, home_class_id: u32, key: Reg },
     /// `dst = super[key](args…)`: computed form of SuperMethod.
     SuperMethodComputed { dst: Reg, home_class_id: u32, key: Reg, arg_base: Reg, argc: u16 },
+    /// `super.<name> = val`: if the superclass prototype chain has an inherited
+    /// setter, invoke it with `this` = the current receiver; otherwise create an
+    /// own property on the receiver.
+    SuperSet { home_class_id: u32, name: u32, val: Reg },
+    /// `super[key] = val`: computed form of SuperSet (`key` is a register).
+    SuperSetComputed { home_class_id: u32, key: Reg, val: Reg },
     /// `dst = new callee(args…)` — construct an instance. `callee` must be a
     /// class value; builds an object, installs the methods, runs the ctor.
     New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
