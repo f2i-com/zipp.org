@@ -167,6 +167,14 @@ pub enum Instr {
     /// `dst = super.<name>(args…)`: call the named method found from the lexical
     /// superclass up its chain, with `this` = the current frame's `this` (reg 0).
     SuperMethod { dst: Reg, home_class_id: u32, name: u32, arg_base: Reg, argc: u16 },
+    /// `dst = super.<name>`: read an inherited property (method value, or a getter
+    /// invoked with `this` = the current frame's `this`) via the superclass's
+    /// prototype.
+    SuperGet { dst: Reg, home_class_id: u32, name: u32 },
+    /// `dst = super[key]`: computed form of SuperGet (`key` is a register).
+    SuperGetComputed { dst: Reg, home_class_id: u32, key: Reg },
+    /// `dst = super[key](args…)`: computed form of SuperMethod.
+    SuperMethodComputed { dst: Reg, home_class_id: u32, key: Reg, arg_base: Reg, argc: u16 },
     /// `dst = new callee(args…)` — construct an instance. `callee` must be a
     /// class value; builds an object, installs the methods, runs the ctor.
     New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },

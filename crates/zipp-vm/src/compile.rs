@@ -2968,6 +2968,13 @@ impl<'a> FnCompiler<'a> {
             // ordinary property reads of the `Symbol` global (whose key_of maps to
             // the engine's `@@iterator` convention, so iteration is unchanged).
         }
+        // `super.name` — read an inherited property through the lexical superclass.
+        if matches!(&m.object, ox::Expression::Super(_)) {
+            let pid = self.super_class.ok_or("`super.x` is only valid in a derived class")?;
+            let name = self.string_name(m.property.name.as_str());
+            self.emit(Instr::SuperGet { dst, home_class_id: pid, name });
+            return Ok(dst);
+        }
         let obj = self.expr(&m.object)?;
         if m.optional {
             self.emit_optional_check(obj);
@@ -2978,6 +2985,13 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn computed_member(&mut self, m: &ox::ComputedMemberExpression, dst: Reg) -> R<Reg> {
+        // `super[expr]` — computed inherited-property read.
+        if matches!(&m.object, ox::Expression::Super(_)) {
+            let pid = self.super_class.ok_or("`super[x]` is only valid in a derived class")?;
+            let key = self.expr(&m.expression)?;
+            self.emit(Instr::SuperGetComputed { dst, home_class_id: pid, key });
+            return Ok(dst);
+        }
         let obj = self.expr(&m.object)?;
         if m.optional {
             self.emit_optional_check(obj);
@@ -4549,6 +4563,20 @@ impl<'a> FnCompiler<'a> {
         }
 
         // Computed method call `obj[key](args…)` → bind `this` to obj. Evaluate
+        // `super[expr](args…)` — computed inherited-method call.
+        if let ox::Expression::ComputedMemberExpression(m) = &c.callee {
+            if matches!(&m.object, ox::Expression::Super(_)) {
+                let pid = self.super_class.ok_or("`super[x](...)` is only valid in a derived class")?;
+                let key = self.expr(&m.expression)?;
+                let key_reg = self.alloc_reg();
+                if key != key_reg {
+                    self.emit(Instr::Move { dst: key_reg, src: key });
+                }
+                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                self.emit(Instr::SuperMethodComputed { dst, home_class_id: pid, key: key_reg, arg_base, argc });
+                return Ok(dst);
+            }
+        }
         // obj and the key into stable registers (below the contiguous arg block).
         if let ox::Expression::ComputedMemberExpression(m) = &c.callee {
             let obj = self.expr(&m.object)?;

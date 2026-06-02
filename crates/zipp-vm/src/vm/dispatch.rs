@@ -871,6 +871,49 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    Instr::SuperGet { dst, home_class_id, name } => {
+                        // `super.name` read: resolve on the superclass's prototype
+                        // with `this` = the current receiver (so a getter sees it).
+                        let key =
+                            self.program.functions[func_id as usize].string_constants[name as usize].clone();
+                        let parent = self
+                            .super_parent(home_class_id)
+                            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
+                        let proto = self.prototype_of(parent).unwrap_or(Value::UNDEFINED);
+                        let this = self.get(base, 0);
+                        let r = self.get_member(proto, &key, this)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::SuperGetComputed { dst, home_class_id, key } => {
+                        let kv = self.get(base, key);
+                        let ks = self.to_property_key(kv)?;
+                        let parent = self
+                            .super_parent(home_class_id)
+                            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
+                        let proto = self.prototype_of(parent).unwrap_or(Value::UNDEFINED);
+                        let this = self.get(base, 0);
+                        let r = self.get_member(proto, &ks, this)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::SuperMethodComputed { dst, home_class_id, key, arg_base, argc } => {
+                        let kv = self.get(base, key);
+                        let ks = self.to_property_key(kv)?;
+                        let parent = self
+                            .super_parent(home_class_id)
+                            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
+                        let proto = self.prototype_of(parent).unwrap_or(Value::UNDEFINED);
+                        let this = self.get(base, 0);
+                        let m = self.get_member(proto, &ks, this)?;
+                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                        for i in 0..argc {
+                            args.push(self.get(base, arg_base + i));
+                        }
+                        let r = self.call_value(m, this, &args)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
                         let arr = if argc == 1 && self.get(base, arg_base).is_number() {
                             // `Array(n)` → n empty slots (undefined).
