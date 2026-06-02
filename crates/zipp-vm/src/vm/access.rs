@@ -182,11 +182,10 @@ impl<'p> Vm<'p> {
         // setter; a non-writable data property silently ignores the write (sloppy).
         let own_attr = match self.heap.get(idx) {
             HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
-            // An Array's named (non-index) own properties live in arr_props.
-            HeapObj::Array(_) => {
-                self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attrs[i]))
-            }
-            _ => None,
+            // An Array's named props — and an exotic object's defineProperty'd own
+            // props (Map/Set/Date/Promise/…) — live in the arr_props side table.
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) | HeapObj::Class(_) => None,
+            _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attrs[i])),
         };
         if let Some(a) = own_attr {
             if a.accessor {
@@ -261,6 +260,26 @@ impl<'p> Vm<'p> {
         // result's `index`/`input`/`groups` — lives in the arr_props side table
         // (numeric indices + `length` were handled above). Mirrors fn_props.
         if matches!(self.heap.get(idx), HeapObj::Array(_)) {
+            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            if added {
+                self.heap.bump_version(idx);
+            }
+            return Ok(());
+        }
+        // An exotic object's extra own property (`mapInst.x = 1`) lives in the same
+        // arr_props side table that get_member / defineProperty use for it, so the
+        // write is readable (parity with the defineProperty path).
+        if matches!(
+            self.heap.get(idx),
+            HeapObj::Map { .. }
+                | HeapObj::Set(_)
+                | HeapObj::WeakMap { .. }
+                | HeapObj::WeakSet(_)
+                | HeapObj::WeakRef(_)
+                | HeapObj::FinalizationRegistry { .. }
+                | HeapObj::Date(_)
+                | HeapObj::Promise { .. }
+        ) {
             let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             if added {
                 self.heap.bump_version(idx);
