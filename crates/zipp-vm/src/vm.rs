@@ -281,6 +281,20 @@ mod native {
     pub const INST_FROM_EPOCH_SEC: u16 = 508;
     pub const INST_FROM_EPOCH_US: u16 = 509;
     pub const INST_COMPARE: u16 = 510;
+    /// Temporal.PlainYearMonth.prototype methods at PYM_M_BASE + index.
+    pub const PLAINYEARMONTH_METHODS: &[&str] = &[
+        "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
+        "toPlainDate", "getISOFields",
+    ];
+    pub const PYM_M_BASE: u16 = 512;
+    pub const PLAINYEARMONTH_FROM: u16 = 524;
+    pub const PLAINYEARMONTH_COMPARE: u16 = 525;
+    /// Temporal.PlainMonthDay.prototype methods at PMD_M_BASE + index.
+    pub const PLAINMONTHDAY_METHODS: &[&str] = &[
+        "with", "equals", "toString", "toJSON", "valueOf", "toPlainDate", "getISOFields",
+    ];
+    pub const PMD_M_BASE: u16 = 528;
+    pub const PLAINMONTHDAY_FROM: u16 = 536;
     /// Field names of a Temporal.Duration, in slot order.
     pub const DURATION_FIELDS: [&str; 10] = [
         "years", "months", "weeks", "days", "hours", "minutes", "seconds",
@@ -685,6 +699,10 @@ pub struct Vm<'p> {
     plaindatetime_proto: u32,
     instant_ctor: u32,
     instant_proto: u32,
+    plainyearmonth_ctor: u32,
+    plainyearmonth_proto: u32,
+    plainmonthday_ctor: u32,
+    plainmonthday_proto: u32,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -833,6 +851,10 @@ impl<'p> Vm<'p> {
             plaindatetime_proto: 0,
             instant_ctor: 0,
             instant_proto: 0,
+            plainyearmonth_ctor: 0,
+            plainyearmonth_proto: 0,
+            plainmonthday_ctor: 0,
+            plainmonthday_proto: 0,
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -5738,12 +5760,64 @@ impl<'p> Vm<'p> {
                 p.define("constructor", Value::heap(instant_ctor), method_attr);
                 p.define("@@toStringTag", itag, fn_attr);
             }
+            // Temporal.PlainYearMonth
+            let pym_methods: Vec<(&str, u16)> = native::PLAINYEARMONTH_METHODS
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, native::PYM_M_BASE + i as u16))
+                .collect();
+            let plainyearmonth_proto = build(self, &pym_methods, None);
+            self.proto_of.insert(plainyearmonth_proto, Value::heap(obj_proto));
+            self.plainyearmonth_proto = plainyearmonth_proto;
+            let pymfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINYEARMONTH_FROM)));
+            let pymcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINYEARMONTH_COMPARE)));
+            let pymname = self.alloc_str("PlainYearMonth".to_string());
+            let pymtag = self.alloc_str("Temporal.PlainYearMonth".to_string());
+            let mut pymm = ObjMap::new();
+            pymm.define("prototype", Value::heap(plainyearmonth_proto), proto_attr);
+            pymm.define("from", pymfrom, method_attr);
+            pymm.define("compare", pymcompare, method_attr);
+            pymm.define("name", pymname, fn_attr);
+            pymm.define("length", Value::num(2.0), fn_attr);
+            pymm.is_ctor = true;
+            let plainyearmonth_ctor = self.heap.alloc(HeapObj::Object(pymm));
+            self.plainyearmonth_ctor = plainyearmonth_ctor;
+            if let HeapObj::Object(p) = self.heap.get_mut(plainyearmonth_proto) {
+                p.define("constructor", Value::heap(plainyearmonth_ctor), method_attr);
+                p.define("@@toStringTag", pymtag, fn_attr);
+            }
+            // Temporal.PlainMonthDay
+            let pmd_methods: Vec<(&str, u16)> = native::PLAINMONTHDAY_METHODS
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, native::PMD_M_BASE + i as u16))
+                .collect();
+            let plainmonthday_proto = build(self, &pmd_methods, None);
+            self.proto_of.insert(plainmonthday_proto, Value::heap(obj_proto));
+            self.plainmonthday_proto = plainmonthday_proto;
+            let pmdfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINMONTHDAY_FROM)));
+            let pmdname = self.alloc_str("PlainMonthDay".to_string());
+            let pmdtag = self.alloc_str("Temporal.PlainMonthDay".to_string());
+            let mut pmdm = ObjMap::new();
+            pmdm.define("prototype", Value::heap(plainmonthday_proto), proto_attr);
+            pmdm.define("from", pmdfrom, method_attr);
+            pmdm.define("name", pmdname, fn_attr);
+            pmdm.define("length", Value::num(2.0), fn_attr);
+            pmdm.is_ctor = true;
+            let plainmonthday_ctor = self.heap.alloc(HeapObj::Object(pmdm));
+            self.plainmonthday_ctor = plainmonthday_ctor;
+            if let HeapObj::Object(p) = self.heap.get_mut(plainmonthday_proto) {
+                p.define("constructor", Value::heap(plainmonthday_ctor), method_attr);
+                p.define("@@toStringTag", pmdtag, fn_attr);
+            }
             let mut tn = ObjMap::new();
             tn.define("Duration", Value::heap(duration_ctor), method_attr);
             tn.define("PlainDate", Value::heap(plaindate_ctor), method_attr);
             tn.define("PlainTime", Value::heap(plaintime_ctor), method_attr);
             tn.define("PlainDateTime", Value::heap(plaindatetime_ctor), method_attr);
             tn.define("Instant", Value::heap(instant_ctor), method_attr);
+            tn.define("PlainYearMonth", Value::heap(plainyearmonth_ctor), method_attr);
+            tn.define("PlainMonthDay", Value::heap(plainmonthday_ctor), method_attr);
             self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
@@ -6816,6 +6890,45 @@ impl<'p> Vm<'p> {
                 let b = self.to_instant_ns(a1)?;
                 Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
             }
+            _ if (PYM_M_BASE..PYM_M_BASE + PLAINYEARMONTH_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINYEARMONTH_METHODS[(id - PYM_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 5, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainYearMonth.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PLAINYEARMONTH_FROM => {
+                let (y, m, rd) = self.to_plain_year_month(a0)?;
+                self.make_plain_year_month(y, m, rd)?
+            }
+            PLAINYEARMONTH_COMPARE => {
+                let a = self.to_plain_year_month(a0)?;
+                let b = self.to_plain_year_month(a1)?;
+                let ka = a.0 * 12 + a.1;
+                let kb = b.0 * 12 + b.1;
+                Value::num(if ka < kb { -1.0 } else if ka > kb { 1.0 } else { 0.0 })
+            }
+            _ if (PMD_M_BASE..PMD_M_BASE + PLAINMONTHDAY_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINMONTHDAY_METHODS[(id - PMD_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 6, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainMonthDay.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PLAINMONTHDAY_FROM => {
+                let (ry, m, d) = self.to_plain_month_day(a0)?;
+                self.make_plain_month_day(m, d, ry)?
+            }
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -7611,6 +7724,32 @@ impl<'p> Vm<'p> {
                 "epochSeconds" => Value::num((ns / 1_000_000_000) as f64),
                 "epochMicroseconds" => self.make_bigint(ns / 1_000),
                 _ => self.proto_member(self.instant_proto, key),
+            });
+        }
+        // Temporal.PlainYearMonth getters; methods via the prototype.
+        if let HeapObj::Temporal { kind: 5, fields } = self.heap.get(obj.heap_index()) {
+            let (y, m) = (fields[0], fields[1]);
+            return Ok(match key {
+                "year" => Value::num(y as f64),
+                "month" => Value::num(m as f64),
+                "monthCode" => self.alloc_str(format!("M{m:02}")),
+                "daysInMonth" => Value::num(days_in_month(y, m) as f64),
+                "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
+                "monthsInYear" => Value::num(12.0),
+                "inLeapYear" => Value::bool(is_leap_year(y)),
+                "era" | "eraYear" => Value::UNDEFINED,
+                "calendarId" => self.alloc_str("iso8601".to_string()),
+                _ => self.proto_member(self.plainyearmonth_proto, key),
+            });
+        }
+        // Temporal.PlainMonthDay getters; methods via the prototype.
+        if let HeapObj::Temporal { kind: 6, fields } = self.heap.get(obj.heap_index()) {
+            let (m, d) = (fields[1], fields[2]);
+            return Ok(match key {
+                "monthCode" => self.alloc_str(format!("M{m:02}")),
+                "day" => Value::num(d as f64),
+                "calendarId" => self.alloc_str("iso8601".to_string()),
+                _ => self.proto_member(self.plainmonthday_proto, key),
             });
         }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
@@ -9784,6 +9923,8 @@ impl<'p> Vm<'p> {
             HeapObj::Temporal { kind: 2, .. } => self.plain_time_method(idx, name, args),
             HeapObj::Temporal { kind: 3, .. } => self.plain_date_time_method(idx, name, args),
             HeapObj::Temporal { kind: 4, .. } => self.instant_method(idx, name, args),
+            HeapObj::Temporal { kind: 5, .. } => self.plain_year_month_method(idx, name, args),
+            HeapObj::Temporal { kind: 6, .. } => self.plain_month_day_method(idx, name, args),
             _ => Ok(None),
         }
     }
@@ -10348,6 +10489,226 @@ impl<'p> Vm<'p> {
                 df[8] = (sub / 1_000) % 1_000;
                 df[9] = sub % 1_000;
                 Ok(Some(self.make_duration(df)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    // ── Temporal.PlainYearMonth ──
+
+    fn make_plain_year_month(&mut self, y: i64, m: i64, ref_day: i64) -> Result<Value, Thrown> {
+        if !(1..=12).contains(&m) || !(-271821..=275760).contains(&y) {
+            return Err(Thrown("RangeError: invalid year-month value".into()));
+        }
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 5, fields: vec![y, m, ref_day] });
+        if self.plainyearmonth_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.plainyearmonth_proto));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    fn pym_fields(&self, idx: u32) -> Option<(i64, i64, i64)> {
+        match self.heap.get(idx) {
+            HeapObj::Temporal { kind: 5, fields } => {
+                Some((fields[0], fields[1], *fields.get(2).unwrap_or(&1)))
+            }
+            _ => None,
+        }
+    }
+
+    fn to_plain_year_month(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
+        if v.is_heap() {
+            if let Some(t) = self.pym_fields(v.heap_index()) {
+                return Ok(t);
+            }
+            if self.heap.is_str_like(v.heap_index()) {
+                let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                return parse_iso_year_month(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid year-month string '{s}'")));
+            }
+            if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+                let yv = self.get_prop(v, "year")?;
+                let m = self.read_month_field(v)?;
+                if yv == Value::UNDEFINED || m.is_none() {
+                    return Err(Thrown(
+                        "TypeError: PlainYearMonth-like requires year and month".into(),
+                    ));
+                }
+                let y = self.to_number(yv)? as i64;
+                let m = m.unwrap();
+                if !(1..=12).contains(&m) {
+                    return Err(Thrown("RangeError: month out of range".into()));
+                }
+                return Ok((y, m, 1));
+            }
+        }
+        Err(Thrown("TypeError: cannot convert value to a Temporal.PlainYearMonth".into()))
+    }
+
+    /// Read month from an object: monthCode ("M06") takes precedence over `month`.
+    fn read_month_field(&mut self, obj: Value) -> Result<Option<i64>, Thrown> {
+        let mc = self.get_prop(obj, "monthCode")?;
+        if mc != Value::UNDEFINED {
+            let s = self.to_js_string(mc)?;
+            return Ok(parse_month_code(&s));
+        }
+        self.opt_int_field(obj, "month")
+    }
+
+    fn plain_year_month_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let (y, m, _ref) = match self.pym_fields(idx) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "toString" | "toJSON" => Ok(Some(self.alloc_str(year_month_string(y, m)))),
+            "valueOf" => {
+                Err(Thrown("TypeError: Called Temporal.PlainYearMonth.prototype.valueOf".into()))
+            }
+            "equals" => {
+                let o = self.to_plain_year_month(a0)?;
+                Ok(Some(Value::bool((y, m) == (o.0, o.1))))
+            }
+            "with" => {
+                let ny = self.opt_int_field(a0, "year")?.unwrap_or(y);
+                let nm = self.read_month_field(a0)?.unwrap_or(m);
+                Ok(Some(self.make_plain_year_month(ny, nm, 1)?))
+            }
+            "add" | "subtract" => {
+                let dur = self.to_duration(a0)?;
+                let sign = if name == "add" { 1 } else { -1 };
+                let op_sign = sign * Self::duration_sign(&dur);
+                // Reference day per spec: start of month for non-negative ops, end of
+                // month for negative — so day/week units don't spill into a wrong month.
+                let ref_day = if op_sign < 0 { days_in_month(y, m) } else { 1 };
+                let (ny, nm, _nd) = self.date_add(y, m, ref_day, &dur, sign);
+                Ok(Some(self.make_plain_year_month(ny, nm, 1)?))
+            }
+            "until" | "since" => {
+                let o = self.to_plain_year_month(a0)?;
+                let from = y * 12 + (m - 1);
+                let to = o.0 * 12 + (o.1 - 1);
+                let diff = if name == "until" { to - from } else { from - to };
+                let mut f = [0i64; 10];
+                f[0] = diff / 12;
+                f[1] = diff % 12;
+                Ok(Some(self.make_duration(f)))
+            }
+            "toPlainDate" => {
+                let day = self.opt_int_field(a0, "day")?.ok_or_else(|| {
+                    Thrown("TypeError: toPlainDate requires a day".into())
+                })?;
+                Ok(Some(self.make_plain_date(y, m, day)?))
+            }
+            "getISOFields" => {
+                let cal = self.alloc_str("iso8601".to_string());
+                let mut o = ObjMap::new();
+                o.set("isoYear", Value::num(y as f64));
+                o.set("isoMonth", Value::num(m as f64));
+                o.set("isoDay", Value::num(_ref as f64));
+                o.set("calendar", cal);
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(o)))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    // ── Temporal.PlainMonthDay ──
+
+    fn make_plain_month_day(&mut self, m: i64, d: i64, ref_year: i64) -> Result<Value, Thrown> {
+        if !(1..=12).contains(&m) || d < 1 || d > days_in_month(ref_year, m) {
+            return Err(Thrown("RangeError: invalid month-day value".into()));
+        }
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 6, fields: vec![ref_year, m, d] });
+        if self.plainmonthday_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.plainmonthday_proto));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    fn pmd_fields(&self, idx: u32) -> Option<(i64, i64, i64)> {
+        match self.heap.get(idx) {
+            HeapObj::Temporal { kind: 6, fields } => {
+                Some((fields[0], fields[1], fields[2]))
+            }
+            _ => None,
+        }
+    }
+
+    fn to_plain_month_day(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
+        if v.is_heap() {
+            if let Some(t) = self.pmd_fields(v.heap_index()) {
+                return Ok(t);
+            }
+            if self.heap.is_str_like(v.heap_index()) {
+                let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                return parse_iso_month_day(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid month-day string '{s}'")));
+            }
+            if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+                let m = self.read_month_field(v)?;
+                let dv = self.get_prop(v, "day")?;
+                if m.is_none() || dv == Value::UNDEFINED {
+                    return Err(Thrown(
+                        "TypeError: PlainMonthDay-like requires month and day".into(),
+                    ));
+                }
+                let m = m.unwrap();
+                let d = self.to_number(dv)? as i64;
+                if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
+                    return Err(Thrown("RangeError: month-day out of range".into()));
+                }
+                return Ok((1972, m, d));
+            }
+        }
+        Err(Thrown("TypeError: cannot convert value to a Temporal.PlainMonthDay".into()))
+    }
+
+    fn plain_month_day_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let (ry, m, d) = match self.pmd_fields(idx) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match name {
+            "toString" | "toJSON" => Ok(Some(self.alloc_str(format!("{m:02}-{d:02}")))),
+            "valueOf" => {
+                Err(Thrown("TypeError: Called Temporal.PlainMonthDay.prototype.valueOf".into()))
+            }
+            "equals" => {
+                let o = self.to_plain_month_day(a0)?;
+                Ok(Some(Value::bool((ry, m, d) == o)))
+            }
+            "with" => {
+                let nm = self.read_month_field(a0)?.unwrap_or(m);
+                let nd = self.opt_int_field(a0, "day")?.unwrap_or(d);
+                Ok(Some(self.make_plain_month_day(nm, nd, ry)?))
+            }
+            "toPlainDate" => {
+                let year = self.opt_int_field(a0, "year")?.ok_or_else(|| {
+                    Thrown("TypeError: toPlainDate requires a year".into())
+                })?;
+                Ok(Some(self.make_plain_date(year, m, d)?))
+            }
+            "getISOFields" => {
+                let cal = self.alloc_str("iso8601".to_string());
+                let mut o = ObjMap::new();
+                o.set("isoYear", Value::num(ry as f64));
+                o.set("isoMonth", Value::num(m as f64));
+                o.set("isoDay", Value::num(d as f64));
+                o.set("calendar", cal);
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(o)))))
             }
             _ => Ok(None),
         }
@@ -11012,6 +11373,26 @@ impl<'p> Vm<'p> {
         if ci == self.instant_ctor && ci != 0 {
             let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             return self.make_instant(ns);
+        }
+        if ci == self.plainyearmonth_ctor && ci != 0 {
+            // (year, month, calendar?, referenceISODay=1)
+            let y = self.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))? as i64;
+            let m = self.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))? as i64;
+            let rd = match args.get(3).copied() {
+                Some(v) if v != Value::UNDEFINED => self.to_number(v)? as i64,
+                _ => 1,
+            };
+            return self.make_plain_year_month(y, m, rd);
+        }
+        if ci == self.plainmonthday_ctor && ci != 0 {
+            // (month, day, calendar?, referenceISOYear=1972)
+            let m = self.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))? as i64;
+            let d = self.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))? as i64;
+            let ry = match args.get(3).copied() {
+                Some(v) if v != Value::UNDEFINED => self.to_number(v)? as i64,
+                _ => 1972,
+            };
+            return self.make_plain_month_day(m, d, ry);
         }
         // Constructing through a Proxy: `construct` trap (or construct the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(ci) {
@@ -13345,6 +13726,8 @@ impl<'p> Vm<'p> {
                     let ns = ((fields[0] as i128) << 64) | ((fields[1] as u64) as i128);
                     instant_to_string(ns)
                 }
+                HeapObj::Temporal { kind: 5, fields } => year_month_string(fields[0], fields[1]),
+                HeapObj::Temporal { kind: 6, fields } => format!("{:02}-{:02}", fields[1], fields[2]),
                 HeapObj::Temporal { .. } => "[object Temporal]".into(),
                 HeapObj::Str(s) => s.bytes.clone(),
                 HeapObj::Cons { .. } => {
@@ -13487,6 +13870,16 @@ impl<'p> Vm<'p> {
                     iso_date_string(g(0), g(1), g(2)),
                     time_string(&[g(3), g(4), g(5), g(6), g(7), g(8)])
                 )
+            }
+            HeapObj::Temporal { kind: 4, fields } => {
+                let ns = ((fields[0] as i128) << 64) | ((fields[1] as u64) as i128);
+                format!("Temporal.Instant <{}>", instant_to_string(ns))
+            }
+            HeapObj::Temporal { kind: 5, fields } => {
+                format!("Temporal.PlainYearMonth <{}>", year_month_string(fields[0], fields[1]))
+            }
+            HeapObj::Temporal { kind: 6, fields } => {
+                format!("Temporal.PlainMonthDay <{:02}-{:02}>", fields[1], fields[2])
             }
             HeapObj::Temporal { .. } => "[object Temporal]".into(),
             HeapObj::Str(s) => format!("'{}'", s.bytes),
@@ -14341,6 +14734,76 @@ fn iso_date_string(y: i64, m: i64, d: i64) -> String {
         format!("{y:+07}")
     };
     format!("{ys}-{m:02}-{d:02}")
+}
+
+/// "YYYY-MM" (expanded-year aware) — Temporal.PlainYearMonth serialization.
+fn year_month_string(y: i64, m: i64) -> String {
+    let ys = if (0..=9999).contains(&y) {
+        format!("{y:04}")
+    } else {
+        format!("{y:+07}")
+    };
+    format!("{ys}-{m:02}")
+}
+
+/// Parse a month code like "M06" (ISO calendars have no leap months) → 1..=12.
+fn parse_month_code(s: &str) -> Option<i64> {
+    let body = s.strip_prefix('M')?;
+    let body = body.strip_suffix('L').unwrap_or(body);
+    let n = body.parse::<i64>().ok()?;
+    (1..=12).contains(&n).then_some(n)
+}
+
+/// Parse "YYYY-MM" (or a fuller ISO date) → (year, month, referenceISODay).
+fn parse_iso_year_month(s: &str) -> Option<(i64, i64, i64)> {
+    let s = s.trim();
+    if let Some((y, m, d)) = parse_iso_date(s) {
+        return Some((y, m, d));
+    }
+    let bytes = s.as_bytes();
+    let (sign, rest) = match bytes.first() {
+        Some(b'-') | Some(b'+') => (if bytes[0] == b'-' { -1i64 } else { 1 }, &s[1..]),
+        _ => (1, s),
+    };
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let ylen = if digits.len() >= 6 { 6 } else { 4 };
+    if digits.len() < ylen {
+        return None;
+    }
+    let y = sign * rest[..ylen].parse::<i64>().ok()?;
+    let after = &rest[ylen..];
+    let after = after.strip_prefix('-').unwrap_or(after);
+    if after.len() < 2 {
+        return None;
+    }
+    let m = after[..2].parse::<i64>().ok()?;
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    Some((y, m, 1))
+}
+
+/// Parse "MM-DD" / "--MM-DD" (or a fuller ISO date) → (referenceISOYear, month, day).
+fn parse_iso_month_day(s: &str) -> Option<(i64, i64, i64)> {
+    let s = s.trim();
+    if let Some((y, m, d)) = parse_iso_date(s) {
+        return Some((y, m, d));
+    }
+    let body = s.strip_prefix("--").unwrap_or(s);
+    if body.len() < 4 {
+        return None;
+    }
+    let m = body.get(..2)?.parse::<i64>().ok()?;
+    let after = &body[2..];
+    let after = after.strip_prefix('-').unwrap_or(after);
+    if after.len() < 2 {
+        return None;
+    }
+    let d = after[..2].parse::<i64>().ok()?;
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
+        return None;
+    }
+    Some((1972, m, d))
 }
 
 /// ISO day-of-week: Monday=1 … Sunday=7.
