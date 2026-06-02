@@ -414,6 +414,29 @@ impl<'p> Vm<'p> {
         Ok((unit, n as i32, false, mode))
     }
 
+    /// The calendar annotation suffix for a toString() per the `calendarName`
+    /// option: "always" → "[u-ca=iso8601]", "critical" → "[!u-ca=iso8601]",
+    /// "auto" (iso8601 is the default calendar, so omitted) / "never" → "".
+    pub(crate) fn calendar_name_suffix(&mut self, options: Value) -> Result<String, Thrown> {
+        if options == Value::UNDEFINED {
+            return Ok(String::new());
+        }
+        if !self.is_object_value(options) {
+            return Err(Thrown("TypeError: options must be an object or undefined".into()));
+        }
+        let cn = self.opt_string(
+            options,
+            "calendarName",
+            "auto",
+            &["auto", "always", "never", "critical"],
+        )?;
+        Ok(match cn.as_str() {
+            "always" => "[u-ca=iso8601]".to_string(),
+            "critical" => "[!u-ca=iso8601]".to_string(),
+            _ => String::new(),
+        })
+    }
+
     pub(crate) fn to_plain_date(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
         self.to_plain_date_overflow(v, false)
     }
@@ -481,7 +504,11 @@ impl<'p> Vm<'p> {
         };
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "toString" | "toJSON" => Ok(Some(self.alloc_str(iso_date_string(y, m, d)))),
+            "toJSON" => Ok(Some(self.alloc_str(iso_date_string(y, m, d)))),
+            "toString" => {
+                let suf = self.calendar_name_suffix(a0)?;
+                Ok(Some(self.alloc_str(format!("{}{}", iso_date_string(y, m, d), suf))))
+            }
             "valueOf" => Err(Thrown("TypeError: Called Temporal.PlainDate.prototype.valueOf".into())),
             "equals" => {
                 let other = self.to_plain_date(a0)?;
@@ -838,12 +865,18 @@ impl<'p> Vm<'p> {
             }
             "toString" => {
                 let (unit, digits, omit, mode) = self.time_precision(a0)?;
+                let suf = self.calendar_name_suffix(a0)?;
                 let rounded = round_increment(time_to_ns(&time), unit, &mode);
                 let carry = rounded.div_euclid(DAY_NS) as i64;
                 let t = ns_to_time(rounded.rem_euclid(DAY_NS));
                 let (ny, nm, nd) =
                     epoch_days_to_iso(iso_to_epoch_days(date[0], date[1], date[2]) + carry);
-                let s = format!("{}T{}", iso_date_string(ny, nm, nd), format_time_part(&t, digits, omit));
+                let s = format!(
+                    "{}T{}{}",
+                    iso_date_string(ny, nm, nd),
+                    format_time_part(&t, digits, omit),
+                    suf
+                );
                 Ok(Some(self.alloc_str(s)))
             }
             "valueOf" => {
