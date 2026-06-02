@@ -199,13 +199,28 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(out)))
             }
             "split" => {
+                // lim = ToUint32(limit); `undefined` → no cap. lim 0 → [].
+                let lim = match args.get(1).copied() {
+                    Some(v) if v != Value::UNDEFINED => {
+                        let n = self.to_number(v)?;
+                        if n.is_finite() {
+                            (n as i64).rem_euclid(4_294_967_296) as usize
+                        } else {
+                            0
+                        }
+                    }
+                    _ => usize::MAX,
+                };
                 let sep = self.display(arg0);
-                let parts: Vec<Value> = if args.is_empty() {
+                let parts: Vec<Value> = if lim == 0 {
+                    Vec::new()
+                } else if args.is_empty() || arg0 == Value::UNDEFINED {
+                    // No separator → the whole string as a single element.
                     vec![self.alloc_str(s.clone())]
                 } else if sep.is_empty() {
-                    s.chars().map(|c| self.alloc_str(c.to_string())).collect()
+                    s.chars().take(lim).map(|c| self.alloc_str(c.to_string())).collect()
                 } else {
-                    s.split(&sep).map(|p| self.alloc_str(p.to_string())).collect()
+                    s.split(&sep).take(lim).map(|p| self.alloc_str(p.to_string())).collect()
                 };
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(parts)))))
             }

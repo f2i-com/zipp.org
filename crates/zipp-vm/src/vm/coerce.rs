@@ -567,6 +567,25 @@ impl<'p> Vm<'p> {
             if t.is_empty() {
                 return Ok(0.0);
             }
+            // Non-decimal integer literals `0x…`/`0o…`/`0b…` (StringNumericLiteral;
+            // no sign allowed). Fold digits into an f64 so arbitrarily long
+            // literals don't overflow.
+            let radix = match t.as_bytes() {
+                [b'0', b'x' | b'X', ..] => Some((16u32, &t[2..])),
+                [b'0', b'o' | b'O', ..] => Some((8, &t[2..])),
+                [b'0', b'b' | b'B', ..] => Some((2, &t[2..])),
+                _ => None,
+            };
+            if let Some((base, digits)) = radix {
+                let mut acc = 0.0f64;
+                for c in digits.chars() {
+                    match c.to_digit(base) {
+                        Some(d) => acc = acc * base as f64 + d as f64,
+                        None => return Ok(f64::NAN),
+                    }
+                }
+                return Ok(if digits.is_empty() { f64::NAN } else { acc });
+            }
             return Ok(t.parse::<f64>().unwrap_or(f64::NAN));
         }
         Ok(f64::NAN)
