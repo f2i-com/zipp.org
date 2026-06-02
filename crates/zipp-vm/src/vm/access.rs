@@ -136,6 +136,16 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
+        // `o.__proto__ = v` invokes the inherited Object.prototype.__proto__
+        // setter: set [[Prototype]] when v is an object or null, else a silent
+        // no-op (a primitive value). Mirrors Object.setPrototypeOf; the getter
+        // side already works via the inherited accessor.
+        if key == "__proto__" {
+            if self.is_object_value(val) || val == Value::NULL {
+                self.proto_of.insert(idx, val);
+            }
+            return Ok(());
+        }
         // `re.lastIndex = n` — the only writable own property of a RegExp.
         if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
             let n = self.to_number(val)?;
