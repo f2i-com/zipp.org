@@ -341,6 +341,9 @@ impl<'p> Vm<'p> {
         if options == Value::UNDEFINED {
             return Ok(false);
         }
+        if !self.is_object_value(options) {
+            return Err(Thrown("TypeError: options must be an object or undefined".into()));
+        }
         let v = self.get_prop(options, "overflow")?;
         if v == Value::UNDEFINED {
             return Ok(false);
@@ -482,9 +485,27 @@ impl<'p> Vm<'p> {
 
     /// `date ± duration` (date units constrain day; time units fold to whole days).
     pub(crate) fn date_add(&self, y: i64, m: i64, d: i64, dur: &[i64; 10], sign: i64) -> (i64, i64, i64) {
+        self.date_add_overflow(y, m, d, dur, sign, false).unwrap()
+    }
+
+    /// `date ± duration` with an overflow mode. The year+month step can land the
+    /// day past the new month's length: "constrain" clamps it, "reject" throws.
+    /// Weeks/days/time then add via exact epoch-day math.
+    pub(crate) fn date_add_overflow(
+        &self,
+        y: i64,
+        m: i64,
+        d: i64,
+        dur: &[i64; 10],
+        sign: i64,
+        reject: bool,
+    ) -> Result<(i64, i64, i64), Thrown> {
         let total_months = (y + dur[0] * sign) * 12 + (m - 1) + dur[1] * sign;
         let ny = total_months.div_euclid(12);
         let nm = total_months.rem_euclid(12) + 1;
+        if reject && d > days_in_month(ny, nm) {
+            return Err(Thrown("RangeError: date arithmetic overflows the month".into()));
+        }
         let nd = d.min(days_in_month(ny, nm));
         let time_ns = (dur[4] as i128) * 3_600_000_000_000
             + (dur[5] as i128) * 60_000_000_000
@@ -494,7 +515,7 @@ impl<'p> Vm<'p> {
             + (dur[9] as i128);
         let extra_days = (time_ns / 86_400_000_000_000) as i64;
         let ed = iso_to_epoch_days(ny, nm, nd) + (dur[2] * 7 + dur[3] + extra_days) * sign;
-        epoch_days_to_iso(ed)
+        Ok(epoch_days_to_iso(ed))
     }
 
     pub(crate) fn plain_date_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
@@ -527,8 +548,9 @@ impl<'p> Vm<'p> {
             }
             "add" | "subtract" => {
                 let dur = self.to_duration(a0)?;
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign = if name == "add" { 1 } else { -1 };
-                let (ny, nm, nd) = self.date_add(y, m, d, &dur, sign);
+                let (ny, nm, nd) = self.date_add_overflow(y, m, d, &dur, sign, reject)?;
                 Ok(Some(self.make_plain_date(ny, nm, nd)?))
             }
             "until" | "since" => {
@@ -913,6 +935,7 @@ impl<'p> Vm<'p> {
             }
             "add" | "subtract" => {
                 let dur = self.to_duration(a0)?;
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign: i64 = if name == "add" { 1 } else { -1 };
                 // Time part with day carry.
                 let tns = time_to_ns(&time)
@@ -925,10 +948,13 @@ impl<'p> Vm<'p> {
                         * sign as i128;
                 let carry = tns.div_euclid(86_400_000_000_000) as i64;
                 let nt = ns_to_time(tns.rem_euclid(86_400_000_000_000));
-                // Date part: years/months constrain, then weeks/days + carry.
+                // Date part: years/months constrain (or reject), then weeks/days + carry.
                 let tm = (date[0] + dur[0] * sign) * 12 + (date[1] - 1) + dur[1] * sign;
                 let ny0 = tm.div_euclid(12);
                 let nmo = tm.rem_euclid(12) + 1;
+                if reject && date[2] > days_in_month(ny0, nmo) {
+                    return Err(Thrown("RangeError: date arithmetic overflows the month".into()));
+                }
                 let nd0 = date[2].min(days_in_month(ny0, nmo));
                 let ed = iso_to_epoch_days(ny0, nmo, nd0) + (dur[2] * 7 + dur[3]) * sign + carry;
                 let (ny, nm, nd) = epoch_days_to_iso(ed);
@@ -1225,6 +1251,9 @@ impl<'p> Vm<'p> {
             }
             "add" | "subtract" => {
                 let dur = self.to_duration(a0)?;
+                // The result is always a valid year-month, but the overflow option
+                // is still validated (constrain/reject/RangeError on bad values).
+                let _ = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign = if name == "add" { 1 } else { -1 };
                 let op_sign = sign * Self::duration_sign(&dur);
                 // Reference day per spec: start of month for non-negative ops, end of
