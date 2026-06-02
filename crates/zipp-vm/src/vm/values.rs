@@ -117,7 +117,7 @@ impl<'p> Vm<'p> {
     /// is structural: by heap kind for Array/Object/Function, and by the `name`
     /// field for the Error family (any error subtype satisfies `instanceof
     /// Error`). Primitives are never an instance of anything.
-    pub(crate) fn eval_instanceof(&self, val: Value, ctor: InstanceCtor) -> bool {
+    pub(crate) fn eval_instanceof(&mut self, val: Value, ctor: InstanceCtor) -> bool {
         use InstanceCtor as C;
         if !val.is_heap() {
             return false;
@@ -133,14 +133,51 @@ impl<'p> Vm<'p> {
                 self.heap.get(idx),
                 HeapObj::Array(_) | HeapObj::Object(_) | HeapObj::Func(_) | HeapObj::Closure { .. }
             ),
-            C::Error => self.error_name(idx).is_some(),
-            C::TypeError => self.error_name(idx).as_deref() == Some("TypeError"),
-            C::RangeError => self.error_name(idx).as_deref() == Some("RangeError"),
-            C::SyntaxError => self.error_name(idx).as_deref() == Some("SyntaxError"),
-            C::ReferenceError => self.error_name(idx).as_deref() == Some("ReferenceError"),
-            C::EvalError => self.error_name(idx).as_deref() == Some("EvalError"),
-            C::UriError => self.error_name(idx).as_deref() == Some("URIError"),
-            C::AggregateError => self.error_name(idx).as_deref() == Some("AggregateError"),
+            // An error ctor: a canonical-named error instance (internal throw /
+            // `new TypeError`) OR — for `class X extends TypeError` / `Object.
+            // create(TypeError.prototype)` — the matching error prototype is in
+            // `val`'s prototype chain.
+            C::Error => self.error_name(idx).is_some() || self.error_proto_in_chain(val, "Error"),
+            C::TypeError => {
+                self.error_name(idx).as_deref() == Some("TypeError")
+                    || self.error_proto_in_chain(val, "TypeError")
+            }
+            C::RangeError => {
+                self.error_name(idx).as_deref() == Some("RangeError")
+                    || self.error_proto_in_chain(val, "RangeError")
+            }
+            C::SyntaxError => {
+                self.error_name(idx).as_deref() == Some("SyntaxError")
+                    || self.error_proto_in_chain(val, "SyntaxError")
+            }
+            C::ReferenceError => {
+                self.error_name(idx).as_deref() == Some("ReferenceError")
+                    || self.error_proto_in_chain(val, "ReferenceError")
+            }
+            C::EvalError => {
+                self.error_name(idx).as_deref() == Some("EvalError")
+                    || self.error_proto_in_chain(val, "EvalError")
+            }
+            C::UriError => {
+                self.error_name(idx).as_deref() == Some("URIError")
+                    || self.error_proto_in_chain(val, "URIError")
+            }
+            C::AggregateError => {
+                self.error_name(idx).as_deref() == Some("AggregateError")
+                    || self.error_proto_in_chain(val, "AggregateError")
+            }
+        }
+    }
+
+    /// Whether the error prototype named `name` (e.g. "TypeError") is in `val`'s
+    /// prototype chain — the proto-based half of `instanceof <ErrorCtor>`, which
+    /// catches subclasses and `Object.create(XError.prototype)`.
+    fn error_proto_in_chain(&mut self, val: Value, name: &str) -> bool {
+        match native::ERROR_NAMES.iter().position(|&n| n == name) {
+            Some(k) if self.error_protos[k] != 0 => {
+                self.is_prototype_of(Value::heap(self.error_protos[k]), val)
+            }
+            _ => false,
         }
     }
 
