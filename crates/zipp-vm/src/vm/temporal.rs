@@ -29,6 +29,20 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// ToIntegerIfIntegral for a Duration field: a Symbol or BigInt is a TypeError
+    /// (ToNumber semantics; our plain to_number is lenient on BigInt), a user
+    /// valueOf/toString is honoured, and the result must be a finite integer.
+    pub(crate) fn duration_field(&mut self, v: Value) -> Result<f64, Thrown> {
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
+            return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
+        }
+        let n = self.to_number_coerce(v)?;
+        if !n.is_finite() || n.fract() != 0.0 {
+            return Err(Thrown("RangeError: Temporal.Duration fields must be integers".into()));
+        }
+        Ok(n)
+    }
+
     /// All non-zero fields must share a sign (else RangeError).
     pub(crate) fn validate_duration(&self, f: &[i64; 10]) -> Result<(), Thrown> {
         let mut sign = 0i64;
@@ -53,13 +67,7 @@ impl<'p> Vm<'p> {
         for (i, slot) in ff.iter_mut().enumerate() {
             let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
             if v != Value::UNDEFINED {
-                let n = self.to_number_coerce(v)?;
-                if !n.is_finite() || n.fract() != 0.0 {
-                    return Err(Thrown(
-                        "RangeError: Temporal.Duration fields must be integers".into(),
-                    ));
-                }
-                *slot = n;
+                *slot = self.duration_field(v)?;
             }
         }
         if !is_valid_duration(&ff) {
@@ -89,13 +97,7 @@ impl<'p> Vm<'p> {
                     let pv = self.get_prop(v, name)?;
                     if pv != Value::UNDEFINED {
                         any = true;
-                        let n = self.to_number_coerce(pv)?;
-                        if !n.is_finite() || n.fract() != 0.0 {
-                            return Err(Thrown(
-                                "RangeError: Temporal.Duration fields must be integers".into(),
-                            ));
-                        }
-                        ff[i] = n;
+                        ff[i] = self.duration_field(pv)?;
                     }
                 }
                 if !any {
@@ -151,11 +153,7 @@ impl<'p> Vm<'p> {
                     let pv = self.get_prop(a0, name)?;
                     if pv != Value::UNDEFINED {
                         any = true;
-                        let n = self.to_number_coerce(pv)?;
-                        if !n.is_finite() || n.fract() != 0.0 {
-                            return Err(Thrown("RangeError: Duration fields must be integers".into()));
-                        }
-                        nf[i] = n;
+                        nf[i] = self.duration_field(pv)?;
                     }
                 }
                 if !any {

@@ -229,6 +229,12 @@ pub(crate) fn parse_offset_ns(s: &str) -> Option<i128> {
     if matches!(s, "Z" | "z") {
         return Some(0);
     }
+    // A sub-second offset fraction may have at most 9 digits.
+    if let Some(dot) = s.find('.') {
+        if s[dot + 1..].chars().take_while(|c| c.is_ascii_digit()).count() > 9 {
+            return None;
+        }
+    }
     let sign: i128 = match s.as_bytes().first() {
         Some(b'+') => 1,
         Some(b'-') => -1,
