@@ -138,7 +138,9 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
                 self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
             }
-            _ => None,
+            // Exotic objects (Map/Set/Date/Promise/…) keep defineProperty'd own
+            // properties in the generic arr_props side table.
+            _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
         match own {
             Some((a, raw)) if a.accessor => {
@@ -424,13 +426,17 @@ impl<'p> Vm<'p> {
             return Ok(());
         }
         // 0 = plain object, 1 = class (own props live in `statics`), 2 = callable
-        // (own props live in `fn_props`).
+        // (own props live in `fn_props`), 3 = the generic side table `arr_props`
+        // (array named props + every other exotic object: Map/Set/Date/Promise/
+        // RegExp/Weak*/…). String/Symbol/BigInt are PRIMITIVES → "non-object".
         let target = match self.heap.get(idx) {
             HeapObj::Object(_) => 0u8,
             HeapObj::Class(_) => 1,
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => 2,
-            HeapObj::Array(_) => 3, // named (non-index) own prop -> arr_props
-            _ => return Err(Thrown("TypeError: Object.defineProperty called on non-object".into())),
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) => {
+                return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
+            }
+            _ => 3, // Array named prop + exotic objects -> arr_props side table
         };
         // A callable's/class's `name`/`length`/`prototype` are synthesized; accept
         // the call but don't shadow them (full redefinition isn't modelled).
@@ -438,10 +444,17 @@ impl<'p> Vm<'p> {
             return Ok(());
         }
         let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
-        let existing = match self.heap.get(idx) {
-            HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
-            HeapObj::Class(c) => c.statics.pos(key).map(|i| (c.statics.attrs[i], c.statics.vals[i])),
-            HeapObj::Array(_) => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
+        // The existing descriptor lives wherever `target` writes (below).
+        let existing = match target {
+            0 => match self.heap.get(idx) {
+                HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
+                _ => None,
+            },
+            1 => match self.heap.get(idx) {
+                HeapObj::Class(c) => c.statics.pos(key).map(|i| (c.statics.attrs[i], c.statics.vals[i])),
+                _ => None,
+            },
+            3 => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
             _ => self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
         let is_accessor = get.is_some() || set.is_some();
@@ -672,6 +685,24 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn get_prop(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
         self.get_member(obj, key, obj)
+    }
+
+    /// Read `key` from an exotic object (Map/Set/Date/Promise/…): a defineProperty
+    /// own property in the generic `arr_props` side table (invoking a getter with
+    /// `this = obj`), else delegate to the type's prototype. Lets these objects
+    /// carry own properties defined via `Object.defineProperty`.
+    fn exotic_own_or_proto(&mut self, obj: Value, proto: u32, key: &str) -> Result<Value, Thrown> {
+        let found = self
+            .arr_props
+            .get(&obj.heap_index())
+            .and_then(|m| m.pos(key).map(|i| (m.attrs[i].accessor, m.vals[i])));
+        if let Some((is_accessor, v)) = found {
+            if is_accessor {
+                return if v == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(v, obj, &[]) };
+            }
+            return Ok(v);
+        }
+        Ok(self.proto_member(proto, key))
     }
 
     /// Property GET with an explicit `receiver` — the original object a lookup
@@ -1053,12 +1084,12 @@ impl<'p> Vm<'p> {
             HeapObj::Set(items) if key == "size" => Ok(len_value(items.len())),
             // A method as a VALUE on a Map/Set/Date/Promise instance
             // (`new Map().set`, `d.getHours`) → the corresponding prototype.
-            HeapObj::Map { .. } => Ok(self.proto_member(self.map_proto, key)),
-            HeapObj::Set(_) => Ok(self.proto_member(self.set_proto, key)),
-            HeapObj::WeakMap { .. } => Ok(self.proto_member(self.weakmap_proto, key)),
-            HeapObj::WeakSet(_) => Ok(self.proto_member(self.weakset_proto, key)),
-            HeapObj::WeakRef(_) => Ok(self.proto_member(self.weakref_proto, key)),
-            HeapObj::FinalizationRegistry { .. } => Ok(self.proto_member(self.finreg_proto, key)),
+            HeapObj::Map { .. } => self.exotic_own_or_proto(obj, self.map_proto, key),
+            HeapObj::Set(_) => self.exotic_own_or_proto(obj, self.set_proto, key),
+            HeapObj::WeakMap { .. } => self.exotic_own_or_proto(obj, self.weakmap_proto, key),
+            HeapObj::WeakSet(_) => self.exotic_own_or_proto(obj, self.weakset_proto, key),
+            HeapObj::WeakRef(_) => self.exotic_own_or_proto(obj, self.weakref_proto, key),
+            HeapObj::FinalizationRegistry { .. } => self.exotic_own_or_proto(obj, self.finreg_proto, key),
             HeapObj::Iterator { proto, .. } => {
                 let p = *proto;
                 self.proto_chain_get(p, key, obj)
@@ -1083,8 +1114,8 @@ impl<'p> Vm<'p> {
                 };
                 Ok(self.proto_member(proto, key))
             }
-            HeapObj::Date(_) => Ok(self.proto_member(self.date_proto, key)),
-            HeapObj::Promise { .. } => Ok(self.proto_member(self.promise_proto, key)),
+            HeapObj::Date(_) => self.exotic_own_or_proto(obj, self.date_proto, key),
+            HeapObj::Promise { .. } => self.exotic_own_or_proto(obj, self.promise_proto, key),
             // A Symbol: `.description` reads the wrapped description; methods
             // (toString/valueOf/constructor) resolve through Symbol.prototype.
             HeapObj::Symbol { desc, .. } => {
