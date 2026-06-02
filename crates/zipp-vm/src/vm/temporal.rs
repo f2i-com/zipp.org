@@ -480,6 +480,9 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                if !temporal_string_ok(&s, true) {
+                    return Err(Thrown(format!("RangeError: invalid date string '{s}'")));
+                }
                 return parse_iso_date(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid date string '{s}'")));
             }
@@ -756,6 +759,9 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                if !temporal_string_ok(&s, true) {
+                    return Err(Thrown(format!("RangeError: invalid time string '{s}'")));
+                }
                 return parse_iso_time(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid time string '{s}'")));
             }
@@ -930,6 +936,9 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                if !temporal_string_ok(&s, true) {
+                    return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
+                }
                 return parse_iso_datetime(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
             }
@@ -1531,6 +1540,9 @@ impl<'p> Vm<'p> {
         }
         let s = self.to_js_string(item)?;
         let _ = self.read_overflow(options)?;
+        if !temporal_string_ok(&s, false) {
+            return Err(Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")));
+        }
         let (f, offset, id) = parse_zdt_string(&s)
             .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
         let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
@@ -1616,6 +1628,9 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                if !temporal_string_ok(&s, false) {
+                    return Err(Thrown(format!("RangeError: invalid instant string '{s}'")));
+                }
                 return instant_str_to_ns(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid instant string '{s}'")));
             }
@@ -1731,6 +1746,9 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                if !temporal_string_ok(&s, true) {
+                    return Err(Thrown(format!("RangeError: invalid year-month string '{s}'")));
+                }
                 return parse_iso_year_month(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid year-month string '{s}'")));
             }
@@ -1929,6 +1947,9 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                if !temporal_string_ok(&s, true) {
+                    return Err(Thrown(format!("RangeError: invalid month-day string '{s}'")));
+                }
                 return parse_iso_month_day(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid month-day string '{s}'")));
             }
@@ -2064,6 +2085,62 @@ fn is_valid_duration(f: &[f64; 10]) -> bool {
         + (f[8] as i128) * 1_000
         + (f[9] as i128);
     total_ns.unsigned_abs() < 9_007_199_254_740_992u128 * 1_000_000_000
+}
+
+/// Validate the `[...]` annotation suffix of a Temporal ISO string per the
+/// grammar's critical-flag rules: a critical annotation with an unknown key
+/// (anything but `u-ca`) is rejected, at most one time-zone annotation is
+/// allowed, and 2+ calendar (`u-ca`) annotations are rejected if any is
+/// critical. `ann` starts at the first `[`.
+fn annotations_valid(ann: &str) -> bool {
+    let mut s = ann;
+    let mut cal_count = 0u32;
+    let mut cal_critical = false;
+    let mut tz_count = 0u32;
+    while !s.is_empty() {
+        if !s.starts_with('[') {
+            return false;
+        }
+        let end = match s.find(']') {
+            Some(e) => e,
+            None => return false,
+        };
+        let content = &s[1..end];
+        s = &s[end + 1..];
+        let (critical, body) = match content.strip_prefix('!') {
+            Some(b) => (true, b),
+            None => (false, content),
+        };
+        if let Some(eq) = body.find('=') {
+            if &body[..eq] == "u-ca" {
+                cal_count += 1;
+                cal_critical |= critical;
+            } else if critical {
+                return false; // critical unknown key annotation
+            }
+        } else {
+            tz_count += 1; // [Area/Location] time-zone annotation
+        }
+    }
+    tz_count <= 1 && !(cal_count > 1 && cal_critical)
+}
+
+/// Validate a Temporal ISO string for a given parser context: the annotation
+/// suffix must be well-formed, and (for the wall-clock "Plain" types) the string
+/// must not carry a `Z`/`z` UTC designator (a numeric offset is still allowed).
+fn temporal_string_ok(s: &str, reject_utc_designator: bool) -> bool {
+    let s = s.trim();
+    let (main, ann) = match s.find('[') {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    };
+    if !ann.is_empty() && !annotations_valid(ann) {
+        return false;
+    }
+    if reject_utc_designator && main.bytes().any(|b| b == b'Z' || b == b'z') {
+        return false;
+    }
+    true
 }
 
 /// Resolve a calendar string to its canonical id. The ISO-only engine accepts
