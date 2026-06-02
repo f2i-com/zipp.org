@@ -200,6 +200,25 @@ impl<'p> Vm<'p> {
             }
             // writable own data property → fall through to overwrite its value.
         }
+        // An inherited accessor on the prototype-OBJECT chain (`Object.create`
+        // proto, `fn.prototype` via defineProperty) governs the write: invoke its
+        // setter, or sloppy no-op for a getter-only accessor. (Class-instance
+        // chains are handled just below via map.class; `__proto__` was handled
+        // at the top.) Only when there's no own property with this key.
+        let needs_proto_walk = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.class.is_none() && m.pos(key).is_none(),
+            _ => false,
+        };
+        if needs_proto_walk {
+            match self.proto_accessor_setter(idx, key) {
+                Some(Some(setter)) => {
+                    self.call_value(setter, obj, &[val])?;
+                    return Ok(());
+                }
+                Some(None) => return Ok(()), // inherited getter-only ⇒ sloppy no-op
+                None => {}                    // no inherited accessor ⇒ data write
+            }
+        }
         // A class instance with an inherited `set x(v)` accessor: assigning a
         // property that is NOT an own data property invokes the setter (own data
         // properties shadow an inherited accessor, per JS [[Set]]).
@@ -268,6 +287,32 @@ impl<'p> Vm<'p> {
             self.heap.bump_version(idx); // invalidate any JIT inline cache (vals realloc)
         }
         Ok(())
+    }
+
+    /// Walk `start_idx`'s prototype-object chain for an own accessor named `key`,
+    /// for the [[Set]] algorithm. Returns:
+    /// * `Some(Some(setter))` — an accessor with a setter (invoke it);
+    /// * `Some(None)` — a getter-only accessor (assignment is a sloppy no-op);
+    /// * `None` — no accessor reached (a data property shadows / the chain ends),
+    ///   so the caller writes an own data property.
+    fn proto_accessor_setter(&mut self, start_idx: u32, key: &str) -> Option<Option<Value>> {
+        let mut cur = self.object_get_prototype_of(Value::heap(start_idx));
+        for _ in 0..64 {
+            if !cur.is_heap() {
+                return None;
+            }
+            if let HeapObj::Object(m) = self.heap.get(cur.heap_index()) {
+                if let Some(i) = m.pos(key) {
+                    let a = m.attrs[i];
+                    if a.accessor {
+                        return Some((a.setter != Value::UNDEFINED).then_some(a.setter));
+                    }
+                    return None; // inherited data property → own-data shadow
+                }
+            }
+            cur = self.object_get_prototype_of(cur);
+        }
+        None
     }
 
     /// Install an object-literal accessor (`{ get k(){…} }` / `{ set k(v){…} }`)
