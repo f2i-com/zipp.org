@@ -37,6 +37,11 @@ impl<'p> Vm<'p> {
         if ci == self.ta_base_ctor && ci != 0 {
             return Err(Thrown("TypeError: Abstract class TypedArray not directly constructable".into()));
         }
+        if ci == self.iterator_ctor && ci != 0 {
+            return Err(Thrown(
+                "TypeError: Abstract class Iterator not directly constructable".into(),
+            ));
+        }
         if ci == self.proxy_ctor && ci != 0 {
             return self.make_proxy(
                 args.first().copied().unwrap_or(Value::UNDEFINED),
@@ -491,7 +496,7 @@ impl<'p> Vm<'p> {
         }
         // A user iterator object (one with a `next()` method) or a built-in
         // Iterator: drain it.
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. }) {
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
             let next = self.get_prop(v, "next")?;
             if self.is_callable(next) {
                 let mut out = Vec::new();

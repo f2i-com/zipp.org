@@ -431,6 +431,21 @@ pub enum HeapObj {
     /// `proto` is its prototype heap index (%ArrayIteratorPrototype% etc., distinct
     /// per collection). `.next()` yields `items[index]` then advances.
     Iterator { items: Vec<Value>, index: usize, proto: u32 },
+    /// A lazy Iterator Helper (the result of `Iterator.prototype.{map,filter,
+    /// take,drop,flatMap}`). `source` is the underlying iterator; `kind` selects
+    /// the transform (0=map,1=filter,2=take,3=drop,4=flatMap); `arg` is the
+    /// callback (map/filter/flatMap); `n` is the remaining count (take/drop);
+    /// `idx` is the 0-based counter passed to callbacks; `done` marks exhaustion;
+    /// `inner` is flatMap's current inner iterator (or UNDEFINED).
+    IterHelper {
+        source: Value,
+        kind: u8,
+        arg: Value,
+        n: i64,
+        idx: i64,
+        done: bool,
+        inner: Value,
+    },
     /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
     /// `ctor` is the func id that runs instance field initializers then the user
     /// constructor (or `None`); `methods` maps each instance method name to its

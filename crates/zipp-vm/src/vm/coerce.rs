@@ -580,6 +580,7 @@ impl<'p> Vm<'p> {
                 HeapObj::WeakRef(_) => "[object WeakRef]".into(),
                 HeapObj::FinalizationRegistry { .. } => "[object FinalizationRegistry]".into(),
                 HeapObj::Iterator { .. } => "[object Array Iterator]".into(),
+                HeapObj::IterHelper { .. } => "[object Iterator Helper]".into(),
                 // A boxed primitive stringifies as its wrapped value (ToString).
                 HeapObj::Boxed { value, .. } => self.display(*value),
                 // ToString of a Symbol actually throws (see `to_js_string`); this
@@ -771,6 +772,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakRef(_) => "WeakRef {}".into(),
             HeapObj::FinalizationRegistry { .. } => "FinalizationRegistry {}".into(),
             HeapObj::Iterator { .. } => "Object [Array Iterator] {}".into(),
+            HeapObj::IterHelper { .. } => "Object [Iterator Helper] {}".into(),
             HeapObj::Boxed { kind, value } => {
                 let inner = self.inspect_nested(*value);
                 match kind {

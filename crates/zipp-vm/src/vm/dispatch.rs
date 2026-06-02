@@ -2104,7 +2104,7 @@ impl<'p> Vm<'p> {
                         // A user iterator object (`@@iterator` already resolved by
                         // GetIterator): pull the next result via `.next()`. Lazy —
                         // a `break` simply stops calling it.
-                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. }) {
+                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
                             let next = self.get_prop(it, "next")?;
                             if self.is_callable(next) {
                                 let res = self.call_value(next, it, &[])?;

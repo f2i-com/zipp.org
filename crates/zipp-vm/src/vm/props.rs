@@ -234,6 +234,7 @@ impl<'p> Vm<'p> {
             HeapObj::WeakRef(_) => self.weakref_proto,
             HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
             HeapObj::Iterator { proto, .. } => *proto,
+            HeapObj::IterHelper { .. } => self.iterator_helper_proto,
             HeapObj::Boxed { kind, .. } => match kind {
                 0 => self.str_proto,
                 1 => self.num_proto,
@@ -956,7 +957,11 @@ impl<'p> Vm<'p> {
             HeapObj::FinalizationRegistry { .. } => Ok(self.proto_member(self.finreg_proto, key)),
             HeapObj::Iterator { proto, .. } => {
                 let p = *proto;
-                Ok(self.proto_member(p, key))
+                self.proto_chain_get(p, key, obj)
+            }
+            HeapObj::IterHelper { .. } => {
+                let p = self.iterator_helper_proto;
+                self.proto_chain_get(p, key, obj)
             }
             // A boxed primitive: `length` (String box) reads the wrapped string;
             // everything else resolves through the wrapped type's prototype.

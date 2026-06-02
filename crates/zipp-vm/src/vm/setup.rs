@@ -297,6 +297,82 @@ impl<'p> Vm<'p> {
         // different identity so getPrototypeOf discriminates them).
         self.map_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
         self.set_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        // ── ES2025 Iterator Helpers ──
+        // %Iterator.prototype% (the shared root holding the helper methods).
+        let iter_root = build(
+            self,
+            &[
+                ("map", ITER_MAP),
+                ("filter", ITER_FILTER),
+                ("take", ITER_TAKE),
+                ("drop", ITER_DROP),
+                ("flatMap", ITER_FLATMAP),
+                ("reduce", ITER_REDUCE),
+                ("toArray", ITER_TOARRAY),
+                ("forEach", ITER_FOREACH),
+                ("some", ITER_SOME),
+                ("every", ITER_EVERY),
+                ("find", ITER_FIND),
+                ("@@iterator", ITER_SELF),
+            ],
+            None,
+        );
+        self.iterator_proto_root = iter_root;
+        self.proto_of.insert(iter_root, Value::heap(obj_proto));
+        // @@toStringTag + constructor are accessors on %Iterator.prototype%.
+        let acc_attr = |setter: Value| PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: true,
+            setter,
+        };
+        let tag_get = Value::heap(self.heap.alloc(HeapObj::Native(ITER_TAG_GET)));
+        let tag_set = Value::heap(self.heap.alloc(HeapObj::Native(ITER_TAG_SET)));
+        let ctor_get = Value::heap(self.heap.alloc(HeapObj::Native(ITER_CTOR_GET)));
+        let ctor_set = Value::heap(self.heap.alloc(HeapObj::Native(ITER_CTOR_SET)));
+        if let HeapObj::Object(m) = self.heap.get_mut(iter_root) {
+            m.define("@@toStringTag", tag_get, acc_attr(tag_set));
+            m.define("constructor", ctor_get, acc_attr(ctor_set));
+        }
+        // %IteratorHelperPrototype% (next/return for lazy helpers) chains to root.
+        let helper_proto =
+            build(self, &[("next", ITER_HELPER_NEXT), ("return", ITER_HELPER_RETURN)], None);
+        self.iterator_helper_proto = helper_proto;
+        self.proto_of.insert(helper_proto, Value::heap(iter_root));
+        let helper_tag = self.alloc_str("Iterator Helper".to_string());
+        let tag_data = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        if let HeapObj::Object(m) = self.heap.get_mut(helper_proto) {
+            m.define("@@toStringTag", helper_tag, tag_data);
+        }
+        // The `Iterator` constructor (abstract): prototype = %Iterator.prototype%,
+        // static `Iterator.from`. name "Iterator", length 0.
+        let iter_ctor = build(self, &[("from", ITER_FROM)], Some(iter_root));
+        self.iterator_ctor = iter_ctor;
+        let iter_name = self.alloc_str("Iterator".to_string());
+        if let HeapObj::Object(m) = self.heap.get_mut(iter_ctor) {
+            m.define("name", iter_name, tag_data);
+            m.define("length", Value::num(0.0), tag_data);
+        }
+        // Built-in iterator prototypes inherit the helpers from %Iterator.prototype%
+        // (with their own @@toStringTag so getPrototypeOf/toString stay correct).
+        for (p, tag) in [
+            (self.array_iter_proto, "Array Iterator"),
+            (self.map_iter_proto, "Map Iterator"),
+            (self.set_iter_proto, "Set Iterator"),
+        ] {
+            self.proto_of.insert(p, Value::heap(iter_root));
+            let tv = self.alloc_str(tag.to_string());
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("@@toStringTag", tv, tag_data);
+            }
+        }
         // Default @@iterator: Map → entries, Set → values (alias to the same fn).
         let map_entries = match self.heap.get(map_proto) {
             HeapObj::Object(m) => m.get("entries"),
@@ -1041,6 +1117,7 @@ impl<'p> Vm<'p> {
                 "ArrayBuffer" => Some(self.arraybuffer_ctor),
                 "DataView" => Some(self.dataview_ctor),
                 "Proxy" => Some(self.proxy_ctor),
+                "Iterator" => Some(self.iterator_ctor),
                 "Temporal" => Some(self.temporal_ns),
                 "Intl" => Some(self.intl_ns),
                 "parseInt" => Some(parse_int_fn),
@@ -1061,7 +1138,7 @@ impl<'p> Vm<'p> {
                 if matches!(self.heap.get(v), HeapObj::Object(m) if m.is_ctor) {
                     let len = match name.as_str() {
                         "Date" => 7.0,
-                        "Map" | "Set" | "WeakMap" | "WeakSet" => 0.0,
+                        "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator" => 0.0,
                         "AggregateError" => 2.0, // (errors, message?)
                         "RegExp" => 2.0,         // (pattern, flags)
                         "Proxy" => 2.0,          // (target, handler)

@@ -78,6 +78,25 @@ pub const FR_UNREGISTER: u16 = 299;
 // Built-in iterator methods.
 pub const ITER_NEXT: u16 = 300;
 pub const ITER_SELF: u16 = 301; // `[Symbol.iterator]()` → returns the iterator
+// ES2025 Iterator Helpers (%Iterator.prototype%).
+pub const ITER_MAP: u16 = 600;
+pub const ITER_FILTER: u16 = 601;
+pub const ITER_TAKE: u16 = 602;
+pub const ITER_DROP: u16 = 603;
+pub const ITER_FLATMAP: u16 = 604;
+pub const ITER_REDUCE: u16 = 605;
+pub const ITER_TOARRAY: u16 = 606;
+pub const ITER_FOREACH: u16 = 607;
+pub const ITER_SOME: u16 = 608;
+pub const ITER_EVERY: u16 = 609;
+pub const ITER_FIND: u16 = 610;
+pub const ITER_HELPER_NEXT: u16 = 611;
+pub const ITER_HELPER_RETURN: u16 = 612;
+pub const ITER_FROM: u16 = 613;
+pub const ITER_TAG_GET: u16 = 614;
+pub const ITER_TAG_SET: u16 = 615;
+pub const ITER_CTOR_GET: u16 = 616;
+pub const ITER_CTOR_SET: u16 = 617;
 pub const PROTO_TO_LOCALE_STRING: u16 = 302; // Object.prototype.toLocaleString
 // Number static methods as first-class values (the CALL form is a StaticFn).
 pub const NUM_IS_INTEGER: u16 = 303;
@@ -488,6 +507,20 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         FR_UNREGISTER => ("unregister", 1),
         ITER_NEXT => ("next", 0),
         ITER_SELF => ("[Symbol.iterator]", 0),
+        ITER_MAP => ("map", 1),
+        ITER_FILTER => ("filter", 1),
+        ITER_TAKE => ("take", 1),
+        ITER_DROP => ("drop", 1),
+        ITER_FLATMAP => ("flatMap", 1),
+        ITER_REDUCE => ("reduce", 1),
+        ITER_TOARRAY => ("toArray", 0),
+        ITER_FOREACH => ("forEach", 1),
+        ITER_SOME => ("some", 1),
+        ITER_EVERY => ("every", 1),
+        ITER_FIND => ("find", 1),
+        ITER_HELPER_NEXT => ("next", 0),
+        ITER_HELPER_RETURN => ("return", 0),
+        ITER_FROM => ("from", 1),
         PROTO_TO_LOCALE_STRING => ("toLocaleString", 0),
         NUM_IS_INTEGER => ("isInteger", 1),
         NUM_IS_NAN => ("isNaN", 1),

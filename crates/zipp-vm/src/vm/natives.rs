@@ -634,6 +634,62 @@ impl<'p> Vm<'p> {
                 Value::heap(self.heap.alloc(HeapObj::Object(m)))
             }
             ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
+            // ES2025 Iterator Helpers (%Iterator.prototype%).
+            ITER_MAP | ITER_FILTER | ITER_TAKE | ITER_DROP | ITER_FLATMAP | ITER_REDUCE
+            | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND => {
+                self.iter_helper_method(id, this, args)?
+            }
+            ITER_HELPER_NEXT => {
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::IterHelper { .. })
+                ) {
+                    return Err(Thrown(
+                        "TypeError: Iterator Helper next called on an incompatible receiver".into(),
+                    ));
+                }
+                self.iter_helper_next(this.heap_index())?
+            }
+            ITER_HELPER_RETURN => {
+                if this.is_heap() {
+                    if let HeapObj::IterHelper { done, .. } = self.heap.get_mut(this.heap_index()) {
+                        *done = true;
+                    }
+                }
+                self.iter_result(Value::UNDEFINED, true)
+            }
+            ITER_FROM => self.iterator_from(a0)?,
+            ITER_TAG_GET => self.alloc_str("Iterator".to_string()),
+            ITER_TAG_SET => {
+                if this.is_heap() && this.heap_index() == self.iterator_proto_root {
+                    return Err(Thrown(
+                        "TypeError: Cannot assign to read only property 'Symbol(Symbol.toStringTag)'"
+                            .into(),
+                    ));
+                }
+                if self.is_object_value(this) {
+                    self.set_prop(this, "@@toStringTag", a0)?;
+                }
+                Value::UNDEFINED
+            }
+            ITER_CTOR_GET => {
+                if self.iterator_ctor != 0 {
+                    Value::heap(self.iterator_ctor)
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            ITER_CTOR_SET => {
+                if this.is_heap() && this.heap_index() == self.iterator_proto_root {
+                    return Err(Thrown(
+                        "TypeError: Cannot assign to read only property 'constructor'".into(),
+                    ));
+                }
+                if self.is_object_value(this) {
+                    self.set_prop(this, "constructor", a0)?;
+                }
+                Value::UNDEFINED
+            }
             // Number static methods as values (no coercion, per spec).
             NUM_IS_INTEGER => Value::bool(num_is_integer(a0)),
             NUM_IS_NAN => Value::bool(a0.is_double() && a0.as_f64().is_nan()),

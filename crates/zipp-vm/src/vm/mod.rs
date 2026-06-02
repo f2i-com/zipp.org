@@ -256,6 +256,12 @@ pub struct Vm<'p> {
     /// symbol-keyed own property can be reflected back to its Symbol by
     /// `Object.getOwnPropertySymbols`.
     symbol_keys: std::collections::HashMap<String, Value>,
+    /// `%Iterator.prototype%` (the shared root of all iterator prototypes; holds
+    /// the ES2025 helper methods), `%IteratorHelperPrototype%` (next/return for
+    /// lazy helpers, chains to the root), and the `Iterator` constructor.
+    iterator_proto_root: u32,
+    iterator_helper_proto: u32,
+    iterator_ctor: u32,
     /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
     /// iterators (and the default array `@@iterator`). 0 until set up.
     array_iter_proto: u32,
@@ -319,6 +325,7 @@ mod builtins;
 mod values;
 mod temporal;
 mod intl;
+mod iterhelpers;
 mod proxy_regexp;
 mod typedarray;
 mod construct;
