@@ -195,6 +195,16 @@ impl<'p> Vm<'p> {
             let k = self.key_of(key);
             return self.set_prop(obj, &k, val);
         }
+        // Assigning past the dense-array cap (`a[2**31] = v`) would eagerly grow
+        // the Vec to billions of holes and OOM — zipp has no sparse arrays, so
+        // throw a RangeError instead. (Checked before the &mut borrow below.)
+        if let Some(i) = array_index(key) {
+            if matches!(self.heap.get(idx), HeapObj::Array(_)) && i >= crate::vm::MAX_DENSE_ARRAY_LEN {
+                return Err(Thrown(
+                    "RangeError: array index exceeds the engine's dense-array limit".into(),
+                ));
+            }
+        }
         match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 // Numeric key (incl. an integral double — the JIT region produces

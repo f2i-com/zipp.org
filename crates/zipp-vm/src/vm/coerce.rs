@@ -23,7 +23,11 @@ impl<'p> Vm<'p> {
             .ok()
             .and_then(|v| self.to_number(v).ok())
             .unwrap_or(0.0);
-        let len = if len.is_finite() && len > 0.0 { (len as usize).min(1 << 26) } else { 0 };
+        let len = if len.is_finite() && len > 0.0 {
+            (len as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
+        } else {
+            0
+        };
         let mut out = Vec::with_capacity(len.min(4096));
         for i in 0..len {
             out.push(self.get_index(this, Value::int(i as i32)).unwrap_or(Value::UNDEFINED));

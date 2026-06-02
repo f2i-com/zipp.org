@@ -151,6 +151,11 @@ impl<'p> Vm<'p> {
             if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
                 return Err(Thrown("RangeError: Invalid array length".into()));
             }
+            if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
+                return Err(Thrown(
+                    "RangeError: array length exceeds the engine's dense-array limit".into(),
+                ));
+            }
             if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                 items.resize(n as usize, Value::UNDEFINED);
             }

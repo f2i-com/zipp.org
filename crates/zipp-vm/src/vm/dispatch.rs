@@ -861,6 +861,11 @@ impl<'p> Vm<'p> {
                             if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
                                 return Err(Thrown("RangeError: Invalid array length".into()));
                             }
+                            if n as usize > super::MAX_DENSE_ARRAY_LEN {
+                                return Err(Thrown(
+                                    "RangeError: array length exceeds the engine's dense-array limit".into(),
+                                ));
+                            }
                             vec![Value::UNDEFINED; n as usize]
                         } else {
                             (0..argc).map(|i| self.get(base, arg_base + i)).collect()

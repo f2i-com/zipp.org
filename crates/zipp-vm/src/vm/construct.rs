@@ -504,6 +504,11 @@ impl<'p> Vm<'p> {
                     break;
                 }
                 out.push(self.get_prop(res, "value")?);
+                if out.len() > crate::vm::MAX_DENSE_ARRAY_LEN {
+                    return Err(Thrown(
+                        "RangeError: iterator produced more values than the engine's limit".into(),
+                    ));
+                }
             }
             return Ok(out);
         }
@@ -520,6 +525,11 @@ impl<'p> Vm<'p> {
                         break;
                     }
                     out.push(self.get_prop(res, "value")?);
+                    if out.len() > crate::vm::MAX_DENSE_ARRAY_LEN {
+                        return Err(Thrown(
+                            "RangeError: iterator produced more values than the engine's limit".into(),
+                        ));
+                    }
                 }
                 return Ok(out);
             }
@@ -596,6 +606,11 @@ impl<'p> Vm<'p> {
                     } else {
                         0
                     };
+                    if n > crate::vm::MAX_DENSE_ARRAY_LEN {
+                        return Err(Thrown(
+                            "RangeError: array length exceeds the engine's dense-array limit".into(),
+                        ));
+                    }
                     for i in 0..n {
                         elems.push(self.get_index(src, Value::int(i as i32))?);
                     }

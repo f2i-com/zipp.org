@@ -372,6 +372,11 @@ impl<'p> Vm<'p> {
             // (target 3 -> arr_props) with full descriptor semantics. read_descriptor
             // (which may run getters) is therefore invoked exactly once per path.
             if let Ok(i) = key.parse::<usize>() {
+                if i >= crate::vm::MAX_DENSE_ARRAY_LEN {
+                    return Err(Thrown(
+                        "RangeError: array index exceeds the engine's dense-array limit".into(),
+                    ));
+                }
                 let (value, get, set, ..) = self.read_descriptor(desc)?;
                 if get.is_none() && set.is_none() {
                     let v = value.unwrap_or(Value::UNDEFINED);
@@ -391,6 +396,11 @@ impl<'p> Vm<'p> {
                     let n = self.to_number(v)?;
                     if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
                         return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                    if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
+                        return Err(Thrown(
+                            "RangeError: array length exceeds the engine's dense-array limit".into(),
+                        ));
                     }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         items.resize(n as usize, Value::UNDEFINED);

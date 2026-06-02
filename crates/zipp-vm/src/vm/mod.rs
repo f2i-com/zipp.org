@@ -41,6 +41,16 @@ const FIELD_POOL: usize = 64;
 /// function rather than a closure. Real heap indices are always `< u32::MAX`.
 const NO_CLOSURE: u32 = u32::MAX;
 
+/// Largest length zipp will EAGERLY materialize for a dense array (`Vec<Value>`).
+/// The spec allows up to 2^32-1, but a dense Vec of that many `Value`s would be
+/// 32 GB; real engines store such arrays sparsely. Until zipp has sparse arrays,
+/// a `new Array(n)` / `arr.length = n` / defineProperty('length') / large-index
+/// assignment / array-like materialization beyond this cap throws a RangeError
+/// instead of OOMing the host. 2^22 elements ≈ 32 MB per array — far larger than
+/// any realistic program needs, while keeping a 12-way-parallel test262 run (each
+/// process possibly building several arrays) comfortably bounded.
+pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
+
 /// An active `try` handler within a frame.
 /// One activation record.
 struct Frame {
