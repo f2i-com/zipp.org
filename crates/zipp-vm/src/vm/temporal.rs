@@ -1787,12 +1787,35 @@ impl<'p> Vm<'p> {
             }
             "until" | "since" => {
                 let o = self.to_plain_year_month(a0)?;
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let ym_units = &["auto", "year", "years", "month", "months"];
+                // smallestUnit default "month"; largestUnit default "auto" → "year".
+                let smallest =
+                    normalize_unit(&self.opt_string(opts, "smallestUnit", "month", ym_units)?, "month");
+                let largest_raw =
+                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", ym_units)?, "auto");
+                let largest = if largest_raw == "auto" { "year".to_string() } else { largest_raw };
+                let rank = |u: &str| if u == "year" { 0 } else { 1 };
+                if rank(&smallest) < rank(&largest) {
+                    return Err(Thrown(
+                        "RangeError: smallestUnit is larger than largestUnit".into(),
+                    ));
+                }
+                let inc = self.read_rounding_increment(opts)?;
+                let mode = self.read_rounding_mode(opts, "trunc")?;
                 let from = y * 12 + (m - 1);
                 let to = o.0 * 12 + (o.1 - 1);
-                let diff = if name == "until" { to - from } else { from - to };
+                let total_months = if name == "until" { to - from } else { from - to };
+                // Round to smallestUnit: whole years round to a multiple of 12·inc.
+                let step = if smallest == "year" { 12 * inc } else { inc };
+                let rounded = round_increment(total_months as i128, step, &mode) as i64;
                 let mut f = [0i64; 10];
-                f[0] = diff / 12;
-                f[1] = diff % 12;
+                if largest == "year" {
+                    f[0] = rounded / 12;
+                    f[1] = rounded % 12;
+                } else {
+                    f[1] = rounded;
+                }
                 Ok(Some(self.make_duration(f)))
             }
             "toPlainDate" => {

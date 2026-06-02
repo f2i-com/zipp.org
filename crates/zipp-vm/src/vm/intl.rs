@@ -202,32 +202,11 @@ impl<'p> Vm<'p> {
         if !allowed.contains(&su.as_str()) {
             return Err(Thrown(format!("RangeError: invalid smallestUnit: {su}")));
         }
-        let inc = if options == Value::UNDEFINED {
-            1
-        } else {
-            let v = self.get_prop(options, "roundingIncrement")?;
-            if v == Value::UNDEFINED {
-                1
-            } else {
-                let n = self.to_number(v)?;
-                if !n.is_finite() || n < 1.0 || n.floor() != n {
-                    return Err(Thrown("RangeError: roundingIncrement out of range".into()));
-                }
-                n as i128
-            }
-        };
+        let inc = self.read_rounding_increment(options)?;
         let mode = if options == Value::UNDEFINED {
             "halfExpand".to_string()
         } else {
-            self.opt_string(
-                options,
-                "roundingMode",
-                "halfExpand",
-                &[
-                    "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
-                    "halfEven", "halfExpand",
-                ],
-            )?
+            self.read_rounding_mode(options, "halfExpand")?
         };
         if let Some(max) = max_increment(&su) {
             if inc >= max || max % inc != 0 {
@@ -269,27 +248,8 @@ impl<'p> Vm<'p> {
             &self.opt_string(options, "smallestUnit", "nanosecond", small_allowed)?,
             "nanosecond",
         );
-        let inc = {
-            let v = self.get_prop(options, "roundingIncrement")?;
-            if v == Value::UNDEFINED {
-                1
-            } else {
-                let n = self.to_number(v)?;
-                if !n.is_finite() || n < 1.0 || n.floor() != n {
-                    return Err(Thrown("RangeError: roundingIncrement out of range".into()));
-                }
-                n as i128
-            }
-        };
-        let mode = self.opt_string(
-            options,
-            "roundingMode",
-            "trunc",
-            &[
-                "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
-                "halfEven", "halfExpand",
-            ],
-        )?;
+        let inc = self.read_rounding_increment(options)?;
+        let mode = self.read_rounding_mode(options, "trunc")?;
         if rank(&lu) > rank(&su) {
             return Err(Thrown(
                 "RangeError: largestUnit must not be smaller than smallestUnit".into(),
