@@ -404,6 +404,56 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(recv))
             }
+            // ES2023 change-array-by-copy: build a NEW typed array of the same kind.
+            "toReversed" => {
+                let mut snap = self.ta_snapshot(idx);
+                snap.reverse();
+                Ok(Some(self.ta_build_from(kind, &snap)?))
+            }
+            "toSorted" => {
+                let cmp = a0;
+                if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
+                    return Err(Thrown(
+                        "TypeError: the comparator argument must be a function or undefined".into(),
+                    ));
+                }
+                let mut snap = self.ta_snapshot(idx);
+                if self.is_callable(cmp) {
+                    let n = snap.len();
+                    for i in 1..n {
+                        let mut j = i;
+                        while j > 0 {
+                            let r = self.call_value(cmp, Value::UNDEFINED, &[snap[j - 1], snap[j]])?;
+                            if self.value_num(r) > 0.0 {
+                                snap.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    snap.sort_by(|a, b| {
+                        let (x, y) = (self.value_num(*a), self.value_num(*b));
+                        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+                Ok(Some(self.ta_build_from(kind, &snap)?))
+            }
+            "with" => {
+                // %TypedArray%.prototype.with(index, value): a copy with one element
+                // replaced. A relative (negative = from end) index out of range is a
+                // RangeError; the value is coerced by ta_build_from.
+                let n = self.value_num(a0);
+                let n = if n.is_nan() { 0.0 } else { n.trunc() };
+                let actual = if n < 0.0 { len as f64 + n } else { n };
+                if actual < 0.0 || actual >= len as f64 {
+                    return Err(Thrown("RangeError: invalid typed array index".into()));
+                }
+                let mut snap = self.ta_snapshot(idx);
+                snap[actual as usize] = a1;
+                Ok(Some(self.ta_build_from(kind, &snap)?))
+            }
             "slice" => {
                 let start = rel(a0, 0, self);
                 let end = rel(a1, len, self);

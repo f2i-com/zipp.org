@@ -184,7 +184,7 @@ pub const TA_PROTO_METHODS: &[&str] = &[
     "at", "join", "toString", "indexOf", "lastIndexOf", "includes", "forEach", "map",
     "filter", "find", "findIndex", "findLast", "findLastIndex", "every", "some", "reduce",
     "reduceRight", "fill", "reverse", "slice", "subarray", "sort", "copyWithin", "set",
-    "keys", "values", "entries", "@@iterator",
+    "keys", "values", "entries", "@@iterator", "toReversed", "toSorted", "with",
 ];
 pub const TA_METHOD_BASE: u16 = 340;
 /// `DataView.prototype` get/set method names (registered at DV_METHOD_BASE+i).
@@ -452,8 +452,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     if (TA_METHOD_BASE..TA_METHOD_BASE + TA_PROTO_METHODS.len() as u16).contains(&id) {
         let m = TA_PROTO_METHODS[(id - TA_METHOD_BASE) as usize];
         let len: u8 = match m {
-            "reverse" | "keys" | "values" | "entries" | "toString" | "@@iterator" => 0,
-            "slice" | "subarray" | "copyWithin" => 2,
+            "reverse" | "keys" | "values" | "entries" | "toString" | "@@iterator"
+            | "toReversed" => 0,
+            "slice" | "subarray" | "copyWithin" | "with" => 2,
             _ => 1,
         };
         let name = if m == "@@iterator" { "[Symbol.iterator]" } else { m };
