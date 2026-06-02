@@ -10623,11 +10623,28 @@ impl<'p> Vm<'p> {
             }
             "until" | "since" => {
                 let other = self.to_plain_date(a0)?;
-                let from = iso_to_epoch_days(y, m, d);
-                let to = iso_to_epoch_days(other.0, other.1, other.2);
-                let days = if name == "until" { to - from } else { from - to };
+                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let largest = self.opt_string(
+                    a1,
+                    "largestUnit",
+                    "auto",
+                    &[
+                        "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
+                    ],
+                )?;
+                let largest = normalize_unit(&largest, "day");
+                // until: this → other; since: other → this.
+                let (d1, d2) = if name == "until" {
+                    ((y, m, d), other)
+                } else {
+                    (other, (y, m, d))
+                };
+                let diff = difference_iso_date(d1, d2, &largest);
                 let mut f = [0i64; 10];
-                f[3] = days;
+                f[0] = diff[0];
+                f[1] = diff[1];
+                f[2] = diff[2];
+                f[3] = diff[3];
                 Ok(Some(self.make_duration(f)))
             }
             "getISOFields" => {
@@ -10930,21 +10947,21 @@ impl<'p> Vm<'p> {
             }
             "until" | "since" => {
                 let o = self.to_plain_date_time(a0)?;
-                let a_ns = iso_to_epoch_days(f[0], f[1], f[2]) as i128 * 86_400_000_000_000
-                    + time_to_ns(&time);
-                let b_ns = iso_to_epoch_days(o[0], o[1], o[2]) as i128 * 86_400_000_000_000
-                    + time_to_ns(&[o[3], o[4], o[5], o[6], o[7], o[8]]);
-                let diff = if name == "until" { b_ns - a_ns } else { a_ns - b_ns };
-                let days = (diff.abs() / 86_400_000_000_000) as i64;
-                let t = ns_to_time(diff.abs() % 86_400_000_000_000);
-                let mut df = [0i64; 10];
-                df[3] = days;
-                df[4..10].copy_from_slice(&t);
-                if diff < 0 {
-                    for x in df.iter_mut() {
-                        *x = -*x;
-                    }
-                }
+                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let largest = self.opt_string(
+                    a1,
+                    "largestUnit",
+                    "auto",
+                    &[
+                        "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
+                        "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
+                        "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
+                    ],
+                )?;
+                let largest = normalize_unit(&largest, "day");
+                // until: this → other; since: other → this.
+                let (dt1, dt2) = if name == "until" { (f, o) } else { (o, f) };
+                let df = difference_datetime(dt1, dt2, &largest);
                 Ok(Some(self.make_duration(df)))
             }
             "getISOFields" => {
@@ -16159,6 +16176,130 @@ fn format_duration_en(d: &[i64; 10]) -> String {
     } else {
         parts.join(", ")
     }
+}
+
+/// Normalize a Temporal unit option: strip a trailing plural "s"; "auto"→`auto_to`.
+fn normalize_unit(u: &str, auto_to: &str) -> String {
+    let base = u.strip_suffix('s').unwrap_or(u);
+    if base == "auto" { auto_to.to_string() } else { base.to_string() }
+}
+
+/// DifferenceISODate: the duration FROM date1 TO date2 as [years,months,weeks,days]
+/// for the given largestUnit ("year"/"month"/"week"/"day"). Sign-aware. Mirrors the
+/// Temporal reference algorithm (constrain-add probing for the year/month split).
+fn difference_iso_date(
+    d1: (i64, i64, i64),
+    d2: (i64, i64, i64),
+    largest: &str,
+) -> [i64; 4] {
+    let cmp = |a: (i64, i64, i64), b: (i64, i64, i64)| -> i64 {
+        let (ea, eb) = (iso_to_epoch_days(a.0, a.1, a.2), iso_to_epoch_days(b.0, b.1, b.2));
+        (ea > eb) as i64 - (ea < eb) as i64
+    };
+    if largest == "day" || largest == "week" {
+        let mut days = iso_to_epoch_days(d2.0, d2.1, d2.2) - iso_to_epoch_days(d1.0, d1.1, d1.2);
+        let mut weeks = 0;
+        if largest == "week" {
+            weeks = days / 7;
+            days %= 7;
+        }
+        return [0, 0, weeks, days];
+    }
+    // year / month
+    let sign = -cmp(d1, d2); // +1 if d2 after d1
+    if sign == 0 {
+        return [0, 0, 0, 0];
+    }
+    let (y1, m1, dd1) = d1;
+    // (y1,m1,dd1) + (yy years, mm months), day constrained to the target month.
+    let add_ym = |yy: i64, mm: i64| -> (i64, i64, i64) {
+        let total = y1 * 12 + (m1 - 1) + yy * 12 + mm;
+        let ny = total.div_euclid(12);
+        let nm = total.rem_euclid(12) + 1;
+        (ny, nm, dd1.min(days_in_month(ny, nm)))
+    };
+    let mut years = d2.0 - y1;
+    let mut mid = add_ym(years, 0);
+    if -cmp(mid, d2) == 0 {
+        return if largest == "year" { [years, 0, 0, 0] } else { [0, years * 12, 0, 0] };
+    }
+    let mut months = d2.1 - m1;
+    if -cmp(mid, d2) != sign {
+        years -= sign;
+        months += sign * 12;
+    }
+    mid = add_ym(years, months);
+    let mid_sign = -cmp(mid, d2);
+    if mid_sign == 0 {
+        return if largest == "year" {
+            [years, months, 0, 0]
+        } else {
+            [0, years * 12 + months, 0, 0]
+        };
+    }
+    if mid_sign != sign {
+        months -= sign;
+        mid = add_ym(years, months);
+    }
+    let days = iso_to_epoch_days(d2.0, d2.1, d2.2) - iso_to_epoch_days(mid.0, mid.1, mid.2);
+    if largest == "year" {
+        [years, months, 0, days]
+    } else {
+        [0, years * 12 + months, 0, days]
+    }
+}
+
+/// DifferenceISODateTime: duration FROM dt1 TO dt2 as a 10-field Duration for the
+/// given largestUnit. Borrows a day when the time part runs opposite to the date
+/// direction; folds everything into time units when largestUnit is sub-day.
+fn difference_datetime(dt1: [i64; 9], dt2: [i64; 9], largest: &str) -> [i64; 10] {
+    let time1 = time_to_ns(&[dt1[3], dt1[4], dt1[5], dt1[6], dt1[7], dt1[8]]);
+    let time2 = time_to_ns(&[dt2[3], dt2[4], dt2[5], dt2[6], dt2[7], dt2[8]]);
+    let mut time_diff = time2 - time1;
+    let date1 = (dt1[0], dt1[1], dt1[2]);
+    let e1 = iso_to_epoch_days(date1.0, date1.1, date1.2);
+    let e2 = iso_to_epoch_days(dt2[0], dt2[1], dt2[2]);
+    let date_sign = (e2 > e1) as i64 - (e2 < e1) as i64;
+    let mut date2 = (dt2[0], dt2[1], dt2[2]);
+    if time_diff != 0 && date_sign != 0 && time_diff.signum() != date_sign as i128 {
+        let ed = iso_to_epoch_days(date2.0, date2.1, date2.2) - date_sign;
+        date2 = epoch_days_to_iso(ed);
+        time_diff += (date_sign as i128) * DAY_NS;
+    }
+    let mut df = [0i64; 10];
+    if matches!(
+        largest,
+        "hour" | "minute" | "second" | "millisecond" | "microsecond" | "nanosecond"
+    ) {
+        let day_diff = iso_to_epoch_days(date2.0, date2.1, date2.2) - e1;
+        let total = (day_diff as i128) * DAY_NS + time_diff;
+        let units = [
+            3_600_000_000_000i128, 60_000_000_000, 1_000_000_000, 1_000_000, 1_000, 1,
+        ];
+        let start = match largest {
+            "hour" => 0,
+            "minute" => 1,
+            "second" => 2,
+            "millisecond" => 3,
+            "microsecond" => 4,
+            _ => 5,
+        };
+        let sign = total.signum() as i64;
+        let mut n = total.abs();
+        for i in start..6 {
+            df[4 + i] = (n / units[i]) as i64 * sign;
+            n %= units[i];
+        }
+        return df;
+    }
+    let dpart = difference_iso_date(date1, date2, largest);
+    df[..4].copy_from_slice(&dpart);
+    let tsign = time_diff.signum() as i64;
+    let t = ns_to_time(time_diff.abs());
+    for i in 0..6 {
+        df[4 + i] = t[i] * tsign;
+    }
+    df
 }
 
 /// ISO day-of-week: Monday=1 … Sunday=7.
