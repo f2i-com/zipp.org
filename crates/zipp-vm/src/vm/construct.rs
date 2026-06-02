@@ -123,6 +123,85 @@ impl<'p> Vm<'p> {
                 None => self.construct(target, args),
             };
         }
+        // A core built-in constructor used as a VALUE (`new C()` where C is the
+        // Array/Object/Map/… constructor reached via a variable, `.constructor`,
+        // or a species lookup — not the compile-lowered `new Array()` literal).
+        // Identify it by its own `prototype` (the canonical proto object), so it
+        // works however the constructor was obtained.
+        let builtin_proto = match self.heap.get(ci) {
+            HeapObj::Object(m) if m.is_ctor => {
+                m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index())
+            }
+            _ => None,
+        };
+        if let Some(p) = builtin_proto {
+            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if p == self.arr_proto && self.arr_proto != 0 {
+                let arr = if args.len() == 1 && a0.is_number() {
+                    let n = a0.as_f64();
+                    if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
+                        return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                    if n as usize > super::MAX_DENSE_ARRAY_LEN {
+                        return Err(Thrown(
+                            "RangeError: array length exceeds the engine's dense-array limit".into(),
+                        ));
+                    }
+                    vec![Value::UNDEFINED; n as usize]
+                } else {
+                    args.to_vec()
+                };
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(arr))));
+            }
+            if p == self.obj_proto && self.obj_proto != 0 {
+                return self.to_object(a0);
+            }
+            if p == self.num_proto && self.num_proto != 0 {
+                let n = if args.is_empty() { 0.0 } else { self.to_number(a0)? };
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 1, value: Value::num(n) })));
+            }
+            if p == self.bool_proto && self.bool_proto != 0 {
+                let b = !args.is_empty() && self.truthy(a0);
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 2, value: Value::bool(b) })));
+            }
+            if p == self.str_proto && self.str_proto != 0 {
+                let s = if args.is_empty() { String::new() } else { self.to_js_string(a0)? };
+                let sv = self.alloc_str(s);
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 0, value: sv })));
+            }
+            if p == self.regexp_proto && self.regexp_proto != 0 {
+                return self.build_regexp(a0, args.get(1).copied().unwrap_or(Value::UNDEFINED));
+            }
+            if p == self.map_proto && self.map_proto != 0 {
+                let (mut keys, mut vals): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+                if !a0.is_nullish() {
+                    for e in self.iterate_to_vec(a0)? {
+                        let k = normalize_zero(self.get_index(e, Value::int(0))?);
+                        let v = self.get_index(e, Value::int(1))?;
+                        match keys.iter().position(|kk| self.same_value_zero(*kk, k)) {
+                            Some(i) => vals[i] = v,
+                            None => {
+                                keys.push(k);
+                                vals.push(v);
+                            }
+                        }
+                    }
+                }
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Map { keys, vals })));
+            }
+            if p == self.set_proto && self.set_proto != 0 {
+                let mut items: Vec<Value> = Vec::new();
+                if !a0.is_nullish() {
+                    for e in self.iterate_to_vec(a0)? {
+                        let v = normalize_zero(e);
+                        if !items.iter().any(|x| self.same_value_zero(*x, v)) {
+                            items.push(v);
+                        }
+                    }
+                }
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Set(items))));
+            }
+        }
         // Constructor FUNCTION (`new F()`, the pre-class OOP idiom): make an object
         // whose [[Prototype]] is `F.prototype` (so its methods + `constructor`
         // resolve), run `F` with `this` = that object, and use F's return value if
