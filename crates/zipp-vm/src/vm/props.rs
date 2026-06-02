@@ -1100,14 +1100,10 @@ impl<'p> Vm<'p> {
                         return Ok(v);
                     }
                 }
-                if self.fn_proto != 0 {
-                    if let HeapObj::Object(m) = self.heap.get(self.fn_proto) {
-                        if let Some(v) = m.get(key) {
-                            return Ok(v);
-                        }
-                    }
-                }
-                Ok(Value::UNDEFINED)
+                // Inherited methods: Function.prototype (call/apply/bind) then up
+                // the chain to Object.prototype (toString/valueOf/hasOwnProperty/…),
+                // so `fn.toString`, `fn.hasOwnProperty`, `fn + ''` (ToPrimitive) work.
+                Ok(self.proto_member(self.fn_proto, key))
             }
             _ => Ok(Value::UNDEFINED),
         }
