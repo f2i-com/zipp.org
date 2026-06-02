@@ -1243,7 +1243,8 @@ impl<'p> Vm<'p> {
                             S::PromiseRace => self.promise_combine(crate::heap::CombKind::Race, a0)?,
                             S::PromiseAny => self.promise_combine(crate::heap::CombKind::Any, a0)?,
                             S::ObjectDefineProperty => {
-                                let key = self.key_of(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                                let key =
+                                    self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                                 let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                                 self.object_define_property(a0, &key, desc)?;
                                 a0

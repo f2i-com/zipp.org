@@ -258,6 +258,20 @@ impl<'p> Vm<'p> {
         self.display(key)
     }
 
+    /// `ToPropertyKey(key)` (7.1.19): a Symbol maps to its registry key; anything
+    /// else is `ToString`-coerced (invoking `toString`/`valueOf` on an object and
+    /// throwing TypeError for a Symbol-returning conversion). Unlike [`key_of`]
+    /// this runs user coercion, so it is `&mut self` and fallible — use it for a
+    /// caller-supplied property-name argument (e.g. `Object.defineProperty`).
+    pub(crate) fn to_property_key(&mut self, key: Value) -> Result<String, Thrown> {
+        if key.is_heap() {
+            if let HeapObj::Symbol { prop_key, .. } = self.heap.get(key.heap_index()) {
+                return Ok(prop_key.clone());
+            }
+        }
+        self.to_js_string(key)
+    }
+
     /// Allocate a BigInt value.
     pub(crate) fn make_bigint(&mut self, v: i128) -> Value {
         Value::heap(self.heap.alloc(HeapObj::BigInt(v)))

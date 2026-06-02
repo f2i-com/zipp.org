@@ -41,7 +41,7 @@ impl<'p> Vm<'p> {
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         Ok(match id {
             OBJ_DEFINE_PROPERTY => {
-                let key = self.key_of(a1);
+                let key = self.to_property_key(a1)?;
                 self.object_define_property(a0, &key, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
                 a0
             }
