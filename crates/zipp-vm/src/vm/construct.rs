@@ -201,6 +201,30 @@ impl<'p> Vm<'p> {
                 }
                 return Ok(Value::heap(self.heap.alloc(HeapObj::Set(items))));
             }
+            if p == self.date_proto && self.date_proto != 0 {
+                let ms = self.date_new_ms(args)?;
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Date(ms))));
+            }
+            if p == self.promise_proto && self.promise_proto != 0 {
+                if !self.is_callable(a0) {
+                    return Err(Thrown(format!(
+                        "TypeError: Promise resolver {} is not a function",
+                        self.display(a0)
+                    )));
+                }
+                let prom = self.alloc_promise();
+                let res = Value::heap(
+                    self.heap.alloc(HeapObj::BoundResolver { promise: prom, is_reject: false }),
+                );
+                let rej = Value::heap(
+                    self.heap.alloc(HeapObj::BoundResolver { promise: prom, is_reject: true }),
+                );
+                if self.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
+                    let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                    self.reject(prom, reason);
+                }
+                return Ok(Value::heap(prom));
+            }
         }
         // Constructor FUNCTION (`new F()`, the pre-class OOP idiom): make an object
         // whose [[Prototype]] is `F.prototype` (so its methods + `constructor`
