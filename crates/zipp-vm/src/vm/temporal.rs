@@ -605,16 +605,30 @@ impl<'p> Vm<'p> {
             }
             "until" | "since" => {
                 let other = self.to_plain_date(a0)?;
-                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let largest = self.opt_string(
-                    a1,
-                    "largestUnit",
-                    "auto",
-                    &[
-                        "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
-                    ],
-                )?;
-                let largest = normalize_unit(&largest, "day");
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let date_units = &[
+                    "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
+                ];
+                // GetDifferenceSettings: smallestUnit (default "day"), largestUnit
+                // (default "auto" → the larger of smallestUnit and "day").
+                let smallest =
+                    normalize_unit(&self.opt_string(opts, "smallestUnit", "day", date_units)?, "day");
+                let largest_raw =
+                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", date_units)?, "auto");
+                let order = ["year", "month", "week", "day"];
+                let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(3);
+                let largest = if largest_raw == "auto" {
+                    if rank(&smallest) < 3 { smallest.clone() } else { "day".to_string() }
+                } else {
+                    largest_raw
+                };
+                if rank(&smallest) < rank(&largest) {
+                    return Err(Thrown(
+                        "RangeError: smallestUnit is larger than largestUnit".into(),
+                    ));
+                }
+                let inc = self.read_rounding_increment(opts)?;
+                let mode = self.read_rounding_mode(opts, "trunc")?;
                 // until: this → other; since: other → this.
                 let (d1, d2) = if name == "until" {
                     ((y, m, d), other)
@@ -623,10 +637,19 @@ impl<'p> Vm<'p> {
                 };
                 let diff = difference_iso_date(d1, d2, &largest);
                 let mut f = [0i64; 10];
-                f[0] = diff[0];
-                f[1] = diff[1];
-                f[2] = diff[2];
-                f[3] = diff[3];
+                f[..4].copy_from_slice(&diff);
+                // Round to smallestUnit. The day field rounds to the increment; a
+                // larger smallestUnit truncates the units below it (full calendar
+                // rounding for year/month/week with non-trunc modes is deferred).
+                let si = rank(&smallest);
+                if si == 3 {
+                    f[3] = round_increment(f[3] as i128, inc, &mode) as i64;
+                } else {
+                    for slot in f.iter_mut().take(4).skip(si + 1) {
+                        *slot = 0;
+                    }
+                    f[si] = round_increment(f[si] as i128, inc, &mode) as i64;
+                }
                 Ok(Some(self.make_duration(f)))
             }
             "getISOFields" => {
@@ -640,6 +663,39 @@ impl<'p> Vm<'p> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Read the `roundingIncrement` option: ToNumber (valueOf-aware; a BigInt is a
+    /// TypeError, like the spec's ToNumber), then require a finite integer >= 1.
+    pub(crate) fn read_rounding_increment(&mut self, opts: Value) -> Result<i128, Thrown> {
+        if opts == Value::UNDEFINED {
+            return Ok(1);
+        }
+        let v = self.get_prop(opts, "roundingIncrement")?;
+        if v == Value::UNDEFINED {
+            return Ok(1);
+        }
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
+            return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
+        }
+        let n = self.to_number_coerce(v)?;
+        if !n.is_finite() || n < 1.0 || n.fract() != 0.0 {
+            return Err(Thrown("RangeError: roundingIncrement out of range".into()));
+        }
+        Ok(n as i128)
+    }
+
+    /// Read the `roundingMode` option, validated against the nine Temporal modes.
+    pub(crate) fn read_rounding_mode(&mut self, opts: Value, default: &str) -> Result<String, Thrown> {
+        self.opt_string(
+            opts,
+            "roundingMode",
+            default,
+            &[
+                "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
+                "halfEven", "halfExpand",
+            ],
+        )
     }
 
     /// Read an optional integer field from an options/with object (None if absent).
