@@ -108,6 +108,23 @@ fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
             }
             collect_bound_stmt(&f.body, out);
         }
+        // Descend into try/switch/labeled bodies so a binding declared inside one
+        // that a nested closure captures is detected (and boxed).
+        S::TryStatement(t) => {
+            collect_bound_in_body(&t.block.body, out);
+            if let Some(h) = &t.handler {
+                collect_bound_in_body(&h.body.body, out);
+            }
+            if let Some(f) = &t.finalizer {
+                collect_bound_in_body(&f.body, out);
+            }
+        }
+        S::SwitchStatement(sw) => {
+            for case in &sw.cases {
+                collect_bound_in_body(&case.consequent, out);
+            }
+        }
+        S::LabeledStatement(l) => collect_bound_stmt(&l.body, out),
         _ => {}
     }
 }
@@ -209,6 +226,42 @@ fn stmt_refs(s: &ox::Statement, out: &mut HashSet<String>) {
             // (minus what it binds), exactly like a function expression would.
             fn_node_free(&f.params, f.body.as_deref(), out);
         }
+        S::ForOfStatement(f) => {
+            expr_refs(&f.right, out);
+            stmt_refs(&f.body, out);
+        }
+        S::ForInStatement(f) => {
+            expr_refs(&f.right, out);
+            stmt_refs(&f.body, out);
+        }
+        S::TryStatement(t) => {
+            for st in &t.block.body {
+                stmt_refs(st, out);
+            }
+            if let Some(h) = &t.handler {
+                for st in &h.body.body {
+                    stmt_refs(st, out);
+                }
+            }
+            if let Some(f) = &t.finalizer {
+                for st in &f.body {
+                    stmt_refs(st, out);
+                }
+            }
+        }
+        S::SwitchStatement(sw) => {
+            expr_refs(&sw.discriminant, out);
+            for case in &sw.cases {
+                if let Some(t) = &case.test {
+                    expr_refs(t, out);
+                }
+                for st in &case.consequent {
+                    stmt_refs(st, out);
+                }
+            }
+        }
+        S::ThrowStatement(t) => expr_refs(&t.argument, out),
+        S::LabeledStatement(l) => stmt_refs(&l.body, out),
         _ => {}
     }
 }
@@ -308,8 +361,18 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
         }
         E::ObjectExpression(o) => {
             for prop in &o.properties {
-                if let ox::ObjectPropertyKind::ObjectProperty(p) = prop {
-                    expr_refs(&p.value, out);
+                match prop {
+                    ox::ObjectPropertyKind::ObjectProperty(p) => {
+                        // A computed key `{[expr]: v}` references variables too —
+                        // they must be captured, not just the value's.
+                        if p.computed {
+                            if let Some(ke) = p.key.as_expression() {
+                                expr_refs(ke, out);
+                            }
+                        }
+                        expr_refs(&p.value, out);
+                    }
+                    ox::ObjectPropertyKind::SpreadProperty(s) => expr_refs(&s.argument, out),
                 }
             }
         }
@@ -396,6 +459,34 @@ fn collect_nested_free(s: &ox::Statement, out: &mut HashSet<String>) {
             }
         }
         S::FunctionDeclaration(f) => fn_node_free(&f.params, f.body.as_deref(), out),
+        S::TryStatement(t) => {
+            for st in &t.block.body {
+                collect_nested_free(st, out);
+            }
+            if let Some(h) = &t.handler {
+                for st in &h.body.body {
+                    collect_nested_free(st, out);
+                }
+            }
+            if let Some(f) = &t.finalizer {
+                for st in &f.body {
+                    collect_nested_free(st, out);
+                }
+            }
+        }
+        S::SwitchStatement(sw) => {
+            collect_nested_free_expr(&sw.discriminant, out);
+            for case in &sw.cases {
+                if let Some(t) = &case.test {
+                    collect_nested_free_expr(t, out);
+                }
+                for st in &case.consequent {
+                    collect_nested_free(st, out);
+                }
+            }
+        }
+        S::ThrowStatement(t) => collect_nested_free_expr(&t.argument, out),
+        S::LabeledStatement(l) => collect_nested_free(&l.body, out),
         _ => {}
     }
 }
@@ -474,8 +565,18 @@ fn collect_nested_free_expr(e: &ox::Expression, out: &mut HashSet<String>) {
         }
         E::ObjectExpression(o) => {
             for prop in &o.properties {
-                if let ox::ObjectPropertyKind::ObjectProperty(p) = prop {
-                    collect_nested_free_expr(&p.value, out);
+                match prop {
+                    ox::ObjectPropertyKind::ObjectProperty(p) => {
+                        if p.computed {
+                            if let Some(ke) = p.key.as_expression() {
+                                collect_nested_free_expr(ke, out);
+                            }
+                        }
+                        collect_nested_free_expr(&p.value, out);
+                    }
+                    ox::ObjectPropertyKind::SpreadProperty(s) => {
+                        collect_nested_free_expr(&s.argument, out)
+                    }
                 }
             }
         }
