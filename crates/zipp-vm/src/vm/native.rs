@@ -86,6 +86,10 @@ pub const SYMBOL_TO_PRIMITIVE: u16 = 655;
 pub const SYMBOL_DESCRIPTION_GET: u16 = 656;
 /// `String.prototype[Symbol.iterator]` — a String Iterator over code points.
 pub const STR_ITERATOR: u16 = 657;
+/// `JSON.rawJSON(text)` — wrap validated JSON text so `stringify` emits it raw.
+pub const JSON_RAW_JSON: u16 = 658;
+/// `JSON.isRawJSON(value)` — true for a `JSON.rawJSON` result object.
+pub const JSON_IS_RAW_JSON: u16 = 659;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -582,6 +586,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         REFLECT_PREVENT_EXT => ("preventExtensions", 1),
         JSON_PARSE => ("parse", 2),
         JSON_STRINGIFY => ("stringify", 3),
+        JSON_RAW_JSON => ("rawJSON", 1),
+        JSON_IS_RAW_JSON => ("isRawJSON", 1),
         MATH_RANDOM => ("random", 0),
         WM_GET => ("get", 1),
         WM_SET => ("set", 2),

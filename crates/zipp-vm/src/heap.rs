@@ -37,6 +37,10 @@ pub struct ObjMap {
     /// "function" and they satisfy IsConstructor. False for ordinary objects and
     /// the namespace globals (Reflect/Math/JSON).
     pub is_ctor: bool,
+    /// `[[IsRawJSON]]`: set only on the frozen objects returned by
+    /// `JSON.rawJSON`. `JSON.isRawJSON` reports it, and `JSON.stringify` emits
+    /// the object's `"rawJSON"` string property verbatim instead of serialising.
+    pub is_raw_json: bool,
 }
 
 /// One property's attributes — the ECMAScript property-descriptor flags plus an
@@ -62,7 +66,15 @@ impl PropAttr {
 
 impl ObjMap {
     pub fn new() -> ObjMap {
-        ObjMap { keys: Vec::new(), vals: Vec::new(), attrs: Vec::new(), class: None, extensible: true, is_ctor: false }
+        ObjMap {
+            keys: Vec::new(),
+            vals: Vec::new(),
+            attrs: Vec::new(),
+            class: None,
+            extensible: true,
+            is_ctor: false,
+            is_raw_json: false,
+        }
     }
 
     /// `Object.isSealed`: not extensible and every own property non-configurable.

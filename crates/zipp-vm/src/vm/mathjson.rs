@@ -217,6 +217,8 @@ impl<'p> Vm<'p> {
             Arr(Vec<Value>),
             Obj(Vec<(String, Value)>),
             EmptyObj,
+            /// A `JSON.rawJSON` object: emit its stored text verbatim.
+            Raw(String),
         }
         let node = match self.heap.get(idx) {
             HeapObj::Str(_) | HeapObj::Cons { .. } => {
@@ -230,6 +232,16 @@ impl<'p> Vm<'p> {
             HeapObj::BigInt(_) => Node::BigInt,
             HeapObj::Boxed { value, .. } => Node::Boxed(*value),
             HeapObj::Array(items) => Node::Arr(items.clone()),
+            HeapObj::Object(map) if map.is_raw_json => {
+                // [[IsRawJSON]]: emit the stored "rawJSON" text verbatim.
+                let raw_val = map.get("rawJSON").unwrap_or(Value::UNDEFINED);
+                let s = self
+                    .heap
+                    .str_cow(raw_val.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                Node::Raw(s)
+            }
             HeapObj::Object(map) => {
                 let mut pairs = Vec::new();
                 if let Some(allow) = allowlist {
@@ -257,6 +269,7 @@ impl<'p> Vm<'p> {
         };
         match node {
             Node::Omit => Ok(None),
+            Node::Raw(s) => Ok(Some(s)),
             Node::Str(s) => Ok(Some(json_quote(&s))),
             Node::BigInt => Err(Thrown("TypeError: Do not know how to serialize a BigInt".into())),
             // A boxed Number/String/Boolean serializes as its wrapped primitive.

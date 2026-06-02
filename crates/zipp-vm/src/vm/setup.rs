@@ -1254,7 +1254,16 @@ impl<'p> Vm<'p> {
         }
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
-        let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
+        let json_ctor = build(
+            self,
+            &[
+                ("parse", JSON_PARSE),
+                ("stringify", JSON_STRINGIFY),
+                ("rawJSON", JSON_RAW_JSON),
+                ("isRawJSON", JSON_IS_RAW_JSON),
+            ],
+            None,
+        );
         {
             // JSON[Symbol.toStringTag] = "JSON" (so Object.prototype.toString is
             // "[object JSON]"); non-writable/enumerable, configurable.

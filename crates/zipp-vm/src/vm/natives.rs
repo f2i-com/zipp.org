@@ -1083,6 +1083,46 @@ impl<'p> Vm<'p> {
                     None => Value::UNDEFINED,
                 }
             }
+            JSON_RAW_JSON => {
+                // JSON.rawJSON(text): ToString (throws TypeError for a Symbol),
+                // then validate the text is a single non-empty JSON value with no
+                // leading/trailing JSON whitespace. The result is a frozen,
+                // null-prototype object whose sole own property "rawJSON" holds the
+                // text, tagged [[IsRawJSON]] so stringify emits it verbatim.
+                let s = self.to_js_string(a0)?;
+                let bytes = s.as_bytes();
+                let ws = |c: u8| matches!(c, b'\t' | b'\n' | b'\r' | b' ');
+                if s.is_empty() || ws(bytes[0]) || ws(bytes[bytes.len() - 1]) {
+                    return Err(Thrown(
+                        "SyntaxError: JSON.rawJSON text must be non-empty without leading/trailing whitespace".into(),
+                    ));
+                }
+                // Validate it parses as one complete JSON value (checks trailing).
+                self.json_parse(&s)?;
+                let _gc = self.gc_lock_guard();
+                let sval = self.alloc_str(s);
+                let mut m = crate::heap::ObjMap::new();
+                m.is_raw_json = true;
+                m.extensible = false;
+                m.keys.push("rawJSON".to_string());
+                m.vals.push(sval);
+                m.attrs.push(crate::heap::PropAttr {
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                });
+                let idx = self.heap.alloc(HeapObj::Object(m));
+                self.proto_of.insert(idx, Value::NULL); // OrdinaryObjectCreate(null)
+                Value::heap(idx)
+            }
+            JSON_IS_RAW_JSON => {
+                let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let is = v.is_heap()
+                    && matches!(self.heap.get(v.heap_index()), HeapObj::Object(m) if m.is_raw_json);
+                Value::bool(is)
+            }
             // `Math.random` as a value (the call form uses the Random op). xorshift64*.
             MATH_RANDOM => {
                 let mut x = self.rng_state;
