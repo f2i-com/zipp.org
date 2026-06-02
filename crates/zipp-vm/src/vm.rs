@@ -295,6 +295,12 @@ mod native {
     ];
     pub const PMD_M_BASE: u16 = 528;
     pub const PLAINMONTHDAY_FROM: u16 = 536;
+    /// Temporal.Now namespace methods.
+    pub const NOW_INSTANT: u16 = 540;
+    pub const NOW_PLAINDATETIME_ISO: u16 = 541;
+    pub const NOW_PLAINDATE_ISO: u16 = 542;
+    pub const NOW_PLAINTIME_ISO: u16 = 543;
+    pub const NOW_TIMEZONE_ID: u16 = 544;
     /// Field names of a Temporal.Duration, in slot order.
     pub const DURATION_FIELDS: [&str; 10] = [
         "years", "months", "weeks", "days", "hours", "minutes", "seconds",
@@ -5810,6 +5816,21 @@ impl<'p> Vm<'p> {
                 p.define("constructor", Value::heap(plainmonthday_ctor), method_attr);
                 p.define("@@toStringTag", pmdtag, fn_attr);
             }
+            // Temporal.Now (a namespace object, not a constructor).
+            let nowtag = self.alloc_str("Temporal.Now".to_string());
+            let mut nown = ObjMap::new();
+            for (n, id) in [
+                ("instant", NOW_INSTANT),
+                ("plainDateTimeISO", NOW_PLAINDATETIME_ISO),
+                ("plainDateISO", NOW_PLAINDATE_ISO),
+                ("plainTimeISO", NOW_PLAINTIME_ISO),
+                ("timeZoneId", NOW_TIMEZONE_ID),
+            ] {
+                let v = Value::heap(self.heap.alloc(HeapObj::Native(id)));
+                nown.define(n, v, method_attr);
+            }
+            nown.define("@@toStringTag", nowtag, fn_attr);
+            let now_ns = self.heap.alloc(HeapObj::Object(nown));
             let mut tn = ObjMap::new();
             tn.define("Duration", Value::heap(duration_ctor), method_attr);
             tn.define("PlainDate", Value::heap(plaindate_ctor), method_attr);
@@ -5818,6 +5839,7 @@ impl<'p> Vm<'p> {
             tn.define("Instant", Value::heap(instant_ctor), method_attr);
             tn.define("PlainYearMonth", Value::heap(plainyearmonth_ctor), method_attr);
             tn.define("PlainMonthDay", Value::heap(plainmonthday_ctor), method_attr);
+            tn.define("Now", Value::heap(now_ns), method_attr);
             self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
@@ -6929,6 +6951,28 @@ impl<'p> Vm<'p> {
                 let (ry, m, d) = self.to_plain_month_day(a0)?;
                 self.make_plain_month_day(m, d, ry)?
             }
+            // Temporal.Now — no timezone DB, so everything reports UTC.
+            NOW_INSTANT => {
+                let ns = Self::now_epoch_ns();
+                self.make_instant(ns)?
+            }
+            NOW_PLAINDATETIME_ISO => {
+                let ns = Self::now_epoch_ns();
+                let days = ns.div_euclid(DAY_NS);
+                let t = ns_to_time(ns.rem_euclid(DAY_NS));
+                let (y, mo, d) = epoch_days_to_iso(days as i64);
+                self.make_plain_date_time([y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]])?
+            }
+            NOW_PLAINDATE_ISO => {
+                let ns = Self::now_epoch_ns();
+                let (y, mo, d) = epoch_days_to_iso(ns.div_euclid(DAY_NS) as i64);
+                self.make_plain_date(y, mo, d)?
+            }
+            NOW_PLAINTIME_ISO => {
+                let ns = Self::now_epoch_ns();
+                self.make_plain_time(ns_to_time(ns.rem_euclid(DAY_NS)))?
+            }
+            NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -10411,6 +10455,14 @@ impl<'p> Vm<'p> {
     }
 
     // ── Temporal.Instant ──
+
+    /// Current wall-clock time as nanoseconds since the Unix epoch.
+    fn now_epoch_ns() -> i128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i128)
+            .unwrap_or(0)
+    }
 
     fn make_instant(&mut self, ns: i128) -> Result<Value, Thrown> {
         if ns.abs() > 8_640_000_000_000_000_000_000 {
