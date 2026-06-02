@@ -667,7 +667,16 @@ impl<'p> Vm<'p> {
         Some(if key == "name" { self.alloc_str(nm) } else { Value::int(len) })
     }
 
+    #[inline]
     pub(crate) fn get_prop(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
+        self.get_member(obj, key, obj)
+    }
+
+    /// Property GET with an explicit `receiver` — the original object a lookup
+    /// started from. It equals `obj` at the top level; during prototype-chain
+    /// delegation `obj` advances up the chain while `receiver` stays the original,
+    /// so an INHERITED accessor's getter is invoked with the correct `this`.
+    pub(crate) fn get_member(&mut self, obj: Value, key: &str, receiver: Value) -> Result<Value, Thrown> {
         // Proxy `get` trap (or fall through to the target).
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
@@ -679,7 +688,7 @@ impl<'p> Vm<'p> {
                         let kv = self.key_to_value(key);
                         self.call_value(trap, handler, &[target, kv, obj])
                     }
-                    None => self.get_prop(target, key),
+                    None => self.get_member(target, key, receiver),
                 };
             }
         }
@@ -731,7 +740,7 @@ impl<'p> Vm<'p> {
                 return if raw == Value::UNDEFINED {
                     Ok(Value::UNDEFINED)
                 } else {
-                    self.call_value(raw, obj, &[])
+                    self.call_value(raw, receiver, &[])
                 };
             }
             return Ok(raw);
@@ -904,7 +913,7 @@ impl<'p> Vm<'p> {
                     return if raw == Value::UNDEFINED {
                         Ok(Value::UNDEFINED)
                     } else {
-                        self.call_value(raw, obj, &[])
+                        self.call_value(raw, receiver, &[])
                     };
                 }
                 return Ok(raw);
@@ -920,7 +929,7 @@ impl<'p> Vm<'p> {
         if let Some((a, raw)) = own {
             if a.accessor {
                 // `raw` is the getter (UNDEFINED ⇒ no getter ⇒ read is undefined).
-                return if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, obj, &[]) };
+                return if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, receiver, &[]) };
             }
             return Ok(raw);
         }
@@ -985,7 +994,7 @@ impl<'p> Vm<'p> {
                     return Ok(m);
                 }
                 if let Some(g) = getter {
-                    return self.call_value(g, obj, &[]);
+                    return self.call_value(g, receiver, &[]);
                 }
                 // Own + class miss: delegate up the prototype chain — an explicit
                 // `Object.create` proto, else a class instance's `C.prototype`
@@ -1001,7 +1010,7 @@ impl<'p> Vm<'p> {
                     None
                 };
                 match proto {
-                    Some(p) => self.get_prop(p, key),
+                    Some(p) => self.get_member(p, key, receiver),
                     None => Ok(Value::UNDEFINED),
                 }
             }

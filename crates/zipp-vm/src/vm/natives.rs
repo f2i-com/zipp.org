@@ -822,7 +822,17 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.get called on non-object".into()));
                 }
-                self.get_index(a0, a1)?
+                // Reflect.get(target, key, receiver?): an explicit receiver is the
+                // `this` for an accessor getter (else the target). Use the index
+                // path when there's no distinct receiver (it also reads array
+                // elements for numeric keys).
+                let receiver = args.get(2).copied().unwrap_or(a0);
+                if receiver == a0 {
+                    self.get_index(a0, a1)?
+                } else {
+                    let key = self.key_of(a1);
+                    self.get_member(a0, &key, receiver)?
+                }
             }
             REFLECT_SET => {
                 if !self.is_object_value(a0) {
