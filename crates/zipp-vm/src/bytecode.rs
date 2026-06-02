@@ -131,6 +131,10 @@ pub enum Instr {
     /// (`let {a, ...rest} = src`). The excluded keys are `string_constants
     /// [exclude_start .. exclude_start+exclude_count]` (the sibling properties).
     ObjectRest { dst: Reg, src: Reg, exclude_start: u32, exclude_count: u16 },
+    /// Like ObjectRest, but the excluded sibling keys are the `n` runtime values
+    /// in registers `keys_base..keys_base+n` (each ToPropertyKey-coerced) — used
+    /// when an object-rest pattern has a computed sibling key (`{[k]: a, ...r}`).
+    ObjectRestDyn { dst: Reg, src: Reg, keys_base: Reg, n: u16 },
     /// `dst = <the class value for classes[class_id]>` — materialize a class.
     /// `parent` is the register holding the superclass value (`extends P`), or
     /// `None`; the new class links to it for inherited lookup + instanceof.

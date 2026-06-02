@@ -683,6 +683,35 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::ObjectRestDyn { dst, src, keys_base, n } => {
+                        let s = self.get(base, src);
+                        // Resolve the excluded sibling keys (ToPropertyKey) from regs.
+                        let mut excluded: Vec<String> = Vec::with_capacity(n as usize);
+                        for i in 0..n {
+                            let kv = self.get(base, keys_base + i);
+                            excluded.push(self.to_property_key(kv)?);
+                        }
+                        let pairs: Vec<(String, Value)> = if s.is_heap() {
+                            match self.heap.get(s.heap_index()) {
+                                HeapObj::Object(map) => spec_key_order(&map.keys)
+                                    .into_iter()
+                                    .filter(|&i| map.attrs[i].enumerable)
+                                    .map(|i| (map.keys[i].clone(), map.vals[i]))
+                                    .filter(|(k, _)| !excluded.iter().any(|e| e == k))
+                                    .collect(),
+                                _ => Vec::new(),
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        let mut m = ObjMap::new();
+                        for (k, v) in pairs {
+                            m.set(&k, v);
+                        }
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::MakeClass { dst, class_id, parent } => {
                         let cd = self.program.classes[class_id as usize].clone();
                         let parent_idx = parent.and_then(|p| {

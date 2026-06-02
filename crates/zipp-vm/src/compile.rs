@@ -1253,6 +1253,50 @@ impl<'a> FnCompiler<'a> {
                 self.extract_pattern(&ap.left, src)
             }
             P::ObjectPattern(op) => {
+                // With a `...rest` AND a computed sibling key, the exclusion set
+                // isn't known until runtime: evaluate each sibling key once into a
+                // contiguous block (reused for extraction + ObjectRestDyn).
+                if op.rest.is_some() && op.properties.iter().any(|p| p.computed) {
+                    let block_save = self.next_reg;
+                    let keys_base = self.next_reg;
+                    let n = op.properties.len() as u16;
+                    for _ in 0..op.properties.len() {
+                        self.alloc_reg();
+                    }
+                    for (i, prop) in op.properties.iter().enumerate() {
+                        let kreg = keys_base + i as Reg;
+                        if prop.computed {
+                            let e = prop
+                                .key
+                                .as_expression()
+                                .ok_or("unsupported computed destructuring key")?;
+                            let v = self.expr_into(e, kreg)?;
+                            if v != kreg {
+                                self.emit(Instr::Move { dst: kreg, src: v });
+                            }
+                        } else {
+                            let name = class_key_name(&prop.key)?;
+                            let idx = self.add_string_const(&name);
+                            self.emit(Instr::LoadConst { dst: kreg, idx });
+                        }
+                    }
+                    for (i, prop) in op.properties.iter().enumerate() {
+                        let save = self.next_reg;
+                        let kreg = keys_base + i as Reg;
+                        let val = self.alloc_reg();
+                        self.emit(Instr::GetIndex { dst: val, obj: src, key: kreg });
+                        self.extract_pattern(&prop.value, val)?;
+                        self.next_reg = save;
+                    }
+                    let rest = op.rest.as_ref().unwrap();
+                    let save = self.next_reg;
+                    let val = self.alloc_reg();
+                    self.emit(Instr::ObjectRestDyn { dst: val, src, keys_base, n });
+                    self.extract_pattern(&rest.argument, val)?;
+                    self.next_reg = save;
+                    self.next_reg = block_save;
+                    return Ok(());
+                }
                 for prop in &op.properties {
                     let save = self.next_reg;
                     let val = self.alloc_reg();
@@ -3823,6 +3867,69 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn assign_object_target(&mut self, o: &ox::ObjectAssignmentTarget, src: Reg) -> R<()> {
+        // Computed sibling key + `...rest`: evaluate each sibling key once into a
+        // contiguous block (reused for extraction and the ObjectRestDyn exclusion).
+        let has_computed = o.rest.is_some()
+            && o.properties.iter().any(|p| {
+                matches!(p, ox::AssignmentTargetProperty::AssignmentTargetPropertyProperty(pp) if pp.computed)
+            });
+        if has_computed {
+            use ox::AssignmentTargetProperty as ATP;
+            let block_save = self.next_reg;
+            let keys_base = self.next_reg;
+            let n = o.properties.len() as u16;
+            for _ in 0..o.properties.len() {
+                self.alloc_reg();
+            }
+            for (i, prop) in o.properties.iter().enumerate() {
+                let kreg = keys_base + i as Reg;
+                match prop {
+                    ATP::AssignmentTargetPropertyProperty(p) if p.computed => {
+                        let e = p.name.as_expression().ok_or("unsupported computed destructuring key")?;
+                        let v = self.expr_into(e, kreg)?;
+                        if v != kreg {
+                            self.emit(Instr::Move { dst: kreg, src: v });
+                        }
+                    }
+                    ATP::AssignmentTargetPropertyProperty(p) => {
+                        let name = class_key_name(&p.name)?;
+                        let idx = self.add_string_const(&name);
+                        self.emit(Instr::LoadConst { dst: kreg, idx });
+                    }
+                    ATP::AssignmentTargetPropertyIdentifier(p) => {
+                        let idx = self.add_string_const(&p.binding.name);
+                        self.emit(Instr::LoadConst { dst: kreg, idx });
+                    }
+                }
+            }
+            for (i, prop) in o.properties.iter().enumerate() {
+                let save = self.next_reg;
+                let kreg = keys_base + i as Reg;
+                let val = self.alloc_reg();
+                self.emit(Instr::GetIndex { dst: val, obj: src, key: kreg });
+                match prop {
+                    ATP::AssignmentTargetPropertyIdentifier(p) => {
+                        if let Some(init) = &p.init {
+                            self.apply_default_in_place_named(val, init, Some(&p.binding.name))?;
+                        }
+                        let b = self.resolve(&p.binding.name);
+                        self.store_binding(&b, val);
+                    }
+                    ATP::AssignmentTargetPropertyProperty(p) => {
+                        self.assign_maybe_default(&p.binding, val)?;
+                    }
+                }
+                self.next_reg = save;
+            }
+            let rest = o.rest.as_ref().unwrap();
+            let save = self.next_reg;
+            let val = self.alloc_reg();
+            self.emit(Instr::ObjectRestDyn { dst: val, src, keys_base, n });
+            self.assign_target(&rest.target, val)?;
+            self.next_reg = save;
+            self.next_reg = block_save;
+            return Ok(());
+        }
         for prop in &o.properties {
             let save = self.next_reg;
             match prop {
