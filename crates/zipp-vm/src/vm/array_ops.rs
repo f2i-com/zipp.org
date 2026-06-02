@@ -287,11 +287,11 @@ impl<'p> Vm<'p> {
             }
             "at" => {
                 // Negative index counts from the end; out of range → undefined.
+                let i = self.to_integer_or_zero(arg0)?;
                 let len = match self.heap.get(idx) {
                     HeapObj::Array(items) => items.len(),
                     _ => 0,
                 };
-                let i = arg0.is_number().then(|| arg0.as_f64()).unwrap_or(0.0) as i64;
                 let abs = if i < 0 { i + len as i64 } else { i };
                 let v = if abs >= 0 && (abs as usize) < len {
                     match self.heap.get(idx) {
@@ -305,7 +305,15 @@ impl<'p> Vm<'p> {
             }
             "indexOf" => {
                 let snapshot = self.array_snapshot(idx);
-                let pos = snapshot.iter().position(|v| self.values_strict_eq(*v, arg0));
+                let len = snapshot.len() as i64;
+                // Optional fromIndex (ToInteger; negative counts from the end).
+                let from = if args.len() >= 2 {
+                    let f = self.to_integer_or_zero(args[1])?;
+                    if f < 0 { (len + f).max(0) } else { f.min(len) }
+                } else {
+                    0
+                } as usize;
+                let pos = (from..snapshot.len()).find(|&i| self.values_strict_eq(snapshot[i], arg0));
                 Ok(Some(Value::int(pos.map(|p| p as i32).unwrap_or(-1))))
             }
             "includes" => {
@@ -315,8 +323,26 @@ impl<'p> Vm<'p> {
             }
             "lastIndexOf" => {
                 let snapshot = self.array_snapshot(idx);
-                let pos = snapshot.iter().rposition(|v| self.values_strict_eq(*v, arg0));
-                Ok(Some(Value::int(pos.map(|p| p as i32).unwrap_or(-1))))
+                let len = snapshot.len() as i64;
+                // fromIndex defaults to len-1 (search from the end); negative
+                // counts from the end. ToInteger.
+                let from = if args.len() >= 2 {
+                    let f = self.to_integer_or_zero(args[1])?;
+                    if f < 0 { len + f } else { f.min(len - 1) }
+                } else {
+                    len - 1
+                };
+                let mut result = -1i32;
+                if from >= 0 && !snapshot.is_empty() {
+                    let hi = (from as usize).min(snapshot.len() - 1);
+                    for i in (0..=hi).rev() {
+                        if self.values_strict_eq(snapshot[i], arg0) {
+                            result = i as i32;
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Value::int(result)))
             }
             "reverse" => {
                 if let HeapObj::Array(items) = self.heap.get_mut(idx) {
@@ -340,13 +366,12 @@ impl<'p> Vm<'p> {
                 let depth = if args.is_empty() {
                     1
                 } else {
-                    let d = arg0.as_f64();
-                    if d.is_infinite() && d > 0.0 {
-                        i32::MAX
-                    } else if d.is_finite() && d >= 0.0 {
-                        d as i32
-                    } else {
+                    // ToInteger (Infinity saturates to i64::MAX -> deep flatten).
+                    let n = self.to_integer_or_zero(arg0)?;
+                    if n < 0 {
                         0
+                    } else {
+                        n.min(i32::MAX as i64) as i32
                     }
                 };
                 let snapshot = self.array_snapshot(idx);
@@ -359,23 +384,27 @@ impl<'p> Vm<'p> {
                     HeapObj::Array(items) => items.len() as i32,
                     _ => 0,
                 };
-                let start = norm_index(if args.len() >= 2 { args[1].as_f64() as i32 } else { 0 }, len);
-                let end = norm_index(if args.len() >= 3 { args[2].as_f64() as i32 } else { len }, len);
+                let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
+                let e0 = if args.len() >= 3 { self.to_integer_or_zero(args[2])? } else { len as i64 };
+                let start = norm_index(s0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
+                let end = norm_index(e0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
                 if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    for i in start..end {
+                    let n = items.len() as i32; // re-clamp (a coercion valueOf may have resized)
+                    for i in start..end.min(n) {
                         items[i as usize] = val;
                     }
                 }
                 Ok(Some(Value::heap(idx)))
             }
             "slice" => {
+                let s0 = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)? };
+                let e0 = if args.len() < 2 { None } else { Some(self.to_integer_or_zero(args[1])?) };
                 let snapshot = self.array_snapshot(idx);
                 let len = snapshot.len() as i32;
-                let start = norm_index(if args.is_empty() { 0 } else { arg0.as_f64() as i32 }, len);
-                let end = if args.len() < 2 {
-                    len
-                } else {
-                    norm_index(args[1].as_f64() as i32, len)
+                let start = norm_index(s0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
+                let end = match e0 {
+                    None => len,
+                    Some(e) => norm_index(e.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len),
                 };
                 let slice: Vec<Value> = if start < end {
                     snapshot[start as usize..end as usize].to_vec()
@@ -629,17 +658,26 @@ impl<'p> Vm<'p> {
                     HeapObj::Array(items) => items.len(),
                     _ => 0,
                 };
-                let s = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
+                let s = self.to_integer_or_zero(arg0)?;
                 let start = if s < 0 { (len as i64 + s).max(0) as usize } else { (s as usize).min(len) };
-                let del = if args.len() < 2 {
+                // deleteCount: 0 args → 0; 1 arg → len-start; else ToInteger(arg1).
+                let del = if args.is_empty() {
+                    0
+                } else if args.len() < 2 {
                     len - start
                 } else {
-                    let d = if args[1].is_number() { args[1].as_f64() as i64 } else { 0 };
+                    let d = self.to_integer_or_zero(args[1])?;
                     (d.max(0) as usize).min(len - start)
                 };
                 let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
                 let removed: Vec<Value> = match self.heap.get_mut(idx) {
-                    HeapObj::Array(items) => items.splice(start..start + del, insert).collect(),
+                    HeapObj::Array(items) => {
+                        // Re-clamp to the current length (a coercion valueOf may have resized).
+                        let n = items.len();
+                        let st = start.min(n);
+                        let en = (start + del).min(n);
+                        items.splice(st..en, insert).collect()
+                    }
                     _ => Vec::new(),
                 };
                 self.heap.bump_version(idx); // length/contents changed
@@ -727,9 +765,13 @@ impl<'p> Vm<'p> {
                     HeapObj::Array(items) => items.len() as i32,
                     _ => 0,
                 };
-                let target = norm_index(if arg0.is_number() { arg0.as_f64() as i32 } else { 0 }, len);
-                let start = norm_index(if args.len() >= 2 && args[1].is_number() { args[1].as_f64() as i32 } else { 0 }, len);
-                let end = norm_index(if args.len() >= 3 && args[2].is_number() { args[2].as_f64() as i32 } else { len }, len);
+                let i32c = |n: i64| n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                let t0 = self.to_integer_or_zero(arg0)?;
+                let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
+                let e0 = if args.len() >= 3 { self.to_integer_or_zero(args[2])? } else { len as i64 };
+                let target = norm_index(i32c(t0), len);
+                let start = norm_index(i32c(s0), len);
+                let end = norm_index(i32c(e0), len);
                 let count = (end - start).min(len - target).max(0);
                 if count > 0 {
                     let snapshot = self.array_snapshot(idx);
