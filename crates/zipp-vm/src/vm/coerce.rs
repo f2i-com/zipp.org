@@ -75,7 +75,14 @@ impl<'p> Vm<'p> {
     /// Whether `v` is a JS Object (Type(v) === Object): a heap value that is not a
     /// primitive string (`Str`/`Cons`). Used by Reflect, which throws on non-objects.
     pub(crate) fn is_object_value(&self, v: Value) -> bool {
-        v.is_heap() && !self.heap.is_str_like(v.heap_index())
+        // Symbol and BigInt are heap-allocated but are primitives, not objects
+        // (typeof is "symbol"/"bigint"), so they must not count here.
+        v.is_heap()
+            && !self.heap.is_str_like(v.heap_index())
+            && !matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+            )
     }
 
     /// `ToObject(v)` — backs `Object(x)` / `new Object(x)`. Primitives box into

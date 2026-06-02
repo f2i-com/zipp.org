@@ -1568,16 +1568,33 @@ impl<'p> Vm<'p> {
     /// Resolve a time-zone argument (a string id, or an object with a `timeZone`
     /// property) into a (normalized id, offset-ns) pair.
     pub(crate) fn parse_tz_arg(&mut self, v: Value) -> Result<(String, i64), Thrown> {
-        let s = if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
-            let tz = self.get_prop(v, "timeZone")?;
-            if tz == Value::UNDEFINED {
+        // A `{ timeZone }` bag yields its timeZone field; otherwise the value is
+        // itself the time-zone-like.
+        let tz = if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            let t = self.get_prop(v, "timeZone")?;
+            if t == Value::UNDEFINED {
                 return Err(Thrown("TypeError: a timeZone is required".into()));
             }
-            self.to_js_string(tz)?
+            t
         } else {
-            self.to_js_string(v)?
+            v
         };
-        parse_time_zone(&s).ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{s}\"")))
+        // ToTemporalTimeZoneIdentifier: a ZonedDateTime carries its zone, a string
+        // is parsed; anything else (incl. undefined and plain objects) is a
+        // TypeError.
+        if tz.is_heap() {
+            if let HeapObj::Temporal { kind: 7, .. } = self.heap.get(tz.heap_index()) {
+                let id = self.zdt_tz_id(tz.heap_index()).unwrap_or_else(|| "UTC".to_string());
+                return parse_time_zone(&id)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{id}\"")));
+            }
+            if self.heap.is_str_like(tz.heap_index()) {
+                let s = self.heap.str_cow(tz.heap_index()).unwrap().into_owned();
+                return parse_time_zone(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{s}\"")));
+            }
+        }
+        Err(Thrown("TypeError: timeZone is not a string or object".into()))
     }
 
     /// Parse a `relativeTo` option into a date-time [y,mo,d,h,…] anchor (a
