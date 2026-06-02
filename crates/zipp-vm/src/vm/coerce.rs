@@ -437,6 +437,11 @@ impl<'p> Vm<'p> {
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() < vb.as_int());
         }
+        // Abstract relational comparison: ToPrimitive (number hint) both operands
+        // first (`[2] < 10`, `{valueOf(){return 5}} < 10`), then compare two
+        // strings lexicographically, else numerically.
+        let va = self.to_primitive_default(va)?;
+        let vb = self.to_primitive_default(vb)?;
         if let Some(o) = self.str_relational(va, vb) {
             return Ok(o.is_lt());
         }
@@ -449,6 +454,8 @@ impl<'p> Vm<'p> {
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() <= vb.as_int());
         }
+        let va = self.to_primitive_default(va)?;
+        let vb = self.to_primitive_default(vb)?;
         if let Some(o) = self.str_relational(va, vb) {
             return Ok(o.is_le());
         }
