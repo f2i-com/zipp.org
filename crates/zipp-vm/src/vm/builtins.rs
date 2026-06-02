@@ -666,7 +666,7 @@ impl<'p> Vm<'p> {
                     (n as u64).to_le_bytes()
                 }
             } else {
-                let f = self.to_number(v)?;
+                let f = self.to_number_coerce(v)?;
                 ta_encode(kind, f)
             };
             if !little_endian {

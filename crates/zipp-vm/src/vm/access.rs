@@ -148,7 +148,11 @@ impl<'p> Vm<'p> {
         }
         // `re.lastIndex = n` — the only writable own property of a RegExp.
         if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
-            let n = self.to_number(val)?;
+            // NOTE: `lastIndex` is a plain data property; ToLength is applied when
+            // `exec` reads it, not on assignment, so we must NOT run user coercion
+            // (valueOf/toString) here. A non-numeric assignment is stored as 0
+            // (an engine simplification — the slot is a usize).
+            let n = self.to_number(val).unwrap_or(f64::NAN);
             let li = if n.is_finite() && n >= 0.0 { n as usize } else { 0 };
             self.set_regexp_last_index(idx, li);
             return Ok(());
@@ -157,7 +161,7 @@ impl<'p> Vm<'p> {
         // dense array — a very common idiom (`arr.length = 0` clears it). Per JS,
         // n must be a non-negative integer < 2^32, else a RangeError.
         if key == "length" && matches!(self.heap.get(idx), HeapObj::Array(_)) {
-            let n = self.to_number(val)?;
+            let n = self.to_number_coerce(val)?;
             if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
                 return Err(Thrown("RangeError: Invalid array length".into()));
             }

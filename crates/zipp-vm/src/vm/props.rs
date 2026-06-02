@@ -416,7 +416,7 @@ impl<'p> Vm<'p> {
             if key == "length" {
                 let (value, ..) = self.read_descriptor(desc)?;
                 if let Some(v) = value {
-                    let n = self.to_number(v)?;
+                    let n = self.to_number_coerce(v)?;
                     if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }

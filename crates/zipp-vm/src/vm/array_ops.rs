@@ -751,7 +751,7 @@ impl<'p> Vm<'p> {
                 // index throws a RangeError.
                 let mut out = self.array_snapshot(idx);
                 let len = out.len() as i64;
-                let n = self.to_number(arg0)?;
+                let n = self.to_number_coerce(arg0)?;
                 let rel = if n.is_nan() { 0 } else { n.trunc() as i64 };
                 let actual = if rel >= 0 { rel } else { len + rel };
                 if actual < 0 || actual >= len {
