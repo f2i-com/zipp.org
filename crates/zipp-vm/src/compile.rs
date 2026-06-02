@@ -1482,7 +1482,8 @@ impl<'a> FnCompiler<'a> {
     /// `cls`: evaluate `extends`, `MakeClass`, then install static fields and
     /// computed-key members. Shared by class declarations and class expressions.
     fn build_class_into(&mut self, class: &ox::Class, cls: Reg, name: Option<&str>) -> R<()> {
-        let (class_id, static_fields, computed, computed_fields) = self.compile_class(class, name)?;
+        let (class_id, static_fields, computed, computed_fields, static_block_fns) =
+            self.compile_class(class, name)?;
         // Evaluate the superclass value (`extends P`) into a temp the VM links in.
         let parent_reg = if let Some(sc) = &class.super_class {
             let t = self.temp();
@@ -1542,6 +1543,20 @@ impl<'a> FnCompiler<'a> {
             }
             self.next_reg = save;
         }
+        // `static { … }` blocks: run each thunk with `this` = the class, in source
+        // order, after the static fields. Invoked as `thunk.call(cls)` so the
+        // existing call machinery binds `this` — no new opcode needed.
+        for &fid in &static_block_fns {
+            let save = self.next_reg;
+            let f = self.temp();
+            self.emit(Instr::MakeFunc { dst: f, func_id: fid });
+            let argb = self.temp();
+            self.emit(Instr::Move { dst: argb, src: cls });
+            let trash = self.temp();
+            let call_idx = self.string_name("call");
+            self.emit(Instr::CallMethod { dst: trash, obj: f, name: call_idx, arg_base: argb, argc: 1 });
+            self.next_reg = save;
+        }
         Ok(())
     }
 
@@ -1568,6 +1583,7 @@ impl<'a> FnCompiler<'a> {
         Vec<(String, Option<&'b ox::Expression<'b>>)>,
         Vec<(&'b ox::Expression<'b>, u32, u8)>,
         Vec<(&'b ox::Expression<'b>, Option<&'b ox::Expression<'b>>, bool)>,
+        Vec<u32>,
     )> {
         // A named class expression keeps its own name; an anonymous one inherits
         // the binding it's assigned to (NamedEvaluation), else the "<class>" stub.
@@ -1615,6 +1631,9 @@ impl<'a> FnCompiler<'a> {
         let mut static_setters: Vec<(String, &ox::Function)> = Vec::new();
         let mut fields: Vec<(String, Option<&ox::Expression>)> = Vec::new();
         let mut static_fields: Vec<(String, Option<&'b ox::Expression<'b>>)> = Vec::new();
+        // `static { … }` initializer blocks, in source order. Each is compiled to a
+        // thunk and run once at class definition time with `this` = the class.
+        let mut static_blocks: Vec<&'b [ox::Statement<'b>]> = Vec::new();
         // Computed-key fields (`[expr] = v` / `static [expr] = v`). Their KEYS are
         // evaluated once at class definition (in source order, see class_decl);
         // `computed_fields_ordered` drives that. Instance ones also need their init
@@ -1688,8 +1707,8 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                 }
-                ox::ClassElement::StaticBlock(_) => {
-                    return Err("static blocks are not in the zipp-vm subset yet".into());
+                ox::ClassElement::StaticBlock(b) => {
+                    static_blocks.push(&b.body);
                 }
                 _ => return Err("unsupported class member in the zipp-vm subset".into()),
             }
@@ -1890,6 +1909,27 @@ impl<'a> FnCompiler<'a> {
             self.cx.functions.push(proto);
             computed_defs.push((key, fid, *kind));
         }
+        // `static { … }` blocks: each body compiles to a zero-arg thunk (like a
+        // method, so `this`/`super` and arguments work) that class_decl runs once
+        // with `this` = the class.
+        let mut static_block_fns: Vec<u32> = Vec::new();
+        for body in &static_blocks {
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.<static_block>"),
+                &[],
+                None,
+                None,
+                &[],
+                &[],
+                body,
+                None, // static context: `super` is the parent class (as for static methods, not modelled)
+                false,
+                false,
+            )?;
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            static_block_fns.push(fid);
+        }
         self.cx.classes[class_id as usize] = ClassDef {
             name: cname,
             ctor,
@@ -1902,7 +1942,7 @@ impl<'a> FnCompiler<'a> {
             static_setters: static_setter_defs,
             source: self.cx.src_slice(class.span.start, class.span.end),
         };
-        Ok((class_id, static_fields, computed_defs, computed_fields_ordered))
+        Ok((class_id, static_fields, computed_defs, computed_fields_ordered, static_block_fns))
     }
 
     /// The enclosing-function chain to hand a function nested in THIS one: our
