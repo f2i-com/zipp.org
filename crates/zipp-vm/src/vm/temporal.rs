@@ -1588,6 +1588,40 @@ impl<'p> Vm<'p> {
         self.to_plain_date_time(rel)
     }
 
+    /// `Temporal.Duration.compare(one, two, { relativeTo })`. With a relativeTo
+    /// anchor both durations are added to it and their resulting instants are
+    /// compared (correct for years/months/weeks). Without one, calendar units
+    /// are a RangeError and the remaining day+time span is compared directly.
+    pub(crate) fn duration_compare(
+        &mut self,
+        fa: [i64; 10],
+        fb: [i64; 10],
+        opts: Value,
+    ) -> Result<f64, Thrown> {
+        let rel = if opts == Value::UNDEFINED {
+            Value::UNDEFINED
+        } else {
+            self.get_prop(opts, "relativeTo")?
+        };
+        let order = |a: i128, b: i128| if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 };
+        if rel != Value::UNDEFINED {
+            let start = self.relative_to_dt(rel)?;
+            let e1 = dt_epoch_ns(dt_add_dur(start, fa));
+            let e2 = dt_epoch_ns(dt_add_dur(start, fb));
+            return Ok(order(e1, e2));
+        }
+        if fa[..3].iter().any(|&x| x != 0) || fb[..3].iter().any(|&x| x != 0) {
+            return Err(Thrown(
+                "RangeError: a relativeTo option is required for years, months, or weeks".into(),
+            ));
+        }
+        let tot = |f: &[i64; 10]| -> i128 {
+            (f[3] as i128) * DAY_NS
+                + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]])
+        };
+        Ok(order(tot(&fa), tot(&fb)))
+    }
+
     /// The time-zone id string of a ZDT instance (for equality).
     fn zdt_tz_id(&self, idx: u32) -> Option<String> {
         self.zdt_tz

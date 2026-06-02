@@ -1481,18 +1481,8 @@ impl<'p> Vm<'p> {
             TEMPORAL_DURATION_COMPARE => {
                 let fa = self.to_duration(a0)?;
                 let fb = self.to_duration(a1)?;
-                // Approximate total (24h days, 7-day weeks; y/mo need relativeTo).
-                let tot = |f: &[i64; 10]| -> i128 {
-                    ((f[2] * 7 + f[3]) as i128) * 86_400_000_000_000
-                        + (f[4] as i128) * 3_600_000_000_000
-                        + (f[5] as i128) * 60_000_000_000
-                        + (f[6] as i128) * 1_000_000_000
-                        + (f[7] as i128) * 1_000_000
-                        + (f[8] as i128) * 1_000
-                        + (f[9] as i128)
-                };
-                let (a, b) = (tot(&fa), tot(&fb));
-                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+                let opts = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                Value::num(self.duration_compare(fa, fb, opts)?)
             }
             _ if (PD_M_BASE..PD_M_BASE + PLAINDATE_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINDATE_METHODS[(id - PD_M_BASE) as usize];
