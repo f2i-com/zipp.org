@@ -34,10 +34,20 @@ impl<'p> Vm<'p> {
         if let Some(&p) = self.prototypes.get(&idx) {
             return Some(Value::heap(p));
         }
-        // Collect own methods first (ends the immutable heap borrow before alloc).
-        let methods: Vec<(String, Value)> = match self.heap.get(idx) {
-            HeapObj::Class(c) => c.methods.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-            _ => Vec::new(),
+        // Collect own methods + accessors first (ends the immutable heap borrow
+        // before alloc).
+        #[allow(clippy::type_complexity)]
+        let (methods, getters, setters): (
+            Vec<(String, Value)>,
+            Vec<(String, Value)>,
+            Vec<(String, Value)>,
+        ) = match self.heap.get(idx) {
+            HeapObj::Class(c) => (
+                c.methods.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                c.getters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                c.setters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            ),
+            _ => (Vec::new(), Vec::new(), Vec::new()),
         };
         // Methods and the constructor back-reference are NON-enumerable
         // (writable + configurable), matching ES `class`/function semantics that
@@ -47,6 +57,25 @@ impl<'p> Vm<'p> {
         let mut map = ObjMap::new();
         for (k, v) in &methods {
             map.define(k, *v, nonenum);
+        }
+        // Accessors become real accessor properties (getter in `vals`, setter in
+        // `attr.setter`) so getOwnPropertyDescriptor / getOwnPropertyNames /
+        // enumeration reflect them; non-enumerable + configurable per spec. A
+        // get+set pair on one key merges into a single accessor property.
+        let acc_attr =
+            PropAttr { writable: false, enumerable: false, configurable: true, accessor: true, setter: Value::UNDEFINED };
+        for (k, g) in &getters {
+            map.define(k, *g, acc_attr);
+        }
+        for (k, s) in &setters {
+            if let Some(i) = map.pos(k) {
+                map.attrs[i].accessor = true;
+                map.attrs[i].setter = *s;
+            } else {
+                let mut a = acc_attr;
+                a.setter = *s;
+                map.define(k, Value::UNDEFINED, a);
+            }
         }
         map.define("constructor", obj, nonenum);
         let p = self.heap.alloc(HeapObj::Object(map));
