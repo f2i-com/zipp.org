@@ -60,6 +60,7 @@ pub const REGEXP_GET_UNICODE: u16 = 637;
 pub const REGEXP_GET_UNICODESETS: u16 = 638;
 pub const REGEXP_GET_STICKY: u16 = 639;
 pub const REGEXP_GET_HASINDICES: u16 = 640;
+pub const REGEXP_SYM_MATCHALL: u16 = 641;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -387,6 +388,7 @@ pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
     ("normalize", 1, 0), ("isWellFormed", 1, 0), ("toWellFormed", 1, 0),
     ("valueOf", 1, 0), ("toString", 1, 0), ("lastIndexOf", 1, 1),
     ("toLocaleLowerCase", 1, 0), ("toLocaleUpperCase", 1, 0),
+    ("match", 1, 1), ("matchAll", 1, 1), ("search", 1, 1),
     // Annex B HTML wrapper methods.
     ("anchor", 1, 1), ("big", 1, 0), ("blink", 1, 0), ("bold", 1, 0), ("fixed", 1, 0),
     ("fontcolor", 1, 1), ("fontsize", 1, 1), ("italics", 1, 0), ("link", 1, 1),
@@ -492,6 +494,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         REGEXP_GET_UNICODESETS => ("get unicodeSets", 0),
         REGEXP_GET_STICKY => ("get sticky", 0),
         REGEXP_GET_HASINDICES => ("get hasIndices", 0),
+        REGEXP_SYM_MATCHALL => ("[Symbol.matchAll]", 1),
         FN_CALL => ("call", 1),
         FN_APPLY => ("apply", 2),
         FN_BIND => ("bind", 1),

@@ -170,6 +170,33 @@ impl<'p> Vm<'p> {
                     Ok(Some(r))
                 }
             }
+            "matchAll" => {
+                let regexp = arg0;
+                let s_val = Value::heap(idx);
+                let nullish = regexp == Value::NULL || regexp == Value::UNDEFINED;
+                if !nullish {
+                    // A real RegExp argument must be global (spec: IsRegExp +
+                    // RequireObjectCoercible(flags) + 'g' check).
+                    if self.as_regexp(regexp).is_some() {
+                        let flags_v = self.get_prop(regexp, "flags")?;
+                        let flags = self.to_js_string(flags_v)?;
+                        if !flags.contains('g') {
+                            return Err(Thrown(
+                                "TypeError: String.prototype.matchAll called with a non-global RegExp argument".into(),
+                            ));
+                        }
+                    }
+                    let matcher = self.get_prop(regexp, "@@matchAll")?;
+                    if matcher != Value::UNDEFINED && matcher != Value::NULL {
+                        return Ok(Some(self.call_value(matcher, regexp, &[s_val])?));
+                    }
+                }
+                // Otherwise build a fresh global RegExp and use its @@matchAll.
+                let gflag = self.alloc_str("g".to_string());
+                let rx = self.build_regexp(regexp, gflag)?;
+                let matcher = self.get_prop(rx, "@@matchAll")?;
+                Ok(Some(self.call_value(matcher, rx, &[s_val])?))
+            }
             "split" if self.as_regexp(arg0).is_some() => {
                 let re = self.as_regexp(arg0).unwrap();
                 let limit = match args.get(1) {

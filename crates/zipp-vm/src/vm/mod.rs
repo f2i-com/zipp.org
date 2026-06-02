@@ -210,6 +210,9 @@ pub struct Vm<'p> {
     /// `RegExp.prototype` and the `RegExp` constructor object. 0 until setup.
     regexp_proto: u32,
     regexp_ctor: u32,
+    /// `%RegExpStringIteratorPrototype%` — the prototype of the iterator returned
+    /// by `RegExp.prototype[Symbol.matchAll]` / `String.prototype.matchAll`.
+    regexp_string_iter_proto: u32,
     /// Extra own properties of a regex match-result Array (`.index`, `.input`,
     /// `.groups`), keyed by the result array's heap index — our `Array` is a plain
     /// `Vec` with no slot for named properties, so they live in this side table

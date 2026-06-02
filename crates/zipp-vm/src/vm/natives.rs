@@ -356,6 +356,59 @@ impl<'p> Vm<'p> {
                 }
                 self.alloc_str(out)
             }
+            REGEXP_SYM_MATCHALL => {
+                // RegExp.prototype[Symbol.matchAll](string): an iterator over all
+                // matches. Eagerly computed (no user-overridable exec).
+                if !this.is_heap() {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object".into(),
+                    ));
+                }
+                let s = self.to_js_string(a0)?;
+                let s_val = self.alloc_str(s.clone());
+                let flags_v = self.get_prop(this, "flags")?;
+                let flags = self.to_js_string(flags_v)?;
+                let global = flags.contains('g');
+                // Clone the regex so iteration doesn't disturb the receiver.
+                let matcher = self.build_regexp(this, flags_v)?;
+                let matcher_idx = matcher.heap_index();
+                let li = self.get_prop(this, "lastIndex")?;
+                let li = self.to_number(li)?;
+                let li = if li.is_finite() && li > 0.0 { li as usize } else { 0 };
+                self.set_regexp_last_index(matcher_idx, li);
+                let mut items: Vec<Value> = Vec::new();
+                let mut guard = 0u32;
+                loop {
+                    guard += 1;
+                    if guard > 1_000_000 {
+                        break;
+                    }
+                    let r = self.regexp_exec(matcher_idx, s_val)?;
+                    if r == Value::NULL {
+                        break;
+                    }
+                    items.push(r);
+                    if !global {
+                        break;
+                    }
+                    // Empty match: advance one char so the loop terminates.
+                    let empty = matches!(
+                        self.heap.get(r.heap_index()),
+                        HeapObj::Array(a) if a.first().is_some_and(|v| {
+                            matches!(self.heap.get(v.heap_index()), HeapObj::Str(s) if s.char_len == 0)
+                        })
+                    );
+                    if empty {
+                        let cur = match self.heap.get(matcher_idx) {
+                            HeapObj::RegExp { last_index, .. } => *last_index,
+                            _ => 0,
+                        };
+                        self.set_regexp_last_index(matcher_idx, cur + 1);
+                    }
+                }
+                let proto = self.regexp_string_iter_proto;
+                Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto }))
+            }
             REGEXP_GET_GLOBAL
             | REGEXP_GET_IGNORECASE
             | REGEXP_GET_MULTILINE

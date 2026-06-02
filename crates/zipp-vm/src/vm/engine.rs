@@ -77,6 +77,7 @@ impl<'p> Vm<'p> {
             bigint_ctor: 0,
             regexp_proto: 0,
             regexp_ctor: 0,
+            regexp_string_iter_proto: 0,
             regexp_match_extras: std::collections::HashMap::new(),
             ta_base_ctor: 0,
             ta_base_proto: 0,

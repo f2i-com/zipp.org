@@ -606,6 +606,29 @@ impl<'p> Vm<'p> {
                     p.define(name, gv, acc);
                 }
             }
+            // %RegExpStringIteratorPrototype% — inherits %Iterator.prototype%,
+            // carries the "RegExp String Iterator" toStringTag.
+            let rsi_proto =
+                build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+            let iter_root = self.iterator_proto_root;
+            self.proto_of.insert(rsi_proto, Value::heap(iter_root));
+            let tag = self.alloc_str("RegExp String Iterator".to_string());
+            let tag_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            if let HeapObj::Object(p) = self.heap.get_mut(rsi_proto) {
+                p.define("@@toStringTag", tag, tag_attr);
+            }
+            self.regexp_string_iter_proto = rsi_proto;
+            // RegExp.prototype[Symbol.matchAll].
+            let mav = Value::heap(self.heap.alloc(HeapObj::Native(REGEXP_SYM_MATCHALL)));
+            if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
+                p.define("@@matchAll", mav, method_attr);
+            }
             let regexp_ctor = build(self, &[("escape", REGEXP_ESCAPE)], Some(regexp_proto));
             self.regexp_ctor = regexp_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
