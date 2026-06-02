@@ -61,6 +61,9 @@ pub const REGEXP_GET_UNICODESETS: u16 = 638;
 pub const REGEXP_GET_STICKY: u16 = 639;
 pub const REGEXP_GET_HASINDICES: u16 = 640;
 pub const REGEXP_SYM_MATCHALL: u16 = 641;
+pub const REGEXP_SYM_SEARCH: u16 = 642;
+pub const REGEXP_SYM_MATCH: u16 = 643;
+pub const REGEXP_SYM_SPLIT: u16 = 644;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -495,6 +498,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         REGEXP_GET_STICKY => ("get sticky", 0),
         REGEXP_GET_HASINDICES => ("get hasIndices", 0),
         REGEXP_SYM_MATCHALL => ("[Symbol.matchAll]", 1),
+        REGEXP_SYM_SEARCH => ("[Symbol.search]", 1),
+        REGEXP_SYM_MATCH => ("[Symbol.match]", 1),
+        REGEXP_SYM_SPLIT => ("[Symbol.split]", 2),
         FN_CALL => ("call", 1),
         FN_APPLY => ("apply", 2),
         FN_BIND => ("bind", 1),

@@ -139,36 +139,11 @@ impl<'p> Vm<'p> {
             }
             "search" => {
                 let re = self.to_regexp_arg(arg0)?;
-                let found = match self.heap.get(re) {
-                    HeapObj::RegExp { regex, .. } => regex.find(&s),
-                    _ => None,
-                };
-                Ok(Some(match found {
-                    Some(m) => Value::num(byte_to_char(&s, m.start()) as f64),
-                    None => Value::int(-1),
-                }))
+                Ok(Some(self.regexp_search_impl(re, Value::heap(idx))?))
             }
             "match" => {
                 let re = self.to_regexp_arg(arg0)?;
-                let global =
-                    matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
-                if global {
-                    let strs: Vec<String> = match self.heap.get(re) {
-                        HeapObj::RegExp { regex, .. } => {
-                            regex.find_iter(&s).map(|m| s[m.range()].to_string()).collect()
-                        }
-                        _ => Vec::new(),
-                    };
-                    self.set_regexp_last_index(re, 0);
-                    if strs.is_empty() {
-                        return Ok(Some(Value::NULL));
-                    }
-                    let elems: Vec<Value> = strs.into_iter().map(|m| self.alloc_str(m)).collect();
-                    Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(elems)))))
-                } else {
-                    let r = self.regexp_exec(re, Value::heap(idx))?;
-                    Ok(Some(r))
-                }
+                Ok(Some(self.regexp_match_impl(re, Value::heap(idx))?))
             }
             "matchAll" => {
                 let regexp = arg0;
@@ -199,32 +174,8 @@ impl<'p> Vm<'p> {
             }
             "split" if self.as_regexp(arg0).is_some() => {
                 let re = self.as_regexp(arg0).unwrap();
-                let limit = match args.get(1) {
-                    Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
-                    _ => usize::MAX,
-                };
-                let spans: Vec<(usize, usize)> = match self.heap.get(re) {
-                    HeapObj::RegExp { regex, .. } => {
-                        regex.find_iter(&s).map(|m| (m.start(), m.end())).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                let mut parts: Vec<Value> = Vec::new();
-                let mut last = 0usize;
-                for (st, en) in spans {
-                    if parts.len() >= limit {
-                        break;
-                    }
-                    if st < last || (st == en && st == last) {
-                        continue; // skip overlapping / empty-at-cursor matches
-                    }
-                    parts.push(self.alloc_str(s[last..st].to_string()));
-                    last = en;
-                }
-                if parts.len() < limit {
-                    parts.push(self.alloc_str(s[last..].to_string()));
-                }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(parts)))))
+                let limit = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                Ok(Some(self.regexp_split_impl(re, Value::heap(idx), limit)?))
             }
             "replace" if self.as_regexp(arg0).is_some() => {
                 let re = self.as_regexp(arg0).unwrap();

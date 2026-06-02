@@ -356,6 +356,33 @@ impl<'p> Vm<'p> {
                 }
                 self.alloc_str(out)
             }
+            REGEXP_SYM_SEARCH => {
+                if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. })
+                {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype[Symbol.search] called on a non-RegExp".into(),
+                    ));
+                }
+                self.regexp_search_impl(this.heap_index(), a0)?
+            }
+            REGEXP_SYM_MATCH => {
+                if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. })
+                {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype[Symbol.match] called on a non-RegExp".into(),
+                    ));
+                }
+                self.regexp_match_impl(this.heap_index(), a0)?
+            }
+            REGEXP_SYM_SPLIT => {
+                if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. })
+                {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype[Symbol.split] called on a non-RegExp".into(),
+                    ));
+                }
+                self.regexp_split_impl(this.heap_index(), a0, a1)?
+            }
             REGEXP_SYM_MATCHALL => {
                 // RegExp.prototype[Symbol.matchAll](string): an iterator over all
                 // matches. Eagerly computed (no user-overridable exec).

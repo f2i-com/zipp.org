@@ -624,10 +624,17 @@ impl<'p> Vm<'p> {
                 p.define("@@toStringTag", tag, tag_attr);
             }
             self.regexp_string_iter_proto = rsi_proto;
-            // RegExp.prototype[Symbol.matchAll].
-            let mav = Value::heap(self.heap.alloc(HeapObj::Native(REGEXP_SYM_MATCHALL)));
-            if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
-                p.define("@@matchAll", mav, method_attr);
+            // RegExp.prototype Symbol methods.
+            for (key, nid) in [
+                ("@@matchAll", REGEXP_SYM_MATCHALL),
+                ("@@search", REGEXP_SYM_SEARCH),
+                ("@@match", REGEXP_SYM_MATCH),
+                ("@@split", REGEXP_SYM_SPLIT),
+            ] {
+                let mv = Value::heap(self.heap.alloc(HeapObj::Native(nid)));
+                if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
+                    p.define(key, mv, method_attr);
+                }
             }
             let regexp_ctor = build(self, &[("escape", REGEXP_ESCAPE)], Some(regexp_proto));
             self.regexp_ctor = regexp_ctor;

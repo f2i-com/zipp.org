@@ -192,6 +192,97 @@ impl<'p> Vm<'p> {
         out
     }
 
+    /// RegExp.prototype[Symbol.search] core: reset lastIndex to 0, exec, restore
+    /// lastIndex, return the match index or -1. Shared by String.prototype.search.
+    pub(crate) fn regexp_search_impl(&mut self, re: u32, input: Value) -> Result<Value, Thrown> {
+        let prev = match self.heap.get(re) {
+            HeapObj::RegExp { last_index, .. } => *last_index,
+            _ => {
+                return Err(Thrown(
+                    "TypeError: RegExp.prototype[Symbol.search] called on a non-RegExp".into(),
+                ))
+            }
+        };
+        if prev != 0 {
+            self.set_regexp_last_index(re, 0);
+        }
+        let result = self.regexp_exec(re, input)?;
+        let cur = match self.heap.get(re) {
+            HeapObj::RegExp { last_index, .. } => *last_index,
+            _ => 0,
+        };
+        if cur != prev {
+            self.set_regexp_last_index(re, prev);
+        }
+        if result == Value::NULL {
+            return Ok(Value::int(-1));
+        }
+        self.get_prop(result, "index")
+    }
+
+    /// RegExp.prototype[Symbol.match] core: a non-global regex returns the exec
+    /// result (array or null); a global regex returns the array of matched
+    /// substrings (or null) and resets lastIndex. Shared by String.match.
+    pub(crate) fn regexp_match_impl(&mut self, re: u32, input: Value) -> Result<Value, Thrown> {
+        let global =
+            matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
+        if !global {
+            return self.regexp_exec(re, input);
+        }
+        let s = self.to_js_string(input)?;
+        let strs: Vec<String> = match self.heap.get(re) {
+            HeapObj::RegExp { regex, .. } => {
+                regex.find_iter(&s).map(|m| s[m.range()].to_string()).collect()
+            }
+            _ => Vec::new(),
+        };
+        self.set_regexp_last_index(re, 0);
+        if strs.is_empty() {
+            return Ok(Value::NULL);
+        }
+        let elems: Vec<Value> = strs.into_iter().map(|m| self.alloc_str(m)).collect();
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))))
+    }
+
+    /// RegExp.prototype[Symbol.split] core (simplified — no capture groups in the
+    /// output yet). Shared by String.prototype.split for a regex separator.
+    pub(crate) fn regexp_split_impl(
+        &mut self,
+        re: u32,
+        input: Value,
+        limit: Value,
+    ) -> Result<Value, Thrown> {
+        let s = self.to_js_string(input)?;
+        let lim = if limit == Value::UNDEFINED {
+            usize::MAX
+        } else {
+            let n = self.to_number(limit)?;
+            if n.is_finite() && n > 0.0 { n as usize } else { 0 }
+        };
+        let spans: Vec<(usize, usize)> = match self.heap.get(re) {
+            HeapObj::RegExp { regex, .. } => {
+                regex.find_iter(&s).map(|m| (m.start(), m.end())).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut parts: Vec<Value> = Vec::new();
+        let mut last = 0usize;
+        for (st, en) in spans {
+            if parts.len() >= lim {
+                break;
+            }
+            if st < last || (st == en && st == last) {
+                continue; // skip overlapping / empty-at-cursor matches
+            }
+            parts.push(self.alloc_str(s[last..st].to_string()));
+            last = en;
+        }
+        if parts.len() < lim {
+            parts.push(self.alloc_str(s[last..].to_string()));
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(parts))))
+    }
+
     pub(crate) fn regexp_get_prop(
         &mut self,
         source: &str,
