@@ -278,20 +278,34 @@ impl<'p> Vm<'p> {
             }
             "indexOf" | "lastIndexOf" | "includes" => {
                 let snap = self.ta_snapshot(idx);
+                let len = snap.len() as i64;
+                // fromIndex (ToInteger). lastIndexOf defaults to len-1 and counts
+                // negatives from the end; indexOf/includes clamp to [0, len].
+                let from = if args.len() >= 2 {
+                    self.to_integer_or_zero(a1)?
+                } else if name == "lastIndexOf" {
+                    len - 1
+                } else {
+                    0
+                };
                 let mut found: i64 = -1;
                 if name == "lastIndexOf" {
-                    for i in (0..snap.len()).rev() {
-                        if self.values_strict_eq(snap[i], a0) {
-                            found = i as i64;
-                            break;
+                    let hi = if from < 0 { len + from } else { from.min(len - 1) };
+                    if hi >= 0 {
+                        for i in (0..=(hi as usize).min(snap.len().saturating_sub(1))).rev() {
+                            if self.values_strict_eq(snap[i], a0) {
+                                found = i as i64;
+                                break;
+                            }
                         }
                     }
                 } else {
-                    for (i, &e) in snap.iter().enumerate() {
+                    let lo = if from < 0 { (len + from).max(0) } else { from.min(len) } as usize;
+                    for i in lo..snap.len() {
                         let eq = if name == "includes" {
-                            self.same_value_zero(e, a0)
+                            self.same_value_zero(snap[i], a0)
                         } else {
-                            self.values_strict_eq(e, a0)
+                            self.values_strict_eq(snap[i], a0)
                         };
                         if eq {
                             found = i as i64;
