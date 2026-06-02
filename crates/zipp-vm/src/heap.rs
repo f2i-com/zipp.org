@@ -261,6 +261,8 @@ pub struct ClassData {
     /// definition (in source order) and read per-instance by the `FieldInit` op
     /// during construction. Empty for classes with no computed instance fields.
     pub computed_field_keys: Vec<Value>,
+    /// Exact `class … { … }` source text, for `Function.prototype.toString`.
+    pub source: String,
 }
 
 /// Boxed payload of a [`HeapObj::AsyncState`] (see that variant's docs). Boxed for

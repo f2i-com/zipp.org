@@ -1591,6 +1591,7 @@ impl<'a> FnCompiler<'a> {
             statics: Vec::new(),
             static_getters: Vec::new(),
             static_setters: Vec::new(),
+            source: String::new(), // filled in below once the body is compiled
         });
         self.cx.class_names.push((cname.clone(), class_id));
         // `super` resolves its target at RUNTIME via this class's own
@@ -1899,6 +1900,7 @@ impl<'a> FnCompiler<'a> {
             statics: static_defs,
             static_getters: static_getter_defs,
             static_setters: static_setter_defs,
+            source: self.cx.src_slice(class.span.start, class.span.end),
         };
         Ok((class_id, static_fields, computed_defs, computed_fields_ordered))
     }

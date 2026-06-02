@@ -672,4 +672,7 @@ pub struct ClassDef {
     /// `this` = the class value on read/write of `C.name`.
     pub static_getters: Vec<(String, u32)>,
     pub static_setters: Vec<(String, u32)>,
+    /// Exact source text of the whole `class … { … }` (by the class node's span),
+    /// returned by `Function.prototype.toString` on the class value.
+    pub source: String,
 }

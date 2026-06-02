@@ -1041,7 +1041,10 @@ impl<'p> Vm<'p> {
                         _ => break,
                     }
                 }
-                Ok(Value::UNDEFINED)
+                // A class is a function: keys not found as a static fall back to
+                // Function.prototype (so `C.toString()` → the class source via
+                // FN_TO_STRING, and `C.call`/`apply`/`bind` resolve).
+                Ok(self.proto_member(self.fn_proto, key))
             }
             // `map.size` / `set.size` — an accessor property, not a method.
             HeapObj::Map { keys, .. } if key == "size" => Ok(len_value(keys.len())),

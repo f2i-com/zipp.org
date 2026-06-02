@@ -541,7 +541,9 @@ impl<'p> Vm<'p> {
                         let s = &self.program.functions[*func as usize].source;
                         (!s.is_empty()).then(|| s.clone())
                     }
-                    HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::Class(_) => None,
+                    // A class value renders as its whole `class … { … }` source.
+                    HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
+                    HeapObj::Native(_) | HeapObj::Bound { .. } => None,
                     _ => {
                         return Err(Thrown(
                             "TypeError: Function.prototype.toString requires that 'this' be a Function"

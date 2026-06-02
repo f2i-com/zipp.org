@@ -714,6 +714,7 @@ impl<'p> Vm<'p> {
                             static_setters,
                             parent: parent_idx,
                             computed_field_keys: Vec::new(),
+                            source: cd.source,
                         }))));
                         // Remember it so `super` in a derived class can reach it.
                         self.class_values[class_id as usize] = Some(v);
