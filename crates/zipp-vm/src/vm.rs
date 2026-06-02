@@ -264,8 +264,8 @@ mod native {
     pub const PLAINTIME_COMPARE: u16 = 471;
     /// Temporal.PlainDateTime.prototype methods at PDT_M_BASE + index.
     pub const PLAINDATETIME_METHODS: &[&str] = &[
-        "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
-        "toPlainDate", "toPlainTime", "getISOFields",
+        "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON",
+        "valueOf", "toPlainDate", "toPlainTime", "getISOFields",
     ];
     pub const PDT_M_BASE: u16 = 472;
     pub const PLAINDATETIME_FROM: u16 = 490;
@@ -10786,6 +10786,16 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(self.make_duration(df)))
             }
+            "round" => {
+                let (su, inc, mode) = self.read_round_options(
+                    a0,
+                    &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"],
+                )?;
+                let ns = time_to_ns(&f);
+                let inc_ns = unit_ns(&su) * inc;
+                let rounded = round_increment(ns, inc_ns, &mode).rem_euclid(DAY_NS);
+                Ok(Some(self.make_plain_time(ns_to_time(rounded))?))
+            }
             "getISOFields" => {
                 let cal = self.alloc_str("iso8601".to_string());
                 let mut o = ObjMap::new();
@@ -10964,6 +10974,25 @@ impl<'p> Vm<'p> {
                 let df = difference_datetime(dt1, dt2, &largest);
                 Ok(Some(self.make_duration(df)))
             }
+            "round" => {
+                let (su, inc, mode) = self.read_round_options(
+                    a0,
+                    &[
+                        "day", "hour", "minute", "second", "millisecond", "microsecond",
+                        "nanosecond",
+                    ],
+                )?;
+                let time_ns = time_to_ns(&time);
+                let inc_ns = unit_ns(&su) * inc;
+                let rounded = round_increment(time_ns, inc_ns, &mode);
+                let day_carry = rounded.div_euclid(DAY_NS) as i64;
+                let nt = ns_to_time(rounded.rem_euclid(DAY_NS));
+                let ed = iso_to_epoch_days(date[0], date[1], date[2]) + day_carry;
+                let (ny, nm, nd) = epoch_days_to_iso(ed);
+                Ok(Some(self.make_plain_date_time([
+                    ny, nm, nd, nt[0], nt[1], nt[2], nt[3], nt[4], nt[5],
+                ])?))
+            }
             "getISOFields" => {
                 let cal = self.alloc_str("iso8601".to_string());
                 let names = [
@@ -11075,6 +11104,21 @@ impl<'p> Vm<'p> {
                 df[8] = (sub / 1_000) % 1_000;
                 df[9] = sub % 1_000;
                 Ok(Some(self.make_duration(df)))
+            }
+            "round" => {
+                let (su, inc, mode) = self.read_round_options(
+                    a0,
+                    &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"],
+                )?;
+                let inc_ns = unit_ns(&su) * inc;
+                // Instant rounding increments must evenly divide a 24-hour day.
+                if DAY_NS % inc_ns != 0 {
+                    return Err(Thrown(
+                        "RangeError: roundingIncrement does not divide evenly into a day".into(),
+                    ));
+                }
+                let rounded = round_increment(ns, inc_ns, &mode);
+                Ok(Some(self.make_instant(rounded)?))
             }
             _ => Ok(None),
         }
@@ -11471,6 +11515,66 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("RangeError: {key} value is out of range")));
         }
         Ok(n as i64)
+    }
+
+    /// Read a Temporal round() options bag (or a bare smallestUnit string):
+    /// returns (smallestUnit, roundingIncrement, roundingMode), validated.
+    fn read_round_options(
+        &mut self,
+        arg: Value,
+        allowed: &[&str],
+    ) -> Result<(String, i128, String), Thrown> {
+        // A bare string argument is shorthand for { smallestUnit: <string> }.
+        let (smallest_v, options) =
+            if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
+                (arg, Value::UNDEFINED)
+            } else if arg == Value::UNDEFINED {
+                return Err(Thrown("TypeError: round() requires an options argument".into()));
+            } else {
+                (self.get_prop(arg, "smallestUnit")?, arg)
+            };
+        if smallest_v == Value::UNDEFINED {
+            return Err(Thrown("RangeError: smallestUnit is required".into()));
+        }
+        let su = normalize_unit(&self.to_js_string(smallest_v)?, "");
+        if !allowed.contains(&su.as_str()) {
+            return Err(Thrown(format!("RangeError: invalid smallestUnit: {su}")));
+        }
+        let inc = if options == Value::UNDEFINED {
+            1
+        } else {
+            let v = self.get_prop(options, "roundingIncrement")?;
+            if v == Value::UNDEFINED {
+                1
+            } else {
+                let n = self.to_number(v)?;
+                if !n.is_finite() || n < 1.0 || n.floor() != n {
+                    return Err(Thrown("RangeError: roundingIncrement out of range".into()));
+                }
+                n as i128
+            }
+        };
+        let mode = if options == Value::UNDEFINED {
+            "halfExpand".to_string()
+        } else {
+            self.opt_string(
+                options,
+                "roundingMode",
+                "halfExpand",
+                &[
+                    "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
+                    "halfEven", "halfExpand",
+                ],
+            )?
+        };
+        if let Some(max) = max_increment(&su) {
+            if inc >= max || max % inc != 0 {
+                return Err(Thrown(
+                    "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                ));
+            }
+        }
+        Ok((su, inc, mode))
     }
 
     /// `new Intl.<service>(locales, options)` → build resolved options + instance.
@@ -16300,6 +16404,81 @@ fn difference_datetime(dt1: [i64; 9], dt2: [i64; 9], largest: &str) -> [i64; 10]
         df[4 + i] = t[i] * tsign;
     }
     df
+}
+
+/// Size of a time/day unit in nanoseconds (used for rounding).
+fn unit_ns(u: &str) -> i128 {
+    match u {
+        "day" => DAY_NS,
+        "hour" => 3_600_000_000_000,
+        "minute" => 60_000_000_000,
+        "second" => 1_000_000_000,
+        "millisecond" => 1_000_000,
+        "microsecond" => 1_000,
+        _ => 1, // nanosecond
+    }
+}
+
+/// Maximum (exclusive) roundingIncrement for a time unit (the count of that unit
+/// in the next-larger unit). None for "day" (no fixed maximum).
+fn max_increment(u: &str) -> Option<i128> {
+    match u {
+        "hour" => Some(24),
+        "minute" | "second" => Some(60),
+        "millisecond" | "microsecond" | "nanosecond" => Some(1000),
+        _ => None,
+    }
+}
+
+/// Round `value` to a multiple of `inc` per a Temporal roundingMode.
+fn round_increment(value: i128, inc: i128, mode: &str) -> i128 {
+    if inc <= 1 && mode == "halfExpand" {
+        // fast path: inc==1 rounds nothing
+        if inc <= 1 {
+            return value;
+        }
+    }
+    if inc <= 0 {
+        return value;
+    }
+    let lower = value.div_euclid(inc) * inc;
+    let r = value - lower;
+    if r == 0 {
+        return value;
+    }
+    let upper = lower + inc;
+    let expand = if value >= 0 { upper } else { lower }; // away from zero
+    let trunc = if value >= 0 { lower } else { upper }; // toward zero
+    match mode {
+        "ceil" => upper,
+        "floor" => lower,
+        "expand" => expand,
+        "trunc" => trunc,
+        _ => {
+            let twice = 2 * r;
+            if twice != inc {
+                if twice > inc {
+                    upper
+                } else {
+                    lower
+                }
+            } else {
+                match mode {
+                    "halfCeil" => upper,
+                    "halfFloor" => lower,
+                    "halfTrunc" => trunc,
+                    "halfEven" => {
+                        if (lower / inc) % 2 == 0 {
+                            lower
+                        } else {
+                            upper
+                        }
+                    }
+                    _ => expand, // halfExpand (default)
+                }
+            }
+        }
+    }
 }
 
 /// ISO day-of-week: Monday=1 … Sunday=7.
