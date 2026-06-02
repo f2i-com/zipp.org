@@ -490,6 +490,30 @@ impl<'p> Vm<'p> {
         self.weakset_proto = weakset_proto;
         self.weakref_proto = weakref_proto;
         self.finreg_proto = finreg_proto;
+        // `X.prototype[Symbol.toStringTag] = "X"` (non-writable/enumerable,
+        // configurable) — so `Object.prototype.toString.call(new Map())` is
+        // "[object Map]", and the property itself is reflectable.
+        let tag_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        for (proto, name) in [
+            (map_proto, "Map"),
+            (set_proto, "Set"),
+            (promise_proto, "Promise"),
+            (weakmap_proto, "WeakMap"),
+            (weakset_proto, "WeakSet"),
+            (weakref_proto, "WeakRef"),
+            (finreg_proto, "FinalizationRegistry"),
+        ] {
+            let tag = self.alloc_str(name.to_string());
+            if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                p.define("@@toStringTag", tag, tag_attr);
+            }
+        }
         let weakmap_ctor = build(self, &[], Some(weakmap_proto));
         let weakset_ctor = build(self, &[], Some(weakset_proto));
         let weakref_ctor = build(self, &[], Some(weakref_proto));

@@ -172,6 +172,10 @@ impl<'p> Vm<'p> {
                 HeapObj::Boxed { kind: 0, .. } => "String",
                 HeapObj::Boxed { kind: 1, .. } => "Number",
                 HeapObj::Boxed { kind: 2, .. } => "Boolean",
+                // Date/RegExp have built-in tags ([[DateValue]]/[[RegExpMatcher]]);
+                // Map/Set/Promise/etc instead carry a @@toStringTag (handled below).
+                HeapObj::Date(_) => "Date",
+                HeapObj::RegExp { .. } => "RegExp",
                 _ if self.error_name(this.heap_index()).is_some() => "Error",
                 _ => "Object",
             }
