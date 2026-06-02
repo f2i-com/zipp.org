@@ -1191,6 +1191,38 @@ impl<'p> Vm<'p> {
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
                 Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
             }
+            "add" | "subtract" => {
+                // Fixed-offset zones: apply the same calendar/clock arithmetic as
+                // PlainDateTime to the local wall-clock, then re-zone. (Named-zone
+                // DST disambiguation is not modelled.)
+                let dur = self.to_duration(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let sign: i64 = if name == "add" { 1 } else { -1 };
+                let lf = self.zdt_local(idx);
+                let time = [lf[3], lf[4], lf[5], lf[6], lf[7], lf[8]];
+                let tns = time_to_ns(&time)
+                    + ((dur[4] as i128) * 3_600_000_000_000
+                        + (dur[5] as i128) * 60_000_000_000
+                        + (dur[6] as i128) * 1_000_000_000
+                        + (dur[7] as i128) * 1_000_000
+                        + (dur[8] as i128) * 1_000
+                        + (dur[9] as i128))
+                        * sign as i128;
+                let carry = tns.div_euclid(DAY_NS) as i64;
+                let nt = ns_to_time(tns.rem_euclid(DAY_NS));
+                let tm = (lf[0] + dur[0] * sign) * 12 + (lf[1] - 1) + dur[1] * sign;
+                let ny0 = tm.div_euclid(12);
+                let nmo = tm.rem_euclid(12) + 1;
+                if reject && lf[2] > days_in_month(ny0, nmo) {
+                    return Err(Thrown("RangeError: date arithmetic overflows the month".into()));
+                }
+                let nd0 = lf[2].min(days_in_month(ny0, nmo));
+                let ed = iso_to_epoch_days(ny0, nmo, nd0) + (dur[2] * 7 + dur[3]) * sign + carry;
+                let off = self.zdt_offset_ns(idx);
+                let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
+                let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+                Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
+            }
             "with" => {
                 // Merge date/time fields from the bag over the current local
                 // wall-clock; the zone (and thus offset) is unchanged.
