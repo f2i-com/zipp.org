@@ -308,13 +308,14 @@ impl<'p> Vm<'p> {
         desc: Value,
     ) -> Result<(Option<Value>, Option<Value>, Option<Value>, Option<bool>, Option<bool>, Option<bool>), Thrown>
     {
-        if !desc.is_heap() || !matches!(self.heap.get(desc.heap_index()), HeapObj::Object(_)) {
+        // ToPropertyDescriptor only requires Type(Obj) is Object — a Function (or
+        // any other object) carrying value/get/set/... own props is a valid
+        // descriptor, so accept any object, not just a plain HeapObj::Object.
+        if !self.is_object_value(desc) {
             return Err(Thrown("TypeError: Property description must be an object".into()));
         }
-        let idx = desc.heap_index();
-        let present = |vm: &Self, k: &str| -> bool {
-            matches!(vm.heap.get(idx), HeapObj::Object(m) if m.pos(k).is_some())
-        };
+        // Presence uses [[HasProperty]]-on-own across object/class/function bags.
+        let present = |vm: &Self, k: &str| -> bool { vm.has_own_property(desc, k) };
         let value = if present(self, "value") { Some(self.get_prop(desc, "value")?) } else { None };
         let get = if present(self, "get") { Some(self.get_prop(desc, "get")?) } else { None };
         let set = if present(self, "set") { Some(self.get_prop(desc, "set")?) } else { None };
@@ -449,15 +450,23 @@ impl<'p> Vm<'p> {
                 )));
             }
         }
+        // When redefining an existing accessor with only one half present, the
+        // missing half is preserved (spec keeps fields absent from the new desc).
+        let existing_get = existing.and_then(|(a, v)| if a.accessor { Some(v) } else { None });
+        let existing_set = existing.and_then(|(a, _)| if a.accessor { Some(a.setter) } else { None });
         let attr = PropAttr {
             writable: wr,
             enumerable: en,
             configurable: cf,
             accessor: is_accessor,
-            setter: set.unwrap_or(Value::UNDEFINED),
+            setter: if is_accessor {
+                set.or(existing_set).unwrap_or(Value::UNDEFINED)
+            } else {
+                Value::UNDEFINED
+            },
         };
         let stored = if is_accessor {
-            get.unwrap_or(Value::UNDEFINED)
+            get.or(existing_get).unwrap_or(Value::UNDEFINED)
         } else {
             value.or(existing.map(|(_, v)| v)).unwrap_or(Value::UNDEFINED)
         };
