@@ -2137,6 +2137,11 @@ impl<'p> Vm<'p> {
                         self.pending_await = Some((v, ip, f.handlers));
                         return Ok(v);
                     }
+                    Instr::IterClose { iter } => {
+                        let it = self.get(base, iter);
+                        self.iterator_close(it)?;
+                        ip += 1;
+                    }
                     Instr::IterNext { value_dst, done_dst, iter, idx } => {
                         let it = self.get(base, iter);
                         if !it.is_heap() {

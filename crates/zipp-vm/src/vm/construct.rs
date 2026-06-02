@@ -627,22 +627,34 @@ impl<'p> Vm<'p> {
             out.push(self.get_prop(res, "value")?);
         }
         // IteratorClose (normal completion): destructuring took the fixed number of
-        // elements it needed; if the iterator isn't exhausted (and isn't a
-        // generator, which closes on its own GC), call its `return()` once. This is
-        // what `[a] = iter` / `[] = iter` (no rest) require — when a `...rest` is
-        // present `max` is unbounded so the loop runs to `done` and we skip this.
-        if !iter_done && !is_gen {
-            let ret = self.get_prop(iter, "return")?;
-            if self.is_callable(ret) {
-                let r = self.call_value(ret, iter, &[])?;
-                if !self.is_object_value(r) {
-                    return Err(Thrown(
-                        "TypeError: iterator return() result is not an object".into(),
-                    ));
-                }
-            }
+        // elements it needed; if the iterator isn't exhausted, close it. With a
+        // `...rest` present `max` is unbounded so the loop ran to `done` and we skip.
+        let _ = is_gen;
+        if !iter_done {
+            self.iterator_close(iter)?;
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
+    /// IteratorClose(iterator, normal): call the iterator's `return()` once if it
+    /// has one, requiring an Object result (TypeError otherwise). Skips generators
+    /// (driven directly via generator_method, not a prototype `return`) and
+    /// non-objects. Shared by destructuring and `for-of` break.
+    pub(crate) fn iterator_close(&mut self, iter: Value) -> Result<(), Thrown> {
+        if !iter.is_heap() {
+            return Ok(());
+        }
+        if matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. }) {
+            return Ok(());
+        }
+        let ret = self.get_prop(iter, "return")?;
+        if self.is_callable(ret) {
+            let r = self.call_value(ret, iter, &[])?;
+            if !self.is_object_value(r) {
+                return Err(Thrown("TypeError: iterator return() result is not an object".into()));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {

@@ -2515,11 +2515,25 @@ impl<'a> FnCompiler<'a> {
             self.patch_jump(c, top); // continue → re-run IterNext (advance + test)
         }
         self.emit(Instr::Jump { target: top });
-        let end = self.here();
-        self.patch_jump(jdone, end);
-        for b in ctx.break_jumps {
-            self.patch_jump(b, end);
-        }
+        // A `break` out of the loop closes the (not-yet-exhausted) iterator via a
+        // block reached only from break jumps; the normal `done` exit skips it
+        // (the iterator already signalled completion). (`return`/`throw` out of the
+        // body don't yet close — a remaining gap.)
+        let end = if ctx.break_jumps.is_empty() {
+            let e = self.here();
+            self.patch_jump(jdone, e);
+            e
+        } else {
+            let brk_target = self.here();
+            self.emit(Instr::IterClose { iter: iter_reg });
+            let e = self.here();
+            self.patch_jump(jdone, e);
+            for b in ctx.break_jumps {
+                self.patch_jump(b, brk_target);
+            }
+            e
+        };
+        let _ = end;
         self.pop_scope();
         Ok(())
     }

@@ -147,6 +147,9 @@ pub enum Instr {
     /// the next element to `value_dst` and a bool to `done_dst`. Throws if `iter`
     /// is not iterable.
     IterNext { value_dst: Reg, done_dst: Reg, iter: Reg, idx: Reg },
+    /// IteratorClose: invoke `iter`'s `return()` (if present) — emitted on the
+    /// abrupt `break` exit of a `for-of` so a not-yet-exhausted iterator is closed.
+    IterClose { iter: Reg },
     /// Resolve `src`'s ASYNC iterator into `dst`: `src[@@asyncIterator]()` if
     /// present, else `src[@@iterator]()` (a sync iterable used by `for await`),
     /// else pass `src` through (async generators / built-ins iterate directly).
