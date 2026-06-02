@@ -472,14 +472,15 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid date string '{s}'")));
             }
             if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+                self.validate_iso_calendar_field(v)?;
                 let yv = self.get_prop(v, "year")?;
-                let mv = self.get_prop(v, "month")?;
                 let dv = self.get_prop(v, "day")?;
-                if yv == Value::UNDEFINED || mv == Value::UNDEFINED || dv == Value::UNDEFINED {
+                let m_opt = self.read_month_field(v)?; // monthCode or month
+                if yv == Value::UNDEFINED || m_opt.is_none() || dv == Value::UNDEFINED {
                     return Err(Thrown("TypeError: PlainDate-like requires year, month, day".into()));
                 }
                 let (y, mut m, mut d) =
-                    (self.to_number(yv)? as i64, self.to_number(mv)? as i64, self.to_number(dv)? as i64);
+                    (self.to_number(yv)? as i64, m_opt.unwrap(), self.to_number(dv)? as i64);
                 if reject {
                     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
                         return Err(Thrown("RangeError: invalid date fields".into()));
@@ -864,18 +865,27 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
             }
             if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
-                let names = [
-                    "year", "month", "day", "hour", "minute", "second", "millisecond",
-                    "microsecond", "nanosecond",
-                ];
+                self.validate_iso_calendar_field(v)?;
                 let mut f = [0i64; 9];
                 let mut have_date = [false; 3];
-                for (i, nm) in names.iter().enumerate() {
+                if let Some(x) = self.opt_int_field(v, "year")? {
+                    f[0] = x;
+                    have_date[0] = true;
+                }
+                if let Some(x) = self.read_month_field(v)? {
+                    // monthCode ("M11") or month
+                    f[1] = x;
+                    have_date[1] = true;
+                }
+                if let Some(x) = self.opt_int_field(v, "day")? {
+                    f[2] = x;
+                    have_date[2] = true;
+                }
+                let time_names =
+                    ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+                for (i, nm) in time_names.iter().enumerate() {
                     if let Some(x) = self.opt_int_field(v, nm)? {
-                        f[i] = x;
-                        if i < 3 {
-                            have_date[i] = true;
-                        }
+                        f[3 + i] = x;
                     }
                 }
                 if !have_date.iter().all(|&b| b) {
@@ -1601,6 +1611,7 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid year-month string '{s}'")));
             }
             if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+                self.validate_iso_calendar_field(v)?;
                 let yv = self.get_prop(v, "year")?;
                 let m = self.read_month_field(v)?;
                 if yv == Value::UNDEFINED || m.is_none() {
@@ -1631,6 +1642,26 @@ impl<'p> Vm<'p> {
             return Ok(parse_month_code(&s));
         }
         self.opt_int_field(obj, "month")
+    }
+
+    /// Validate a property-bag `calendar` field for the ISO-only engine: absent,
+    /// or resolving to "iso8601" (case-insensitive, or via an embedded `[u-ca=…]`
+    /// annotation / bare ISO string), is accepted; anything else is a RangeError.
+    pub(crate) fn validate_iso_calendar_field(&mut self, obj: Value) -> Result<(), Thrown> {
+        let cv = self.get_prop(obj, "calendar")?;
+        if cv == Value::UNDEFINED {
+            return Ok(());
+        }
+        // A Temporal instance used as a calendar carries the ISO calendar.
+        if cv.is_heap() && matches!(self.heap.get(cv.heap_index()), HeapObj::Temporal { .. }) {
+            return Ok(());
+        }
+        let s = self.to_js_string(cv)?;
+        match calendar_id_from_string(&s) {
+            Some(id) if id.eq_ignore_ascii_case("iso8601") => Ok(()),
+            Some(id) => Err(Thrown(format!("RangeError: unsupported calendar \"{id}\""))),
+            None => Err(Thrown(format!("RangeError: invalid calendar \"{s}\""))),
+        }
     }
 
     pub(crate) fn plain_year_month_method(
@@ -1755,6 +1786,7 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid month-day string '{s}'")));
             }
             if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+                self.validate_iso_calendar_field(v)?;
                 let m = self.read_month_field(v)?;
                 let dv = self.get_prop(v, "day")?;
                 if m.is_none() || dv == Value::UNDEFINED {
@@ -1839,6 +1871,30 @@ impl<'p> Vm<'p> {
 
     // ── Intl ──
 
+}
+
+/// Resolve a calendar string to its canonical id. The ISO-only engine accepts
+/// only "iso8601", but parsing the id lets an unsupported calendar error cleanly:
+/// "iso8601" in any ASCII case, a `[u-ca=…]` annotation embedded in an ISO
+/// string, or a bare ISO date / year-month / month-day string (→ iso8601).
+fn calendar_id_from_string(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("iso8601") {
+        return Some("iso8601".to_string());
+    }
+    if let Some(p) = s.find("u-ca=") {
+        let val = &s[p + 5..];
+        let end = val.find(']')?;
+        return Some(val[..end].to_string());
+    }
+    if parse_iso_datetime(s).is_some()
+        || parse_iso_date(s).is_some()
+        || parse_iso_year_month(s).is_some()
+        || parse_iso_month_day(s).is_some()
+    {
+        return Some("iso8601".to_string());
+    }
+    None
 }
 
 /// Parse a Temporal time-zone argument into a (normalized id, offset-ns) pair.
