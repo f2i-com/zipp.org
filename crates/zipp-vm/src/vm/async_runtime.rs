@@ -1008,7 +1008,15 @@ impl<'p> Vm<'p> {
     /// run in the same drain). The whole event loop.
     pub(crate) fn drain_microtasks(&mut self) {
         while let Some(t) = self.microtasks.pop_front() {
-            self.run_microtask(t);
+            // The popped microtask `t` holds Values (callback/arg/dependent) in a
+            // Rust local that are NOT reachable from the GC roots while
+            // run_microtask re-enters the interpreter — suspend GC for its scope.
+            {
+                let _gc = self.gc_lock_guard();
+                self.run_microtask(t);
+            }
+            // Between microtasks no un-rooted local survives, so reclaim now.
+            self.maybe_gc();
         }
     }
 

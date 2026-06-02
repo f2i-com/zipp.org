@@ -113,6 +113,10 @@ impl<'p> Vm<'p> {
     /// when the `stop_depth` frame returns, or `Err` to begin unwinding.
     pub(crate) fn dispatch_body(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
         loop {
+            // GC safe point on every frame transition (call/return): no native
+            // built-in is mid-flight holding an un-rooted Vec here, and all live
+            // Values are in regs/frames/globals/side-tables (the GC root set).
+            self.maybe_gc();
             // Snapshot the current frame's coordinates. `ip` is advanced as a
             // local and written back only on frame transitions / loops.
             let frame_idx = self.frames.len() - 1;
@@ -1269,6 +1273,13 @@ impl<'p> Vm<'p> {
 
                     Instr::Jump { target } => {
                         let t = target as usize;
+                        // A backward jump is a loop back-edge — poll the GC here so
+                        // a tight allocating loop (which never leaves this inner
+                        // loop) still gets collected. Safe: all live Values are in
+                        // regs, and gc_lock guards any native built-in up-stack.
+                        if t < ip {
+                            self.maybe_gc();
+                        }
                         // ── OSR tier ── a backward jump is a loop back-edge. After
                         // the region heats up, compile `[target, ip]` (the loop
                         // body, headed at `target`) and run it natively; the

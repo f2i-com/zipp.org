@@ -128,6 +128,11 @@ impl<'p> Vm<'p> {
             reg_capacity: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regs_hw: 0,
+            // 0 until set_gc_floor() runs after setup; until then nothing is
+            // collectable, so an early GC (if any) is a no-op.
+            gc_floor: 0,
+            gc_lock: 0,
+            gc_stress: std::env::var_os("ZIPP_GC_STRESS").is_some(),
         }
     }
 
@@ -433,6 +438,9 @@ impl<'p> Vm<'p> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.reserve_jit_regs();
         self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new() });
+        // Everything allocated so far (interned strings, all built-ins, hoisted
+        // top-level functions) is pinned: the GC never collects below this floor.
+        self.set_gc_floor();
         // Run until the top-level frame returns (frames drains back to 0), then
         // run the event loop: drain queued microtasks (promise reactions, async
         // resumes) to empty. Drains even on a main throw (matches node ordering),

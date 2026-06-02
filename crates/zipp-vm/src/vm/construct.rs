@@ -468,6 +468,10 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
+        // The accumulating result Vec holds values yielded by `.next()` that are
+        // not yet reachable from the GC roots, while `.next()` (user code) keeps
+        // re-entering the interpreter — suspend GC for the scope.
+        let _gc = self.gc_lock_guard();
         // A TypedArray iterates positionally over its elements.
         if let Some(ta) = self.as_typed_array(v) {
             let n = match self.heap.get(ta) {
@@ -542,6 +546,9 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn array_from(&mut self, src: Value, mapfn: Value) -> Result<Value, Thrown> {
+        // Holds an un-rooted `elems` Vec while the mapfn / iterator re-enters the
+        // interpreter — suspend GC for the scope.
+        let _gc = self.gc_lock_guard();
         // Classify the source under a short-lived borrow, then materialize its
         // elements (the object/array-like path needs &mut self for get_prop).
         enum Kind {

@@ -467,7 +467,24 @@ pub struct Heap {
     /// `vals`-pointer: a matching version proves `vals` hasn't reallocated since
     /// the cache was filled. Allocated in lockstep with `objs` so indices align.
     versions: Vec<u32>,
+    /// Free list of reclaimed slot indices (filled by the mark-sweep GC's sweep,
+    /// drained by `alloc`). A reused slot is overwritten and its version bumped so
+    /// any stale JIT inline-cache entry misses. Empty until the first collection.
+    free: Vec<u32>,
+    /// Number of live (allocated, non-free) slots — `objs.len()` minus the free
+    /// list and the pinned built-in prefix bookkeeping. Used to decide when to GC.
+    live: usize,
+    /// `alloc` sets this once the live count passes `gc_threshold`; the interpreter
+    /// dispatch loop polls it at a safe point and runs a collection.
+    gc_requested: bool,
+    /// Live-count at which the next collection is requested (grown adaptively after
+    /// each GC to amortise; never below `GC_MIN_THRESHOLD`).
+    gc_threshold: usize,
 }
+
+/// Smallest live-object count that triggers a collection — below this the heap is
+/// trivially small and collecting would be pure overhead.
+pub const GC_MIN_THRESHOLD: usize = 1 << 16;
 
 impl Default for Heap {
     fn default() -> Self {
@@ -489,15 +506,71 @@ impl Heap {
         }
         objs.push(HeapObj::Str(JsStr { bytes: String::new(), char_len: 0, ascii: true }));
         versions.push(0);
-        Heap { objs, versions }
+        let live = objs.len();
+        Heap { objs, versions, free: Vec::new(), live, gc_requested: false, gc_threshold: GC_MIN_THRESHOLD }
     }
 
     #[inline]
     pub fn alloc(&mut self, obj: HeapObj) -> u32 {
+        self.live += 1;
+        if self.live >= self.gc_threshold {
+            self.gc_requested = true;
+        }
+        // Reuse a reclaimed slot when one is available (its version is bumped so a
+        // stale inline-cache entry for the old occupant misses).
+        if let Some(idx) = self.free.pop() {
+            self.objs[idx as usize] = obj;
+            self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            return idx;
+        }
         let idx = self.objs.len() as u32;
         self.objs.push(obj);
         self.versions.push(0);
         idx
+    }
+
+    /// Total slot count (live + free + pinned). Sweeps iterate `0..len`.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.objs.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.objs.is_empty()
+    }
+
+    /// Whether the dispatch loop should run a collection (live count passed the
+    /// adaptive threshold). Cleared by `note_gc_done`.
+    #[inline]
+    pub fn gc_requested(&self) -> bool {
+        self.gc_requested
+    }
+
+    /// The currently-free slot indices (so the GC can protect them from a
+    /// double-free without tracing them).
+    #[inline]
+    pub fn free_indices(&self) -> &[u32] {
+        &self.free
+    }
+
+    /// Reclaim slot `idx`: drop its (possibly large) contents to a tiny tombstone
+    /// and return the slot to the free list. The caller (GC sweep) guarantees no
+    /// live reference remains. Never call on a pinned built-in slot.
+    #[inline]
+    pub fn free_slot(&mut self, idx: u32) {
+        self.objs[idx as usize] = HeapObj::Date(f64::NAN);
+        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        self.free.push(idx);
+    }
+
+    /// Record the post-sweep live count and grow the next threshold to ~2x it
+    /// (amortising collection cost), clearing the request flag.
+    #[inline]
+    pub fn note_gc_done(&mut self, live: usize) {
+        self.live = live;
+        self.gc_threshold = (live.saturating_mul(2)).max(GC_MIN_THRESHOLD);
+        self.gc_requested = false;
     }
 
     /// Bump object `idx`'s version (call after a key-add reallocates its `vals`).

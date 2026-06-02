@@ -309,6 +309,15 @@ pub struct Vm<'p> {
     /// (`reserve_jit_regs`) so initialized slots stay valid for the VM's life.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     regs_hw: usize,
+    /// Mark-sweep GC. `gc_floor` is the first collectable slot: everything below
+    /// it (the interned strings + all built-ins allocated during setup) is pinned
+    /// and never freed. `gc_lock` > 0 disables collection during native built-ins
+    /// that hold un-rooted `Vec<Value>` working sets across a callback re-entry
+    /// (array iteration, sort, iterate_to_vec, …). `gc_stress` (ZIPP_GC_STRESS)
+    /// forces a collection at every safe point to flush out missed roots/edges.
+    gc_floor: u32,
+    gc_lock: u32,
+    gc_stress: bool,
 }
 
 /// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
@@ -344,6 +353,7 @@ mod helpers_datetime;
 mod helpers_numeric;
 mod helpers_json;
 mod helpers_num2;
+mod gc;
 
 pub(crate) use helpers_misc::*;
 pub(crate) use helpers_datetime::*;

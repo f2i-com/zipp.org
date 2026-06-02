@@ -15,6 +15,9 @@ impl<'p> Vm<'p> {
     /// The window is always released (truncate) before returning — including on a
     /// callback error — so a thrown callback never leaks register slots.
     pub(crate) fn array_each(&mut self, idx: u32, cb: Value, mode: EachMode, this_arg: Value) -> Result<Option<Value>, Thrown> {
+        // `out` (and the snapshot) hold values not reachable from the GC roots
+        // while the callback re-enters the interpreter — suspend GC for the scope.
+        let _gc = self.gc_lock_guard();
         let snapshot = self.array_snapshot(idx);
         // The receiver passed to the callback as its 3rd argument.
         let receiver = Value::heap(idx);
@@ -204,6 +207,11 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        // Suspend GC for the whole method: callback-driven arms (map/filter/
+        // reduce/sort/…) hold un-rooted working sets across interpreter re-entry,
+        // and the array-like path builds an un-rooted temp array. Non-callback
+        // arms never reach a GC safe point, so the lock is free for them.
+        let _gc = self.gc_lock_guard();
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // Generic array methods accept an array-like `this`
         // (`Array.prototype.map.call({length:2, 0:'a', 1:'b'}, cb)`, or on a string).

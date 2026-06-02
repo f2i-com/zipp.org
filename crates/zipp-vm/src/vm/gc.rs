@@ -1,0 +1,395 @@
+//! Mark-sweep garbage collector for the VM heap.
+//!
+//! The heap is a `Vec<HeapObj>` indexed by `u32`; `Value` references objects by
+//! INDEX, so this collector is NON-MOVING — it only frees unreachable slots back
+//! to a free list (reused by `Heap::alloc`), never relocating live objects, so
+//! every existing index stays valid. That sidesteps having to rewrite indices in
+//! the ~dozens of side tables, the register file, and the JIT.
+//!
+//! Safety rests on three invariants:
+//!   1. `gc_floor` pins the interned strings + every built-in allocated during
+//!      setup — they are always marked and never swept.
+//!   2. The root set below is COMPLETE: every live `Value`/index reachable by the
+//!      running program is enumerated here or reachable by tracing from it. A
+//!      missed root would free a live object; `ZIPP_GC_STRESS` (collect at every
+//!      safe point) turns any such miss into an immediate corpus/test262 failure.
+//!   3. Collection only happens at a dispatch-loop safe point with `gc_lock == 0`,
+//!      so no native built-in is holding an un-rooted `Vec<Value>` working set.
+
+use super::{Microtask, Resume, Vm};
+use crate::heap::{GenState, HeapObj};
+use crate::value::Value;
+
+/// RAII guard that suspends collection for its scope (decrements on drop, even
+/// across `?` early returns). Held by native built-ins that keep an un-rooted
+/// `Vec<Value>` of freshly-allocated objects while re-entering the interpreter
+/// (a callback), where a safe point could otherwise free that working set.
+pub(crate) struct GcGuard {
+    lock: *mut u32,
+}
+
+impl Drop for GcGuard {
+    fn drop(&mut self) {
+        // SAFETY: the guard never outlives the `&mut Vm` it was created from, and
+        // a `Vm` behind `&mut self` is not relocated for the guard's lifetime.
+        unsafe {
+            *self.lock = (*self.lock).saturating_sub(1);
+        }
+    }
+}
+
+impl Vm<'_> {
+    /// Pin everything allocated so far (called once, after setup + hoisting).
+    pub(crate) fn set_gc_floor(&mut self) {
+        self.gc_floor = self.heap.len() as u32;
+    }
+
+    /// Suspend GC for the returned guard's scope (see [`GcGuard`]).
+    #[inline]
+    pub(crate) fn gc_lock_guard(&mut self) -> GcGuard {
+        self.gc_lock += 1;
+        GcGuard { lock: &mut self.gc_lock as *mut u32 }
+    }
+
+    /// Run a collection if one is due (or always, under stress) and it is safe.
+    #[inline]
+    pub(crate) fn maybe_gc(&mut self) {
+        if self.gc_lock == 0
+            && self.gc_floor != 0
+            && (self.heap.gc_requested() || self.gc_stress)
+        {
+            self.gc();
+        }
+    }
+
+    fn gc(&mut self) {
+        let n = self.heap.len();
+        let floor = self.gc_floor as usize;
+        if floor == 0 || n <= floor {
+            self.heap.note_gc_done(n);
+            return;
+        }
+        let mut marks = vec![false; n];
+        let mut stack: Vec<u32> = Vec::with_capacity(1024);
+
+        // Already-free slots stay free: mark them so the sweep does not push a
+        // duplicate onto the free list, but do NOT trace them (they are tombstones).
+        for &idx in self.heap.free_indices() {
+            marks[idx as usize] = true;
+        }
+        let free_before = self.heap.free_indices().len();
+
+        // --- Roots ---------------------------------------------------------
+        // Pinned built-ins: marked AND traced (a built-in proto may hold a user
+        // object, e.g. `Array.prototype.foo = userObj`).
+        for i in 0..floor {
+            if !marks[i] {
+                marks[i] = true;
+                stack.push(i as u32);
+            }
+        }
+        macro_rules! root_val {
+            ($v:expr) => {{
+                let v: Value = $v;
+                if v.is_heap() {
+                    let i = v.heap_index() as usize;
+                    if i < n && !marks[i] {
+                        marks[i] = true;
+                        stack.push(v.heap_index());
+                    }
+                }
+            }};
+        }
+        macro_rules! root_idx {
+            ($i:expr) => {{
+                let i = $i as usize;
+                if i < n && !marks[i] {
+                    marks[i] = true;
+                    stack.push(i as u32);
+                }
+            }};
+        }
+
+        for &v in &self.regs {
+            root_val!(v);
+        }
+        for &v in &self.globals {
+            root_val!(v);
+        }
+        for v in self.class_values.iter().flatten() {
+            root_val!(*v);
+        }
+        if let Some(v) = self.pending_throw {
+            root_val!(v);
+        }
+        if let Some((v, _)) = self.pending_yield {
+            root_val!(v);
+        }
+        if let Some((v, _, _)) = &self.pending_await {
+            root_val!(*v);
+        }
+        for mt in &self.microtasks {
+            match mt {
+                Microtask::Reaction { callback, arg, dependent, .. } => {
+                    root_val!(*callback);
+                    root_val!(*arg);
+                    root_idx!(*dependent);
+                }
+                Microtask::AsyncResume { activation, input } => {
+                    root_idx!(*activation);
+                    match input {
+                        Resume::Value(v) | Resume::Throw(v) => root_val!(*v),
+                    }
+                }
+            }
+        }
+        for f in &self.frames {
+            root_idx!(f.closure);
+        }
+        // Error / TypedArray constructor + prototype tables (mostly < floor, but
+        // root them unconditionally to be safe).
+        for &i in self.error_protos.iter().chain(self.error_ctors.iter()) {
+            root_idx!(i);
+        }
+        for &i in self.ta_protos.iter().chain(self.ta_ctors.iter()) {
+            root_idx!(i);
+        }
+        // Side tables: their VALUES are roots (an entry keyed by a live object
+        // must keep its payload alive). Over-approximate by rooting all values;
+        // entries whose KEY is dead are pruned after the sweep.
+        for v in self.proto_of.values() {
+            root_val!(*v);
+        }
+        for &p in self.prototypes.values() {
+            root_idx!(p);
+        }
+        for m in self.fn_props.values() {
+            for &v in &m.vals {
+                root_val!(v);
+            }
+            for a in &m.attrs {
+                root_val!(a.setter);
+            }
+        }
+        for &(a, b, c) in self.regexp_match_extras.values() {
+            root_val!(a);
+            root_val!(b);
+            root_val!(c);
+        }
+        for v in self.template_raws.values() {
+            root_val!(*v);
+        }
+        for v in self.symbol_registry.values() {
+            root_val!(*v);
+        }
+        for v in self.symbol_keys.values() {
+            root_val!(*v);
+        }
+        // Suspended async activations are pending event-loop JOBS: an async
+        // function's `AsyncState` is referenced only by the await-reaction it
+        // registered (a cycle the program can't otherwise reach), so the event
+        // loop conceptually keeps it alive until it resumes. Pin every
+        // non-completed async activation; tracing it then keeps its awaited
+        // promises / saved registers alive. A completed activation is unrooted
+        // here and reclaimed normally.
+        for i in floor..n {
+            match self.heap.get(i as u32) {
+                HeapObj::AsyncState(s) if !matches!(s.state, GenState::Completed) => {
+                    root_idx!(i)
+                }
+                HeapObj::AsyncGenerator(s) if !matches!(s.state, GenState::Completed) => {
+                    root_idx!(i)
+                }
+                _ => {}
+            }
+        }
+
+        // --- Trace ---------------------------------------------------------
+        while let Some(idx) = stack.pop() {
+            self.trace_edges(idx, &mut marks, &mut stack, n);
+        }
+
+        // --- Sweep + prune -------------------------------------------------
+        for i in floor..n {
+            if !marks[i] {
+                self.heap.free_slot(i as u32);
+            }
+        }
+        // Drop side-table entries whose keyed object was reclaimed.
+        self.proto_of.retain(|&k, _| marks[k as usize]);
+        self.prototypes.retain(|&k, _| marks[k as usize]);
+        self.fn_props.retain(|&k, _| marks[k as usize]);
+        self.regexp_match_extras.retain(|&k, _| marks[k as usize]);
+
+        let free_after = self.heap.free_indices().len();
+        let _ = free_before;
+        self.heap.note_gc_done(n - free_after);
+    }
+
+    /// Push every heap reference held by object `idx` onto the mark stack.
+    fn trace_edges(&self, idx: u32, marks: &mut [bool], stack: &mut Vec<u32>, n: usize) {
+        macro_rules! m_val {
+            ($v:expr) => {{
+                let v: Value = $v;
+                if v.is_heap() {
+                    let i = v.heap_index() as usize;
+                    if i < n && !marks[i] {
+                        marks[i] = true;
+                        stack.push(v.heap_index());
+                    }
+                }
+            }};
+        }
+        macro_rules! m_idx {
+            ($i:expr) => {{
+                let i = $i as usize;
+                if i < n && !marks[i] {
+                    marks[i] = true;
+                    stack.push(i as u32);
+                }
+            }};
+        }
+        // Trace an ObjMap's edges (own values, accessor setters, class link).
+        macro_rules! m_objmap {
+            ($map:expr) => {{
+                let map = $map;
+                for &v in &map.vals {
+                    m_val!(v);
+                }
+                for a in &map.attrs {
+                    m_val!(a.setter);
+                }
+                if let Some(c) = map.class {
+                    m_idx!(c);
+                }
+            }};
+        }
+
+        match self.heap.get(idx) {
+            HeapObj::Str(_)
+            | HeapObj::Func(_)
+            | HeapObj::Native(_)
+            | HeapObj::Date(_)
+            | HeapObj::RegExp { .. }
+            | HeapObj::ArrayBuffer { .. }
+            | HeapObj::Temporal { .. }
+            | HeapObj::BigInt(_) => {}
+            HeapObj::Cons { left, right, .. } => {
+                m_idx!(*left);
+                m_idx!(*right);
+            }
+            HeapObj::Closure { upvalues, .. } => {
+                for &u in upvalues {
+                    m_idx!(u);
+                }
+            }
+            HeapObj::Cell(v) => m_val!(*v),
+            HeapObj::Bound { target, this, args } => {
+                m_val!(*target);
+                m_val!(*this);
+                for &a in args {
+                    m_val!(a);
+                }
+            }
+            HeapObj::Array(items) => {
+                for &v in items {
+                    m_val!(v);
+                }
+            }
+            HeapObj::Object(map) => m_objmap!(map),
+            HeapObj::Promise { result, fulfill, reject, .. } => {
+                m_val!(*result);
+                for r in fulfill.iter().chain(reject.iter()) {
+                    m_val!(r.callback);
+                    m_idx!(r.dependent);
+                }
+            }
+            HeapObj::BoundResolver { promise, .. } => m_idx!(*promise),
+            HeapObj::Combinator { results, result, .. } => {
+                for &v in results {
+                    m_val!(v);
+                }
+                m_idx!(*result);
+            }
+            HeapObj::CombinatorResolver { combinator, .. } => m_idx!(*combinator),
+            HeapObj::Generator { closure, regs, .. } => {
+                m_idx!(*closure);
+                for &v in regs {
+                    m_val!(v);
+                }
+            }
+            HeapObj::AsyncGenerator(s) => {
+                m_idx!(s.closure);
+                for &v in &s.regs {
+                    m_val!(v);
+                }
+                for &q in &s.queue {
+                    m_idx!(q);
+                }
+            }
+            HeapObj::AsyncState(s) => {
+                m_idx!(s.closure);
+                for &v in &s.regs {
+                    m_val!(v);
+                }
+                m_idx!(s.result);
+            }
+            HeapObj::Map { keys, vals } | HeapObj::WeakMap { keys, vals } => {
+                for &v in keys.iter().chain(vals.iter()) {
+                    m_val!(v);
+                }
+            }
+            HeapObj::Set(items) | HeapObj::WeakSet(items) => {
+                for &v in items {
+                    m_val!(v);
+                }
+            }
+            HeapObj::WeakRef(v) => m_val!(*v),
+            HeapObj::FinalizationRegistry { cleanup, tokens } => {
+                m_val!(*cleanup);
+                for &t in tokens {
+                    m_val!(t);
+                }
+            }
+            HeapObj::Boxed { value, .. } => m_val!(*value),
+            HeapObj::TypedArray { buffer, .. } => m_idx!(*buffer),
+            HeapObj::DataView { buffer, .. } => m_idx!(*buffer),
+            HeapObj::Proxy { target, handler, .. } => {
+                m_val!(*target);
+                m_val!(*handler);
+            }
+            HeapObj::Intl { resolved, .. } => m_idx!(*resolved),
+            HeapObj::Symbol { desc, .. } => m_val!(*desc),
+            HeapObj::Iterator { items, proto, .. } => {
+                for &v in items {
+                    m_val!(v);
+                }
+                m_idx!(*proto);
+            }
+            HeapObj::IterHelper { source, arg, inner, .. } => {
+                m_val!(*source);
+                m_val!(*arg);
+                m_val!(*inner);
+            }
+            HeapObj::Class(c) => {
+                for (_, v) in c
+                    .methods
+                    .iter()
+                    .chain(c.getters.iter())
+                    .chain(c.setters.iter())
+                    .chain(c.static_getters.iter())
+                    .chain(c.static_setters.iter())
+                {
+                    m_val!(*v);
+                }
+                m_objmap!(&c.statics);
+                for &v in &c.computed_field_keys {
+                    m_val!(v);
+                }
+                if let Some(p) = c.parent {
+                    m_idx!(p);
+                }
+            }
+        }
+    }
+}

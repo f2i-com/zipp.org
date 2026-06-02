@@ -641,6 +641,10 @@ impl<'p> Vm<'p> {
             // Object.groupBy(items, cb) -> null-proto object of arrays keyed by cb's
             // (string) return; Map.groupBy -> a Map keyed by cb's value (SameValueZero).
             OBJ_GROUP_BY | MAP_GROUP_BY => {
+                // The accumulating group arrays / keys live in Rust locals (not
+                // reachable from the GC roots) while the callback re-enters the
+                // interpreter — suspend GC for the scope.
+                let _gc = self.gc_lock_guard();
                 let src = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if !(cb.is_heap() && self.heap.as_callable(cb.heap_index()).is_some()) {
