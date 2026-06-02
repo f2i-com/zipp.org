@@ -723,11 +723,10 @@ impl<'p> Vm<'p> {
                     elems = self.iterate_to_vec(src)?;
                 } else {
                     let len = self.get_prop(src, "length")?;
-                    let n = if len.is_number() && len.as_f64() >= 0.0 {
-                        len.as_f64() as usize
-                    } else {
-                        0
-                    };
+                    // ToLength: ToInteger(length) clamped to >= 0 (so a string/
+                    // boolean length like {length:"3"} is honoured).
+                    let n_i = self.to_integer_or_zero(len)?;
+                    let n = if n_i > 0 { n_i as usize } else { 0 };
                     if n > crate::vm::MAX_DENSE_ARRAY_LEN {
                         return Err(Thrown(
                             "RangeError: array length exceeds the engine's dense-array limit".into(),
