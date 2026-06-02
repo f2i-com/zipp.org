@@ -3789,7 +3789,17 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    fn assign_array_target(&mut self, arr: &ox::ArrayAssignmentTarget, src: Reg) -> R<()> {
+    fn assign_array_target(&mut self, arr: &ox::ArrayAssignmentTarget, src_in: Reg) -> R<()> {
+        // Array assignment destructuring uses the iterator protocol (like the
+        // binding form): normalize the source into an array, pulling only the
+        // needed elements (unbounded with `...rest`). IterToArray drives a custom
+        // iterable's next()/return() — so a non-array source yields the right
+        // values AND the iterator is closed when not fully consumed. A plain array
+        // takes IterToArray's no-op fast path, so indexed reads are unchanged.
+        let save_top = self.next_reg;
+        let count = if arr.rest.is_some() { u32::MAX } else { arr.elements.len() as u32 };
+        let src = self.alloc_reg();
+        self.emit(Instr::IterToArray { dst: src, src: src_in, count });
         for (i, el) in arr.elements.iter().enumerate() {
             if let Some(maybe) = el {
                 let save = self.next_reg;
@@ -3808,6 +3818,7 @@ impl<'a> FnCompiler<'a> {
             self.assign_target(&rest.target, val)?;
             self.next_reg = save;
         }
+        self.next_reg = save_top;
         Ok(())
     }
 
