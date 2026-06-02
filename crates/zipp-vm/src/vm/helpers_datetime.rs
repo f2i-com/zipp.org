@@ -146,6 +146,10 @@ pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
             sub = [ns / 1_000_000, (ns / 1_000) % 1_000, ns % 1_000];
         }
     }
+    // A leap second (:60) is accepted and clamped to :59 (per Temporal parsing).
+    if sec == 60 {
+        sec = 59;
+    }
     if !(0..24).contains(&h) || !(0..60).contains(&mi) || !(0..60).contains(&sec) {
         return None;
     }
@@ -761,6 +765,21 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
     let d = after[..2].parse::<i64>().ok()?;
     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
         return None;
+    }
+    // Validate any trailing content: a date-only string may be followed only by a
+    // calendar/annotation block "[...]" or a "T" + valid time. A bare UTC
+    // designator/offset (Z, +HH:MM) or a "T" with no time is invalid.
+    let rem = &after[2..];
+    if !rem.is_empty() {
+        if rem.starts_with('[') {
+            // calendar/time-zone annotations — accepted (not deeply validated)
+        } else if rem.starts_with(['T', 't']) {
+            if parse_iso_time(&rem[1..]).is_none() {
+                return None;
+            }
+        } else {
+            return None;
+        }
     }
     Some((y, m, d))
 }
