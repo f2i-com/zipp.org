@@ -80,6 +80,10 @@ pub const SPECIES_GET: u16 = 653;
 /// `Function.prototype.toString` — returns the function's stored source text, or
 /// the `function name() { [native code] }` form for natives/bound functions.
 pub const FN_TO_STRING: u16 = 654;
+/// `Symbol.prototype[Symbol.toPrimitive]` — returns the Symbol primitive.
+pub const SYMBOL_TO_PRIMITIVE: u16 = 655;
+/// `get Symbol.prototype.description` — the symbol's description (or undefined).
+pub const SYMBOL_DESCRIPTION_GET: u16 = 656;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -495,6 +499,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         SYMBOL_KEY_FOR => ("keyFor", 1),
         SYMBOL_TO_STRING => ("toString", 0),
         SYMBOL_VALUE_OF => ("valueOf", 0),
+        SYMBOL_TO_PRIMITIVE => ("[Symbol.toPrimitive]", 1),
+        SYMBOL_DESCRIPTION_GET => ("get description", 0),
         BIGINT_TO_STRING => ("toString", 0),
         BIGINT_VALUE_OF => ("valueOf", 0),
         BIGINT_AS_INTN => ("asIntN", 2),

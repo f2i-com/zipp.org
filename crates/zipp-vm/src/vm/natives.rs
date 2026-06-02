@@ -121,6 +121,32 @@ impl<'p> Vm<'p> {
                     ));
                 }
             }
+            SYMBOL_TO_PRIMITIVE => {
+                // `Symbol.prototype[Symbol.toPrimitive](hint)` → the Symbol itself.
+                if matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Symbol { .. })
+                ) {
+                    this
+                } else {
+                    return Err(Thrown(
+                        "TypeError: Symbol.prototype[Symbol.toPrimitive] requires that 'this' be a Symbol"
+                            .into(),
+                    ));
+                }
+            }
+            SYMBOL_DESCRIPTION_GET => {
+                // `get Symbol.prototype.description` → the symbol's description.
+                match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Symbol { desc, .. }) => *desc,
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: Symbol.prototype.description getter requires that 'this' be a Symbol"
+                                .into(),
+                        ))
+                    }
+                }
+            }
             SYMBOL_FOR => {
                 // `Symbol.for(key)`: shared registry symbol for the ToString(key).
                 let key = self.to_js_string(a0)?;

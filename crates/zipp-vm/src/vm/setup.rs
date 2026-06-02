@@ -554,6 +554,24 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(p) = self.heap.get_mut(symbol_proto) {
                 p.define("constructor", Value::heap(symbol_ctor), method_attr);
             }
+            // Symbol.prototype: @@toPrimitive (returns the symbol), @@toStringTag
+            // ("Symbol"), and `description` as a real accessor (so descriptor
+            // introspection sees it; value access still uses the fast path).
+            let to_prim = Value::heap(self.heap.alloc(HeapObj::Native(SYMBOL_TO_PRIMITIVE)));
+            let desc_get = Value::heap(self.heap.alloc(HeapObj::Native(SYMBOL_DESCRIPTION_GET)));
+            let tag = self.alloc_str("Symbol".to_string());
+            let acc_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: Value::UNDEFINED,
+            };
+            if let HeapObj::Object(p) = self.heap.get_mut(symbol_proto) {
+                p.define("@@toPrimitive", to_prim, fn_attr);
+                p.define("@@toStringTag", tag, fn_attr);
+                p.define("description", desc_get, acc_attr);
+            }
             // Well-known symbols: real symbols (non-writable/enum/configurable own
             // props of Symbol), each with its fixed `@@`-prefixed key + description.
             for &(jsname, prop_key) in native::WELL_KNOWN_SYMBOLS {
