@@ -752,6 +752,7 @@ impl<'p> Vm<'p> {
                 }
                 HeapObj::Temporal { kind: 5, fields } => year_month_string(fields[0], fields[1]),
                 HeapObj::Temporal { kind: 6, fields } => format!("{:02}-{:02}", fields[1], fields[2]),
+                HeapObj::Temporal { kind: 7, .. } => self.zdt_to_string(v.heap_index()),
                 HeapObj::Temporal { .. } => "[object Temporal]".into(),
                 HeapObj::Intl { .. } => "[object Object]".into(),
                 HeapObj::Str(s) => s.bytes.clone(),
@@ -906,6 +907,9 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Temporal { kind: 6, fields } => {
                 format!("Temporal.PlainMonthDay <{:02}-{:02}>", fields[1], fields[2])
+            }
+            HeapObj::Temporal { kind: 7, .. } => {
+                format!("Temporal.ZonedDateTime <{}>", self.zdt_to_string(v.heap_index()))
             }
             HeapObj::Temporal { .. } => "[object Temporal]".into(),
             HeapObj::Intl { kind, .. } => {

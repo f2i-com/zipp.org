@@ -1181,6 +1181,56 @@ impl<'p> Vm<'p> {
         Value::heap(idx)
     }
 
+    /// `Temporal.ZonedDateTime.from(item[, options])`. From a ZDT instance → a copy;
+    /// from a property bag `{timeZone, year, month, day, …}` → built from the local
+    /// wall-clock + zone offset; from an ISO string `…±OFF[tz]` → parsed.
+    pub(crate) fn zoned_date_time_from(&mut self, item: Value, options: Value) -> Result<Value, Thrown> {
+        let _gc = self.gc_lock_guard();
+        if item.is_heap() {
+            if let Some(ns) = self.zdt_epoch_ns(item.heap_index()) {
+                let off = self.zdt_offset_ns(item.heap_index());
+                let _ = self.read_overflow(options)?;
+                return Ok(self.make_zoned_date_time_raw(ns, off, item.heap_index()));
+            }
+            if matches!(self.heap.get(item.heap_index()), HeapObj::Object(_)) {
+                let tzv = self.get_prop(item, "timeZone")?;
+                if tzv == Value::UNDEFINED {
+                    return Err(Thrown(
+                        "TypeError: Temporal.ZonedDateTime.from requires a timeZone property".into(),
+                    ));
+                }
+                let tzstr = self.to_js_string(tzv)?;
+                let (id, offset) = parse_time_zone(&tzstr)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{tzstr}\"")))?;
+                let reject = self.read_overflow(options)?;
+                let f = self.to_plain_date_time_overflow(item, reject)?;
+                let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
+                    + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
+                return Ok(self.alloc_zdt(local - offset as i128, offset, id));
+            }
+        }
+        let s = self.to_js_string(item)?;
+        let _ = self.read_overflow(options)?;
+        let (f, offset, id) = parse_zdt_string(&s)
+            .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
+        let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
+            + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
+        Ok(self.alloc_zdt(local - offset as i128, offset, id))
+    }
+
+    /// Allocate a ZonedDateTime from epoch ns, offset, and an (owned) tz id.
+    pub(crate) fn alloc_zdt(&mut self, ns: i128, offset_ns: i64, id: String) -> Value {
+        let hi = (ns >> 64) as i64;
+        let lo = ns as i64;
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 7, fields: vec![hi, lo, offset_ns] });
+        if self.zoneddatetime_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.zoneddatetime_proto));
+        }
+        let idv = self.alloc_str(id);
+        self.zdt_tz.insert(idx, idv);
+        Value::heap(idx)
+    }
+
     /// The time-zone id string of a ZDT instance (for equality).
     fn zdt_tz_id(&self, idx: u32) -> Option<String> {
         self.zdt_tz
@@ -1603,6 +1653,30 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
         return Some((t.to_string(), 0));
     }
     None
+}
+
+/// Parse a ZonedDateTime ISO string `YYYY-MM-DDTHH:MM:SS[.fff]±OFF[tzid]` into
+/// (date-time fields, offset ns, tz id). The bracketed id may carry a leading `!`
+/// critical flag (stripped). Stage 1: uses the explicit string offset.
+fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String)> {
+    let lb = s.find('[')?;
+    let rb = s[lb..].find(']').map(|r| lb + r)?;
+    let mut tz = s[lb + 1..rb].to_string();
+    if let Some(stripped) = tz.strip_prefix('!') {
+        tz = stripped.to_string();
+    }
+    let head = &s[..lb];
+    let tpos = head.find(['T', 't', ' '])?;
+    let time = &head[tpos + 1..];
+    let (dt_end, offset_ns) = if let Some(zpos) = time.find(['Z', 'z']) {
+        (tpos + 1 + zpos, 0i64)
+    } else if let Some(opos) = time.find(['+', '-']) {
+        (tpos + 1 + opos, parse_time_zone(&time[opos..]).map(|(_, o)| o)?)
+    } else {
+        return None; // a ZonedDateTime string must carry an offset
+    };
+    let f = parse_iso_datetime(&head[..dt_end])?;
+    Some((f, offset_ns, tz))
 }
 
 /// Format a UTC offset (nanoseconds) as `±HH:MM` (or `±HH:MM:SS` when needed).

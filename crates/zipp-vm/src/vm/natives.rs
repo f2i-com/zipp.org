@@ -1659,6 +1659,18 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            ZDT_FROM => self.zoned_date_time_from(a0, a1)?,
+            ZDT_COMPARE => {
+                let za = self.zoned_date_time_from(a0, Value::UNDEFINED)?;
+                let zb = self.zoned_date_time_from(a1, Value::UNDEFINED)?;
+                let na = self.zdt_epoch_ns(za.heap_index()).unwrap_or(0);
+                let nb = self.zdt_epoch_ns(zb.heap_index()).unwrap_or(0);
+                Value::num(match na.cmp(&nb) {
+                    std::cmp::Ordering::Less => -1.0,
+                    std::cmp::Ordering::Equal => 0.0,
+                    std::cmp::Ordering::Greater => 1.0,
+                })
+            }
             PLAINMONTHDAY_FROM => {
                 let reject = self.read_overflow(a1)?;
                 let (ry, m, d) = self.to_plain_month_day_overflow(a0, reject)?;
