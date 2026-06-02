@@ -216,7 +216,8 @@ impl<'p> Vm<'p> {
             }
             return Ok(self.alloc_typed_array(buf, kind, byte_offset, length));
         }
-        // new TA(typedArray) / new TA(array | iterable) → copy element-by-element.
+        // new TA(typedArray) / new TA(array | iterable | array-like) → copy
+        // element-by-element.
         if a0.is_heap() && !a0.is_uninitialized() {
             let src: Vec<Value> = if let Some(src_ta) = self.as_typed_array(a0) {
                 let len = match self.heap.get(src_ta) {
@@ -225,7 +226,31 @@ impl<'p> Vm<'p> {
                 };
                 (0..len).map(|i| self.ta_element_get(src_ta, i)).collect()
             } else {
-                self.iterate_to_vec(a0)?
+                // A custom iterable (callable `@@iterator`) is iterated; anything
+                // else is treated as ARRAY-LIKE per InitializeTypedArrayFromArrayLike
+                // (read ToLength(`length`), then indices 0..length). The length read
+                // and each element read propagate abrupt completions.
+                let it = self.get_prop(a0, "@@iterator")?;
+                if self.is_callable(it) {
+                    self.iterate_to_vec(a0)?
+                } else {
+                    let lenv = self.get_prop(a0, "length")?;
+                    let nf = self.to_number(lenv)?;
+                    let n = if nf.is_nan() || nf <= 0.0 {
+                        0
+                    } else if nf > (MAX_ARRAY_BUFFER_LEN / size as i64) as f64 {
+                        return Err(Thrown(
+                            "RangeError: typed array length exceeds the maximum".into(),
+                        ));
+                    } else {
+                        nf as usize
+                    };
+                    let mut v = Vec::with_capacity(n);
+                    for i in 0..n {
+                        v.push(self.get_index(a0, Value::int(i as i32))?);
+                    }
+                    v
+                }
             };
             let len = src.len();
             let buf = self.alloc_array_buffer(len * size);
