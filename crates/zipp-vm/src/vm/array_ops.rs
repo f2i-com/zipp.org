@@ -450,6 +450,9 @@ impl<'p> Vm<'p> {
             }
             "reduce" => {
                 let cb = arg0;
+                if !self.is_callable(cb) {
+                    return Err(Thrown("TypeError: Reduce callback is not a function".into()));
+                }
                 let snapshot = self.array_snapshot(idx);
                 let has_init = args.len() >= 2;
                 // Seed + first index to process: with an initial value, start at
@@ -559,8 +562,15 @@ impl<'p> Vm<'p> {
             }
             "sort" => {
                 let cmp = arg0;
+                // A non-undefined, non-callable comparator is a TypeError.
+                if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
+                    return Err(Thrown(
+                        "TypeError: The comparison function must be either a function or undefined"
+                            .into(),
+                    ));
+                }
                 let mut snapshot = self.array_snapshot(idx);
-                if cmp.is_heap() && self.heap.as_callable(cmp.heap_index()).is_some() {
+                if self.is_callable(cmp) {
                     // Comparator sort: stable O(n log n) bottom-up merge sort,
                     // re-entering the VM for each comparison.
                     self.comparator_sort(&mut snapshot, cmp)?;
@@ -575,6 +585,9 @@ impl<'p> Vm<'p> {
             }
             "reduceRight" => {
                 let cb = arg0;
+                if !self.is_callable(cb) {
+                    return Err(Thrown("TypeError: Reduce callback is not a function".into()));
+                }
                 let snapshot = self.array_snapshot(idx);
                 let mut i = snapshot.len();
                 let mut acc = if args.len() >= 2 {
@@ -638,8 +651,14 @@ impl<'p> Vm<'p> {
             "toSorted" => {
                 // Like sort() but returns a NEW array; the receiver is unchanged.
                 let cmp = arg0;
+                if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
+                    return Err(Thrown(
+                        "TypeError: The comparison function must be either a function or undefined"
+                            .into(),
+                    ));
+                }
                 let mut snapshot = self.array_snapshot(idx);
-                if cmp.is_heap() && self.heap.as_callable(cmp.heap_index()).is_some() {
+                if self.is_callable(cmp) {
                     self.comparator_sort(&mut snapshot, cmp)?;
                 } else {
                     snapshot.sort_by(|a, b| self.display(*a).cmp(&self.display(*b)));
