@@ -1284,6 +1284,36 @@ impl<'p> Vm<'p> {
                 self.globals[slot] = Value::heap(v);
             }
         }
+        // `get [Symbol.species]` (a shared getter returning `this`) on every
+        // species-aware constructor — used by slice/map/etc. and required by the
+        // Symbol.species descriptor tests. Globals are assigned above, so
+        // global_by_name resolves the named ctors here.
+        {
+            let species_get = Value::heap(self.heap.alloc(HeapObj::Native(SPECIES_GET)));
+            let sp_acc = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: Value::UNDEFINED,
+            };
+            let mut ctors: Vec<u32> =
+                vec![self.ta_base_ctor, self.regexp_ctor, self.arraybuffer_ctor];
+            for n in ["Array", "Map", "Set", "Promise"] {
+                if let Some(v) = self.global_by_name(n) {
+                    if v.is_heap() {
+                        ctors.push(v.heap_index());
+                    }
+                }
+            }
+            for c in ctors {
+                if c != 0 {
+                    if let HeapObj::Object(m) = self.heap.get_mut(c) {
+                        m.define("@@species", species_get, sp_acc);
+                    }
+                }
+            }
+        }
     }
 
 }

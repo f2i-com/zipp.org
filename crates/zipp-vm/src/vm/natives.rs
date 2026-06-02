@@ -551,6 +551,8 @@ impl<'p> Vm<'p> {
                     _ => Value::num(if detached { 0.0 } else { length as f64 }), // TA_GET_LENGTH
                 }
             }
+            // `get [Symbol.species]` — returns the receiver constructor unchanged.
+            SPECIES_GET => this,
             TA_GET_TOSTRINGTAG => {
                 match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::TypedArray { kind, .. }) => {
