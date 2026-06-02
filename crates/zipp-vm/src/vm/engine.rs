@@ -116,6 +116,7 @@ impl<'p> Vm<'p> {
             array_iter_proto: 0,
             map_iter_proto: 0,
             set_iter_proto: 0,
+            string_iter_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

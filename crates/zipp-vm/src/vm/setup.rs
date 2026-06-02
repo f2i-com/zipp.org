@@ -367,6 +367,14 @@ impl<'p> Vm<'p> {
         // different identity so getPrototypeOf discriminates them).
         self.map_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
         self.set_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        // %StringIteratorPrototype% + String.prototype[@@iterator] (code points).
+        self.string_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        {
+            let it = Value::heap(self.heap.alloc(HeapObj::Native(STR_ITERATOR)));
+            if let HeapObj::Object(m) = self.heap.get_mut(str_proto) {
+                m.define("@@iterator", it, method_attr);
+            }
+        }
         // ── ES2025 Iterator Helpers ──
         // %Iterator.prototype% (the shared root holding the helper methods).
         let iter_root = build(
@@ -436,6 +444,7 @@ impl<'p> Vm<'p> {
             (self.array_iter_proto, "Array Iterator"),
             (self.map_iter_proto, "Map Iterator"),
             (self.set_iter_proto, "Set Iterator"),
+            (self.string_iter_proto, "String Iterator"),
         ] {
             self.proto_of.insert(p, Value::heap(iter_root));
             let tv = self.alloc_str(tag.to_string());

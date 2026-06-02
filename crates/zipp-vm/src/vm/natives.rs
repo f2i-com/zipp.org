@@ -147,6 +147,19 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            STR_ITERATOR => {
+                // `String.prototype[Symbol.iterator]()` — RequireObjectCoercible +
+                // ToString, then a String Iterator yielding one code POINT at a time.
+                if this.is_nullish() {
+                    return Err(Thrown(
+                        "TypeError: String.prototype[Symbol.iterator] called on null or undefined"
+                            .into(),
+                    ));
+                }
+                let s = self.to_js_string(this)?;
+                let cps: Vec<Value> = s.chars().map(|c| self.alloc_str(c.to_string())).collect();
+                self.make_iterator(cps, self.string_iter_proto)
+            }
             SYMBOL_FOR => {
                 // `Symbol.for(key)`: shared registry symbol for the ToString(key).
                 let key = self.to_js_string(a0)?;

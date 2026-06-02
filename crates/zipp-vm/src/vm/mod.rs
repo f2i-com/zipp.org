@@ -285,6 +285,7 @@ pub struct Vm<'p> {
     /// `getPrototypeOf(map.entries())` differs from a Set/Array iterator's.
     map_iter_proto: u32,
     set_iter_proto: u32,
+    string_iter_proto: u32,
     /// The `globalThis` object (an empty Object at this heap index); property
     /// access on it is routed to the global slots by name. 0 until `setup_globals`.
     global_this: u32,
