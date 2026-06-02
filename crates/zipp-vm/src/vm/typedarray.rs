@@ -7,6 +7,10 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Practical upper bound on an ArrayBuffer/TypedArray byte length. A larger
+/// request is a RangeError rather than an attempted (process-aborting) alloc.
+const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
+
 impl<'p> Vm<'p> {
     pub(crate) fn as_array_buffer(&self, v: Value) -> Option<u32> {
         (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::ArrayBuffer { .. }))
@@ -166,6 +170,24 @@ impl<'p> Vm<'p> {
         if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
             return Err(Thrown("RangeError: Invalid ArrayBuffer length".into()));
         }
+        if n > MAX_ARRAY_BUFFER_LEN as f64 {
+            return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
+        }
+        // `maxByteLength` (resizable ArrayBuffer) is at least validated for range.
+        if let Some(&opt) = args.get(1) {
+            if self.is_object_value(opt) {
+                let mbl = self.get_prop(opt, "maxByteLength")?;
+                if mbl != Value::UNDEFINED {
+                    let m = self.to_number(mbl)?;
+                    if !m.is_finite() || m < 0.0 || m.fract() != 0.0 || m > MAX_ARRAY_BUFFER_LEN as f64 {
+                        return Err(Thrown("RangeError: invalid maxByteLength".into()));
+                    }
+                    if m < n {
+                        return Err(Thrown("RangeError: maxByteLength < byteLength".into()));
+                    }
+                }
+            }
+        }
         Ok(Value::heap(self.alloc_array_buffer(n as usize)))
     }
 
@@ -220,6 +242,9 @@ impl<'p> Vm<'p> {
             let n = self.to_number(a0)?;
             if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
                 return Err(Thrown("RangeError: invalid typed array length".into()));
+            }
+            if n > (MAX_ARRAY_BUFFER_LEN / size as i64) as f64 {
+                return Err(Thrown("RangeError: typed array length exceeds the maximum".into()));
             }
             n as usize
         };
