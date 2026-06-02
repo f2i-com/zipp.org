@@ -18,11 +18,14 @@ impl<'p> Vm<'p> {
         if let HeapObj::Array(items) = self.heap.get(idx) {
             return items.clone();
         }
-        let len = self
-            .get_prop(this, "length")
-            .ok()
-            .and_then(|v| self.to_number(v).ok())
-            .unwrap_or(0.0);
+        // ToLength(Get(this, "length")): the length value is ToNumber-coerced via
+        // the full ToPrimitive path (`to_number_coerce`), so an array-like whose
+        // `length` is an object with `toString`/`valueOf` (or a getter) is honoured
+        // rather than read as 0 (the bare `&self` `to_number` can't run that code).
+        let len = match self.get_prop(this, "length") {
+            Ok(v) => self.to_number_coerce(v).unwrap_or(0.0),
+            Err(_) => 0.0,
+        };
         let len = if len.is_finite() && len > 0.0 {
             (len as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
         } else {
