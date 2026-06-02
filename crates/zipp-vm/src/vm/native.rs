@@ -67,6 +67,13 @@ pub const REGEXP_SYM_SPLIT: u16 = 644;
 pub const REGEXP_SYM_REPLACE: u16 = 645;
 pub const TA_FROM: u16 = 646;
 pub const TA_OF: u16 = 647;
+// %TypedArray%.prototype accessor getters (buffer/byteLength/byteOffset/length +
+// the @@toStringTag), defined on the prototype, not the instance.
+pub const TA_GET_BUFFER: u16 = 648;
+pub const TA_GET_BYTELENGTH: u16 = 649;
+pub const TA_GET_BYTEOFFSET: u16 = 650;
+pub const TA_GET_LENGTH: u16 = 651;
+pub const TA_GET_TOSTRINGTAG: u16 = 652;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -507,6 +514,11 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         REGEXP_SYM_REPLACE => ("[Symbol.replace]", 2),
         TA_FROM => ("from", 1),
         TA_OF => ("of", 0),
+        TA_GET_BUFFER => ("get buffer", 0),
+        TA_GET_BYTELENGTH => ("get byteLength", 0),
+        TA_GET_BYTEOFFSET => ("get byteOffset", 0),
+        TA_GET_LENGTH => ("get length", 0),
+        TA_GET_TOSTRINGTAG => ("get [Symbol.toStringTag]", 0),
         FN_CALL => ("call", 1),
         FN_APPLY => ("apply", 2),
         FN_BIND => ("bind", 1),

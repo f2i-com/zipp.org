@@ -527,6 +527,39 @@ impl<'p> Vm<'p> {
                 };
                 self.build_typed_array(kind, &[arr])?
             }
+            // %TypedArray%.prototype accessor getters. The data accessors throw on a
+            // non-TypedArray receiver; @@toStringTag returns undefined instead.
+            TA_GET_BUFFER | TA_GET_BYTELENGTH | TA_GET_BYTEOFFSET | TA_GET_LENGTH => {
+                let (buffer, kind, byte_offset, length) =
+                    match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                        Some(HeapObj::TypedArray { buffer, kind, byte_offset, length }) => {
+                            (*buffer, *kind, *byte_offset, *length)
+                        }
+                        _ => {
+                            return Err(Thrown(
+                                "TypeError: TypedArray accessor called on a non-TypedArray".into(),
+                            ))
+                        }
+                    };
+                let size = native::TA_KINDS[kind as usize].1;
+                let detached =
+                    matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. });
+                match id {
+                    TA_GET_BUFFER => Value::heap(buffer),
+                    TA_GET_BYTELENGTH => Value::num(if detached { 0.0 } else { (length * size) as f64 }),
+                    TA_GET_BYTEOFFSET => Value::num(if detached { 0.0 } else { byte_offset as f64 }),
+                    _ => Value::num(if detached { 0.0 } else { length as f64 }), // TA_GET_LENGTH
+                }
+            }
+            TA_GET_TOSTRINGTAG => {
+                match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::TypedArray { kind, .. }) => {
+                        let name = native::TA_KINDS[*kind as usize].0.to_string();
+                        self.alloc_str(name)
+                    }
+                    _ => Value::UNDEFINED,
+                }
+            }
             // `Array.prototype.{join,push}` as values: `this` is the receiver array.
             // join is generic over array-likes (array_method materializes a
             // non-array receiver); push mutates, so it still requires a real array.

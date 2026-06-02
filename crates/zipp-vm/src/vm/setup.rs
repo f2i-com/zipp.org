@@ -679,6 +679,28 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get_mut(ta_base_proto) {
                 m.define("constructor", Value::heap(ta_base_ctor), method_attr);
             }
+            // %TypedArray%.prototype accessor getters (buffer/byteLength/byteOffset/
+            // length + the @@toStringTag) — real prototype accessors (like the RegExp
+            // flag getters); instances still resolve them via the get_prop fast path.
+            for (name, getid) in [
+                ("buffer", TA_GET_BUFFER),
+                ("byteLength", TA_GET_BYTELENGTH),
+                ("byteOffset", TA_GET_BYTEOFFSET),
+                ("length", TA_GET_LENGTH),
+                ("@@toStringTag", TA_GET_TOSTRINGTAG),
+            ] {
+                let gv = Value::heap(self.heap.alloc(HeapObj::Native(getid)));
+                let acc = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: Value::UNDEFINED,
+                };
+                if let HeapObj::Object(m) = self.heap.get_mut(ta_base_proto) {
+                    m.define(name, gv, acc);
+                }
+            }
             for k in 0..native::TA_KINDS.len() {
                 let size = native::TA_KINDS[k].1;
                 let proto = build(self, &[], None);
