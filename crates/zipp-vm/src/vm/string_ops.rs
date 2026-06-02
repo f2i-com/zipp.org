@@ -47,7 +47,7 @@ impl<'p> Vm<'p> {
         // per-char loop — `s.charCodeAt(i)` scanning is a very common idiom).
         match name {
             "charCodeAt" => {
-                let i = arg0.as_f64() as i32;
+                let i = self.to_integer_or_zero(arg0)?;
                 let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
                 return Ok(Some(match c {
                     Some(c) => Value::int(c as i32),
@@ -55,7 +55,7 @@ impl<'p> Vm<'p> {
                 }));
             }
             "codePointAt" => {
-                let i = arg0.as_f64() as i32;
+                let i = self.to_integer_or_zero(arg0)?;
                 let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
                 return Ok(Some(match c {
                     Some(c) => Value::int(c as i32),
@@ -63,13 +63,13 @@ impl<'p> Vm<'p> {
                 }));
             }
             "charAt" => {
-                let i = arg0.as_f64() as i32;
+                let i = self.to_integer_or_zero(arg0)?;
                 let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
                 return Ok(Some(self.alloc_str(c.map(|c| c.to_string()).unwrap_or_default())));
             }
             "at" => {
                 let len = self.heap_char_len(idx) as i64;
-                let i = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
+                let i = self.to_integer_or_zero(arg0)?;
                 let abs = if i < 0 { i + len } else { i };
                 let c = if abs >= 0 && abs < len { self.heap_char_at(idx, abs as usize) } else { None };
                 return Ok(Some(match c {

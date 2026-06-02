@@ -596,6 +596,25 @@ impl<'p> Vm<'p> {
     /// `to_number`, which returns NaN for an un-handled object. Primitives and the
     /// already-handled heap types (Date/Boxed/Symbol/BigInt/String) defer straight
     /// to `to_number`; a plain object is reduced to a primitive first.
+    /// `ToIntegerOrInfinity(v)` clamped to `i64` — ToNumber then NaN→0, truncate
+    /// toward zero (±Infinity saturate to i64::MAX/MIN). Backs string index/
+    /// position args (`charAt`/`charCodeAt`/`at`/…), which use ToInteger, not a
+    /// plain number cast (so `"42".charAt(true)` is index 1, `"1"` is 1, etc).
+    pub(crate) fn to_integer_or_zero(&mut self, v: Value) -> Result<i64, Thrown> {
+        let n = self.to_number_coerce(v)?;
+        if n.is_nan() {
+            return Ok(0);
+        }
+        let t = n.trunc();
+        Ok(if t >= i64::MAX as f64 {
+            i64::MAX
+        } else if t <= i64::MIN as f64 {
+            i64::MIN
+        } else {
+            t as i64
+        })
+    }
+
     pub(crate) fn to_number_coerce(&mut self, v: Value) -> Result<f64, Thrown> {
         if !v.is_heap() {
             return self.to_number(v);

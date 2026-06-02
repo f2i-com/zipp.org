@@ -279,6 +279,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::FinalizationRegistry { .. }
                 | HeapObj::Date(_)
                 | HeapObj::Promise { .. }
+                | HeapObj::Boxed { .. }
         ) {
             let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             if added {

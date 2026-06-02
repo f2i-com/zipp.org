@@ -1112,7 +1112,9 @@ impl<'p> Vm<'p> {
                     3 => self.symbol_proto,
                     _ => self.bigint_proto,
                 };
-                Ok(self.proto_member(proto, key))
+                // An assigned/defined own property (`new Object(42).charAt = …`)
+                // wins over the wrapped type's prototype.
+                self.exotic_own_or_proto(obj, proto, key)
             }
             HeapObj::Date(_) => self.exotic_own_or_proto(obj, self.date_proto, key),
             HeapObj::Promise { .. } => self.exotic_own_or_proto(obj, self.promise_proto, key),
