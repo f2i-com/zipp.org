@@ -1136,6 +1136,9 @@ impl<'p> Vm<'p> {
                     Instr::HasProp { dst, key, obj } => {
                         let k = self.get(base, key);
                         let o = self.get(base, obj);
+                        // ToPropertyKey: an object key is ToString-coerced (toString/
+                        // valueOf), not rendered "[object Object]".
+                        let k = self.coerce_index_key(k)?;
                         // Proxy `has` trap (or fall through to the target).
                         let r = if let Some((target, handler, revoked)) =
                             o.is_heap().then(|| self.proxy_parts(o.heap_index())).flatten()
@@ -1255,7 +1258,8 @@ impl<'p> Vm<'p> {
                                 a0
                             }
                             S::ObjectGetOwnPropertyDescriptor => {
-                                let key = self.key_of(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                                let key =
+                                    self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                                 self.object_get_own_property_descriptor(a0, &key)
                             }
                             S::ObjectGetOwnPropertyNames => self.object_own_property_names(a0),
@@ -1584,7 +1588,7 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let kv = self.get(base, key);
                         let f = self.get(base, func);
-                        let k = self.key_of(kv);
+                        let k = self.to_property_key(kv)?;
                         self.define_object_accessor(o, &k, f, is_setter);
                         ip += 1;
                     }
@@ -1618,7 +1622,7 @@ impl<'p> Vm<'p> {
                     Instr::DeleteIndex { dst, obj, key } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
-                        let ks = self.key_of(k); // ToPropertyKey (symbol → its prop_key)
+                        let ks = self.to_property_key(k)?; // ToPropertyKey (symbol → prop_key, object → ToString)
                         let r = self.delete_property(o, &ks)?;
                         self.set(base, dst, r);
                         ip += 1;

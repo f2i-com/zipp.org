@@ -50,7 +50,7 @@ impl<'p> Vm<'p> {
                 a0
             }
             OBJ_GET_OWN_DESC => {
-                let key = self.key_of(a1);
+                let key = self.to_property_key(a1)?;
                 self.object_get_own_property_descriptor(a0, &key)
             }
             OBJ_GET_OWN_NAMES => self.object_own_property_names(a0),
@@ -69,8 +69,14 @@ impl<'p> Vm<'p> {
                 }
                 o
             }
-            PROTO_HAS_OWN => Value::bool(self.has_own_property(this, &self.key_of(a0))),
-            PROTO_PROP_ENUM => Value::bool(self.own_is_enumerable(this, &self.key_of(a0))),
+            PROTO_HAS_OWN => {
+                let k = self.to_property_key(a0)?;
+                Value::bool(self.has_own_property(this, &k))
+            }
+            PROTO_PROP_ENUM => {
+                let k = self.to_property_key(a0)?;
+                Value::bool(self.own_is_enumerable(this, &k))
+            }
             PROTO_IS_PROTO_OF => Value::bool(self.is_prototype_of(this, a0)),
             PROTO_VALUE_OF => this,
             PROTO_TO_STRING => {
@@ -687,7 +693,7 @@ impl<'p> Vm<'p> {
             }
             OBJ_HAS_OWN => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let k = self.display(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                let k = self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 Value::bool(self.has_own_property(o, &k))
             }
             OBJ_SET_PROTO_OF => {
@@ -930,7 +936,7 @@ impl<'p> Vm<'p> {
                 if receiver == a0 {
                     self.get_index(a0, a1)?
                 } else {
-                    let key = self.key_of(a1);
+                    let key = self.to_property_key(a1)?;
                     self.get_member(a0, &key, receiver)?
                 }
             }
@@ -939,7 +945,11 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: Reflect.set called on non-object".into()));
                 }
                 let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                let key = self.key_of(a1);
+                // ToPropertyKey once (an object key may have a side-effecting
+                // toString); reuse the coerced key Value for set_index so it isn't
+                // coerced a second time.
+                let kv = self.coerce_index_key(a1)?;
+                let key = self.key_of(kv);
                 // success = not blocked by a non-writable own data property, an
                 // accessor without a setter, or a new key on a non-extensible object.
                 let ok = match self.heap.get(a0.heap_index()) {
@@ -956,7 +966,7 @@ impl<'p> Vm<'p> {
                     _ => true,
                 };
                 if ok {
-                    self.set_index(a0, a1, value)?;
+                    self.set_index(a0, kv, value)?;
                 }
                 Value::bool(ok)
             }
@@ -964,13 +974,14 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.has called on non-object".into()));
                 }
-                Value::bool(self.has_property(a0, a1))
+                let kv = self.coerce_index_key(a1)?;
+                Value::bool(self.has_property(a0, kv))
             }
             REFLECT_DELETE => {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.deleteProperty called on non-object".into()));
                 }
-                let key = self.key_of(a1);
+                let key = self.to_property_key(a1)?;
                 self.delete_prop(a0, &key)
             }
             REFLECT_OWN_KEYS => {
@@ -1005,7 +1016,7 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(desc) {
                     return Err(Thrown("TypeError: Property description must be an object".into()));
                 }
-                let key = self.key_of(a1);
+                let key = self.to_property_key(a1)?;
                 // Reflect.defineProperty returns false (not throw) when the definition
                 // is rejected (non-configurable redefine, non-extensible new key).
                 match self.object_define_property(a0, &key, desc) {
@@ -1019,7 +1030,7 @@ impl<'p> Vm<'p> {
                         "TypeError: Reflect.getOwnPropertyDescriptor called on non-object".into(),
                     ));
                 }
-                let key = self.key_of(a1);
+                let key = self.to_property_key(a1)?;
                 self.object_get_own_property_descriptor(a0, &key)
             }
             REFLECT_IS_EXT => {
@@ -1219,7 +1230,7 @@ impl<'p> Vm<'p> {
                         "TypeError: Object.prototype.__define[GS]etter__: expecting a function".into(),
                     ));
                 }
-                let key = self.key_of(a0);
+                let key = self.to_property_key(a0)?;
                 let mut d = ObjMap::new();
                 d.set(if id == OBJPROTO_DEFINE_GETTER { "get" } else { "set" }, a1);
                 d.set("enumerable", Value::bool(true));
@@ -1229,7 +1240,7 @@ impl<'p> Vm<'p> {
                 Value::UNDEFINED
             }
             OBJPROTO_LOOKUP_GETTER | OBJPROTO_LOOKUP_SETTER => {
-                let key = self.key_of(a0);
+                let key = self.to_property_key(a0)?;
                 self.lookup_accessor(this, &key, id == OBJPROTO_LOOKUP_SETTER)
             }
             OBJPROTO_PROTO_GET => self.object_get_prototype_of(this),

@@ -106,11 +106,11 @@ impl<'p> Vm<'p> {
         // ── Object.prototype methods (available on every object) ──
         match name {
             "hasOwnProperty" => {
-                let key = self.key_of(args.first().copied().unwrap_or(Value::UNDEFINED));
+                let key = self.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 return Ok(Some(Value::bool(self.has_own_property(recv, &key))));
             }
             "propertyIsEnumerable" => {
-                let key = self.key_of(args.first().copied().unwrap_or(Value::UNDEFINED));
+                let key = self.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 return Ok(Some(Value::bool(self.own_is_enumerable(recv, &key))));
             }
             "isPrototypeOf" => {

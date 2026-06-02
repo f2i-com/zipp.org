@@ -8,12 +8,31 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
+    /// ToPropertyKey for a computed index: a Symbol or already-flat string keys
+    /// as-is and primitives (numbers/bool/null) fall through unchanged, but an
+    /// object key must be ToString-coerced (invoking its `toString`/`valueOf`)
+    /// rather than rendered "[object Object]" by `key_of`'s `display`. Returns the
+    /// key Value to use downstream (a fresh heap string for the coerced case).
+    pub(crate) fn coerce_index_key(&mut self, key: Value) -> Result<Value, Thrown> {
+        if key.is_heap()
+            && !matches!(
+                self.heap.get(key.heap_index()),
+                HeapObj::Symbol { .. } | HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+        {
+            let s = self.to_js_string(key)?;
+            return Ok(self.alloc_str(s));
+        }
+        Ok(key)
+    }
+
     pub(crate) fn get_index(&mut self, obj: Value, key: Value) -> Result<Value, Thrown> {
         // A rope must be materialized before random access; no-op (one tag
         // check) for arrays, objects, and already-flat strings.
         if obj.is_heap() {
             self.heap.flatten(obj.heap_index());
         }
+        let key = self.coerce_index_key(key)?;
         if !obj.is_heap() {
             // null/undefined throw; a number/boolean primitive resolves method-as-value
             // through its prototype (`(5)["toFixed"]`, `true["toString"]`).
@@ -163,6 +182,7 @@ impl<'p> Vm<'p> {
         if !obj.is_heap() {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
+        let key = self.coerce_index_key(key)?;
         let idx = obj.heap_index();
         // A TypedArray: a canonical numeric index writes the element (coerced +
         // out-of-bounds is a silent no-op); other keys go to set_prop.
