@@ -1054,6 +1054,39 @@ impl<'p> Vm<'p> {
             tn.define("PlainMonthDay", Value::heap(plainmonthday_ctor), method_attr);
             tn.define("Now", Value::heap(now_ns), method_attr);
             self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
+            // Register each Temporal type's field getters as accessor properties on
+            // its prototype (the value still resolves via get_member's fast path;
+            // this gives `getOwnPropertyDescriptor(Type.prototype, field).get` a real
+            // function and brand-checks when invoked on the wrong receiver).
+            let temporal_getter_sets: [(u32, &[&str]); 7] = [
+                (self.duration_proto, native::TEMP_G_DURATION),
+                (self.plaindate_proto, native::TEMP_G_PLAINDATE),
+                (self.plaintime_proto, native::TEMP_G_PLAINTIME),
+                (self.plaindatetime_proto, native::TEMP_G_PLAINDATETIME),
+                (self.instant_proto, native::TEMP_G_INSTANT),
+                (self.plainyearmonth_proto, native::TEMP_G_PLAINYEARMONTH),
+                (self.plainmonthday_proto, native::TEMP_G_PLAINMONTHDAY),
+            ];
+            let getter_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: Value::UNDEFINED,
+            };
+            for (proto, fields) in temporal_getter_sets {
+                for &name in fields {
+                    let idx = native::TEMPORAL_GETTER_FIELDS
+                        .iter()
+                        .position(|f| *f == name)
+                        .expect("getter field in union");
+                    let gid = native::TEMPORAL_GETTER_BASE + idx as u16;
+                    let gv = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
+                    if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                        p.define(name, gv, getter_attr);
+                    }
+                }
+            }
             // ── Intl namespace + service constructors ──
             let intl_services: Vec<(u8, &str, f64, Vec<(&str, u16)>, bool)> = vec![
                 (

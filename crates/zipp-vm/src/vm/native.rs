@@ -325,6 +325,44 @@ pub const DURATION_FIELDS: [&str; 10] = [
     "years", "months", "weeks", "days", "hours", "minutes", "seconds",
     "milliseconds", "microseconds", "nanoseconds",
 ];
+/// Temporal prototype field getters. Each unique field name has a getter native
+/// at TEMPORAL_GETTER_BASE + its index in TEMPORAL_GETTER_FIELDS; the handler
+/// brand-checks `this` is a Temporal instance and reads the field. These are
+/// registered as accessor properties on the relevant prototypes by setup so
+/// that `Object.getOwnPropertyDescriptor(Type.prototype, field).get` is a real
+/// function (the value still resolves via the fast get_member path).
+pub const TEMPORAL_GETTER_BASE: u16 = 700;
+pub const TEMPORAL_GETTER_FIELDS: &[&str] = &[
+    "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
+    "microseconds", "nanoseconds", "sign", "blank", "year", "month", "day", "dayOfWeek",
+    "dayOfYear", "weekOfYear", "daysInWeek", "daysInMonth", "daysInYear", "monthsInYear",
+    "inLeapYear", "monthCode", "calendarId", "hour", "minute", "second", "millisecond",
+    "microsecond", "nanosecond", "epochMilliseconds", "epochNanoseconds", "epochSeconds",
+    "epochMicroseconds", "era", "eraYear",
+];
+// Per-prototype getter sets (match the get_member field computations).
+pub const TEMP_G_DURATION: &[&str] = &[
+    "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
+    "microseconds", "nanoseconds", "sign", "blank",
+];
+pub const TEMP_G_PLAINDATE: &[&str] = &[
+    "year", "month", "day", "dayOfWeek", "dayOfYear", "weekOfYear", "daysInMonth",
+    "daysInYear", "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId",
+];
+pub const TEMP_G_PLAINTIME: &[&str] =
+    &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+pub const TEMP_G_PLAINDATETIME: &[&str] = &[
+    "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
+    "nanosecond", "dayOfWeek", "dayOfYear", "weekOfYear", "daysInMonth", "daysInYear",
+    "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId",
+];
+pub const TEMP_G_INSTANT: &[&str] =
+    &["epochMilliseconds", "epochNanoseconds", "epochSeconds", "epochMicroseconds"];
+pub const TEMP_G_PLAINYEARMONTH: &[&str] = &[
+    "year", "month", "monthCode", "daysInMonth", "daysInYear", "monthsInYear", "inLeapYear",
+    "era", "eraYear", "calendarId",
+];
+pub const TEMP_G_PLAINMONTHDAY: &[&str] = &["monthCode", "day", "calendarId"];
 // RegExp.prototype methods.
 pub const REGEXP_TEST: u16 = 326;
 pub const REGEXP_EXEC: u16 = 327;

@@ -39,6 +39,23 @@ impl<'p> Vm<'p> {
         use native::*;
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        // Temporal prototype field getter: brand-check `this` is a Temporal
+        // instance, then read the field (the fast get_member path computes it).
+        if (native::TEMPORAL_GETTER_BASE
+            ..native::TEMPORAL_GETTER_BASE + native::TEMPORAL_GETTER_FIELDS.len() as u16)
+            .contains(&id)
+        {
+            if !matches!(
+                this.is_heap().then(|| self.heap.get(this.heap_index())),
+                Some(HeapObj::Temporal { .. })
+            ) {
+                return Err(Thrown(
+                    "TypeError: Temporal field getter called on a non-Temporal receiver".into(),
+                ));
+            }
+            let field = native::TEMPORAL_GETTER_FIELDS[(id - native::TEMPORAL_GETTER_BASE) as usize];
+            return self.get_prop(this, field);
+        }
         Ok(match id {
             OBJ_DEFINE_PROPERTY => {
                 let key = self.to_property_key(a1)?;
