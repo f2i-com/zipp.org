@@ -1,0 +1,1243 @@
+#![allow(unused_imports)]
+use super::*;
+use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::heap::{
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
+    PropAttr, PromiseState, Reaction,
+};
+use crate::value::Value;
+
+impl<'p> Vm<'p> {
+    /// Invoke a native (built-in) function by id with `this` and `args`. Backs
+    /// first-class builtin values (`Object.defineProperty`, `Array.isArray`,
+    /// `Object.prototype.hasOwnProperty`, `Function.prototype.call`, …).
+    pub(crate) fn call_native(&mut self, id: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        use native::*;
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        Ok(match id {
+            OBJ_DEFINE_PROPERTY => {
+                let key = self.key_of(a1);
+                self.object_define_property(a0, &key, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+                a0
+            }
+            OBJ_DEFINE_PROPERTIES => {
+                self.object_define_properties(a0, a1)?;
+                a0
+            }
+            OBJ_GET_OWN_DESC => {
+                let key = self.key_of(a1);
+                self.object_get_own_property_descriptor(a0, &key)
+            }
+            OBJ_GET_OWN_NAMES => self.object_own_property_names(a0),
+            OBJ_GET_PROTO => self.object_get_prototype_of(a0),
+            OBJ_KEYS => self.object_enum_own(a0, EnumWhat::Keys),
+            OBJ_VALUES => self.object_enum_own(a0, EnumWhat::Values),
+            OBJ_ENTRIES => self.object_enum_own(a0, EnumWhat::Entries),
+            OBJ_ASSIGN => self.object_assign(args)?,
+            OBJ_CREATE => {
+                let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                if a0 != Value::UNDEFINED {
+                    self.proto_of.insert(o.heap_index(), a0);
+                }
+                if a1 != Value::UNDEFINED {
+                    self.object_define_properties(o, a1)?;
+                }
+                o
+            }
+            PROTO_HAS_OWN => Value::bool(self.has_own_property(this, &self.key_of(a0))),
+            PROTO_PROP_ENUM => Value::bool(self.own_is_enumerable(this, &self.key_of(a0))),
+            PROTO_IS_PROTO_OF => Value::bool(self.is_prototype_of(this, a0)),
+            PROTO_VALUE_OF => this,
+            PROTO_TO_STRING => {
+                let tag = self.object_to_string_tag(this)?;
+                self.alloc_str(format!("[object {tag}]"))
+            }
+            ERROR_TO_STRING => {
+                // `name` (default "Error") + ": " + `message` (default ""), dropping
+                // the separator when either part is empty.
+                let nv = self.get_prop(this, "name")?;
+                let name =
+                    if nv == Value::UNDEFINED { "Error".to_string() } else { self.to_js_string(nv)? };
+                let mv = self.get_prop(this, "message")?;
+                let msg = if mv == Value::UNDEFINED { String::new() } else { self.to_js_string(mv)? };
+                let s = if name.is_empty() {
+                    msg
+                } else if msg.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {msg}")
+                };
+                self.alloc_str(s)
+            }
+            SYMBOL_TO_STRING => {
+                // `Symbol.prototype.toString` → "Symbol(description)".
+                let desc = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Symbol { desc, .. }) => *desc,
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: Symbol.prototype.toString requires that 'this' be a Symbol"
+                                .into(),
+                        ))
+                    }
+                };
+                let d = if desc == Value::UNDEFINED { String::new() } else { self.display(desc) };
+                self.alloc_str(format!("Symbol({d})"))
+            }
+            SYMBOL_VALUE_OF => {
+                // `Symbol.prototype.valueOf` → the Symbol primitive itself.
+                if matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Symbol { .. })
+                ) {
+                    this
+                } else {
+                    return Err(Thrown(
+                        "TypeError: Symbol.prototype.valueOf requires that 'this' be a Symbol".into(),
+                    ));
+                }
+            }
+            SYMBOL_FOR => {
+                // `Symbol.for(key)`: shared registry symbol for the ToString(key).
+                let key = self.to_js_string(a0)?;
+                if let Some(&sym) = self.symbol_registry.get(&key) {
+                    sym
+                } else {
+                    let desc = self.alloc_str(key.clone());
+                    let prop_key = format!("@@for:{key}");
+                    let sym = self.make_named_symbol(desc, &prop_key);
+                    self.symbol_registry.insert(key, sym);
+                    sym
+                }
+            }
+            SYMBOL_KEY_FOR => {
+                // `Symbol.keyFor(sym)`: the registry key for a registered symbol, else undefined.
+                if !matches!(
+                    a0.is_heap().then(|| self.heap.get(a0.heap_index())),
+                    Some(HeapObj::Symbol { .. })
+                ) {
+                    return Err(Thrown(
+                        "TypeError: Symbol.keyFor requires that the argument be a Symbol".into(),
+                    ));
+                }
+                let key =
+                    self.symbol_registry.iter().find(|(_, v)| v.bits() == a0.bits()).map(|(k, _)| k.clone());
+                match key {
+                    Some(k) => self.alloc_str(k),
+                    None => Value::UNDEFINED,
+                }
+            }
+            BIGINT_TO_STRING => {
+                let n = match self.bigint_value(this) {
+                    Some(n) => n,
+                    None => {
+                        return Err(Thrown(
+                            "TypeError: BigInt.prototype.toString requires that 'this' be a BigInt".into(),
+                        ))
+                    }
+                };
+                let radix = if a0 == Value::UNDEFINED { 10 } else { self.to_number(a0)? as i64 };
+                if !(2..=36).contains(&radix) {
+                    return Err(Thrown("RangeError: toString() radix must be between 2 and 36".into()));
+                }
+                self.alloc_str(bigint_to_radix(n, radix as u32))
+            }
+            BIGINT_VALUE_OF => {
+                if self.bigint_value(this).is_some() {
+                    this
+                } else {
+                    return Err(Thrown(
+                        "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt".into(),
+                    ));
+                }
+            }
+            BIGINT_AS_INTN => {
+                let bits = self.to_number(a0)?;
+                if !bits.is_finite() || bits < 0.0 {
+                    return Err(Thrown("RangeError: Invalid bits for BigInt.asIntN".into()));
+                }
+                let x = self.to_bigint(a1)?;
+                self.make_bigint(bigint_as_intn(bits as u32, x))
+            }
+            BIGINT_AS_UINTN => {
+                let bits = self.to_number(a0)?;
+                if !bits.is_finite() || bits < 0.0 {
+                    return Err(Thrown("RangeError: Invalid bits for BigInt.asUintN".into()));
+                }
+                let x = self.to_bigint(a1)?;
+                self.make_bigint(bigint_as_uintn(bits as u32, x))
+            }
+            REGEXP_EXEC => {
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
+                    ));
+                }
+                self.regexp_exec(this.heap_index(), a0)?
+            }
+            REGEXP_TEST => {
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.test called on a non-RegExp".into(),
+                    ));
+                }
+                let r = self.regexp_exec(this.heap_index(), a0)?;
+                Value::bool(r != Value::NULL)
+            }
+            REGEXP_TO_STRING => {
+                let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::RegExp { source, flags, .. }) => (
+                        if source.is_empty() { "(?:)".to_string() } else { source.clone() },
+                        flags.clone(),
+                    ),
+                    _ => {
+                        let s = self.get_prop(this, "source")?;
+                        let f = self.get_prop(this, "flags")?;
+                        (self.to_js_string(s)?, self.to_js_string(f)?)
+                    }
+                };
+                self.alloc_str(format!("/{src}/{flg}"))
+            }
+            FN_CALL => {
+                let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
+                self.call_value(this, a0, rest)?
+            }
+            FN_APPLY => {
+                let callargs = if a1.is_heap() { self.iterate_to_vec(a1)? } else { Vec::new() };
+                self.call_value(this, a0, &callargs)?
+            }
+            FN_BIND => {
+                let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+                Value::heap(self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound }))
+            }
+            ARR_IS_ARRAY => {
+                Value::bool(a0.is_heap() && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_)))
+            }
+            ARR_FROM => self.array_from(a0, a1)?,
+            ARR_OF => Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec()))),
+            // `Array.prototype.{join,push}` as values: `this` is the receiver array.
+            // join is generic over array-likes (array_method materializes a
+            // non-array receiver); push mutates, so it still requires a real array.
+            ARR_JOIN => {
+                if this.is_heap() {
+                    self.array_method(this.heap_index(), "join", args)?.unwrap_or(Value::UNDEFINED)
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            ARR_PUSH => {
+                if this.is_heap() && matches!(self.heap.get(this.heap_index()), HeapObj::Array(_)) {
+                    self.array_method(this.heap_index(), "push", args)?.unwrap_or(Value::UNDEFINED)
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            // More Object statics as values.
+            OBJ_IS => {
+                let a = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let b = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                Value::bool(self.same_value(a, b))
+            }
+            OBJ_HAS_OWN => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let k = self.display(args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                Value::bool(self.has_own_property(o, &k))
+            }
+            OBJ_SET_PROTO_OF => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let proto = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if o.is_heap() {
+                    self.proto_of.insert(o.heap_index(), proto);
+                }
+                o
+            }
+            OBJ_GET_OWN_SYMBOLS => {
+                // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
+                // back to their Symbol values via the prop_key registry.
+                let mut syms: Vec<Value> = Vec::new();
+                if a0.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
+                        let keys: Vec<String> =
+                            m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect();
+                        for k in keys {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
+                    }
+                }
+                Value::heap(self.heap.alloc(HeapObj::Array(syms)))
+            }
+            OBJ_FROM_ENTRIES => {
+                let src = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let entries = if src.is_heap() { self.iterate_to_vec(src)? } else { Vec::new() };
+                let mut map = ObjMap::new();
+                for e in entries {
+                    let k = self.get_index(e, Value::int(0))?;
+                    let v = self.get_index(e, Value::int(1))?;
+                    let ks = self.display(k);
+                    map.set(&ks, v);
+                }
+                Value::heap(self.heap.alloc(HeapObj::Object(map)))
+            }
+            OBJ_GET_OWN_DESCS => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let names = self.object_own_property_names(o);
+                let keys: Vec<Value> = match self.heap.get(names.heap_index()) {
+                    HeapObj::Array(items) => items.clone(),
+                    _ => Vec::new(),
+                };
+                let mut map = ObjMap::new();
+                for kv in keys {
+                    let ks = self.display(kv);
+                    let desc = self.object_get_own_property_descriptor(o, &ks);
+                    map.set(&ks, desc);
+                }
+                Value::heap(self.heap.alloc(HeapObj::Object(map)))
+            }
+            // Integrity traits. Non-object arguments pass through unchanged
+            // (freeze/seal/preventExtensions) or report as already-locked
+            // (isFrozen/isSealed -> true, isExtensible -> false), per ES2015+.
+            OBJ_FREEZE => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if o.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                        m.freeze();
+                    }
+                }
+                o
+            }
+            OBJ_SEAL => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if o.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                        m.seal();
+                    }
+                }
+                o
+            }
+            OBJ_PREVENT_EXT => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if o.is_heap() {
+                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                        m.extensible = false;
+                    }
+                }
+                o
+            }
+            OBJ_IS_FROZEN => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let frozen = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
+                    Some(HeapObj::Object(m)) => m.is_frozen(),
+                    _ => true,
+                };
+                Value::bool(frozen)
+            }
+            OBJ_IS_SEALED => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let sealed = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
+                    Some(HeapObj::Object(m)) => m.is_sealed(),
+                    _ => true,
+                };
+                Value::bool(sealed)
+            }
+            OBJ_IS_EXT => {
+                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let ext = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
+                    Some(HeapObj::Object(m)) => m.extensible,
+                    _ => false,
+                };
+                Value::bool(ext)
+            }
+            // Object.groupBy(items, cb) -> null-proto object of arrays keyed by cb's
+            // (string) return; Map.groupBy -> a Map keyed by cb's value (SameValueZero).
+            OBJ_GROUP_BY | MAP_GROUP_BY => {
+                let src = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if !(cb.is_heap() && self.heap.as_callable(cb.heap_index()).is_some()) {
+                    return Err(Thrown("TypeError: groupBy callback is not callable".into()));
+                }
+                if !src.is_heap() {
+                    return Err(Thrown("TypeError: groupBy items is not iterable".into()));
+                }
+                let items = self.iterate_to_vec(src)?;
+                if id == OBJ_GROUP_BY {
+                    let mut map = ObjMap::new();
+                    for (i, item) in items.into_iter().enumerate() {
+                        let key = self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
+                        let ks = self.display(key);
+                        match map.get(&ks) {
+                            Some(arr) => {
+                                if let HeapObj::Array(a) = self.heap.get_mut(arr.heap_index()) {
+                                    a.push(item);
+                                }
+                            }
+                            None => {
+                                let arr = Value::heap(self.heap.alloc(HeapObj::Array(vec![item])));
+                                map.set(&ks, arr);
+                            }
+                        }
+                    }
+                    let result = self.heap.alloc(HeapObj::Object(map));
+                    self.proto_of.insert(result, Value::NULL); // null prototype per spec
+                    Value::heap(result)
+                } else {
+                    let mut keys: Vec<Value> = Vec::new();
+                    let mut vals: Vec<Value> = Vec::new();
+                    for (i, item) in items.into_iter().enumerate() {
+                        let mut key = self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
+                        if key.is_number() && key.as_f64() == 0.0 {
+                            key = Value::int(0); // Map normalizes -0 to +0
+                        }
+                        match keys.iter().position(|k| self.same_value_zero(*k, key)) {
+                            Some(pos) => {
+                                if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index()) {
+                                    a.push(item);
+                                }
+                            }
+                            None => {
+                                keys.push(key);
+                                vals.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![item]))));
+                            }
+                        }
+                    }
+                    Value::heap(self.heap.alloc(HeapObj::Map { keys, vals }))
+                }
+            }
+            // Promise.withResolvers() -> { promise, resolve, reject }.
+            PROMISE_WITH_RESOLVERS => {
+                let p = self.alloc_promise();
+                let resolve = Value::heap(
+                    self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
+                );
+                let reject = Value::heap(
+                    self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true }),
+                );
+                let mut map = ObjMap::new();
+                map.set("promise", Value::heap(p));
+                map.set("resolve", resolve);
+                map.set("reject", reject);
+                Value::heap(self.heap.alloc(HeapObj::Object(map)))
+            }
+            // Reflect namespace. apply/construct accept any callable target; the
+            // property-reflecting methods require Type(target) === Object (else TypeError).
+            REFLECT_APPLY => {
+                let target = a0;
+                let this_arg = a1;
+                let args_list = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let arg_vec =
+                    if args_list.is_heap() { self.array_snapshot(args_list.heap_index()) } else { Vec::new() };
+                self.call_value(target, this_arg, &arg_vec)?
+            }
+            REFLECT_CONSTRUCT => {
+                let target = a0;
+                if !self.is_constructor(target) {
+                    return Err(Thrown("TypeError: Reflect.construct target is not a constructor".into()));
+                }
+                // An explicit newTarget (3rd arg) must also be a constructor. We
+                // don't model newTarget-driven prototype selection, but the throw is
+                // what test262's isConstructor relies on.
+                if let Some(nt) = args.get(2) {
+                    if !self.is_constructor(*nt) {
+                        return Err(Thrown(
+                            "TypeError: Reflect.construct newTarget is not a constructor".into(),
+                        ));
+                    }
+                }
+                let arg_vec = if a1.is_heap() { self.array_snapshot(a1.heap_index()) } else { Vec::new() };
+                self.construct(target, &arg_vec)?
+            }
+            REFLECT_GET => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.get called on non-object".into()));
+                }
+                self.get_index(a0, a1)?
+            }
+            REFLECT_SET => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.set called on non-object".into()));
+                }
+                let value = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let key = self.key_of(a1);
+                // success = not blocked by a non-writable own data property, an
+                // accessor without a setter, or a new key on a non-extensible object.
+                let ok = match self.heap.get(a0.heap_index()) {
+                    HeapObj::Object(m) => match m.pos(&key) {
+                        Some(i) => {
+                            if m.attrs[i].accessor {
+                                m.attrs[i].setter != Value::UNDEFINED
+                            } else {
+                                m.attrs[i].writable
+                            }
+                        }
+                        None => m.extensible,
+                    },
+                    _ => true,
+                };
+                if ok {
+                    self.set_index(a0, a1, value)?;
+                }
+                Value::bool(ok)
+            }
+            REFLECT_HAS => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.has called on non-object".into()));
+                }
+                Value::bool(self.has_property(a0, a1))
+            }
+            REFLECT_DELETE => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.deleteProperty called on non-object".into()));
+                }
+                let key = self.key_of(a1);
+                self.delete_prop(a0, &key)
+            }
+            REFLECT_OWN_KEYS => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.ownKeys called on non-object".into()));
+                }
+                self.object_own_property_names(a0)
+            }
+            REFLECT_GET_PROTO => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.getPrototypeOf called on non-object".into()));
+                }
+                self.object_get_prototype_of(a0)
+            }
+            REFLECT_SET_PROTO => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.setPrototypeOf called on non-object".into()));
+                }
+                if a1 != Value::NULL && !self.is_object_value(a1) {
+                    return Err(Thrown(
+                        "TypeError: Reflect.setPrototypeOf prototype must be an object or null".into(),
+                    ));
+                }
+                self.proto_of.insert(a0.heap_index(), a1);
+                Value::bool(true)
+            }
+            REFLECT_DEFINE => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.defineProperty called on non-object".into()));
+                }
+                let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_object_value(desc) {
+                    return Err(Thrown("TypeError: Property description must be an object".into()));
+                }
+                let key = self.key_of(a1);
+                // Reflect.defineProperty returns false (not throw) when the definition
+                // is rejected (non-configurable redefine, non-extensible new key).
+                match self.object_define_property(a0, &key, desc) {
+                    Ok(()) => Value::bool(true),
+                    Err(_) => Value::bool(false),
+                }
+            }
+            REFLECT_GET_OWN_DESC => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Reflect.getOwnPropertyDescriptor called on non-object".into(),
+                    ));
+                }
+                let key = self.key_of(a1);
+                self.object_get_own_property_descriptor(a0, &key)
+            }
+            REFLECT_IS_EXT => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.isExtensible called on non-object".into()));
+                }
+                let ext = match self.heap.get(a0.heap_index()) {
+                    HeapObj::Object(m) => m.extensible,
+                    _ => true,
+                };
+                Value::bool(ext)
+            }
+            REFLECT_PREVENT_EXT => {
+                if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: Reflect.preventExtensions called on non-object".into()));
+                }
+                if let HeapObj::Object(m) = self.heap.get_mut(a0.heap_index()) {
+                    m.extensible = false;
+                }
+                Value::bool(true)
+            }
+            // JSON namespace methods as values (`JSON.parse`/`JSON.stringify`).
+            // (The direct `JSON.parse(x)` call form is compile-lowered to a JSON op;
+            // these back the value form + reflection.)
+            JSON_PARSE => {
+                let s = self.display(a0);
+                self.json_parse(&s)?
+            }
+            JSON_STRINGIFY => {
+                let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let indent = self.json_indent(space);
+                match self.json_value(a0, &indent, 0) {
+                    Some(s) => self.alloc_str(s),
+                    None => Value::UNDEFINED,
+                }
+            }
+            // `Math.random` as a value (the call form uses the Random op). xorshift64*.
+            MATH_RANDOM => {
+                let mut x = self.rng_state;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.rng_state = x;
+                let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                Value::num((r >> 11) as f64 / (1u64 << 53) as f64)
+            }
+            // WeakMap/WeakSet methods (brand-checked + object-key validated inside).
+            WM_GET => self.weakmap_method(this, "get", args)?,
+            WM_SET => self.weakmap_method(this, "set", args)?,
+            WM_HAS => self.weakmap_method(this, "has", args)?,
+            WM_DELETE => self.weakmap_method(this, "delete", args)?,
+            WS_ADD => self.weakset_method(this, "add", args)?,
+            WS_HAS => self.weakset_method(this, "has", args)?,
+            WS_DELETE => self.weakset_method(this, "delete", args)?,
+            WR_DEREF => {
+                match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::WeakRef(t)) => *t, // no GC → target always live
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: WeakRef.prototype.deref called on incompatible receiver".into(),
+                        ))
+                    }
+                }
+            }
+            FR_REGISTER => self.finreg_method(this, "register", args)?,
+            FR_UNREGISTER => self.finreg_method(this, "unregister", args)?,
+            ITER_NEXT => {
+                let (val, done) = match this.is_heap().then(|| self.heap.get_mut(this.heap_index())) {
+                    Some(HeapObj::Iterator { items, index, .. }) => {
+                        if *index < items.len() {
+                            let v = items[*index];
+                            *index += 1;
+                            (v, false)
+                        } else {
+                            (Value::UNDEFINED, true)
+                        }
+                    }
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: Iterator.prototype.next called on incompatible receiver".into(),
+                        ))
+                    }
+                };
+                let mut m = ObjMap::new();
+                m.set("value", val);
+                m.set("done", Value::bool(done));
+                Value::heap(self.heap.alloc(HeapObj::Object(m)))
+            }
+            ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
+            // Number static methods as values (no coercion, per spec).
+            NUM_IS_INTEGER => Value::bool(num_is_integer(a0)),
+            NUM_IS_NAN => Value::bool(a0.is_double() && a0.as_f64().is_nan()),
+            NUM_IS_FINITE => Value::bool(num_is_finite(a0)),
+            NUM_IS_SAFE_INTEGER => Value::bool(num_is_safe_integer(a0)),
+            // Global functions as values.
+            GLOBAL_PARSE_INT => {
+                let s = self.display(a0);
+                let radix = if args.len() >= 2 { self.to_number(a1)? as i32 } else { 0 };
+                Value::num(parse_int(&s, radix))
+            }
+            GLOBAL_PARSE_FLOAT => Value::num(parse_float(&self.display(a0))),
+            GLOBAL_IS_NAN => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan()),
+            GLOBAL_IS_FINITE => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite()),
+            // String static methods.
+            STR_FROM_CHAR_CODE => {
+                let mut s = String::new();
+                for &v in args {
+                    let u = to_uint32(self.to_number(v).unwrap_or(0.0)) as u16;
+                    s.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}'));
+                }
+                self.alloc_str(s)
+            }
+            STR_FROM_CODE_POINT => {
+                let mut s = String::new();
+                for &v in args {
+                    let n = self.to_number(v)?;
+                    if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
+                        return Err(Thrown(format!("RangeError: Invalid code point {n}")));
+                    }
+                    // A lone-surrogate code point can't be a Rust char → replacement.
+                    s.push(char::from_u32(n as u32).unwrap_or('\u{FFFD}'));
+                }
+                self.alloc_str(s)
+            }
+            // Date static methods as values.
+            DATE_NOW => Value::num(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(0.0),
+            ),
+            DATE_PARSE => Value::num(parse_date(&self.display(a0))),
+            DATE_UTC => Value::num(self.date_utc_ms(args)?),
+            STR_RAW => {
+                // String.raw(template, ...subs): interleave template.raw[i] with subs[i].
+                let raw = self.get_prop(a0, "raw")?;
+                if !raw.is_heap() {
+                    return Ok(self.alloc_str(String::new()));
+                }
+                let len_v = self.get_prop(raw, "length")?;
+                let n = self.to_number(len_v)?;
+                let raw_len = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
+                let subs = args.get(1..).unwrap_or(&[]);
+                let mut out = String::new();
+                for i in 0..raw_len {
+                    let seg = self.get_index(raw, Value::int(i as i32))?;
+                    out.push_str(&self.display(seg));
+                    if i + 1 == raw_len {
+                        break;
+                    }
+                    if let Some(sub) = subs.get(i) {
+                        out.push_str(&self.display(*sub));
+                    }
+                }
+                self.alloc_str(out)
+            }
+            // Object.prototype.toLocaleString() → this.toString().
+            PROTO_TO_LOCALE_STRING => {
+                let ts = self.get_prop(this, "toString")?;
+                if self.is_callable(ts) {
+                    self.call_value(ts, this, &[])?
+                } else {
+                    return Err(Thrown("TypeError: toString is not callable".into()));
+                }
+            }
+            // `Math.<op>` as a value (`Math.abs`, `Math.max`, …). The direct call
+            // form is compile-lowered to MathOp; these back the value form.
+            _ if native::math_method(id).is_some() => {
+                let (_, op, _) = native::math_method(id).unwrap();
+                Value::num(self.eval_math_args(op, args)?)
+            }
+            // Promise static methods invoked as values (`Promise.resolve`, …).
+            PROMISE_RESOLVE => {
+                let p = self.to_promise(args.first().copied().unwrap_or(Value::UNDEFINED));
+                Value::heap(p)
+            }
+            PROMISE_REJECT => {
+                let p = self.alloc_promise();
+                self.reject(p, args.first().copied().unwrap_or(Value::UNDEFINED));
+                Value::heap(p)
+            }
+            PROMISE_ALL => self.promise_combine(crate::heap::CombKind::All, args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            PROMISE_ALLSETTLED => self.promise_combine(crate::heap::CombKind::AllSettled, args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            PROMISE_RACE => self.promise_combine(crate::heap::CombKind::Race, args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            PROMISE_ANY => self.promise_combine(crate::heap::CombKind::Any, args.first().copied().unwrap_or(Value::UNDEFINED))?,
+            // `%TypedArray%.prototype.<m>` invoked as a value (`.map.call(ta, …)`).
+            _ if (TA_METHOD_BASE..TA_METHOD_BASE + TA_PROTO_METHODS.len() as u16).contains(&id) => {
+                let m = TA_PROTO_METHODS[(id - TA_METHOD_BASE) as usize];
+                if !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::TypedArray { .. })) {
+                    return Err(Thrown(format!(
+                        "TypeError: TypedArray.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.typed_array_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            _ if (DV_METHOD_BASE..DV_METHOD_BASE + DV_PROTO_METHODS.len() as u16).contains(&id) => {
+                let m = DV_PROTO_METHODS[(id - DV_METHOD_BASE) as usize];
+                if !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::DataView { .. })) {
+                    return Err(Thrown(format!(
+                        "TypeError: DataView.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.dataview_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            ARRAYBUFFER_SLICE => {
+                if !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::ArrayBuffer { .. })) {
+                    return Err(Thrown(
+                        "TypeError: ArrayBuffer.prototype.slice called on incompatible receiver".into(),
+                    ));
+                }
+                self.arraybuffer_method(this.heap_index(), "slice", args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PROXY_REVOCABLE => {
+                // Proxy.revocable(target, handler) → { proxy, revoke }.
+                let p = self.make_proxy(a0, a1)?;
+                let revoke_fn = self.heap.alloc(HeapObj::Native(PROXY_REVOKE));
+                let revoke = Value::heap(self.heap.alloc(HeapObj::Bound {
+                    target: Value::heap(revoke_fn),
+                    this: p,
+                    args: Vec::new(),
+                }));
+                let mut m = ObjMap::new();
+                m.set("proxy", p);
+                m.set("revoke", revoke);
+                Value::heap(self.heap.alloc(HeapObj::Object(m)))
+            }
+            PROXY_REVOKE => {
+                if this.is_heap() {
+                    if let HeapObj::Proxy { revoked, .. } = self.heap.get_mut(this.heap_index()) {
+                        *revoked = true;
+                    }
+                }
+                Value::UNDEFINED
+            }
+            _ if (TEMPORAL_M_BASE..TEMPORAL_M_BASE + TEMPORAL_DURATION_METHODS.len() as u16)
+                .contains(&id) =>
+            {
+                let m = TEMPORAL_DURATION_METHODS[(id - TEMPORAL_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 0, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.Duration.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            TEMPORAL_DURATION_FROM => {
+                let f = self.to_duration(a0)?;
+                self.make_duration(f)
+            }
+            TEMPORAL_DURATION_COMPARE => {
+                let fa = self.to_duration(a0)?;
+                let fb = self.to_duration(a1)?;
+                // Approximate total (24h days, 7-day weeks; y/mo need relativeTo).
+                let tot = |f: &[i64; 10]| -> i128 {
+                    ((f[2] * 7 + f[3]) as i128) * 86_400_000_000_000
+                        + (f[4] as i128) * 3_600_000_000_000
+                        + (f[5] as i128) * 60_000_000_000
+                        + (f[6] as i128) * 1_000_000_000
+                        + (f[7] as i128) * 1_000_000
+                        + (f[8] as i128) * 1_000
+                        + (f[9] as i128)
+                };
+                let (a, b) = (tot(&fa), tot(&fb));
+                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+            }
+            _ if (PD_M_BASE..PD_M_BASE + PLAINDATE_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINDATE_METHODS[(id - PD_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 1, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainDate.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PLAINDATE_FROM => {
+                let (y, m, d) = self.to_plain_date(a0)?;
+                self.make_plain_date(y, m, d)?
+            }
+            PLAINDATE_COMPARE => {
+                let a = self.to_plain_date(a0)?;
+                let b = self.to_plain_date(a1)?;
+                let ea = iso_to_epoch_days(a.0, a.1, a.2);
+                let eb = iso_to_epoch_days(b.0, b.1, b.2);
+                Value::num(if ea < eb { -1.0 } else if ea > eb { 1.0 } else { 0.0 })
+            }
+            _ if (PT_M_BASE..PT_M_BASE + PLAINTIME_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINTIME_METHODS[(id - PT_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 2, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainTime.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PLAINTIME_FROM => {
+                let f = self.to_plain_time(a0)?;
+                self.make_plain_time(f)?
+            }
+            PLAINTIME_COMPARE => {
+                let a = self.to_plain_time(a0)?;
+                let b = self.to_plain_time(a1)?;
+                let (ta, tb) = (time_to_ns(&a), time_to_ns(&b));
+                Value::num(if ta < tb { -1.0 } else if ta > tb { 1.0 } else { 0.0 })
+            }
+            _ if (PDT_M_BASE..PDT_M_BASE + PLAINDATETIME_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINDATETIME_METHODS[(id - PDT_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 3, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainDateTime.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PLAINDATETIME_FROM => {
+                let f = self.to_plain_date_time(a0)?;
+                self.make_plain_date_time(f)?
+            }
+            PLAINDATETIME_COMPARE => {
+                let a = self.to_plain_date_time(a0)?;
+                let b = self.to_plain_date_time(a1)?;
+                let an = iso_to_epoch_days(a[0], a[1], a[2]) as i128 * 86_400_000_000_000
+                    + time_to_ns(&[a[3], a[4], a[5], a[6], a[7], a[8]]);
+                let bn = iso_to_epoch_days(b[0], b[1], b[2]) as i128 * 86_400_000_000_000
+                    + time_to_ns(&[b[3], b[4], b[5], b[6], b[7], b[8]]);
+                Value::num(if an < bn { -1.0 } else if an > bn { 1.0 } else { 0.0 })
+            }
+            _ if (INST_M_BASE..INST_M_BASE + INSTANT_METHODS.len() as u16).contains(&id) => {
+                let m = INSTANT_METHODS[(id - INST_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 4, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.Instant.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            INST_FROM => {
+                let ns = self.to_instant_ns(a0)?;
+                self.make_instant(ns)?
+            }
+            INST_FROM_EPOCH_MS => {
+                let ns = (self.to_number(a0)? as i128) * 1_000_000;
+                self.make_instant(ns)?
+            }
+            INST_FROM_EPOCH_SEC => {
+                let ns = (self.to_number(a0)? as i128) * 1_000_000_000;
+                self.make_instant(ns)?
+            }
+            INST_FROM_EPOCH_NS => {
+                let ns = self.to_bigint(a0)?;
+                self.make_instant(ns)?
+            }
+            INST_FROM_EPOCH_US => {
+                let ns = self.to_bigint(a0)? * 1_000;
+                self.make_instant(ns)?
+            }
+            INST_COMPARE => {
+                let a = self.to_instant_ns(a0)?;
+                let b = self.to_instant_ns(a1)?;
+                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+            }
+            _ if (PYM_M_BASE..PYM_M_BASE + PLAINYEARMONTH_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINYEARMONTH_METHODS[(id - PYM_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 5, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainYearMonth.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PLAINYEARMONTH_FROM => {
+                let (y, m, rd) = self.to_plain_year_month(a0)?;
+                self.make_plain_year_month(y, m, rd)?
+            }
+            PLAINYEARMONTH_COMPARE => {
+                let a = self.to_plain_year_month(a0)?;
+                let b = self.to_plain_year_month(a1)?;
+                let ka = a.0 * 12 + a.1;
+                let kb = b.0 * 12 + b.1;
+                Value::num(if ka < kb { -1.0 } else if ka > kb { 1.0 } else { 0.0 })
+            }
+            _ if (PMD_M_BASE..PMD_M_BASE + PLAINMONTHDAY_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINMONTHDAY_METHODS[(id - PMD_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 6, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainMonthDay.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PLAINMONTHDAY_FROM => {
+                let (ry, m, d) = self.to_plain_month_day(a0)?;
+                self.make_plain_month_day(m, d, ry)?
+            }
+            // Temporal.Now — no timezone DB, so everything reports UTC.
+            NOW_INSTANT => {
+                let ns = Self::now_epoch_ns();
+                self.make_instant(ns)?
+            }
+            NOW_PLAINDATETIME_ISO => {
+                let ns = Self::now_epoch_ns();
+                let days = ns.div_euclid(DAY_NS);
+                let t = ns_to_time(ns.rem_euclid(DAY_NS));
+                let (y, mo, d) = epoch_days_to_iso(days as i64);
+                self.make_plain_date_time([y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]])?
+            }
+            NOW_PLAINDATE_ISO => {
+                let ns = Self::now_epoch_ns();
+                let (y, mo, d) = epoch_days_to_iso(ns.div_euclid(DAY_NS) as i64);
+                self.make_plain_date(y, mo, d)?
+            }
+            NOW_PLAINTIME_ISO => {
+                let ns = Self::now_epoch_ns();
+                self.make_plain_time(ns_to_time(ns.rem_euclid(DAY_NS)))?
+            }
+            NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
+            // ── Intl ──
+            INTL_GET_CANONICAL_LOCALES => {
+                let list = self.canonicalize_locale_list(a0)?;
+                let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
+                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+            }
+            INTL_SUPPORTED_VALUES_OF => {
+                let key = self.to_js_string(a0)?;
+                let vals: &[&str] = match key.as_str() {
+                    "calendar" => &["gregory", "iso8601"],
+                    "collation" => &["default"],
+                    "currency" => &["USD", "EUR", "GBP", "JPY"],
+                    "numberingSystem" => &["latn"],
+                    "timeZone" => &["UTC"],
+                    "unit" => &["meter", "second", "byte"],
+                    _ => {
+                        return Err(Thrown(format!(
+                            "RangeError: invalid key for supportedValuesOf: {key}"
+                        )))
+                    }
+                };
+                let items: Vec<Value> = vals.iter().map(|s| self.alloc_str(s.to_string())).collect();
+                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+            }
+            INTL_SUPPORTED_LOCALES_OF => {
+                let list = self.canonicalize_locale_list(a0)?;
+                let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
+                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+            }
+            INTL_RESOLVED_OPTIONS => {
+                let resolved = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Intl { resolved, .. }) => *resolved,
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: resolvedOptions called on an incompatible receiver".into(),
+                        ))
+                    }
+                };
+                self.clone_plain_object(resolved)
+            }
+            INTL_NF_FORMAT => {
+                let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "format")?;
+                self.intl_number_format(resolved, a0)?
+            }
+            INTL_NF_FORMAT_TO_PARTS => {
+                let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "formatToParts")?;
+                let formatted = self.intl_number_format(resolved, a0)?;
+                let mut part = ObjMap::new();
+                let ty = self.alloc_str("integer".to_string());
+                part.set("type", ty);
+                part.set("value", formatted);
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+            }
+            INTL_DTF_FORMAT => {
+                let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "format")?;
+                let ms = if a0 == Value::UNDEFINED {
+                    (Self::now_epoch_ns() / 1_000_000) as f64
+                } else {
+                    self.to_number(a0)?
+                };
+                let s = self.dtf_format(resolved, ms);
+                self.alloc_str(s)
+            }
+            INTL_DTF_FORMAT_TO_PARTS => {
+                let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, "formatToParts")?;
+                let ms = if a0 == Value::UNDEFINED {
+                    (Self::now_epoch_ns() / 1_000_000) as f64
+                } else {
+                    self.to_number(a0)?
+                };
+                let s = self.dtf_format(resolved, ms);
+                let mut part = ObjMap::new();
+                let ty = self.alloc_str("literal".to_string());
+                part.set("type", ty);
+                let sv = self.alloc_str(s);
+                part.set("value", sv);
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+            }
+            INTL_COLLATOR_COMPARE => {
+                let _ = self.intl_this(this, INTL_COLLATOR, "compare")?;
+                let a = self.to_js_string(a0)?;
+                let b = self.to_js_string(a1)?;
+                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+            }
+            INTL_PLURAL_SELECT => {
+                let _ = self.intl_this(this, INTL_PLURALRULES, "select")?;
+                let n = self.to_number(a0)?;
+                let cat = if n == 1.0 { "one" } else { "other" };
+                self.alloc_str(cat.to_string())
+            }
+            INTL_PLURAL_SELECT_RANGE => {
+                let _ = self.intl_this(this, INTL_PLURALRULES, "selectRange")?;
+                self.alloc_str("other".to_string())
+            }
+            INTL_LIST_FORMAT => {
+                let resolved = self.intl_this(this, INTL_LISTFORMAT, "format")?;
+                let items = self.iterate_to_vec(a0)?;
+                let mut strs: Vec<String> = Vec::with_capacity(items.len());
+                for v in items {
+                    strs.push(self.to_js_string(v)?);
+                }
+                let t = self.display(self.intl_slot(resolved, "type"));
+                let conj = if t == "disjunction" { "or" } else { "and" };
+                let s = format_list_en(&strs, conj);
+                self.alloc_str(s)
+            }
+            INTL_LIST_FORMAT_TO_PARTS => {
+                let resolved = self.intl_this(this, INTL_LISTFORMAT, "formatToParts")?;
+                let items = self.iterate_to_vec(a0)?;
+                let mut strs: Vec<String> = Vec::with_capacity(items.len());
+                for v in items {
+                    strs.push(self.to_js_string(v)?);
+                }
+                let t = self.display(self.intl_slot(resolved, "type"));
+                let conj = if t == "disjunction" { "or" } else { "and" };
+                let s = format_list_en(&strs, conj);
+                let mut part = ObjMap::new();
+                let ty = self.alloc_str("literal".to_string());
+                part.set("type", ty);
+                let sv = self.alloc_str(s);
+                part.set("value", sv);
+                let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+            }
+            INTL_RTF_FORMAT | INTL_RTF_FORMAT_TO_PARTS => {
+                let _ = self.intl_this(this, INTL_RELATIVETIMEFORMAT, "format")?;
+                let v = self.to_number(a0)?;
+                let unit = self.to_js_string(a1)?;
+                let s = format_relative_time_en(v, &unit);
+                if id == INTL_RTF_FORMAT {
+                    self.alloc_str(s)
+                } else {
+                    let mut part = ObjMap::new();
+                    let ty = self.alloc_str("literal".to_string());
+                    part.set("type", ty);
+                    let sv = self.alloc_str(s);
+                    part.set("value", sv);
+                    let p = Value::heap(self.heap.alloc(HeapObj::Object(part)));
+                    Value::heap(self.heap.alloc(HeapObj::Array(vec![p])))
+                }
+            }
+            INTL_DISPLAYNAMES_OF => {
+                let resolved = self.intl_this(this, INTL_DISPLAYNAMES, "of")?;
+                let code = self.to_js_string(a0)?;
+                let fb = self.display(self.intl_slot(resolved, "fallback"));
+                if fb == "none" {
+                    Value::UNDEFINED
+                } else {
+                    self.alloc_str(code)
+                }
+            }
+            INTL_LOCALE_TOSTRING => {
+                let resolved = self.intl_this(this, INTL_LOCALE, "toString")?;
+                self.intl_slot(resolved, "baseName")
+            }
+            INTL_LOCALE_MAXIMIZE | INTL_LOCALE_MINIMIZE => {
+                let resolved = self.intl_this(this, INTL_LOCALE, "maximize")?;
+                let bn = self.intl_slot(resolved, "baseName");
+                self.make_locale(bn, Value::UNDEFINED)?
+            }
+            INTL_SEGMENTER_SEGMENT => {
+                let _ = self.intl_this(this, INTL_SEGMENTER, "segment")?;
+                // Minimal Segments object (full grapheme/word segmentation TBD).
+                let s = self.to_js_string(a0)?;
+                let mut o = ObjMap::new();
+                let sv = self.alloc_str(s);
+                o.set("@@seginput", sv);
+                Value::heap(self.heap.alloc(HeapObj::Object(o)))
+            }
+            INTL_DURATION_FORMAT => {
+                let _ = self.intl_this(this, INTL_DURATIONFORMAT, "format")?;
+                let dur = self.to_duration(a0)?;
+                let s = format_duration_en(&dur);
+                self.alloc_str(s)
+            }
+            _ if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16)
+                .contains(&id) =>
+            {
+                let field = LOCALE_ACCESSORS[(id - INTL_LOCALE_GET_BASE) as usize];
+                let resolved = self.intl_this(this, INTL_LOCALE, field)?;
+                self.intl_slot(resolved, field)
+            }
+            // The format/compare bound-function getters: return (and cache) a
+            // function bound to the instance, so `nf.format === nf.format`.
+            INTL_NF_FORMAT_GET | INTL_DTF_FORMAT_GET | INTL_COLLATOR_COMPARE_GET => {
+                let (kind, target_id, svc) = match id {
+                    INTL_NF_FORMAT_GET => (INTL_NUMBERFORMAT, INTL_NF_FORMAT, "format"),
+                    INTL_DTF_FORMAT_GET => (INTL_DATETIMEFORMAT, INTL_DTF_FORMAT, "format"),
+                    _ => (INTL_COLLATOR, INTL_COLLATOR_COMPARE, "compare"),
+                };
+                let resolved = self.intl_this(this, kind, svc)?;
+                let cached = self.intl_slot(resolved, "@@boundfn");
+                if cached != Value::UNDEFINED {
+                    cached
+                } else {
+                    let nat = Value::heap(self.heap.alloc(HeapObj::Native(target_id)));
+                    let b = Value::heap(self.heap.alloc(HeapObj::Bound {
+                        target: nat,
+                        this,
+                        args: vec![],
+                    }));
+                    if let HeapObj::Object(m) = self.heap.get_mut(resolved) {
+                        m.set("@@boundfn", b);
+                    }
+                    b
+                }
+            }
+            // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
+            // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
+            _ if native::proto_method(id).is_some() => {
+                let (m, kind, _len) = native::proto_method(id).unwrap();
+                // A boxed primitive receiver unwraps to its [[PrimitiveValue]] so the
+                // method runs on the primitive (`new Number(5).toFixed(2)`).
+                let this = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::Boxed { value, .. }) => *value,
+                    _ => this,
+                };
+                // Number/Boolean receivers are primitive values; the rest are heap.
+                if kind == 2 {
+                    self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
+                } else if kind == 5 {
+                    self.boolean_method(this, m)
+                } else if kind == 1 {
+                    // String methods are generic: RequireObjectCoercible(this) then
+                    // ToString(this), so `String.prototype.slice.call(123, …)` works.
+                    let s_idx = if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                        this.heap_index()
+                    } else if this == Value::UNDEFINED || this == Value::NULL {
+                        return Err(Thrown(format!(
+                            "TypeError: String.prototype.{m} called on null or undefined"
+                        )));
+                    } else {
+                        let s = self.to_js_string(this)?;
+                        self.alloc_str(s).heap_index()
+                    };
+                    self.string_method(s_idx, m, args)?.unwrap_or(Value::UNDEFINED)
+                } else if !this.is_heap() {
+                    return Err(Thrown(format!(
+                        "TypeError: prototype method {m} called on {}",
+                        self.display(this)
+                    )));
+                } else {
+                    let r = match kind {
+                        0 => self.array_method(this.heap_index(), m, args)?,
+                        1 => self.string_method(this.heap_index(), m, args)?,
+                        3 => self.set_method(this.heap_index(), m, args)?,
+                        4 => self.map_method(this.heap_index(), m, args)?,
+                        6 => self.date_method(this.heap_index(), m, args)?,
+                        _ => self.promise_method(this.heap_index(), m, args)?, // kind 7
+                    };
+                    r.unwrap_or(Value::UNDEFINED)
+                }
+            }
+            _ => Value::UNDEFINED,
+        })
+    }
+
+}

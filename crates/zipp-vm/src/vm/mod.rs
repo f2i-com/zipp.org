@@ -1,0 +1,340 @@
+//! Explicit-frame register virtual machine.
+//!
+//! The defining choice: **JS recursion does not use the native Rust stack**.
+//! Every activation is a frame in `frames: Vec<Frame>` over one flat register
+//! file `regs: Vec<Value>`. A call pushes a frame and continues the same
+//! dispatch loop; a return pops it. Consequences:
+//!
+//! * Deep recursion is bounded by a counter, not by the OS stack — it throws a
+//!   catchable `RangeError` instead of segfaulting (a real bug in the old
+//!   engine's JIT path).
+//! * There is exactly one hot loop to optimise, and registers are explicit —
+//!   the shape a register-allocating JIT consumes directly. Keeping unboxed
+//!   `i32` live across a call boundary (where V8 wins and the old engine lost)
+//!   becomes a property of *this* loop's frame model rather than something
+//!   bolted on.
+//!
+//! Arithmetic has typed-`i32` fast paths inline; anything else falls to the
+//! generic `f64` path. v1 is an interpreter — it will be slower than the old
+//! JIT'd engine and than V8; the point is a clean substrate that a JIT can
+//! later make faster.
+
+#![allow(unused_imports)]
+use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::heap::{
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap, PropAttr, PromiseState, Reaction,
+};
+use crate::value::Value;
+
+/// Hard cap on simultaneous JS frames. Throws a catchable RangeError rather
+/// than growing unbounded. 100k is far beyond any non-pathological recursion
+/// and the flat register file makes each frame cheap.
+const MAX_FRAMES: usize = 100_000;
+
+/// Extra global slots reserved past `global_count` as JIT scratch "field globals"
+/// for object scalar-replacement (SROA). A field-promoted region uses pool slots
+/// `[global_count, global_count + n_fields)`; regions reuse the pool (synced per
+/// native run, never concurrent), so this caps fields-per-region, not total.
+const FIELD_POOL: usize = 64;
+
+/// Sentinel `closure` value for a frame whose callee is a plain (capture-free)
+/// function rather than a closure. Real heap indices are always `< u32::MAX`.
+const NO_CLOSURE: u32 = u32::MAX;
+
+/// An active `try` handler within a frame.
+/// One activation record.
+struct Frame {
+    func: u32,
+    /// Base index into `regs` of this frame's register window.
+    base: usize,
+    /// Instruction pointer within the function's code.
+    ip: usize,
+    /// Register in the *caller's* window that receives this call's result.
+    ret_dst: u16,
+    /// Heap index of the `Closure` object this frame is executing, or
+    /// `NO_CLOSURE` for a plain function. `UpvalGet`/`UpvalSet` read the
+    /// closure's captured cell indices through it.
+    closure: u32,
+    /// Active `try` handlers in this frame, innermost last. A `Throw` (or a
+    /// thrown error bubbling up from a builtin call) unwinds to the innermost
+    /// handler here, else propagates to the caller frame.
+    handlers: Vec<Handler>,
+}
+
+/// Which array higher-order method `array_each` is driving (callback args are
+/// `[element, index]` for all three; only the result handling differs).
+#[derive(Clone, Copy)]
+pub(crate) enum EachMode {
+    Map,
+    Filter,
+    ForEach,
+}
+
+/// Whether a promise reaction is the fulfill or reject handler.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReactionKind {
+    Fulfill,
+    Reject,
+}
+
+/// How a suspended async activation is resumed: with an awaited value, or by
+/// throwing a rejection into it at the await point.
+#[derive(Clone, Copy)]
+pub(crate) enum Resume {
+    Value(Value),
+    Throw(Value),
+}
+
+/// A queued microtask (the whole event loop). `Reaction` runs a promise reaction
+/// — `callback` (a JS fn, a native BoundResolver, or undefined for pass-through)
+/// applied to the settled `arg`, settling `dependent`. `AsyncResume` resumes a
+/// suspended async activation.
+pub(crate) enum Microtask {
+    Reaction { callback: Value, arg: Value, dependent: u32, kind: ReactionKind, finally: bool },
+    AsyncResume { activation: u32, input: Resume },
+}
+
+/// Native (built-in) function ids — the discriminant carried by `HeapObj::Native`.
+/// Each maps to an arm of `Vm::call_native`.
+
+/// What `object_enum_own` collects.
+#[derive(Clone, Copy)]
+pub(crate) enum EnumWhat {
+    Keys,
+    Values,
+    Entries,
+}
+
+pub struct Vm<'p> {
+    program: &'p Program,
+    /// Most-recent class value per class_id (filled by `MakeClass`), so a
+    /// `super` call can reach its lexical superclass value at runtime.
+    class_values: Vec<Option<Value>>,
+    heap: Heap,
+    globals: Vec<Value>,
+    /// One contiguous register file shared by all live frames; each frame owns
+    /// the window `[base, base + reg_count)`.
+    regs: Vec<Value>,
+    frames: Vec<Frame>,
+    /// Lines produced by `Print` (console.log/info/debug → stdout), in order.
+    pub output: Vec<String>,
+    /// Lines produced by `console.error`/`console.warn` (→ stderr in node).
+    pub errput: Vec<String>,
+    /// VM start instant — the zero point for `performance.now()` (which reports
+    /// fractional milliseconds elapsed since the program began).
+    start: std::time::Instant,
+    /// The JS value currently being thrown, set when a `Throw` (or an internal
+    /// error) begins unwinding and cleared when a `catch` handler receives it.
+    /// Carrying the real `Value` (not just a message) lets `catch (e)` bind the
+    /// exact thrown object/string/number, and survives propagation across
+    /// nested `run_loop` invocations (builtin callbacks) until caught.
+    pending_throw: Option<Value>,
+    /// Set by a `Yield` op to hand a generator's yielded value (+ the yield's
+    /// bytecode ip, for the resume point) back to `generator_method`, which
+    /// `.take()`s it to distinguish a suspension from a normal return.
+    pending_yield: Option<(Value, usize)>,
+    /// Set by an `Await` op (the awaited value + the Await's ip + the activation's
+    /// live `try` handlers); `drive_async` `.take()`s it to suspend the async
+    /// activation, mirroring `pending_yield`. Unlike generators, async activations
+    /// PRESERVE handlers across a suspension so `try { await p } catch` works.
+    pending_await: Option<(Value, usize, Vec<Handler>)>,
+    /// FIFO microtask queue — the entire event loop (no timers/IO exist). Drained
+    /// to empty by `drain_microtasks` after the main script returns; a microtask
+    /// may enqueue more, which run in the same drain.
+    microtasks: std::collections::VecDeque<Microtask>,
+    /// The `.raw` array of a tagged-template strings object, keyed by the cooked
+    /// array's heap index. Arrays don't carry named properties here, so a
+    /// template object's `raw` lives in this side table (read by `get_prop`).
+    template_raws: std::collections::HashMap<u32, Value>,
+    /// Lazily-created `.prototype` object for a function/class value, keyed by the
+    /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
+    /// stable object (identity: `C.prototype === C.prototype`), so it is built on
+    /// first access and cached here. For a class it carries the own methods +
+    /// `constructor`; for a plain function just `constructor`.
+    prototypes: std::collections::HashMap<u32, u32>,
+    /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
+    /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
+    proto_of: std::collections::HashMap<u32, Value>,
+    /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
+    /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
+    /// so their (rare) own props live here.
+    fn_props: std::collections::HashMap<u32, ObjMap>,
+    /// Callables expose `name`/`length` as synthesized own properties (computed
+    /// from the proto, not stored). They're `configurable: true`, so `delete
+    /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |
+    /// 1=length)`. Empty in normal programs; only `delete` on these keys fills it.
+    deleted_callable_intrinsics: std::collections::HashSet<(u32, u8)>,
+    /// Heap indices of the built-in prototype objects (`Object.prototype`,
+    /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
+    /// the [[Prototype]] for plain objects / functions / arrays so their methods
+    /// resolve as values and `getPrototypeOf` returns them. 0 until set up.
+    obj_proto: u32,
+    fn_proto: u32,
+    arr_proto: u32,
+    /// `String.prototype` — primitive string values delegate here for method
+    /// access (`"x".charAt`, `"x".slice`, …, as values), 0 until `setup_globals`.
+    str_proto: u32,
+    /// `Map`/`Set`/`Date`/`Promise`.prototype — instances delegate here for
+    /// method access as VALUES (`new Map().set`, `d.getHours`). 0 until set up.
+    map_proto: u32,
+    set_proto: u32,
+    date_proto: u32,
+    promise_proto: u32,
+    /// `Number`/`Boolean`.prototype — number/boolean PRIMITIVES delegate here for
+    /// method-as-value access (`(5).toFixed`, `true.toString`). 0 until set up.
+    num_proto: u32,
+    bool_proto: u32,
+    /// `WeakMap`/`WeakSet`/`WeakRef`.prototype — instances delegate here.
+    weakmap_proto: u32,
+    weakset_proto: u32,
+    weakref_proto: u32,
+    finreg_proto: u32,
+    /// Error prototypes, indexed by the canonical error kind (0=Error.prototype,
+    /// 1=TypeError.prototype, …, 7=AggregateError.prototype). The subtype protos
+    /// chain to `error_protos[0]`; every error instance links here via `proto_of`
+    /// so `.constructor`/`.name`/`.message`/`.toString`/`instanceof` resolve. 0
+    /// until `setup_globals`.
+    error_protos: [u32; 8],
+    /// The matching error constructor function values (`Error`, `TypeError`, …),
+    /// indexed the same way. Stored on each proto as `.constructor` and used by the
+    /// runtime `new (TypeError)()` / `Reflect.construct` path.
+    error_ctors: [u32; 8],
+    /// `Symbol.prototype` heap index (toString/valueOf/description) and the `Symbol`
+    /// constructor object heap index (callable, NOT constructable). 0 until setup.
+    symbol_proto: u32,
+    symbol_ctor: u32,
+    /// `BigInt.prototype` and the `BigInt` constructor object (callable, NOT
+    /// constructable — like `Symbol`). 0 until setup.
+    bigint_proto: u32,
+    bigint_ctor: u32,
+    /// `RegExp.prototype` and the `RegExp` constructor object. 0 until setup.
+    regexp_proto: u32,
+    regexp_ctor: u32,
+    /// Extra own properties of a regex match-result Array (`.index`, `.input`,
+    /// `.groups`), keyed by the result array's heap index — our `Array` is a plain
+    /// `Vec` with no slot for named properties, so they live in this side table
+    /// (mirroring `template_raws`). Tuple is (index, input, groups).
+    regexp_match_extras: std::collections::HashMap<u32, (Value, Value, Value)>,
+    /// The `%TypedArray%` intrinsic (abstract base ctor) + its prototype, the 11
+    /// concrete TypedArray ctors + their prototypes (indexed by `kind`), and the
+    /// `ArrayBuffer`/`DataView` ctors + prototypes. 0 until setup.
+    ta_base_ctor: u32,
+    ta_base_proto: u32,
+    ta_ctors: [u32; 11],
+    ta_protos: [u32; 11],
+    arraybuffer_ctor: u32,
+    arraybuffer_proto: u32,
+    dataview_ctor: u32,
+    dataview_proto: u32,
+    /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
+    proxy_ctor: u32,
+    /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.
+    temporal_ns: u32,
+    duration_ctor: u32,
+    duration_proto: u32,
+    plaindate_ctor: u32,
+    plaindate_proto: u32,
+    plaintime_ctor: u32,
+    plaintime_proto: u32,
+    plaindatetime_ctor: u32,
+    plaindatetime_proto: u32,
+    instant_ctor: u32,
+    instant_proto: u32,
+    plainyearmonth_ctor: u32,
+    plainyearmonth_proto: u32,
+    plainmonthday_ctor: u32,
+    plainmonthday_proto: u32,
+    intl_ns: u32,
+    intl_ctors: [u32; 10],
+    intl_protos: [u32; 10],
+    /// Monotonic counter giving each `Symbol()` a unique internal property key
+    /// (`@@sym:N`), so distinct symbols never collide as object keys.
+    symbol_counter: u64,
+    /// The `Symbol.for` global registry: registry key string → the shared Symbol.
+    symbol_registry: std::collections::HashMap<String, Value>,
+    /// Internal prop_key (`@@iterator`, `@@sym:N`, …) → the Symbol value, so a
+    /// symbol-keyed own property can be reflected back to its Symbol by
+    /// `Object.getOwnPropertySymbols`.
+    symbol_keys: std::collections::HashMap<String, Value>,
+    /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
+    /// iterators (and the default array `@@iterator`). 0 until set up.
+    array_iter_proto: u32,
+    /// `%MapIteratorPrototype%` / `%SetIteratorPrototype%` — distinct prototypes so
+    /// `getPrototypeOf(map.entries())` differs from a Set/Array iterator's.
+    map_iter_proto: u32,
+    set_iter_proto: u32,
+    /// The `globalThis` object (an empty Object at this heap index); property
+    /// access on it is routed to the global slots by name. 0 until `setup_globals`.
+    global_this: u32,
+    /// `Math.random()` PRNG state (xorshift64*). Deterministically seeded, so a
+    /// program's random sequence is reproducible run-to-run (and JIT-on == off).
+    rng_state: u64,
+    /// Native JIT tier (x86-64 only, `feature = "jit"`). Compiles hot leaf
+    /// integer functions to native code that shares this VM's register window;
+    /// any non-int/heap/call op bails back to the interpreter at the exact ip.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit: crate::codegen::Jit,
+    /// JIT on/off (set from `ZIPP_NOJIT` env var at construction) — lets a
+    /// single binary A/B the JIT against the pure interpreter for honest
+    /// measurement.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_enabled: bool,
+    /// Current native self-recursion depth (guards `jit_self_call`).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_recurse_depth: u32,
+    /// Pinned register-file capacity: `self.regs` is reserved to this at startup
+    /// and NEVER allowed to grow past it (every call/recursion site checks),
+    /// so the Vec never reallocates while native JIT code holds a raw pointer
+    /// into it. 0 until `reserve_jit_regs` runs (interpreter-only builds ignore
+    /// it). Exceeding it throws RangeError — a tighter bound than MAX_FRAMES.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    reg_capacity: usize,
+    /// High-water mark: the largest `regs.len()` ever reached (and thus
+    /// initialized). A native self-call window at or below this can be exposed
+    /// with `set_len` instead of a zero-filling `resize` — its slots already hold
+    /// valid `Value` bits (stale, but the compiled code defs-before-use). This
+    /// avoids re-zeroing the callee window on every recursive call once the
+    /// recursion has reached its deepest native level. Backing buffer is pinned
+    /// (`reserve_jit_regs`) so initialized slots stay valid for the VM's life.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    regs_hw: usize,
+}
+
+/// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
+#[derive(Debug)]
+pub struct Thrown(pub String);
+
+
+// submodules (split from the former monolithic vm.rs)
+mod engine;
+mod dispatch;
+mod async_runtime;
+mod indexing_date;
+mod setup;
+mod natives;
+mod props;
+mod mathjson;
+mod access;
+mod builtins;
+mod values;
+mod temporal;
+mod intl;
+mod proxy_regexp;
+mod typedarray;
+mod construct;
+mod misc_methods;
+mod array_ops;
+mod string_ops;
+mod coerce;
+mod native;
+mod helpers_misc;
+mod helpers_datetime;
+mod helpers_numeric;
+mod helpers_json;
+mod helpers_num2;
+
+pub(crate) use helpers_misc::*;
+pub(crate) use helpers_datetime::*;
+pub(crate) use helpers_numeric::*;
+pub(crate) use helpers_json::*;
+pub(crate) use helpers_num2::*;

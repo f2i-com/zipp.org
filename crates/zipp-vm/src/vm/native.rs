@@ -1,0 +1,508 @@
+pub const OBJ_DEFINE_PROPERTY: u16 = 1;
+pub const OBJ_DEFINE_PROPERTIES: u16 = 2;
+pub const OBJ_GET_OWN_DESC: u16 = 3;
+pub const OBJ_GET_OWN_NAMES: u16 = 4;
+pub const OBJ_GET_PROTO: u16 = 5;
+pub const OBJ_KEYS: u16 = 6;
+pub const OBJ_VALUES: u16 = 7;
+pub const OBJ_ENTRIES: u16 = 8;
+pub const OBJ_ASSIGN: u16 = 9;
+pub const OBJ_CREATE: u16 = 10;
+pub const PROTO_HAS_OWN: u16 = 11;
+pub const PROTO_PROP_ENUM: u16 = 12;
+pub const PROTO_IS_PROTO_OF: u16 = 13;
+pub const PROTO_VALUE_OF: u16 = 14;
+pub const PROTO_TO_STRING: u16 = 15;
+pub const FN_CALL: u16 = 16;
+pub const FN_APPLY: u16 = 17;
+pub const FN_BIND: u16 = 18;
+pub const ARR_IS_ARRAY: u16 = 19;
+pub const ARR_FROM: u16 = 20;
+pub const ARR_OF: u16 = 21;
+pub const ARR_JOIN: u16 = 22;
+pub const ARR_PUSH: u16 = 23;
+// Promise static methods as first-class values (`Promise.resolve`, …).
+pub const PROMISE_RESOLVE: u16 = 24;
+pub const PROMISE_REJECT: u16 = 25;
+pub const PROMISE_ALL: u16 = 26;
+pub const PROMISE_ALLSETTLED: u16 = 27;
+pub const PROMISE_RACE: u16 = 28;
+pub const PROMISE_ANY: u16 = 29;
+// More Object statics (as first-class values).
+pub const OBJ_IS: u16 = 30;
+pub const OBJ_HAS_OWN: u16 = 31;
+pub const OBJ_FROM_ENTRIES: u16 = 32;
+pub const OBJ_SET_PROTO_OF: u16 = 33;
+pub const OBJ_GET_OWN_SYMBOLS: u16 = 34;
+pub const OBJ_GET_OWN_DESCS: u16 = 35;
+// Integrity traits.
+pub const OBJ_FREEZE: u16 = 36;
+pub const OBJ_IS_FROZEN: u16 = 37;
+pub const OBJ_SEAL: u16 = 38;
+pub const OBJ_IS_SEALED: u16 = 39;
+pub const OBJ_PREVENT_EXT: u16 = 40;
+pub const OBJ_IS_EXT: u16 = 41;
+// ES2024 grouping + promise capability.
+pub const OBJ_GROUP_BY: u16 = 42;
+pub const MAP_GROUP_BY: u16 = 43;
+pub const PROMISE_WITH_RESOLVERS: u16 = 44;
+// Reflect namespace statics.
+pub const REFLECT_APPLY: u16 = 45;
+pub const REFLECT_CONSTRUCT: u16 = 46;
+pub const REFLECT_GET: u16 = 47;
+pub const REFLECT_SET: u16 = 48;
+pub const REFLECT_HAS: u16 = 49;
+pub const REFLECT_DELETE: u16 = 50;
+pub const REFLECT_OWN_KEYS: u16 = 51;
+pub const REFLECT_GET_PROTO: u16 = 52;
+pub const REFLECT_SET_PROTO: u16 = 53;
+pub const REFLECT_DEFINE: u16 = 54;
+pub const REFLECT_GET_OWN_DESC: u16 = 55;
+pub const REFLECT_IS_EXT: u16 = 56;
+pub const REFLECT_PREVENT_EXT: u16 = 57;
+// JSON namespace methods as first-class values.
+pub const JSON_PARSE: u16 = 58;
+pub const JSON_STRINGIFY: u16 = 59;
+pub const MATH_RANDOM: u16 = 60;
+// WeakMap/WeakSet methods (290+, clear of PROTO 64-190 and MATH 256-289).
+pub const WM_GET: u16 = 290;
+pub const WM_SET: u16 = 291;
+pub const WM_HAS: u16 = 292;
+pub const WM_DELETE: u16 = 293;
+pub const WS_ADD: u16 = 294;
+pub const WS_HAS: u16 = 295;
+pub const WS_DELETE: u16 = 296;
+pub const WR_DEREF: u16 = 297;
+pub const FR_REGISTER: u16 = 298;
+pub const FR_UNREGISTER: u16 = 299;
+// Built-in iterator methods.
+pub const ITER_NEXT: u16 = 300;
+pub const ITER_SELF: u16 = 301; // `[Symbol.iterator]()` → returns the iterator
+pub const PROTO_TO_LOCALE_STRING: u16 = 302; // Object.prototype.toLocaleString
+// Number static methods as first-class values (the CALL form is a StaticFn).
+pub const NUM_IS_INTEGER: u16 = 303;
+pub const NUM_IS_NAN: u16 = 304;
+pub const NUM_IS_FINITE: u16 = 305;
+pub const NUM_IS_SAFE_INTEGER: u16 = 306;
+// Global functions as first-class values (the CALL form is a GlobalFn).
+pub const GLOBAL_PARSE_INT: u16 = 307;
+pub const GLOBAL_PARSE_FLOAT: u16 = 308;
+pub const GLOBAL_IS_NAN: u16 = 309;
+pub const GLOBAL_IS_FINITE: u16 = 310;
+// String static methods.
+pub const STR_FROM_CHAR_CODE: u16 = 311;
+pub const STR_FROM_CODE_POINT: u16 = 312;
+pub const STR_RAW: u16 = 313;
+// Date static methods as first-class values (the call form uses Now/DateParse/DateUTC).
+pub const DATE_NOW: u16 = 314;
+pub const DATE_PARSE: u16 = 315;
+pub const DATE_UTC: u16 = 316;
+/// `Error.prototype.toString` — `name`/`message` → "name: message".
+pub const ERROR_TO_STRING: u16 = 317;
+/// Canonical native error names, indexed by error kind (parallels compile.rs
+/// `error_kind_index` and the VM's `error_protos`/`error_ctors`).
+pub const ERROR_NAMES: [&str; 8] = [
+    "Error", "TypeError", "RangeError", "SyntaxError",
+    "ReferenceError", "EvalError", "URIError", "AggregateError",
+];
+/// TypedArray element kinds, indexed by `kind`: (ctor name, element byte size,
+/// is_bigint, is_float). Uint8Clamped (index 2) clamps on write.
+pub const TA_KINDS: &[(&str, usize, bool, bool)] = &[
+    ("Int8Array", 1, false, false),
+    ("Uint8Array", 1, false, false),
+    ("Uint8ClampedArray", 1, false, false),
+    ("Int16Array", 2, false, false),
+    ("Uint16Array", 2, false, false),
+    ("Int32Array", 4, false, false),
+    ("Uint32Array", 4, false, false),
+    ("Float32Array", 4, false, true),
+    ("Float64Array", 8, false, true),
+    ("BigInt64Array", 8, true, false),
+    ("BigUint64Array", 8, true, false),
+];
+/// `%TypedArray%.prototype` method names, registered as Natives at
+/// `TA_METHOD_BASE + index` so the value form (`TypedArray.prototype.map`,
+/// `.call(...)`, `typeof`) works; the method-call form dispatches directly.
+pub const TA_PROTO_METHODS: &[&str] = &[
+    "at", "join", "toString", "indexOf", "lastIndexOf", "includes", "forEach", "map",
+    "filter", "find", "findIndex", "findLast", "findLastIndex", "every", "some", "reduce",
+    "reduceRight", "fill", "reverse", "slice", "subarray", "sort", "copyWithin", "set",
+    "keys", "values", "entries", "@@iterator",
+];
+pub const TA_METHOD_BASE: u16 = 340;
+/// `DataView.prototype` get/set method names (registered at DV_METHOD_BASE+i).
+pub const DV_PROTO_METHODS: &[&str] = &[
+    "getInt8", "getUint8", "getInt16", "getUint16", "getInt32", "getUint32", "getFloat32",
+    "getFloat64", "getBigInt64", "getBigUint64", "setInt8", "setUint8", "setInt16",
+    "setUint16", "setInt32", "setUint32", "setFloat32", "setFloat64", "setBigInt64",
+    "setBigUint64",
+];
+pub const DV_METHOD_BASE: u16 = 372;
+pub const ARRAYBUFFER_SLICE: u16 = 396;
+pub const PROXY_REVOCABLE: u16 = 397;
+pub const PROXY_REVOKE: u16 = 398;
+/// Temporal.Duration.prototype instance methods (dispatched by name via
+/// `temporal_method`), at TEMPORAL_M_BASE + index.
+pub const TEMPORAL_DURATION_METHODS: &[&str] =
+    &["with", "negated", "abs", "toString", "toJSON", "valueOf"];
+pub const TEMPORAL_M_BASE: u16 = 400;
+pub const TEMPORAL_DURATION_FROM: u16 = 410;
+pub const TEMPORAL_DURATION_COMPARE: u16 = 411;
+/// Temporal.PlainDate.prototype methods at PD_M_BASE + index.
+pub const PLAINDATE_METHODS: &[&str] = &[
+    "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
+    "getISOFields", "toPlainDateTime",
+];
+pub const PD_M_BASE: u16 = 420;
+pub const PLAINDATE_FROM: u16 = 448;
+pub const PLAINDATE_COMPARE: u16 = 449;
+/// Temporal.PlainTime.prototype methods at PT_M_BASE + index.
+pub const PLAINTIME_METHODS: &[&str] = &[
+    "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON",
+    "valueOf", "getISOFields",
+];
+pub const PT_M_BASE: u16 = 450;
+pub const PLAINTIME_FROM: u16 = 470;
+pub const PLAINTIME_COMPARE: u16 = 471;
+/// Temporal.PlainDateTime.prototype methods at PDT_M_BASE + index.
+pub const PLAINDATETIME_METHODS: &[&str] = &[
+    "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON",
+    "valueOf", "toPlainDate", "toPlainTime", "getISOFields",
+];
+pub const PDT_M_BASE: u16 = 472;
+pub const PLAINDATETIME_FROM: u16 = 490;
+pub const PLAINDATETIME_COMPARE: u16 = 491;
+/// Temporal.Instant.prototype methods at INST_M_BASE + index.
+pub const INSTANT_METHODS: &[&str] = &[
+    "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON", "valueOf",
+];
+pub const INST_M_BASE: u16 = 492;
+pub const INST_FROM: u16 = 505;
+pub const INST_FROM_EPOCH_MS: u16 = 506;
+pub const INST_FROM_EPOCH_NS: u16 = 507;
+pub const INST_FROM_EPOCH_SEC: u16 = 508;
+pub const INST_FROM_EPOCH_US: u16 = 509;
+pub const INST_COMPARE: u16 = 510;
+/// Temporal.PlainYearMonth.prototype methods at PYM_M_BASE + index.
+pub const PLAINYEARMONTH_METHODS: &[&str] = &[
+    "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
+    "toPlainDate", "getISOFields",
+];
+pub const PYM_M_BASE: u16 = 512;
+pub const PLAINYEARMONTH_FROM: u16 = 524;
+pub const PLAINYEARMONTH_COMPARE: u16 = 525;
+/// Temporal.PlainMonthDay.prototype methods at PMD_M_BASE + index.
+pub const PLAINMONTHDAY_METHODS: &[&str] = &[
+    "with", "equals", "toString", "toJSON", "valueOf", "toPlainDate", "getISOFields",
+];
+pub const PMD_M_BASE: u16 = 528;
+pub const PLAINMONTHDAY_FROM: u16 = 536;
+/// Temporal.Now namespace methods.
+pub const NOW_INSTANT: u16 = 540;
+pub const NOW_PLAINDATETIME_ISO: u16 = 541;
+pub const NOW_PLAINDATE_ISO: u16 = 542;
+pub const NOW_PLAINTIME_ISO: u16 = 543;
+pub const NOW_TIMEZONE_ID: u16 = 544;
+/// Intl namespace + per-service method native ids.
+pub const INTL_GET_CANONICAL_LOCALES: u16 = 560;
+pub const INTL_SUPPORTED_VALUES_OF: u16 = 561;
+pub const INTL_RESOLVED_OPTIONS: u16 = 562;
+pub const INTL_SUPPORTED_LOCALES_OF: u16 = 563;
+pub const INTL_NF_FORMAT: u16 = 564;
+pub const INTL_NF_FORMAT_TO_PARTS: u16 = 565;
+pub const INTL_DTF_FORMAT: u16 = 566;
+pub const INTL_DTF_FORMAT_TO_PARTS: u16 = 567;
+pub const INTL_COLLATOR_COMPARE: u16 = 568;
+pub const INTL_PLURAL_SELECT: u16 = 569;
+pub const INTL_LIST_FORMAT: u16 = 570;
+pub const INTL_LIST_FORMAT_TO_PARTS: u16 = 571;
+pub const INTL_RTF_FORMAT: u16 = 572;
+pub const INTL_RTF_FORMAT_TO_PARTS: u16 = 573;
+pub const INTL_DISPLAYNAMES_OF: u16 = 574;
+pub const INTL_LOCALE_TOSTRING: u16 = 575;
+pub const INTL_LOCALE_MAXIMIZE: u16 = 576;
+pub const INTL_LOCALE_MINIMIZE: u16 = 577;
+pub const INTL_SEGMENTER_SEGMENT: u16 = 578;
+pub const INTL_DURATION_FORMAT: u16 = 579;
+pub const INTL_PLURAL_SELECT_RANGE: u16 = 580;
+/// Intl.Locale prototype getters at INTL_LOCALE_GET_BASE + index of LOCALE_ACCESSORS.
+pub const INTL_LOCALE_GET_BASE: u16 = 581;
+pub const LOCALE_ACCESSORS: &[&str] = &[
+    "language", "script", "region", "baseName", "calendar", "caseFirst", "collation",
+    "hourCycle", "numeric", "numberingSystem",
+];
+/// `format`/`compare` bound-function getters (spec: these are accessors that
+/// return a function bound to the instance).
+pub const INTL_NF_FORMAT_GET: u16 = 592;
+pub const INTL_DTF_FORMAT_GET: u16 = 593;
+pub const INTL_COLLATOR_COMPARE_GET: u16 = 594;
+/// Intl service kinds (index into VM.intl_ctors / intl_protos).
+pub const INTL_NUMBERFORMAT: u8 = 0;
+pub const INTL_DATETIMEFORMAT: u8 = 1;
+pub const INTL_COLLATOR: u8 = 2;
+pub const INTL_PLURALRULES: u8 = 3;
+pub const INTL_LISTFORMAT: u8 = 4;
+pub const INTL_RELATIVETIMEFORMAT: u8 = 5;
+pub const INTL_SEGMENTER: u8 = 6;
+pub const INTL_LOCALE: u8 = 7;
+pub const INTL_DISPLAYNAMES: u8 = 8;
+pub const INTL_DURATIONFORMAT: u8 = 9;
+/// Field names of a Temporal.Duration, in slot order.
+pub const DURATION_FIELDS: [&str; 10] = [
+    "years", "months", "weeks", "days", "hours", "minutes", "seconds",
+    "milliseconds", "microseconds", "nanoseconds",
+];
+// RegExp.prototype methods.
+pub const REGEXP_TEST: u16 = 326;
+pub const REGEXP_EXEC: u16 = 327;
+pub const REGEXP_TO_STRING: u16 = 328;
+// BigInt: statics + BigInt.prototype methods.
+pub const BIGINT_AS_INTN: u16 = 322;
+pub const BIGINT_AS_UINTN: u16 = 323;
+pub const BIGINT_TO_STRING: u16 = 324;
+pub const BIGINT_VALUE_OF: u16 = 325;
+// Symbol: the static methods + Symbol.prototype methods as first-class values.
+pub const SYMBOL_FOR: u16 = 318;
+pub const SYMBOL_KEY_FOR: u16 = 319;
+pub const SYMBOL_TO_STRING: u16 = 320; // Symbol.prototype.toString
+pub const SYMBOL_VALUE_OF: u16 = 321; // Symbol.prototype.valueOf
+/// The well-known symbols, as `(JS property name on `Symbol`, internal prop_key)`.
+/// The prop_key is the string the symbol uses as an object key — `@@iterator`
+/// etc. match the engine's existing iterator convention so iteration is unchanged.
+pub const WELL_KNOWN_SYMBOLS: &[(&str, &str)] = &[
+    ("iterator", "@@iterator"),
+    ("asyncIterator", "@@asyncIterator"),
+    ("toPrimitive", "@@toPrimitive"),
+    ("toStringTag", "@@toStringTag"),
+    ("hasInstance", "@@hasInstance"),
+    ("isConcatSpreadable", "@@isConcatSpreadable"),
+    ("species", "@@species"),
+    ("match", "@@match"),
+    ("matchAll", "@@matchAll"),
+    ("replace", "@@replace"),
+    ("search", "@@search"),
+    ("split", "@@split"),
+    ("unscopables", "@@unscopables"),
+    ("dispose", "@@dispose"),
+    ("asyncDispose", "@@asyncDispose"),
+];
+// Math methods as first-class values: id = MATH_METHOD_BASE + index into
+// MATH_METHODS, each carrying its MathFn + spec `length`. Base is well above the
+// PROTO_METHODS id range (64 + ~127) to avoid collision.
+pub const MATH_METHOD_BASE: u16 = 256;
+pub const MATH_METHODS: &[(&str, crate::bytecode::MathFn, u8)] = {
+    use crate::bytecode::MathFn as F;
+    &[
+        ("abs", F::Abs, 1), ("floor", F::Floor, 1), ("ceil", F::Ceil, 1),
+        ("round", F::Round, 1), ("trunc", F::Trunc, 1), ("sign", F::Sign, 1),
+        ("sqrt", F::Sqrt, 1), ("cbrt", F::Cbrt, 1), ("exp", F::Exp, 1),
+        ("log", F::Log, 1), ("log2", F::Log2, 1), ("log10", F::Log10, 1),
+        ("expm1", F::Expm1, 1), ("log1p", F::Log1p, 1), ("sin", F::Sin, 1),
+        ("cos", F::Cos, 1), ("tan", F::Tan, 1), ("asin", F::Asin, 1),
+        ("acos", F::Acos, 1), ("atan", F::Atan, 1), ("sinh", F::Sinh, 1),
+        ("cosh", F::Cosh, 1), ("tanh", F::Tanh, 1), ("asinh", F::Asinh, 1),
+        ("acosh", F::Acosh, 1), ("atanh", F::Atanh, 1), ("clz32", F::Clz32, 1),
+        ("fround", F::Fround, 1), ("pow", F::Pow, 2), ("atan2", F::Atan2, 2),
+        ("imul", F::Imul, 2), ("min", F::Min, 2), ("max", F::Max, 2),
+        ("hypot", F::Hypot, 2),
+    ]
+};
+
+pub fn math_method(id: u16) -> Option<(&'static str, crate::bytecode::MathFn, u8)> {
+    id.checked_sub(MATH_METHOD_BASE)
+        .and_then(|i| MATH_METHODS.get(i as usize).copied())
+}
+
+/// First native id for a prototype method (`Array.prototype.map` etc.). Method
+/// `PROTO_METHODS[i]` has native id `PROTO_METHOD_BASE + i`, so these are
+/// first-class callable VALUES (`Array.prototype.map.call(arr, fn)`).
+pub const PROTO_METHOD_BASE: u16 = 64;
+
+/// Prototype methods exposed as values, paired with their receiver kind
+/// (0 = Array.prototype, 1 = String.prototype). Only methods that
+/// `array_method`/`string_method` actually implement are listed, so a `.call`
+/// through the value behaves identically to a direct `arr.method()` call.
+pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
+    // (name, kind, spec `length`). join/push already on arr_proto via ARR_*.
+    // Array.prototype.
+    ("at", 0, 1), ("concat", 0, 1), ("every", 0, 1), ("fill", 0, 1), ("filter", 0, 1),
+    ("find", 0, 1), ("findIndex", 0, 1), ("findLast", 0, 1), ("findLastIndex", 0, 1),
+    ("flat", 0, 0), ("flatMap", 0, 1), ("forEach", 0, 1), ("includes", 0, 1),
+    ("indexOf", 0, 1), ("lastIndexOf", 0, 1), ("map", 0, 1), ("pop", 0, 0), ("reduce", 0, 1),
+    ("reduceRight", 0, 1), ("reverse", 0, 0), ("shift", 0, 0), ("slice", 0, 2),
+    ("some", 0, 1), ("sort", 0, 1), ("splice", 0, 2), ("toReversed", 0, 0),
+    ("toSorted", 0, 1), ("toSpliced", 0, 2), ("toString", 0, 0), ("with", 0, 2),
+    ("copyWithin", 0, 2), ("entries", 0, 0), ("keys", 0, 0), ("values", 0, 0),
+    ("toLocaleString", 0, 0),
+    // String.prototype.
+    ("at", 1, 1), ("charAt", 1, 1), ("charCodeAt", 1, 1), ("codePointAt", 1, 1),
+    ("endsWith", 1, 1), ("includes", 1, 1), ("indexOf", 1, 1), ("padEnd", 1, 1),
+    ("padStart", 1, 1), ("repeat", 1, 1), ("replace", 1, 2), ("replaceAll", 1, 2),
+    ("slice", 1, 2), ("split", 1, 2), ("startsWith", 1, 1), ("substring", 1, 2),
+    ("toLowerCase", 1, 0), ("toUpperCase", 1, 0), ("trim", 1, 0), ("trimEnd", 1, 0),
+    ("trimStart", 1, 0), ("concat", 1, 1), ("substr", 1, 2), ("localeCompare", 1, 1),
+    ("normalize", 1, 0), ("isWellFormed", 1, 0), ("toWellFormed", 1, 0),
+    ("valueOf", 1, 0), ("toString", 1, 0),
+    // Number.prototype (kind 2 → number_method, receiver is a number value).
+    ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0), ("toLocaleString", 2, 0),
+    // Set.prototype (kind 3 → set_method on the Set receiver).
+    ("add", 3, 1), ("clear", 3, 0), ("delete", 3, 1), ("entries", 3, 0), ("forEach", 3, 1),
+    ("has", 3, 1), ("keys", 3, 0), ("values", 3, 0), ("union", 3, 1), ("intersection", 3, 1),
+    ("difference", 3, 1), ("symmetricDifference", 3, 1), ("isSubsetOf", 3, 1),
+    ("isSupersetOf", 3, 1), ("isDisjointFrom", 3, 1),
+    // Map.prototype (kind 4 → map_method on the Map receiver).
+    ("clear", 4, 0), ("delete", 4, 1), ("entries", 4, 0), ("forEach", 4, 1), ("get", 4, 1),
+    ("has", 4, 1), ("keys", 4, 0), ("set", 4, 2), ("values", 4, 0),
+    // Boolean.prototype (kind 5 → boolean_method on the boolean value).
+    ("toString", 5, 0), ("valueOf", 5, 0),
+    // Promise.prototype (kind 7 → promise_method on the Promise receiver).
+    ("then", 7, 2), ("catch", 7, 1), ("finally", 7, 1),
+    // Date.prototype (kind 6 → date_method on the Date receiver). Getters length 0;
+    // setters per spec (setHours=4, setMinutes/setFullYear=3, setMonth/setSeconds=2, …).
+    ("getDate", 6, 0), ("getDay", 6, 0), ("getFullYear", 6, 0), ("getHours", 6, 0),
+    ("getMilliseconds", 6, 0), ("getMinutes", 6, 0), ("getMonth", 6, 0), ("getSeconds", 6, 0),
+    ("getTime", 6, 0), ("getTimezoneOffset", 6, 0), ("getUTCDate", 6, 0), ("getUTCDay", 6, 0),
+    ("getUTCFullYear", 6, 0), ("getUTCHours", 6, 0), ("getUTCMilliseconds", 6, 0),
+    ("getUTCMinutes", 6, 0), ("getUTCMonth", 6, 0), ("getUTCSeconds", 6, 0), ("setDate", 6, 1),
+    ("setFullYear", 6, 3), ("setHours", 6, 4), ("setMilliseconds", 6, 1), ("setMinutes", 6, 3),
+    ("setMonth", 6, 2), ("setSeconds", 6, 2), ("setTime", 6, 1), ("setUTCDate", 6, 1),
+    ("setUTCFullYear", 6, 3), ("setUTCHours", 6, 4), ("setUTCMilliseconds", 6, 1),
+    ("setUTCMinutes", 6, 3), ("setUTCMonth", 6, 2), ("setUTCSeconds", 6, 2), ("toDateString", 6, 0),
+    ("toISOString", 6, 0), ("toJSON", 6, 1), ("toLocaleDateString", 6, 0), ("toLocaleString", 6, 0),
+    ("toLocaleTimeString", 6, 0), ("toString", 6, 0), ("toTimeString", 6, 0), ("toUTCString", 6, 0),
+    ("toGMTString", 6, 0), ("getYear", 6, 0), ("setYear", 6, 1),
+    ("valueOf", 6, 0),
+];
+
+/// `(name, kind)` for a prototype-method native id, if it is one.
+pub fn proto_method(id: u16) -> Option<(&'static str, u8, u8)> {
+    id.checked_sub(PROTO_METHOD_BASE)
+        .and_then(|i| PROTO_METHODS.get(i as usize).copied())
+}
+
+/// The spec `name` and `length` of a static/namespace native (Object.*,
+/// Reflect.*, Function.prototype.call, …) so it exposes real own `name`/
+/// `length` properties like any function. (Proto methods use `proto_method`.)
+pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
+    // %TypedArray%.prototype method natives.
+    if (TA_METHOD_BASE..TA_METHOD_BASE + TA_PROTO_METHODS.len() as u16).contains(&id) {
+        let m = TA_PROTO_METHODS[(id - TA_METHOD_BASE) as usize];
+        let len: u8 = match m {
+            "reverse" | "keys" | "values" | "entries" | "toString" | "@@iterator" => 0,
+            "slice" | "subarray" | "copyWithin" => 2,
+            _ => 1,
+        };
+        let name = if m == "@@iterator" { "[Symbol.iterator]" } else { m };
+        return Some((name, len));
+    }
+    // DataView.prototype get*/set* natives (get* length 1, set* length 2).
+    if (DV_METHOD_BASE..DV_METHOD_BASE + DV_PROTO_METHODS.len() as u16).contains(&id) {
+        let m = DV_PROTO_METHODS[(id - DV_METHOD_BASE) as usize];
+        return Some((m, if m.starts_with("set") { 2 } else { 1 }));
+    }
+    if id == ARRAYBUFFER_SLICE {
+        return Some(("slice", 2));
+    }
+    Some(match id {
+        OBJ_DEFINE_PROPERTY => ("defineProperty", 3),
+        OBJ_DEFINE_PROPERTIES => ("defineProperties", 2),
+        OBJ_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),
+        OBJ_GET_OWN_NAMES => ("getOwnPropertyNames", 1),
+        OBJ_GET_PROTO => ("getPrototypeOf", 1),
+        OBJ_KEYS => ("keys", 1),
+        OBJ_VALUES => ("values", 1),
+        OBJ_ENTRIES => ("entries", 1),
+        OBJ_ASSIGN => ("assign", 2),
+        OBJ_CREATE => ("create", 2),
+        PROTO_HAS_OWN => ("hasOwnProperty", 1),
+        PROTO_PROP_ENUM => ("propertyIsEnumerable", 1),
+        PROTO_IS_PROTO_OF => ("isPrototypeOf", 1),
+        PROTO_VALUE_OF => ("valueOf", 0),
+        PROTO_TO_STRING => ("toString", 0),
+        ERROR_TO_STRING => ("toString", 0),
+        SYMBOL_FOR => ("for", 1),
+        SYMBOL_KEY_FOR => ("keyFor", 1),
+        SYMBOL_TO_STRING => ("toString", 0),
+        SYMBOL_VALUE_OF => ("valueOf", 0),
+        BIGINT_TO_STRING => ("toString", 0),
+        BIGINT_VALUE_OF => ("valueOf", 0),
+        BIGINT_AS_INTN => ("asIntN", 2),
+        BIGINT_AS_UINTN => ("asUintN", 2),
+        REGEXP_TEST => ("test", 1),
+        REGEXP_EXEC => ("exec", 1),
+        REGEXP_TO_STRING => ("toString", 0),
+        FN_CALL => ("call", 1),
+        FN_APPLY => ("apply", 2),
+        FN_BIND => ("bind", 1),
+        ARR_IS_ARRAY => ("isArray", 1),
+        ARR_FROM => ("from", 1),
+        ARR_OF => ("of", 0),
+        ARR_JOIN => ("join", 1),
+        ARR_PUSH => ("push", 1),
+        PROMISE_RESOLVE => ("resolve", 1),
+        PROMISE_REJECT => ("reject", 1),
+        PROMISE_ALL => ("all", 1),
+        PROMISE_ALLSETTLED => ("allSettled", 1),
+        PROMISE_RACE => ("race", 1),
+        PROMISE_ANY => ("any", 1),
+        OBJ_IS => ("is", 2),
+        OBJ_HAS_OWN => ("hasOwn", 2),
+        OBJ_FROM_ENTRIES => ("fromEntries", 1),
+        OBJ_SET_PROTO_OF => ("setPrototypeOf", 2),
+        OBJ_GET_OWN_SYMBOLS => ("getOwnPropertySymbols", 1),
+        OBJ_GET_OWN_DESCS => ("getOwnPropertyDescriptors", 1),
+        OBJ_FREEZE => ("freeze", 1),
+        OBJ_IS_FROZEN => ("isFrozen", 1),
+        OBJ_SEAL => ("seal", 1),
+        OBJ_IS_SEALED => ("isSealed", 1),
+        OBJ_PREVENT_EXT => ("preventExtensions", 1),
+        OBJ_IS_EXT => ("isExtensible", 1),
+        OBJ_GROUP_BY => ("groupBy", 2),
+        MAP_GROUP_BY => ("groupBy", 2),
+        PROMISE_WITH_RESOLVERS => ("withResolvers", 0),
+        REFLECT_APPLY => ("apply", 3),
+        REFLECT_CONSTRUCT => ("construct", 2),
+        REFLECT_GET => ("get", 2),
+        REFLECT_SET => ("set", 3),
+        REFLECT_HAS => ("has", 2),
+        REFLECT_DELETE => ("deleteProperty", 2),
+        REFLECT_OWN_KEYS => ("ownKeys", 1),
+        REFLECT_GET_PROTO => ("getPrototypeOf", 1),
+        REFLECT_SET_PROTO => ("setPrototypeOf", 2),
+        REFLECT_DEFINE => ("defineProperty", 3),
+        REFLECT_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),
+        REFLECT_IS_EXT => ("isExtensible", 1),
+        REFLECT_PREVENT_EXT => ("preventExtensions", 1),
+        JSON_PARSE => ("parse", 2),
+        JSON_STRINGIFY => ("stringify", 3),
+        MATH_RANDOM => ("random", 0),
+        WM_GET => ("get", 1),
+        WM_SET => ("set", 2),
+        WM_HAS => ("has", 1),
+        WM_DELETE => ("delete", 1),
+        WS_ADD => ("add", 1),
+        WS_HAS => ("has", 1),
+        WS_DELETE => ("delete", 1),
+        WR_DEREF => ("deref", 0),
+        FR_REGISTER => ("register", 2),
+        FR_UNREGISTER => ("unregister", 1),
+        ITER_NEXT => ("next", 0),
+        ITER_SELF => ("[Symbol.iterator]", 0),
+        PROTO_TO_LOCALE_STRING => ("toLocaleString", 0),
+        NUM_IS_INTEGER => ("isInteger", 1),
+        NUM_IS_NAN => ("isNaN", 1),
+        NUM_IS_FINITE => ("isFinite", 1),
+        NUM_IS_SAFE_INTEGER => ("isSafeInteger", 1),
+        GLOBAL_PARSE_INT => ("parseInt", 2),
+        GLOBAL_PARSE_FLOAT => ("parseFloat", 1),
+        GLOBAL_IS_NAN => ("isNaN", 1),
+        GLOBAL_IS_FINITE => ("isFinite", 1),
+        STR_FROM_CHAR_CODE => ("fromCharCode", 1),
+        STR_FROM_CODE_POINT => ("fromCodePoint", 1),
+        STR_RAW => ("raw", 1),
+        DATE_NOW => ("now", 0),
+        DATE_PARSE => ("parse", 1),
+        DATE_UTC => ("UTC", 7),
+        _ => return None,
+    })
+}
