@@ -484,6 +484,25 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     if id == ARRAYBUFFER_SLICE {
         return Some(("slice", 2));
     }
+    // Temporal.<Type>.prototype method natives: name + length as own properties.
+    for (base, methods) in [
+        (TEMPORAL_M_BASE, TEMPORAL_DURATION_METHODS),
+        (PD_M_BASE, PLAINDATE_METHODS),
+        (PT_M_BASE, PLAINTIME_METHODS),
+        (PDT_M_BASE, PLAINDATETIME_METHODS),
+        (INST_M_BASE, INSTANT_METHODS),
+        (PYM_M_BASE, PLAINYEARMONTH_METHODS),
+        (PMD_M_BASE, PLAINMONTHDAY_METHODS),
+    ] {
+        if (base..base + methods.len() as u16).contains(&id) {
+            let m = methods[(id - base) as usize];
+            let len: u8 = match m {
+                "with" | "add" | "subtract" | "until" | "since" | "round" | "equals" => 1,
+                _ => 0,
+            };
+            return Some((m, len));
+        }
+    }
     Some(match id {
         OBJ_DEFINE_PROPERTY => ("defineProperty", 3),
         OBJ_DEFINE_PROPERTIES => ("defineProperties", 2),
