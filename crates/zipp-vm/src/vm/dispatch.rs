@@ -1072,8 +1072,18 @@ impl<'p> Vm<'p> {
                             G::String => {
                                 if argc == 0 {
                                     self.alloc_str(String::new())
-                                } else {
+                                } else if a0.is_heap()
+                                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Symbol { .. })
+                                {
+                                    // `String(symbol)` is allowed (unlike ToString,
+                                    // which throws) and yields "Symbol(desc)".
                                     let s = self.display(a0);
+                                    self.alloc_str(s)
+                                } else {
+                                    // Proper ToString: routes objects/functions
+                                    // through their `toString` (so a function yields
+                                    // its real source via Function.prototype.toString).
+                                    let s = self.to_js_string(a0)?;
                                     self.alloc_str(s)
                                 }
                             }

@@ -287,8 +287,8 @@ fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool) {
     }
 }
 
-pub fn compile_program(prog: &ox::Program) -> R<Program> {
-    let mut c = Compiler::new();
+pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
+    let mut c = Compiler::new(source.to_string());
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
@@ -314,17 +314,31 @@ struct Compiler {
     /// startup (var hoisting), so a read before the textual decl isn't a
     /// never-declared ReferenceError.
     hoisted_globals: Vec<u32>,
+    /// The full program source, kept so each function can record its exact
+    /// source slice (by oxc span) for `Function.prototype.toString`.
+    source: String,
 }
 
 impl Compiler {
-    fn new() -> Compiler {
+    fn new(source: String) -> Compiler {
         Compiler {
             functions: Vec::new(),
             globals: Vec::new(),
             classes: Vec::new(),
             class_names: Vec::new(),
             hoisted_globals: Vec::new(),
+            source,
         }
+    }
+
+    /// Slice the program source by a function node's byte span, for
+    /// `Function.prototype.toString`. Empty if the range is degenerate or not on
+    /// a UTF-8 boundary (then `toString` uses the native-function fallback).
+    fn src_slice(&self, start: u32, end: u32) -> String {
+        self.source
+            .get(start as usize..end as usize)
+            .map(|s| s.to_string())
+            .unwrap_or_default()
     }
 
     fn global_slot(&mut self, name: &str) -> u16 {
@@ -463,6 +477,7 @@ impl Compiler {
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
             upvalues,
+            source: String::new(), // set by the caller from the function node's span
         })
     }
 
@@ -559,6 +574,7 @@ impl Compiler {
             string_constants: fc.string_constants,
             name_global: None,
             upvalues,
+            source: String::new(), // class methods: caller may override from span
         })
     }
 
@@ -617,6 +633,7 @@ impl Compiler {
             string_constants: fc.string_constants,
             name_global: None,
             upvalues,
+            source: String::new(), // set by compile_arrow from the arrow's span
         })
     }
 }
@@ -662,6 +679,7 @@ fn placeholder(name: &str) -> FuncProto {
         string_constants: Vec::new(),
         name_global: None,
         upvalues: Vec::new(),
+        source: String::new(),
     }
 }
 
@@ -1363,6 +1381,7 @@ impl<'a> FnCompiler<'a> {
             captured,
             enclosing,
         )?;
+        proto.source = self.cx.src_slice(f.span.start, f.span.end);
         let id = self.cx.functions.len() as u32;
         let has_upvalues = !proto.upvalues.is_empty();
         if self.is_script {
@@ -1853,7 +1872,7 @@ impl<'a> FnCompiler<'a> {
         names.extend(param_pattern_leaves(&f.params));
         let captured = capture::captured_locals(&names, body);
         let enclosing = self.child_enclosing();
-        let proto = self.cx.compile_function_body(
+        let mut proto = self.cx.compile_function_body(
             name.as_deref(),
             &params,
             rest.as_deref(),
@@ -1865,6 +1884,7 @@ impl<'a> FnCompiler<'a> {
             captured,
             enclosing,
         )?;
+        proto.source = self.cx.src_slice(f.span.start, f.span.end);
         let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);
@@ -1883,6 +1903,7 @@ impl<'a> FnCompiler<'a> {
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing)?;
         proto.name = name.to_string();
+        proto.source = self.cx.src_slice(a.span.start, a.span.end);
         let has_upvalues = !proto.upvalues.is_empty();
         let id = self.cx.functions.len() as u32;
         self.cx.functions.push(proto);

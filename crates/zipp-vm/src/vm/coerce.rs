@@ -91,7 +91,9 @@ impl<'p> Vm<'p> {
         }
         for name in ["toString", "valueOf"] {
             let f = self.get_prop(v, name)?;
-            if f.is_heap() && self.heap.as_callable(f.heap_index()).is_some() {
+            // `is_callable` (not `as_callable`) so native methods count — notably
+            // `Function.prototype.toString`, which yields the real source text.
+            if self.is_callable(f) {
                 let r = self.call_value(f, v, &[])?;
                 if !r.is_heap() || self.heap.is_str_like(r.heap_index()) {
                     return Ok(self.display(r));

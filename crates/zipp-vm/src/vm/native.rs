@@ -77,6 +77,9 @@ pub const TA_GET_TOSTRINGTAG: u16 = 652;
 /// `get [Symbol.species]()` — returns the receiver constructor (`this`). Shared
 /// by Array/TypedArray/Map/Set/Promise/RegExp/ArrayBuffer.
 pub const SPECIES_GET: u16 = 653;
+/// `Function.prototype.toString` — returns the function's stored source text, or
+/// the `function name() { [native code] }` form for natives/bound functions.
+pub const FN_TO_STRING: u16 = 654;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -524,6 +527,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         TA_GET_LENGTH => ("get length", 0),
         TA_GET_TOSTRINGTAG => ("get [Symbol.toStringTag]", 0),
         SPECIES_GET => ("get [Symbol.species]", 0),
+        FN_TO_STRING => ("toString", 0),
         FN_CALL => ("call", 1),
         FN_APPLY => ("apply", 2),
         FN_BIND => ("bind", 1),

@@ -53,7 +53,7 @@ pub fn run(src: &str) -> Result<Outcome, String> {
     if !ret.errors.is_empty() {
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
-    let program = compile::compile_program(&ret.program)?;
+    let program = compile::compile_program(&ret.program, src)?;
     // Dev aid: `ZIPP_VM_DUMP=1` prints each function's bytecode to stderr before
     // running (so the JIT-able regions can be inspected).
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
@@ -127,7 +127,7 @@ mod tests {
         let allocator = Allocator::default();
         let ret = Parser::new(&allocator, src, SourceType::default()).parse();
         assert!(ret.errors.is_empty(), "parse error: {:?}", ret.errors);
-        let program = compile::compile_program(&ret.program).expect("compile");
+        let program = compile::compile_program(&ret.program, src).expect("compile");
         let mut vm = vm::Vm::new(&program);
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         vm.set_jit_enabled(false);

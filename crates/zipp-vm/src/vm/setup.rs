@@ -125,7 +125,12 @@ impl<'p> Vm<'p> {
         }
         self.fn_proto = build(
             self,
-            &[("call", FN_CALL), ("apply", FN_APPLY), ("bind", FN_BIND)],
+            &[
+                ("call", FN_CALL),
+                ("apply", FN_APPLY),
+                ("bind", FN_BIND),
+                ("toString", FN_TO_STRING),
+            ],
             None,
         );
         // Build the Array.prototype / String.prototype method lists from the

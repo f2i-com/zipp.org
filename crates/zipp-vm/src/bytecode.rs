@@ -432,6 +432,11 @@ pub struct FuncProto {
     /// frame finds the cell to capture: a local register holding a cell, or one
     /// of the defining frame's own upvalues (nested-of-nested capture).
     pub upvalues: Vec<UpvalSource>,
+    /// Exact source text of this function (sliced from the program source by the
+    /// function node's span), used by `Function.prototype.toString`. Empty for
+    /// the synthetic top-level script body and for placeholders, in which case
+    /// `toString` falls back to the native-function form.
+    pub source: String,
 }
 
 /// Where a closure's upvalue is sourced from, evaluated in the defining frame.

@@ -8,6 +8,30 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
+    /// The bare name of a callable value, for the `function <name>() { [native
+    /// code] }` form of `toString`. Synthetic names (`<arrow>`, `<anonymous>`)
+    /// and `Class.method` qualifiers are stripped; unknown → empty.
+    pub(crate) fn callable_name(&self, v: Value) -> String {
+        if !v.is_heap() {
+            return String::new();
+        }
+        let raw: String = match self.heap.get(v.heap_index()) {
+            HeapObj::Func(id) => self.program.functions[*id as usize].name.clone(),
+            HeapObj::Closure { func, .. } => self.program.functions[*func as usize].name.clone(),
+            HeapObj::Class(c) => c.name.clone(),
+            HeapObj::Native(nid) => native::static_name_length(*nid)
+                .map(|(n, _)| n.to_string())
+                .or_else(|| native::proto_method(*nid).map(|(n, _, _)| n.to_string()))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        if raw.is_empty() || raw.starts_with('<') {
+            String::new()
+        } else {
+            raw.rsplit('.').next().unwrap_or(&raw).to_string()
+        }
+    }
+
     /// Invoke a native (built-in) function by id with `this` and `args`. Backs
     /// first-class builtin values (`Object.defineProperty`, `Array.isArray`,
     /// `Object.prototype.hasOwnProperty`, `Function.prototype.call`, …).
@@ -498,6 +522,41 @@ impl<'p> Vm<'p> {
             FN_BIND => {
                 let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
                 Value::heap(self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound }))
+            }
+            FN_TO_STRING => {
+                if !this.is_heap() {
+                    return Err(Thrown(
+                        "TypeError: Function.prototype.toString requires that 'this' be a Function"
+                            .into(),
+                    ));
+                }
+                // User functions carry their exact source slice; everything else
+                // (natives, bound, classes) renders in the `[native code]` form.
+                let stored: Option<String> = match self.heap.get(this.heap_index()) {
+                    HeapObj::Func(id) => {
+                        let s = &self.program.functions[*id as usize].source;
+                        (!s.is_empty()).then(|| s.clone())
+                    }
+                    HeapObj::Closure { func, .. } => {
+                        let s = &self.program.functions[*func as usize].source;
+                        (!s.is_empty()).then(|| s.clone())
+                    }
+                    HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::Class(_) => None,
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: Function.prototype.toString requires that 'this' be a Function"
+                                .into(),
+                        ))
+                    }
+                };
+                let out = match stored {
+                    Some(s) => s,
+                    None => {
+                        let name = self.callable_name(this);
+                        format!("function {name}() {{ [native code] }}")
+                    }
+                };
+                self.alloc_str(out)
             }
             ARR_IS_ARRAY => {
                 Value::bool(a0.is_heap() && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_)))
