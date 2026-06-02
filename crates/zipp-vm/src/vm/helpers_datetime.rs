@@ -617,6 +617,30 @@ pub(crate) fn difference_datetime(dt1: [i64; 9], dt2: [i64; 9], largest: &str) -
 }
 
 /// Size of a time/day unit in nanoseconds (used for rounding).
+/// Format the time portion "HH:MM[:SS[.fff]]" for a Temporal toString with a
+/// resolved precision: `digits` = -1 (auto, trim trailing zeros), 0..9 fixed
+/// fractional-second digits; `omit_sec` drops ":SS" (smallestUnit "minute").
+pub(crate) fn format_time_part(t: &[i64; 6], digits: i32, omit_sec: bool) -> String {
+    let mut out = format!("{:02}:{:02}", t[0], t[1]);
+    if omit_sec {
+        return out;
+    }
+    out.push_str(&format!(":{:02}", t[2]));
+    let frac_ns = t[3] * 1_000_000 + t[4] * 1_000 + t[5]; // 0..=999_999_999
+    if digits < 0 {
+        if frac_ns != 0 {
+            let s = format!("{frac_ns:09}");
+            out.push('.');
+            out.push_str(s.trim_end_matches('0'));
+        }
+    } else if digits > 0 {
+        let s = format!("{frac_ns:09}");
+        out.push('.');
+        out.push_str(&s[..digits as usize]);
+    }
+    out
+}
+
 /// The ten Temporal duration units (singular), largest to smallest.
 pub(crate) const DURATION_UNITS: &[&str] = &[
     "year", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond",

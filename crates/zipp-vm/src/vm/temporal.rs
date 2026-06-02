@@ -343,6 +343,68 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Resolve a toString() options bag (fractionalSecondDigits / smallestUnit /
+    /// roundingMode) into (round-unit ns, fractional digits [-1=auto, 0..9],
+    /// omit-seconds, roundingMode). smallestUnit wins over fractionalSecondDigits.
+    pub(crate) fn time_precision(
+        &mut self,
+        options: Value,
+    ) -> Result<(i128, i32, bool, String), Thrown> {
+        if options == Value::UNDEFINED {
+            return Ok((1, -1, false, "trunc".to_string()));
+        }
+        if !self.is_object_value(options) {
+            return Err(Thrown("TypeError: options must be an object or undefined".into()));
+        }
+        let mode = self.opt_string(
+            options,
+            "roundingMode",
+            "trunc",
+            &[
+                "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
+                "halfEven", "halfExpand",
+            ],
+        )?;
+        let su_v = self.get_prop(options, "smallestUnit")?;
+        if su_v != Value::UNDEFINED {
+            let su = normalize_unit(&self.to_js_string(su_v)?, "");
+            let (unit, digits, omit) = match su.as_str() {
+                "minute" => (60_000_000_000i128, 0, true),
+                "second" => (1_000_000_000, 0, false),
+                "millisecond" => (1_000_000, 3, false),
+                "microsecond" => (1_000, 6, false),
+                "nanosecond" => (1, 9, false),
+                _ => {
+                    return Err(Thrown(format!(
+                        "RangeError: invalid smallestUnit for toString: {su}"
+                    )))
+                }
+            };
+            return Ok((unit, digits, omit, mode));
+        }
+        let fsd_v = self.get_prop(options, "fractionalSecondDigits")?;
+        if fsd_v == Value::UNDEFINED {
+            return Ok((1, -1, false, mode));
+        }
+        // A string value must be exactly "auto"; otherwise it is a Number 0..9.
+        if fsd_v.is_heap() && self.heap.is_str_like(fsd_v.heap_index()) {
+            if self.to_js_string(fsd_v)? == "auto" {
+                return Ok((1, -1, false, mode));
+            }
+            return Err(Thrown("RangeError: fractionalSecondDigits must be 'auto' or 0..9".into()));
+        }
+        let n = self.to_number(fsd_v)?;
+        if n.is_nan() {
+            return Err(Thrown("RangeError: fractionalSecondDigits is NaN".into()));
+        }
+        let n = n.trunc() as i64;
+        if !(0..=9).contains(&n) {
+            return Err(Thrown("RangeError: fractionalSecondDigits out of range".into()));
+        }
+        let unit = 10i128.pow(9 - n as u32);
+        Ok((unit, n as i32, false, mode))
+    }
+
     pub(crate) fn to_plain_date(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
         self.to_plain_date_overflow(v, false)
     }
@@ -562,7 +624,13 @@ impl<'p> Vm<'p> {
         };
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "toString" | "toJSON" => Ok(Some(self.alloc_str(time_string(&f)))),
+            "toJSON" => Ok(Some(self.alloc_str(time_string(&f)))),
+            "toString" => {
+                let (unit, digits, omit, mode) = self.time_precision(a0)?;
+                let rounded = round_increment(time_to_ns(&f), unit, &mode).rem_euclid(DAY_NS);
+                let t = ns_to_time(rounded);
+                Ok(Some(self.alloc_str(format_time_part(&t, digits, omit))))
+            }
             "valueOf" => Err(Thrown("TypeError: Called Temporal.PlainTime.prototype.valueOf".into())),
             "equals" => {
                 let o = self.to_plain_time(a0)?;
@@ -755,8 +823,18 @@ impl<'p> Vm<'p> {
         let date = [f[0], f[1], f[2]];
         let time = [f[3], f[4], f[5], f[6], f[7], f[8]];
         match name {
-            "toString" | "toJSON" => {
+            "toJSON" => {
                 let s = format!("{}T{}", iso_date_string(date[0], date[1], date[2]), time_string(&time));
+                Ok(Some(self.alloc_str(s)))
+            }
+            "toString" => {
+                let (unit, digits, omit, mode) = self.time_precision(a0)?;
+                let rounded = round_increment(time_to_ns(&time), unit, &mode);
+                let carry = rounded.div_euclid(DAY_NS) as i64;
+                let t = ns_to_time(rounded.rem_euclid(DAY_NS));
+                let (ny, nm, nd) =
+                    epoch_days_to_iso(iso_to_epoch_days(date[0], date[1], date[2]) + carry);
+                let s = format!("{}T{}", iso_date_string(ny, nm, nd), format_time_part(&t, digits, omit));
                 Ok(Some(self.alloc_str(s)))
             }
             "valueOf" => {
@@ -935,7 +1013,16 @@ impl<'p> Vm<'p> {
         };
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "toString" | "toJSON" => Ok(Some(self.alloc_str(instant_to_string(ns)))),
+            "toJSON" => Ok(Some(self.alloc_str(instant_to_string(ns)))),
+            "toString" => {
+                // Default time zone is UTC ("Z"); a timeZone option is not yet supported.
+                let (unit, digits, omit, mode) = self.time_precision(a0)?;
+                let rounded = round_increment(ns, unit, &mode);
+                let t = ns_to_time(rounded.rem_euclid(DAY_NS));
+                let (y, mo, d) = epoch_days_to_iso(rounded.div_euclid(DAY_NS) as i64);
+                let s = format!("{}T{}Z", iso_date_string(y, mo, d), format_time_part(&t, digits, omit));
+                Ok(Some(self.alloc_str(s)))
+            }
             "valueOf" => Err(Thrown("TypeError: Called Temporal.Instant.prototype.valueOf".into())),
             "equals" => {
                 let o = self.to_instant_ns(a0)?;
