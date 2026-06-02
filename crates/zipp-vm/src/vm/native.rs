@@ -278,9 +278,9 @@ pub const ZONEDDATETIME_METHODS: &[&str] = &[
     "since", "round", "equals", "toString", "toJSON", "toLocaleString", "valueOf",
     "startOfDay", "toInstant", "toPlainDate", "toPlainTime", "toPlainDateTime", "getISOFields",
 ];
-pub const ZDT_M_BASE: u16 = 600;
-pub const ZDT_FROM: u16 = 640;
-pub const ZDT_COMPARE: u16 = 641;
+pub const ZDT_M_BASE: u16 = 660;
+pub const ZDT_FROM: u16 = 680;
+pub const ZDT_COMPARE: u16 = 681;
 /// Temporal.Now namespace methods.
 pub const NOW_INSTANT: u16 = 540;
 pub const NOW_PLAINDATETIME_ISO: u16 = 541;

@@ -1119,7 +1119,7 @@ impl<'p> Vm<'p> {
         &mut self,
         idx: u32,
         name: &str,
-        _args: &[Value],
+        args: &[Value],
     ) -> Result<Option<Value>, Thrown> {
         match name {
             "valueOf" => Err(Thrown(
@@ -1130,8 +1130,62 @@ impl<'p> Vm<'p> {
                 let s = self.zdt_to_string(idx);
                 Ok(Some(self.alloc_str(s)))
             }
+            "toInstant" => {
+                let ns = self.zdt_epoch_ns(idx).unwrap_or(0);
+                Ok(Some(self.make_instant(ns)?))
+            }
+            "toPlainDateTime" => {
+                let f = self.zdt_local(idx);
+                Ok(Some(self.make_plain_date_time(f)?))
+            }
+            "toPlainDate" => {
+                let f = self.zdt_local(idx);
+                Ok(Some(self.make_plain_date(f[0], f[1], f[2])?))
+            }
+            "toPlainTime" => {
+                let f = self.zdt_local(idx);
+                Ok(Some(self.make_plain_time([f[3], f[4], f[5], f[6], f[7], f[8]])?))
+            }
+            "startOfDay" => {
+                let off = self.zdt_offset_ns(idx) as i128;
+                let local = self.zdt_epoch_ns(idx).unwrap_or(0) + off;
+                let midnight_local = local.div_euclid(DAY_NS) * DAY_NS;
+                let new_ns = midnight_local - off;
+                Ok(Some(self.make_zoned_date_time_raw(new_ns, self.zdt_offset_ns(idx), idx)))
+            }
+            "equals" => {
+                let other = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let eq = other.is_heap()
+                    && self.zdt_epoch_ns(other.heap_index()) == self.zdt_epoch_ns(idx)
+                    && self.zdt_epoch_ns(idx).is_some()
+                    && self.zdt_tz_id(idx) == self.zdt_tz_id(other.heap_index());
+                Ok(Some(Value::bool(eq)))
+            }
             _ => Ok(None),
         }
+    }
+
+    /// Build a ZonedDateTime from epoch ns + offset, copying the time-zone id of an
+    /// existing instance `src` (used by methods that derive a new ZDT in place).
+    pub(crate) fn make_zoned_date_time_raw(&mut self, ns: i128, offset_ns: i64, src: u32) -> Value {
+        let _gc = self.gc_lock_guard();
+        let hi = (ns >> 64) as i64;
+        let lo = ns as i64;
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 7, fields: vec![hi, lo, offset_ns] });
+        if self.zoneddatetime_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.zoneddatetime_proto));
+        }
+        if let Some(tz) = self.zdt_tz.get(&src).copied() {
+            self.zdt_tz.insert(idx, tz);
+        }
+        Value::heap(idx)
+    }
+
+    /// The time-zone id string of a ZDT instance (for equality).
+    fn zdt_tz_id(&self, idx: u32) -> Option<String> {
+        self.zdt_tz
+            .get(&idx)
+            .and_then(|v| self.heap.str_cow(v.heap_index()).map(|s| s.into_owned()))
     }
 
     /// ISO string for a ZonedDateTime: `YYYY-MM-DDTHH:MM:SS<offset>[<tzid>]`.
