@@ -262,6 +262,14 @@ mod native {
     pub const PT_M_BASE: u16 = 450;
     pub const PLAINTIME_FROM: u16 = 470;
     pub const PLAINTIME_COMPARE: u16 = 471;
+    /// Temporal.PlainDateTime.prototype methods at PDT_M_BASE + index.
+    pub const PLAINDATETIME_METHODS: &[&str] = &[
+        "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
+        "toPlainDate", "toPlainTime", "getISOFields",
+    ];
+    pub const PDT_M_BASE: u16 = 472;
+    pub const PLAINDATETIME_FROM: u16 = 490;
+    pub const PLAINDATETIME_COMPARE: u16 = 491;
     /// Field names of a Temporal.Duration, in slot order.
     pub const DURATION_FIELDS: [&str; 10] = [
         "years", "months", "weeks", "days", "hours", "minutes", "seconds",
@@ -662,6 +670,8 @@ pub struct Vm<'p> {
     plaindate_proto: u32,
     plaintime_ctor: u32,
     plaintime_proto: u32,
+    plaindatetime_ctor: u32,
+    plaindatetime_proto: u32,
     /// Monotonic counter giving each `Symbol()` a unique internal property key
     /// (`@@sym:N`), so distinct symbols never collide as object keys.
     symbol_counter: u64,
@@ -806,6 +816,8 @@ impl<'p> Vm<'p> {
             plaindate_proto: 0,
             plaintime_ctor: 0,
             plaintime_proto: 0,
+            plaindatetime_ctor: 0,
+            plaindatetime_proto: 0,
             symbol_counter: 0,
             symbol_registry: std::collections::HashMap::new(),
             symbol_keys: std::collections::HashMap::new(),
@@ -5652,10 +5664,37 @@ impl<'p> Vm<'p> {
                 p.define("constructor", Value::heap(plaintime_ctor), method_attr);
                 p.define("@@toStringTag", pttag, fn_attr);
             }
+            // Temporal.PlainDateTime
+            let pdt_methods: Vec<(&str, u16)> = native::PLAINDATETIME_METHODS
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| (n, native::PDT_M_BASE + i as u16))
+                .collect();
+            let plaindatetime_proto = build(self, &pdt_methods, None);
+            self.proto_of.insert(plaindatetime_proto, Value::heap(obj_proto));
+            self.plaindatetime_proto = plaindatetime_proto;
+            let pdtfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATETIME_FROM)));
+            let pdtcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATETIME_COMPARE)));
+            let pdtname = self.alloc_str("PlainDateTime".to_string());
+            let pdttag = self.alloc_str("Temporal.PlainDateTime".to_string());
+            let mut pdtm = ObjMap::new();
+            pdtm.define("prototype", Value::heap(plaindatetime_proto), proto_attr);
+            pdtm.define("from", pdtfrom, method_attr);
+            pdtm.define("compare", pdtcompare, method_attr);
+            pdtm.define("name", pdtname, fn_attr);
+            pdtm.define("length", Value::num(3.0), fn_attr);
+            pdtm.is_ctor = true;
+            let plaindatetime_ctor = self.heap.alloc(HeapObj::Object(pdtm));
+            self.plaindatetime_ctor = plaindatetime_ctor;
+            if let HeapObj::Object(p) = self.heap.get_mut(plaindatetime_proto) {
+                p.define("constructor", Value::heap(plaindatetime_ctor), method_attr);
+                p.define("@@toStringTag", pdttag, fn_attr);
+            }
             let mut tn = ObjMap::new();
             tn.define("Duration", Value::heap(duration_ctor), method_attr);
             tn.define("PlainDate", Value::heap(plaindate_ctor), method_attr);
             tn.define("PlainTime", Value::heap(plaintime_ctor), method_attr);
+            tn.define("PlainDateTime", Value::heap(plaindatetime_ctor), method_attr);
             self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
             let dataview_ctor = build(self, &[], Some(dataview_proto));
             self.dataview_ctor = dataview_ctor;
@@ -6666,6 +6705,31 @@ impl<'p> Vm<'p> {
                 let (ta, tb) = (time_to_ns(&a), time_to_ns(&b));
                 Value::num(if ta < tb { -1.0 } else if ta > tb { 1.0 } else { 0.0 })
             }
+            _ if (PDT_M_BASE..PDT_M_BASE + PLAINDATETIME_METHODS.len() as u16).contains(&id) => {
+                let m = PLAINDATETIME_METHODS[(id - PDT_M_BASE) as usize];
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::Temporal { kind: 3, .. })
+                ) {
+                    return Err(Thrown(format!(
+                        "TypeError: Temporal.PlainDateTime.prototype.{m} called on incompatible receiver"
+                    )));
+                }
+                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+            }
+            PLAINDATETIME_FROM => {
+                let f = self.to_plain_date_time(a0)?;
+                self.make_plain_date_time(f)?
+            }
+            PLAINDATETIME_COMPARE => {
+                let a = self.to_plain_date_time(a0)?;
+                let b = self.to_plain_date_time(a1)?;
+                let an = iso_to_epoch_days(a[0], a[1], a[2]) as i128 * 86_400_000_000_000
+                    + time_to_ns(&[a[3], a[4], a[5], a[6], a[7], a[8]]);
+                let bn = iso_to_epoch_days(b[0], b[1], b[2]) as i128 * 86_400_000_000_000
+                    + time_to_ns(&[b[3], b[4], b[5], b[6], b[7], b[8]]);
+                Value::num(if an < bn { -1.0 } else if an > bn { 1.0 } else { 0.0 })
+            }
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -7421,6 +7485,35 @@ impl<'p> Vm<'p> {
                 "nanosecond" => Value::num(f[5] as f64),
                 "calendarId" => self.alloc_str("iso8601".to_string()),
                 _ => self.proto_member(self.plaintime_proto, key),
+            });
+        }
+        // Temporal.PlainDateTime getters (date + time); methods via the prototype.
+        if let HeapObj::Temporal { kind: 3, .. } = self.heap.get(obj.heap_index()) {
+            let f = self.pdt_fields(obj.heap_index()).unwrap_or([0; 9]);
+            let (y, m, d) = (f[0], f[1], f[2]);
+            return Ok(match key {
+                "year" => Value::num(y as f64),
+                "month" => Value::num(m as f64),
+                "day" => Value::num(d as f64),
+                "hour" => Value::num(f[3] as f64),
+                "minute" => Value::num(f[4] as f64),
+                "second" => Value::num(f[5] as f64),
+                "millisecond" => Value::num(f[6] as f64),
+                "microsecond" => Value::num(f[7] as f64),
+                "nanosecond" => Value::num(f[8] as f64),
+                "dayOfWeek" => Value::num(iso_day_of_week(y, m, d) as f64),
+                "dayOfYear" => {
+                    Value::num((iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1) as f64)
+                }
+                "weekOfYear" => Value::num(iso_week_of_year(y, m, d) as f64),
+                "daysInMonth" => Value::num(days_in_month(y, m) as f64),
+                "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
+                "daysInWeek" => Value::num(7.0),
+                "monthsInYear" => Value::num(12.0),
+                "inLeapYear" => Value::bool(is_leap_year(y)),
+                "monthCode" => self.alloc_str(format!("M{m:02}")),
+                "calendarId" => self.alloc_str("iso8601".to_string()),
+                _ => self.proto_member(self.plaindatetime_proto, key),
             });
         }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
@@ -9592,6 +9685,7 @@ impl<'p> Vm<'p> {
             HeapObj::Temporal { kind: 0, .. } => self.duration_method(idx, name, args),
             HeapObj::Temporal { kind: 1, .. } => self.plain_date_method(idx, name, args),
             HeapObj::Temporal { kind: 2, .. } => self.plain_time_method(idx, name, args),
+            HeapObj::Temporal { kind: 3, .. } => self.plain_date_time_method(idx, name, args),
             _ => Ok(None),
         }
     }
@@ -9886,6 +9980,187 @@ impl<'p> Vm<'p> {
                     "isoMicrosecond",
                     "isoNanosecond",
                 ];
+                for (i, nm) in names.iter().enumerate() {
+                    o.set(nm, Value::num(f[i] as f64));
+                }
+                o.set("calendar", cal);
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(o)))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    // ── Temporal.PlainDateTime ──
+
+    fn make_plain_date_time(&mut self, f: [i64; 9]) -> Result<Value, Thrown> {
+        if !(1..=12).contains(&f[1])
+            || f[2] < 1
+            || f[2] > days_in_month(f[0], f[1])
+            || !(-271821..=275760).contains(&f[0])
+            || !(0..24).contains(&f[3])
+            || !(0..60).contains(&f[4])
+            || !(0..60).contains(&f[5])
+            || !(0..1000).contains(&f[6])
+            || !(0..1000).contains(&f[7])
+            || !(0..1000).contains(&f[8])
+        {
+            return Err(Thrown("RangeError: invalid PlainDateTime value".into()));
+        }
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 3, fields: f.to_vec() });
+        if self.plaindatetime_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.plaindatetime_proto));
+        }
+        Ok(Value::heap(idx))
+    }
+
+    fn pdt_fields(&self, idx: u32) -> Option<[i64; 9]> {
+        match self.heap.get(idx) {
+            HeapObj::Temporal { kind: 3, fields } => {
+                let mut f = [0i64; 9];
+                for (i, s) in f.iter_mut().enumerate() {
+                    *s = *fields.get(i).unwrap_or(&0);
+                }
+                Some(f)
+            }
+            _ => None,
+        }
+    }
+
+    fn to_plain_date_time(&mut self, v: Value) -> Result<[i64; 9], Thrown> {
+        if v.is_heap() {
+            if let Some(f) = self.pdt_fields(v.heap_index()) {
+                return Ok(f);
+            }
+            if let Some((y, m, d)) = self.plain_date_fields(v.heap_index()) {
+                return Ok([y, m, d, 0, 0, 0, 0, 0, 0]);
+            }
+            if self.heap.is_str_like(v.heap_index()) {
+                let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
+                return parse_iso_datetime(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
+            }
+            if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+                let names = [
+                    "year", "month", "day", "hour", "minute", "second", "millisecond",
+                    "microsecond", "nanosecond",
+                ];
+                let mut f = [0i64; 9];
+                let mut have_date = [false; 3];
+                for (i, nm) in names.iter().enumerate() {
+                    if let Some(x) = self.opt_int_field(v, nm)? {
+                        f[i] = x;
+                        if i < 3 {
+                            have_date[i] = true;
+                        }
+                    }
+                }
+                if !have_date.iter().all(|&b| b) {
+                    return Err(Thrown("TypeError: PlainDateTime-like requires year, month, day".into()));
+                }
+                return Ok(f);
+            }
+        }
+        Err(Thrown("TypeError: cannot convert value to a Temporal.PlainDateTime".into()))
+    }
+
+    fn plain_date_time_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+        let f = match self.pdt_fields(idx) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let date = [f[0], f[1], f[2]];
+        let time = [f[3], f[4], f[5], f[6], f[7], f[8]];
+        match name {
+            "toString" | "toJSON" => {
+                let s = format!("{}T{}", iso_date_string(date[0], date[1], date[2]), time_string(&time));
+                Ok(Some(self.alloc_str(s)))
+            }
+            "valueOf" => {
+                Err(Thrown("TypeError: Called Temporal.PlainDateTime.prototype.valueOf".into()))
+            }
+            "equals" => {
+                let o = self.to_plain_date_time(a0)?;
+                Ok(Some(Value::bool(f == o)))
+            }
+            "toPlainDate" => Ok(Some(self.make_plain_date(date[0], date[1], date[2])?)),
+            "toPlainTime" => Ok(Some(self.make_plain_time(time)?)),
+            "with" => {
+                let names = [
+                    "year", "month", "day", "hour", "minute", "second", "millisecond",
+                    "microsecond", "nanosecond",
+                ];
+                let mut nf = f;
+                let mut any = false;
+                for (i, nm) in names.iter().enumerate() {
+                    if let Some(x) = self.opt_int_field(a0, nm)? {
+                        nf[i] = x;
+                        any = true;
+                    }
+                }
+                if !any {
+                    return Err(Thrown("TypeError: with() requires a partial object".into()));
+                }
+                Ok(Some(self.make_plain_date_time(nf)?))
+            }
+            "add" | "subtract" => {
+                let dur = self.to_duration(a0)?;
+                let sign: i64 = if name == "add" { 1 } else { -1 };
+                // Time part with day carry.
+                let tns = time_to_ns(&time)
+                    + ((dur[4] as i128) * 3_600_000_000_000
+                        + (dur[5] as i128) * 60_000_000_000
+                        + (dur[6] as i128) * 1_000_000_000
+                        + (dur[7] as i128) * 1_000_000
+                        + (dur[8] as i128) * 1_000
+                        + (dur[9] as i128))
+                        * sign as i128;
+                let carry = tns.div_euclid(86_400_000_000_000) as i64;
+                let nt = ns_to_time(tns.rem_euclid(86_400_000_000_000));
+                // Date part: years/months constrain, then weeks/days + carry.
+                let tm = (date[0] + dur[0] * sign) * 12 + (date[1] - 1) + dur[1] * sign;
+                let ny0 = tm.div_euclid(12);
+                let nmo = tm.rem_euclid(12) + 1;
+                let nd0 = date[2].min(days_in_month(ny0, nmo));
+                let ed = iso_to_epoch_days(ny0, nmo, nd0) + (dur[2] * 7 + dur[3]) * sign + carry;
+                let (ny, nm, nd) = epoch_days_to_iso(ed);
+                Ok(Some(self.make_plain_date_time([
+                    ny, nm, nd, nt[0], nt[1], nt[2], nt[3], nt[4], nt[5],
+                ])?))
+            }
+            "until" | "since" => {
+                let o = self.to_plain_date_time(a0)?;
+                let a_ns = iso_to_epoch_days(f[0], f[1], f[2]) as i128 * 86_400_000_000_000
+                    + time_to_ns(&time);
+                let b_ns = iso_to_epoch_days(o[0], o[1], o[2]) as i128 * 86_400_000_000_000
+                    + time_to_ns(&[o[3], o[4], o[5], o[6], o[7], o[8]]);
+                let diff = if name == "until" { b_ns - a_ns } else { a_ns - b_ns };
+                let days = (diff.abs() / 86_400_000_000_000) as i64;
+                let t = ns_to_time(diff.abs() % 86_400_000_000_000);
+                let mut df = [0i64; 10];
+                df[3] = days;
+                df[4..10].copy_from_slice(&t);
+                if diff < 0 {
+                    for x in df.iter_mut() {
+                        *x = -*x;
+                    }
+                }
+                Ok(Some(self.make_duration(df)))
+            }
+            "getISOFields" => {
+                let cal = self.alloc_str("iso8601".to_string());
+                let names = [
+                    "isoYear",
+                    "isoMonth",
+                    "isoDay",
+                    "isoHour",
+                    "isoMinute",
+                    "isoSecond",
+                    "isoMillisecond",
+                    "isoMicrosecond",
+                    "isoNanosecond",
+                ];
+                let mut o = ObjMap::new();
                 for (i, nm) in names.iter().enumerate() {
                     o.set(nm, Value::num(f[i] as f64));
                 }
@@ -10540,6 +10815,17 @@ impl<'p> Vm<'p> {
                 }
             }
             return self.make_plain_time(f);
+        }
+        if ci == self.plaindatetime_ctor && ci != 0 {
+            // year/month/day required (omitted → 0 → RangeError); time fields default 0.
+            let mut f = [0i64; 9];
+            for (i, slot) in f.iter_mut().enumerate() {
+                let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
+                if v != Value::UNDEFINED {
+                    *slot = self.to_number(v)? as i64;
+                }
+            }
+            return self.make_plain_date_time(f);
         }
         // Constructing through a Proxy: `construct` trap (or construct the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(ci) {
@@ -12861,6 +13147,14 @@ impl<'p> Vm<'p> {
                     }
                     time_string(&f)
                 }
+                HeapObj::Temporal { kind: 3, fields } => {
+                    let g = |i: usize| *fields.get(i).unwrap_or(&0);
+                    format!(
+                        "{}T{}",
+                        iso_date_string(g(0), g(1), g(2)),
+                        time_string(&[g(3), g(4), g(5), g(6), g(7), g(8)])
+                    )
+                }
                 HeapObj::Temporal { .. } => "[object Temporal]".into(),
                 HeapObj::Str(s) => s.bytes.clone(),
                 HeapObj::Cons { .. } => {
@@ -12995,6 +13289,14 @@ impl<'p> Vm<'p> {
                     *s = *fields.get(i).unwrap_or(&0);
                 }
                 format!("Temporal.PlainTime <{}>", time_string(&f))
+            }
+            HeapObj::Temporal { kind: 3, fields } => {
+                let g = |i: usize| *fields.get(i).unwrap_or(&0);
+                format!(
+                    "Temporal.PlainDateTime <{}T{}>",
+                    iso_date_string(g(0), g(1), g(2)),
+                    time_string(&[g(3), g(4), g(5), g(6), g(7), g(8)])
+                )
             }
             HeapObj::Temporal { .. } => "[object Temporal]".into(),
             HeapObj::Str(s) => format!("'{}'", s.bytes),
@@ -13758,6 +14060,24 @@ fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
         return None;
     }
     Some([h, mi, sec, sub[0], sub[1], sub[2]])
+}
+
+/// Parse "YYYY-MM-DD[THH:MM:SS.fff]" → [y,mo,d,h,mi,s,ms,us,ns] (time defaults 0).
+fn parse_iso_datetime(s: &str) -> Option<[i64; 9]> {
+    let s = s.trim();
+    let (date_s, time_s) = match s.find(['T', 't']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => match s.find(' ') {
+            Some(i) => (&s[..i], Some(&s[i + 1..])),
+            None => (s, None),
+        },
+    };
+    let (y, mo, d) = parse_iso_date(date_s)?;
+    let t = match time_s {
+        Some(ts) if !ts.is_empty() => parse_iso_time(ts)?,
+        _ => [0; 6],
+    };
+    Some([y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]])
 }
 
 /// "YYYY-MM-DD" (expanded ±YYYYYY for years outside 0..9999).
