@@ -362,7 +362,7 @@ pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
     ("some", 0, 1), ("sort", 0, 1), ("splice", 0, 2), ("toReversed", 0, 0),
     ("toSorted", 0, 1), ("toSpliced", 0, 2), ("toString", 0, 0), ("with", 0, 2),
     ("copyWithin", 0, 2), ("entries", 0, 0), ("keys", 0, 0), ("values", 0, 0),
-    ("toLocaleString", 0, 0),
+    ("toLocaleString", 0, 0), ("unshift", 0, 1),
     // String.prototype.
     ("at", 1, 1), ("charAt", 1, 1), ("charCodeAt", 1, 1), ("codePointAt", 1, 1),
     ("endsWith", 1, 1), ("includes", 1, 1), ("indexOf", 1, 1), ("padEnd", 1, 1),
@@ -379,6 +379,7 @@ pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
     ("small", 1, 0), ("strike", 1, 0), ("sub", 1, 0), ("sup", 1, 0),
     // Number.prototype (kind 2 → number_method, receiver is a number value).
     ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0), ("toLocaleString", 2, 0),
+    ("toExponential", 2, 1), ("toPrecision", 2, 1),
     // Set.prototype (kind 3 → set_method on the Set receiver).
     ("add", 3, 1), ("clear", 3, 0), ("delete", 3, 1), ("entries", 3, 0), ("forEach", 3, 1),
     ("has", 3, 1), ("keys", 3, 0), ("values", 3, 0), ("union", 3, 1), ("intersection", 3, 1),

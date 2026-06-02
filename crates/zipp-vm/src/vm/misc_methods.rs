@@ -114,6 +114,34 @@ impl<'p> Vm<'p> {
             "valueOf" => Ok(Some(recv)),
             // No Intl: toLocaleString() behaves like the default base-10 toString().
             "toLocaleString" => Ok(Some(self.alloc_str(self.display(recv)))),
+            "toExponential" => {
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let digits = if arg == Value::UNDEFINED {
+                    None
+                } else {
+                    let d = arg.as_f64();
+                    if !d.is_finite() || d < 0.0 || d > 100.0 {
+                        return Err(Thrown(
+                            "RangeError: toExponential() argument must be between 0 and 100".into(),
+                        ));
+                    }
+                    Some(d as usize)
+                };
+                Ok(Some(self.alloc_str(fmt_exponential(n, digits))))
+            }
+            "toPrecision" => {
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if arg == Value::UNDEFINED {
+                    return Ok(Some(self.alloc_str(self.display(recv))));
+                }
+                let p = arg.as_f64();
+                if !p.is_finite() || p < 1.0 || p > 100.0 {
+                    return Err(Thrown(
+                        "RangeError: toPrecision() argument must be between 1 and 100".into(),
+                    ));
+                }
+                Ok(Some(self.alloc_str(fmt_precision(n, p as usize))))
+            }
             _ => Ok(None),
         }
     }
@@ -236,4 +264,65 @@ impl<'p> Vm<'p> {
         self.call_value(cb, Value::UNDEFINED, args)
     }
 
+}
+
+/// `Number.prototype.toExponential` formatting → JS form "d.ddde±X" (the exponent
+/// always carries a sign; `digits` None = minimal mantissa).
+fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    let raw = match digits {
+        Some(d) => format!("{n:.d$e}"),
+        None => format!("{n:e}"),
+    };
+    match raw.find('e') {
+        Some(epos) => {
+            let (mant, exp) = raw.split_at(epos);
+            let exp = &exp[1..];
+            let (sign, num) = match exp.strip_prefix('-') {
+                Some(r) => ("-", r),
+                None => ("+", exp),
+            };
+            format!("{mant}e{sign}{num}")
+        }
+        None => raw,
+    }
+}
+
+/// `Number.prototype.toPrecision` formatting (significant digits → fixed or
+/// exponential depending on the magnitude).
+fn fmt_precision(n: f64, p: usize) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
+    }
+    if n == 0.0 {
+        return if p == 1 { "0".to_string() } else { format!("0.{}", "0".repeat(p - 1)) };
+    }
+    let neg = n < 0.0;
+    let a = n.abs();
+    // Round to p significant figures via exponential form, then read the exponent.
+    let exp_str = format!("{a:.*e}", p - 1);
+    let epos = exp_str.find('e').unwrap();
+    let mant: f64 = exp_str[..epos].parse().unwrap_or(a);
+    let exp: i32 = exp_str[epos + 1..].parse().unwrap_or(0);
+    let body = if exp < -6 || exp >= p as i32 {
+        let m = format!("{mant:.*}", p - 1);
+        let sign = if exp < 0 { "-" } else { "+" };
+        format!("{m}e{sign}{}", exp.abs())
+    } else {
+        let frac = (p as i32 - 1 - exp).max(0) as usize;
+        format!("{a:.frac$}")
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
+    }
 }

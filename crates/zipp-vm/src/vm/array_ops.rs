@@ -223,6 +223,19 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::UNDEFINED))
             }
+            "unshift" => {
+                // Prepend all args (preserving order) and return the new length.
+                let len = if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    for (i, &v) in args.iter().enumerate() {
+                        items.insert(i, v);
+                    }
+                    items.len()
+                } else {
+                    0
+                };
+                self.heap.bump_version(idx);
+                Ok(Some(len_value(len)))
+            }
             // `Array.prototype.toString()` is `join()` with the default "," sep.
             "join" | "toString" => {
                 let sep = if name == "toString" || args.is_empty() {
