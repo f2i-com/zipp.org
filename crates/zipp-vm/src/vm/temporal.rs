@@ -185,6 +185,8 @@ impl<'p> Vm<'p> {
                     a0
                 } else if a0 == Value::UNDEFINED {
                     return Err(Thrown("TypeError: total() requires an options argument".into()));
+                } else if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: total() argument must be a string or object".into()));
                 } else {
                     self.get_prop(a0, "unit")?
                 };
@@ -221,6 +223,8 @@ impl<'p> Vm<'p> {
                     (a0, Value::UNDEFINED)
                 } else if a0 == Value::UNDEFINED {
                     return Err(Thrown("TypeError: round() requires an options argument".into()));
+                } else if !self.is_object_value(a0) {
+                    return Err(Thrown("TypeError: round() argument must be a string or object".into()));
                 } else {
                     (self.get_prop(a0, "smallestUnit")?, a0)
                 };
@@ -1650,6 +1654,10 @@ impl<'p> Vm<'p> {
         fb: [i64; 10],
         opts: Value,
     ) -> Result<f64, Thrown> {
+        // GetOptionsObject: a non-undefined options must be an object.
+        if opts != Value::UNDEFINED && !self.is_object_value(opts) {
+            return Err(Thrown("TypeError: options must be an object or undefined".into()));
+        }
         let rel = if opts == Value::UNDEFINED {
             Value::UNDEFINED
         } else {
