@@ -1901,16 +1901,31 @@ impl<'p> Vm<'p> {
         if cv == Value::UNDEFINED {
             return Ok(());
         }
-        // A Temporal instance used as a calendar carries the ISO calendar.
-        if cv.is_heap() && matches!(self.heap.get(cv.heap_index()), HeapObj::Temporal { .. }) {
-            return Ok(());
+        if cv.is_heap() {
+            // A Temporal instance that carries a calendar (Date/DateTime/YearMonth/
+            // MonthDay/ZonedDateTime) is accepted; Duration/PlainTime/Instant have
+            // no calendar, so they (and any plain object) are a TypeError.
+            if let HeapObj::Temporal { kind, .. } = self.heap.get(cv.heap_index()) {
+                return if matches!(kind, 1 | 3 | 5 | 6 | 7) {
+                    Ok(())
+                } else {
+                    Err(Thrown("TypeError: value is not a valid calendar".into()))
+                };
+            }
+            if self.heap.is_str_like(cv.heap_index()) {
+                let s = self.heap.str_cow(cv.heap_index()).unwrap().into_owned();
+                return match calendar_id_from_string(&s) {
+                    Some(id) if id.eq_ignore_ascii_case("iso8601") => Ok(()),
+                    Some(id) => Err(Thrown(format!("RangeError: unsupported calendar \"{id}\""))),
+                    None => Err(Thrown(format!("RangeError: invalid calendar \"{s}\""))),
+                };
+            }
+            // A non-string, non-Temporal object (incl. Symbol/BigInt) is invalid.
+            return Err(Thrown("TypeError: value is not a valid calendar".into()));
         }
-        let s = self.to_js_string(cv)?;
-        match calendar_id_from_string(&s) {
-            Some(id) if id.eq_ignore_ascii_case("iso8601") => Ok(()),
-            Some(id) => Err(Thrown(format!("RangeError: unsupported calendar \"{id}\""))),
-            None => Err(Thrown(format!("RangeError: invalid calendar \"{s}\""))),
-        }
+        // A non-string primitive (null/boolean/number) is a TypeError, not a
+        // bad calendar string.
+        Err(Thrown("TypeError: value is not a valid calendar".into()))
     }
 
     pub(crate) fn plain_year_month_method(
@@ -2246,6 +2261,16 @@ fn temporal_string_ok(s: &str, reject_utc_designator: bool) -> bool {
     }
     if reject_utc_designator && main.bytes().any(|b| b == b'Z' || b == b'z') {
         return false;
+    }
+    // No fractional run (sub-second OR a sub-minute offset) may exceed 9 digits.
+    let chars: Vec<char> = main.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '.' || c == ',' {
+            let n = chars[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+            if n > 9 {
+                return false;
+            }
+        }
     }
     true
 }
