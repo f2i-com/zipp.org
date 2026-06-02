@@ -46,6 +46,7 @@ pub const OBJ_IS_EXT: u16 = 41;
 pub const OBJ_GROUP_BY: u16 = 42;
 pub const MAP_GROUP_BY: u16 = 43;
 pub const PROMISE_WITH_RESOLVERS: u16 = 44;
+pub const PROMISE_TRY: u16 = 628;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -495,6 +496,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         OBJ_GROUP_BY => ("groupBy", 2),
         MAP_GROUP_BY => ("groupBy", 2),
         PROMISE_WITH_RESOLVERS => ("withResolvers", 0),
+        PROMISE_TRY => ("try", 1),
         REFLECT_APPLY => ("apply", 3),
         REFLECT_CONSTRUCT => ("construct", 2),
         REFLECT_GET => ("get", 2),

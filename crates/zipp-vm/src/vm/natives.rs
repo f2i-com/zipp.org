@@ -412,6 +412,11 @@ impl<'p> Vm<'p> {
             }
             // Promise.withResolvers() -> { promise, resolve, reject }.
             PROMISE_WITH_RESOLVERS => {
+                if !self.is_constructor(this) {
+                    return Err(Thrown(
+                        "TypeError: Promise.withResolvers called on a non-constructor".into(),
+                    ));
+                }
                 let p = self.alloc_promise();
                 let resolve = Value::heap(
                     self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
@@ -424,6 +429,21 @@ impl<'p> Vm<'p> {
                 map.set("resolve", resolve);
                 map.set("reject", reject);
                 Value::heap(self.heap.alloc(HeapObj::Object(map)))
+            }
+            PROMISE_TRY => {
+                if !self.is_constructor(this) {
+                    return Err(Thrown("TypeError: Promise.try called on a non-constructor".into()));
+                }
+                let p = self.alloc_promise();
+                let rest: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+                match self.call_value(a0, Value::UNDEFINED, &rest) {
+                    Ok(v) => self.resolve(p, v),
+                    Err(Thrown(msg)) => {
+                        let e = self.alloc_error_from_message(&msg);
+                        self.reject(p, e);
+                    }
+                }
+                Value::heap(p)
             }
             // Reflect namespace. apply/construct accept any callable target; the
             // property-reflecting methods require Type(target) === Object (else TypeError).

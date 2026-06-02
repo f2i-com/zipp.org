@@ -268,11 +268,10 @@ impl<'p> Vm<'p> {
                 ("allSettled", PROMISE_ALLSETTLED),
                 ("race", PROMISE_RACE),
                 ("any", PROMISE_ANY),
-                // NOTE: withResolvers is implemented (PROMISE_WITH_RESOLVERS handler)
-                // but NOT exposed: without Promise-subclassing it can't validate
-                // `this` is a constructor, so the ctx-non-ctor/ctx-non-object tests
-                // (which passed via property-access-on-undefined) net-regress. Re-expose
-                // once `this`-as-constructor / NewPromiseCapability(C) is modelled.
+                // withResolvers/try validate `this` is a constructor (via
+                // is_constructor) so the ctx-non-ctor/non-object tests throw correctly.
+                ("withResolvers", PROMISE_WITH_RESOLVERS),
+                ("try", PROMISE_TRY),
             ],
             Some(promise_proto),
         );
