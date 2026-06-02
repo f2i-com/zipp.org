@@ -480,6 +480,17 @@ impl<'p> Vm<'p> {
             if let Some(t) = self.plain_date_fields(v.heap_index()) {
                 return Ok(t);
             }
+            // A ZonedDateTime or PlainDateTime yields its calendar date.
+            if let HeapObj::Temporal { kind, .. } = self.heap.get(v.heap_index()) {
+                let date = match kind {
+                    7 => Some(self.zdt_local(v.heap_index())),
+                    3 => self.pdt_fields(v.heap_index()),
+                    _ => None,
+                };
+                if let Some(f) = date {
+                    return Ok((f[0], f[1], f[2]));
+                }
+            }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
                 if !temporal_string_ok(&s, true) {
@@ -490,14 +501,13 @@ impl<'p> Vm<'p> {
             }
             if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
                 self.validate_iso_calendar_field(v)?;
-                let yv = self.get_prop(v, "year")?;
-                let dv = self.get_prop(v, "day")?;
+                let y_opt = self.opt_int_field(v, "year")?;
                 let m_opt = self.read_month_field(v)?; // monthCode or month
-                if yv == Value::UNDEFINED || m_opt.is_none() || dv == Value::UNDEFINED {
+                let d_opt = self.opt_int_field(v, "day")?;
+                if y_opt.is_none() || m_opt.is_none() || d_opt.is_none() {
                     return Err(Thrown("TypeError: PlainDate-like requires year, month, day".into()));
                 }
-                let (y, mut m, mut d) =
-                    (self.to_number(yv)? as i64, m_opt.unwrap(), self.to_number(dv)? as i64);
+                let (y, mut m, mut d) = (y_opt.unwrap(), m_opt.unwrap(), d_opt.unwrap());
                 if reject {
                     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
                         return Err(Thrown("RangeError: invalid date fields".into()));
@@ -683,8 +693,14 @@ impl<'p> Vm<'p> {
         if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
             return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
         }
+        // ToIntegerWithTruncation: a non-integer is truncated toward zero (2.5 -> 2),
+        // not rejected; only non-finite or < 1 is out of range.
         let n = self.to_number_coerce(v)?;
-        if !n.is_finite() || n < 1.0 || n.fract() != 0.0 {
+        if !n.is_finite() {
+            return Err(Thrown("RangeError: roundingIncrement out of range".into()));
+        }
+        let n = n.trunc();
+        if n < 1.0 {
             return Err(Thrown("RangeError: roundingIncrement out of range".into()));
         }
         Ok(n as i128)
@@ -707,11 +723,15 @@ impl<'p> Vm<'p> {
     pub(crate) fn opt_int_field(&mut self, obj: Value, key: &str) -> Result<Option<i64>, Thrown> {
         let v = self.get_prop(obj, key)?;
         if v == Value::UNDEFINED {
-            Ok(None)
-        } else {
-            // ToNumber honours a user valueOf/toString (ToPrimitive) on objects.
-            Ok(Some(self.to_number_coerce(v)? as i64))
+            return Ok(None);
         }
+        // ToNumber honours a user valueOf/toString (ToPrimitive) on objects; a
+        // non-finite field (Infinity/NaN) is rejected per the spec.
+        let n = self.to_number_coerce(v)?;
+        if !n.is_finite() {
+            return Err(Thrown(format!("RangeError: {key} property must be a finite number")));
+        }
+        Ok(Some(n.trunc() as i64))
     }
 
     // ── Temporal.PlainTime ──
@@ -758,6 +778,17 @@ impl<'p> Vm<'p> {
         if v.is_heap() {
             if let Some(f) = self.plain_time_fields(v.heap_index()) {
                 return Ok(f);
+            }
+            // A ZonedDateTime or PlainDateTime yields its wall-clock time.
+            if let HeapObj::Temporal { kind, .. } = self.heap.get(v.heap_index()) {
+                let f = match kind {
+                    7 => Some(self.zdt_local(v.heap_index())),
+                    3 => self.pdt_fields(v.heap_index()),
+                    _ => None,
+                };
+                if let Some(f) = f {
+                    return Ok([f[3], f[4], f[5], f[6], f[7], f[8]]);
+                }
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
