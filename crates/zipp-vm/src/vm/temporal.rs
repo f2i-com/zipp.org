@@ -546,6 +546,32 @@ impl<'p> Vm<'p> {
                 let other = self.to_plain_date(a0)?;
                 Ok(Some(Value::bool((y, m, d) == other)))
             }
+            "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(y, m, d)?)),
+            "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(m, d, y)?)),
+            "withCalendar" => {
+                let cal = self.to_js_string(a0)?;
+                if !cal.eq_ignore_ascii_case("iso8601") {
+                    return Err(Thrown(format!("RangeError: unsupported calendar \"{cal}\"")));
+                }
+                Ok(Some(self.make_plain_date(y, m, d)?))
+            }
+            "toZonedDateTime" => {
+                let (id, offset) = self.parse_tz_arg(a0)?;
+                let time = if a0.is_heap()
+                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Object(_))
+                {
+                    let pt = self.get_prop(a0, "plainTime")?;
+                    if pt == Value::UNDEFINED {
+                        [0i64; 6]
+                    } else {
+                        self.to_plain_time(pt)?
+                    }
+                } else {
+                    [0i64; 6]
+                };
+                let local = (iso_to_epoch_days(y, m, d) as i128) * DAY_NS + time_to_ns(&time);
+                Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)))
+            }
             "with" => {
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let ny = self.opt_int_field(a0, "year")?.unwrap_or(y);
@@ -917,6 +943,27 @@ impl<'p> Vm<'p> {
             }
             "toPlainDate" => Ok(Some(self.make_plain_date(date[0], date[1], date[2])?)),
             "toPlainTime" => Ok(Some(self.make_plain_time(time)?)),
+            "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(date[0], date[1], date[2])?)),
+            "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(date[1], date[2], date[0])?)),
+            "withCalendar" => {
+                let cal = self.to_js_string(a0)?;
+                if !cal.eq_ignore_ascii_case("iso8601") {
+                    return Err(Thrown(format!("RangeError: unsupported calendar \"{cal}\"")));
+                }
+                Ok(Some(self.make_plain_date_time(f)?))
+            }
+            "withPlainDate" => {
+                let nd = self.to_plain_date(a0)?;
+                Ok(Some(self.make_plain_date_time([
+                    nd.0, nd.1, nd.2, f[3], f[4], f[5], f[6], f[7], f[8],
+                ])?))
+            }
+            "toZonedDateTime" => {
+                let (id, offset) = self.parse_tz_arg(a0)?;
+                let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
+                    + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
+                Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)))
+            }
             "with" => {
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let names = [
@@ -1370,6 +1417,21 @@ impl<'p> Vm<'p> {
         Value::heap(idx)
     }
 
+    /// Resolve a time-zone argument (a string id, or an object with a `timeZone`
+    /// property) into a (normalized id, offset-ns) pair.
+    pub(crate) fn parse_tz_arg(&mut self, v: Value) -> Result<(String, i64), Thrown> {
+        let s = if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            let tz = self.get_prop(v, "timeZone")?;
+            if tz == Value::UNDEFINED {
+                return Err(Thrown("TypeError: a timeZone is required".into()));
+            }
+            self.to_js_string(tz)?
+        } else {
+            self.to_js_string(v)?
+        };
+        parse_time_zone(&s).ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{s}\"")))
+    }
+
     /// Parse a `relativeTo` option into a date-time [y,mo,d,h,…] anchor (a
     /// ZonedDateTime uses its local wall-clock; otherwise PlainDate/PlainDateTime/
     /// string/object coercion).
@@ -1448,6 +1510,10 @@ impl<'p> Vm<'p> {
             "equals" => {
                 let o = self.to_instant_ns(a0)?;
                 Ok(Some(Value::bool(ns == o)))
+            }
+            "toZonedDateTimeISO" | "toZonedDateTime" => {
+                let (id, offset) = self.parse_tz_arg(a0)?;
+                Ok(Some(self.alloc_zdt(ns, offset, id)))
             }
             "add" | "subtract" => {
                 let dur = self.to_duration(a0)?;

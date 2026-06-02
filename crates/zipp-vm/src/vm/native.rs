@@ -224,7 +224,8 @@ pub const TEMPORAL_DURATION_COMPARE: u16 = 411;
 /// Temporal.PlainDate.prototype methods at PD_M_BASE + index.
 pub const PLAINDATE_METHODS: &[&str] = &[
     "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
-    "getISOFields", "toPlainDateTime",
+    "getISOFields", "toPlainDateTime", "toZonedDateTime", "withCalendar", "toPlainYearMonth",
+    "toPlainMonthDay",
 ];
 pub const PD_M_BASE: u16 = 420;
 pub const PLAINDATE_FROM: u16 = 448;
@@ -240,7 +241,8 @@ pub const PLAINTIME_COMPARE: u16 = 471;
 /// Temporal.PlainDateTime.prototype methods at PDT_M_BASE + index.
 pub const PLAINDATETIME_METHODS: &[&str] = &[
     "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON",
-    "valueOf", "toPlainDate", "toPlainTime", "getISOFields",
+    "valueOf", "toPlainDate", "toPlainTime", "getISOFields", "toZonedDateTime", "withCalendar",
+    "withPlainDate", "toPlainYearMonth", "toPlainMonthDay",
 ];
 pub const PDT_M_BASE: u16 = 472;
 pub const PLAINDATETIME_FROM: u16 = 490;
@@ -248,6 +250,7 @@ pub const PLAINDATETIME_COMPARE: u16 = 491;
 /// Temporal.Instant.prototype methods at INST_M_BASE + index.
 pub const INSTANT_METHODS: &[&str] = &[
     "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON", "valueOf",
+    "toZonedDateTimeISO", "toZonedDateTime",
 ];
 pub const INST_M_BASE: u16 = 492;
 pub const INST_FROM: u16 = 505;
@@ -556,7 +559,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
             let m = methods[(id - base) as usize];
             let len: u8 = match m {
                 "with" | "add" | "subtract" | "until" | "since" | "round" | "equals"
-                | "withPlainTime" | "withTimeZone" | "withCalendar" => 1,
+                | "withPlainTime" | "withTimeZone" | "withCalendar" | "withPlainDate"
+                | "toZonedDateTime" | "toZonedDateTimeISO" => 1,
                 _ => 0,
             };
             return Some((m, len));
