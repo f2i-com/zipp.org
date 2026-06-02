@@ -323,6 +323,17 @@ mod native {
     pub const INTL_SEGMENTER_SEGMENT: u16 = 578;
     pub const INTL_DURATION_FORMAT: u16 = 579;
     pub const INTL_PLURAL_SELECT_RANGE: u16 = 580;
+    /// Intl.Locale prototype getters at INTL_LOCALE_GET_BASE + index of LOCALE_ACCESSORS.
+    pub const INTL_LOCALE_GET_BASE: u16 = 581;
+    pub const LOCALE_ACCESSORS: &[&str] = &[
+        "language", "script", "region", "baseName", "calendar", "caseFirst", "collation",
+        "hourCycle", "numeric", "numberingSystem",
+    ];
+    /// `format`/`compare` bound-function getters (spec: these are accessors that
+    /// return a function bound to the instance).
+    pub const INTL_NF_FORMAT_GET: u16 = 592;
+    pub const INTL_DTF_FORMAT_GET: u16 = 593;
+    pub const INTL_COLLATOR_COMPARE_GET: u16 = 594;
     /// Intl service kinds (index into VM.intl_ctors / intl_protos).
     pub const INTL_NUMBERFORMAT: u8 = 0;
     pub const INTL_DATETIMEFORMAT: u8 = 1;
@@ -5939,8 +5950,8 @@ impl<'p> Vm<'p> {
                     native::INTL_NUMBERFORMAT,
                     "NumberFormat",
                     0.0,
+                    // `format` is an accessor (added below), not a data method.
                     vec![
-                        ("format", INTL_NF_FORMAT),
                         ("formatToParts", INTL_NF_FORMAT_TO_PARTS),
                         ("resolvedOptions", INTL_RESOLVED_OPTIONS),
                     ],
@@ -5951,7 +5962,6 @@ impl<'p> Vm<'p> {
                     "DateTimeFormat",
                     0.0,
                     vec![
-                        ("format", INTL_DTF_FORMAT),
                         ("formatToParts", INTL_DTF_FORMAT_TO_PARTS),
                         ("resolvedOptions", INTL_RESOLVED_OPTIONS),
                     ],
@@ -5961,10 +5971,7 @@ impl<'p> Vm<'p> {
                     native::INTL_COLLATOR,
                     "Collator",
                     0.0,
-                    vec![
-                        ("compare", INTL_COLLATOR_COMPARE),
-                        ("resolvedOptions", INTL_RESOLVED_OPTIONS),
-                    ],
+                    vec![("resolvedOptions", INTL_RESOLVED_OPTIONS)],
                     true,
                 ),
                 (
@@ -6065,6 +6072,35 @@ impl<'p> Vm<'p> {
                     p.define("@@toStringTag", tag, fn_attr);
                 }
                 intl_ns_map.define(name, Value::heap(ctor), method_attr);
+            }
+            // Intl.Locale.prototype subtag getters (accessors reading the instance).
+            let accessor_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: Value::UNDEFINED,
+            };
+            let locale_proto = self.intl_protos[native::INTL_LOCALE as usize];
+            for (i, gname) in native::LOCALE_ACCESSORS.iter().enumerate() {
+                let getter =
+                    Value::heap(self.heap.alloc(HeapObj::Native(INTL_LOCALE_GET_BASE + i as u16)));
+                if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
+                    p.define(gname, getter, accessor_attr);
+                }
+            }
+            // NumberFormat/DateTimeFormat `format` + Collator `compare`: spec says
+            // these are accessors returning a function bound to the instance.
+            for (k, name, gid) in [
+                (native::INTL_NUMBERFORMAT, "format", INTL_NF_FORMAT_GET),
+                (native::INTL_DATETIMEFORMAT, "format", INTL_DTF_FORMAT_GET),
+                (native::INTL_COLLATOR, "compare", INTL_COLLATOR_COMPARE_GET),
+            ] {
+                let getter = Value::heap(self.heap.alloc(HeapObj::Native(gid)));
+                let p = self.intl_protos[k as usize];
+                if let HeapObj::Object(o) = self.heap.get_mut(p) {
+                    o.define(name, getter, accessor_attr);
+                }
             }
             let gcl = Value::heap(self.heap.alloc(HeapObj::Native(INTL_GET_CANONICAL_LOCALES)));
             intl_ns_map.define("getCanonicalLocales", gcl, method_attr);
@@ -7383,6 +7419,38 @@ impl<'p> Vm<'p> {
                 let s = format_duration_en(&dur);
                 self.alloc_str(s)
             }
+            _ if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16)
+                .contains(&id) =>
+            {
+                let field = LOCALE_ACCESSORS[(id - INTL_LOCALE_GET_BASE) as usize];
+                let resolved = self.intl_this(this, INTL_LOCALE, field)?;
+                self.intl_slot(resolved, field)
+            }
+            // The format/compare bound-function getters: return (and cache) a
+            // function bound to the instance, so `nf.format === nf.format`.
+            INTL_NF_FORMAT_GET | INTL_DTF_FORMAT_GET | INTL_COLLATOR_COMPARE_GET => {
+                let (kind, target_id, svc) = match id {
+                    INTL_NF_FORMAT_GET => (INTL_NUMBERFORMAT, INTL_NF_FORMAT, "format"),
+                    INTL_DTF_FORMAT_GET => (INTL_DATETIMEFORMAT, INTL_DTF_FORMAT, "format"),
+                    _ => (INTL_COLLATOR, INTL_COLLATOR_COMPARE, "compare"),
+                };
+                let resolved = self.intl_this(this, kind, svc)?;
+                let cached = self.intl_slot(resolved, "@@boundfn");
+                if cached != Value::UNDEFINED {
+                    cached
+                } else {
+                    let nat = Value::heap(self.heap.alloc(HeapObj::Native(target_id)));
+                    let b = Value::heap(self.heap.alloc(HeapObj::Bound {
+                        target: nat,
+                        this,
+                        args: vec![],
+                    }));
+                    if let HeapObj::Object(m) = self.heap.get_mut(resolved) {
+                        m.set("@@boundfn", b);
+                    }
+                    b
+                }
+            }
             // `Array.prototype.<m>` / `String.prototype.<m>` invoked as a value
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
@@ -7967,6 +8035,21 @@ impl<'p> Vm<'p> {
                 .map(|(n, _, l)| (n.to_string(), l as i32))
                 .or_else(|| native::math_method(*id).map(|(n, _, l)| (n.to_string(), l as i32)))
                 .or_else(|| native::static_name_length(*id).map(|(n, l)| (n.to_string(), l as i32))),
+            // The anonymous functions returned by the Intl format/compare getters
+            // have name "" and length 1 (format) / 2 (compare).
+            HeapObj::Bound { target, .. } if target.is_heap() => {
+                if let HeapObj::Native(tid) = self.heap.get(target.heap_index()) {
+                    match *tid {
+                        native::INTL_NF_FORMAT | native::INTL_DTF_FORMAT => {
+                            Some((String::new(), 1))
+                        }
+                        native::INTL_COLLATOR_COMPARE => Some((String::new(), 2)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -8206,21 +8289,29 @@ impl<'p> Vm<'p> {
                 _ => self.proto_member(self.plainmonthday_proto, key),
             });
         }
-        // Intl.* instance: Locale exposes parsed subtags via prototype getters that
-        // read the instance's internal slots; every other service delegates to its
-        // prototype (resolvedOptions/format/… are prototype methods).
-        if let HeapObj::Intl { kind, resolved } = self.heap.get(obj.heap_index()) {
-            let (kind, resolved) = (*kind, *resolved);
-            if kind == native::INTL_LOCALE
-                && matches!(
-                    key,
-                    "baseName" | "language" | "script" | "region" | "calendar" | "caseFirst"
-                        | "collation" | "hourCycle" | "numeric" | "numberingSystem"
-                )
-            {
-                return Ok(self.intl_slot(resolved, key));
+        // Intl.* instance: resolve the key on its prototype chain (service proto →
+        // Object.prototype), invoking accessor getters (Locale subtags, format/
+        // compare) with this = the instance.
+        if let HeapObj::Intl { kind, .. } = self.heap.get(obj.heap_index()) {
+            let proto = self.intl_protos[*kind as usize];
+            let found = self.own_member(proto, key).or_else(|| {
+                if self.obj_proto != 0 {
+                    self.own_member(self.obj_proto, key)
+                } else {
+                    None
+                }
+            });
+            if let Some((attr, raw)) = found {
+                if attr.accessor {
+                    return if raw == Value::UNDEFINED {
+                        Ok(Value::UNDEFINED)
+                    } else {
+                        self.call_value(raw, obj, &[])
+                    };
+                }
+                return Ok(raw);
             }
-            return Ok(self.proto_member(self.intl_protos[kind as usize], key));
+            return Ok(Value::UNDEFINED);
         }
         // Own data/accessor property on a plain object. Extracted BEFORE the type
         // match so an accessor's getter can be invoked outside the heap borrow.
@@ -11204,6 +11295,17 @@ impl<'p> Vm<'p> {
         Value::UNDEFINED
     }
 
+    /// An object's own property (attr + value) if present — used to resolve and
+    /// invoke prototype accessor getters for Intl instances.
+    fn own_member(&self, idx: u32, key: &str) -> Option<(PropAttr, Value)> {
+        if let HeapObj::Object(m) = self.heap.get(idx) {
+            if let Some(i) = m.pos(key) {
+                return Some((m.attrs[i], m.vals[i]));
+            }
+        }
+        None
+    }
+
     /// Brand-check `this` as an Intl instance of `kind`; return its `resolved` idx.
     fn intl_this(&self, this: Value, kind: u8, m: &str) -> Result<u32, Thrown> {
         if this.is_heap() {
@@ -11221,7 +11323,7 @@ impl<'p> Vm<'p> {
     fn clone_plain_object(&mut self, src: u32) -> Value {
         let pairs: Vec<(String, Value)> = match self.heap.get(src) {
             HeapObj::Object(m) => (0..m.keys.len())
-                .filter(|&i| !m.attrs[i].accessor)
+                .filter(|&i| !m.attrs[i].accessor && !is_hidden_key(&m.keys[i]))
                 .map(|i| (m.keys[i].clone(), m.vals[i]))
                 .collect(),
             _ => vec![],
