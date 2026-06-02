@@ -1023,13 +1023,51 @@ impl<'p> Vm<'p> {
             // case is a real Set, whose elements we read directly.
             "union" | "intersection" | "difference" | "symmetricDifference"
             | "isSubsetOf" | "isSupersetOf" | "isDisjointFrom" => {
+                // Calls user has()/keys() (Set-like arg), so suspend GC for the scope.
+                let _gc = self.gc_lock_guard();
                 let this_items = match self.heap.get(idx) {
                     HeapObj::Set(items) => items.clone(),
                     _ => Vec::new(),
                 };
-                let other_items = match a0.is_heap().then(|| self.heap.get(a0.heap_index())) {
+                // GetSetRecord: a real Set uses its elements directly; any other
+                // value must be a Set-like object ({size: number, has, keys}) —
+                // read size (ToNumber, observable) / has / keys in spec order, then
+                // materialize its elements via keys().
+                let other_items: Vec<Value> = match a0.is_heap().then(|| self.heap.get(a0.heap_index())) {
                     Some(HeapObj::Set(items)) => items.clone(),
-                    _ => return Err(Thrown("TypeError: Set method argument is not a Set".into())),
+                    _ => {
+                        if !self.is_object_value(a0) {
+                            return Err(Thrown(
+                                "TypeError: Set.prototype set method called with a non-object".into(),
+                            ));
+                        }
+                        let raw_size = self.get_prop(a0, "size")?;
+                        if raw_size.is_heap()
+                            && matches!(self.heap.get(raw_size.heap_index()), HeapObj::BigInt(_))
+                        {
+                            return Err(Thrown(
+                                "TypeError: Set-like 'size' cannot be a BigInt".into(),
+                            ));
+                        }
+                        let num_size = self.to_number_coerce(raw_size)?;
+                        if num_size.is_nan() {
+                            return Err(Thrown("TypeError: Set-like 'size' is NaN".into()));
+                        }
+                        let has = self.get_prop(a0, "has")?;
+                        if !self.is_callable(has) {
+                            return Err(Thrown("TypeError: Set-like 'has' is not callable".into()));
+                        }
+                        let keys = self.get_prop(a0, "keys")?;
+                        if !self.is_callable(keys) {
+                            return Err(Thrown("TypeError: Set-like 'keys' is not callable".into()));
+                        }
+                        let kiter = self.call_value(keys, a0, &[])?;
+                        // -0 from keys() normalizes to +0 (SameValueZero).
+                        self.iterate_to_vec(kiter)?
+                            .into_iter()
+                            .map(|v| if v.is_number() && v.as_f64() == 0.0 { Value::int(0) } else { v })
+                            .collect()
+                    }
                 };
                 let has = |hay: &[Value], v: Value, vm: &Self| hay.iter().any(|x| vm.same_value_zero(*x, v));
                 let result = match name {
