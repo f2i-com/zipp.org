@@ -413,9 +413,14 @@ impl<'p> Vm<'p> {
             comp[start + i] = if n.is_finite() { n as i64 } else { 0 };
         }
         // A component setter (setMonth..setMilliseconds, start>=1) on an Invalid
-        // Date stays NaN AFTER coercing args. setFullYear (start==0) revives it
-        // (spec treats t as +0), so it does NOT short-circuit on orig NaN.
-        let ms = if any_nan || (orig_ms.is_nan() && start != 0) {
+        // Date returns NaN — but per spec [[DateValue]] is read BEFORE ToNumber
+        // and the method returns early WITHOUT writing, so a side effect the
+        // argument's valueOf had on this Date (e.g. setTime) persists. setFullYear
+        // (start==0) revives an invalid Date (t treated as +0), so no short-circuit.
+        if orig_ms.is_nan() && start != 0 {
+            return Ok(Value::num(f64::NAN));
+        }
+        let ms = if any_nan {
             f64::NAN
         } else {
             time_clip(ms_from_utc(comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6]))
