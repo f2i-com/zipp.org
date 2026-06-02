@@ -665,6 +665,20 @@ fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
     Some(UpvalSource::ParentUpval(idx))
 }
 
+/// A method's `Function.prototype.toString` source. For a `static` member the
+/// `static` keyword is part of the ClassElement, not the MethodDefinition, so
+/// it is excluded from the method's [[SourceText]] (e.g. `static s(){}` →
+/// `s(){}`, `static get x(){}` → `get x(){}`). When `is_static` the slice begins
+/// with the `static` keyword (the parser flagged it), so strip it + trailing ws.
+fn method_source(text: String, is_static: bool) -> String {
+    if is_static {
+        if let Some(rest) = text.strip_prefix("static") {
+            return rest.trim_start().to_string();
+        }
+    }
+    text
+}
+
 fn placeholder(name: &str) -> FuncProto {
     FuncProto {
         name: name.to_string(),
@@ -1587,6 +1601,11 @@ impl<'a> FnCompiler<'a> {
         // `extends <identifier-of-an-earlier-class>`.
         let super_class_id = class.super_class.as_ref().map(|_| class_id);
         let mut ctor_fn: Option<&ox::Function> = None;
+        // Each method's value-Function start byte → its MethodDefinition span, so
+        // `Function.prototype.toString` can recover the exact `m() {}` / `get x()
+        // {}` source (the value-Function span omits the method name/key).
+        let mut method_spans: std::collections::HashMap<u32, (u32, u32)> =
+            std::collections::HashMap::new();
         let mut methods: Vec<(String, &ox::Function)> = Vec::new();
         let mut getters: Vec<(String, &ox::Function)> = Vec::new();
         let mut setters: Vec<(String, &ox::Function)> = Vec::new();
@@ -1614,6 +1633,9 @@ impl<'a> FnCompiler<'a> {
         for el in &class.body.body {
             match el {
                 ox::ClassElement::MethodDefinition(m) => {
+                    // Record the full MethodDefinition span (keyed by the value
+                    // function's start) for toString source recovery.
+                    method_spans.insert(m.value.span.start, (m.span.start, m.span.end));
                     // A constructor is never computed; otherwise a key that
                     // class_key_name can't name statically (and is `computed`) is a
                     // runtime-keyed member.
@@ -1675,7 +1697,7 @@ impl<'a> FnCompiler<'a> {
         let mut method_defs: Vec<(String, u32)> = Vec::new();
         for (mname, func) in &methods {
             let (params, rest, body) = function_parts(func)?;
-            let proto = self.cx.compile_class_fn(
+            let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.{mname}"),
                 &params,
                 rest.as_deref(),
@@ -1687,6 +1709,9 @@ impl<'a> FnCompiler<'a> {
                 func.generator,
                 func.r#async,
             )?;
+            if let Some(&(s, e)) = method_spans.get(&func.span.start) {
+                proto.source = self.cx.src_slice(s, e);
+            }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             method_defs.push((mname.clone(), fid));
@@ -1695,7 +1720,7 @@ impl<'a> FnCompiler<'a> {
         let mut getter_defs: Vec<(String, u32)> = Vec::new();
         for (gname, func) in &getters {
             let (params, rest, body) = function_parts(func)?;
-            let proto = self.cx.compile_class_fn(
+            let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.get {gname}"),
                 &params,
                 rest.as_deref(),
@@ -1707,6 +1732,9 @@ impl<'a> FnCompiler<'a> {
                 false, // getters are never generators
                 false, // getters are never async
             )?;
+            if let Some(&(s, e)) = method_spans.get(&func.span.start) {
+                proto.source = self.cx.src_slice(s, e);
+            }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             getter_defs.push((gname.clone(), fid));
@@ -1715,7 +1743,7 @@ impl<'a> FnCompiler<'a> {
         let mut setter_defs: Vec<(String, u32)> = Vec::new();
         for (sname, func) in &setters {
             let (params, rest, body) = function_parts(func)?;
-            let proto = self.cx.compile_class_fn(
+            let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.set {sname}"),
                 &params,
                 rest.as_deref(),
@@ -1727,6 +1755,9 @@ impl<'a> FnCompiler<'a> {
                 false, // setters are never generators
                 false, // setters are never async
             )?;
+            if let Some(&(s, e)) = method_spans.get(&func.span.start) {
+                proto.source = self.cx.src_slice(s, e);
+            }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             setter_defs.push((sname.clone(), fid));
@@ -1735,7 +1766,7 @@ impl<'a> FnCompiler<'a> {
         let mut static_defs: Vec<(String, u32)> = Vec::new();
         for (sname, func) in &statics {
             let (params, rest, body) = function_parts(func)?;
-            let proto = self.cx.compile_class_fn(
+            let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.{sname}"),
                 &params,
                 rest.as_deref(),
@@ -1747,6 +1778,9 @@ impl<'a> FnCompiler<'a> {
                 func.generator,
                 func.r#async,
             )?;
+            if let Some(&(s, e)) = method_spans.get(&func.span.start) {
+                proto.source = method_source(self.cx.src_slice(s, e), true);
+            }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_defs.push((sname.clone(), fid));
@@ -1755,7 +1789,7 @@ impl<'a> FnCompiler<'a> {
         let mut static_getter_defs: Vec<(String, u32)> = Vec::new();
         for (gname, func) in &static_getters {
             let (params, rest, body) = function_parts(func)?;
-            let proto = self.cx.compile_class_fn(
+            let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.static get {gname}"),
                 &params,
                 rest.as_deref(),
@@ -1767,6 +1801,9 @@ impl<'a> FnCompiler<'a> {
                 false,
                 false,
             )?;
+            if let Some(&(s, e)) = method_spans.get(&func.span.start) {
+                proto.source = method_source(self.cx.src_slice(s, e), true);
+            }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_getter_defs.push((gname.clone(), fid));
@@ -1774,7 +1811,7 @@ impl<'a> FnCompiler<'a> {
         let mut static_setter_defs: Vec<(String, u32)> = Vec::new();
         for (sname, func) in &static_setters {
             let (params, rest, body) = function_parts(func)?;
-            let proto = self.cx.compile_class_fn(
+            let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.static set {sname}"),
                 &params,
                 rest.as_deref(),
@@ -1786,6 +1823,9 @@ impl<'a> FnCompiler<'a> {
                 false,
                 false,
             )?;
+            if let Some(&(s, e)) = method_spans.get(&func.span.start) {
+                proto.source = method_source(self.cx.src_slice(s, e), true);
+            }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_setter_defs.push((sname.clone(), fid));
@@ -1801,7 +1841,7 @@ impl<'a> FnCompiler<'a> {
                 None => (Vec::new(), None, &[][..]),
             };
             let params_ast = ctor_fn.map(|f| &*f.params);
-            let proto = self.cx.compile_class_fn(
+            let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.constructor"),
                 &params,
                 rest.as_deref(),
@@ -1813,6 +1853,11 @@ impl<'a> FnCompiler<'a> {
                 false, // a constructor is never a generator
                 false, // a constructor is never async
             )?;
+            if let Some(cf) = ctor_fn {
+                if let Some(&(s, e)) = method_spans.get(&cf.span.start) {
+                    proto.source = self.cx.src_slice(s, e);
+                }
+            }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             Some(fid)
@@ -1825,7 +1870,7 @@ impl<'a> FnCompiler<'a> {
         let mut computed_defs: Vec<(&'b ox::Expression<'b>, u32, u8)> = Vec::new();
         for (key, func, kind) in &computed {
             let (params, rest, body) = function_parts(func)?;
-            let proto = self.cx.compile_class_fn(
+            let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.[computed]"),
                 &params,
                 rest.as_deref(),
@@ -1837,6 +1882,9 @@ impl<'a> FnCompiler<'a> {
                 func.generator,
                 func.r#async,
             )?;
+            if let Some(&(s, e)) = method_spans.get(&func.span.start) {
+                proto.source = method_source(self.cx.src_slice(s, e), matches!(*kind, 3 | 4 | 5));
+            }
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             computed_defs.push((key, fid, *kind));
@@ -3128,6 +3176,13 @@ impl<'a> FnCompiler<'a> {
                             kr
                         };
                         let func = self.expr(&p.value)?;
+                        // `Function.prototype.toString` of an object accessor is the
+                        // whole `get k(){}` / `set k(v){}`; the value-Function span
+                        // omits the `get`/`set` and the key, so patch the just-
+                        // compiled proto (pushed last) with the ObjectProperty span.
+                        let fid = self.cx.functions.len() - 1;
+                        self.cx.functions[fid].source =
+                            self.cx.src_slice(p.span.start, p.span.end);
                         self.emit(Instr::DefineAccessor {
                             obj: dst,
                             key,
@@ -3153,6 +3208,15 @@ impl<'a> FnCompiler<'a> {
                         // value function/class takes the property key as its name.
                         let vtmp = self.alloc_reg();
                         let v = self.compile_named_init(vtmp, &p.value, &key)?;
+                        // Shorthand method `{ m(){}, *g(){}, async a(){} }`: its
+                        // toString is the whole `m(){}` (the value-Function span omits
+                        // the name/modifiers). Patch the proto just compiled (last).
+                        // Regular `k: function(){}` keeps the value's own span.
+                        if p.method {
+                            let fid = self.cx.functions.len() - 1;
+                            self.cx.functions[fid].source =
+                                self.cx.src_slice(p.span.start, p.span.end);
+                        }
                         self.emit(Instr::SetProp { obj: dst, name, val: v });
                     }
                 }
