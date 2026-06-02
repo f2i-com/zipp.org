@@ -255,44 +255,52 @@ impl<'p> Vm<'p> {
                         "RangeError: at least one of smallestUnit or largestUnit is required".into(),
                     ));
                 }
-                let cal =
-                    |u: &Option<String>| u.as_deref().is_some_and(|x| matches!(x, "year" | "month" | "week"));
-                if f[0] != 0 || f[1] != 0 || f[2] != 0 || cal(&su) || cal(&lu) {
+                let inc = self.read_rounding_increment(options)?;
+                let mode = if options == Value::UNDEFINED {
+                    "halfExpand".to_string()
+                } else {
+                    self.read_rounding_mode(options, "halfExpand")?
+                };
+                let smallest = su.unwrap_or_else(|| "nanosecond".to_string());
+                // largestUnit "auto" → the larger of smallestUnit and the duration's
+                // own largest non-zero unit.
+                let all = [
+                    "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
+                    "microsecond", "nanosecond",
+                ];
+                let urank = |u: &str| all.iter().position(|&x| x == u).unwrap_or(9);
+                let dur_largest =
+                    all.iter().find(|&&u| f[urank(u)] != 0).copied().unwrap_or("nanosecond");
+                let largest = lu.unwrap_or_else(|| {
+                    if urank(dur_largest) < urank(&smallest) {
+                        dur_largest.to_string()
+                    } else {
+                        smallest.clone()
+                    }
+                });
+                if urank(&smallest) < urank(&largest) {
+                    return Err(Thrown(
+                        "RangeError: smallestUnit must not be larger than largestUnit".into(),
+                    ));
+                }
+                // A relativeTo anchor enables calendar-unit rounding/balancing.
+                let rel = if options == Value::UNDEFINED {
+                    Value::UNDEFINED
+                } else {
+                    self.get_prop(options, "relativeTo")?
+                };
+                if rel != Value::UNDEFINED {
+                    let start = self.relative_to_dt(rel)?;
+                    let r = self.round_duration_relative(f, start, &smallest, &largest, inc, &mode)?;
+                    return Ok(Some(self.make_duration(r)));
+                }
+                // No relativeTo: calendar units require one.
+                let cal = |u: &str| matches!(u, "year" | "month" | "week");
+                if f[0] != 0 || f[1] != 0 || f[2] != 0 || cal(&smallest) || cal(&largest) {
                     return Err(Thrown(
                         "RangeError: a relativeTo option is required for years, months, or weeks".into(),
                     ));
                 }
-                let inc = if options == Value::UNDEFINED {
-                    1
-                } else {
-                    let v = self.get_prop(options, "roundingIncrement")?;
-                    if v == Value::UNDEFINED {
-                        1
-                    } else {
-                        let n = self.to_number(v)?;
-                        if !n.is_finite() || n < 1.0 || n.fract() != 0.0 {
-                            return Err(Thrown("RangeError: roundingIncrement out of range".into()));
-                        }
-                        n as i128
-                    }
-                };
-                let mode = if options == Value::UNDEFINED {
-                    "halfExpand".to_string()
-                } else {
-                    self.opt_string(
-                        options,
-                        "roundingMode",
-                        "halfExpand",
-                        &[
-                            "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
-                            "halfEven", "halfExpand",
-                        ],
-                    )?
-                };
-                let day_units =
-                    ["day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
-                let rank = |u: &str| day_units.iter().position(|&x| x == u).unwrap_or(6) as i32;
-                let smallest = su.unwrap_or_else(|| "nanosecond".to_string());
                 if let Some(max) = max_increment(&smallest) {
                     if inc >= max || max % inc != 0 {
                         return Err(Thrown(
@@ -300,10 +308,6 @@ impl<'p> Vm<'p> {
                         ));
                     }
                 }
-                let existing =
-                    (3..10).filter(|&i| f[i] != 0).map(|i| (i - 3) as i32).min().unwrap_or(6);
-                let largest =
-                    lu.unwrap_or_else(|| day_units[existing.min(rank(&smallest)) as usize].to_string());
                 let total_ns = (f[3] as i128) * DAY_NS
                     + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
                 let inc_ns = unit_ns(&smallest) * inc;
@@ -1620,6 +1624,77 @@ impl<'p> Vm<'p> {
                 + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]])
         };
         Ok(order(tot(&fa), tot(&fb)))
+    }
+
+    /// `Duration.round` with a relativeTo anchor: add the duration to the anchor,
+    /// round the span to smallestUnit (calendar-aware for week/month/year via the
+    /// anchor's variable unit lengths), then re-express from the anchor in
+    /// largestUnit. Date-oriented; a sub-day remainder is rounded as nanoseconds.
+    pub(crate) fn round_duration_relative(
+        &mut self,
+        f: [i64; 10],
+        start: [i64; 9],
+        smallest: &str,
+        largest: &str,
+        inc: i128,
+        mode: &str,
+    ) -> Result<[i64; 10], Thrown> {
+        let end = dt_add_dur(start, f);
+        let sd = (start[0], start[1], start[2]);
+        let sed = iso_to_epoch_days(sd.0, sd.1, sd.2);
+        let eed = iso_to_epoch_days(end[0], end[1], end[2]);
+        let sign: i64 = if eed >= sed { 1 } else { -1 };
+        let total_ns = dt_epoch_ns(end) - dt_epoch_ns(start);
+
+        // Express the span start→(date at epoch `e`) in largestUnit as [y,m,w,d].
+        let express = |e: i64| -> [i64; 4] {
+            let (ey, em, edd) = epoch_days_to_iso(e);
+            difference_iso_date(sd, (ey, em, edd), largest)
+        };
+        // Round `whole` units of `unit_kind` (0=month,1=year) to the increment,
+        // using the anchor's actual unit length for the fractional part.
+        let mut round_calendar = |whole: i64, year: bool| -> i64 {
+            let step = |n: i64| -> [i64; 10] {
+                if year { [n, 0, 0, 0, 0, 0, 0, 0, 0, 0] } else { [0, n, 0, 0, 0, 0, 0, 0, 0, 0] }
+            };
+            let ml = dt_add_dur(start, step(whole));
+            let ml1 = dt_add_dur(start, step(whole + sign));
+            let mle = iso_to_epoch_days(ml[0], ml[1], ml[2]);
+            let ml1e = iso_to_epoch_days(ml1[0], ml1[1], ml1[2]);
+            let denom = (ml1e - mle).unsigned_abs().max(1) as i128;
+            let num = (eed - mle) as i128;
+            let scaled = whole as i128 * denom + num;
+            (round_increment(scaled, inc * denom, mode) / denom) as i64
+        };
+
+        if ["year", "month", "week", "day"].contains(&smallest) {
+            let rounded_end = match smallest {
+                "day" => sed + round_increment((eed - sed) as i128, inc, mode) as i64,
+                "week" => sed + (round_increment((eed - sed) as i128, 7 * inc, mode) / 7) as i64 * 7,
+                "month" => {
+                    let bal = difference_iso_date(sd, (end[0], end[1], end[2]), "month");
+                    let rm = round_calendar(bal[0] * 12 + bal[1], false);
+                    let re = dt_add_dur(start, [0, rm, 0, 0, 0, 0, 0, 0, 0, 0]);
+                    iso_to_epoch_days(re[0], re[1], re[2])
+                }
+                _ => {
+                    let bal = difference_iso_date(sd, (end[0], end[1], end[2]), "year");
+                    let ry = round_calendar(bal[0], true);
+                    let re = dt_add_dur(start, [ry, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                    iso_to_epoch_days(re[0], re[1], re[2])
+                }
+            };
+            let b = express(rounded_end);
+            Ok([b[0], b[1], b[2], b[3], 0, 0, 0, 0, 0, 0])
+        } else {
+            // Time smallestUnit (or the nanosecond default → pure balancing).
+            let inc_ns = unit_ns(smallest) * inc;
+            let rounded_ns = round_increment(total_ns, inc_ns, mode);
+            let days = rounded_ns.div_euclid(DAY_NS);
+            let t = ns_to_time(rounded_ns.rem_euclid(DAY_NS));
+            let b = express(sed + days as i64);
+            Ok([b[0], b[1], b[2], b[3], t[0], t[1], t[2], t[3], t[4], t[5]])
+        }
     }
 
     /// The time-zone id string of a ZDT instance (for equality).
