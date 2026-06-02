@@ -299,25 +299,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(out)))
             }
             "replace" => {
-                // String search: replaces only the FIRST occurrence (JS semantics).
-                let search = self.display(arg0);
-                let repl = if args.len() >= 2 { self.display(args[1]) } else { "undefined".to_string() };
-                let out = match s.find(&search) {
-                    Some(pos) => {
-                        let mut r = String::with_capacity(s.len() + repl.len());
-                        r.push_str(&s[..pos]);
-                        r.push_str(&repl);
-                        r.push_str(&s[pos + search.len()..]);
-                        r
-                    }
-                    None => s.clone(),
-                };
-                Ok(Some(self.alloc_str(out)))
+                let r = self.string_replace_plain(&s, idx, arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED), false)?;
+                Ok(Some(r))
             }
             "replaceAll" => {
-                let search = self.display(arg0);
-                let repl = if args.len() >= 2 { self.display(args[1]) } else { "undefined".to_string() };
-                Ok(Some(self.alloc_str(s.replace(&search, &repl))))
+                let r = self.string_replace_plain(&s, idx, arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED), true)?;
+                Ok(Some(r))
             }
             // toLocale* default to the locale-independent case mappings.
             "toLocaleUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
@@ -375,6 +362,73 @@ impl<'p> Vm<'p> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// String.prototype.replace / replaceAll with a NON-regexp searchValue.
+    /// `s_idx` is the receiver string's heap index, `all` selects replaceAll.
+    /// Delegates to a custom `searchValue[Symbol.replace]` if present, else does a
+    /// plain substring replacement with full GetSubstitution ($-pattern) support
+    /// and functional replacers.
+    pub(crate) fn string_replace_plain(
+        &mut self,
+        s: &str,
+        s_idx: u32,
+        search_v: Value,
+        repl_v: Value,
+        all: bool,
+    ) -> Result<Value, Thrown> {
+        // If searchValue has a @@replace method, defer to it (custom search object).
+        if search_v != Value::NULL && search_v != Value::UNDEFINED {
+            let m = self.get_prop(search_v, "@@replace")?;
+            if self.is_callable(m) {
+                let sval = Value::heap(s_idx);
+                return self.call_value(m, search_v, &[sval, repl_v]);
+            }
+        }
+        let search = self.to_js_string(search_v)?;
+        let functional = self.is_callable(repl_v);
+        let repl_str = if functional { String::new() } else { self.to_js_string(repl_v)? };
+        // Match byte offsets (non-overlapping). An empty searchValue matches at
+        // every char boundary including the end (replaceAll), or just position 0.
+        let positions: Vec<usize> = if search.is_empty() {
+            if all {
+                let mut v: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+                v.push(s.len());
+                v
+            } else {
+                vec![0]
+            }
+        } else if all {
+            s.match_indices(&search).map(|(i, _)| i).collect()
+        } else {
+            s.find(&search).into_iter().collect()
+        };
+        let mut out = String::new();
+        let mut last = 0usize;
+        for pos in positions {
+            out.push_str(&s[last..pos]);
+            if functional {
+                let m = self.alloc_str(search.clone());
+                let off = Value::num(byte_to_char(s, pos) as f64);
+                let sv = self.alloc_str(s.to_string());
+                let r = self.call_value(repl_v, Value::UNDEFINED, &[m, off, sv])?;
+                let rs = self.to_js_string(r)?;
+                out.push_str(&rs);
+            } else {
+                let rep = self.expand_replacement(
+                    &repl_str,
+                    &search,
+                    &[],
+                    &[],
+                    &s[..pos],
+                    &s[pos + search.len()..],
+                );
+                out.push_str(&rep);
+            }
+            last = pos + search.len();
+        }
+        out.push_str(&s[last..]);
+        Ok(self.alloc_str(out))
     }
 
 }
