@@ -103,47 +103,76 @@ pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
     let s = s.trim();
     // Allow a leading "T".
     let s = s.strip_prefix(['T', 't']).unwrap_or(s);
-    let digits: Vec<char> = s.chars().collect();
+    let b: Vec<char> = s.chars().collect();
+    let n = b.len();
     let take2 = |i: usize| -> Option<i64> {
-        if i + 1 < digits.len() && digits[i].is_ascii_digit() && digits[i + 1].is_ascii_digit() {
-            format!("{}{}", digits[i], digits[i + 1]).parse().ok()
+        if i + 1 < n && b[i].is_ascii_digit() && b[i + 1].is_ascii_digit() {
+            Some((b[i] as i64 - '0' as i64) * 10 + (b[i + 1] as i64 - '0' as i64))
         } else {
             None
         }
     };
     let h = take2(0)?;
-    // minute after optional ':'
     let mut i = 2;
-    if digits.get(i) == Some(&':') {
-        i += 1;
-    }
-    let mi = take2(i).unwrap_or(0);
-    i += 2;
+    let mut mi = 0i64;
     let mut sec = 0i64;
     let mut sub = [0i64; 3];
-    if digits.get(i) == Some(&':') || digits.get(i).is_some_and(|c| c.is_ascii_digit()) {
-        if digits.get(i) == Some(&':') {
-            i += 1;
+    // Minutes: optional, after an optional ':' separator. A ':' must be followed
+    // by two digits.
+    let mut had_min = false;
+    {
+        let mut j = i;
+        let colon = b.get(j) == Some(&':');
+        if colon {
+            j += 1;
         }
-        sec = take2(i).unwrap_or(0);
-        i += 2;
-        if digits.get(i) == Some(&'.') || digits.get(i) == Some(&',') {
-            i += 1;
-            let mut fr = String::new();
-            while let Some(c) = digits.get(i) {
-                if c.is_ascii_digit() {
-                    fr.push(*c);
+        if let Some(v) = take2(j) {
+            mi = v;
+            i = j + 2;
+            had_min = true;
+        } else if colon {
+            return None;
+        }
+    }
+    // Seconds (only meaningful when minutes were present), then an optional
+    // fractional part — fractions are ONLY allowed after seconds, never after a
+    // bare hour or minute (those make the string invalid).
+    if had_min {
+        let mut j = i;
+        let colon = b.get(j) == Some(&':');
+        if colon {
+            j += 1;
+        }
+        if let Some(v) = take2(j) {
+            sec = v;
+            i = j + 2;
+            if b.get(i) == Some(&'.') || b.get(i) == Some(&',') {
+                i += 1;
+                let start = i;
+                while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
                     i += 1;
-                } else {
-                    break;
                 }
+                let cnt = i - start;
+                // 1..=9 fractional digits; more than 9 is a RangeError.
+                if cnt == 0 || cnt > 9 {
+                    return None;
+                }
+                let mut fr: String = b[start..i].iter().collect();
+                while fr.len() < 9 {
+                    fr.push('0');
+                }
+                let ns: i64 = fr.parse().ok()?;
+                sub = [ns / 1_000_000, (ns / 1_000) % 1_000, ns % 1_000];
             }
-            while fr.len() < 9 {
-                fr.push('0');
-            }
-            fr.truncate(9);
-            let ns: i64 = fr.parse().ok()?;
-            sub = [ns / 1_000_000, (ns / 1_000) % 1_000, ns % 1_000];
+        } else if colon {
+            return None;
+        }
+    }
+    // Anything left must begin a UTC offset / designator / annotation block —
+    // a stray '.' or ',' here is a fractional hour/minute and is invalid.
+    if let Some(&c) = b.get(i) {
+        if !matches!(c, '+' | '-' | 'Z' | 'z' | '[' | ' ') {
+            return None;
         }
     }
     // A leap second (:60) is accepted and clamped to :59 (per Temporal parsing).
@@ -281,7 +310,11 @@ pub(crate) fn parse_iso_year_month(s: &str) -> Option<(i64, i64, i64)> {
     if digits.len() < ylen {
         return None;
     }
-    let y = sign * rest[..ylen].parse::<i64>().ok()?;
+    let yv = rest[..ylen].parse::<i64>().ok()?;
+    if sign < 0 && yv == 0 {
+        return None;
+    }
+    let y = sign * yv;
     let after = &rest[ylen..];
     let after = after.strip_prefix('-').unwrap_or(after);
     if after.len() < 2 {
@@ -774,7 +807,12 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
     if digits.len() < ylen {
         return None;
     }
-    let y = sign * rest[..ylen].parse::<i64>().ok()?;
+    let yv = rest[..ylen].parse::<i64>().ok()?;
+    // Negative zero as an extended year ("-000000") is rejected.
+    if sign < 0 && yv == 0 {
+        return None;
+    }
+    let y = sign * yv;
     let after = &rest[ylen..];
     let after = after.strip_prefix('-').unwrap_or(after);
     if after.len() < 2 {
