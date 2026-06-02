@@ -23,7 +23,17 @@ impl<'p> Vm<'p> {
                     .map(|(kv, _)| kv)
                     .collect(),
                 HeapObj::Array(items) => {
-                    items.iter().enumerate().map(|(i, v)| (i.to_string(), *v)).collect()
+                    let mut v: Vec<(String, Value)> =
+                        items.iter().enumerate().map(|(i, x)| (i.to_string(), *x)).collect();
+                    // Enumerable named own properties (arr.foo / match-result fields).
+                    if let Some(m) = self.arr_props.get(&obj.heap_index()) {
+                        for (i, k) in m.keys.iter().enumerate() {
+                            if m.attrs[i].enumerable && !is_hidden_key(k) {
+                                v.push((k.clone(), m.vals[i]));
+                            }
+                        }
+                    }
+                    v
                 }
                 _ => Vec::new(),
             }
@@ -90,7 +100,9 @@ impl<'p> Vm<'p> {
                         let v = items[i];
                         return self.make_data_descriptor(v, true, true, true);
                     }
-                    _ => return Value::UNDEFINED,
+                    // A named (non-index) own property lives in arr_props; let the
+                    // shared tail render it as a data/accessor descriptor.
+                    _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
                 }
             }
             // Class static members: data props, plus `static get`/`set` rendered
@@ -161,6 +173,9 @@ impl<'p> Vm<'p> {
                         keys.push(i.to_string());
                     }
                     keys.push("length".to_string());
+                    if let Some(m) = self.arr_props.get(&idx) {
+                        keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                    }
                 }
                 HeapObj::Class(c) => {
                     if has_length {
@@ -352,8 +367,12 @@ impl<'p> Vm<'p> {
         // (Index accessors / extra named props aren't modeled — accepted as a no-op
         // so the definition doesn't abort the program, matching common test setup.)
         if let HeapObj::Array(_) = self.heap.get(idx) {
-            let (value, get, set, ..) = self.read_descriptor(desc)?;
+            // A numeric-index data descriptor sets the element; `length` resizes.
+            // A named (non-index) property falls through to the generic path below
+            // (target 3 -> arr_props) with full descriptor semantics. read_descriptor
+            // (which may run getters) is therefore invoked exactly once per path.
             if let Ok(i) = key.parse::<usize>() {
+                let (value, get, set, ..) = self.read_descriptor(desc)?;
                 if get.is_none() && set.is_none() {
                     let v = value.unwrap_or(Value::UNDEFINED);
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
@@ -367,6 +386,7 @@ impl<'p> Vm<'p> {
                 return Ok(());
             }
             if key == "length" {
+                let (value, ..) = self.read_descriptor(desc)?;
                 if let Some(v) = value {
                     let n = self.to_number(v)?;
                     if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
@@ -377,8 +397,9 @@ impl<'p> Vm<'p> {
                     }
                     self.heap.bump_version(idx);
                 }
+                return Ok(());
             }
-            return Ok(());
+            // else: named key → generic path.
         }
         // TypedArray: a numeric-index data descriptor writes the element.
         if let HeapObj::TypedArray { .. } = self.heap.get(idx) {
@@ -396,6 +417,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(_) => 0u8,
             HeapObj::Class(_) => 1,
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => 2,
+            HeapObj::Array(_) => 3, // named (non-index) own prop -> arr_props
             _ => return Err(Thrown("TypeError: Object.defineProperty called on non-object".into())),
         };
         // A callable's/class's `name`/`length`/`prototype` are synthesized; accept
@@ -407,6 +429,7 @@ impl<'p> Vm<'p> {
         let existing = match self.heap.get(idx) {
             HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
             HeapObj::Class(c) => c.statics.pos(key).map(|i| (c.statics.attrs[i], c.statics.vals[i])),
+            HeapObj::Array(_) => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
             _ => self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
         let is_accessor = get.is_some() || set.is_some();
@@ -480,6 +503,9 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Class(c) = self.heap.get_mut(idx) {
                     c.statics.define(key, stored, attr);
                 }
+            }
+            3 => {
+                self.arr_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
             }
             _ => {
                 self.fn_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
@@ -683,6 +709,20 @@ impl<'p> Vm<'p> {
                 "groups" => return Ok(groups),
                 _ => {}
             }
+        }
+        // An Array's named (non-index) own properties (arr.foo, and a match
+        // result's index/input/groups) live in arr_props and shadow the prototype.
+        let arr_entry =
+            self.arr_props.get(&obj.heap_index()).and_then(|m| m.pos(key).map(|i| (m.vals[i], m.attrs[i])));
+        if let Some((raw, attr)) = arr_entry {
+            if attr.accessor {
+                return if raw == Value::UNDEFINED {
+                    Ok(Value::UNDEFINED)
+                } else {
+                    self.call_value(raw, obj, &[])
+                };
+            }
+            return Ok(raw);
         }
         // TypedArray / ArrayBuffer / DataView instance properties.
         if let HeapObj::TypedArray { buffer, kind, byte_offset, length } = self.heap.get(obj.heap_index()) {

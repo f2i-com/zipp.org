@@ -159,6 +159,12 @@ pub struct Vm<'p> {
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.
     fn_props: std::collections::HashMap<u32, ObjMap>,
+    /// Non-index string-keyed own properties of an Array (`arr.foo = 1`, and a
+    /// regex match-result's `index`/`input`/`groups`), keyed by the array's heap
+    /// index. `HeapObj::Array` is a dense `Vec<Value>` with no inline property
+    /// map, so its (rare) named own properties live here — exactly mirroring
+    /// `fn_props` for callables. Numeric indices + `length` stay in the Vec.
+    arr_props: std::collections::HashMap<u32, ObjMap>,
     /// Callables expose `name`/`length` as synthesized own properties (computed
     /// from the proto, not stored). They're `configurable: true`, so `delete
     /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |

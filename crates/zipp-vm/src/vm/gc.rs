@@ -163,7 +163,7 @@ impl Vm<'_> {
         for &p in self.prototypes.values() {
             root_idx!(p);
         }
-        for m in self.fn_props.values() {
+        for m in self.fn_props.values().chain(self.arr_props.values()) {
             for &v in &m.vals {
                 root_val!(v);
             }
@@ -219,6 +219,7 @@ impl Vm<'_> {
         self.proto_of.retain(|&k, _| marks[k as usize]);
         self.prototypes.retain(|&k, _| marks[k as usize]);
         self.fn_props.retain(|&k, _| marks[k as usize]);
+        self.arr_props.retain(|&k, _| marks[k as usize]);
         self.regexp_match_extras.retain(|&k, _| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();

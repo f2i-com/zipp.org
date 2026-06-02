@@ -1381,84 +1381,19 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ObjectKeys { dst, obj } => {
                         let o = self.get(base, obj);
-                        // Collect the raw key strings first (immutable heap
-                        // borrow), then intern them (mutable) — can't hold both.
-                        let key_strs: Vec<String> = if o.is_heap() {
-                            match self.heap.get(o.heap_index()) {
-                                // Only OWN ENUMERABLE keys (skip non-enumerable
-                                // and private "#" names).
-                                HeapObj::Object(map) => map
-                                    .keys
-                                    .iter()
-                                    .zip(map.attrs.iter())
-                                    .filter(|(k, a)| a.enumerable && !is_hidden_key(k))
-                                    .map(|(k, _)| k.clone())
-                                    .collect(),
-                                HeapObj::Array(items) => {
-                                    (0..items.len()).map(|i| i.to_string()).collect()
-                                }
-                                _ => Vec::new(),
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        let keys: Vec<Value> =
-                            key_strs.into_iter().map(|k| self.alloc_str(k)).collect();
-                        let v = Value::heap(self.heap.alloc(HeapObj::Array(keys)));
+                        let v = self.object_enum_own(o, EnumWhat::Keys);
                         self.set(base, dst, v);
                         ip += 1;
                     }
                     Instr::ObjectValues { dst, obj } => {
                         let o = self.get(base, obj);
-                        let vals: Vec<Value> = if o.is_heap() {
-                            match self.heap.get(o.heap_index()) {
-                                HeapObj::Object(map) => map
-                                    .vals
-                                    .iter()
-                                    .zip(map.attrs.iter())
-                                    .filter(|(_, a)| a.enumerable)
-                                    .map(|(v, _)| *v)
-                                    .collect(),
-                                HeapObj::Array(items) => items.clone(),
-                                _ => Vec::new(),
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        let v = Value::heap(self.heap.alloc(HeapObj::Array(vals)));
+                        let v = self.object_enum_own(o, EnumWhat::Values);
                         self.set(base, dst, v);
                         ip += 1;
                     }
                     Instr::ObjectEntries { dst, obj } => {
                         let o = self.get(base, obj);
-                        // Snapshot (key string, value) pairs under the immutable
-                        // borrow, then build `[key, value]` arrays (which allocate).
-                        let pairs: Vec<(String, Value)> = if o.is_heap() {
-                            match self.heap.get(o.heap_index()) {
-                                HeapObj::Object(map) => map
-                                    .keys
-                                    .iter()
-                                    .cloned()
-                                    .zip(map.vals.iter().copied())
-                                    .zip(map.attrs.iter())
-                                    .filter(|(_, a)| a.enumerable)
-                                    .map(|(kv, _)| kv)
-                                    .collect(),
-                                HeapObj::Array(items) => {
-                                    items.iter().enumerate().map(|(i, v)| (i.to_string(), *v)).collect()
-                                }
-                                _ => Vec::new(),
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        let mut entries = Vec::with_capacity(pairs.len());
-                        for (k, val) in pairs {
-                            let ks = self.alloc_str(k);
-                            let inner = self.heap.alloc(HeapObj::Array(vec![ks, val]));
-                            entries.push(Value::heap(inner));
-                        }
-                        let v = Value::heap(self.heap.alloc(HeapObj::Array(entries)));
+                        let v = self.object_enum_own(o, EnumWhat::Entries);
                         self.set(base, dst, v);
                         ip += 1;
                     }

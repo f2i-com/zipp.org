@@ -188,6 +188,13 @@ impl<'p> Vm<'p> {
             let k = self.key_of(key);
             return self.set_prop(obj, &k, val);
         }
+        // An Array with a non-index key (`arr["foo"] = v`, `arr.length` is handled
+        // in set_prop) is a NAMED property → route through set_prop (-> arr_props),
+        // so bracket and dot assignment agree. Numeric indices stay in the Vec.
+        if matches!(self.heap.get(idx), HeapObj::Array(_)) && array_index(key).is_none() {
+            let k = self.key_of(key);
+            return self.set_prop(obj, &k, val);
+        }
         match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 // Numeric key (incl. an integral double — the JIT region produces
@@ -198,7 +205,6 @@ impl<'p> Vm<'p> {
                     }
                     items[i] = val;
                 }
-                // Non-numeric / negative / fractional key: no-op in this subset.
                 Ok(())
             }
             HeapObj::Object(_) => {

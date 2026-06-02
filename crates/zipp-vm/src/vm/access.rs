@@ -101,8 +101,11 @@ impl<'p> Vm<'p> {
                     if i < items.len() {
                         items[i] = Value::UNDEFINED;
                     }
+                    false // array slot stays (a hole); no version bump needed
+                } else {
+                    // A named (non-index) own property in arr_props.
+                    self.arr_props.get_mut(&idx).map_or(false, |m| m.remove(key))
                 }
-                false // array slot stays (a hole); no version bump needed
             }
             HeapObj::Class(c) => c.statics.remove(key),
             // A function's assigned own property (`delete fn.x`).
@@ -164,6 +167,10 @@ impl<'p> Vm<'p> {
         // setter; a non-writable data property silently ignores the write (sloppy).
         let own_attr = match self.heap.get(idx) {
             HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
+            // An Array's named (non-index) own properties live in arr_props.
+            HeapObj::Array(_) => {
+                self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attrs[i]))
+            }
             _ => None,
         };
         if let Some(a) = own_attr {
@@ -215,6 +222,16 @@ impl<'p> Vm<'p> {
                 Some(None) => return Ok(()), // getter-only ⇒ sloppy no-op
                 None => {}                    // fall through to a data write
             }
+        }
+        // An Array's named (non-index) own property — `arr.foo = 1`, a match
+        // result's `index`/`input`/`groups` — lives in the arr_props side table
+        // (numeric indices + `length` were handled above). Mirrors fn_props.
+        if matches!(self.heap.get(idx), HeapObj::Array(_)) {
+            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            if added {
+                self.heap.bump_version(idx);
+            }
+            return Ok(());
         }
         let mut added = false;
         match self.heap.get_mut(idx) {

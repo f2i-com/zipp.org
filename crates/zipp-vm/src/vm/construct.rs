@@ -342,7 +342,9 @@ impl<'p> Vm<'p> {
                         && self.global_by_name(key).is_some())
             }
             HeapObj::Array(items) => {
-                key == "length" || key.parse::<usize>().map_or(false, |i| i < items.len())
+                key == "length"
+                    || key.parse::<usize>().map_or(false, |i| i < items.len())
+                    || self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
             }
             HeapObj::Str(s) => {
                 key == "length" || key.parse::<usize>().map_or(false, |i| i < s.char_len)
@@ -373,7 +375,14 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Object(m) => m.pos(key).map_or(false, |i| m.attrs[i].enumerable),
-            HeapObj::Array(items) => key.parse::<usize>().map_or(false, |i| i < items.len()),
+            HeapObj::Array(items) => {
+                key.parse::<usize>().map_or(false, |i| i < items.len())
+                    || self
+                        .arr_props
+                        .get(&obj.heap_index())
+                        .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
+                        .unwrap_or(false)
+            }
             _ => false,
         }
     }

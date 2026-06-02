@@ -42,7 +42,10 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Array(items) => match array_index(key) {
                 Some(i) => i < items.len(),
-                None => self.display(key) == "length",
+                None => {
+                    let k = self.key_of(key);
+                    k == "length" || self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
+                }
             },
             HeapObj::Str(s) => match array_index(key) {
                 Some(i) => i < s.char_len,

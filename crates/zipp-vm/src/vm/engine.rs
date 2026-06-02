@@ -54,6 +54,7 @@ impl<'p> Vm<'p> {
             prototypes: std::collections::HashMap::new(),
             proto_of: std::collections::HashMap::new(),
             fn_props: std::collections::HashMap::new(),
+            arr_props: std::collections::HashMap::new(),
             deleted_callable_intrinsics: std::collections::HashSet::new(),
             obj_proto: 0,
             fn_proto: 0,
