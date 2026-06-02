@@ -214,8 +214,9 @@ impl<'p> Vm<'p> {
         param_count: usize,
         cb: Value,
         args: &[Value],
+        this_val: Value,
     ) -> Result<Value, Thrown> {
-        self.regs[win] = Value::UNDEFINED; // reg 0 = this
+        self.regs[win] = this_val; // reg 0 = this (thisArg)
         let n = args.len().min(param_count);
         for i in 0..n {
             self.regs[win + 1 + i] = args[i];
@@ -243,7 +244,7 @@ impl<'p> Vm<'p> {
         }
         // Plain deopt (non-int operand / overflow): re-run this element on the
         // interpreter, which nests its frame above the reused window.
-        self.call_value(cb, Value::UNDEFINED, args)
+        self.call_value(cb, this_val, args)
     }
 
     /// One per-element callback invocation: native fast path when `native` is
@@ -255,13 +256,14 @@ impl<'p> Vm<'p> {
         win: usize,
         cb: Value,
         args: &[Value],
+        this_val: Value,
     ) -> Result<Value, Thrown> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if let Some((entry, _callee_regs, param_count)) = native {
-            return self.invoke_cb_windowed(entry, win, param_count, cb, args);
+            return self.invoke_cb_windowed(entry, win, param_count, cb, args, this_val);
         }
         let _ = (native, win);
-        self.call_value(cb, Value::UNDEFINED, args)
+        self.call_value(cb, this_val, args)
     }
 
 }

@@ -14,8 +14,15 @@ impl<'p> Vm<'p> {
     /// native call per element. Falls back to `call_value` per element otherwise.
     /// The window is always released (truncate) before returning — including on a
     /// callback error — so a thrown callback never leaks register slots.
-    pub(crate) fn array_each(&mut self, idx: u32, cb: Value, mode: EachMode) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn array_each(&mut self, idx: u32, cb: Value, mode: EachMode, this_arg: Value) -> Result<Option<Value>, Thrown> {
         let snapshot = self.array_snapshot(idx);
+        // The receiver passed to the callback as its 3rd argument.
+        let receiver = Value::heap(idx);
+        // The fused kernels inline the callback over (element, index) only and run
+        // with `this`=undefined, so they cannot honour a thisArg, a 3rd "array"
+        // parameter, or `arguments`. Disable them when the callback could observe
+        // any of those (the per-element path below handles every case correctly).
+        let kernel_ok = this_arg.is_undefined();
         let collect = matches!(mode, EachMode::Map | EachMode::Filter);
         let mut out: Vec<Value> =
             if collect { Vec::with_capacity(snapshot.len()) } else { Vec::new() };
@@ -30,6 +37,7 @@ impl<'p> Vm<'p> {
         let mut start = 0usize;
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Map)
+            && kernel_ok
             && self.jit_enabled
             && self.jit_recurse_depth == 0
             && cb.is_heap()
@@ -45,7 +53,16 @@ impl<'p> Vm<'p> {
                     let proto_ref = unsafe { &*proto };
                     let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
                     let reg_count = (proto_ref.reg_count as usize).max(min_window);
-                    if let Some(entry) = self.jit.map_kernel(fid, proto_ref) {
+                    // A callback that declares the 3rd (array) param or uses
+                    // `arguments` must see the receiver — not the kernel's path.
+                    let kernel_entry = if proto_ref.param_count >= 3
+                        || proto_ref.arguments_reg.is_some()
+                    {
+                        None
+                    } else {
+                        self.jit.map_kernel(fid, proto_ref)
+                    };
+                    if let Some(entry) = kernel_entry {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
@@ -81,6 +98,7 @@ impl<'p> Vm<'p> {
         // that element to the per-element tail (which evaluates JS truthiness).
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if matches!(mode, EachMode::Filter)
+            && kernel_ok
             && self.jit_enabled
             && self.jit_recurse_depth == 0
             && cb.is_heap()
@@ -94,7 +112,16 @@ impl<'p> Vm<'p> {
                     let proto_ref = unsafe { &*proto };
                     let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
                     let reg_count = (proto_ref.reg_count as usize).max(min_window);
-                    if let Some(entry) = self.jit.filter_kernel(fid, proto_ref) {
+                    // Skip the kernel when the predicate could observe the 3rd
+                    // (array) param or `arguments` (see the map branch).
+                    let kernel_entry = if proto_ref.param_count >= 3
+                        || proto_ref.arguments_reg.is_some()
+                    {
+                        None
+                    } else {
+                        self.jit.filter_kernel(fid, proto_ref)
+                    };
+                    if let Some(entry) = kernel_entry {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
@@ -142,8 +169,8 @@ impl<'p> Vm<'p> {
         let mut err = None;
         for i in start..snapshot.len() {
             let v = snapshot[i];
-            let args = [v, Value::int(i as i32)];
-            match self.run_cb_elem(native, win, cb, &args) {
+            let args = [v, Value::int(i as i32), receiver];
+            match self.run_cb_elem(native, win, cb, &args, this_arg) {
                 Ok(r) => match mode {
                     EachMode::Map => out.push(r),
                     EachMode::Filter => {
@@ -349,17 +376,25 @@ impl<'p> Vm<'p> {
                 };
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(slice)))))
             }
-            "map" => self.array_each(idx, arg0, EachMode::Map),
-            "filter" => self.array_each(idx, arg0, EachMode::Filter),
-            "forEach" => self.array_each(idx, arg0, EachMode::ForEach),
+            "map" => {
+                self.array_each(idx, arg0, EachMode::Map, args.get(1).copied().unwrap_or(Value::UNDEFINED))
+            }
+            "filter" => {
+                self.array_each(idx, arg0, EachMode::Filter, args.get(1).copied().unwrap_or(Value::UNDEFINED))
+            }
+            "forEach" => {
+                self.array_each(idx, arg0, EachMode::ForEach, args.get(1).copied().unwrap_or(Value::UNDEFINED))
+            }
             // Short-circuiting callback searches. They stop at the first match, so
             // they use call_value directly (the all-elements array_each driver
             // doesn't fit); the callback receives (element, index).
             "find" | "findIndex" | "some" | "every" => {
                 let cb = arg0;
+                let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let receiver = Value::heap(idx);
                 let snapshot = self.array_snapshot(idx);
                 for (i, v) in snapshot.iter().enumerate() {
-                    let r = self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
+                    let r = self.call_value(cb, this_arg, &[*v, Value::int(i as i32), receiver])?;
                     let t = self.truthy(r);
                     match name {
                         "find" if t => return Ok(Some(*v)),
@@ -412,7 +447,18 @@ impl<'p> Vm<'p> {
                             // the jit-vs-program borrow conflict (as elsewhere).
                             let proto_ref = unsafe { &*proto };
                             let reg_count = (proto_ref.reg_count as usize).max(3);
-                            if let Some(entry) = self.jit.reduce_kernel(fid, proto_ref) {
+                            // The reduce kernel passes only (acc, element); a
+                            // callback that declares the 3rd (index) / 4th (array)
+                            // param or uses `arguments` must take the per-element
+                            // path so those args are supplied.
+                            let kernel_entry = if proto_ref.param_count >= 3
+                                || proto_ref.arguments_reg.is_some()
+                            {
+                                None
+                            } else {
+                                self.jit.reduce_kernel(fid, proto_ref)
+                            };
+                            if let Some(entry) = kernel_entry {
                                 let win = self.regs.len();
                                 if !self.regs_would_overflow(win + reg_count) {
                                     self.regs.resize(win + reg_count, Value::UNDEFINED);
@@ -455,9 +501,10 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let mut err = None;
+                let receiver = Value::heap(idx);
                 for i in start..snapshot.len() {
-                    let cbargs = [acc, snapshot[i], Value::int(i as i32)];
-                    match self.run_cb_elem(native, win, cb, &cbargs) {
+                    let cbargs = [acc, snapshot[i], Value::int(i as i32), receiver];
+                    match self.run_cb_elem(native, win, cb, &cbargs, Value::UNDEFINED) {
                         Ok(r) => acc = r,
                         Err(e) => {
                             err = Some(e);
@@ -503,19 +550,26 @@ impl<'p> Vm<'p> {
                         "TypeError: Reduce of empty array with no initial value".into(),
                     ));
                 };
+                let receiver = Value::heap(idx);
                 while i > 0 {
                     i -= 1;
-                    acc = self.call_value(cb, Value::UNDEFINED, &[acc, snapshot[i], Value::int(i as i32)])?;
+                    acc = self.call_value(
+                        cb,
+                        Value::UNDEFINED,
+                        &[acc, snapshot[i], Value::int(i as i32), receiver],
+                    )?;
                 }
                 Ok(Some(acc))
             }
             "flatMap" => {
                 // map(cb) then flatten one level (array results spliced in).
                 let cb = arg0;
+                let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let receiver = Value::heap(idx);
                 let snapshot = self.array_snapshot(idx);
                 let mut out: Vec<Value> = Vec::new();
                 for (i, v) in snapshot.iter().enumerate() {
-                    let r = self.call_value(cb, Value::UNDEFINED, &[*v, Value::int(i as i32)])?;
+                    let r = self.call_value(cb, this_arg, &[*v, Value::int(i as i32), receiver])?;
                     if r.is_heap() {
                         if let HeapObj::Array(items) = self.heap.get(r.heap_index()) {
                             out.extend(items.iter().copied());
@@ -528,10 +582,12 @@ impl<'p> Vm<'p> {
             }
             "findLast" | "findLastIndex" => {
                 let cb = arg0;
+                let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let receiver = Value::heap(idx);
                 let snapshot = self.array_snapshot(idx);
                 for i in (0..snapshot.len()).rev() {
                     let v = snapshot[i];
-                    let r = self.call_value(cb, Value::UNDEFINED, &[v, Value::int(i as i32)])?;
+                    let r = self.call_value(cb, this_arg, &[v, Value::int(i as i32), receiver])?;
                     if self.truthy(r) {
                         return Ok(Some(if name == "findLast" {
                             v
@@ -718,7 +774,7 @@ impl<'p> Vm<'p> {
                 // Merge a[lo..mid] and a[mid..hi] into b[lo..hi], stably.
                 let (mut l, mut r, mut k) = (lo, mid, lo);
                 while l < mid && r < hi {
-                    let c = match self.run_cb_elem(native, win, cmp, &[a[l], a[r]]) {
+                    let c = match self.run_cb_elem(native, win, cmp, &[a[l], a[r]], Value::UNDEFINED) {
                         Ok(c) => c,
                         Err(e) => {
                             err = Some(e);
