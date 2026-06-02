@@ -356,6 +356,25 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
+        // ToPropertyDescriptor validation (6.2.5.5 steps 13-21): a present getter
+        // or setter must be callable (or `undefined`), and an accessor descriptor
+        // may not also carry data fields (`value`/`writable`).
+        if let Some(g) = get {
+            if g != Value::UNDEFINED && !self.is_callable(g) {
+                return Err(Thrown("TypeError: Getter must be a function".into()));
+            }
+        }
+        if let Some(s) = set {
+            if s != Value::UNDEFINED && !self.is_callable(s) {
+                return Err(Thrown("TypeError: Setter must be a function".into()));
+            }
+        }
+        if (get.is_some() || set.is_some()) && (value.is_some() || writable.is_some()) {
+            return Err(Thrown(
+                "TypeError: Invalid property descriptor. Cannot both specify accessors and a value or writable attribute"
+                    .into(),
+            ));
+        }
         Ok((value, get, set, writable, enumerable, configurable))
     }
 
