@@ -667,9 +667,14 @@ impl<'p> Vm<'p> {
             self.ta_base_ctor = ta_base_ctor;
             self.proto_of.insert(ta_base_ctor, Value::heap(fn_proto));
             let tname = self.alloc_str("TypedArray".to_string());
+            let ta_from = Value::heap(self.heap.alloc(HeapObj::Native(TA_FROM)));
+            let ta_of = Value::heap(self.heap.alloc(HeapObj::Native(TA_OF)));
             if let HeapObj::Object(m) = self.heap.get_mut(ta_base_ctor) {
                 m.define("name", tname, fn_attr);
                 m.define("length", Value::num(0.0), fn_attr);
+                // %TypedArray%.from / .of — inherited by every concrete kind ctor.
+                m.define("from", ta_from, method_attr);
+                m.define("of", ta_of, method_attr);
             }
             if let HeapObj::Object(m) = self.heap.get_mut(ta_base_proto) {
                 m.define("constructor", Value::heap(ta_base_ctor), method_attr);

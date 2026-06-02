@@ -65,6 +65,8 @@ pub const REGEXP_SYM_SEARCH: u16 = 642;
 pub const REGEXP_SYM_MATCH: u16 = 643;
 pub const REGEXP_SYM_SPLIT: u16 = 644;
 pub const REGEXP_SYM_REPLACE: u16 = 645;
+pub const TA_FROM: u16 = 646;
+pub const TA_OF: u16 = 647;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -503,6 +505,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         REGEXP_SYM_MATCH => ("[Symbol.match]", 1),
         REGEXP_SYM_SPLIT => ("[Symbol.split]", 2),
         REGEXP_SYM_REPLACE => ("[Symbol.replace]", 2),
+        TA_FROM => ("from", 1),
+        TA_OF => ("of", 0),
         FN_CALL => ("call", 1),
         FN_APPLY => ("apply", 2),
         FN_BIND => ("bind", 1),

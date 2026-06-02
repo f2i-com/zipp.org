@@ -504,6 +504,29 @@ impl<'p> Vm<'p> {
             }
             ARR_FROM => self.array_from(a0, a1)?,
             ARR_OF => Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec()))),
+            // `%TypedArray%.from(src, mapFn?)` / `.of(...items)` — `this` is the
+            // concrete kind constructor (Int8Array, …); collect the values into a
+            // plain Array, then materialize a typed array of that kind.
+            TA_FROM | TA_OF => {
+                let kind = self
+                    .ta_ctors
+                    .iter()
+                    .position(|&c| this.is_heap() && c == this.heap_index());
+                let kind = match kind {
+                    Some(k) => k as u8,
+                    None => {
+                        return Err(Thrown(
+                            "TypeError: this is not a TypedArray constructor".into(),
+                        ))
+                    }
+                };
+                let arr = if id == TA_FROM {
+                    self.array_from(a0, a1)?
+                } else {
+                    Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())))
+                };
+                self.build_typed_array(kind, &[arr])?
+            }
             // `Array.prototype.{join,push}` as values: `this` is the receiver array.
             // join is generic over array-likes (array_method materializes a
             // non-array receiver); push mutates, so it still requires a real array.
