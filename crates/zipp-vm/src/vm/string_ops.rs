@@ -341,6 +341,60 @@ impl<'p> Vm<'p> {
                 let repl = if args.len() >= 2 { self.display(args[1]) } else { "undefined".to_string() };
                 Ok(Some(self.alloc_str(s.replace(&search, &repl))))
             }
+            // toLocale* default to the locale-independent case mappings.
+            "toLocaleUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
+            "toLocaleLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
+            "lastIndexOf" => {
+                let needle = self.display(arg0);
+                let sc: Vec<char> = s.chars().collect();
+                let nc: Vec<char> = needle.chars().collect();
+                let len = sc.len();
+                let cap = if args.len() >= 2 && args[1].is_number() && !args[1].as_f64().is_nan() {
+                    (args[1].as_f64().max(0.0) as usize).min(len)
+                } else {
+                    len
+                };
+                let mut result: i64 = -1;
+                if nc.is_empty() {
+                    result = cap.min(len) as i64;
+                } else if nc.len() <= len {
+                    let max_start = (len - nc.len()).min(cap);
+                    for start in (0..=max_start).rev() {
+                        if sc[start..start + nc.len()] == nc[..] {
+                            result = start as i64;
+                            break;
+                        }
+                    }
+                }
+                Ok(Some(Value::num(result as f64)))
+            }
+            // Annex B HTML wrapper methods (B.2.3): wrap the string in a tag, with
+            // the attribute value's `"` escaped to `&quot;`.
+            "anchor" | "big" | "blink" | "bold" | "fixed" | "fontcolor" | "fontsize"
+            | "italics" | "link" | "small" | "strike" | "sub" | "sup" => {
+                let (tag, attr): (&str, Option<&str>) = match name {
+                    "anchor" => ("a", Some("name")),
+                    "big" => ("big", None),
+                    "blink" => ("blink", None),
+                    "bold" => ("b", None),
+                    "fixed" => ("tt", None),
+                    "fontcolor" => ("font", Some("color")),
+                    "fontsize" => ("font", Some("size")),
+                    "italics" => ("i", None),
+                    "link" => ("a", Some("href")),
+                    "small" => ("small", None),
+                    "strike" => ("strike", None),
+                    "sub" => ("sub", None),
+                    _ => ("sup", None),
+                };
+                let open = if let Some(aname) = attr {
+                    let aval = self.display(arg0).replace('"', "&quot;");
+                    format!("<{tag} {aname}=\"{aval}\">")
+                } else {
+                    format!("<{tag}>")
+                };
+                Ok(Some(self.alloc_str(format!("{open}{s}</{tag}>"))))
+            }
             _ => Ok(None),
         }
     }

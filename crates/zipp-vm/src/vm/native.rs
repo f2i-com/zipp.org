@@ -371,7 +371,12 @@ pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
     ("toLowerCase", 1, 0), ("toUpperCase", 1, 0), ("trim", 1, 0), ("trimEnd", 1, 0),
     ("trimStart", 1, 0), ("concat", 1, 1), ("substr", 1, 2), ("localeCompare", 1, 1),
     ("normalize", 1, 0), ("isWellFormed", 1, 0), ("toWellFormed", 1, 0),
-    ("valueOf", 1, 0), ("toString", 1, 0),
+    ("valueOf", 1, 0), ("toString", 1, 0), ("lastIndexOf", 1, 1),
+    ("toLocaleLowerCase", 1, 0), ("toLocaleUpperCase", 1, 0),
+    // Annex B HTML wrapper methods.
+    ("anchor", 1, 1), ("big", 1, 0), ("blink", 1, 0), ("bold", 1, 0), ("fixed", 1, 0),
+    ("fontcolor", 1, 1), ("fontsize", 1, 1), ("italics", 1, 0), ("link", 1, 1),
+    ("small", 1, 0), ("strike", 1, 0), ("sub", 1, 0), ("sup", 1, 0),
     // Number.prototype (kind 2 → number_method, receiver is a number value).
     ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0), ("toLocaleString", 2, 0),
     // Set.prototype (kind 3 → set_method on the Set receiver).
