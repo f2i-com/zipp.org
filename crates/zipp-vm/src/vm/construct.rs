@@ -290,8 +290,10 @@ impl<'p> Vm<'p> {
                     .collect()
             } else {
                 match self.heap.get(src.heap_index()) {
+                    // Object.assign copies own ENUMERABLE properties only.
                     HeapObj::Object(map) => spec_key_order(&map.keys)
                         .into_iter()
+                        .filter(|&i| map.attrs[i].enumerable)
                         .map(|i| (map.keys[i].clone(), map.vals[i]))
                         .collect(),
                     HeapObj::Array(items) => {

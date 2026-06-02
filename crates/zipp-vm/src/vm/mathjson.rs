@@ -152,13 +152,14 @@ impl<'p> Vm<'p> {
             HeapObj::Object(map) => {
                 let keys = map.keys.clone();
                 let vals = map.vals.clone();
+                let enumerable: Vec<bool> = map.attrs.iter().map(|a| a.enumerable).collect();
                 let order = spec_key_order(&keys);
                 let sep = if indent.is_empty() { ":" } else { ": " };
                 let mut parts = Vec::new();
                 for &i in &order {
                     let k = &keys[i];
-                    // Symbol-keyed (and private) properties are skipped by JSON.
-                    if is_hidden_key(k) {
+                    // Only own ENUMERABLE string keys; symbol/private keys skipped.
+                    if !enumerable[i] || is_hidden_key(k) {
                         continue;
                     }
                     if let Some(vs) = self.json_value(vals[i], indent, depth + 1) {
