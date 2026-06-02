@@ -751,56 +751,67 @@ impl<'p> Vm<'p> {
             // Integrity traits. Non-object arguments pass through unchanged
             // (freeze/seal/preventExtensions) or report as already-locked
             // (isFrozen/isSealed -> true, isExtensible -> false), per ES2015+.
-            OBJ_FREEZE => {
+            // Extensibility for an exotic (non-Object) heap value — array, function,
+            // Temporal instance, Map/Set/Date/… — is tracked in the `arr_props` side
+            // table (its ObjMap carries the `extensible` flag, default true). A fresh
+            // exotic is therefore extensible / not-frozen / not-sealed (per spec),
+            // and preventExtensions/seal/freeze record it consistently. Plain
+            // Objects keep their own `extensible` flag; primitives are immutable.
+            OBJ_FREEZE | OBJ_SEAL | OBJ_PREVENT_EXT => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if o.is_heap() {
-                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
-                        m.freeze();
+                    let idx = o.heap_index();
+                    match self.heap.get(idx) {
+                        // Heap-but-primitive (string/symbol/bigint): a no-op.
+                        HeapObj::Str(_)
+                        | HeapObj::Cons { .. }
+                        | HeapObj::Symbol { .. }
+                        | HeapObj::BigInt(_) => {}
+                        HeapObj::Object(_) => {
+                            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                                match id {
+                                    OBJ_FREEZE => m.freeze(),
+                                    OBJ_SEAL => m.seal(),
+                                    _ => m.extensible = false,
+                                }
+                            }
+                        }
+                        _ => {
+                            let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+                            match id {
+                                OBJ_FREEZE => m.freeze(),
+                                OBJ_SEAL => m.seal(),
+                                _ => m.extensible = false,
+                            }
+                        }
                     }
                 }
                 o
             }
-            OBJ_SEAL => {
+            OBJ_IS_FROZEN | OBJ_IS_SEALED | OBJ_IS_EXT => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                if o.is_heap() {
-                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
-                        m.seal();
+                // A non-object (primitive, incl. heap string/symbol/bigint) is
+                // non-extensible and vacuously frozen/sealed. An exotic object's
+                // flags live in `arr_props` (default: extensible, not frozen/sealed).
+                let (frozen, sealed, ext) = if o.is_heap() {
+                    match self.heap.get(o.heap_index()) {
+                        HeapObj::Object(m) => (m.is_frozen(), m.is_sealed(), m.extensible),
+                        HeapObj::Str(_)
+                        | HeapObj::Cons { .. }
+                        | HeapObj::Symbol { .. }
+                        | HeapObj::BigInt(_) => (true, true, false),
+                        _ => self.arr_props.get(&o.heap_index()).map_or((false, false, true), |m| {
+                            (m.is_frozen(), m.is_sealed(), m.extensible)
+                        }),
                     }
-                }
-                o
-            }
-            OBJ_PREVENT_EXT => {
-                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                if o.is_heap() {
-                    if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
-                        m.extensible = false;
-                    }
-                }
-                o
-            }
-            OBJ_IS_FROZEN => {
-                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let frozen = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
-                    Some(HeapObj::Object(m)) => m.is_frozen(),
-                    _ => true,
+                } else {
+                    (true, true, false)
                 };
-                Value::bool(frozen)
-            }
-            OBJ_IS_SEALED => {
-                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let sealed = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
-                    Some(HeapObj::Object(m)) => m.is_sealed(),
-                    _ => true,
-                };
-                Value::bool(sealed)
-            }
-            OBJ_IS_EXT => {
-                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let ext = match o.is_heap().then(|| self.heap.get(o.heap_index())) {
-                    Some(HeapObj::Object(m)) => m.extensible,
-                    _ => false,
-                };
-                Value::bool(ext)
+                Value::bool(match id {
+                    OBJ_IS_FROZEN => frozen,
+                    OBJ_IS_SEALED => sealed,
+                    _ => ext,
+                })
             }
             // Object.groupBy(items, cb) -> null-proto object of arrays keyed by cb's
             // (string) return; Map.groupBy -> a Map keyed by cb's value (SameValueZero).
@@ -1039,7 +1050,7 @@ impl<'p> Vm<'p> {
                 }
                 let ext = match self.heap.get(a0.heap_index()) {
                     HeapObj::Object(m) => m.extensible,
-                    _ => true,
+                    _ => self.arr_props.get(&a0.heap_index()).map_or(true, |m| m.extensible),
                 };
                 Value::bool(ext)
             }
@@ -1047,8 +1058,13 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.preventExtensions called on non-object".into()));
                 }
-                if let HeapObj::Object(m) = self.heap.get_mut(a0.heap_index()) {
-                    m.extensible = false;
+                let idx = a0.heap_index();
+                if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                        m.extensible = false;
+                    }
+                } else {
+                    self.arr_props.entry(idx).or_insert_with(ObjMap::new).extensible = false;
                 }
                 Value::bool(true)
             }
