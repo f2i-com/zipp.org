@@ -947,11 +947,13 @@ pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
     if !num.is_empty() {
         return None;
     }
-    // Time units H/M/S (S may have a fraction → ms/us/ns).
+    // Time units H/M/S. Only the lowest-order unit present may carry a fraction
+    // (`,`/`.`), which cascades into the smaller units (e.g. PT1.5H → 1h 30m).
     if !time_s.is_empty() {
         let mut num = String::new();
         let mut frac = String::new();
         let mut in_frac = false;
+        let mut frac_done = false; // a fractional unit must be the last one
         for c in time_s.chars() {
             if c.is_ascii_digit() {
                 if in_frac {
@@ -959,31 +961,49 @@ pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
                 } else {
                     num.push(c);
                 }
-            } else if c == '.' || c == ',' {
+            } else if (c == '.' || c == ',') && !in_frac {
                 in_frac = true;
             } else {
+                if frac_done || num.is_empty() {
+                    return None; // a unit after a fractional one, or a bare unit
+                }
                 let n: i64 = num.parse().ok()?;
-                let slot = match c {
-                    'H' | 'h' => 4,
-                    'M' => 5,
-                    'S' | 's' => 6,
+                // (slot, seconds-per-unit) for H/M/S.
+                let (slot, unit_secs): (usize, i128) = match c {
+                    'H' | 'h' => (4, 3_600),
+                    'M' => (5, 60),
+                    'S' | 's' => (6, 1),
                     _ => return None,
                 };
                 f[slot] = n;
                 saw = true;
-                if !frac.is_empty() {
-                    if !matches!(c, 'S' | 's') {
-                        return None; // only seconds-fraction supported
+                if in_frac {
+                    if frac.is_empty() {
+                        return None; // a "," / "." with no fractional digits
                     }
-                    let mut fr = frac.clone();
-                    while fr.len() < 9 {
-                        fr.push('0');
+                    // Sub-unit nanoseconds = frac × unit_secs × 1e9, half-expand
+                    // rounded. Cap the fraction length so the i128 math can't
+                    // overflow (extra digits are sub-nanosecond).
+                    frac.truncate(18);
+                    let l = frac.len() as u32;
+                    let numer: i128 = frac.parse().ok()?;
+                    let denom: i128 = 10i128.pow(l);
+                    let scaled = numer * unit_secs * 1_000_000_000;
+                    let sub_ns = (scaled + denom / 2) / denom;
+                    // Distribute into min/s/ms/us/ns (indices 5..=9), starting at
+                    // the unit just below the fractional one.
+                    let divisors = [60_000_000_000i128, 1_000_000_000, 1_000_000, 1_000, 1];
+                    let start = match c {
+                        'H' | 'h' => 0,
+                        'M' => 1,
+                        _ => 2, // S
+                    };
+                    let mut rem = sub_ns;
+                    for (k, &div) in divisors.iter().enumerate().skip(start) {
+                        f[5 + k] = (rem / div) as i64;
+                        rem %= div;
                     }
-                    fr.truncate(9);
-                    let ns: i64 = fr.parse().ok()?;
-                    f[7] = ns / 1_000_000;
-                    f[8] = (ns / 1_000) % 1_000;
-                    f[9] = ns % 1_000;
+                    frac_done = true;
                 }
                 num.clear();
                 frac.clear();
