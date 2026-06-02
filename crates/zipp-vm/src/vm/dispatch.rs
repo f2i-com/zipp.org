@@ -1546,6 +1546,14 @@ impl<'p> Vm<'p> {
                         self.set_index(o, k, v)?;
                         ip += 1;
                     }
+                    Instr::DefineAccessor { obj, key, func, is_setter } => {
+                        let o = self.get(base, obj);
+                        let kv = self.get(base, key);
+                        let f = self.get(base, func);
+                        let k = self.key_of(kv);
+                        self.define_object_accessor(o, &k, f, is_setter);
+                        ip += 1;
+                    }
                     Instr::GetProp { dst, obj, name } => {
                         let o = self.get(base, obj);
                         let key = self.program.functions[func_id as usize]

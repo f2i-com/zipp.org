@@ -308,6 +308,11 @@ pub enum Instr {
     GetIndex { dst: Reg, obj: Reg, key: Reg },
     /// `obj[key] = val` — computed member write.
     SetIndex { obj: Reg, key: Reg, val: Reg },
+    /// Define an accessor property in an object literal: `{ get key(){…} }` or
+    /// `{ set key(v){…} }`. `func` is the getter/setter function; `is_setter`
+    /// picks the half. Merges with an existing accessor for the same key (so a
+    /// get + set pair on one key becomes a single get/set accessor).
+    DefineAccessor { obj: Reg, key: Reg, func: Reg, is_setter: bool },
     /// `dst = obj.<string_constants[name]>` — static property read
     /// (also resolves `.length` for arrays/strings).
     GetProp { dst: Reg, obj: Reg, name: u32 },

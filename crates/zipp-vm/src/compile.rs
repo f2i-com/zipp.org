@@ -3086,7 +3086,34 @@ impl<'a> FnCompiler<'a> {
             let save = self.next_reg;
             match prop {
                 ox::ObjectPropertyKind::ObjectProperty(p) => {
-                    if p.computed {
+                    if matches!(p.kind, ox::PropertyKind::Get | ox::PropertyKind::Set) {
+                        // `{ get k(){…} }` / `{ set k(v){…} }` — an accessor property.
+                        // The key is loaded into a register (computed expr or the
+                        // static key string); a get+set pair on one key merges.
+                        let key = if p.computed {
+                            let ke =
+                                p.key.as_expression().ok_or("unsupported computed accessor key")?;
+                            self.expr(ke)?
+                        } else {
+                            let k = match &p.key {
+                                ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                                ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                                ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
+                                _ => return Err("unsupported accessor key in the zipp-vm subset".into()),
+                            };
+                            let kr = self.alloc_reg();
+                            let idx = self.add_string_const(&k);
+                            self.emit(Instr::LoadConst { dst: kr, idx });
+                            kr
+                        };
+                        let func = self.expr(&p.value)?;
+                        self.emit(Instr::DefineAccessor {
+                            obj: dst,
+                            key,
+                            func,
+                            is_setter: matches!(p.kind, ox::PropertyKind::Set),
+                        });
+                    } else if p.computed {
                         // Computed key `{[expr]: v}` → SetIndex.
                         let ke = p.key.as_expression().ok_or("unsupported computed object key")?;
                         let key = self.expr(ke)?;

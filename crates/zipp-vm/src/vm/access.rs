@@ -260,6 +260,44 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// Install an object-literal accessor (`{ get k(){…} }` / `{ set k(v){…} }`)
+    /// on a plain object, merging with an existing accessor for the same key (so a
+    /// get+set pair becomes one get/set accessor). Object-literal accessors are
+    /// enumerable + configurable. A getter is stored in `vals[i]`, a setter in
+    /// `attrs[i].setter`.
+    pub(crate) fn define_object_accessor(&mut self, obj: Value, key: &str, func: Value, is_setter: bool) {
+        if !obj.is_heap() {
+            return;
+        }
+        let idx = obj.heap_index();
+        if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+            if let Some(i) = m.pos(key) {
+                if m.attrs[i].accessor {
+                    if is_setter {
+                        m.attrs[i].setter = func;
+                    } else {
+                        m.vals[i] = func;
+                    }
+                    return;
+                }
+            }
+            let (getter, setter) = if is_setter {
+                (Value::UNDEFINED, func)
+            } else {
+                (func, Value::UNDEFINED)
+            };
+            let attr = PropAttr {
+                writable: false,
+                enumerable: true,
+                configurable: true,
+                accessor: true,
+                setter,
+            };
+            m.define(key, getter, attr);
+            self.heap.bump_version(idx);
+        }
+    }
+
     /// Walk a class chain for a `set key(v)` accessor, returning the setter fn.
     pub(crate) fn lookup_setter(&self, class: Option<u32>, key: &str) -> Option<Value> {
         let mut cur = class;
