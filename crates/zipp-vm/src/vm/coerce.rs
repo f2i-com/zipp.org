@@ -500,6 +500,51 @@ impl<'p> Vm<'p> {
         Ok(f64::NAN)
     }
 
+    /// `ToNumber(v)` that honours a user `valueOf`/`toString` when `v` is an
+    /// object (ToPrimitive with the number hint) — unlike the immutable
+    /// `to_number`, which returns NaN for an un-handled object. Primitives and the
+    /// already-handled heap types (Date/Boxed/Symbol/BigInt/String) defer straight
+    /// to `to_number`; a plain object is reduced to a primitive first.
+    pub(crate) fn to_number_coerce(&mut self, v: Value) -> Result<f64, Thrown> {
+        if !v.is_heap() {
+            return self.to_number(v);
+        }
+        if matches!(
+            self.heap.get(v.heap_index()),
+            HeapObj::Date(_)
+                | HeapObj::Boxed { .. }
+                | HeapObj::Symbol { .. }
+                | HeapObj::BigInt(_)
+                | HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+        ) {
+            return self.to_number(v);
+        }
+        let prim = self.to_primitive_number(v)?;
+        self.to_number(prim)
+    }
+
+    /// OrdinaryToPrimitive(v, "number"): try `valueOf` then `toString`, returning
+    /// the first that yields a primitive; TypeError if neither does. (The
+    /// `Symbol.toPrimitive` hook is not consulted yet.)
+    pub(crate) fn to_primitive_number(&mut self, v: Value) -> Result<Value, Thrown> {
+        for name in ["valueOf", "toString"] {
+            let f = self.get_prop(v, name)?;
+            if self.is_callable(f) {
+                let r = self.call_value(f, v, &[])?;
+                let is_primitive = !r.is_heap()
+                    || matches!(
+                        self.heap.get(r.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+                    );
+                if is_primitive {
+                    return Ok(r);
+                }
+            }
+        }
+        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+    }
+
     /// String COERCION (`String(v)`, `'' + v`, property keys). Arrays join with
     /// commas; objects become `[object Object]` — JS `toString` semantics.
     pub(crate) fn display(&self, v: Value) -> String {

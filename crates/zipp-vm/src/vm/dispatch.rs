@@ -354,7 +354,7 @@ impl<'p> Vm<'p> {
                         } else if self.bigint_value(va).is_some() {
                             return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
                         } else {
-                            Value::num(self.to_number(va)?)
+                            Value::num(self.to_number_coerce(va)?)
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -369,7 +369,7 @@ impl<'p> Vm<'p> {
                         } else if let Some(n) = self.bigint_value(va) {
                             self.make_bigint(n.wrapping_neg())
                         } else {
-                            Value::num(-self.to_number(va)?)
+                            Value::num(-self.to_number_coerce(va)?)
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -1058,7 +1058,7 @@ impl<'p> Vm<'p> {
                         let a0 = if argc >= 1 { self.get(base, arg_base) } else { Value::UNDEFINED };
                         let v = match op {
                             G::Number => {
-                                if argc == 0 { Value::num(0.0) } else { Value::num(self.to_number(a0)?) }
+                                if argc == 0 { Value::num(0.0) } else { Value::num(self.to_number_coerce(a0)?) }
                             }
                             G::String => {
                                 if argc == 0 {
