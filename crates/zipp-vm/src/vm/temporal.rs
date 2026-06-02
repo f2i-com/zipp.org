@@ -185,12 +185,22 @@ impl<'p> Vm<'p> {
                 if !DURATION_UNITS.contains(&unit.as_str()) {
                     return Err(Thrown(format!("RangeError: invalid unit: {unit}")));
                 }
-                // No relativeTo support: years/months/weeks (in the value or as the
-                // requested unit) need a calendar.
+                // Years/months/weeks (in the value or as the requested unit) need a
+                // calendar: use the `relativeTo` option's date-time as the anchor.
                 if f[0] != 0 || f[1] != 0 || f[2] != 0 || matches!(unit.as_str(), "year" | "month" | "week") {
-                    return Err(Thrown(
-                        "RangeError: a relativeTo option is required for years, months, or weeks".into(),
-                    ));
+                    let rel = if a0.is_heap() && !self.heap.is_str_like(a0.heap_index()) {
+                        self.get_prop(a0, "relativeTo")?
+                    } else {
+                        Value::UNDEFINED
+                    };
+                    if rel == Value::UNDEFINED {
+                        return Err(Thrown(
+                            "RangeError: a relativeTo option is required for years, months, or weeks"
+                                .into(),
+                        ));
+                    }
+                    let start = self.relative_to_dt(rel)?;
+                    return Ok(Some(Value::num(duration_total_relative(f, start, &unit))));
                 }
                 let total_ns = (f[3] as i128) * DAY_NS
                     + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
@@ -1360,6 +1370,18 @@ impl<'p> Vm<'p> {
         Value::heap(idx)
     }
 
+    /// Parse a `relativeTo` option into a date-time [y,mo,d,h,…] anchor (a
+    /// ZonedDateTime uses its local wall-clock; otherwise PlainDate/PlainDateTime/
+    /// string/object coercion).
+    pub(crate) fn relative_to_dt(&mut self, rel: Value) -> Result<[i64; 9], Thrown> {
+        if rel.is_heap() {
+            if matches!(self.heap.get(rel.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
+                return Ok(self.zdt_local(rel.heap_index()));
+            }
+        }
+        self.to_plain_date_time(rel)
+    }
+
     /// The time-zone id string of a ZDT instance (for equality).
     fn zdt_tz_id(&self, idx: u32) -> Option<String> {
         self.zdt_tz
@@ -1782,6 +1804,72 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
         return Some((t.to_string(), 0));
     }
     None
+}
+
+/// Add a Duration `f` ([y,mo,w,d,h,mi,s,ms,us,ns]) to a date-time `start`
+/// ([y,mo,d,h,mi,s,ms,us,ns]) with calendar constrain — the shared add path.
+fn dt_add_dur(start: [i64; 9], f: [i64; 10]) -> [i64; 9] {
+    let tns = time_to_ns(&[start[3], start[4], start[5], start[6], start[7], start[8]])
+        + (f[4] as i128) * 3_600_000_000_000
+        + (f[5] as i128) * 60_000_000_000
+        + (f[6] as i128) * 1_000_000_000
+        + (f[7] as i128) * 1_000_000
+        + (f[8] as i128) * 1_000
+        + (f[9] as i128);
+    let carry = tns.div_euclid(DAY_NS) as i64;
+    let nt = ns_to_time(tns.rem_euclid(DAY_NS));
+    let tm = (start[0] + f[0]) * 12 + (start[1] - 1) + f[1];
+    let ny0 = tm.div_euclid(12);
+    let nmo = tm.rem_euclid(12) + 1;
+    let nd0 = start[2].min(days_in_month(ny0, nmo));
+    let ed = iso_to_epoch_days(ny0, nmo, nd0) + f[2] * 7 + f[3] + carry;
+    let (ny, nm, nd) = epoch_days_to_iso(ed);
+    [ny, nm, nd, nt[0], nt[1], nt[2], nt[3], nt[4], nt[5]]
+}
+
+/// Epoch nanoseconds of a date-time [y,mo,d,h,mi,s,ms,us,ns] (ISO/UTC frame).
+fn dt_epoch_ns(dt: [i64; 9]) -> i128 {
+    (iso_to_epoch_days(dt[0], dt[1], dt[2]) as i128) * DAY_NS
+        + time_to_ns(&[dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]])
+}
+
+/// `Duration.total(unit)` relative to a start date-time: the (possibly fractional)
+/// total of the duration measured in `unit`, computed via the calendar at `start`.
+fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> f64 {
+    let end_ns = dt_epoch_ns(dt_add_dur(start, f));
+    let start_ns = dt_epoch_ns(start);
+    let diff = end_ns - start_ns;
+    match unit {
+        "year" | "month" => {
+            let sign = if diff < 0 { -1i64 } else { 1 };
+            let step: [i64; 10] = if unit == "year" {
+                [sign, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            } else {
+                [0, sign, 0, 0, 0, 0, 0, 0, 0, 0]
+            };
+            let mut whole = 0i64;
+            let mut cur = start;
+            for _ in 0..2_000_000 {
+                let next = dt_add_dur(cur, step);
+                let nn = dt_epoch_ns(next);
+                if (sign > 0 && nn > end_ns) || (sign < 0 && nn < end_ns) {
+                    break;
+                }
+                cur = next;
+                whole += sign;
+            }
+            let cur_ns = dt_epoch_ns(cur);
+            let next_ns = dt_epoch_ns(dt_add_dur(cur, step));
+            let frac = if next_ns != cur_ns {
+                (end_ns - cur_ns) as f64 / (next_ns - cur_ns) as f64
+            } else {
+                0.0
+            };
+            whole as f64 + frac
+        }
+        "week" => diff as f64 / (7.0 * DAY_NS as f64),
+        _ => diff as f64 / unit_ns(unit) as f64,
+    }
 }
 
 /// Parse a ZonedDateTime ISO string `YYYY-MM-DDTHH:MM:SS[.fff]±OFF[tzid]` into
