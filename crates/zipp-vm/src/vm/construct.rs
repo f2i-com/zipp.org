@@ -599,25 +599,48 @@ impl<'p> Vm<'p> {
         if !drain {
             return Ok(v);
         }
+        // Hold the not-yet-rooted drained values across the `.next()`/`.return()`
+        // user re-entries.
+        let _gc = self.gc_lock_guard();
         let iter = self.get_iterator(v)?; // generator → itself; iterable → its iterator
+        let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. });
         let lim = max as usize;
         let mut out = Vec::new();
+        let mut iter_done = false;
         while out.len() < lim {
-            let res = if matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. }) {
+            let res = if is_gen {
                 self.generator_method(iter.heap_index(), "next", &[])?
                     .unwrap_or(Value::UNDEFINED)
             } else {
                 let next = self.get_prop(iter, "next")?;
                 if !self.is_callable(next) {
+                    iter_done = true;
                     break;
                 }
                 self.call_value(next, iter, &[])?
             };
             let done = self.get_prop(res, "done")?;
             if self.truthy(done) {
+                iter_done = true;
                 break;
             }
             out.push(self.get_prop(res, "value")?);
+        }
+        // IteratorClose (normal completion): destructuring took the fixed number of
+        // elements it needed; if the iterator isn't exhausted (and isn't a
+        // generator, which closes on its own GC), call its `return()` once. This is
+        // what `[a] = iter` / `[] = iter` (no rest) require — when a `...rest` is
+        // present `max` is unbounded so the loop runs to `done` and we skip this.
+        if !iter_done && !is_gen {
+            let ret = self.get_prop(iter, "return")?;
+            if self.is_callable(ret) {
+                let r = self.call_value(ret, iter, &[])?;
+                if !self.is_object_value(r) {
+                    return Err(Thrown(
+                        "TypeError: iterator return() result is not an object".into(),
+                    ));
+                }
+            }
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
     }
