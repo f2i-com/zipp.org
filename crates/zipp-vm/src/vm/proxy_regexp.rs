@@ -408,12 +408,27 @@ impl<'p> Vm<'p> {
                 };
                 gm.set(name, v);
             }
-            Value::heap(self.heap.alloc(HeapObj::Object(gm)))
+            let gidx = self.heap.alloc(HeapObj::Object(gm));
+            // The groups object is OrdinaryObjectCreate(null) — no prototype.
+            self.proto_of.insert(gidx, Value::NULL);
+            Value::heap(gidx)
         };
         let arr_idx = self.heap.alloc(HeapObj::Array(elems));
         let index_v = Value::num(byte_to_char(&input, mstart) as f64);
         let input_sv = self.alloc_str(input.clone());
-        self.regexp_match_extras.insert(arr_idx, (index_v, input_sv, groups));
+        // index/input/groups are real own data properties of the result array
+        // (writable, enumerable, configurable) so reflection sees them.
+        let attr = PropAttr {
+            writable: true,
+            enumerable: true,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let m = self.arr_props.entry(arr_idx).or_insert_with(ObjMap::new);
+        m.define("index", index_v, attr);
+        m.define("input", input_sv, attr);
+        m.define("groups", groups, attr);
         if stateful {
             self.set_regexp_last_index(re_idx, byte_to_char(&input, mend));
         }

@@ -219,11 +219,6 @@ pub struct Vm<'p> {
     /// `%RegExpStringIteratorPrototype%` — the prototype of the iterator returned
     /// by `RegExp.prototype[Symbol.matchAll]` / `String.prototype.matchAll`.
     regexp_string_iter_proto: u32,
-    /// Extra own properties of a regex match-result Array (`.index`, `.input`,
-    /// `.groups`), keyed by the result array's heap index — our `Array` is a plain
-    /// `Vec` with no slot for named properties, so they live in this side table
-    /// (mirroring `template_raws`). Tuple is (index, input, groups).
-    regexp_match_extras: std::collections::HashMap<u32, (Value, Value, Value)>,
     /// The `%TypedArray%` intrinsic (abstract base ctor) + its prototype, the 11
     /// concrete TypedArray ctors + their prototypes (indexed by `kind`), and the
     /// `ArrayBuffer`/`DataView` ctors + prototypes. 0 until setup.

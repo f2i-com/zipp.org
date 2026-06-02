@@ -702,14 +702,6 @@ impl<'p> Vm<'p> {
             let (s, f, li) = (source.clone(), flags.clone(), *last_index);
             return self.regexp_get_prop(&s, &f, li, key);
         }
-        if let Some(&(index, input, groups)) = self.regexp_match_extras.get(&obj.heap_index()) {
-            match key {
-                "index" => return Ok(index),
-                "input" => return Ok(input),
-                "groups" => return Ok(groups),
-                _ => {}
-            }
-        }
         // An Array's named (non-index) own properties (arr.foo, and a match
         // result's index/input/groups) live in arr_props and shadow the prototype.
         let arr_entry =
