@@ -691,6 +691,16 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         DATE_NOW => ("now", 0),
         DATE_PARSE => ("parse", 1),
         DATE_UTC => ("UTC", 7),
+        // Temporal static methods: from (length 1), compare (length 2), and
+        // Instant.fromEpoch* (length 1).
+        TEMPORAL_DURATION_FROM | PLAINDATE_FROM | PLAINTIME_FROM | PLAINDATETIME_FROM
+        | INST_FROM | PLAINYEARMONTH_FROM | PLAINMONTHDAY_FROM => ("from", 1),
+        TEMPORAL_DURATION_COMPARE | PLAINDATE_COMPARE | PLAINTIME_COMPARE
+        | PLAINDATETIME_COMPARE | INST_COMPARE | PLAINYEARMONTH_COMPARE => ("compare", 2),
+        INST_FROM_EPOCH_MS => ("fromEpochMilliseconds", 1),
+        INST_FROM_EPOCH_NS => ("fromEpochNanoseconds", 1),
+        INST_FROM_EPOCH_SEC => ("fromEpochSeconds", 1),
+        INST_FROM_EPOCH_US => ("fromEpochMicroseconds", 1),
         _ => return None,
     })
 }
