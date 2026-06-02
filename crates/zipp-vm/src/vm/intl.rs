@@ -239,6 +239,72 @@ impl<'p> Vm<'p> {
         Ok((su, inc, mode))
     }
 
+    /// Read until()/since() options for time-only types (PlainTime/Instant):
+    /// largestUnit (default `default_largest`), smallestUnit (default nanosecond),
+    /// roundingIncrement, roundingMode (default trunc). Returns the resolved
+    /// (largestUnit, smallestUnit, increment, mode); errors if largest < smallest.
+    pub(crate) fn read_time_diff_options(
+        &mut self,
+        options: Value,
+        default_largest: &str,
+    ) -> Result<(String, String, i128, String), Thrown> {
+        let units = ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+        let rank = |u: &str| units.iter().position(|&x| x == u).unwrap_or(5) as i32;
+        if options == Value::UNDEFINED {
+            return Ok((default_largest.to_string(), "nanosecond".to_string(), 1, "trunc".to_string()));
+        }
+        if !self.is_object_value(options) {
+            return Err(Thrown("TypeError: options must be an object or undefined".into()));
+        }
+        let largest_allowed = [
+            "auto", "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
+            "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
+        ];
+        let small_allowed = &largest_allowed[1..]; // same minus "auto"
+        let lu = normalize_unit(
+            &self.opt_string(options, "largestUnit", "auto", &largest_allowed)?,
+            default_largest,
+        );
+        let su = normalize_unit(
+            &self.opt_string(options, "smallestUnit", "nanosecond", small_allowed)?,
+            "nanosecond",
+        );
+        let inc = {
+            let v = self.get_prop(options, "roundingIncrement")?;
+            if v == Value::UNDEFINED {
+                1
+            } else {
+                let n = self.to_number(v)?;
+                if !n.is_finite() || n < 1.0 || n.floor() != n {
+                    return Err(Thrown("RangeError: roundingIncrement out of range".into()));
+                }
+                n as i128
+            }
+        };
+        let mode = self.opt_string(
+            options,
+            "roundingMode",
+            "trunc",
+            &[
+                "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
+                "halfEven", "halfExpand",
+            ],
+        )?;
+        if rank(&lu) > rank(&su) {
+            return Err(Thrown(
+                "RangeError: largestUnit must not be smaller than smallestUnit".into(),
+            ));
+        }
+        if let Some(max) = max_increment(&su) {
+            if inc >= max || max % inc != 0 {
+                return Err(Thrown(
+                    "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                ));
+            }
+        }
+        Ok((lu, su, inc, mode))
+    }
+
     /// `new Intl.<service>(locales, options)` → build resolved options + instance.
     pub(crate) fn make_intl(&mut self, kind: u8, locales: Value, options: Value) -> Result<Value, Thrown> {
         use native::*;

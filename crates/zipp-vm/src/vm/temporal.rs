@@ -705,20 +705,16 @@ impl<'p> Vm<'p> {
             }
             "until" | "since" => {
                 let o = self.to_plain_time(a0)?;
+                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (largest, smallest, inc, mode) = self.read_time_diff_options(a1, "hour")?;
                 let diff = if name == "until" {
                     time_to_ns(&o) - time_to_ns(&f)
                 } else {
                     time_to_ns(&f) - time_to_ns(&o)
                 };
-                let t = ns_to_time(diff.abs());
-                let mut df = [0i64; 10];
-                df[4..10].copy_from_slice(&t);
-                if diff < 0 {
-                    for x in df.iter_mut() {
-                        *x = -*x;
-                    }
-                }
-                Ok(Some(self.make_duration(df)))
+                let inc_ns = unit_ns(&smallest) * inc;
+                let rounded = round_increment(diff, inc_ns, &mode);
+                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
             }
             "round" => {
                 let (su, inc, mode) = self.read_round_options(
@@ -1089,15 +1085,12 @@ impl<'p> Vm<'p> {
             }
             "until" | "since" => {
                 let o = self.to_instant_ns(a0)?;
+                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (largest, smallest, inc, mode) = self.read_time_diff_options(a1, "second")?;
                 let diff = if name == "until" { o - ns } else { ns - o };
-                let s = (diff / 1_000_000_000) as i64;
-                let sub = (diff % 1_000_000_000) as i64;
-                let mut df = [0i64; 10];
-                df[6] = s;
-                df[7] = sub / 1_000_000;
-                df[8] = (sub / 1_000) % 1_000;
-                df[9] = sub % 1_000;
-                Ok(Some(self.make_duration(df)))
+                let inc_ns = unit_ns(&smallest) * inc;
+                let rounded = round_increment(diff, inc_ns, &mode);
+                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
             }
             "round" => {
                 let (su, inc, mode) = self.read_round_options(
