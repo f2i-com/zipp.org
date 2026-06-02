@@ -47,6 +47,7 @@ pub const OBJ_GROUP_BY: u16 = 42;
 pub const MAP_GROUP_BY: u16 = 43;
 pub const PROMISE_WITH_RESOLVERS: u16 = 44;
 pub const PROMISE_TRY: u16 = 628;
+pub const REGEXP_COMPILE: u16 = 629;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -467,6 +468,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         REGEXP_TEST => ("test", 1),
         REGEXP_EXEC => ("exec", 1),
         REGEXP_TO_STRING => ("toString", 0),
+        REGEXP_COMPILE => ("compile", 2),
         FN_CALL => ("call", 1),
         FN_APPLY => ("apply", 2),
         FN_BIND => ("bind", 1),

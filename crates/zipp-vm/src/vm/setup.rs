@@ -569,7 +569,12 @@ impl<'p> Vm<'p> {
         {
             let regexp_proto = build(
                 self,
-                &[("test", REGEXP_TEST), ("exec", REGEXP_EXEC), ("toString", REGEXP_TO_STRING)],
+                &[
+                    ("test", REGEXP_TEST),
+                    ("exec", REGEXP_EXEC),
+                    ("toString", REGEXP_TO_STRING),
+                    ("compile", REGEXP_COMPILE),
+                ],
                 None,
             );
             self.proto_of.insert(regexp_proto, Value::heap(obj_proto));

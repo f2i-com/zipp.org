@@ -190,6 +190,45 @@ impl<'p> Vm<'p> {
                 let r = self.regexp_exec(this.heap_index(), a0)?;
                 Value::bool(r != Value::NULL)
             }
+            REGEXP_COMPILE => {
+                // RegExp.prototype.compile(pattern, flags): recompile in place.
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.compile called on a non-RegExp".into(),
+                    ));
+                }
+                // Reuse the constructor path (validates flags, builds the matcher),
+                // then move the freshly built fields into the receiver.
+                let built = self.build_regexp(a0, a1)?;
+                let (source, flags) = match self.heap.get(built.heap_index()) {
+                    HeapObj::RegExp { source, flags, .. } => (source.clone(), flags.clone()),
+                    _ => unreachable!(),
+                };
+                // Rebuild the matcher from the validated source/flags.
+                let mut rflags = String::new();
+                for c in flags.chars() {
+                    match c {
+                        'i' | 'm' | 's' => rflags.push(c),
+                        'u' | 'v' if !rflags.contains('u') => rflags.push('u'),
+                        _ => {}
+                    }
+                }
+                let regex = regress::Regex::with_flags(&source, rflags.as_str()).map_err(|e| {
+                    Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
+                })?;
+                if let HeapObj::RegExp { regex: r, source: s, flags: fl, last_index } =
+                    self.heap.get_mut(this.heap_index())
+                {
+                    *r = Box::new(regex);
+                    *s = source;
+                    *fl = flags;
+                    *last_index = 0;
+                }
+                this
+            }
             REGEXP_TO_STRING => {
                 let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::RegExp { source, flags, .. }) => (
