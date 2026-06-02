@@ -216,7 +216,7 @@ impl<'p> Vm<'p> {
 
     /// `new Date(...)` → epoch ms. 0 args = now; 1 number = ms (time-clipped);
     /// 1 Date = copy; 1 string = parsed; ≥2 = UTC components (month0-based).
-    pub(crate) fn date_new_ms(&self, args: &[Value]) -> Result<f64, Thrown> {
+    pub(crate) fn date_new_ms(&mut self, args: &[Value]) -> Result<f64, Thrown> {
         match args.len() {
             0 => Ok(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -224,47 +224,64 @@ impl<'p> Vm<'p> {
                 .unwrap_or(0.0)),
             1 => {
                 let a = args[0];
+                // `new Date(aDate)` copies its time value directly.
                 if a.is_heap() {
                     if let HeapObj::Date(ms) = self.heap.get(a.heap_index()) {
                         return Ok(*ms);
                     }
-                    if matches!(self.heap.get(a.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
-                        let s = self.heap.str_cow(a.heap_index()).unwrap().into_owned();
-                        return Ok(parse_date(&s));
-                    }
                 }
-                Ok(time_clip(self.to_number(a)?))
+                // Otherwise ToPrimitive(default): a String is parsed; anything else
+                // is ToNumber'd (so `new Date({valueOf:()=>1000})` works).
+                let prim = self.to_primitive_default(a)?;
+                if prim.is_heap()
+                    && matches!(self.heap.get(prim.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
+                {
+                    let s = self.heap.str_cow(prim.heap_index()).unwrap().into_owned();
+                    return Ok(parse_date(&s));
+                }
+                Ok(time_clip(self.to_number(prim)?))
             }
             _ => {
-                let mut comp = [0i64, 0, 1, 0, 0, 0, 0]; // y, mo0, day, h, mi, s, ms
-                for (i, &v) in args.iter().enumerate().take(7) {
-                    let n = self.to_number(v)?;
-                    if n.is_nan() {
-                        return Ok(f64::NAN);
+                let comp = self.date_components(args)?;
+                Ok(match comp {
+                    Some(mut c) => {
+                        c[0] = legacy_year(c[0]);
+                        time_clip(ms_from_utc(c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
                     }
-                    comp[i] = n as i64;
-                }
-                comp[0] = legacy_year(comp[0]);
-                Ok(time_clip(ms_from_utc(comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6])))
+                    None => f64::NAN,
+                })
             }
         }
     }
 
+    /// Coerce up to 7 Date component args (y, mo0, day, h, mi, s, ms) via ToNumber
+    /// — invoking each arg's `valueOf` in ORDER (all coerced even if an earlier one
+    /// is NaN, so side effects match spec). Returns `None` if any component is NaN.
+    fn date_components(&mut self, args: &[Value]) -> Result<Option<[i64; 7]>, Thrown> {
+        let mut comp = [0i64, 0, 1, 0, 0, 0, 0];
+        let mut any_nan = false;
+        for (i, &v) in args.iter().enumerate().take(7) {
+            let n = self.to_number_coerce(v)?;
+            if n.is_nan() {
+                any_nan = true;
+            }
+            comp[i] = if n.is_finite() { n as i64 } else { 0 };
+        }
+        Ok(if any_nan { None } else { Some(comp) })
+    }
+
     /// `Date.UTC(year, month0, …)` → epoch ms (NaN with no args / a NaN field).
-    pub(crate) fn date_utc_ms(&self, args: &[Value]) -> Result<f64, Thrown> {
+    pub(crate) fn date_utc_ms(&mut self, args: &[Value]) -> Result<f64, Thrown> {
         if args.is_empty() {
             return Ok(f64::NAN);
         }
-        let mut comp = [0i64, 0, 1, 0, 0, 0, 0];
-        for (i, &v) in args.iter().enumerate().take(7) {
-            let n = self.to_number(v)?;
-            if n.is_nan() {
-                return Ok(f64::NAN);
+        Ok(match self.date_components(args)? {
+            Some(mut c) => {
+                c[0] = legacy_year(c[0]);
+                time_clip(ms_from_utc(c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
             }
-            comp[i] = n as i64;
-        }
-        comp[0] = legacy_year(comp[0]);
-        Ok(time_clip(ms_from_utc(comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6])))
+            None => f64::NAN,
+        })
     }
 
     /// Dispatch a method on a `Date` receiver (`idx` is its heap index). All
@@ -317,7 +334,7 @@ impl<'p> Vm<'p> {
             "getYear" => field(p.0 - 1900),
             "setYear" => {
                 let y = match args.first() {
-                    Some(&v) => self.to_number(v)?,
+                    Some(&v) => self.to_number_coerce(v)?,
                     None => f64::NAN,
                 };
                 if y.is_nan() {
@@ -333,7 +350,7 @@ impl<'p> Vm<'p> {
             }
             "setTime" => {
                 let n = match args.first() {
-                    Some(&v) => time_clip(self.to_number(v)?),
+                    Some(&v) => time_clip(self.to_number_coerce(v)?),
                     None => f64::NAN,
                 };
                 if let HeapObj::Date(m) = self.heap.get_mut(idx) {
@@ -362,19 +379,27 @@ impl<'p> Vm<'p> {
         args: &[Value],
         start: usize,
     ) -> Result<Value, Thrown> {
+        let orig_ms = match self.heap.get(idx) {
+            HeapObj::Date(m) => *m,
+            _ => f64::NAN,
+        };
         let mut comp = [p.0, p.1, p.2, p.3, p.4, p.5, p.6];
         let mut any_nan = false;
+        // Coerce ALL args (ToNumber, invoking valueOf in order) before deciding.
         for (i, &v) in args.iter().enumerate() {
             if start + i >= 7 {
                 break;
             }
-            let n = self.to_number(v)?;
+            let n = self.to_number_coerce(v)?;
             if n.is_nan() {
                 any_nan = true;
             }
-            comp[start + i] = n as i64;
+            comp[start + i] = if n.is_finite() { n as i64 } else { 0 };
         }
-        let ms = if any_nan {
+        // A component setter (setMonth..setMilliseconds, start>=1) on an Invalid
+        // Date stays NaN AFTER coercing args. setFullYear (start==0) revives it
+        // (spec treats t as +0), so it does NOT short-circuit on orig NaN.
+        let ms = if any_nan || (orig_ms.is_nan() && start != 0) {
             f64::NAN
         } else {
             time_clip(ms_from_utc(comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6]))
