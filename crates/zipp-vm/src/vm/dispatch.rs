@@ -302,7 +302,7 @@ impl<'p> Vm<'p> {
                         } else if let Some(bv) = self.bigint_binop(BigOp::Sub, va, vb)? {
                             bv
                         } else {
-                            Value::num(self.to_number(va)? - self.to_number(vb)?)
+                            Value::num(self.to_number_coerce(va)? - self.to_number_coerce(vb)?)
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -318,7 +318,7 @@ impl<'p> Vm<'p> {
                         } else if let Some(bv) = self.bigint_binop(BigOp::Mul, va, vb)? {
                             bv
                         } else {
-                            Value::num(self.to_number(va)? * self.to_number(vb)?)
+                            Value::num(self.to_number_coerce(va)? * self.to_number_coerce(vb)?)
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -329,7 +329,7 @@ impl<'p> Vm<'p> {
                         let r = if let Some(bv) = self.bigint_binop(BigOp::Div, va, vb)? {
                             bv
                         } else {
-                            Value::num(self.to_number(va)? / self.to_number(vb)?)
+                            Value::num(self.to_number_coerce(va)? / self.to_number_coerce(vb)?)
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -340,7 +340,7 @@ impl<'p> Vm<'p> {
                         let r = if let Some(bv) = self.bigint_binop(BigOp::Mod, va, vb)? {
                             bv
                         } else {
-                            Value::num(self.to_number(va)? % self.to_number(vb)?)
+                            Value::num(self.to_number_coerce(va)? % self.to_number_coerce(vb)?)
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -400,23 +400,23 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                         }
-                        let x = to_int32(self.to_number(va)?);
+                        let x = to_int32(self.to_number_coerce(va)?);
                         // Shift counts use the low 5 bits per the JS spec.
                         let r = match op {
-                            B::And => Value::int(x & to_int32(self.to_number(vb)?)),
-                            B::Or => Value::int(x | to_int32(self.to_number(vb)?)),
-                            B::Xor => Value::int(x ^ to_int32(self.to_number(vb)?)),
+                            B::And => Value::int(x & to_int32(self.to_number_coerce(vb)?)),
+                            B::Or => Value::int(x | to_int32(self.to_number_coerce(vb)?)),
+                            B::Xor => Value::int(x ^ to_int32(self.to_number_coerce(vb)?)),
                             B::Shl => {
-                                let s = to_uint32(self.to_number(vb)?) & 31;
+                                let s = to_uint32(self.to_number_coerce(vb)?) & 31;
                                 Value::int(x.wrapping_shl(s))
                             }
                             B::Shr => {
-                                let s = to_uint32(self.to_number(vb)?) & 31;
+                                let s = to_uint32(self.to_number_coerce(vb)?) & 31;
                                 Value::int(x >> s)
                             }
                             B::Ushr => {
-                                let s = to_uint32(self.to_number(vb)?) & 31;
-                                let u = to_uint32(self.to_number(va)?) >> s;
+                                let s = to_uint32(self.to_number_coerce(vb)?) & 31;
+                                let u = to_uint32(self.to_number_coerce(va)?) >> s;
                                 // u32 may exceed i32::MAX → keep numeric range.
                                 if u <= i32::MAX as u32 {
                                     Value::int(u as i32)
@@ -434,7 +434,7 @@ impl<'p> Vm<'p> {
                         let r = if let Some(bv) = self.bigint_binop(BigOp::Pow, va, vb)? {
                             bv
                         } else {
-                            Value::num(self.to_number(va)?.powf(self.to_number(vb)?))
+                            Value::num(self.to_number_coerce(va)?.powf(self.to_number_coerce(vb)?))
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -445,7 +445,7 @@ impl<'p> Vm<'p> {
                             let r = self.make_bigint(!n);
                             self.set(base, dst, r);
                         } else {
-                            let r = !to_int32(self.to_number(va)?);
+                            let r = !to_int32(self.to_number_coerce(va)?);
                             self.set(base, dst, Value::int(r));
                         }
                         ip += 1;
@@ -458,7 +458,7 @@ impl<'p> Vm<'p> {
                                 None => Value::num(va.as_int() as f64 + imm as f64),
                             }
                         } else {
-                            Value::num(self.to_number(va)? + imm as f64)
+                            Value::num(self.to_number_coerce(va)? + imm as f64)
                         };
                         self.set(base, dst, r);
                         ip += 1;

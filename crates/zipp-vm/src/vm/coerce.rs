@@ -285,16 +285,24 @@ impl<'p> Vm<'p> {
             }
             // else: fall through to string concatenation (to_str_idx → decimal).
         }
-        // If either side is a heap value, JS `+` is string concatenation (arrays
-        // and objects coerce to a string primitive, and string+anything joins).
-        // Build a rope (cons-string) in O(1) — children point at existing flat
-        // strings / ropes, so a `s += x` loop is O(n) overall, not O(n²).
+        // If either side is a heap value, reduce both to primitives first
+        // (ToPrimitive, default hint). If either primitive is a String, `+` is
+        // string concatenation; otherwise it is numeric addition.
         if va.is_heap() || vb.is_heap() {
-            let li = self.to_str_idx(va);
-            let ri = self.to_str_idx(vb);
-            let llen = self.heap.str_char_len(li).unwrap_or(0);
-            let rlen = self.heap.str_char_len(ri).unwrap_or(0);
-            return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
+            let pa = self.to_primitive_default(va)?;
+            let pb = self.to_primitive_default(vb)?;
+            let pa_str = pa.is_heap() && self.heap.is_str_like(pa.heap_index());
+            let pb_str = pb.is_heap() && self.heap.is_str_like(pb.heap_index());
+            if pa_str || pb_str {
+                // Build a rope (cons-string) in O(1) — children point at existing
+                // flat strings / ropes, so a `s += x` loop is O(n) overall.
+                let li = self.to_str_idx(pa);
+                let ri = self.to_str_idx(pb);
+                let llen = self.heap.str_char_len(li).unwrap_or(0);
+                let rlen = self.heap.str_char_len(ri).unwrap_or(0);
+                return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
+            }
+            return Ok(Value::num(self.to_number(pa)? + self.to_number(pb)?));
         }
         Ok(Value::num(self.to_number(va)? + self.to_number(vb)?))
     }
@@ -529,6 +537,42 @@ impl<'p> Vm<'p> {
     /// `Symbol.toPrimitive` hook is not consulted yet.)
     pub(crate) fn to_primitive_number(&mut self, v: Value) -> Result<Value, Thrown> {
         for name in ["valueOf", "toString"] {
+            let f = self.get_prop(v, name)?;
+            if self.is_callable(f) {
+                let r = self.call_value(f, v, &[])?;
+                let is_primitive = !r.is_heap()
+                    || matches!(
+                        self.heap.get(r.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+                    );
+                if is_primitive {
+                    return Ok(r);
+                }
+            }
+        }
+        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+    }
+
+    /// ToPrimitive(v) with the DEFAULT hint (used by binary `+` and `==`): an
+    /// already-primitive value passes through; a Date prefers `toString` (string
+    /// hint), every other object prefers `valueOf` (number hint). The
+    /// `Symbol.toPrimitive` hook is not consulted yet.
+    pub(crate) fn to_primitive_default(&mut self, v: Value) -> Result<Value, Thrown> {
+        if !v.is_heap() {
+            return Ok(v);
+        }
+        if matches!(
+            self.heap.get(v.heap_index()),
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+        ) {
+            return Ok(v);
+        }
+        let order: [&str; 2] = if matches!(self.heap.get(v.heap_index()), HeapObj::Date(_)) {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for name in order {
             let f = self.get_prop(v, name)?;
             if self.is_callable(f) {
                 let r = self.call_value(f, v, &[])?;
