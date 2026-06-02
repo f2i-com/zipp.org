@@ -344,18 +344,53 @@ pub(crate) fn fmt_f64(n: f64) -> String {
     if n == 0.0 {
         return "0".into();
     }
-    // Integer-valued doubles print without a decimal point (JS semantics). Use
-    // Rust's shortest-round-trip f64 Display (matches JS Number→String, which
-    // prints the shortest decimal that round-trips, e.g. 4660046610375530000 not
-    // ...496) — NOT `n as i64`, which prints excess digits the f64 can't
-    // distinguish and overflows for whole doubles above i64::MAX.
-    if n.fract() == 0.0 && n.abs() < 1e21 {
-        return format!("{n}");
+    let neg = n < 0.0;
+    let abs = n.abs();
+    // Integer-valued doubles below the 1e21 exponential cutoff print without a
+    // decimal point. Rust's `{}` is shortest-round-trip (matches JS Number→String,
+    // e.g. 4660046610375530000 not …496) — NOT `n as i64`, which prints excess
+    // digits the f64 can't distinguish and overflows for whole doubles > i64::MAX.
+    if abs.fract() == 0.0 && abs < 1e21 {
+        return if neg { format!("-{abs}") } else { format!("{abs}") };
     }
-    let mut s = format!("{n}");
-    if s.contains('e') {
-        // JS uses e+/e- exponent formatting; Rust already does e.g. 1e21.
-        s = s.replace('e', "e+").replace("e+-", "e-");
+    // General case: ECMAScript Number::toString (7.1.12.1). Extract the shortest
+    // round-trip significant digits `s` (k of them) and the decimal point position
+    // `n` such that the value is `s × 10^(n-k)`, via Rust's `{:e}` (also shortest
+    // round-trip), then format with JS's exponential cutoffs (n > 21 or n ≤ -6).
+    let sci = format!("{abs:e}"); // e.g. "1.2345e2", "1e21", "5e-1"
+    let (mant, exp) = sci.split_once('e').expect("{:e} always has an exponent");
+    let e: i32 = exp.parse().expect("valid exponent");
+    let digits: String = mant.chars().filter(|c| *c != '.').collect();
+    let s = digits.as_str();
+    let k = s.len() as i32;
+    let np = e + 1; // decimal-point position (value ≈ 0.s × 10^np)
+    let body = if k <= np && np <= 21 {
+        // Integer: all digits, then (np-k) trailing zeros.
+        let mut r = String::from(s);
+        r.extend(std::iter::repeat('0').take((np - k) as usize));
+        r
+    } else if 0 < np && np <= 21 {
+        // Point inside the digits.
+        format!("{}.{}", &s[..np as usize], &s[np as usize..])
+    } else if -6 < np && np <= 0 {
+        // Leading "0." then (-np) zeros then the digits.
+        let mut r = String::from("0.");
+        r.extend(std::iter::repeat('0').take((-np) as usize));
+        r.push_str(s);
+        r
+    } else {
+        // Exponential: first digit, optional ".rest", then e±(np-1).
+        let mut m = String::from(&s[..1]);
+        if k > 1 {
+            m.push('.');
+            m.push_str(&s[1..]);
+        }
+        let e2 = np - 1;
+        format!("{m}e{}{}", if e2 >= 0 { '+' } else { '-' }, e2.abs())
+    };
+    if neg {
+        format!("-{body}")
+    } else {
+        body
     }
-    s
 }
