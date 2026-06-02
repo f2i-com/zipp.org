@@ -4358,8 +4358,9 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // `JSON.stringify(value, replacer, space)` → JsonStringify op (the
-        // replacer arg is ignored; `space` controls indentation).
+        // `JSON.parse(text)` / `JSON.stringify(value)` → fast ops. The forms with
+        // a reviver / replacer (2+ args) fall through to the generic call so the
+        // `JSON_PARSE` / `JSON_STRINGIFY` natives can honour them.
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             if let ox::Expression::Identifier(obj) = &m.object {
                 if obj.name == "JSON" && m.property.name == "parse" && c.arguments.len() == 1 {
@@ -4369,23 +4370,11 @@ impl<'a> FnCompiler<'a> {
                         return Ok(dst);
                     }
                 }
-                if obj.name == "JSON" && m.property.name == "stringify" && !c.arguments.is_empty() {
+                if obj.name == "JSON" && m.property.name == "stringify" && c.arguments.len() == 1 {
                     if let Some(ve) = c.arguments[0].as_expression() {
                         let val = self.expr(ve)?;
-                        let space = if c.arguments.len() >= 3 {
-                            match c.arguments[2].as_expression() {
-                                Some(se) => self.expr(se)?,
-                                None => {
-                                    let r = self.temp();
-                                    self.emit(Instr::LoadUndefined { dst: r });
-                                    r
-                                }
-                            }
-                        } else {
-                            let r = self.temp();
-                            self.emit(Instr::LoadUndefined { dst: r });
-                            r
-                        };
+                        let space = self.temp();
+                        self.emit(Instr::LoadUndefined { dst: space });
                         self.emit(Instr::JsonStringify { dst, val, space });
                         return Ok(dst);
                     }

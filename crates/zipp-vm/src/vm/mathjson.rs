@@ -108,15 +108,66 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Resolve `JSON.stringify`'s second argument into either a function
+    /// replacer or a property allowlist. A callable is the function form; an
+    /// Array is a PropertyList — its String / Number (and boxed String/Number)
+    /// entries become allowed keys, ToString-coerced and deduplicated in order.
+    pub(crate) fn json_resolve_replacer(
+        &mut self,
+        replacer: Value,
+    ) -> Result<(Value, Option<Vec<String>>), Thrown> {
+        if self.is_callable(replacer) {
+            return Ok((replacer, None));
+        }
+        if replacer.is_heap() {
+            let idx = replacer.heap_index();
+            if let HeapObj::Array(items) = self.heap.get(idx) {
+                let items = items.clone();
+                let mut list: Vec<String> = Vec::new();
+                for it in items {
+                    let key = if it.is_number() {
+                        Some(self.to_js_string(it)?)
+                    } else if it.is_heap() {
+                        match self.heap.get(it.heap_index()) {
+                            HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                                self.heap.str_cow(it.heap_index()).map(|s| s.into_owned())
+                            }
+                            HeapObj::Boxed { kind, .. } if *kind == 0 || *kind == 1 => {
+                                Some(self.to_js_string(it)?)
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(k) = key {
+                        if !list.contains(&k) {
+                            list.push(k);
+                        }
+                    }
+                }
+                return Ok((Value::UNDEFINED, Some(list)));
+            }
+        }
+        Ok((Value::UNDEFINED, None))
+    }
+
     /// Serialize `v` to JSON (`None` ⇒ omit: undefined / function). `indent` is
     /// the per-level pad (empty ⇒ compact); `depth` is the current nesting.
+    /// `holder` is the object/array `key` lives on (the `this` for a function
+    /// `replacer`); `replacer` is a callable or undefined; `allowlist`, when
+    /// `Some`, restricts which object keys are emitted (the array-replacer form).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn json_value(
         &mut self,
+        holder: Value,
         key: &str,
         v: Value,
         indent: &str,
         depth: usize,
         visited: &mut Vec<u32>,
+        replacer: Value,
+        allowlist: Option<&[String]>,
     ) -> Result<Option<String>, Thrown> {
         // SerializeJSONProperty: a value with a callable `toJSON` is replaced by
         // `value.toJSON(key)` before serialization (Date, user objects, …).
@@ -128,6 +179,14 @@ impl<'p> Vm<'p> {
             } else {
                 v
             }
+        } else {
+            v
+        };
+        // A function `replacer` is applied after `toJSON`: replacer(key, value)
+        // with `this` = the holder. Its result is what gets serialized.
+        let v = if self.is_callable(replacer) {
+            let kv = self.alloc_str(key.to_string());
+            self.call_value(replacer, holder, &[kv, v])?
         } else {
             v
         };
@@ -172,11 +231,23 @@ impl<'p> Vm<'p> {
             HeapObj::Boxed { value, .. } => Node::Boxed(*value),
             HeapObj::Array(items) => Node::Arr(items.clone()),
             HeapObj::Object(map) => {
-                let order = spec_key_order(&map.keys);
                 let mut pairs = Vec::new();
-                for i in order {
-                    if map.attrs[i].enumerable && !is_hidden_key(&map.keys[i]) {
-                        pairs.push((map.keys[i].clone(), map.vals[i]));
+                if let Some(allow) = allowlist {
+                    // Array-replacer (PropertyList): emit keys in the allowlist's
+                    // order, only those the object owns enumerably.
+                    for k in allow {
+                        if let Some(pos) = map.keys.iter().position(|kk| kk == k) {
+                            if map.attrs[pos].enumerable && !is_hidden_key(&map.keys[pos]) {
+                                pairs.push((k.clone(), map.vals[pos]));
+                            }
+                        }
+                    }
+                } else {
+                    let order = spec_key_order(&map.keys);
+                    for i in order {
+                        if map.attrs[i].enumerable && !is_hidden_key(&map.keys[i]) {
+                            pairs.push((map.keys[i].clone(), map.vals[i]));
+                        }
                     }
                 }
                 Node::Obj(pairs)
@@ -189,7 +260,10 @@ impl<'p> Vm<'p> {
             Node::Str(s) => Ok(Some(json_quote(&s))),
             Node::BigInt => Err(Thrown("TypeError: Do not know how to serialize a BigInt".into())),
             // A boxed Number/String/Boolean serializes as its wrapped primitive.
-            Node::Boxed(inner) => self.json_value(key, inner, indent, depth, visited),
+            // The replacer has already fired on the wrapper, so don't re-apply it.
+            Node::Boxed(inner) => {
+                self.json_value(holder, key, inner, indent, depth, visited, Value::UNDEFINED, allowlist)
+            }
             Node::EmptyObj => Ok(Some("{}".to_string())),
             Node::Arr(items) => {
                 if visited.contains(&idx) {
@@ -199,8 +273,10 @@ impl<'p> Vm<'p> {
                 let mut parts = Vec::with_capacity(items.len());
                 for (i, e) in items.iter().enumerate() {
                     let ks = i.to_string();
+                    // Array elements ignore the PropertyList allowlist (which only
+                    // filters object keys), but a function replacer still applies.
                     let part = self
-                        .json_value(&ks, *e, indent, depth + 1, visited)?
+                        .json_value(v, &ks, *e, indent, depth + 1, visited, replacer, None)?
                         .unwrap_or_else(|| "null".to_string());
                     parts.push(part);
                 }
@@ -219,7 +295,9 @@ impl<'p> Vm<'p> {
                 let sep = if indent.is_empty() { ":" } else { ": " };
                 let mut parts = Vec::new();
                 for (k, val) in pairs {
-                    if let Some(vs) = self.json_value(&k, val, indent, depth + 1, visited)? {
+                    if let Some(vs) =
+                        self.json_value(v, &k, val, indent, depth + 1, visited, replacer, allowlist)?
+                    {
                         parts.push(format!("{}{}{}", json_quote(&k), sep, vs));
                     }
                 }
@@ -335,4 +413,83 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Object(map))))
     }
 
+    /// If `holder` is an Array and `key` is a canonical index string, the index.
+    fn array_element_index(&self, holder: Value, key: &str) -> Option<usize> {
+        if holder.is_heap() {
+            if let HeapObj::Array(_) = self.heap.get(holder.heap_index()) {
+                return key.parse::<usize>().ok().filter(|i| i.to_string() == key);
+            }
+        }
+        None
+    }
+
+    /// InternalizeJSONProperty: walk the parsed tree bottom-up, replacing each
+    /// `holder[key]` with `reviver.call(holder, key, value)`. Children are
+    /// revived before their parent; a child revived to `undefined` is deleted.
+    pub(crate) fn internalize_json(
+        &mut self,
+        holder: Value,
+        key: &str,
+        reviver: Value,
+    ) -> Result<Value, Thrown> {
+        // Read `holder[key]`, routing a numeric key on an array to its element
+        // (`get_prop` only handles named properties).
+        let val = match self.array_element_index(holder, key) {
+            Some(i) => match self.heap.get(holder.heap_index()) {
+                HeapObj::Array(items) => items.get(i).copied().unwrap_or(Value::UNDEFINED),
+                _ => Value::UNDEFINED,
+            },
+            None => self.get_prop(holder, key)?,
+        };
+        if val.is_heap() {
+            // Snapshot the child shape under a short borrow, then recurse (no heap
+            // borrow may be held across the reviver re-entry).
+            enum Kind {
+                Arr(usize),
+                Obj(Vec<String>),
+                Other,
+            }
+            let kind = match self.heap.get(val.heap_index()) {
+                HeapObj::Array(items) => Kind::Arr(items.len()),
+                HeapObj::Object(map) => {
+                    let mut keys = Vec::new();
+                    for i in 0..map.keys.len() {
+                        if map.attrs[i].enumerable && !is_hidden_key(&map.keys[i]) {
+                            keys.push(map.keys[i].clone());
+                        }
+                    }
+                    Kind::Obj(keys)
+                }
+                _ => Kind::Other,
+            };
+            match kind {
+                Kind::Arr(len) => {
+                    for i in 0..len {
+                        let k = i.to_string();
+                        let nv = self.internalize_json(val, &k, reviver)?;
+                        // Array elements: write/clear in place (a deleted element
+                        // becomes a hole, which serialises back as `null`).
+                        if let HeapObj::Array(items) = self.heap.get_mut(val.heap_index()) {
+                            if i < items.len() {
+                                items[i] = if nv.is_undefined() { Value::UNDEFINED } else { nv };
+                            }
+                        }
+                    }
+                }
+                Kind::Obj(keys) => {
+                    for k in keys {
+                        let nv = self.internalize_json(val, &k, reviver)?;
+                        if nv.is_undefined() {
+                            self.delete_property(val, &k)?;
+                        } else {
+                            self.set_prop(val, &k, nv)?;
+                        }
+                    }
+                }
+                Kind::Other => {}
+            }
+        }
+        let kv = self.alloc_str(key.to_string());
+        self.call_value(reviver, holder, &[kv, val])
+    }
 }

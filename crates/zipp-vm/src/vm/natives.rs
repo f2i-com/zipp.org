@@ -1045,16 +1045,40 @@ impl<'p> Vm<'p> {
             // (The direct `JSON.parse(x)` call form is compile-lowered to a JSON op;
             // these back the value form + reflection.)
             JSON_PARSE => {
-                let s = self.display(a0);
-                self.json_parse(&s)?
+                let s = self.to_js_string(a0)?;
+                let parsed = self.json_parse(&s)?;
+                let reviver = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if self.is_callable(reviver) {
+                    let _gc = self.gc_lock_guard();
+                    let mut m = crate::heap::ObjMap::new();
+                    m.set("", parsed);
+                    let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                    self.internalize_json(wrapper, "", reviver)?
+                } else {
+                    parsed
+                }
             }
             JSON_STRINGIFY => {
                 let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 let indent = self.json_indent(space);
-                // Hold un-rooted Values across toJSON re-entry; suspend GC.
+                let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (replacer_fn, allowlist) = self.json_resolve_replacer(replacer)?;
+                // Hold un-rooted Values across toJSON/replacer re-entry; suspend GC.
                 let _gc = self.gc_lock_guard();
+                let mut m = crate::heap::ObjMap::new();
+                m.set("", a0);
+                let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(m)));
                 let mut visited = Vec::new();
-                match self.json_value("", a0, &indent, 0, &mut visited)? {
+                match self.json_value(
+                    wrapper,
+                    "",
+                    a0,
+                    &indent,
+                    0,
+                    &mut visited,
+                    replacer_fn,
+                    allowlist.as_deref(),
+                )? {
                     Some(s) => self.alloc_str(s),
                     None => Value::UNDEFINED,
                 }

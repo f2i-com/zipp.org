@@ -536,9 +536,22 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let indent = self.json_indent(self.get(base, space));
                         // `JSON.stringify(undefined)` (and of a function) is undefined.
+                        // This op is the single-arg form: no replacer / allowlist.
                         let _gc = self.gc_lock_guard();
+                        let mut m = crate::heap::ObjMap::new();
+                        m.set("", v);
+                        let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(m)));
                         let mut visited = Vec::new();
-                        let result = match self.json_value("", v, &indent, 0, &mut visited)? {
+                        let result = match self.json_value(
+                            wrapper,
+                            "",
+                            v,
+                            &indent,
+                            0,
+                            &mut visited,
+                            Value::UNDEFINED,
+                            None,
+                        )? {
                             Some(s) => self.alloc_str(s),
                             None => Value::UNDEFINED,
                         };
