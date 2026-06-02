@@ -253,28 +253,63 @@ impl<'p> Vm<'p> {
         limit: Value,
     ) -> Result<Value, Thrown> {
         let s = self.to_js_string(input)?;
-        let lim = if limit == Value::UNDEFINED {
-            usize::MAX
+        // ToUint32(limit); undefined -> 2^32-1. lim == 0 yields the empty array.
+        let lim: usize = if limit == Value::UNDEFINED {
+            u32::MAX as usize
         } else {
-            let n = self.to_number(limit)?;
-            if n.is_finite() && n > 0.0 { n as usize } else { 0 }
+            to_uint32(self.to_number_coerce(limit)?) as usize
         };
-        let spans: Vec<(usize, usize)> = match self.heap.get(re) {
-            HeapObj::RegExp { regex, .. } => {
-                regex.find_iter(&s).map(|m| (m.start(), m.end())).collect()
-            }
+        if lim == 0 {
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(Vec::new()))));
+        }
+        // Empty input: [] if the pattern matches the empty string, else [""].
+        if s.is_empty() {
+            let matches_empty = matches!(self.heap.get(re), HeapObj::RegExp { regex, .. } if regex.find(&s).is_some());
+            let parts = if matches_empty { Vec::new() } else { vec![self.alloc_str(String::new())] };
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(parts))));
+        }
+        // Collect matches with the text of each capturing group (group 0 excluded;
+        // `captures` holds groups 1..n, None for a non-participating group).
+        let matches: Vec<(usize, usize, Vec<Option<String>>)> = match self.heap.get(re) {
+            HeapObj::RegExp { regex, .. } => regex
+                .find_iter(&s)
+                .map(|m| {
+                    let caps = m
+                        .captures
+                        .iter()
+                        .map(|c| c.as_ref().map(|r| s[r.clone()].to_string()))
+                        .collect();
+                    (m.start(), m.end(), caps)
+                })
+                .collect(),
             _ => Vec::new(),
         };
         let mut parts: Vec<Value> = Vec::new();
         let mut last = 0usize;
-        for (st, en) in spans {
-            if parts.len() >= lim {
+        'outer: for (st, en, caps) in matches {
+            // The spec only processes matches before the end of the string; a match
+            // AT the end (e.g. an empty match at position length) is not a split
+            // point — the trailing piece S[last..] covers it.
+            if st >= s.len() {
                 break;
             }
             if st < last || (st == en && st == last) {
                 continue; // skip overlapping / empty-at-cursor matches
             }
             parts.push(self.alloc_str(s[last..st].to_string()));
+            if parts.len() >= lim {
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(parts))));
+            }
+            // Spec @@split emits each capturing group between the pieces.
+            for c in &caps {
+                match c {
+                    Some(t) => parts.push(self.alloc_str(t.clone())),
+                    None => parts.push(Value::UNDEFINED),
+                }
+                if parts.len() >= lim {
+                    break 'outer;
+                }
+            }
             last = en;
         }
         if parts.len() < lim {
