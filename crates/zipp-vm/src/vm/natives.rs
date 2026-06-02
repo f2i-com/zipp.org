@@ -229,6 +229,67 @@ impl<'p> Vm<'p> {
                 }
                 this
             }
+            REGEXP_ESCAPE => {
+                // RegExp.escape(S): escape S so it matches itself literally. Throws
+                // TypeError unless S is a String (no coercion).
+                if !(a0.is_heap() && self.heap.is_str_like(a0.heap_index())) {
+                    return Err(Thrown(
+                        "TypeError: RegExp.escape called with a non-string argument".into(),
+                    ));
+                }
+                let s = self.to_js_string(a0)?;
+                // EncodeForRegExpEscape's "other punctuators" / WhiteSpace /
+                // LineTerminator / lone-surrogate set: hex-escaped (\xNN if <=0xFF,
+                // else \uNNNN per UTF-16 code unit). Tab/VT/FF/LF/CR use the control
+                // escapes below, so they are excluded here.
+                let other = |u: u32| -> bool {
+                    matches!(
+                        u,
+                        // ,-=<>#&!%:;@~'`"
+                        0x2c | 0x2d | 0x3d | 0x3c | 0x3e | 0x23 | 0x26 | 0x21 | 0x25 | 0x3a
+                            | 0x3b | 0x40 | 0x7e | 0x27 | 0x60 | 0x22
+                        // WhiteSpace (minus tab/VT/FF) + ZWNBSP
+                            | 0x20 | 0xA0 | 0x1680 | 0x202F | 0x205F | 0x3000 | 0xFEFF
+                        // LineTerminator (minus LF/CR)
+                            | 0x2028 | 0x2029
+                    ) || (0x2000..=0x200A).contains(&u)
+                        || (0xD800..=0xDFFF).contains(&u)
+                };
+                let mut out = String::new();
+                for c in s.chars() {
+                    let u = c as u32;
+                    if out.is_empty() && (c.is_ascii_digit() || c.is_ascii_alphabetic()) {
+                        // A leading digit/letter is hex-escaped so the escape can't
+                        // fuse with a preceding regex token (e.g. \0, a quantifier).
+                        out.push_str(&format!("\\x{u:02x}"));
+                        continue;
+                    }
+                    match c {
+                        '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']'
+                        | '{' | '}' | '|' | '/' => {
+                            out.push('\\');
+                            out.push(c);
+                        }
+                        '\t' => out.push_str("\\t"),
+                        '\n' => out.push_str("\\n"),
+                        '\u{0b}' => out.push_str("\\v"),
+                        '\u{0c}' => out.push_str("\\f"),
+                        '\r' => out.push_str("\\r"),
+                        _ if other(u) => {
+                            if u <= 0xFF {
+                                out.push_str(&format!("\\x{u:02x}"));
+                            } else {
+                                let mut buf = [0u16; 2];
+                                for cu in c.encode_utf16(&mut buf) {
+                                    out.push_str(&format!("\\u{cu:04x}"));
+                                }
+                            }
+                        }
+                        _ => out.push(c),
+                    }
+                }
+                self.alloc_str(out)
+            }
             REGEXP_TO_STRING => {
                 let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::RegExp { source, flags, .. }) => (

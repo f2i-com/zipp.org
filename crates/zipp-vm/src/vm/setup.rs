@@ -579,7 +579,7 @@ impl<'p> Vm<'p> {
             );
             self.proto_of.insert(regexp_proto, Value::heap(obj_proto));
             self.regexp_proto = regexp_proto;
-            let regexp_ctor = build(self, &[], Some(regexp_proto));
+            let regexp_ctor = build(self, &[("escape", REGEXP_ESCAPE)], Some(regexp_proto));
             self.regexp_ctor = regexp_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
                 p.define("constructor", Value::heap(regexp_ctor), method_attr);
