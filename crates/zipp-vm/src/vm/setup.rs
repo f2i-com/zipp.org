@@ -1255,6 +1255,21 @@ impl<'p> Vm<'p> {
         // `JSON`: a namespace object. The direct `JSON.parse(x)`/`stringify(x)` call
         // forms are compile-lowered to ops; these back the value form + reflection.
         let json_ctor = build(self, &[("parse", JSON_PARSE), ("stringify", JSON_STRINGIFY)], None);
+        {
+            // JSON[Symbol.toStringTag] = "JSON" (so Object.prototype.toString is
+            // "[object JSON]"); non-writable/enumerable, configurable.
+            let jtag = self.alloc_str("JSON".to_string());
+            let attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            if let HeapObj::Object(m) = self.heap.get_mut(json_ctor) {
+                m.define("@@toStringTag", jtag, attr);
+            }
+        }
         // `Math`: a namespace object — the 8 constants (non-w/e/c) + the methods as
         // first-class values + `random`. Direct `Math.abs(x)` is compile-lowered to
         // MathOp; this backs the value form + reflection.

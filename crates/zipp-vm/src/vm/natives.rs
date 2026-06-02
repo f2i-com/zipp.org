@@ -1051,7 +1051,10 @@ impl<'p> Vm<'p> {
             JSON_STRINGIFY => {
                 let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 let indent = self.json_indent(space);
-                match self.json_value(a0, &indent, 0) {
+                // Hold un-rooted Values across toJSON re-entry; suspend GC.
+                let _gc = self.gc_lock_guard();
+                let mut visited = Vec::new();
+                match self.json_value("", a0, &indent, 0, &mut visited)? {
                     Some(s) => self.alloc_str(s),
                     None => Value::UNDEFINED,
                 }

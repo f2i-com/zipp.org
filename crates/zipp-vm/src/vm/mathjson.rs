@@ -110,71 +110,126 @@ impl<'p> Vm<'p> {
 
     /// Serialize `v` to JSON (`None` ⇒ omit: undefined / function). `indent` is
     /// the per-level pad (empty ⇒ compact); `depth` is the current nesting.
-    pub(crate) fn json_value(&self, v: Value, indent: &str, depth: usize) -> Option<String> {
-        if depth > 512 {
-            return None; // guard against pathological / circular structures
-        }
+    pub(crate) fn json_value(
+        &mut self,
+        key: &str,
+        v: Value,
+        indent: &str,
+        depth: usize,
+        visited: &mut Vec<u32>,
+    ) -> Result<Option<String>, Thrown> {
+        // SerializeJSONProperty: a value with a callable `toJSON` is replaced by
+        // `value.toJSON(key)` before serialization (Date, user objects, …).
+        let v = if v.is_heap() {
+            let tj = self.get_prop(v, "toJSON")?;
+            if self.is_callable(tj) {
+                let kv = self.alloc_str(key.to_string());
+                self.call_value(tj, v, &[kv])?
+            } else {
+                v
+            }
+        } else {
+            v
+        };
         if v.is_undefined() {
-            return None;
+            return Ok(None);
         }
         if v.is_null() {
-            return Some("null".to_string());
+            return Ok(Some("null".to_string()));
         }
         if v.is_bool() {
-            return Some(if v.as_bool() { "true" } else { "false" }.to_string());
+            return Ok(Some(if v.as_bool() { "true" } else { "false" }.to_string()));
         }
         if v.is_number() {
             let n = v.as_f64();
-            return Some(if n.is_finite() { fmt_f64(n) } else { "null".to_string() });
+            return Ok(Some(if n.is_finite() { fmt_f64(n) } else { "null".to_string() }));
         }
         if !v.is_heap() {
-            return None;
+            return Ok(None);
         }
-        match self.heap.get(v.heap_index()) {
+        let idx = v.heap_index();
+        // Extract under a short borrow; recursion needs &mut self, so no heap
+        // borrow may be held across it.
+        enum Node {
+            Str(String),
+            Omit,
+            BigInt,
+            Boxed(Value),
+            Arr(Vec<Value>),
+            Obj(Vec<(String, Value)>),
+            EmptyObj,
+        }
+        let node = match self.heap.get(idx) {
             HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                let s = self.heap.str_cow(v.heap_index()).unwrap();
-                Some(json_quote(&s))
+                Node::Str(self.heap.str_cow(idx).unwrap().into_owned())
             }
-            HeapObj::Func(_) | HeapObj::Closure { .. } => None, // functions are omitted
-            HeapObj::Symbol { .. } => None,                    // symbols are omitted by JSON
-            HeapObj::Array(items) => {
-                let items = items.clone(); // release the heap borrow before recursing
-                if items.is_empty() {
-                    return Some("[]".to_string());
-                }
-                // A missing element value serializes as null inside an array.
-                let parts: Vec<String> = items
-                    .iter()
-                    .map(|e| self.json_value(*e, indent, depth + 1).unwrap_or_else(|| "null".to_string()))
-                    .collect();
-                Some(wrap_json(&parts, '[', ']', indent, depth))
-            }
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Native(_)
+            | HeapObj::Symbol { .. } => Node::Omit,
+            HeapObj::BigInt(_) => Node::BigInt,
+            HeapObj::Boxed { value, .. } => Node::Boxed(*value),
+            HeapObj::Array(items) => Node::Arr(items.clone()),
             HeapObj::Object(map) => {
-                let keys = map.keys.clone();
-                let vals = map.vals.clone();
-                let enumerable: Vec<bool> = map.attrs.iter().map(|a| a.enumerable).collect();
-                let order = spec_key_order(&keys);
+                let order = spec_key_order(&map.keys);
+                let mut pairs = Vec::new();
+                for i in order {
+                    if map.attrs[i].enumerable && !is_hidden_key(&map.keys[i]) {
+                        pairs.push((map.keys[i].clone(), map.vals[i]));
+                    }
+                }
+                Node::Obj(pairs)
+            }
+            HeapObj::Map { .. } | HeapObj::Set(_) | HeapObj::Generator { .. } => Node::EmptyObj,
+            _ => Node::Omit,
+        };
+        match node {
+            Node::Omit => Ok(None),
+            Node::Str(s) => Ok(Some(json_quote(&s))),
+            Node::BigInt => Err(Thrown("TypeError: Do not know how to serialize a BigInt".into())),
+            // A boxed Number/String/Boolean serializes as its wrapped primitive.
+            Node::Boxed(inner) => self.json_value(key, inner, indent, depth, visited),
+            Node::EmptyObj => Ok(Some("{}".to_string())),
+            Node::Arr(items) => {
+                if visited.contains(&idx) {
+                    return Err(Thrown("TypeError: Converting circular structure to JSON".into()));
+                }
+                visited.push(idx);
+                let mut parts = Vec::with_capacity(items.len());
+                for (i, e) in items.iter().enumerate() {
+                    let ks = i.to_string();
+                    let part = self
+                        .json_value(&ks, *e, indent, depth + 1, visited)?
+                        .unwrap_or_else(|| "null".to_string());
+                    parts.push(part);
+                }
+                visited.pop();
+                Ok(Some(if parts.is_empty() {
+                    "[]".to_string()
+                } else {
+                    wrap_json(&parts, '[', ']', indent, depth)
+                }))
+            }
+            Node::Obj(pairs) => {
+                if visited.contains(&idx) {
+                    return Err(Thrown("TypeError: Converting circular structure to JSON".into()));
+                }
+                visited.push(idx);
                 let sep = if indent.is_empty() { ":" } else { ": " };
                 let mut parts = Vec::new();
-                for &i in &order {
-                    let k = &keys[i];
-                    // Only own ENUMERABLE string keys; symbol/private keys skipped.
-                    if !enumerable[i] || is_hidden_key(k) {
-                        continue;
-                    }
-                    if let Some(vs) = self.json_value(vals[i], indent, depth + 1) {
-                        parts.push(format!("{}{}{}", json_quote(k), sep, vs));
+                for (k, val) in pairs {
+                    if let Some(vs) = self.json_value(&k, val, indent, depth + 1, visited)? {
+                        parts.push(format!("{}{}{}", json_quote(&k), sep, vs));
                     }
                 }
-                if parts.is_empty() {
-                    return Some("{}".to_string());
-                }
-                Some(wrap_json(&parts, '{', '}', indent, depth))
+                visited.pop();
+                Ok(Some(if parts.is_empty() {
+                    "{}".to_string()
+                } else {
+                    wrap_json(&parts, '{', '}', indent, depth)
+                }))
             }
-            // A Map/Set/Generator has no enumerable own properties, so
-            // JSON.stringify renders it as an empty object (not omitted).
-            HeapObj::Map { .. } | HeapObj::Set(_) | HeapObj::Generator { .. } => Some("{}".into()),
-            _ => None,
         }
     }
 

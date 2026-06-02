@@ -536,7 +536,9 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let indent = self.json_indent(self.get(base, space));
                         // `JSON.stringify(undefined)` (and of a function) is undefined.
-                        let result = match self.json_value(v, &indent, 0) {
+                        let _gc = self.gc_lock_guard();
+                        let mut visited = Vec::new();
+                        let result = match self.json_value("", v, &indent, 0, &mut visited)? {
                             Some(s) => self.alloc_str(s),
                             None => Value::UNDEFINED,
                         };
