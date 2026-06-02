@@ -292,10 +292,10 @@ impl<'p> Vm<'p> {
             }
             REGEXP_TO_STRING => {
                 let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::RegExp { source, flags, .. }) => (
-                        if source.is_empty() { "(?:)".to_string() } else { source.clone() },
-                        flags.clone(),
-                    ),
+                    Some(HeapObj::RegExp { source, flags, .. }) => {
+                        let (s, f) = (source.clone(), flags.clone());
+                        (self.escaped_source(&s), f)
+                    }
                     _ => {
                         let s = self.get_prop(this, "source")?;
                         let f = self.get_prop(this, "flags")?;
@@ -303,6 +303,92 @@ impl<'p> Vm<'p> {
                     }
                 };
                 self.alloc_str(format!("/{src}/{flg}"))
+            }
+            REGEXP_GET_SOURCE => {
+                if !this.is_heap() {
+                    return Err(Thrown(
+                        "TypeError: get source called on a non-object".into(),
+                    ));
+                }
+                let idx = this.heap_index();
+                if idx == self.regexp_proto {
+                    self.alloc_str("(?:)".to_string())
+                } else if let HeapObj::RegExp { source, .. } = self.heap.get(idx) {
+                    let s = source.clone();
+                    let esc = self.escaped_source(&s);
+                    self.alloc_str(esc)
+                } else {
+                    return Err(Thrown(
+                        "TypeError: get source called on a non-RegExp object".into(),
+                    ));
+                }
+            }
+            REGEXP_GET_FLAGS => {
+                // Generic getter: Type(R) must be Object; reads each flag property.
+                let is_obj = this.is_heap()
+                    && !matches!(
+                        self.heap.get(this.heap_index()),
+                        HeapObj::Str(_)
+                            | HeapObj::Cons { .. }
+                            | HeapObj::BigInt(_)
+                            | HeapObj::Symbol { .. }
+                    );
+                if !is_obj {
+                    return Err(Thrown(
+                        "TypeError: get flags called on a non-object".into(),
+                    ));
+                }
+                let mut out = String::new();
+                for (prop, ch) in [
+                    ("hasIndices", 'd'),
+                    ("global", 'g'),
+                    ("ignoreCase", 'i'),
+                    ("multiline", 'm'),
+                    ("dotAll", 's'),
+                    ("unicode", 'u'),
+                    ("unicodeSets", 'v'),
+                    ("sticky", 'y'),
+                ] {
+                    let v = self.get_prop(this, prop)?;
+                    if self.truthy(v) {
+                        out.push(ch);
+                    }
+                }
+                self.alloc_str(out)
+            }
+            REGEXP_GET_GLOBAL
+            | REGEXP_GET_IGNORECASE
+            | REGEXP_GET_MULTILINE
+            | REGEXP_GET_DOTALL
+            | REGEXP_GET_UNICODE
+            | REGEXP_GET_UNICODESETS
+            | REGEXP_GET_STICKY
+            | REGEXP_GET_HASINDICES => {
+                let ch = match id {
+                    REGEXP_GET_GLOBAL => 'g',
+                    REGEXP_GET_IGNORECASE => 'i',
+                    REGEXP_GET_MULTILINE => 'm',
+                    REGEXP_GET_DOTALL => 's',
+                    REGEXP_GET_UNICODE => 'u',
+                    REGEXP_GET_UNICODESETS => 'v',
+                    REGEXP_GET_STICKY => 'y',
+                    _ => 'd', // REGEXP_GET_HASINDICES
+                };
+                if !this.is_heap() {
+                    return Err(Thrown(
+                        "TypeError: RegExp flag getter called on a non-object".into(),
+                    ));
+                }
+                let idx = this.heap_index();
+                if idx == self.regexp_proto {
+                    Value::UNDEFINED
+                } else if let HeapObj::RegExp { flags, .. } = self.heap.get(idx) {
+                    Value::bool(flags.contains(ch))
+                } else {
+                    return Err(Thrown(
+                        "TypeError: RegExp flag getter called on a non-RegExp object".into(),
+                    ));
+                }
             }
             FN_CALL => {
                 let rest: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };

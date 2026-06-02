@@ -579,6 +579,33 @@ impl<'p> Vm<'p> {
             );
             self.proto_of.insert(regexp_proto, Value::heap(obj_proto));
             self.regexp_proto = regexp_proto;
+            // The flag/source/flags accessors live on the prototype as getters
+            // (spec: a RegExp instance has no own properties for these).
+            let accessors: [(&str, u16); 10] = [
+                ("source", REGEXP_GET_SOURCE),
+                ("flags", REGEXP_GET_FLAGS),
+                ("global", REGEXP_GET_GLOBAL),
+                ("ignoreCase", REGEXP_GET_IGNORECASE),
+                ("multiline", REGEXP_GET_MULTILINE),
+                ("dotAll", REGEXP_GET_DOTALL),
+                ("unicode", REGEXP_GET_UNICODE),
+                ("unicodeSets", REGEXP_GET_UNICODESETS),
+                ("sticky", REGEXP_GET_STICKY),
+                ("hasIndices", REGEXP_GET_HASINDICES),
+            ];
+            for (name, getid) in accessors {
+                let gv = Value::heap(self.heap.alloc(HeapObj::Native(getid)));
+                let acc = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: Value::UNDEFINED,
+                };
+                if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
+                    p.define(name, gv, acc);
+                }
+            }
             let regexp_ctor = build(self, &[("escape", REGEXP_ESCAPE)], Some(regexp_proto));
             self.regexp_ctor = regexp_ctor;
             if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {

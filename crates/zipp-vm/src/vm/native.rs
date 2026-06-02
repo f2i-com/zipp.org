@@ -49,6 +49,17 @@ pub const PROMISE_WITH_RESOLVERS: u16 = 44;
 pub const PROMISE_TRY: u16 = 628;
 pub const REGEXP_COMPILE: u16 = 629;
 pub const REGEXP_ESCAPE: u16 = 630;
+// RegExp.prototype accessor getters (defined on the prototype, not instances).
+pub const REGEXP_GET_SOURCE: u16 = 631;
+pub const REGEXP_GET_FLAGS: u16 = 632;
+pub const REGEXP_GET_GLOBAL: u16 = 633;
+pub const REGEXP_GET_IGNORECASE: u16 = 634;
+pub const REGEXP_GET_MULTILINE: u16 = 635;
+pub const REGEXP_GET_DOTALL: u16 = 636;
+pub const REGEXP_GET_UNICODE: u16 = 637;
+pub const REGEXP_GET_UNICODESETS: u16 = 638;
+pub const REGEXP_GET_STICKY: u16 = 639;
+pub const REGEXP_GET_HASINDICES: u16 = 640;
 // Reflect namespace statics.
 pub const REFLECT_APPLY: u16 = 45;
 pub const REFLECT_CONSTRUCT: u16 = 46;
@@ -471,6 +482,16 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         REGEXP_TO_STRING => ("toString", 0),
         REGEXP_COMPILE => ("compile", 2),
         REGEXP_ESCAPE => ("escape", 1),
+        REGEXP_GET_SOURCE => ("get source", 0),
+        REGEXP_GET_FLAGS => ("get flags", 0),
+        REGEXP_GET_GLOBAL => ("get global", 0),
+        REGEXP_GET_IGNORECASE => ("get ignoreCase", 0),
+        REGEXP_GET_MULTILINE => ("get multiline", 0),
+        REGEXP_GET_DOTALL => ("get dotAll", 0),
+        REGEXP_GET_UNICODE => ("get unicode", 0),
+        REGEXP_GET_UNICODESETS => ("get unicodeSets", 0),
+        REGEXP_GET_STICKY => ("get sticky", 0),
+        REGEXP_GET_HASINDICES => ("get hasIndices", 0),
         FN_CALL => ("call", 1),
         FN_APPLY => ("apply", 2),
         FN_BIND => ("bind", 1),

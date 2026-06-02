@@ -161,6 +161,37 @@ impl<'p> Vm<'p> {
 
     /// RegExp instance property reads: `lastIndex`, `source` (empty → "(?:)"),
     /// `flags`, and the per-flag booleans; methods delegate to RegExp.prototype.
+    /// EscapeRegExpPattern: render `source` so it round-trips between two `/`
+    /// delimiters — escape a bare `/` and the line terminators, pass `\x` pairs
+    /// through verbatim, and map the empty pattern to `(?:)`.
+    pub(crate) fn escaped_source(&self, source: &str) -> String {
+        if source.is_empty() {
+            return "(?:)".to_string();
+        }
+        let chars: Vec<char> = source.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\\' && i + 1 < chars.len() {
+                out.push('\\');
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            match c {
+                '/' => out.push_str("\\/"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\u{2028}' => out.push_str("\\u2028"),
+                '\u{2029}' => out.push_str("\\u2029"),
+                _ => out.push(c),
+            }
+            i += 1;
+        }
+        out
+    }
+
     pub(crate) fn regexp_get_prop(
         &mut self,
         source: &str,
@@ -171,10 +202,13 @@ impl<'p> Vm<'p> {
         Ok(match key {
             "lastIndex" => Value::num(last_index as f64),
             "source" => {
-                let s = if source.is_empty() { "(?:)".to_string() } else { source.to_string() };
+                let s = self.escaped_source(source);
                 self.alloc_str(s)
             }
-            "flags" => self.alloc_str(flags.to_string()),
+            "flags" => {
+                let s = canonical_flags(flags);
+                self.alloc_str(s)
+            }
             "global" => Value::bool(flags.contains('g')),
             "ignoreCase" => Value::bool(flags.contains('i')),
             "multiline" => Value::bool(flags.contains('m')),
@@ -316,4 +350,16 @@ impl<'p> Vm<'p> {
 
     // ── TypedArrays / ArrayBuffer / DataView ──
 
+}
+
+/// Assemble a RegExp `flags` string in the canonical order `dgimsuvy`,
+/// regardless of the order the flags were supplied in.
+pub(crate) fn canonical_flags(flags: &str) -> String {
+    let mut out = String::new();
+    for ch in ['d', 'g', 'i', 'm', 's', 'u', 'v', 'y'] {
+        if flags.contains(ch) {
+            out.push(ch);
+        }
+    }
+    out
 }
