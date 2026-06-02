@@ -1101,22 +1101,52 @@ impl<'p> Vm<'p> {
             }
             "until" | "since" => {
                 let o = self.to_plain_date_time(a0)?;
-                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let largest = self.opt_string(
-                    a1,
-                    "largestUnit",
-                    "auto",
-                    &[
-                        "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
-                        "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
-                        "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
-                    ],
-                )?;
-                let largest = normalize_unit(&largest, "day");
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let all_units = &[
+                    "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
+                    "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
+                    "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
+                ];
+                // smallestUnit default "nanosecond"; largestUnit default "auto" →
+                // the larger of smallestUnit and "day".
+                let smallest = normalize_unit(
+                    &self.opt_string(opts, "smallestUnit", "nanosecond", all_units)?,
+                    "nanosecond",
+                );
+                let largest_raw =
+                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", all_units)?, "auto");
+                let order = [
+                    "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
+                    "microsecond", "nanosecond",
+                ];
+                let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(9);
+                let largest = if largest_raw == "auto" {
+                    if rank(&smallest) < rank("day") { smallest.clone() } else { "day".to_string() }
+                } else {
+                    largest_raw
+                };
+                if rank(&smallest) < rank(&largest) {
+                    return Err(Thrown(
+                        "RangeError: smallestUnit is larger than largestUnit".into(),
+                    ));
+                }
+                let inc = self.read_rounding_increment(opts)?;
+                let mode = self.read_rounding_mode(opts, "trunc")?;
                 // until: this → other; since: other → this.
                 let (dt1, dt2) = if name == "until" { (f, o) } else { (o, f) };
                 let df = difference_datetime(dt1, dt2, &largest);
-                Ok(Some(self.make_duration(df)))
+                // With no calendar units (largestUnit ≤ day) the difference is an
+                // exact nanosecond span: round it and re-balance. Calendar-unit
+                // largestUnits keep the raw difference (full rounding deferred).
+                if rank(&largest) >= rank("day") {
+                    let total_ns = (df[3] as i128) * DAY_NS
+                        + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
+                    let inc_ns = unit_ns(&smallest) * inc;
+                    let rounded = round_increment(total_ns, inc_ns, &mode);
+                    Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                } else {
+                    Ok(Some(self.make_duration(df)))
+                }
             }
             "round" => {
                 let (su, inc, mode) = self.read_round_options(
@@ -1366,21 +1396,46 @@ impl<'p> Vm<'p> {
                 let oz = self.zoned_date_time_from(other, Value::UNDEFINED)?;
                 let of = self.zdt_local(oz.heap_index());
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let largest = self.opt_string(
-                    opts,
-                    "largestUnit",
-                    "auto",
-                    &[
-                        "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
-                        "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
-                        "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
-                    ],
-                )?;
-                let largest = normalize_unit(&largest, "hour");
+                let all_units = &[
+                    "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
+                    "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
+                    "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
+                ];
+                let smallest = normalize_unit(
+                    &self.opt_string(opts, "smallestUnit", "nanosecond", all_units)?,
+                    "nanosecond",
+                );
+                let largest_raw =
+                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", all_units)?, "auto");
+                let order = [
+                    "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
+                    "microsecond", "nanosecond",
+                ];
+                let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(9);
+                let largest = if largest_raw == "auto" {
+                    if rank(&smallest) < rank("hour") { smallest.clone() } else { "hour".to_string() }
+                } else {
+                    largest_raw
+                };
+                if rank(&smallest) < rank(&largest) {
+                    return Err(Thrown(
+                        "RangeError: smallestUnit is larger than largestUnit".into(),
+                    ));
+                }
+                let inc = self.read_rounding_increment(opts)?;
+                let mode = self.read_rounding_mode(opts, "trunc")?;
                 let f = self.zdt_local(idx);
                 let (dt1, dt2) = if name == "until" { (f, of) } else { (of, f) };
                 let df = difference_datetime(dt1, dt2, &largest);
-                Ok(Some(self.make_duration(df)))
+                if rank(&largest) >= rank("day") {
+                    let total_ns = (df[3] as i128) * DAY_NS
+                        + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
+                    let inc_ns = unit_ns(&smallest) * inc;
+                    let rounded = round_increment(total_ns, inc_ns, &mode);
+                    Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                } else {
+                    Ok(Some(self.make_duration(df)))
+                }
             }
             "round" => {
                 let opts = args.first().copied().unwrap_or(Value::UNDEFINED);
