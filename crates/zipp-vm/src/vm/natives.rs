@@ -659,6 +659,17 @@ impl<'p> Vm<'p> {
                 self.iter_result(Value::UNDEFINED, true)
             }
             ITER_FROM => self.iterator_from(a0)?,
+            // test262 `$262.detachArrayBuffer(ab)` / `$262.gc()`.
+            DOLLAR262_DETACH => {
+                if let Some(buf) = self.as_array_buffer(a0) {
+                    if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buf) {
+                        *detached = true;
+                        data.clear();
+                    }
+                }
+                Value::NULL
+            }
+            DOLLAR262_GC => Value::UNDEFINED,
             ITER_TAG_GET => self.alloc_str("Iterator".to_string()),
             ITER_TAG_SET => {
                 if this.is_heap() && this.heap_index() == self.iterator_proto_root {

@@ -1081,6 +1081,14 @@ impl<'p> Vm<'p> {
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
         self.global_this = global_this;
+        // The test262 `$262` host object: { global, detachArrayBuffer, gc }.
+        let d262_detach = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_DETACH)));
+        let d262_gc = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_GC)));
+        let mut d262 = ObjMap::new();
+        d262.define("global", Value::heap(global_this), method_attr);
+        d262.define("detachArrayBuffer", d262_detach, method_attr);
+        d262.define("gc", d262_gc, method_attr);
+        self.dollar262 = self.heap.alloc(HeapObj::Object(d262));
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).
         let mut sets: Vec<(usize, u32)> = Vec::new();
@@ -1125,6 +1133,7 @@ impl<'p> Vm<'p> {
                 "isNaN" => Some(is_nan_fn),
                 "isFinite" => Some(is_finite_fn),
                 "globalThis" => Some(global_this),
+                "$262" => Some(self.dollar262),
                 // The 11 TypedArray constructors (Int8Array … BigUint64Array).
                 _ => native::TA_KINDS
                     .iter()

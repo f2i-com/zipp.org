@@ -262,6 +262,8 @@ pub struct Vm<'p> {
     iterator_proto_root: u32,
     iterator_helper_proto: u32,
     iterator_ctor: u32,
+    /// The test262 `$262` host object (0 until set up).
+    dollar262: u32,
     /// `%ArrayIteratorPrototype%` — the prototype of Array entries/keys/values
     /// iterators (and the default array `@@iterator`). 0 until set up.
     array_iter_proto: u32,

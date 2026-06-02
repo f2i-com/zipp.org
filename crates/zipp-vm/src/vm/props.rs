@@ -657,10 +657,13 @@ impl<'p> Vm<'p> {
             if let Ok(i) = key.parse::<usize>() {
                 return Ok(self.ta_element_get(obj.heap_index(), i));
             }
+            // A TypedArray over a detached buffer reports length/byteLength/
+            // byteOffset as 0.
+            let detached = matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. });
             return Ok(match key {
-                "length" => Value::num(length as f64),
-                "byteLength" => Value::num((length * size) as f64),
-                "byteOffset" => Value::num(byte_offset as f64),
+                "length" => Value::num(if detached { 0.0 } else { length as f64 }),
+                "byteLength" => Value::num(if detached { 0.0 } else { (length * size) as f64 }),
+                "byteOffset" => Value::num(if detached { 0.0 } else { byte_offset as f64 }),
                 "BYTES_PER_ELEMENT" => Value::num(size as f64),
                 "buffer" => Value::heap(buffer),
                 "@@toStringTag" => self.alloc_str(native::TA_KINDS[kind as usize].0.to_string()),

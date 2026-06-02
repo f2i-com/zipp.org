@@ -97,6 +97,9 @@ pub const ITER_TAG_GET: u16 = 614;
 pub const ITER_TAG_SET: u16 = 615;
 pub const ITER_CTOR_GET: u16 = 616;
 pub const ITER_CTOR_SET: u16 = 617;
+// The test262 `$262` host object.
+pub const DOLLAR262_DETACH: u16 = 620;
+pub const DOLLAR262_GC: u16 = 621;
 pub const PROTO_TO_LOCALE_STRING: u16 = 302; // Object.prototype.toLocaleString
 // Number static methods as first-class values (the CALL form is a StaticFn).
 pub const NUM_IS_INTEGER: u16 = 303;
