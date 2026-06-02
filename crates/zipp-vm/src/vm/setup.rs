@@ -630,6 +630,7 @@ impl<'p> Vm<'p> {
                 ("@@search", REGEXP_SYM_SEARCH),
                 ("@@match", REGEXP_SYM_MATCH),
                 ("@@split", REGEXP_SYM_SPLIT),
+                ("@@replace", REGEXP_SYM_REPLACE),
             ] {
                 let mv = Value::heap(self.heap.alloc(HeapObj::Native(nid)));
                 if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
