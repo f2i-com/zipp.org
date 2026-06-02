@@ -49,6 +49,15 @@ impl<'p> Vm<'p> {
             ),
             _ => (Vec::new(), Vec::new(), Vec::new()),
         };
+        // A derived class's prototype chains to its parent's prototype (so a
+        // subclass instance is `instanceof` the parent — including built-in
+        // parents like Error/Array — and inherits the parent's prototype methods
+        // through the chain). Method/getter resolution itself still uses the
+        // class `extends` chain; this only extends the prototype fallback.
+        let parent: Option<u32> = match self.heap.get(idx) {
+            HeapObj::Class(c) => c.parent,
+            _ => None,
+        };
         // Methods and the constructor back-reference are NON-enumerable
         // (writable + configurable), matching ES `class`/function semantics that
         // test262's verifyProperty checks.
@@ -80,6 +89,15 @@ impl<'p> Vm<'p> {
         map.define("constructor", obj, nonenum);
         let p = self.heap.alloc(HeapObj::Object(map));
         self.prototypes.insert(idx, p);
+        // Link the prototype chain to the parent's prototype (a parent class's
+        // own prototype, or a built-in parent ctor's `.prototype`).
+        if let Some(par) = parent {
+            if let Some(pp) = self.prototype_of(Value::heap(par)) {
+                if pp.is_heap() {
+                    self.proto_of.insert(p, pp);
+                }
+            }
+        }
         Some(Value::heap(p))
     }
 
