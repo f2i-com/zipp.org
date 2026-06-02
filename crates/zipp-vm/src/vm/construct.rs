@@ -344,7 +344,23 @@ impl<'p> Vm<'p> {
         }
         let (ctor, has_explicit, parent) = match self.heap.get(cval.heap_index()) {
             HeapObj::Class(c) => (c.ctor, c.has_explicit_ctor, c.parent),
-            _ => return Ok(()),
+            // `super(...)` to a BUILT-IN parent (`class X extends Error`). We model
+            // the Error family: set `message` on the instance from the argument
+            // (AggregateError takes it as the 2nd arg). The instance's prototype
+            // chain already reaches the error prototype (so name/toString/
+            // instanceof resolve), so nothing else is needed here.
+            _ => {
+                if let Some(k) = self.error_ctors.iter().position(|&c| c == cval.heap_index()) {
+                    let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
+                    if let Some(m) = msg.filter(|m| *m != Value::UNDEFINED) {
+                        let mi = self.to_str_idx(m);
+                        if let HeapObj::Object(map) = self.heap.get_mut(obj.heap_index()) {
+                            map.set("message", Value::heap(mi));
+                        }
+                    }
+                }
+                return Ok(());
+            }
         };
         if has_explicit {
             if let Some(fid) = ctor {

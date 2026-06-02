@@ -27,6 +27,7 @@ impl<'p> Vm<'p> {
         if self.error_protos[0] == 0 {
             return false;
         }
+        // proto_of chain: direct error instances + `Object.create(XError.prototype)`.
         let mut cur = idx;
         for _ in 0..64 {
             match self.proto_of.get(&cur) {
@@ -37,7 +38,27 @@ impl<'p> Vm<'p> {
                     }
                     cur = pi;
                 }
-                _ => return false,
+                _ => break,
+            }
+        }
+        // class `extends` chain: a `class X extends Error` instance has no
+        // proto_of entry (its prototype is reached via map.class). Walk the class
+        // chain and check whether any class's parent is a built-in error ctor.
+        if let HeapObj::Object(m) = self.heap.get(idx) {
+            let mut c = m.class;
+            for _ in 0..64 {
+                let ci = match c {
+                    Some(ci) => ci,
+                    None => break,
+                };
+                match self.heap.get(ci) {
+                    HeapObj::Class(cd) => match cd.parent {
+                        Some(par) if self.error_ctors.contains(&par) => return true,
+                        Some(par) => c = Some(par),
+                        None => break,
+                    },
+                    _ => break,
+                }
             }
         }
         false
