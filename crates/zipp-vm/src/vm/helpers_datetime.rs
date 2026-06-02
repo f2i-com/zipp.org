@@ -811,10 +811,20 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
 /// ISO-8601 serialization of a Temporal.Duration (`P1Y2M3DT4H5.5S`). ms/us/ns
 /// fold into fractional seconds. All-zero → "PT0S".
 pub(crate) fn duration_to_string(f: &[i64; 10]) -> String {
+    duration_to_string_opts(f, -1, "trunc")
+}
+
+/// Like `duration_to_string` but with a toString precision: `digits` = -1 (auto,
+/// trailing zeros trimmed) or 0..9 fixed fractional-second digits (the seconds
+/// component is then always shown), with `mode` rounding the sub-second part.
+pub(crate) fn duration_to_string_opts(f: &[i64; 10], digits: i32, mode: &str) -> String {
     let sign = f.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0);
     let a: Vec<i128> = f.iter().map(|x| (*x as i128).abs()).collect();
     let (y, mo, w, d, h, mi) = (a[0], a[1], a[2], a[3], a[4], a[5]);
-    let total_ns = a[6] * 1_000_000_000 + a[7] * 1_000_000 + a[8] * 1_000 + a[9];
+    let mut total_ns = a[6] * 1_000_000_000 + a[7] * 1_000_000 + a[8] * 1_000 + a[9];
+    if digits >= 0 {
+        total_ns = round_increment(total_ns, 10i128.pow(9 - digits as u32), mode);
+    }
     let whole_s = total_ns / 1_000_000_000;
     let frac_ns = (total_ns % 1_000_000_000) as u64;
     let mut out = String::new();
@@ -834,7 +844,8 @@ pub(crate) fn duration_to_string(f: &[i64; 10]) -> String {
     if d != 0 {
         out.push_str(&format!("{d}D"));
     }
-    let has_time = h != 0 || mi != 0 || whole_s != 0 || frac_ns != 0;
+    let show_seconds = whole_s != 0 || frac_ns != 0 || digits >= 0;
+    let has_time = h != 0 || mi != 0 || show_seconds;
     if has_time {
         out.push('T');
         if h != 0 {
@@ -843,8 +854,11 @@ pub(crate) fn duration_to_string(f: &[i64; 10]) -> String {
         if mi != 0 {
             out.push_str(&format!("{mi}M"));
         }
-        if whole_s != 0 || frac_ns != 0 {
-            if frac_ns == 0 {
+        if show_seconds {
+            if digits > 0 {
+                let frac = format!("{frac_ns:09}");
+                out.push_str(&format!("{whole_s}.{}S", &frac[..digits as usize]));
+            } else if digits == 0 || frac_ns == 0 {
                 out.push_str(&format!("{whole_s}S"));
             } else {
                 let frac = format!("{frac_ns:09}");

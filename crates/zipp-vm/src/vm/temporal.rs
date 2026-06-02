@@ -155,7 +155,16 @@ impl<'p> Vm<'p> {
                 self.validate_duration(&nf)?;
                 Ok(Some(self.make_duration(nf)))
             }
-            "toString" | "toJSON" => Ok(Some(self.alloc_str(duration_to_string(&f)))),
+            "toJSON" => Ok(Some(self.alloc_str(duration_to_string(&f)))),
+            "toString" => {
+                let (_unit, digits, omit, mode) = self.time_precision(a0)?;
+                if omit {
+                    return Err(Thrown(
+                        "RangeError: smallestUnit 'minute' is not valid for Duration.toString".into(),
+                    ));
+                }
+                Ok(Some(self.alloc_str(duration_to_string_opts(&f, digits, &mode))))
+            }
             "valueOf" => {
                 Err(Thrown("TypeError: Called Temporal.Duration.prototype.valueOf".into()))
             }
