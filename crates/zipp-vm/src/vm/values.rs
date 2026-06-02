@@ -23,13 +23,15 @@ impl<'p> Vm<'p> {
                 if map.get(&k).is_some() {
                     return true;
                 }
-                // Inherited method/getter through the class chain.
-                let mut cur = map.class;
+                // Inherited method/getter/setter through the class chain.
+                let class = map.class;
+                let mut cur = class;
                 while let Some(cidx) = cur {
                     match self.heap.get(cidx) {
                         HeapObj::Class(c) => {
                             if c.methods.iter().any(|(n, _)| *n == k)
                                 || c.getters.iter().any(|(n, _)| *n == k)
+                                || c.setters.iter().any(|(n, _)| *n == k)
                             {
                                 return true;
                             }
@@ -38,15 +40,45 @@ impl<'p> Vm<'p> {
                         _ => break,
                     }
                 }
-                false
-            }
-            HeapObj::Array(items) => match array_index(key) {
-                Some(i) => i < items.len(),
-                None => {
-                    let k = self.key_of(key);
-                    k == "length" || self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
+                // [[HasProperty]] continues up the prototype chain: an explicit
+                // `Object.create` proto, then the base Object.prototype (which
+                // carries toString/hasOwnProperty/valueOf/…). Mirrors get_member's
+                // proto resolution, minus class-instance C.prototype (its methods
+                // are already covered by the class-chain walk above).
+                let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                    p.is_heap().then_some(p)
+                } else if self.obj_proto != 0 && idx != self.obj_proto {
+                    Some(Value::heap(self.obj_proto))
+                } else {
+                    None
+                };
+                match proto {
+                    Some(p) => self.has_property(p, key),
+                    None => false,
                 }
-            },
+            }
+            HeapObj::Array(items) => {
+                let len = items.len();
+                if let Some(i) = array_index(key) {
+                    return i < len;
+                }
+                let k = self.key_of(key);
+                // A canonical numeric-string index ("0", not "01"/"-1") is an
+                // array index too.
+                if let Ok(n) = k.parse::<u32>() {
+                    if n != u32::MAX && n.to_string() == k {
+                        return (n as usize) < len;
+                    }
+                }
+                if k == "length" {
+                    return true;
+                }
+                if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                    return true;
+                }
+                // Inherited: Array.prototype (push/map/…) then Object.prototype.
+                self.arr_proto != 0 && self.has_property(Value::heap(self.arr_proto), key)
+            }
             HeapObj::Str(s) => match array_index(key) {
                 Some(i) => i < s.char_len,
                 None => self.display(key) == "length",
