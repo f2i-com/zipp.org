@@ -277,6 +277,10 @@ pub enum Instr {
     NewArray { dst: Reg, arg_base: Reg, argc: u16 },
     /// `dst = {}` — empty object (populated by following SetProp/SetIndex).
     NewObject { dst: Reg },
+    /// `dst = ToObject(src)` — `Object(x)` / `new Object(x)`: primitives box
+    /// (string/number/boolean/symbol/bigint wrappers), null/undefined → a fresh
+    /// object, and an existing object is returned unchanged.
+    ToObject { dst: Reg, src: Reg },
     /// `dst = new <Error subtype>(arg?)` — a proto-linked error instance. `kind`
     /// indexes the canonical error list (0=Error, 1=TypeError, …, 7=AggregateError);
     /// `arg` (when present) is coerced to the `message` string.

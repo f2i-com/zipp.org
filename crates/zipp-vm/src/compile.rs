@@ -2703,8 +2703,14 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::ArrayCtor { dst, arg_base, argc });
                         return Ok(dst);
                     }
-                    if id.name == "Object" && n.arguments.is_empty() {
-                        self.emit(Instr::NewObject { dst });
+                    if id.name == "Object" {
+                        // `new Object()` → a fresh object; `new Object(x)` → ToObject(x).
+                        if let Some(arg) = n.arguments.first().and_then(|a| a.as_expression()) {
+                            let src = self.expr(arg)?;
+                            self.emit(Instr::ToObject { dst, src });
+                        } else {
+                            self.emit(Instr::NewObject { dst });
+                        }
                         return Ok(dst);
                     }
                     // `new Promise(executor)`.
@@ -4277,8 +4283,14 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::ArrayCtor { dst, arg_base, argc });
                 return Ok(dst);
             }
-            if id.name == "Object" && c.arguments.is_empty() {
-                self.emit(Instr::NewObject { dst });
+            if id.name == "Object" {
+                // `Object()` → a fresh object; `Object(x)` → ToObject(x).
+                if let Some(arg) = c.arguments.first().and_then(|a| a.as_expression()) {
+                    let src = self.expr(arg)?;
+                    self.emit(Instr::ToObject { dst, src });
+                } else {
+                    self.emit(Instr::NewObject { dst });
+                }
                 return Ok(dst);
             }
         }

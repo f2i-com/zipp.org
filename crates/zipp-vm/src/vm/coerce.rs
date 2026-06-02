@@ -75,6 +75,33 @@ impl<'p> Vm<'p> {
         v.is_heap() && !self.heap.is_str_like(v.heap_index())
     }
 
+    /// `ToObject(v)` — backs `Object(x)` / `new Object(x)`. Primitives box into
+    /// the matching wrapper (string/number/boolean/symbol/bigint); null and
+    /// undefined become a fresh ordinary object; an existing object (array,
+    /// function, …) is returned unchanged. `Boxed.kind`: 0=String, 1=Number,
+    /// 2=Boolean, 3=Symbol, 4=BigInt.
+    pub(crate) fn to_object(&mut self, v: Value) -> Result<Value, Thrown> {
+        if v.is_number() {
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 1, value: v })));
+        }
+        if v.is_bool() {
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 2, value: v })));
+        }
+        if !v.is_heap() {
+            // null / undefined → a fresh ordinary object.
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new()))));
+        }
+        // A heap value: string/symbol/bigint primitives box; every real object
+        // (Object/Array/Func/Map/Boxed/…) is already an object → unchanged.
+        let kind = match self.heap.get(v.heap_index()) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => 0u8,
+            HeapObj::Symbol { .. } => 3u8,
+            HeapObj::BigInt(_) => 4u8,
+            _ => return Ok(v),
+        };
+        Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind, value: v })))
+    }
+
     /// `ToString(v)` as a Rust String, honouring a user `toString`/`valueOf` on an
     /// object (ToPrimitive with the string hint). Primitives and engine strings use
     /// `display`; a plain object with only the built-in (native) toString also falls

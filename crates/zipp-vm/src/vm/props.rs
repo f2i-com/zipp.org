@@ -279,7 +279,9 @@ impl<'p> Vm<'p> {
             HeapObj::Boxed { kind, .. } => match kind {
                 0 => self.str_proto,
                 1 => self.num_proto,
-                _ => self.bool_proto,
+                2 => self.bool_proto,
+                3 => self.symbol_proto,
+                _ => self.bigint_proto,
             },
             HeapObj::Date(_) => self.date_proto,
             HeapObj::Promise { .. } => self.promise_proto,
@@ -1075,7 +1077,9 @@ impl<'p> Vm<'p> {
                 let proto = match k {
                     0 => self.str_proto,
                     1 => self.num_proto,
-                    _ => self.bool_proto,
+                    2 => self.bool_proto,
+                    3 => self.symbol_proto,
+                    _ => self.bigint_proto,
                 };
                 Ok(self.proto_member(proto, key))
             }

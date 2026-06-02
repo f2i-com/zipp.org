@@ -1500,6 +1500,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::ToObject { dst, src } => {
+                        let v = self.get(base, src);
+                        let o = self.to_object(v)?;
+                        self.set(base, dst, o);
+                        ip += 1;
+                    }
                     Instr::NewError { dst, kind, arg } => {
                         let msg = arg.map(|r| self.get(base, r));
                         let v = self.make_error(kind, msg);
