@@ -545,6 +545,51 @@ impl<'p> Vm<'p> {
         if !obj.is_heap() {
             return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
         }
+        // Proxy defineProperty trap: pass the trap a FromPropertyDescriptor of the
+        // attributes (only the specified fields); a falsy result means the define
+        // failed (Object.defineProperty throws, Reflect.defineProperty -> false).
+        if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
+            if revoked {
+                return Err(Thrown(
+                    "TypeError: Cannot perform 'defineProperty' on a revoked proxy".into(),
+                ));
+            }
+            return match self.proxy_trap(handler, "defineProperty")? {
+                None => self.object_define_property(target, key, desc),
+                Some(trap) => {
+                    let (value, get, set, wr, en, cf) = self.read_descriptor(desc)?;
+                    let mut m = ObjMap::new();
+                    if let Some(v) = value {
+                        m.set("value", v);
+                    }
+                    if let Some(w) = wr {
+                        m.set("writable", Value::bool(w));
+                    }
+                    if let Some(g) = get {
+                        m.set("get", g);
+                    }
+                    if let Some(s) = set {
+                        m.set("set", s);
+                    }
+                    if let Some(e) = en {
+                        m.set("enumerable", Value::bool(e));
+                    }
+                    if let Some(c) = cf {
+                        m.set("configurable", Value::bool(c));
+                    }
+                    let desc_obj = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                    let kv = self.key_to_value(key);
+                    let r = self.call_value(trap, handler, &[target, kv, desc_obj])?;
+                    if self.truthy(r) {
+                        Ok(())
+                    } else {
+                        Err(Thrown(format!(
+                            "TypeError: proxy 'defineProperty' trap returned falsish for property '{key}'"
+                        )))
+                    }
+                }
+            };
+        }
         let idx = obj.heap_index();
         // Array: a numeric-index data descriptor sets the element; `length` resizes.
         // (Index accessors / extra named props aren't modeled — accepted as a no-op
