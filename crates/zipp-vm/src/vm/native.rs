@@ -281,6 +281,9 @@ pub const BUFFER_GETTERS: &[(&str, u8)] = &[
 /// `ArrayBuffer.prototype.transferToImmutable` / `sliceToImmutable` (ES2026).
 pub const ARRAYBUFFER_TRANSFER_IMMUTABLE: u16 = 815;
 pub const ARRAYBUFFER_SLICE_IMMUTABLE: u16 = 816;
+/// `ArrayBuffer.prototype.transfer` (preserves resizability) / `transferToFixedLength`.
+pub const ARRAYBUFFER_TRANSFER: u16 = 817;
+pub const ARRAYBUFFER_TRANSFER_FIXED: u16 = 818;
 pub const PROXY_REVOCABLE: u16 = 397;
 pub const PROXY_REVOKE: u16 = 398;
 /// Temporal.Duration.prototype instance methods (dispatched by name via
@@ -646,6 +649,12 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     }
     if id == ARRAYBUFFER_SLICE_IMMUTABLE {
         return Some(("sliceToImmutable", 2));
+    }
+    if id == ARRAYBUFFER_TRANSFER {
+        return Some(("transfer", 0));
+    }
+    if id == ARRAYBUFFER_TRANSFER_FIXED {
+        return Some(("transferToFixedLength", 0));
     }
     // Temporal.<Type>.prototype method natives: name + length as own properties.
     for (base, methods) in [

@@ -1457,7 +1457,8 @@ impl<'p> Vm<'p> {
                 }
                 self.arraybuffer_method(this.heap_index(), "resize", args)?.unwrap_or(Value::UNDEFINED)
             }
-            ARRAYBUFFER_TRANSFER_IMMUTABLE | ARRAYBUFFER_SLICE_IMMUTABLE => {
+            ARRAYBUFFER_TRANSFER_IMMUTABLE | ARRAYBUFFER_SLICE_IMMUTABLE | ARRAYBUFFER_TRANSFER
+            | ARRAYBUFFER_TRANSFER_FIXED => {
                 let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
                 if shared
                     || !matches!(
@@ -1466,13 +1467,14 @@ impl<'p> Vm<'p> {
                     )
                 {
                     return Err(Thrown(
-                        "TypeError: ArrayBuffer immutable method called on incompatible receiver".into(),
+                        "TypeError: ArrayBuffer transfer method called on incompatible receiver".into(),
                     ));
                 }
-                let name = if id == ARRAYBUFFER_TRANSFER_IMMUTABLE {
-                    "transferToImmutable"
-                } else {
-                    "sliceToImmutable"
+                let name = match id {
+                    ARRAYBUFFER_TRANSFER_IMMUTABLE => "transferToImmutable",
+                    ARRAYBUFFER_SLICE_IMMUTABLE => "sliceToImmutable",
+                    ARRAYBUFFER_TRANSFER => "transfer",
+                    _ => "transferToFixedLength",
                 };
                 self.arraybuffer_method(this.heap_index(), name, args)?.unwrap_or(Value::UNDEFINED)
             }

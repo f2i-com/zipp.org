@@ -801,6 +801,47 @@ impl<'p> Vm<'p> {
                 self.immutable_buffers.insert(new_idx);
                 Ok(Some(Value::heap(new_idx)))
             }
+            // ES2024: copy the bytes into a NEW (mutable) ArrayBuffer of `newLength`
+            // bytes and detach the source. `transfer` preserves resizability (keeps
+            // maxByteLength); `transferToFixedLength` produces a fixed buffer.
+            "transfer" | "transferToFixedLength" => {
+                if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown("TypeError: Cannot transfer a detached ArrayBuffer".into()));
+                }
+                if self.immutable_buffers.contains(&idx) {
+                    return Err(Thrown("TypeError: Cannot transfer an immutable ArrayBuffer".into()));
+                }
+                let new_len = match args.first() {
+                    Some(&v) if v != Value::UNDEFINED => {
+                        let n = self.to_integer_or_zero(v)?;
+                        if n < 0 || n > super::typedarray::MAX_ARRAY_BUFFER_LEN {
+                            return Err(Thrown("RangeError: invalid ArrayBuffer length".into()));
+                        }
+                        n as usize
+                    }
+                    _ => len,
+                };
+                let bytes: Vec<u8> = match self.heap.get(idx) {
+                    HeapObj::ArrayBuffer { data, .. } => data.clone(),
+                    _ => Vec::new(),
+                };
+                let new_idx = self.alloc_array_buffer(new_len);
+                let n = bytes.len().min(new_len);
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
+                    data[..n].copy_from_slice(&bytes[..n]);
+                }
+                // `transfer` keeps the source's resizability (maxByteLength).
+                if name == "transfer" {
+                    if let Some(&m) = self.ab_max.get(&idx) {
+                        self.ab_max.insert(new_idx, m.max(new_len));
+                    }
+                }
+                if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(idx) {
+                    data.clear();
+                    *detached = true;
+                }
+                Ok(Some(Value::heap(new_idx)))
+            }
             _ => Ok(None),
         }
     }

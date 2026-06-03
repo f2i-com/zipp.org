@@ -951,6 +951,8 @@ impl<'p> Vm<'p> {
                     ("resize", ARRAYBUFFER_RESIZE),
                     ("transferToImmutable", native::ARRAYBUFFER_TRANSFER_IMMUTABLE),
                     ("sliceToImmutable", native::ARRAYBUFFER_SLICE_IMMUTABLE),
+                    ("transfer", native::ARRAYBUFFER_TRANSFER),
+                    ("transferToFixedLength", native::ARRAYBUFFER_TRANSFER_FIXED),
                 ],
                 None,
             );
