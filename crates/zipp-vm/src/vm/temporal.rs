@@ -1886,16 +1886,32 @@ impl<'p> Vm<'p> {
             if let Some(ns) = self.instant_ns(v.heap_index()) {
                 return Ok(ns);
             }
+            // A ZonedDateTime yields its epoch nanoseconds.
+            if matches!(self.heap.get(v.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
+                if let Some(ns) = self.zdt_epoch_ns(v.heap_index()) {
+                    return Ok(ns);
+                }
+            }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-                if !temporal_string_ok(&s, false) {
-                    return Err(Thrown(format!("RangeError: invalid instant string '{s}'")));
-                }
-                return instant_str_to_ns(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid instant string '{s}'")));
+                return self.parse_instant_string(&s);
+            }
+            // Any other object: ToPrimitive(string) then parse as an instant string
+            // (e.g. {} -> "[object Object]" -> RangeError; a custom toString is honoured).
+            if self.is_object_value(v) {
+                let s = self.to_js_string(v)?;
+                return self.parse_instant_string(&s);
             }
         }
         Err(Thrown("TypeError: cannot convert value to a Temporal.Instant".into()))
+    }
+
+    fn parse_instant_string(&mut self, s: &str) -> Result<i128, Thrown> {
+        if !temporal_string_ok(s, false) {
+            return Err(Thrown(format!("RangeError: invalid instant string '{s}'")));
+        }
+        instant_str_to_ns(s)
+            .ok_or_else(|| Thrown(format!("RangeError: invalid instant string '{s}'")))
     }
 
     pub(crate) fn instant_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
