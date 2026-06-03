@@ -1346,7 +1346,12 @@ impl<'p> Vm<'p> {
                 "TypeError: Called Temporal.ZonedDateTime.prototype.valueOf which always throws"
                     .into(),
             )),
-            "toString" | "toJSON" | "toLocaleString" => {
+            "toString" => {
+                let opts = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let s = self.zdt_to_string_opts(idx, opts)?;
+                Ok(Some(self.alloc_str(s)))
+            }
+            "toJSON" | "toLocaleString" => {
                 let s = self.zdt_to_string(idx);
                 Ok(Some(self.alloc_str(s)))
             }
@@ -1810,6 +1815,45 @@ impl<'p> Vm<'p> {
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{}[{}]",
             f[0], f[1], f[2], f[3], f[4], f[5], frac, offset, tz
         )
+    }
+
+    /// ZonedDateTime toString honouring options: smallestUnit/fractionalSecondDigits
+    /// rounding of the instant + roundingMode, the calendarName suffix, plus the
+    /// `offset` ("auto"/"never") and `timeZoneName` ("auto"/"never"/"critical")
+    /// suffixes. Order: `<date>T<time><offset>[tz][u-ca=…]`.
+    pub(crate) fn zdt_to_string_opts(&mut self, idx: u32, options: Value) -> Result<String, Thrown> {
+        let (unit, digits, omit, mode) = self.time_precision(options)?;
+        let cal_suf = self.calendar_name_suffix(options)?;
+        let (show_offset, tzn) = if options == Value::UNDEFINED {
+            (true, "auto".to_string())
+        } else {
+            let off_opt = self.opt_string(options, "offset", "auto", &["auto", "never"])?;
+            let tzn =
+                self.opt_string(options, "timeZoneName", "auto", &["auto", "never", "critical"])?;
+            (off_opt != "never", tzn)
+        };
+        let off = self.zdt_offset_ns(idx);
+        // Round the instant to the requested unit, then express in the offset.
+        let epoch = self.zdt_epoch_ns(idx).unwrap_or(0);
+        let rounded = round_increment(epoch, unit, &mode);
+        let local = rounded + off as i128;
+        let t = ns_to_time(local.rem_euclid(DAY_NS));
+        let (ny, nm, nd) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
+        let offset_s = if show_offset { format_offset(off) } else { String::new() };
+        let tz = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+        let tz_suf = match tzn.as_str() {
+            "never" => String::new(),
+            "critical" => format!("[!{tz}]"),
+            _ => format!("[{tz}]"),
+        };
+        Ok(format!(
+            "{}T{}{}{}{}",
+            iso_date_string(ny, nm, nd),
+            format_time_part(&t, digits, omit),
+            offset_s,
+            tz_suf,
+            cal_suf
+        ))
     }
 
     pub(crate) fn to_instant_ns(&mut self, v: Value) -> Result<i128, Thrown> {
