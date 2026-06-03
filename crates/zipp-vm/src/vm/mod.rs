@@ -310,6 +310,12 @@ pub struct Vm<'p> {
     disposablestack_ctor: u32,
     disposablestack_proto: u32,
     dispose_stacks: std::collections::HashMap<u32, (Vec<Value>, bool)>,
+    /// `AsyncDisposableStack` ctor + prototype, and the set of dispose-stack
+    /// instances that are ASYNC (their `use` prefers @@asyncDispose and their
+    /// disposal goes through `disposeAsync`, which returns a Promise).
+    asyncdisposablestack_ctor: u32,
+    asyncdisposablestack_proto: u32,
+    async_stacks: std::collections::HashSet<u32>,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.

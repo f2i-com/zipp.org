@@ -52,12 +52,20 @@ impl<'p> Vm<'p> {
 
     /// Allocate a fresh `DisposableStack` instance (a plain object linked to
     /// %DisposableStack.prototype%, with an empty, not-yet-disposed disposer stack).
-    pub(crate) fn alloc_disposable_stack(&mut self) -> u32 {
+    pub(crate) fn alloc_disposable_stack(&mut self, is_async: bool) -> u32 {
         let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
-        if self.disposablestack_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.disposablestack_proto));
+        let proto = if is_async {
+            self.asyncdisposablestack_proto
+        } else {
+            self.disposablestack_proto
+        };
+        if proto != 0 {
+            self.proto_of.insert(idx, Value::heap(proto));
         }
         self.dispose_stacks.insert(idx, (Vec::new(), false));
+        if is_async {
+            self.async_stacks.insert(idx);
+        }
         idx
     }
 
@@ -82,7 +90,16 @@ impl<'p> Vm<'p> {
                 if a0.is_nullish() {
                     return Ok(a0);
                 }
-                let method = self.get_member(a0, "@@dispose", a0)?;
+                // Async stacks prefer @@asyncDispose, falling back to @@dispose.
+                let is_async = self.async_stacks.contains(&ti);
+                let mut method = if is_async {
+                    self.get_member(a0, "@@asyncDispose", a0)?
+                } else {
+                    Value::UNDEFINED
+                };
+                if !self.is_callable(method) {
+                    method = self.get_member(a0, "@@dispose", a0)?;
+                }
                 if !self.is_callable(method) {
                     return Err(Thrown(
                         "TypeError: value is not disposable (its [Symbol.dispose] is not a function)".into(),
@@ -144,7 +161,37 @@ impl<'p> Vm<'p> {
                     None => Ok(Value::UNDEFINED),
                 }
             }
+            DISPOSABLE_DISPOSE_ASYNC => {
+                // Idempotent; returns a Promise. v1 runs the disposers eagerly
+                // (LIFO) then settles the promise — true per-disposer awaiting is a
+                // follow-on. Errors reject the returned promise.
+                let already = self.dispose_stacks.get(&ti).map(|(_, d)| *d).unwrap_or(true);
+                let disposers = if already {
+                    Vec::new()
+                } else if let Some((d, dd)) = self.dispose_stacks.get_mut(&ti) {
+                    *dd = true;
+                    std::mem::take(d)
+                } else {
+                    Vec::new()
+                };
+                let mut pending: Option<Thrown> = None;
+                for disposer in disposers.into_iter().rev() {
+                    if let Err(e) = self.call_value(disposer, Value::UNDEFINED, &[]) {
+                        pending = Some(e);
+                    }
+                }
+                let p = self.alloc_promise();
+                match pending {
+                    Some(e) => {
+                        let ev = self.alloc_error_from_message(&e.0);
+                        self.reject(p, ev);
+                    }
+                    None => self.resolve(p, Value::UNDEFINED),
+                }
+                Ok(Value::heap(p))
+            }
             DISPOSABLE_MOVE => {
+                let is_async = self.async_stacks.contains(&ti);
                 let disposers = match self.dispose_stacks.get_mut(&ti) {
                     Some((d, dd)) => {
                         let taken = std::mem::take(d);
@@ -153,7 +200,7 @@ impl<'p> Vm<'p> {
                     }
                     None => Vec::new(),
                 };
-                let new_idx = self.alloc_disposable_stack();
+                let new_idx = self.alloc_disposable_stack(is_async);
                 if let Some((d, _)) = self.dispose_stacks.get_mut(&new_idx) {
                     *d = disposers;
                 }
@@ -195,7 +242,10 @@ impl<'p> Vm<'p> {
             return self.build_shared_array_buffer(args);
         }
         if ci == self.disposablestack_ctor && ci != 0 {
-            return Ok(Value::heap(self.alloc_disposable_stack()));
+            return Ok(Value::heap(self.alloc_disposable_stack(false)));
+        }
+        if ci == self.asyncdisposablestack_ctor && ci != 0 {
+            return Ok(Value::heap(self.alloc_disposable_stack(true)));
         }
         if ci == self.dataview_ctor && ci != 0 {
             return self.build_data_view(args);

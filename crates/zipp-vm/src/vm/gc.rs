@@ -228,6 +228,7 @@ impl Vm<'_> {
         self.ta_tracking.retain(|&k| marks[k as usize]);
         self.shared_buffers.retain(|&k| marks[k as usize]);
         self.dispose_stacks.retain(|&k, _| marks[k as usize]);
+        self.async_stacks.retain(|&k| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
         let _ = free_before;

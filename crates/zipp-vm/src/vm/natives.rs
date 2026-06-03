@@ -1498,7 +1498,9 @@ impl<'p> Vm<'p> {
                 self.atomics_op(name, args)?
             }
             DISPOSABLE_USE | DISPOSABLE_ADOPT | DISPOSABLE_DEFER | DISPOSABLE_DISPOSE
-            | DISPOSABLE_MOVE | DISPOSABLE_DISPOSED_GET => self.disposable_op(id, this, args)?,
+            | DISPOSABLE_DISPOSE_ASYNC | DISPOSABLE_MOVE | DISPOSABLE_DISPOSED_GET => {
+                self.disposable_op(id, this, args)?
+            }
             _ if (SAB_GETTER_BASE..SAB_GETTER_BASE + SAB_GETTERS.len() as u16).contains(&id) => {
                 let name = SAB_GETTERS[(id - SAB_GETTER_BASE) as usize];
                 if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {

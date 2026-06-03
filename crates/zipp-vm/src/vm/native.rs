@@ -198,6 +198,8 @@ pub const DISPOSABLE_DEFER: u16 = 842;
 pub const DISPOSABLE_DISPOSE: u16 = 843;
 pub const DISPOSABLE_MOVE: u16 = 844;
 pub const DISPOSABLE_DISPOSED_GET: u16 = 845;
+/// `AsyncDisposableStack.prototype.disposeAsync` — runs disposers, returns a Promise.
+pub const DISPOSABLE_DISPOSE_ASYNC: u16 = 846;
 // String static methods.
 pub const STR_FROM_CHAR_CODE: u16 = 311;
 pub const STR_FROM_CODE_POINT: u16 = 312;
@@ -792,6 +794,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         DISPOSABLE_ADOPT => ("adopt", 2),
         DISPOSABLE_DEFER => ("defer", 1),
         DISPOSABLE_DISPOSE => ("dispose", 0),
+        DISPOSABLE_DISPOSE_ASYNC => ("disposeAsync", 0),
         DISPOSABLE_MOVE => ("move", 0),
         STR_FROM_CHAR_CODE => ("fromCharCode", 1),
         STR_FROM_CODE_POINT => ("fromCodePoint", 1),
