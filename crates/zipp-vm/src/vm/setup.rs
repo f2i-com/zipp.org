@@ -1747,92 +1747,100 @@ impl<'p> Vm<'p> {
         self.dollar262 = self.heap.alloc(HeapObj::Object(d262));
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).
+        // Every builtin global NAME → its heap value, built ONCE and recorded in
+        // `builtin_globals` regardless of whether the running program referenced
+        // it — so eval'd code can resolve a builtin the program never named.
+        let mut all: Vec<(&str, u32)> = vec![
+            ("Object", object_ctor),
+            ("Array", array_ctor),
+            ("Function", function_ctor),
+            ("String", string_ctor),
+            ("Number", number_ctor),
+            ("Set", set_ctor),
+            ("Map", map_ctor),
+            ("Boolean", boolean_ctor),
+            ("Date", date_ctor),
+            ("Promise", promise_ctor),
+            ("Reflect", reflect_ctor),
+            ("JSON", json_ctor),
+            ("Math", math_ctor),
+            ("WeakMap", weakmap_ctor),
+            ("WeakSet", weakset_ctor),
+            ("WeakRef", weakref_ctor),
+            ("FinalizationRegistry", finreg_ctor),
+            ("Error", self.error_ctors[0]),
+            ("TypeError", self.error_ctors[1]),
+            ("RangeError", self.error_ctors[2]),
+            ("SyntaxError", self.error_ctors[3]),
+            ("ReferenceError", self.error_ctors[4]),
+            ("EvalError", self.error_ctors[5]),
+            ("URIError", self.error_ctors[6]),
+            ("AggregateError", self.error_ctors[7]),
+            ("Symbol", self.symbol_ctor),
+            ("BigInt", self.bigint_ctor),
+            ("RegExp", self.regexp_ctor),
+            ("ArrayBuffer", self.arraybuffer_ctor),
+            ("SharedArrayBuffer", self.sab_ctor),
+            ("DataView", self.dataview_ctor),
+            ("Proxy", self.proxy_ctor),
+            ("Iterator", self.iterator_ctor),
+            ("Temporal", self.temporal_ns),
+            ("Intl", self.intl_ns),
+            ("Atomics", atomics_ns),
+            ("DisposableStack", self.disposablestack_ctor),
+            ("AsyncDisposableStack", self.asyncdisposablestack_ctor),
+            ("SuppressedError", self.suppressederror_ctor),
+            ("ShadowRealm", self.shadowrealm_ctor),
+            ("parseInt", parse_int_fn),
+            ("parseFloat", parse_float_fn),
+            ("isNaN", is_nan_fn),
+            ("isFinite", is_finite_fn),
+            ("eval", eval_fn),
+            ("globalThis", global_this),
+            ("$262", self.dollar262),
+        ];
+        // The 11 TypedArray constructors (Int8Array … BigUint64Array).
+        for (k, t) in native::TA_KINDS.iter().enumerate() {
+            all.push((t.0, self.ta_ctors[k]));
+        }
+        for &(name, v) in &all {
+            // Constructor globals expose own `name`/`length` like any function
+            // ({writable:false, enumerable:false, configurable:true}). Namespaces
+            // (Reflect/Math/JSON, is_ctor==false) don't. Applied to EVERY builtin
+            // (not just referenced ones) so eval sees correct `RangeError.name` etc.
+            if matches!(self.heap.get(v), HeapObj::Object(m) if m.is_ctor) {
+                let len = match name {
+                    "Date" => 7.0,
+                    "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator"
+                    | "DisposableStack" | "AsyncDisposableStack" | "ShadowRealm" => 0.0,
+                    "AggregateError" => 2.0,  // (errors, message?)
+                    "SuppressedError" => 3.0, // (error, suppressed, message?)
+                    "RegExp" => 2.0,          // (pattern, flags)
+                    "Proxy" => 2.0,           // (target, handler)
+                    // TypedArray ctors take (length | buffer, byteOffset, length).
+                    n if native::TA_KINDS.iter().any(|t| t.0 == n) => 3.0,
+                    _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise/Error+subtypes/ArrayBuffer/DataView
+                };
+                let nm = self.alloc_str(name.to_string());
+                let fn_attr = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                if let HeapObj::Object(m) = self.heap.get_mut(v) {
+                    m.define("length", Value::num(len), fn_attr);
+                    m.define("name", nm, fn_attr);
+                }
+            }
+            self.builtin_globals.insert(name.to_string(), v);
+        }
+        // Inject into the program's reserved global slots (collect first to end the
+        // program borrow before mutating `self.globals`).
         let mut sets: Vec<(usize, u32)> = Vec::new();
         for (slot, name) in self.program.global_names.iter().enumerate() {
-            let v = match name.as_str() {
-                "Object" => Some(object_ctor),
-                "Array" => Some(array_ctor),
-                "Function" => Some(function_ctor),
-                "String" => Some(string_ctor),
-                "Number" => Some(number_ctor),
-                "Set" => Some(set_ctor),
-                "Map" => Some(map_ctor),
-                "Boolean" => Some(boolean_ctor),
-                "Date" => Some(date_ctor),
-                "Promise" => Some(promise_ctor),
-                "Reflect" => Some(reflect_ctor),
-                "JSON" => Some(json_ctor),
-                "Math" => Some(math_ctor),
-                "WeakMap" => Some(weakmap_ctor),
-                "WeakSet" => Some(weakset_ctor),
-                "WeakRef" => Some(weakref_ctor),
-                "FinalizationRegistry" => Some(finreg_ctor),
-                "Error" => Some(self.error_ctors[0]),
-                "TypeError" => Some(self.error_ctors[1]),
-                "RangeError" => Some(self.error_ctors[2]),
-                "SyntaxError" => Some(self.error_ctors[3]),
-                "ReferenceError" => Some(self.error_ctors[4]),
-                "EvalError" => Some(self.error_ctors[5]),
-                "URIError" => Some(self.error_ctors[6]),
-                "AggregateError" => Some(self.error_ctors[7]),
-                "Symbol" => Some(self.symbol_ctor),
-                "BigInt" => Some(self.bigint_ctor),
-                "RegExp" => Some(self.regexp_ctor),
-                "ArrayBuffer" => Some(self.arraybuffer_ctor),
-                "SharedArrayBuffer" => Some(self.sab_ctor),
-                "DataView" => Some(self.dataview_ctor),
-                "Proxy" => Some(self.proxy_ctor),
-                "Iterator" => Some(self.iterator_ctor),
-                "Temporal" => Some(self.temporal_ns),
-                "Intl" => Some(self.intl_ns),
-                "Atomics" => Some(atomics_ns),
-                "DisposableStack" => Some(self.disposablestack_ctor),
-                "AsyncDisposableStack" => Some(self.asyncdisposablestack_ctor),
-                "SuppressedError" => Some(self.suppressederror_ctor),
-                "ShadowRealm" => Some(self.shadowrealm_ctor),
-                "parseInt" => Some(parse_int_fn),
-                "parseFloat" => Some(parse_float_fn),
-                "isNaN" => Some(is_nan_fn),
-                "isFinite" => Some(is_finite_fn),
-                "eval" => Some(eval_fn),
-                "globalThis" => Some(global_this),
-                "$262" => Some(self.dollar262),
-                // The 11 TypedArray constructors (Int8Array … BigUint64Array).
-                _ => native::TA_KINDS
-                    .iter()
-                    .position(|t| t.0 == name.as_str())
-                    .map(|k| self.ta_ctors[k]),
-            };
-            if let Some(v) = v {
-                // Constructor globals expose own `name`/`length` like any function
-                // ({writable:false, enumerable:false, configurable:true}). Namespaces
-                // (Reflect/Math/JSON, is_ctor==false) don't.
-                if matches!(self.heap.get(v), HeapObj::Object(m) if m.is_ctor) {
-                    let len = match name.as_str() {
-                        "Date" => 7.0,
-                        "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator"
-                        | "DisposableStack" | "AsyncDisposableStack" | "ShadowRealm" => 0.0,
-                        "AggregateError" => 2.0, // (errors, message?)
-                        "SuppressedError" => 3.0, // (error, suppressed, message?)
-                        "RegExp" => 2.0,         // (pattern, flags)
-                        "Proxy" => 2.0,          // (target, handler)
-                        // TypedArray ctors take (length | buffer, byteOffset, length).
-                        n if native::TA_KINDS.iter().any(|t| t.0 == n) => 3.0,
-                        _ => 1.0, // Object/Array/Function/String/Number/Boolean/Promise/Error+subtypes/ArrayBuffer/DataView
-                    };
-                    let nm = self.alloc_str(name.clone());
-                    let fn_attr = PropAttr {
-                        writable: false,
-                        enumerable: false,
-                        configurable: true,
-                        accessor: false,
-                        setter: Value::UNDEFINED,
-                    };
-                    if let HeapObj::Object(m) = self.heap.get_mut(v) {
-                        m.define("length", Value::num(len), fn_attr);
-                        m.define("name", nm, fn_attr);
-                    }
-                }
+            if let Some(&v) = self.builtin_globals.get(name.as_str()) {
                 sets.push((slot, v));
             }
         }

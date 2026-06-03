@@ -74,6 +74,7 @@ impl<'p> Vm<'p> {
             main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
+            builtin_globals: std::collections::HashMap::new(),
             class_values: vec![None; program.classes.len()],
             heap,
             globals,
@@ -711,7 +712,14 @@ impl<'p> Vm<'p> {
         let s = self.eval_global_next;
         self.eval_global_next += 1;
         self.eval_global_map.insert(name.to_string(), s);
-        self.globals[s as usize] = Value::UNINITIALIZED;
+        // A builtin the main program never referenced still resolves in eval'd
+        // code (`eval("new RangeError()")`, `eval("Object.keys(x)")`): seed the
+        // fresh slot with the builtin value rather than the never-declared
+        // sentinel. A genuinely-undeclared name stays UNINITIALIZED → ReferenceError.
+        self.globals[s as usize] = match self.builtin_globals.get(name) {
+            Some(&v) => Value::heap(v),
+            None => Value::UNINITIALIZED,
+        };
         Ok(s)
     }
 

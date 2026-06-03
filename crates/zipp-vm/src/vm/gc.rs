@@ -154,6 +154,11 @@ impl Vm<'_> {
         for &i in self.ta_protos.iter().chain(self.ta_ctors.iter()) {
             root_idx!(i);
         }
+        // Builtin globals (Object/Array/Error/…): permanent roots so a builtin the
+        // program never referenced — reachable only via this map for eval — survives.
+        for &i in self.builtin_globals.values() {
+            root_idx!(i);
+        }
         // Side tables: their VALUES are roots (an entry keyed by a live object
         // must keep its payload alive). Over-approximate by rooting all values;
         // entries whose KEY is dead are pruned after the sweep.

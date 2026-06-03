@@ -149,6 +149,12 @@ pub struct Vm<'p> {
     /// Next free EVAL_POOL slot. Starts at `global_count + FIELD_POOL`; bumped as
     /// new eval globals are assigned, capped at `+ EVAL_POOL`.
     eval_global_next: u32,
+    /// Every builtin global NAME → its heap value, recorded at setup regardless of
+    /// whether the running program referenced it. Lets `eval`'d code resolve
+    /// builtins the main program never named (`eval("new RangeError()")`,
+    /// `eval("Object.keys(x)")`) instead of seeing the never-declared sentinel.
+    /// Values are permanent roots (traced in gc, never pruned).
+    builtin_globals: std::collections::HashMap<String, u32>,
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
     /// `super` call can reach its lexical superclass value at runtime.
     class_values: Vec<Option<Value>>,
