@@ -532,14 +532,31 @@ impl<'p> Vm<'p> {
             if !a.configurable {
                 let make_cfg = d_cf == Some(true);
                 let change_enum = d_en.is_some_and(|b| b != a.enumerable);
-                let change_kind = is_accessor != a.accessor;
+                // A kind change only happens when the descriptor actually specifies
+                // the OTHER kind: an accessor descriptor over a data property, or a
+                // data descriptor (value/writable) over an accessor. A generic
+                // descriptor (only enumerable/configurable) changes neither.
+                let is_data_desc = value.is_some() || d_wr.is_some();
+                let change_kind = (is_accessor && !a.accessor) || (is_data_desc && a.accessor);
                 let make_writable = !a.writable && d_wr == Some(true);
                 // A non-writable data property may only be "redefined" to the same
                 // value — compared with SameValue (so -0 vs +0 and NaN vs NaN are
                 // handled per spec, unlike `==`).
                 let change_frozen_value =
                     !a.accessor && !a.writable && value.is_some_and(|v| !self.same_value(v, oldv));
-                if make_cfg || change_enum || change_kind || make_writable || change_frozen_value {
+                // A non-configurable accessor's get/set may not be changed (an
+                // accessor stores its getter in `oldv`, its setter in `a.setter`).
+                let change_accessor = a.accessor
+                    && is_accessor
+                    && ((get.is_some() && get != Some(oldv))
+                        || (set.is_some() && set != Some(a.setter)));
+                if make_cfg
+                    || change_enum
+                    || change_kind
+                    || make_writable
+                    || change_frozen_value
+                    || change_accessor
+                {
                     return Err(Thrown(format!("TypeError: Cannot redefine property: {key}")));
                 }
             }
