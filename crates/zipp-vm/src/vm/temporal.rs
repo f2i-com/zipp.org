@@ -583,6 +583,11 @@ impl<'p> Vm<'p> {
             }
             "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(y, m, d)?)),
             "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(m, d, y)?)),
+            "toPlainDateTime" => {
+                // Combine this date with a time (ToTemporalTime; default midnight).
+                let t = if a0 == Value::UNDEFINED { [0i64; 6] } else { self.to_plain_time(a0)? };
+                Ok(Some(self.make_plain_date_time([y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]])?))
+            }
             "withCalendar" => {
                 let cal = self.to_js_string(a0)?;
                 if !cal.eq_ignore_ascii_case("iso8601") {
