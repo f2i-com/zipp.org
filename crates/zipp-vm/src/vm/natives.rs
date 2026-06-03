@@ -68,7 +68,10 @@ impl<'p> Vm<'p> {
             }
             OBJ_GET_OWN_DESC => {
                 let key = self.to_property_key(a1)?;
-                self.object_get_own_property_descriptor(a0, &key)
+                match self.proxy_gopd(a0, &key)? {
+                    Some(d) => d,
+                    None => self.object_get_own_property_descriptor(a0, &key),
+                }
             }
             OBJ_GET_OWN_NAMES => self.object_own_property_names(a0),
             OBJ_GET_PROTO => self.object_get_prototype_of(a0),
@@ -758,7 +761,10 @@ impl<'p> Vm<'p> {
                 let mut map = ObjMap::new();
                 for kv in keys {
                     let ks = self.display(kv);
-                    let desc = self.object_get_own_property_descriptor(o, &ks);
+                    let desc = match self.proxy_gopd(o, &ks)? {
+                        Some(d) => d,
+                        None => self.object_get_own_property_descriptor(o, &ks),
+                    };
                     map.set(&ks, desc);
                 }
                 Value::heap(self.heap.alloc(HeapObj::Object(map)))
@@ -1057,7 +1063,10 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let key = self.to_property_key(a1)?;
-                self.object_get_own_property_descriptor(a0, &key)
+                match self.proxy_gopd(a0, &key)? {
+                    Some(d) => d,
+                    None => self.object_get_own_property_descriptor(a0, &key),
+                }
             }
             REFLECT_IS_EXT => {
                 if !self.is_object_value(a0) {

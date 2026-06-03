@@ -1412,7 +1412,10 @@ impl<'p> Vm<'p> {
                             S::ObjectGetOwnPropertyDescriptor => {
                                 let key =
                                     self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                                self.object_get_own_property_descriptor(a0, &key)
+                                match self.proxy_gopd(a0, &key)? {
+                                    Some(d) => d,
+                                    None => self.object_get_own_property_descriptor(a0, &key),
+                                }
                             }
                             S::ObjectGetOwnPropertyNames => self.object_own_property_names(a0),
                             S::ObjectGetPrototypeOf => self.object_get_prototype_of(a0),

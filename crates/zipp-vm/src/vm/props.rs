@@ -71,6 +71,56 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::Object(m)))
     }
 
+    /// A Proxy's `getOwnPropertyDescriptor` trap (ES 10.5.5). Returns:
+    /// * `Some(descriptor)` — `obj` is a proxy: the trap's (normalized) result, or
+    ///   the target's descriptor when the handler defines no trap;
+    /// * `None` — `obj` is not a proxy (the caller uses the ordinary path).
+    /// Callers try this first so `Object.getOwnPropertyDescriptor(proxy, k)` (and
+    /// the descriptor consumers) observe the trap.
+    pub(crate) fn proxy_gopd(&mut self, obj: Value, key: &str) -> Result<Option<Value>, Thrown> {
+        if !obj.is_heap() {
+            return Ok(None);
+        }
+        let (target, handler, revoked) = match self.proxy_parts(obj.heap_index()) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if revoked {
+            return Err(Thrown(
+                "TypeError: Cannot perform 'getOwnPropertyDescriptor' on a revoked proxy".into(),
+            ));
+        }
+        match self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
+            None => Ok(Some(self.object_get_own_property_descriptor(target, key))),
+            Some(trap) => {
+                let kv = self.key_to_value(key);
+                let r = self.call_value(trap, handler, &[target, kv])?;
+                if r.is_undefined() {
+                    return Ok(Some(Value::UNDEFINED));
+                }
+                // ToPropertyDescriptor (read_descriptor) requires an object, then we
+                // re-emit a COMPLETE descriptor (missing fields take their defaults).
+                let (value, get, set, wr, en, cf) = self.read_descriptor(r)?;
+                let normalized = if get.is_some() || set.is_some() {
+                    self.make_accessor_descriptor(
+                        get.unwrap_or(Value::UNDEFINED),
+                        set.unwrap_or(Value::UNDEFINED),
+                        en.unwrap_or(false),
+                        cf.unwrap_or(false),
+                    )
+                } else {
+                    self.make_data_descriptor(
+                        value.unwrap_or(Value::UNDEFINED),
+                        wr.unwrap_or(false),
+                        en.unwrap_or(false),
+                        cf.unwrap_or(false),
+                    )
+                };
+                Ok(Some(normalized))
+            }
+        }
+    }
+
     /// `Object.getOwnPropertyDescriptor(obj, key)` — the property's descriptor, or
     /// undefined for a missing own property / non-object.
     pub(crate) fn object_get_own_property_descriptor(&mut self, obj: Value, key: &str) -> Value {
