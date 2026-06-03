@@ -1371,7 +1371,7 @@ impl<'p> Vm<'p> {
                     Instr::ArrayFrom { dst, src, mapfn } => {
                         let sv = self.get(base, src);
                         let fnv = self.get(base, mapfn);
-                        let out = self.array_from(sv, fnv)?;
+                        let out = self.array_from(Value::UNDEFINED, sv, fnv, Value::UNDEFINED)?;
                         self.set(base, dst, out);
                         ip += 1;
                     }

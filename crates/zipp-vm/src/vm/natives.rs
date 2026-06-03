@@ -625,7 +625,7 @@ impl<'p> Vm<'p> {
             ARR_IS_ARRAY => {
                 Value::bool(a0.is_heap() && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_)))
             }
-            ARR_FROM => self.array_from(a0, a1)?,
+            ARR_FROM => self.array_from(this, a0, a1, args.get(2).copied().unwrap_or(Value::UNDEFINED))?,
             ARR_OF => Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec()))),
             // `%TypedArray%.from(src, mapFn?)` / `.of(...items)` — `this` is the
             // concrete kind constructor (Int8Array, …); collect the values into a
@@ -644,7 +644,7 @@ impl<'p> Vm<'p> {
                     }
                 };
                 let arr = if id == TA_FROM {
-                    self.array_from(a0, a1)?
+                    self.array_from(Value::UNDEFINED, a0, a1, args.get(2).copied().unwrap_or(Value::UNDEFINED))?
                 } else {
                     Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())))
                 };

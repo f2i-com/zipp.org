@@ -4721,7 +4721,12 @@ impl<'a> FnCompiler<'a> {
                     return Ok(dst);
                 }
                 // `Array.from(src[, mapFn])` — needs iteration + optional callback.
-                if obj.name == "Array" && m.property.name == "from" && !c.arguments.is_empty() {
+                // Only the 1-/2-arg form is lowered; a 3rd `thisArg` falls through
+                // to the general call (the native honours it).
+                if obj.name == "Array"
+                    && m.property.name == "from"
+                    && (1..=2).contains(&c.arguments.len())
+                {
                     if let Some(se) = c.arguments[0].as_expression() {
                         let save = self.next_reg;
                         let src = self.expr(se)?;

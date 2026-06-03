@@ -806,10 +806,26 @@ impl<'p> Vm<'p> {
         })
     }
 
-    pub(crate) fn array_from(&mut self, src: Value, mapfn: Value) -> Result<Value, Thrown> {
+    pub(crate) fn array_from(
+        &mut self,
+        this_ctor: Value,
+        src: Value,
+        mapfn: Value,
+        this_arg: Value,
+    ) -> Result<Value, Thrown> {
         // Holds an un-rooted `elems` Vec while the mapfn / iterator re-enters the
         // interpreter — suspend GC for the scope.
         let _gc = self.gc_lock_guard();
+        // A given (non-undefined) mapfn must be callable; null/undefined source is
+        // not coercible to an object (ToObject throws).
+        if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
+            return Err(Thrown("TypeError: Array.from mapfn is not a function".into()));
+        }
+        if src.is_nullish() {
+            return Err(Thrown(
+                "TypeError: Array.from requires an array-like or iterable object".into(),
+            ));
+        }
         // Classify the source under a short-lived borrow, then materialize its
         // elements (the object/array-like path needs &mut self for get_prop).
         enum Kind {
@@ -859,17 +875,29 @@ impl<'p> Vm<'p> {
             }
             Kind::Other => {}
         }
-        // Apply the map callback, if given.
-        let has_map = mapfn.is_heap()
-            && matches!(
-                self.heap.get(mapfn.heap_index()),
-                HeapObj::Func(_) | HeapObj::Closure { .. }
-            );
-        if has_map {
+        // Apply the map callback, if given (validated callable above), with the
+        // supplied thisArg.
+        if mapfn != Value::UNDEFINED {
             for (i, slot) in elems.iter_mut().enumerate() {
                 let args = [*slot, Value::int(i as i32)];
-                *slot = self.call_value(mapfn, Value::UNDEFINED, &args)?;
+                *slot = self.call_value(mapfn, this_arg, &args)?;
             }
+        }
+        // When `Array.from` is called with a custom constructor as `this`
+        // (Array.from.call(C, …) / a subclass), build the result via
+        // Construct(C, «len») and define each element on it, rather than always
+        // returning a plain Array. The Array global itself keeps the fast path.
+        let is_array_global = this_ctor.is_heap()
+            && matches!(self.heap.get(this_ctor.heap_index()), HeapObj::Object(m)
+                if m.get("prototype").is_some_and(|p| p.is_heap() && p.heap_index() == self.arr_proto));
+        if !is_array_global && self.is_constructor(this_ctor) {
+            let len = elems.len();
+            let a = self.construct(this_ctor, &[Value::num(len as f64)])?;
+            for (i, v) in elems.iter().enumerate() {
+                self.set_index(a, Value::num(i as f64), *v)?;
+            }
+            self.set_prop(a, "length", Value::num(len as f64))?;
+            return Ok(a);
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))))
     }
