@@ -1566,6 +1566,11 @@ impl<'p> Vm<'p> {
                     let inc_ns = unit_ns(&smallest) * inc;
                     let rounded = round_increment(total_ns, inc_ns, &mode);
                     Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                } else if matches!(smallest.as_str(), "year" | "month" | "week") {
+                    // Calendar-unit largest + smallest: round against the anchor
+                    // calendar (time-of-day included via epoch nanoseconds).
+                    let r = round_relative_datetime_diff(dt1, dt2, &smallest, &largest, &mode);
+                    Ok(Some(self.make_duration(r)))
                 } else {
                     Ok(Some(self.make_duration(df)))
                 }
