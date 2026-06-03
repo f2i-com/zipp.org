@@ -887,6 +887,42 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get_mut(arraybuffer_proto) {
                 m.define("constructor", Value::heap(arraybuffer_ctor), method_attr);
             }
+            // SharedArrayBuffer: a parallel to ArrayBuffer (shared buffers reuse the
+            // ArrayBuffer representation, flagged in `shared_buffers`). Reuses
+            // `slice`; adds `grow` (grow-only), growable/byteLength/maxByteLength
+            // accessor getters, and @@toStringTag "SharedArrayBuffer".
+            let sab_proto =
+                build(self, &[("slice", ARRAYBUFFER_SLICE), ("grow", native::SAB_GROW)], None);
+            self.proto_of.insert(sab_proto, Value::heap(obj_proto));
+            self.sab_proto = sab_proto;
+            let sab_ctor = build(self, &[], Some(sab_proto));
+            self.sab_ctor = sab_ctor;
+            let sab_acc = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: Value::UNDEFINED,
+            };
+            let sab_data_nw = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            for (g, &name) in native::SAB_GETTERS.iter().enumerate() {
+                let getter =
+                    Value::heap(self.heap.alloc(HeapObj::Native(native::SAB_GETTER_BASE + g as u16)));
+                if let HeapObj::Object(m) = self.heap.get_mut(sab_proto) {
+                    m.define(name, getter, sab_acc);
+                }
+            }
+            let sab_tag = self.alloc_str("SharedArrayBuffer".to_string());
+            if let HeapObj::Object(m) = self.heap.get_mut(sab_proto) {
+                m.define("constructor", Value::heap(sab_ctor), method_attr);
+                m.define("@@toStringTag", sab_tag, sab_data_nw);
+            }
             let dv_methods: Vec<(&str, u16)> = native::DV_PROTO_METHODS
                 .iter()
                 .enumerate()
@@ -1503,6 +1539,7 @@ impl<'p> Vm<'p> {
                 "BigInt" => Some(self.bigint_ctor),
                 "RegExp" => Some(self.regexp_ctor),
                 "ArrayBuffer" => Some(self.arraybuffer_ctor),
+                "SharedArrayBuffer" => Some(self.sab_ctor),
                 "DataView" => Some(self.dataview_ctor),
                 "Proxy" => Some(self.proxy_ctor),
                 "Iterator" => Some(self.iterator_ctor),

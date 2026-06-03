@@ -78,6 +78,9 @@ impl<'p> Vm<'p> {
         if ci == self.arraybuffer_ctor && ci != 0 {
             return self.build_array_buffer(args);
         }
+        if ci == self.sab_ctor && ci != 0 {
+            return self.build_shared_array_buffer(args);
+        }
         if ci == self.dataview_ctor && ci != 0 {
             return self.build_data_view(args);
         }

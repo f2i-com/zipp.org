@@ -857,14 +857,21 @@ impl<'p> Vm<'p> {
             let len = data.len();
             let ai = obj.heap_index();
             let max = self.ab_max.get(&ai).copied();
+            // A SharedArrayBuffer: `growable` (not `resizable`), never `detached`,
+            // methods/@@toStringTag from %SharedArrayBuffer.prototype%.
+            let shared = self.shared_buffers.contains(&ai);
             return Ok(match key {
                 "byteLength" => Value::num(len as f64),
                 "maxByteLength" => Value::num(max.unwrap_or(len) as f64),
-                "resizable" => Value::bool(max.is_some()),
-                "detached" => Value::bool(
+                "growable" if shared => Value::bool(max.is_some()),
+                "resizable" if !shared => Value::bool(max.is_some()),
+                "detached" if !shared => Value::bool(
                     matches!(self.heap.get(ai), HeapObj::ArrayBuffer { detached: true, .. }),
                 ),
-                _ => self.proto_member(self.arraybuffer_proto, key),
+                _ => {
+                    let proto = if shared { self.sab_proto } else { self.arraybuffer_proto };
+                    self.proto_member(proto, key)
+                }
             });
         }
         if let HeapObj::DataView { buffer, byte_offset, byte_length } = self.heap.get(obj.heap_index()) {

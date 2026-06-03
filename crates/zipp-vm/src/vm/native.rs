@@ -166,6 +166,14 @@ pub const GLOBAL_IS_FINITE: u16 = 310;
 /// passed as a thisArg) and calling it parses+runs a code string (indirect eval,
 /// global scope). Picked clear of every BASE range (max ~767).
 pub const GLOBAL_EVAL: u16 = 800;
+/// `SharedArrayBuffer.prototype.grow(newLength)` — like ArrayBuffer.resize but
+/// only grows (a growable SAB).
+pub const SAB_GROW: u16 = 810;
+/// `SharedArrayBuffer.prototype` accessor getters, indexed off this base by
+/// `SAB_GETTERS`. Each validates a shared-buffer receiver then reads the value
+/// from the instance (`get_member`).
+pub const SAB_GETTER_BASE: u16 = 811;
+pub const SAB_GETTERS: &[&str] = &["byteLength", "maxByteLength", "growable"];
 // String static methods.
 pub const STR_FROM_CHAR_CODE: u16 = 311;
 pub const STR_FROM_CODE_POINT: u16 = 312;
@@ -750,6 +758,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_IS_NAN => ("isNaN", 1),
         GLOBAL_IS_FINITE => ("isFinite", 1),
         GLOBAL_EVAL => ("eval", 1),
+        SAB_GROW => ("grow", 1),
         STR_FROM_CHAR_CODE => ("fromCharCode", 1),
         STR_FROM_CODE_POINT => ("fromCodePoint", 1),
         STR_RAW => ("raw", 1),

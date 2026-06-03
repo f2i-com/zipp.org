@@ -227,6 +227,20 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(buf))
     }
 
+    /// `new SharedArrayBuffer(length[, {maxByteLength}])`. Reuses the ArrayBuffer
+    /// representation + length/maxByteLength validation, then marks the buffer
+    /// shared and links it to %SharedArrayBuffer.prototype%. A SAB is growable
+    /// (never shrinks/detaches); the `maxByteLength` option makes `grow` available.
+    pub(crate) fn build_shared_array_buffer(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let v = self.build_array_buffer(args)?;
+        let idx = v.heap_index();
+        self.shared_buffers.insert(idx);
+        if self.sab_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.sab_proto));
+        }
+        Ok(v)
+    }
+
     /// `new <TA>(length | buffer[,off[,len]] | typedArray | array/iterable)`.
     pub(crate) fn build_typed_array(&mut self, kind: u8, args: &[Value]) -> Result<Value, Thrown> {
         let size = native::TA_KINDS[kind as usize].1;

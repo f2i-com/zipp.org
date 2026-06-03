@@ -295,6 +295,15 @@ pub struct Vm<'p> {
     arraybuffer_proto: u32,
     dataview_ctor: u32,
     dataview_proto: u32,
+    /// `SharedArrayBuffer` ctor + prototype. A SharedArrayBuffer reuses the
+    /// `HeapObj::ArrayBuffer` representation; its heap index is recorded in
+    /// `shared_buffers` so property/prototype/`instanceof` resolution treats it as
+    /// shared (growable instead of resizable, never detached, `SharedArrayBuffer`
+    /// toStringTag). 0 until setup.
+    sab_ctor: u32,
+    sab_proto: u32,
+    /// Heap indices of ArrayBuffers that are actually SharedArrayBuffers.
+    shared_buffers: std::collections::HashSet<u32>,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.

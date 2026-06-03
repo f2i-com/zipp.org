@@ -706,6 +706,23 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::UNDEFINED))
             }
+            // `SharedArrayBuffer.prototype.grow(newLength)` — only GROWS (never
+            // shrinks), within [currentLength, maxByteLength]. SABs are never
+            // detached.
+            "grow" => {
+                let max = match self.ab_max.get(&idx) {
+                    Some(&m) => m,
+                    None => return Err(Thrown("TypeError: SharedArrayBuffer is not growable".into())),
+                };
+                let n = self.to_integer_or_zero(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                if n < len as i64 || n as usize > max {
+                    return Err(Thrown("RangeError: SharedArrayBuffer grow length out of range".into()));
+                }
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(idx) {
+                    data.resize(n as usize, 0u8);
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
             "slice" => {
                 let start = self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
                 let end = self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
@@ -716,6 +733,14 @@ impl<'p> Vm<'p> {
                 let new_idx = self.alloc_array_buffer(slice.len());
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
                     data.copy_from_slice(&slice);
+                }
+                // `SharedArrayBuffer.prototype.slice` returns a SharedArrayBuffer
+                // (mark it shared AND link it to %SharedArrayBuffer.prototype%).
+                if self.shared_buffers.contains(&idx) {
+                    self.shared_buffers.insert(new_idx);
+                    if self.sab_proto != 0 {
+                        self.proto_of.insert(new_idx, Value::heap(self.sab_proto));
+                    }
                 }
                 Ok(Some(Value::heap(new_idx)))
             }

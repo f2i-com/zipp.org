@@ -221,6 +221,7 @@ impl Vm<'_> {
         self.zdt_tz.retain(|&k, _| marks[k as usize]);
         self.ab_max.retain(|&k, _| marks[k as usize]);
         self.ta_tracking.retain(|&k| marks[k as usize]);
+        self.shared_buffers.retain(|&k| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
         let _ = free_before;

@@ -1484,6 +1484,25 @@ impl<'p> Vm<'p> {
                 // never consults this proto accessor, so there's no recursion).
                 self.get_member(this, name, this)?
             }
+            SAB_GROW => {
+                let ok = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                if !ok {
+                    return Err(Thrown(
+                        "TypeError: SharedArrayBuffer.prototype.grow called on incompatible receiver".into(),
+                    ));
+                }
+                self.arraybuffer_method(this.heap_index(), "grow", args)?.unwrap_or(Value::UNDEFINED)
+            }
+            _ if (SAB_GETTER_BASE..SAB_GETTER_BASE + SAB_GETTERS.len() as u16).contains(&id) => {
+                let name = SAB_GETTERS[(id - SAB_GETTER_BASE) as usize];
+                if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {
+                    return Err(Thrown(format!(
+                        "TypeError: get SharedArrayBuffer.prototype.{name} called on incompatible receiver"
+                    )));
+                }
+                // The shared-buffer arm of get_member computes the value directly.
+                self.get_member(this, name, this)?
+            }
             PROXY_REVOCABLE => {
                 // Proxy.revocable(target, handler) → { proxy, revoke }.
                 let p = self.make_proxy(a0, a1)?;
