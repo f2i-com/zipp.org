@@ -50,6 +50,119 @@ impl<'p> Vm<'p> {
         self.do_eval(&source)
     }
 
+    /// Allocate a fresh `DisposableStack` instance (a plain object linked to
+    /// %DisposableStack.prototype%, with an empty, not-yet-disposed disposer stack).
+    pub(crate) fn alloc_disposable_stack(&mut self) -> u32 {
+        let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+        if self.disposablestack_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.disposablestack_proto));
+        }
+        self.dispose_stacks.insert(idx, (Vec::new(), false));
+        idx
+    }
+
+    /// Dispatch a `DisposableStack.prototype` method / `disposed` getter. `op` is
+    /// one of the `DISPOSABLE_*` native ids.
+    pub(crate) fn disposable_op(&mut self, op: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        use native::*;
+        if !(this.is_heap() && self.dispose_stacks.contains_key(&this.heap_index())) {
+            return Err(Thrown("TypeError: receiver is not a DisposableStack".into()));
+        }
+        let ti = this.heap_index();
+        let disposed = self.dispose_stacks.get(&ti).map(|(_, d)| *d).unwrap_or(true);
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        // Mutating methods reject a disposed stack with a ReferenceError.
+        if matches!(op, DISPOSABLE_USE | DISPOSABLE_ADOPT | DISPOSABLE_DEFER | DISPOSABLE_MOVE) && disposed
+        {
+            return Err(Thrown("ReferenceError: the DisposableStack has been disposed".into()));
+        }
+        match op {
+            DISPOSABLE_DISPOSED_GET => Ok(Value::bool(disposed)),
+            DISPOSABLE_USE => {
+                if a0.is_nullish() {
+                    return Ok(a0);
+                }
+                let method = self.get_member(a0, "@@dispose", a0)?;
+                if !self.is_callable(method) {
+                    return Err(Thrown(
+                        "TypeError: value is not disposable (its [Symbol.dispose] is not a function)".into(),
+                    ));
+                }
+                let disposer = Value::heap(self.heap.alloc(HeapObj::Bound {
+                    target: method,
+                    this: a0,
+                    args: Vec::new(),
+                }));
+                if let Some((d, _)) = self.dispose_stacks.get_mut(&ti) {
+                    d.push(disposer);
+                }
+                Ok(a0)
+            }
+            DISPOSABLE_ADOPT => {
+                let on = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_callable(on) {
+                    return Err(Thrown("TypeError: onDispose is not callable".into()));
+                }
+                let disposer = Value::heap(self.heap.alloc(HeapObj::Bound {
+                    target: on,
+                    this: Value::UNDEFINED,
+                    args: vec![a0],
+                }));
+                if let Some((d, _)) = self.dispose_stacks.get_mut(&ti) {
+                    d.push(disposer);
+                }
+                Ok(a0)
+            }
+            DISPOSABLE_DEFER => {
+                if !self.is_callable(a0) {
+                    return Err(Thrown("TypeError: onDispose is not callable".into()));
+                }
+                if let Some((d, _)) = self.dispose_stacks.get_mut(&ti) {
+                    d.push(a0);
+                }
+                Ok(Value::UNDEFINED)
+            }
+            DISPOSABLE_DISPOSE => {
+                // Idempotent: a second dispose() is a no-op.
+                let disposers = match self.dispose_stacks.get_mut(&ti) {
+                    Some((d, dd)) if !*dd => {
+                        *dd = true;
+                        std::mem::take(d)
+                    }
+                    _ => return Ok(Value::UNDEFINED),
+                };
+                // Run disposers in LIFO order. Spec aggregates thrown errors into a
+                // SuppressedError; v1 runs them all and re-throws the last one.
+                let mut pending: Option<Thrown> = None;
+                for disposer in disposers.into_iter().rev() {
+                    if let Err(e) = self.call_value(disposer, Value::UNDEFINED, &[]) {
+                        pending = Some(e);
+                    }
+                }
+                match pending {
+                    Some(e) => Err(e),
+                    None => Ok(Value::UNDEFINED),
+                }
+            }
+            DISPOSABLE_MOVE => {
+                let disposers = match self.dispose_stacks.get_mut(&ti) {
+                    Some((d, dd)) => {
+                        let taken = std::mem::take(d);
+                        *dd = true;
+                        taken
+                    }
+                    None => Vec::new(),
+                };
+                let new_idx = self.alloc_disposable_stack();
+                if let Some((d, _)) = self.dispose_stacks.get_mut(&new_idx) {
+                    *d = disposers;
+                }
+                Ok(Value::heap(new_idx))
+            }
+            _ => Ok(Value::UNDEFINED),
+        }
+    }
+
     pub(crate) fn construct(&mut self, cv: Value, args: &[Value]) -> Result<Value, Thrown> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
@@ -80,6 +193,9 @@ impl<'p> Vm<'p> {
         }
         if ci == self.sab_ctor && ci != 0 {
             return self.build_shared_array_buffer(args);
+        }
+        if ci == self.disposablestack_ctor && ci != 0 {
+            return Ok(Value::heap(self.alloc_disposable_stack()));
         }
         if ci == self.dataview_ctor && ci != 0 {
             return self.build_data_view(args);

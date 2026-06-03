@@ -1511,6 +1511,50 @@ impl<'p> Vm<'p> {
             }
             idx
         };
+        // DisposableStack (ES2026 explicit resource management): use/adopt/defer/
+        // dispose/move methods, a `disposed` accessor, [Symbol.dispose] (= dispose),
+        // and @@toStringTag "DisposableStack".
+        {
+            let methods: &[(&str, u16)] = &[
+                ("use", native::DISPOSABLE_USE),
+                ("adopt", native::DISPOSABLE_ADOPT),
+                ("defer", native::DISPOSABLE_DEFER),
+                ("dispose", native::DISPOSABLE_DISPOSE),
+                ("move", native::DISPOSABLE_MOVE),
+            ];
+            let p = build(self, methods, None);
+            self.proto_of.insert(p, Value::heap(obj_proto));
+            let getter =
+                Value::heap(self.heap.alloc(HeapObj::Native(native::DISPOSABLE_DISPOSED_GET)));
+            let dispose_fn =
+                Value::heap(self.heap.alloc(HeapObj::Native(native::DISPOSABLE_DISPOSE)));
+            let acc = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: Value::UNDEFINED,
+            };
+            let data_nw = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let tag = self.alloc_str("DisposableStack".to_string());
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("disposed", getter, acc);
+                m.define("@@dispose", dispose_fn, method_attr);
+                m.define("@@toStringTag", tag, data_nw);
+            }
+            self.disposablestack_proto = p;
+            let ctor = build(self, &[], Some(p));
+            self.disposablestack_ctor = ctor;
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("constructor", Value::heap(ctor), method_attr);
+            }
+        }
         // Bare global functions as first-class values (the call form is GlobalFn).
         let parse_int_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_INT));
         let parse_float_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_FLOAT));
@@ -1570,6 +1614,7 @@ impl<'p> Vm<'p> {
                 "Temporal" => Some(self.temporal_ns),
                 "Intl" => Some(self.intl_ns),
                 "Atomics" => Some(atomics_ns),
+                "DisposableStack" => Some(self.disposablestack_ctor),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -1590,7 +1635,8 @@ impl<'p> Vm<'p> {
                 if matches!(self.heap.get(v), HeapObj::Object(m) if m.is_ctor) {
                     let len = match name.as_str() {
                         "Date" => 7.0,
-                        "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator" => 0.0,
+                        "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator"
+                        | "DisposableStack" => 0.0,
                         "AggregateError" => 2.0, // (errors, message?)
                         "RegExp" => 2.0,         // (pattern, flags)
                         "Proxy" => 2.0,          // (target, handler)

@@ -163,6 +163,11 @@ impl Vm<'_> {
         for &p in self.prototypes.values() {
             root_idx!(p);
         }
+        for (disposers, _) in self.dispose_stacks.values() {
+            for &v in disposers {
+                root_val!(v);
+            }
+        }
         for m in self.fn_props.values().chain(self.arr_props.values()) {
             for &v in &m.vals {
                 root_val!(v);
@@ -222,6 +227,7 @@ impl Vm<'_> {
         self.ab_max.retain(|&k, _| marks[k as usize]);
         self.ta_tracking.retain(|&k| marks[k as usize]);
         self.shared_buffers.retain(|&k| marks[k as usize]);
+        self.dispose_stacks.retain(|&k, _| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
         let _ = free_before;

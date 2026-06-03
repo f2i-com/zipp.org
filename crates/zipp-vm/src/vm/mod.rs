@@ -304,6 +304,12 @@ pub struct Vm<'p> {
     sab_proto: u32,
     /// Heap indices of ArrayBuffers that are actually SharedArrayBuffers.
     shared_buffers: std::collections::HashSet<u32>,
+    /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
+    /// `disposablestack_proto`; its disposer stack + disposed flag live in
+    /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).
+    disposablestack_ctor: u32,
+    disposablestack_proto: u32,
+    dispose_stacks: std::collections::HashMap<u32, (Vec<Value>, bool)>,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.
