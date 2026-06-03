@@ -582,6 +582,13 @@ impl<'p> Vm<'p> {
             let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
             self.regs[new_base + rreg as usize] = arr;
         }
+        // `arguments`: ALL actual args (not just the declared params), so a
+        // callback invoked here (e.g. an array-method callback that reads
+        // `arguments[2]`) sees every argument — matching the direct Call op.
+        if let Some(areg) = proto.arguments_reg {
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+            self.regs[new_base + areg as usize] = arr;
+        }
 
         let stop_depth = self.frames.len();
         self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new() });
