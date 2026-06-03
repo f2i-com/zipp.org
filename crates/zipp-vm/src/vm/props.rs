@@ -762,6 +762,26 @@ impl<'p> Vm<'p> {
         if !obj.is_heap() || self.deleted_callable_intrinsics.contains(&(obj.heap_index(), bit)) {
             return false;
         }
+        // An EXPLICIT own `name`/`length` overrides the synthesized intrinsic: a
+        // class with `static name(){}` / `static name = …` / `static get name()`
+        // (or a function carrying an assigned `name`) keeps that real property.
+        // Per spec SetFunctionName is skipped when the object already has `name`,
+        // so NamedEvaluation must not clobber it.
+        let idx = obj.heap_index();
+        let has_explicit_own = match self.heap.get(idx) {
+            HeapObj::Class(c) => {
+                c.statics.pos(key).is_some()
+                    || c.static_getters.iter().any(|(k, _)| k == key)
+                    || c.static_setters.iter().any(|(k, _)| k == key)
+            }
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                self.fn_props.get(&idx).is_some_and(|m| m.pos(key).is_some())
+            }
+            _ => false,
+        };
+        if has_explicit_own {
+            return false;
+        }
         self.callable_name_length(obj).is_some()
     }
 
