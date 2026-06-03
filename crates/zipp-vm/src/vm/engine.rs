@@ -498,6 +498,12 @@ impl<'p> Vm<'p> {
         let base = 0usize;
         let top_regs = top.reg_count as usize;
         self.regs.resize(top_regs, Value::UNDEFINED);
+        // A Script's top-level `this` is the global object (a Module's would be
+        // undefined). Reg 0 is `this`; seed it with globalThis so sloppy code like
+        // `this.x = 1` at the top level targets the global object.
+        if self.global_this != 0 {
+            self.regs[base] = Value::heap(self.global_this);
+        }
         // Reserve register-file capacity up front so JIT self-recursion can
         // append callee windows without reallocating `self.regs` (which would
         // dangle the native code's window pointer). Must happen while regs holds
