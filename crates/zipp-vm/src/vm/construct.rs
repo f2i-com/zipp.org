@@ -968,10 +968,24 @@ impl<'p> Vm<'p> {
     /// (a custom iterable) yields `obj[@@iterator]()`; everything else (arrays,
     /// strings, Map/Set, generators) iterates directly and passes through.
     pub(crate) fn get_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
-            let m = self.get_prop(v, "@@iterator")?;
-            if self.is_callable(m) {
-                return self.call_value(m, v, &[]);
+        if v.is_heap() {
+            match self.heap.get(v.heap_index()) {
+                HeapObj::Object(_) => {
+                    let m = self.get_prop(v, "@@iterator")?;
+                    if self.is_callable(m) {
+                        return self.call_value(m, v, &[]);
+                    }
+                }
+                // A plain array: fast-path the default iterator (IterNext walks the
+                // array directly), but honour a replaced Array.prototype[@@iterator]
+                // by invoking it (so for-of uses the overridden iterator).
+                HeapObj::Array(_) => {
+                    let m = self.get_prop(v, "@@iterator")?;
+                    if m.bits() != self.default_array_iter.bits() && self.is_callable(m) {
+                        return self.call_value(m, v, &[]);
+                    }
+                }
+                _ => {}
             }
         }
         Ok(v)
