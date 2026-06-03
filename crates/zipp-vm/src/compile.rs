@@ -1084,11 +1084,26 @@ impl<'a> FnCompiler<'a> {
                 self.pop_scope();
             }
             S::IfStatement(i) => self.if_stmt(i)?,
-            S::WhileStatement(w) => self.while_stmt(w)?,
-            S::DoWhileStatement(d) => self.do_while_statement(d)?,
-            S::ForStatement(f) => self.for_stmt(f)?,
-            S::ForOfStatement(f) => self.for_of_statement(f)?,
-            S::ForInStatement(f) => self.for_in_statement(f)?,
+            S::WhileStatement(w) => {
+                self.reset_loop_completion();
+                self.while_stmt(w)?
+            }
+            S::DoWhileStatement(d) => {
+                self.reset_loop_completion();
+                self.do_while_statement(d)?
+            }
+            S::ForStatement(f) => {
+                self.reset_loop_completion();
+                self.for_stmt(f)?
+            }
+            S::ForOfStatement(f) => {
+                self.reset_loop_completion();
+                self.for_of_statement(f)?
+            }
+            S::ForInStatement(f) => {
+                self.reset_loop_completion();
+                self.for_in_statement(f)?
+            }
             S::BreakStatement(b) => {
                 let j = self.here();
                 self.emit(Instr::Jump { target: 0 });
@@ -2164,6 +2179,17 @@ impl<'a> FnCompiler<'a> {
             self.patch_jump(jf, end);
         }
         Ok(())
+    }
+
+    /// In eval mode, a loop's completion value starts as `undefined` (spec: the
+    /// loop's V is initialized to undefined, then updated by each non-empty body
+    /// completion). Emitting this once before the loop makes
+    /// `eval('1; do { break; } while(false)')` undefined rather than 1, while
+    /// `eval('do { 3 } while(false)')` stays 3. No-op outside eval mode.
+    fn reset_loop_completion(&mut self) {
+        if let Some(cr) = self.completion_reg {
+            self.emit(Instr::LoadUndefined { dst: cr });
+        }
     }
 
     fn while_stmt(&mut self, w: &ox::WhileStatement) -> R<()> {
