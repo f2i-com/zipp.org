@@ -548,6 +548,58 @@ impl<'p> Vm<'p> {
         Err(Thrown("TypeError: cannot convert value to a Temporal.PlainDate".into()))
     }
 
+    /// Round the date difference from `d1` to `d2` to `smallest` (a calendar unit:
+    /// year/month/week), then balance up to `largest`. NudgeToCalendarUnit: the
+    /// whole count of the smallest unit, plus the fraction of the way to the next
+    /// (measured in days against the anchor calendar), rounded per `mode`. Assumes
+    /// roundingIncrement 1 (the spec disallows >1 for calendar units).
+    pub(crate) fn round_relative_date_diff(
+        &self,
+        d1: (i64, i64, i64),
+        d2: (i64, i64, i64),
+        smallest: &str,
+        largest: &str,
+        mode: &str,
+    ) -> [i64; 4] {
+        let rank =
+            |u: &str| ["year", "month", "week", "day"].iter().position(|&x| x == u).unwrap_or(3);
+        let si = rank(smallest);
+        let e1 = iso_to_epoch_days(d1.0, d1.1, d1.2);
+        let e2 = iso_to_epoch_days(d2.0, d2.1, d2.2);
+        let sign = (e2 > e1) as i64 - (e2 < e1) as i64;
+        if sign == 0 {
+            return [0, 0, 0, 0];
+        }
+        // Whole count of the smallest unit from d1 to d2.
+        let count = difference_iso_date(d1, d2, smallest)[si];
+        let mk = |k: i64| -> [i64; 10] {
+            let mut dur = [0i64; 10];
+            dur[si] = k;
+            dur
+        };
+        let lower = self.date_add(d1.0, d1.1, d1.2, &mk(count), 1);
+        let ld = iso_to_epoch_days(lower.0, lower.1, lower.2);
+        let rounded = if ld == e2 {
+            count
+        } else {
+            let upper = self.date_add(d1.0, d1.1, d1.2, &mk(count + sign), 1);
+            let ud = iso_to_epoch_days(upper.0, upper.1, upper.2);
+            let denom = (ud - ld) as f64;
+            let progress = if denom != 0.0 { (e2 - ld) as f64 / denom } else { 0.0 };
+            round_fraction(count, sign, progress, mode)
+        };
+        // Balance up to largestUnit (only months can fold into years).
+        match si {
+            1 if rank(largest) == 0 => {
+                let end = self.date_add(d1.0, d1.1, d1.2, &mk(rounded), 1);
+                difference_iso_date(d1, end, "year")
+            }
+            0 => [rounded, 0, 0, 0],
+            1 => [0, rounded, 0, 0],
+            _ => [0, 0, rounded, 0],
+        }
+    }
+
     /// `date ± duration` (date units constrain day; time units fold to whole days).
     pub(crate) fn date_add(&self, y: i64, m: i64, d: i64, dur: &[i64; 10], sign: i64) -> (i64, i64, i64) {
         self.date_add_overflow(y, m, d, dur, sign, false).unwrap()
@@ -681,20 +733,18 @@ impl<'p> Vm<'p> {
                 } else {
                     (other, (y, m, d))
                 };
-                let diff = difference_iso_date(d1, d2, &largest);
                 let mut f = [0i64; 10];
-                f[..4].copy_from_slice(&diff);
-                // Round to smallestUnit. The day field rounds to the increment; a
-                // larger smallestUnit truncates the units below it (full calendar
-                // rounding for year/month/week with non-trunc modes is deferred).
+                // The day field rounds to the increment; a calendar smallestUnit
+                // (year/month/week) rounds the fractional remainder against the
+                // anchor calendar (NudgeToCalendarUnit) and balances to largestUnit.
                 let si = rank(&smallest);
                 if si == 3 {
+                    let diff = difference_iso_date(d1, d2, &largest);
+                    f[..4].copy_from_slice(&diff);
                     f[3] = round_increment(f[3] as i128, inc, &mode) as i64;
                 } else {
-                    for slot in f.iter_mut().take(4).skip(si + 1) {
-                        *slot = 0;
-                    }
-                    f[si] = round_increment(f[si] as i128, inc, &mode) as i64;
+                    let r = self.round_relative_date_diff(d1, d2, &smallest, &largest, &mode);
+                    f[..4].copy_from_slice(&r);
                 }
                 Ok(Some(self.make_duration(f)))
             }

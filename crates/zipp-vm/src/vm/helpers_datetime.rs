@@ -853,6 +853,44 @@ pub(crate) fn round_increment(value: i128, inc: i128, mode: &str) -> i128 {
     }
 }
 
+/// Round a value lying at fractional position `progress` (0..1) between `lower`
+/// and `lower+sign` to one of the two, per a Temporal roundingMode. `lower` is
+/// the toward-zero neighbour; `progress==0` means the value is exactly `lower`.
+/// Used for calendar-unit (year/month/week) difference rounding, where the
+/// fraction comes from the sub-unit remainder against the anchor calendar.
+pub(crate) fn round_fraction(lower: i64, sign: i64, progress: f64, mode: &str) -> i64 {
+    if progress <= 0.0 {
+        return lower; // exact
+    }
+    let upper = lower + sign;
+    let pick_upper = match mode {
+        "ceil" => sign > 0,
+        "floor" => sign < 0,
+        "trunc" => false,
+        "expand" => true,
+        _ => {
+            if progress > 0.5 {
+                true
+            } else if progress < 0.5 {
+                false
+            } else {
+                match mode {
+                    "halfCeil" => sign > 0,
+                    "halfFloor" => sign < 0,
+                    "halfTrunc" => false,
+                    "halfEven" => upper.rem_euclid(2) == 0,
+                    _ => true, // halfExpand
+                }
+            }
+        }
+    };
+    if pick_upper {
+        upper
+    } else {
+        lower
+    }
+}
+
 /// ISO day-of-week: Monday=1 … Sunday=7.
 pub(crate) fn iso_day_of_week(y: i64, m: i64, d: i64) -> i64 {
     let ed = iso_to_epoch_days(y, m, d);
