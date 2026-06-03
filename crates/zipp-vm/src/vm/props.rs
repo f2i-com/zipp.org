@@ -10,6 +10,39 @@ use crate::value::Value;
 impl<'p> Vm<'p> {
     /// Own ENUMERABLE keys / values / [k,v] entries of `obj` as an array (the
     /// shared core of `Object.keys`/`values`/`entries`).
+    /// A Proxy's `setPrototypeOf` trap. `Some(success)` for a proxy (the trap's
+    /// boolean, or the target update when no trap); `None` for a non-proxy.
+    pub(crate) fn proxy_set_prototype_of(
+        &mut self,
+        obj: Value,
+        proto: Value,
+    ) -> Result<Option<bool>, Thrown> {
+        if !obj.is_heap() {
+            return Ok(None);
+        }
+        let (target, handler, revoked) = match self.proxy_parts(obj.heap_index()) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if revoked {
+            return Err(Thrown(
+                "TypeError: Cannot perform 'setPrototypeOf' on a revoked proxy".into(),
+            ));
+        }
+        match self.proxy_trap(handler, "setPrototypeOf")? {
+            Some(trap) => {
+                let r = self.call_value(trap, handler, &[target, proto])?;
+                Ok(Some(self.truthy(r)))
+            }
+            None => {
+                if target.is_heap() {
+                    self.proto_of.insert(target.heap_index(), proto);
+                }
+                Ok(Some(true))
+            }
+        }
+    }
+
     /// A Proxy's `ownKeys` trap result as a list of property-key Values, or None
     /// for a non-proxy. With no trap, delegates to the target's own (string) keys.
     /// The trap result must be an Array.

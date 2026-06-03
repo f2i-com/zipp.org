@@ -717,8 +717,18 @@ impl<'p> Vm<'p> {
             OBJ_SET_PROTO_OF => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let proto = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                if o.is_heap() {
-                    self.proto_of.insert(o.heap_index(), proto);
+                match self.proxy_set_prototype_of(o, proto)? {
+                    Some(true) => {}
+                    Some(false) => {
+                        return Err(Thrown(
+                            "TypeError: Object.setPrototypeOf 'setPrototypeOf' trap returned falsish".into(),
+                        ))
+                    }
+                    None => {
+                        if o.is_heap() {
+                            self.proto_of.insert(o.heap_index(), proto);
+                        }
+                    }
                 }
                 o
             }
@@ -1037,8 +1047,13 @@ impl<'p> Vm<'p> {
                         "TypeError: Reflect.setPrototypeOf prototype must be an object or null".into(),
                     ));
                 }
-                self.proto_of.insert(a0.heap_index(), a1);
-                Value::bool(true)
+                match self.proxy_set_prototype_of(a0, a1)? {
+                    Some(b) => Value::bool(b),
+                    None => {
+                        self.proto_of.insert(a0.heap_index(), a1);
+                        Value::bool(true)
+                    }
+                }
             }
             REFLECT_DEFINE => {
                 if !self.is_object_value(a0) {
