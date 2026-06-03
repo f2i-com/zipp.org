@@ -752,13 +752,31 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot transfer a detached ArrayBuffer".into(),
                     ));
                 }
+                if self.immutable_buffers.contains(&idx) {
+                    return Err(Thrown(
+                        "TypeError: Cannot transfer an immutable ArrayBuffer".into(),
+                    ));
+                }
+                // Optional newLength (ToIndex): the result is that many bytes, the
+                // source bytes copied in (truncated / zero-filled to fit).
+                let new_len = match args.first() {
+                    Some(&v) if v != Value::UNDEFINED => {
+                        let n = self.to_integer_or_zero(v)?;
+                        if n < 0 || n > super::typedarray::MAX_ARRAY_BUFFER_LEN {
+                            return Err(Thrown("RangeError: invalid ArrayBuffer length".into()));
+                        }
+                        n as usize
+                    }
+                    _ => len,
+                };
                 let bytes: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => data.clone(),
                     _ => Vec::new(),
                 };
-                let new_idx = self.alloc_array_buffer(bytes.len());
+                let new_idx = self.alloc_array_buffer(new_len);
+                let n = bytes.len().min(new_len);
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
-                    data.copy_from_slice(&bytes);
+                    data[..n].copy_from_slice(&bytes[..n]);
                 }
                 self.immutable_buffers.insert(new_idx);
                 // Detach the source.

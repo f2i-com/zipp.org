@@ -9,7 +9,7 @@ use crate::value::Value;
 
 /// Practical upper bound on an ArrayBuffer/TypedArray byte length. A larger
 /// request is a RangeError rather than an attempted (process-aborting) alloc.
-const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
+pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
 impl<'p> Vm<'p> {
     pub(crate) fn as_array_buffer(&self, v: Value) -> Option<u32> {
