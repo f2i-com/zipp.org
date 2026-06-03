@@ -45,6 +45,21 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// IsConcatSpreadable(O) (ES 23.1.3.1.1): a `Symbol.isConcatSpreadable`
+    /// ("@@isConcatSpreadable") flag overrides — when present it is ToBoolean'd;
+    /// otherwise the value is spreadable iff it is an Array. Non-objects are never
+    /// spreadable. Used by `Array.prototype.concat`.
+    pub(crate) fn is_concat_spreadable(&mut self, v: Value) -> Result<bool, Thrown> {
+        if !v.is_heap() {
+            return Ok(false);
+        }
+        let flag = self.get_prop(v, "@@isConcatSpreadable")?;
+        if flag != Value::UNDEFINED {
+            return Ok(self.truthy(flag));
+        }
+        Ok(matches!(self.heap.get(v.heap_index()), HeapObj::Array(_)))
+    }
+
     /// Recursively flatten nested arrays up to `depth` levels (for `Array.flat`).
     /// Each nested array is cloned out before recursing (releases the heap borrow).
     pub(crate) fn flatten_array(&self, items: &[Value], depth: i32) -> Vec<Value> {

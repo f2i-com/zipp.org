@@ -572,13 +572,31 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(idx))) // reverses in place, returns the array
             }
             "concat" => {
-                // New array = this ++ each arg, spreading array args one level.
-                let mut out = self.array_snapshot(idx);
-                for a in args {
-                    if a.is_heap() && matches!(self.heap.get(a.heap_index()), HeapObj::Array(_)) {
-                        out.extend(self.array_snapshot(a.heap_index()));
+                // New array = `this` ++ each arg. An element is spread one level
+                // iff IsConcatSpreadable (a `Symbol.isConcatSpreadable` flag, else
+                // IsArray) — so an array-like with the flag spreads, and an array
+                // with the flag cleared is added whole. Both `this` and the args
+                // are subject to the check.
+                let this_val = Value::heap(idx);
+                let mut out: Vec<Value> = Vec::new();
+                for e in std::iter::once(this_val).chain(args.iter().copied()) {
+                    if self.is_concat_spreadable(e)? {
+                        // A real array spreads via its dense storage (fast); any
+                        // other spreadable (array-like) reads ToLength(length) and
+                        // each index — coercion/getters here may throw, per spec.
+                        if e.is_heap() && matches!(self.heap.get(e.heap_index()), HeapObj::Array(_)) {
+                            let snap = self.array_snapshot(e.heap_index());
+                            out.extend(snap);
+                        } else {
+                            let len_v = self.get_prop(e, "length")?;
+                            let len = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1);
+                            for k in 0..len {
+                                let el = self.get_prop(e, &k.to_string())?;
+                                out.push(el);
+                            }
+                        }
                     } else {
-                        out.push(*a);
+                        out.push(e);
                     }
                 }
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
