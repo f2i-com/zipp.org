@@ -1284,11 +1284,14 @@ impl<'a> FnCompiler<'a> {
                 _ => unreachable!("handled above"),
             };
 
-            // Top-level `let`/`const`/`var` bind to GLOBAL slots, so that a
-            // nested function referencing them resolves via LoadGlobal (a
-            // top-level binding is never an upvalue). This keeps the capture
-            // machinery confined to genuinely nested scopes.
-            if self.is_script {
+            // `var` (function-scoped) and a TRUE top-level `let`/`const` bind to
+            // GLOBAL slots, so a nested function resolves them via LoadGlobal (a
+            // top-level binding is never an upvalue). But a `let`/`const` nested
+            // inside a BLOCK is block-scoped and must NOT leak to the global
+            // scope (`{ let x = 1; }` leaves `x` undeclared after the block) — it
+            // falls through to a block-local binding even at script level.
+            let block_scoped_lexical = d.kind.is_lexical() && self.scopes.len() > 1;
+            if self.is_script && !block_scoped_lexical {
                 let slot = self.cx.global_slot(name) as u32;
                 let tmp = self.temp();
                 let v = if let Some(init) = &decl.init {
