@@ -690,10 +690,28 @@ impl<'p> Vm<'p> {
             // A native value's `name`/`length`: a prototype method
             // (`Array.prototype.map.name === "map"`, length 1) or a static/namespace
             // method (`Object.keys.name === "keys"`, `Reflect.get.length === 2`).
-            HeapObj::Native(id) => native::proto_method(*id)
-                .map(|(n, _, l)| (n.to_string(), l as i32))
-                .or_else(|| native::math_method(*id).map(|(n, _, l)| (n.to_string(), l as i32)))
-                .or_else(|| native::static_name_length(*id).map(|(n, l)| (n.to_string(), l as i32))),
+            HeapObj::Native(id) => {
+                let id = *id;
+                // Accessor getters carry name "get <prop>" and length 0.
+                if (native::BUFFER_GETTER_BASE
+                    ..native::BUFFER_GETTER_BASE + native::BUFFER_GETTERS.len() as u16)
+                    .contains(&id)
+                {
+                    let (name, _) = native::BUFFER_GETTERS[(id - native::BUFFER_GETTER_BASE) as usize];
+                    return Some((format!("get {name}"), 0));
+                }
+                if (native::SAB_GETTER_BASE
+                    ..native::SAB_GETTER_BASE + native::SAB_GETTERS.len() as u16)
+                    .contains(&id)
+                {
+                    let name = native::SAB_GETTERS[(id - native::SAB_GETTER_BASE) as usize];
+                    return Some((format!("get {name}"), 0));
+                }
+                native::proto_method(id)
+                    .map(|(n, _, l)| (n.to_string(), l as i32))
+                    .or_else(|| native::math_method(id).map(|(n, _, l)| (n.to_string(), l as i32)))
+                    .or_else(|| native::static_name_length(id).map(|(n, l)| (n.to_string(), l as i32)))
+            }
             // The anonymous functions returned by the Intl format/compare getters
             // have name "" and length 1 (format) / 2 (compare).
             HeapObj::Bound { target, .. } if target.is_heap() => {

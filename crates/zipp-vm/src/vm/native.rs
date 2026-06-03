@@ -634,6 +634,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     if id == ARRAYBUFFER_RESIZE {
         return Some(("resize", 1));
     }
+    if id == ARRAYBUFFER_ISVIEW {
+        return Some(("isView", 1));
+    }
     // Temporal.<Type>.prototype method natives: name + length as own properties.
     for (base, methods) in [
         (TEMPORAL_M_BASE, TEMPORAL_DURATION_METHODS),
