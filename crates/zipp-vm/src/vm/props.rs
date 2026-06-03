@@ -245,6 +245,25 @@ impl<'p> Vm<'p> {
         Value::UNDEFINED
     }
 
+    /// If `idx` is a generator / async / async-generator FUNCTION, the matching
+    /// dynamic-function intrinsic prototype (%GeneratorFunction.prototype% etc.) —
+    /// its [[Prototype]] and the target for its method/`.constructor` lookups.
+    /// `None` for plain functions (which use %Function.prototype%) and non-callables.
+    pub(crate) fn callable_dynfn_proto(&self, idx: u32) -> Option<u32> {
+        let fid = match self.heap.get(idx) {
+            HeapObj::Func(f) => *f,
+            HeapObj::Closure { func, .. } => *func,
+            _ => return None,
+        };
+        let p = self.func(fid as usize);
+        match (p.is_generator, p.is_async) {
+            (true, true) => (self.asyncgen_fn_proto != 0).then_some(self.asyncgen_fn_proto),
+            (true, false) => (self.gen_fn_proto != 0).then_some(self.gen_fn_proto),
+            (false, true) => (self.async_fn_proto != 0).then_some(self.async_fn_proto),
+            (false, false) => None,
+        }
+    }
+
     pub(crate) fn object_get_prototype_of(&mut self, obj: Value) -> Value {
         if !obj.is_heap() {
             return Value::NULL;
@@ -301,6 +320,13 @@ impl<'p> Vm<'p> {
             HeapObj::Array(_) => (None, 2),
             _ => (None, 3),
         };
+        // A generator/async/async-generator function's [[Prototype]] is the
+        // matching dynamic-function intrinsic prototype, not %Function.prototype%.
+        if kind == 1 {
+            if let Some(p) = self.callable_dynfn_proto(idx) {
+                return Value::heap(p);
+            }
+        }
         match kind {
             0 => {
                 if let Some(cidx) = class {
@@ -1224,10 +1250,14 @@ impl<'p> Vm<'p> {
                         return Ok(v);
                     }
                 }
-                // Inherited methods: Function.prototype (call/apply/bind) then up
-                // the chain to Object.prototype (toString/valueOf/hasOwnProperty/…),
-                // so `fn.toString`, `fn.hasOwnProperty`, `fn + ''` (ToPrimitive) work.
-                Ok(self.proto_member(self.fn_proto, key))
+                // Inherited methods: a generator/async function starts at its
+                // dynamic-function intrinsic prototype (so `gen.constructor` is
+                // %GeneratorFunction%), else %Function.prototype% (call/apply/bind),
+                // then up to Object.prototype (toString/valueOf/hasOwnProperty/…).
+                let start = self
+                    .callable_dynfn_proto(obj.heap_index())
+                    .unwrap_or(self.fn_proto);
+                Ok(self.proto_member(start, key))
             }
             _ => Ok(Value::UNDEFINED),
         }

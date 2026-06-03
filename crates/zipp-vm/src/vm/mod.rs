@@ -221,6 +221,18 @@ pub struct Vm<'p> {
     /// `call_ctor_as_function` so `new Function(args, body)` / `Function(...)`
     /// compile and return a real function (via `do_eval` of a function literal).
     function_ctor: u32,
+    /// The %GeneratorFunction% / %AsyncFunction% / %AsyncGeneratorFunction%
+    /// intrinsic constructors and their `.prototype` objects. Not global — reached
+    /// via `Object.getPrototypeOf(function*(){}).constructor` etc. A generator/
+    /// async/async-generator function's [[Prototype]] is the matching `*_fn_proto`
+    /// (so its `.constructor` resolves to the matching ctor); the ctors build new
+    /// functions via `do_eval` of `(function*|async ... anonymous(){...})`.
+    gen_fn_ctor: u32,
+    gen_fn_proto: u32,
+    async_fn_ctor: u32,
+    async_fn_proto: u32,
+    asyncgen_fn_ctor: u32,
+    asyncgen_fn_proto: u32,
     arr_proto: u32,
     /// `String.prototype` — primitive string values delegate here for method
     /// access (`"x".charAt`, `"x".slice`, …, as values), 0 until `setup_globals`.

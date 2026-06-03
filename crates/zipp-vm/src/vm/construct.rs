@@ -19,6 +19,14 @@ impl<'p> Vm<'p> {
     /// function. A malformed body/parameter list surfaces as the parser's
     /// SyntaxError. The result runs in global scope (it captures nothing).
     pub(crate) fn build_function(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        self.build_function_kind(args, 0)
+    }
+
+    /// Shared by all four dynamic-function constructors. `kind`: 0=Function,
+    /// 1=GeneratorFunction, 2=AsyncFunction, 3=AsyncGeneratorFunction — selecting
+    /// the `function` / `function*` / `async function` / `async function*` wrapper
+    /// keyword so the eval completion value is a function of the right kind.
+    pub(crate) fn build_function_kind(&mut self, args: &[Value], kind: u8) -> Result<Value, Thrown> {
         let (params, body) = if args.is_empty() {
             (String::new(), String::new())
         } else {
@@ -29,10 +37,16 @@ impl<'p> Vm<'p> {
             }
             (parts.join(","), body)
         };
+        let prefix = match kind {
+            1 => "function* ",
+            2 => "async function ",
+            3 => "async function* ",
+            _ => "function ",
+        };
         // The newline before `)` defends against a `//` comment in the last
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.
-        let source = format!("(function anonymous({params}\n) {{\n{body}\n}})");
+        let source = format!("({prefix}anonymous({params}\n) {{\n{body}\n}})");
         self.do_eval(&source)
     }
 
@@ -51,6 +65,15 @@ impl<'p> Vm<'p> {
         let ci = cv.heap_index();
         if ci == self.function_ctor && ci != 0 {
             return self.build_function(args);
+        }
+        if ci == self.gen_fn_ctor && ci != 0 {
+            return self.build_function_kind(args, 1);
+        }
+        if ci == self.async_fn_ctor && ci != 0 {
+            return self.build_function_kind(args, 2);
+        }
+        if ci == self.asyncgen_fn_ctor && ci != 0 {
+            return self.build_function_kind(args, 3);
         }
         if ci == self.arraybuffer_ctor && ci != 0 {
             return self.build_array_buffer(args);
@@ -500,10 +523,20 @@ impl<'p> Vm<'p> {
     /// Boolean coerce their argument to a primitive (matching the compiler's
     /// lowered direct-call form); every other core constructor constructs.
     pub(crate) fn call_ctor_as_function(&mut self, callee: Value, args: &[Value]) -> Result<Value, Thrown> {
-        // `Function(args, body)` (called WITHOUT `new`) behaves exactly like
-        // `new Function(...)` — both compile and return a fresh function.
-        if callee.heap_index() == self.function_ctor && self.function_ctor != 0 {
+        // The dynamic-function constructors called WITHOUT `new` behave exactly
+        // like `new <Ctor>(...)` — both compile and return a fresh function.
+        let ci = callee.heap_index();
+        if ci == self.function_ctor && self.function_ctor != 0 {
             return self.build_function(args);
+        }
+        if ci == self.gen_fn_ctor && self.gen_fn_ctor != 0 {
+            return self.build_function_kind(args, 1);
+        }
+        if ci == self.async_fn_ctor && self.async_fn_ctor != 0 {
+            return self.build_function_kind(args, 2);
+        }
+        if ci == self.asyncgen_fn_ctor && self.asyncgen_fn_ctor != 0 {
+            return self.build_function_kind(args, 3);
         }
         let proto = match self.heap.get(callee.heap_index()) {
             HeapObj::Object(m) => m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index()),

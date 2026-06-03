@@ -101,6 +101,51 @@ impl<'p> Vm<'p> {
         Some(Value::heap(p))
     }
 
+    /// Build one of the %GeneratorFunction% / %AsyncFunction% /
+    /// %AsyncGeneratorFunction% intrinsic constructors and its `.prototype`,
+    /// returning `(ctor, prototype)` heap indices. These are NOT global — they are
+    /// reached via `Object.getPrototypeOf(function*(){}).constructor` etc. Their
+    /// chain (spec 27.3/27.4/27.7): ctor [[Prototype]] = %Function%, ctor.prototype
+    /// = proto ({w:false,e:false,c:true}); proto [[Prototype]] = %Function.prototype%,
+    /// proto.constructor = ctor, proto[@@toStringTag] = `tag`. Requires `fn_proto`
+    /// and `function_ctor` already set.
+    fn build_dynamic_fn_intrinsic(&mut self, tag: &str) -> (u32, u32) {
+        // {writable:false, enumerable:false, configurable:true} — name/length and
+        // the intrinsic .prototype and @@toStringTag descriptor.
+        let nameish = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let method_attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let proto = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+        self.proto_of.insert(proto, Value::heap(self.fn_proto));
+        let mut cm = ObjMap::new();
+        cm.define("prototype", Value::heap(proto), nameish);
+        cm.is_ctor = true;
+        let ctor = self.heap.alloc(HeapObj::Object(cm));
+        self.proto_of.insert(ctor, Value::heap(self.function_ctor));
+        let namev = self.alloc_str(tag.to_string());
+        let tagv = self.alloc_str(tag.to_string());
+        if let HeapObj::Object(m) = self.heap.get_mut(ctor) {
+            m.define("name", namev, nameish);
+            m.define("length", Value::num(1.0), nameish);
+        }
+        if let HeapObj::Object(m) = self.heap.get_mut(proto) {
+            m.define("@@toStringTag", tagv, nameish);
+            m.define("constructor", Value::heap(ctor), method_attr);
+        }
+        (ctor, proto)
+    }
+
     /// Build the built-in global object graph (Object/Array/Function + their
     /// prototypes, with methods as native function VALUES) and inject it into the
     /// global slots the compiler reserved for those free identifiers. Makes
@@ -453,6 +498,18 @@ impl<'p> Vm<'p> {
                 m.define("@@toStringTag", tv, tag_data);
             }
         }
+        // %GeneratorFunction% / %AsyncFunction% / %AsyncGeneratorFunction%: the
+        // dynamic-function constructors reached via a generator/async function's
+        // .constructor. Built after `function_ctor`/`fn_proto` exist.
+        let (g_ctor, g_proto) = self.build_dynamic_fn_intrinsic("GeneratorFunction");
+        self.gen_fn_ctor = g_ctor;
+        self.gen_fn_proto = g_proto;
+        let (a_ctor, a_proto) = self.build_dynamic_fn_intrinsic("AsyncFunction");
+        self.async_fn_ctor = a_ctor;
+        self.async_fn_proto = a_proto;
+        let (ag_ctor, ag_proto) = self.build_dynamic_fn_intrinsic("AsyncGeneratorFunction");
+        self.asyncgen_fn_ctor = ag_ctor;
+        self.asyncgen_fn_proto = ag_proto;
         // Default @@iterator: Map → entries, Set → values (alias to the same fn).
         let map_entries = match self.heap.get(map_proto) {
             HeapObj::Object(m) => m.get("entries"),
