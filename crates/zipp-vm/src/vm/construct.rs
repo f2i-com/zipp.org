@@ -1131,7 +1131,9 @@ impl<'p> Vm<'p> {
                 | HeapObj::Set(_)
                 | HeapObj::Map { .. }
                 | HeapObj::TypedArray { .. }
-                | HeapObj::Generator { .. } => Kind::Iterable,
+                | HeapObj::Generator { .. }
+                | HeapObj::Iterator { .. }
+                | HeapObj::IterHelper { .. } => Kind::Iterable,
                 HeapObj::Object(_) => Kind::Obj,
                 _ => Kind::Other,
             }

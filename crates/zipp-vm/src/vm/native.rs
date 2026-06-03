@@ -200,6 +200,10 @@ pub const DISPOSABLE_MOVE: u16 = 844;
 pub const DISPOSABLE_DISPOSED_GET: u16 = 845;
 /// `AsyncDisposableStack.prototype.disposeAsync` — runs disposers, returns a Promise.
 pub const DISPOSABLE_DISPOSE_ASYNC: u16 = 846;
+/// `%GeneratorPrototype%` next/return/throw (dispatch to `generator_method`).
+pub const GEN_NEXT: u16 = 850;
+pub const GEN_RETURN: u16 = 851;
+pub const GEN_THROW: u16 = 852;
 // String static methods.
 pub const STR_FROM_CHAR_CODE: u16 = 311;
 pub const STR_FROM_CODE_POINT: u16 = 312;
@@ -796,6 +800,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         DISPOSABLE_DISPOSE => ("dispose", 0),
         DISPOSABLE_DISPOSE_ASYNC => ("disposeAsync", 0),
         DISPOSABLE_MOVE => ("move", 0),
+        GEN_NEXT => ("next", 1),
+        GEN_RETURN => ("return", 1),
+        GEN_THROW => ("throw", 1),
         STR_FROM_CHAR_CODE => ("fromCharCode", 1),
         STR_FROM_CODE_POINT => ("fromCodePoint", 1),
         STR_RAW => ("raw", 1),

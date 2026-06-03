@@ -475,6 +475,26 @@ impl<'p> Vm<'p> {
         if let HeapObj::Object(m) = self.heap.get_mut(helper_proto) {
             m.define("@@toStringTag", helper_tag, tag_data);
         }
+        // %GeneratorPrototype% — generator instances delegate here. next/return/
+        // throw + @@iterator (self) + @@toStringTag "Generator"; chains to
+        // %Iterator.prototype% so a generator inherits the helper methods
+        // (`g().map(...)`, `g().take(n)`, …).
+        let gen_proto = build(
+            self,
+            &[
+                ("next", native::GEN_NEXT),
+                ("return", native::GEN_RETURN),
+                ("throw", native::GEN_THROW),
+                ("@@iterator", ITER_SELF),
+            ],
+            None,
+        );
+        self.proto_of.insert(gen_proto, Value::heap(iter_root));
+        let gen_tag = self.alloc_str("Generator".to_string());
+        if let HeapObj::Object(m) = self.heap.get_mut(gen_proto) {
+            m.define("@@toStringTag", gen_tag, tag_data);
+        }
+        self.gen_proto = gen_proto;
         // The `Iterator` constructor (abstract): prototype = %Iterator.prototype%,
         // static `Iterator.from`. name "Iterator", length 0.
         let iter_ctor = build(self, &[("from", ITER_FROM)], Some(iter_root));

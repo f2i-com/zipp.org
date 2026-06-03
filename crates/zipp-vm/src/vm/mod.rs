@@ -363,6 +363,10 @@ pub struct Vm<'p> {
     /// lazy helpers, chains to the root), and the `Iterator` constructor.
     iterator_proto_root: u32,
     iterator_helper_proto: u32,
+    /// `%GeneratorPrototype%` — the prototype of generator instances: next/return/
+    /// throw + @@iterator + @@toStringTag, chaining to %Iterator.prototype% so a
+    /// generator inherits the iterator-helper methods (`g().map(...)` etc.).
+    gen_proto: u32,
     iterator_ctor: u32,
     /// The test262 `$262` host object (0 until set up).
     dollar262: u32,

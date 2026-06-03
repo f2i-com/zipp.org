@@ -592,6 +592,7 @@ impl<'p> Vm<'p> {
                                     HeapObj::Generator { .. }
                                         | HeapObj::Object(_)
                                         | HeapObj::Iterator { .. }
+                                        | HeapObj::IterHelper { .. }
                                         | HeapObj::TypedArray { .. }
                                 )
                             {
