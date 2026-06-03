@@ -817,6 +817,11 @@ struct FnCompiler<'a> {
     /// moving the init into a non-capturing thunk (which would lose closure over
     /// the enclosing scope).
     this_override: Option<Reg>,
+    /// Set transiently around a block-nested lexical destructuring declaration at
+    /// SCRIPT level so `declare_pattern` binds the pattern's leaves as block-locals
+    /// (not globals), mirroring the simple-identifier `let`/`const` path — block
+    /// `let {a} = …` must not leak to the global scope. Off everywhere else.
+    pattern_block_local: bool,
     /// True while compiling a `function*` body, so `yield` is allowed.
     in_generator: bool,
     /// True while compiling an `async` body, so `await` is allowed.
@@ -896,6 +901,7 @@ impl<'a> FnCompiler<'a> {
             uses_arguments: false,
             super_class: None,
             this_override: None,
+            pattern_block_local: false,
             in_generator: false,
             in_async: false,
             pending_label: None,
@@ -1294,6 +1300,11 @@ impl<'a> FnCompiler<'a> {
                     .init
                     .as_ref()
                     .ok_or("a destructuring declaration requires an initializer")?;
+                // A block-nested lexical (`let`/`const`) destructuring at script
+                // level binds its leaves block-local, not global — same rule as the
+                // simple-identifier path below, so `{ let {a} = o; }` doesn't leak.
+                let block_local = d.kind.is_lexical() && self.scopes.len() > 1;
+                self.pattern_block_local = block_local;
                 self.declare_pattern(&decl.id)?;
                 let save = self.next_reg;
                 let src = self.alloc_reg();
@@ -1302,6 +1313,7 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::Move { dst: src, src: sv });
                 }
                 self.extract_pattern(&decl.id, src)?;
+                self.pattern_block_local = false;
                 self.next_reg = save; // reclaim the source + extraction temps
                 continue;
             }
@@ -1365,7 +1377,7 @@ impl<'a> FnCompiler<'a> {
         use ox::BindingPattern as P;
         match pat {
             P::BindingIdentifier(id) => {
-                if self.is_script {
+                if self.is_script && !self.pattern_block_local {
                     self.cx.global_slot(&id.name);
                 } else {
                     self.declare_local(&id.name);
