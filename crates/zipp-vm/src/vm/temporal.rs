@@ -2583,9 +2583,12 @@ fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> f64 {
     }
 }
 
-/// Parse a ZonedDateTime ISO string `YYYY-MM-DDTHH:MM:SS[.fff]±OFF[tzid]` into
-/// (date-time fields, offset ns, tz id). The bracketed id may carry a leading `!`
-/// critical flag (stripped). Stage 1: uses the explicit string offset.
+/// Parse a ZonedDateTime ISO string `<date>[T<time>][±OFF|Z][tzid][annotations]`
+/// into (date-time fields, offset ns, tz id). The `[tzid]` annotation is REQUIRED
+/// (it carries the zone); a leading `!` critical flag is stripped. The explicit
+/// numeric offset / `Z` is OPTIONAL — when absent the offset comes from the zone
+/// (so `1970-01-01T00:00[UTC]` and `2020-01-01[+09:00]` parse). The time part is
+/// optional (date-only -> midnight). Basic-format offsets (`-0800`) are accepted.
 fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String)> {
     let lb = s.find('[')?;
     let rb = s[lb..].find(']').map(|r| lb + r)?;
@@ -2593,18 +2596,34 @@ fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String)> {
     if let Some(stripped) = tz.strip_prefix('!') {
         tz = stripped.to_string();
     }
+    // The bracket must be a valid time zone (named or numeric-offset); its offset
+    // is the fallback when the datetime carries no explicit offset.
+    let (tz_id, tz_offset) = parse_time_zone(&tz)?;
     let head = &s[..lb];
-    let tpos = head.find(['T', 't', ' '])?;
-    let time = &head[tpos + 1..];
-    let (dt_end, offset_ns) = if let Some(zpos) = time.find(['Z', 'z']) {
-        (tpos + 1 + zpos, 0i64)
-    } else if let Some(opos) = time.find(['+', '-']) {
-        (tpos + 1 + opos, parse_time_zone(&time[opos..]).map(|(_, o)| o)?)
-    } else {
-        return None; // a ZonedDateTime string must carry an offset
+    // Split off an optional time part at the date/time separator.
+    let (date_part, time_part) = match head.find(['T', 't', ' ']) {
+        Some(tp) => (&head[..tp], Some(&head[tp + 1..])),
+        None => (head, None),
     };
-    let f = parse_iso_datetime(&head[..dt_end])?;
-    Some((f, offset_ns, tz))
+    let date = parse_iso_date(date_part)?;
+    // In the time part, locate an explicit `Z` or numeric offset (else use the
+    // zone's offset). The time itself never contains `+`/`-`, so the first one
+    // begins the offset.
+    let (time_str, offset_ns) = match time_part {
+        None => ("", tz_offset),
+        Some(t) => {
+            if let Some(zpos) = t.find(['Z', 'z']) {
+                (&t[..zpos], 0i64)
+            } else if let Some(opos) = t.find(['+', '-']) {
+                (&t[..opos], parse_offset_ns(&t[opos..])? as i64)
+            } else {
+                (t, tz_offset)
+            }
+        }
+    };
+    let time = if time_str.is_empty() { [0i64; 6] } else { parse_iso_time(time_str)? };
+    let f = [date.0, date.1, date.2, time[0], time[1], time[2], time[3], time[4], time[5]];
+    Some((f, offset_ns, tz_id))
 }
 
 /// Format a UTC offset (nanoseconds) as `±HH:MM` (or `±HH:MM:SS` when needed).
