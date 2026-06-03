@@ -126,6 +126,11 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
             return Err(Thrown("TypeError: Cannot convert a Symbol value to a string".into()));
         }
+        // ToString(object) is ToPrimitive(input, "string") then a string coercion;
+        // honour a `@@toPrimitive` hook before falling back to toString/valueOf.
+        if let Some(p) = self.symbol_to_primitive(v, "string")? {
+            return self.to_js_string(p);
+        }
         for name in ["toString", "valueOf"] {
             let f = self.get_prop(v, name)?;
             // `is_callable` (not `as_callable`) so native methods count — notably
@@ -644,15 +649,53 @@ impl<'p> Vm<'p> {
         self.to_number(prim)
     }
 
-    /// OrdinaryToPrimitive(v, "number"): try `valueOf` then `toString`, returning
-    /// the first that yields a primitive; TypeError if neither does. (The
-    /// `Symbol.toPrimitive` hook is not consulted yet.)
+    /// ToPrimitive's `@@toPrimitive` hook (ES ToPrimitive step 2a-c): if `v` is an
+    /// object with a callable `Symbol.toPrimitive` ("@@toPrimitive") method, invoke
+    /// it with the hint ("number" / "string" / "default") and require a primitive
+    /// result (else TypeError). Returns `None` when there is no such method, so the
+    /// caller falls back to OrdinaryToPrimitive (valueOf/toString). Already-primitive
+    /// heap values (str/bigint/symbol) and boxed wrappers are left to the caller.
+    pub(crate) fn symbol_to_primitive(&mut self, v: Value, hint: &str) -> Result<Option<Value>, Thrown> {
+        if !v.is_heap()
+            || matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+                    | HeapObj::BigInt(_)
+                    | HeapObj::Symbol { .. }
+                    | HeapObj::Boxed { .. }
+            )
+        {
+            return Ok(None);
+        }
+        let f = self.get_prop(v, "@@toPrimitive")?;
+        if !self.is_callable(f) {
+            return Ok(None);
+        }
+        let hv = self.alloc_str(hint.to_string());
+        let r = self.call_value(f, v, &[hv])?;
+        let is_obj = r.is_heap()
+            && !matches!(
+                self.heap.get(r.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+            );
+        if is_obj {
+            return Err(Thrown("TypeError: Cannot convert object to primitive value".into()));
+        }
+        Ok(Some(r))
+    }
+
+    /// ToPrimitive(v, "number"): the `@@toPrimitive` hook, else OrdinaryToPrimitive
+    /// (`valueOf` then `toString`, first primitive wins; TypeError if neither does).
     pub(crate) fn to_primitive_number(&mut self, v: Value) -> Result<Value, Thrown> {
         // A boxed primitive wrapper yields its wrapped primitive directly.
         if v.is_heap() {
             if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
                 return Ok(*value);
             }
+        }
+        if let Some(p) = self.symbol_to_primitive(v, "number")? {
+            return Ok(p);
         }
         for name in ["valueOf", "toString"] {
             let f = self.get_prop(v, name)?;
@@ -689,6 +732,9 @@ impl<'p> Vm<'p> {
         // its wrapped primitive — the built-in valueOf would return the same.
         if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
             return Ok(*value);
+        }
+        if let Some(p) = self.symbol_to_primitive(v, "default")? {
+            return Ok(p);
         }
         let order: [&str; 2] = if matches!(self.heap.get(v.heap_index()), HeapObj::Date(_)) {
             ["toString", "valueOf"]

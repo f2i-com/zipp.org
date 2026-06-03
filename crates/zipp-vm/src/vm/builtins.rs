@@ -140,7 +140,10 @@ impl<'p> Vm<'p> {
                     // class method); only the generic intrinsic is handled inline
                     // (`obj.toString()` was ignoring an own toString).
                     if self.method_is_generic(recv, "toString", native::PROTO_TO_STRING)? {
-                        return Ok(Some(self.alloc_str("[object Object]".to_string())));
+                        // Honour a string `@@toStringTag` (`[object Cool]`), matching
+                        // the Object.prototype.toString value form.
+                        let tag = self.object_to_string_tag(recv)?;
+                        return Ok(Some(self.alloc_str(format!("[object {tag}]"))));
                     }
                 }
             }
