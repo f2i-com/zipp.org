@@ -710,7 +710,9 @@ impl<'p> Vm<'p> {
         use crate::bytecode::{FuncProto, Instr};
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
-        let ret = oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::default()).parse();
+        // eval code is a Script (never a module), so `await` is a valid identifier
+        // and the body runs in sloppy mode unless it carries a "use strict".
+        let ret = oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::script()).parse();
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }

@@ -49,7 +49,7 @@ pub struct Outcome {
 /// [`Outcome::error`] alongside any output produced before it.
 pub fn run(src: &str) -> Result<Outcome, String> {
     let allocator = Allocator::default();
-    let ret = Parser::new(&allocator, src, SourceType::default()).parse();
+    let ret = Parser::new(&allocator, src, SourceType::unambiguous()).parse();
     if !ret.errors.is_empty() {
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
@@ -125,7 +125,7 @@ mod tests {
     /// checks against the default JIT-on `run`.
     fn run_nojit(src: &str) -> Vec<String> {
         let allocator = Allocator::default();
-        let ret = Parser::new(&allocator, src, SourceType::default()).parse();
+        let ret = Parser::new(&allocator, src, SourceType::unambiguous()).parse();
         assert!(ret.errors.is_empty(), "parse error: {:?}", ret.errors);
         let program = compile::compile_program(&ret.program, src).expect("compile");
         let mut vm = vm::Vm::new(&program);
