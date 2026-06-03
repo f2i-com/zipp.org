@@ -581,7 +581,13 @@ impl<'p> Vm<'p> {
                 self.call_value(this, a0, rest)?
             }
             FN_APPLY => {
-                let callargs = if a1.is_heap() { self.iterate_to_vec(a1)? } else { Vec::new() };
+                // argArray null/undefined -> no args; otherwise CreateListFromArrayLike
+                // (an array-like, NOT necessarily an iterable).
+                let callargs = if a1.is_nullish() {
+                    Vec::new()
+                } else {
+                    self.create_list_from_array_like(a1)?
+                };
                 self.call_value(this, a0, &callargs)?
             }
             FN_BIND => {
@@ -959,8 +965,8 @@ impl<'p> Vm<'p> {
                 let target = a0;
                 let this_arg = a1;
                 let args_list = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                let arg_vec =
-                    if args_list.is_heap() { self.array_snapshot(args_list.heap_index()) } else { Vec::new() };
+                // Reflect.apply requires an array-like argumentsList (CreateListFromArrayLike).
+                let arg_vec = self.create_list_from_array_like(args_list)?;
                 self.call_value(target, this_arg, &arg_vec)?
             }
             REFLECT_CONSTRUCT => {

@@ -66,6 +66,28 @@ impl<'p> Vm<'p> {
         false
     }
 
+    /// CreateListFromArrayLike(obj) (ES 7.3.18): the elements `0 .. ToLength(obj.length)`
+    /// of an array-LIKE (any object), read via Get — so `Function.prototype.apply` /
+    /// `Reflect.apply` accept `{length, 0, 1, …}`, not only real arrays. Throws if
+    /// `obj` is not an object.
+    pub(crate) fn create_list_from_array_like(&mut self, obj: Value) -> Result<Vec<Value>, Thrown> {
+        if !self.is_object_value(obj) {
+            return Err(Thrown(
+                "TypeError: CreateListFromArrayLike called on a non-object".into(),
+            ));
+        }
+        if let HeapObj::Array(items) = self.heap.get(obj.heap_index()) {
+            return Ok(items.clone()); // dense fast path
+        }
+        let len_v = self.get_prop(obj, "length")?;
+        let len = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+        let mut out = Vec::with_capacity(len.min(4096));
+        for i in 0..len {
+            out.push(self.get_index(obj, Value::int(i as i32))?);
+        }
+        Ok(out)
+    }
+
     /// IsConcatSpreadable(O) (ES 23.1.3.1.1): a `Symbol.isConcatSpreadable`
     /// ("@@isConcatSpreadable") flag overrides — when present it is ToBoolean'd;
     /// otherwise the value is spreadable iff it is an Array. Non-objects are never

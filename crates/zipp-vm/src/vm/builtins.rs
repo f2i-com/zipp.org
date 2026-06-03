@@ -77,7 +77,13 @@ impl<'p> Vm<'p> {
                 "apply" => {
                     let this = args.first().copied().unwrap_or(Value::UNDEFINED);
                     let arr = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                    let callargs = if arr.is_heap() { self.iterate_to_vec(arr)? } else { Vec::new() };
+                    // argArray null/undefined -> no args; else CreateListFromArrayLike
+                    // (an array-like — `{length, 0, …}` — not necessarily iterable).
+                    let callargs = if arr.is_nullish() {
+                        Vec::new()
+                    } else {
+                        self.create_list_from_array_like(arr)?
+                    };
                     return Ok(Some(self.call_value(recv, this, &callargs)?));
                 }
                 "bind" => {
