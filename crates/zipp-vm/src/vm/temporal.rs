@@ -387,6 +387,25 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Validate the ZonedDateTime resolution options (disambiguation / offset /
+    /// overflow) for their throwing side effects (a bad value or wrong type is a
+    /// RangeError; a non-object, non-undefined `options` is a TypeError). The
+    /// single-offset model can't act on disambiguation/offset, but their values
+    /// must still be in range. Returns the overflow `reject` flag.
+    pub(crate) fn read_zdt_options(&mut self, options: Value) -> Result<bool, Thrown> {
+        if options != Value::UNDEFINED && !self.is_object_value(options) {
+            return Err(Thrown("TypeError: options must be an object or undefined".into()));
+        }
+        self.opt_string(
+            options,
+            "disambiguation",
+            "compatible",
+            &["compatible", "earlier", "later", "reject"],
+        )?;
+        self.opt_string(options, "offset", "reject", &["prefer", "use", "ignore", "reject"])?;
+        self.read_overflow(options)
+    }
+
     /// Resolve a toString() options bag (fractionalSecondDigits / smallestUnit /
     /// roundingMode) into (round-unit ns, fractional digits [-1=auto, 0..9],
     /// omit-seconds, roundingMode). smallestUnit wins over fractionalSecondDigits.
@@ -1534,6 +1553,9 @@ impl<'p> Vm<'p> {
                         f[i] = x;
                     }
                 }
+                // Validate the resolution options (disambiguation/offset/overflow).
+                let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                self.read_zdt_options(options)?;
                 let off = self.zdt_offset_ns(idx);
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
@@ -1581,7 +1603,7 @@ impl<'p> Vm<'p> {
                 let tzstr = self.to_js_string(tzv)?;
                 let (id, offset) = parse_time_zone(&tzstr)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{tzstr}\"")))?;
-                let reject = self.read_overflow(options)?;
+                let reject = self.read_zdt_options(options)?;
                 let f = self.to_plain_date_time_overflow(item, reject)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
@@ -1589,7 +1611,7 @@ impl<'p> Vm<'p> {
             }
         }
         let s = self.to_js_string(item)?;
-        let _ = self.read_overflow(options)?;
+        let _ = self.read_zdt_options(options)?;
         if !temporal_string_ok(&s, false) {
             return Err(Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")));
         }
