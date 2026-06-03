@@ -117,7 +117,17 @@ impl<'p> Vm<'p> {
                 let target = args.first().copied().unwrap_or(Value::UNDEFINED);
                 return Ok(Some(Value::bool(self.is_prototype_of(recv, target))));
             }
-            "valueOf" => return Ok(Some(recv)), // default valueOf returns the object
+            "valueOf" => {
+                // Only the DEFAULT Object.prototype.valueOf (returns the receiver)
+                // is handled inline. A custom own/inherited valueOf — or a
+                // type-specific one (Date/Map/…) — must be invoked normally, so
+                // defer (fall through) when `valueOf` does not resolve to the
+                // generic intrinsic. (`obj.valueOf()` / `date.valueOf()` were
+                // wrongly returning the object itself.)
+                if self.method_is_generic(recv, "valueOf", native::PROTO_VALUE_OF)? {
+                    return Ok(Some(recv));
+                }
+            }
             "toString" => {
                 // Generic `Object.prototype.toString` for a plain object; arrays /
                 // numbers / dates etc. have their own toString in the type dispatch.
@@ -126,7 +136,12 @@ impl<'p> Vm<'p> {
                     if self.is_error_instance(idx) {
                         return self.call_native(native::ERROR_TO_STRING, recv, args).map(Some);
                     }
-                    return Ok(Some(self.alloc_str("[object Object]".to_string())));
+                    // Defer to a custom own/inherited `toString` (user function or
+                    // class method); only the generic intrinsic is handled inline
+                    // (`obj.toString()` was ignoring an own toString).
+                    if self.method_is_generic(recv, "toString", native::PROTO_TO_STRING)? {
+                        return Ok(Some(self.alloc_str("[object Object]".to_string())));
+                    }
                 }
             }
             _ => {}
@@ -145,6 +160,17 @@ impl<'p> Vm<'p> {
             HeapObj::ArrayBuffer { .. } => self.arraybuffer_method(idx, name, args),
             _ => Ok(None),
         }
+    }
+
+    /// True when `recv.name` resolves (own → prototype chain) to the generic
+    /// intrinsic `generic_id` (`Object.prototype.toString`/`valueOf`), i.e. there
+    /// is NO custom override. Used so the inline fast path only fires for the
+    /// default method and a custom `toString`/`valueOf` is actually invoked.
+    /// Resolving a method does not invoke it, so this has no observable effect.
+    fn method_is_generic(&mut self, recv: Value, name: &str, generic_id: u16) -> Result<bool, Thrown> {
+        let m = self.get_prop(recv, name)?;
+        Ok(m.is_heap()
+            && matches!(self.heap.get(m.heap_index()), HeapObj::Native(id) if *id == generic_id))
     }
 
     /// Infallible ToNumber (Symbol/etc. → NaN) — for index/length args in the
