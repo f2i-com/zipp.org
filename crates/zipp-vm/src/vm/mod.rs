@@ -378,6 +378,10 @@ pub struct Vm<'p> {
     /// (returning Promises) + @@asyncIterator + @@toStringTag, chaining to
     /// %AsyncIteratorPrototype%.
     asyncgen_proto: u32,
+    /// The default `Array.prototype[Symbol.iterator]` (the `values` function), so
+    /// array destructuring can fast-path plain arrays yet still honour a replaced
+    /// `Array.prototype[Symbol.iterator]` (drain via the iterator protocol).
+    default_array_iter: Value,
     iterator_ctor: u32,
     /// The test262 `$262` host object (0 until set up).
     dollar262: u32,

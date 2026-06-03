@@ -1010,6 +1010,13 @@ impl<'p> Vm<'p> {
                 let it = self.get_prop(v, "@@iterator")?;
                 self.is_callable(it)
             }
+            // A plain array: fast-path the default iterator (direct indexing), but
+            // honour a replaced Array.prototype[Symbol.iterator] by draining via
+            // the iterator protocol (array destructuring uses it per spec).
+            HeapObj::Array(_) => {
+                let it = self.get_prop(v, "@@iterator")?;
+                it.bits() != self.default_array_iter.bits() && self.is_callable(it)
+            }
             _ => false,
         };
         if !drain {
@@ -1018,7 +1025,15 @@ impl<'p> Vm<'p> {
         // Hold the not-yet-rooted drained values across the `.next()`/`.return()`
         // user re-entries.
         let _gc = self.gc_lock_guard();
-        let iter = self.get_iterator(v)?; // generator → itself; iterable → its iterator
+        // generator → itself; iterable → its iterator. An array only reaches here
+        // when its @@iterator was replaced, so call that explicitly (get_iterator
+        // returns a plain array unchanged).
+        let iter = if matches!(self.heap.get(v.heap_index()), HeapObj::Array(_)) {
+            let m = self.get_prop(v, "@@iterator")?;
+            self.call_value(m, v, &[])?
+        } else {
+            self.get_iterator(v)?
+        };
         let is_gen = matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. });
         let lim = max as usize;
         let mut out = Vec::new();

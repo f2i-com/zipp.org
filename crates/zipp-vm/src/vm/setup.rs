@@ -615,6 +615,9 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get_mut(self.arr_proto) {
                 m.define("@@iterator", vf, attr);
             }
+            // Remember the default so array destructuring can detect a replaced
+            // Array.prototype[Symbol.iterator] and switch to the iterator protocol.
+            self.default_array_iter = vf;
         }
         self.weakmap_proto = weakmap_proto;
         self.weakset_proto = weakset_proto;
