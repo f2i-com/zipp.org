@@ -4589,10 +4589,23 @@ impl<'a> FnCompiler<'a> {
             }
             None => None,
         };
-        self.emit(Instr::NewError { dst, kind: kidx, arg });
-        if arg.is_some() {
-            self.next_reg -= 1; // reclaim the message temp
-        }
+        // The options object follows the message (`new Error(msg, options)`,
+        // `new AggregateError(errors, msg, options)`) — its `cause` becomes the
+        // error's `cause` (NewError installs it).
+        let opts = match args.get(msg_pos + 1).and_then(|a| a.as_expression()) {
+            Some(e) => {
+                let t = self.temp();
+                let v = self.expr_into(e, t)?;
+                if v != t {
+                    self.emit(Instr::Move { dst: t, src: v });
+                }
+                Some(t)
+            }
+            None => None,
+        };
+        self.emit(Instr::NewError { dst, kind: kidx, arg, opts });
+        // Reclaim the message + options temps (allocated in order).
+        self.next_reg -= arg.is_some() as Reg + opts.is_some() as Reg;
         Ok(dst)
     }
 

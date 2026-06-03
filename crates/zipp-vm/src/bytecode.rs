@@ -302,10 +302,12 @@ pub enum Instr {
     /// (string/number/boolean/symbol/bigint wrappers), null/undefined → a fresh
     /// object, and an existing object is returned unchanged.
     ToObject { dst: Reg, src: Reg },
-    /// `dst = new <Error subtype>(arg?)` — a proto-linked error instance. `kind`
-    /// indexes the canonical error list (0=Error, 1=TypeError, …, 7=AggregateError);
-    /// `arg` (when present) is coerced to the `message` string.
-    NewError { dst: Reg, kind: u8, arg: Option<Reg> },
+    /// `dst = new <Error subtype>(arg?, opts?)` — a proto-linked error instance.
+    /// `kind` indexes the canonical error list (0=Error, 1=TypeError, …,
+    /// 7=AggregateError); `arg` (when present) is coerced to the `message` string.
+    /// `opts` (when present) is the options object — if it has a `cause`, a
+    /// non-enumerable own `cause` is installed (ES2022 InstallErrorCause).
+    NewError { dst: Reg, kind: u8, arg: Option<Reg>, opts: Option<Reg> },
     /// `dst = Symbol(desc?)` — a fresh unique Symbol primitive. `desc` (when present)
     /// is coerced to a string description (undefined → no description).
     MakeSymbol { dst: Reg, desc: Option<Reg> },

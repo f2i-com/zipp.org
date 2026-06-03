@@ -1688,9 +1688,30 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, o);
                         ip += 1;
                     }
-                    Instr::NewError { dst, kind, arg } => {
+                    Instr::NewError { dst, kind, arg, opts } => {
                         let msg = arg.map(|r| self.get(base, r));
                         let v = self.make_error(kind, msg);
+                        // InstallErrorCause (ES2022): an options object with a `cause`
+                        // gives the error a non-enumerable own `cause` property.
+                        if let Some(or) = opts {
+                            let options = self.get(base, or);
+                            if self.is_object_value(options) && self.has_own_property(options, "cause") {
+                                let cause = self.get_prop(options, "cause")?;
+                                if let HeapObj::Object(m) = self.heap.get_mut(v.heap_index()) {
+                                    m.define(
+                                        "cause",
+                                        cause,
+                                        PropAttr {
+                                            writable: true,
+                                            enumerable: false,
+                                            configurable: true,
+                                            accessor: false,
+                                            setter: Value::UNDEFINED,
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         self.set(base, dst, v);
                         ip += 1;
                     }
