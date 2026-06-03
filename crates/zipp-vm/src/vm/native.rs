@@ -277,6 +277,7 @@ pub const BUFFER_GETTERS: &[(&str, u8)] = &[
     ("byteLength", 2),
     ("byteOffset", 2),
     ("immutable", 0),
+    ("buffer", 2),
 ];
 /// `ArrayBuffer.prototype.transferToImmutable` / `sliceToImmutable` (ES2026).
 pub const ARRAYBUFFER_TRANSFER_IMMUTABLE: u16 = 815;
