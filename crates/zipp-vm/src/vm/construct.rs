@@ -498,33 +498,34 @@ impl<'p> Vm<'p> {
                 return self.build_regexp(a0, args.get(1).copied().unwrap_or(Value::UNDEFINED));
             }
             if p == self.map_proto && self.map_proto != 0 {
-                let (mut keys, mut vals): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+                // Per spec the entries are added via the `set` adder resolved off the
+                // new map — so an overridden `set` (or a subclass's) is honoured.
+                let map_v = Value::heap(self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() }));
                 if !a0.is_nullish() {
+                    let adder = self.get_member(map_v, "set", map_v)?;
+                    if !self.is_callable(adder) {
+                        return Err(Thrown("TypeError: Map.prototype.set is not callable".into()));
+                    }
                     for e in self.iterate_to_vec(a0)? {
-                        let k = normalize_zero(self.get_index(e, Value::int(0))?);
+                        let k = self.get_index(e, Value::int(0))?;
                         let v = self.get_index(e, Value::int(1))?;
-                        match keys.iter().position(|kk| self.same_value_zero(*kk, k)) {
-                            Some(i) => vals[i] = v,
-                            None => {
-                                keys.push(k);
-                                vals.push(v);
-                            }
-                        }
+                        self.call_value(adder, map_v, &[k, v])?;
                     }
                 }
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Map { keys, vals })));
+                return Ok(map_v);
             }
             if p == self.set_proto && self.set_proto != 0 {
-                let mut items: Vec<Value> = Vec::new();
+                let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
                 if !a0.is_nullish() {
+                    let adder = self.get_member(set_v, "add", set_v)?;
+                    if !self.is_callable(adder) {
+                        return Err(Thrown("TypeError: Set.prototype.add is not callable".into()));
+                    }
                     for e in self.iterate_to_vec(a0)? {
-                        let v = normalize_zero(e);
-                        if !items.iter().any(|x| self.same_value_zero(*x, v)) {
-                            items.push(v);
-                        }
+                        self.call_value(adder, set_v, &[e])?;
                     }
                 }
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Set(items))));
+                return Ok(set_v);
             }
             if p == self.date_proto && self.date_proto != 0 {
                 let ms = self.date_new_ms(args)?;

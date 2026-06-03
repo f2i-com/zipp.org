@@ -1022,43 +1022,45 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::NewMap { dst, src } => {
-                        let (mut keys, mut vals): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+                        // Entries are added through the `set` adder resolved off the
+                        // new map, so an overridden `Map.prototype.set` is honoured
+                        // (the builtin set inserts + normalizes -0 itself).
+                        let m = Value::heap(self.heap.alloc(HeapObj::Map {
+                            keys: Vec::new(),
+                            vals: Vec::new(),
+                        }));
                         if let Some(s) = src {
                             let sv = self.get(base, s);
                             if !sv.is_nullish() {
-                                // Each iterated entry is a [key, value]-indexable.
+                                let adder = self.get_member(m, "set", m)?;
+                                if !self.is_callable(adder) {
+                                    return Err(Thrown("TypeError: Map.prototype.set is not callable".into()));
+                                }
                                 for e in self.iterate_to_vec(sv)? {
-                                    let k = normalize_zero(self.get_index(e, Value::int(0))?);
+                                    let k = self.get_index(e, Value::int(0))?;
                                     let v = self.get_index(e, Value::int(1))?;
-                                    match keys.iter().position(|kk| self.same_value_zero(*kk, k)) {
-                                        Some(i) => vals[i] = v,
-                                        None => {
-                                            keys.push(k);
-                                            vals.push(v);
-                                        }
-                                    }
+                                    self.call_value(adder, m, &[k, v])?;
                                 }
                             }
                         }
-                        let m = Value::heap(self.heap.alloc(HeapObj::Map { keys, vals }));
                         self.set(base, dst, m);
                         ip += 1;
                     }
                     Instr::NewSet { dst, src } => {
-                        let mut items: Vec<Value> = Vec::new();
+                        let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
                         if let Some(s) = src {
                             let sv = self.get(base, s);
                             if !sv.is_nullish() {
+                                let adder = self.get_member(set_v, "add", set_v)?;
+                                if !self.is_callable(adder) {
+                                    return Err(Thrown("TypeError: Set.prototype.add is not callable".into()));
+                                }
                                 for e in self.iterate_to_vec(sv)? {
-                                    let v = normalize_zero(e);
-                                    if !items.iter().any(|x| self.same_value_zero(*x, v)) {
-                                        items.push(v);
-                                    }
+                                    self.call_value(adder, set_v, &[e])?;
                                 }
                             }
                         }
-                        let s = Value::heap(self.heap.alloc(HeapObj::Set(items)));
-                        self.set(base, dst, s);
+                        self.set(base, dst, set_v);
                         ip += 1;
                     }
                     Instr::NewWeakMap { dst, src } => {
