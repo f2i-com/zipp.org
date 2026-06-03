@@ -134,6 +134,14 @@ pub struct Vm<'p> {
     /// Number of functions in the compile-time `program` (the boundary between
     /// program function ids and runtime `eval_funcs` ids).
     main_func_count: usize,
+    /// Classes compiled at runtime by `eval`. Like `eval_funcs`: each is a leaked
+    /// `Box<ClassDef>` addressed by a unified class_id (`program.classes` below
+    /// `main_class_count`, `eval_classes` beyond). Their func-id members and the
+    /// referencing `MakeClass`/`Super*` ops are re-indexed at install time.
+    eval_classes: Vec<&'static crate::bytecode::ClassDef>,
+    /// Number of classes in the compile-time `program` (boundary between program
+    /// and runtime `eval_classes` class ids).
+    main_class_count: usize,
     /// Globals introduced by `eval`: maps a global NAME (one not present in the
     /// compile-time `program.global_names`) to the EVAL_POOL slot it was assigned.
     /// Persists across `eval` calls so repeated evals see each other's globals.

@@ -12,12 +12,28 @@ impl<'p> Vm<'p> {
     /// function for `id < main_func_count`, else a runtime `eval`/`new Function`
     /// function. Both sources have stable addresses (the leaked eval boxes and
     /// the borrowed program), so raw pointers taken from the result stay valid.
+    /// Returns `&'p` (the program lifetime), NOT a `&self`-bound borrow: program
+    /// functions live in the `&'p Program`, and eval functions are leaked
+    /// (`&'static`, which coerces to `&'p`). This lets callers hold the FuncProto
+    /// reference across `&mut self` operations and use it where a `'p`-lived
+    /// string constant (e.g. an interned method-name key) is needed.
     #[inline]
-    pub(crate) fn func(&self, id: usize) -> &crate::bytecode::FuncProto {
+    pub(crate) fn func(&self, id: usize) -> &'p crate::bytecode::FuncProto {
         if id < self.main_func_count {
             &self.program.functions[id]
         } else {
             self.eval_funcs[id - self.main_func_count]
+        }
+    }
+
+    /// Resolve a (unified) class id to its ClassDef: a compile-time program class
+    /// for `id < main_class_count`, else a runtime `eval` class. Mirrors `func`.
+    #[inline]
+    pub(crate) fn class_def(&self, id: usize) -> &crate::bytecode::ClassDef {
+        if id < self.main_class_count {
+            &self.program.classes[id]
+        } else {
+            self.eval_classes[id - self.main_class_count]
         }
     }
 
@@ -54,6 +70,8 @@ impl<'p> Vm<'p> {
             program,
             eval_funcs: Vec::new(),
             main_func_count: program.functions.len(),
+            eval_classes: Vec::new(),
+            main_class_count: program.classes.len(),
             eval_global_map: std::collections::HashMap::new(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
             class_values: vec![None; program.classes.len()],
@@ -668,8 +686,8 @@ impl<'p> Vm<'p> {
     /// Parse, compile, and run an `eval` code string (indirect eval — global,
     /// sloppy scope), returning its completion value. ADDITIVE: the broader suite
     /// never reaches this (calling `eval` previously threw ReferenceError), so it
-    /// cannot regress non-eval programs. v1 limitation: class declarations inside
-    /// eval throw EvalError (they need a runtime class table).
+    /// cannot regress non-eval programs. Classes inside eval are supported via the
+    /// `eval_classes` runtime class table (class-id operands re-indexed like funcs).
     pub(crate) fn do_eval(&mut self, code: &str) -> Result<Value, Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // 1. Parse.
@@ -683,19 +701,40 @@ impl<'p> Vm<'p> {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
-        if !eval_prog.classes.is_empty() {
-            return Err(Thrown(
-                "EvalError: class declarations inside eval are not yet supported".into(),
-            ));
-        }
+        // Runtime base ids: eval functions and classes are appended past the
+        // compile-time tables (parallel to global slots).
+        let base_func = (self.main_func_count + self.eval_funcs.len()) as u32;
+        let base_class = (self.main_class_count + self.eval_classes.len()) as u32;
         // 3. Remap the eval program's own global-slot numbering onto live slots.
         let mut gmap: Vec<u32> = Vec::with_capacity(eval_prog.global_names.len());
         for name in &eval_prog.global_names {
             gmap.push(self.eval_global_slot(name)?);
         }
-        // 4. Re-index function-id and global-slot operands, leak each FuncProto
-        //    (stable address — raw pointers live into it), append to the table.
-        let base_func = (self.main_func_count + self.eval_funcs.len()) as u32;
+        // 4. Install eval classes: re-index their member func ids (which point into
+        //    the eval functions installed below) by base_func, leak each ClassDef,
+        //    and reserve a class_values slot per class (MakeClass writes it). A
+        //    ClassDef holds no class-id references, so only func ids are offset.
+        for mut cd in eval_prog.classes {
+            if let Some(c) = cd.ctor.as_mut() {
+                *c += base_func;
+            }
+            for lst in [
+                &mut cd.methods,
+                &mut cd.getters,
+                &mut cd.setters,
+                &mut cd.statics,
+                &mut cd.static_getters,
+                &mut cd.static_setters,
+            ] {
+                for (_, fid) in lst.iter_mut() {
+                    *fid += base_func;
+                }
+            }
+            self.eval_classes.push(Box::leak(Box::new(cd)));
+            self.class_values.push(None);
+        }
+        // 5. Re-index function-id, global-slot, and class-id operands, leak each
+        //    FuncProto (stable address — raw pointers live into it), append.
         let mut new_funcs: Vec<&'static FuncProto> =
             Vec::with_capacity(eval_prog.functions.len());
         for mut f in eval_prog.functions {
@@ -709,6 +748,17 @@ impl<'p> Vm<'p> {
                     | Instr::StoreGlobal { idx, .. } => {
                         *idx = gmap[*idx as usize];
                     }
+                    // Class-id operands: the class itself, and every `super`
+                    // reference (which names its home class).
+                    Instr::MakeClass { class_id, .. } => *class_id += base_class,
+                    Instr::SuperCtor { home_class_id, .. }
+                    | Instr::SuperCtorSpread { home_class_id, .. }
+                    | Instr::SuperMethod { home_class_id, .. }
+                    | Instr::SuperGet { home_class_id, .. }
+                    | Instr::SuperGetComputed { home_class_id, .. }
+                    | Instr::SuperMethodComputed { home_class_id, .. }
+                    | Instr::SuperSet { home_class_id, .. }
+                    | Instr::SuperSetComputed { home_class_id, .. } => *home_class_id += base_class,
                     _ => {}
                 }
             }

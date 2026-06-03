@@ -670,8 +670,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ObjectRest { dst, src, exclude_start, exclude_count } => {
                         let s = self.get(base, src);
-                        let prog: &'p Program = self.program;
-                        let consts = &prog.functions[func_id as usize].string_constants;
+                        let consts = &self.func(func_id as usize).string_constants;
                         let excluded =
                             &consts[exclude_start as usize..exclude_start as usize + exclude_count as usize];
                         // Copy src's own keys except the destructured siblings.
@@ -726,7 +725,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::MakeClass { dst, class_id, parent } => {
-                        let cd = self.program.classes[class_id as usize].clone();
+                        let cd = self.class_def(class_id as usize).clone();
                         let parent_idx = parent.and_then(|p| {
                             let pv = self.get(base, p);
                             pv.is_heap().then(|| pv.heap_index())
@@ -881,9 +880,10 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::SuperMethod { dst, home_class_id, name, arg_base, argc } => {
-                        let prog: &'p Program = self.program;
+                        // `func()` returns `&'p`, so the interned name key outlives
+                        // any `&mut self` below — and resolves eval functions too.
                         let key: &'p str =
-                            &prog.functions[func_id as usize].string_constants[name as usize];
+                            &self.func(func_id as usize).string_constants[name as usize];
                         let parent = self.super_parent(home_class_id)
                             .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
                         // Find the method up the parent's class chain.
@@ -1158,9 +1158,10 @@ impl<'p> Vm<'p> {
                     }
                     Instr::CallMethodSpread { dst, obj, name, args } => {
                         let recv = self.get(base, obj);
-                        let prog: &'p Program = self.program;
+                        // `func()` returns `&'p`, so the interned name key outlives
+                        // any `&mut self` below — and resolves eval functions too.
                         let key: &'p str =
-                            &prog.functions[func_id as usize].string_constants[name as usize];
+                            &self.func(func_id as usize).string_constants[name as usize];
                         let args_v = self.get(base, args);
                         let arg_vec = self.array_snapshot(args_v.heap_index());
                         // Builtin (array/string/number) method, else a user method
@@ -1845,9 +1846,10 @@ impl<'p> Vm<'p> {
                         // with the program's lifetime (NOT self's) — avoids
                         // cloning the name string on every method call (a heap
                         // alloc per `a.push(i)` / `a.map(cb)` etc.).
-                        let prog: &'p Program = self.program;
+                        // `func()` returns `&'p`, so the interned name key outlives
+                        // any `&mut self` below — and resolves eval functions too.
                         let key: &'p str =
-                            &prog.functions[func_id as usize].string_constants[name as usize];
+                            &self.func(func_id as usize).string_constants[name as usize];
                         // Hot fast path: `arr.push(x)` — the most common
                         // per-element array idiom. Append directly, skipping the
                         // try_builtin_method → dispatch_builtin_method → array_method
