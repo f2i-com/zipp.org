@@ -1311,6 +1311,22 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            // Shared `toLocaleString` (routes to toString) on every Temporal proto.
+            for proto in [
+                self.duration_proto,
+                self.plaindate_proto,
+                self.plaintime_proto,
+                self.plaindatetime_proto,
+                self.instant_proto,
+                self.plainyearmonth_proto,
+                self.plainmonthday_proto,
+                self.zoneddatetime_proto,
+            ] {
+                let v = Value::heap(self.heap.alloc(HeapObj::Native(TEMPORAL_TO_LOCALE_STRING)));
+                if let HeapObj::Object(p) = self.heap.get_mut(proto) {
+                    p.define("toLocaleString", v, method_attr);
+                }
+            }
             // ── Intl namespace + service constructors ──
             let intl_services: Vec<(u8, &str, f64, Vec<(&str, u16)>, bool)> = vec![
                 (

@@ -1876,6 +1876,23 @@ impl<'p> Vm<'p> {
                 self.alloc_zdt(ns, offset, id)
             }
             NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
+            // Shared Temporal toLocaleString: no Intl — same string as toString,
+            // with a brand check (a non-Temporal receiver is a TypeError).
+            TEMPORAL_TO_LOCALE_STRING => {
+                let r = if this.is_heap() {
+                    self.temporal_method(this.heap_index(), "toString", &[])?
+                } else {
+                    None
+                };
+                match r {
+                    Some(v) => v,
+                    None => {
+                        return Err(Thrown(
+                            "TypeError: toLocaleString called on a non-Temporal object".into(),
+                        ))
+                    }
+                }
+            }
             // ── Intl ──
             INTL_GET_CANONICAL_LOCALES => {
                 let list = self.canonicalize_locale_list(a0)?;
