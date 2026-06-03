@@ -506,7 +506,7 @@ impl<'p> Vm<'p> {
                 return parse_iso_date(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid date string '{s}'")));
             }
-            if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
                 let y_opt = self.opt_int_field(v, "year")?;
                 let m_opt = self.read_month_field(v)?; // monthCode or month
@@ -805,7 +805,7 @@ impl<'p> Vm<'p> {
                 return parse_iso_time(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid time string '{s}'")));
             }
-            if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            if self.is_object_value(v) {
                 let names =
                     ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
                 let maxes = [23, 59, 59, 999, 999, 999];
@@ -982,7 +982,7 @@ impl<'p> Vm<'p> {
                 return parse_iso_datetime(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
             }
-            if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
                 let mut f = [0i64; 9];
                 let mut have_date = [false; 3];
@@ -1918,7 +1918,7 @@ impl<'p> Vm<'p> {
                 return parse_iso_year_month(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid year-month string '{s}'")));
             }
-            if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
                 let yv = self.get_prop(v, "year")?;
                 let m = self.read_month_field(v)?;
@@ -2134,7 +2134,7 @@ impl<'p> Vm<'p> {
                 return parse_iso_month_day(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid month-day string '{s}'")));
             }
-            if matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
                 let m = self.read_month_field(v)?;
                 let dv = self.get_prop(v, "day")?;
