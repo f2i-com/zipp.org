@@ -174,6 +174,23 @@ pub const SAB_GROW: u16 = 810;
 /// from the instance (`get_member`).
 pub const SAB_GETTER_BASE: u16 = 811;
 pub const SAB_GETTERS: &[&str] = &["byteLength", "maxByteLength", "growable"];
+/// `Atomics.*` methods, indexed off this base by `ATOMICS_METHODS` (name, length).
+pub const ATOMICS_BASE: u16 = 820;
+pub const ATOMICS_METHODS: &[(&str, u8)] = &[
+    ("add", 3),
+    ("and", 3),
+    ("or", 3),
+    ("xor", 3),
+    ("sub", 3),
+    ("exchange", 3),
+    ("compareExchange", 4),
+    ("load", 2),
+    ("store", 3),
+    ("isLockFree", 1),
+    ("wait", 4),
+    ("notify", 3),
+    ("pause", 0),
+];
 // String static methods.
 pub const STR_FROM_CHAR_CODE: u16 = 311;
 pub const STR_FROM_CODE_POINT: u16 = 312;
@@ -568,6 +585,11 @@ pub fn proto_method(id: u16) -> Option<(&'static str, u8, u8)> {
 /// Reflect.*, Function.prototype.call, …) so it exposes real own `name`/
 /// `length` properties like any function. (Proto methods use `proto_method`.)
 pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
+    // Atomics.* methods.
+    if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) {
+        let (name, len) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];
+        return Some((name, len));
+    }
     // %TypedArray%.prototype method natives.
     if (TA_METHOD_BASE..TA_METHOD_BASE + TA_PROTO_METHODS.len() as u16).contains(&id) {
         let m = TA_PROTO_METHODS[(id - TA_METHOD_BASE) as usize];

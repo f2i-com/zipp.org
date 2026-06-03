@@ -1493,6 +1493,10 @@ impl<'p> Vm<'p> {
                 }
                 self.arraybuffer_method(this.heap_index(), "grow", args)?.unwrap_or(Value::UNDEFINED)
             }
+            _ if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) => {
+                let (name, _) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];
+                self.atomics_op(name, args)?
+            }
             _ if (SAB_GETTER_BASE..SAB_GETTER_BASE + SAB_GETTERS.len() as u16).contains(&id) => {
                 let name = SAB_GETTERS[(id - SAB_GETTER_BASE) as usize];
                 if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {

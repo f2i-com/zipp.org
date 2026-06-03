@@ -1487,6 +1487,30 @@ impl<'p> Vm<'p> {
             }
             idx
         };
+        // `Atomics`: a namespace object (typeof "object", not a constructor) whose
+        // methods perform atomic read-modify-write on integer TypedArrays. Single
+        // -threaded, so the ops are plain RMW; wait/notify have no real waiters.
+        let atomics_ns = {
+            let methods: Vec<(&str, u16)> = native::ATOMICS_METHODS
+                .iter()
+                .enumerate()
+                .map(|(i, &(name, _))| (name, native::ATOMICS_BASE + i as u16))
+                .collect();
+            let idx = build(self, &methods, None);
+            self.proto_of.insert(idx, Value::heap(obj_proto));
+            let tag = self.alloc_str("Atomics".to_string());
+            let data_nw = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.define("@@toStringTag", tag, data_nw);
+            }
+            idx
+        };
         // Bare global functions as first-class values (the call form is GlobalFn).
         let parse_int_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_INT));
         let parse_float_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_FLOAT));
@@ -1545,6 +1569,7 @@ impl<'p> Vm<'p> {
                 "Iterator" => Some(self.iterator_ctor),
                 "Temporal" => Some(self.temporal_ns),
                 "Intl" => Some(self.intl_ns),
+                "Atomics" => Some(atomics_ns),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),

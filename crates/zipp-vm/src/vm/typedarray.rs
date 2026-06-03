@@ -241,6 +241,150 @@ impl<'p> Vm<'p> {
         Ok(v)
     }
 
+    /// Validate an Atomics receiver/index: the receiver must be an INTEGER
+    /// TypedArray (not Uint8Clamped/Float32/Float64), and the index in
+    /// `[0, length)`. Returns `(ta_heap_index, element_index, kind)`.
+    pub(crate) fn atomic_validate(&mut self, ta: Value, idx: Value) -> Result<(u32, usize, u8), Thrown> {
+        let ti = match ta.is_heap().then(|| self.heap.get(ta.heap_index())) {
+            Some(HeapObj::TypedArray { kind, .. }) => {
+                // Uint8Clamped(2), Float32(7), Float64(8) are not integer types.
+                if matches!(*kind, 2 | 7 | 8) {
+                    return Err(Thrown(
+                        "TypeError: Atomics operation requires an integer TypedArray".into(),
+                    ));
+                }
+                ta.heap_index()
+            }
+            _ => {
+                return Err(Thrown(
+                    "TypeError: Atomics operation called on a non-TypedArray".into(),
+                ))
+            }
+        };
+        let kind = match self.heap.get(ti) {
+            HeapObj::TypedArray { kind, .. } => *kind,
+            _ => 0,
+        };
+        let i = self.to_integer_or_zero(idx)?;
+        let len = self.ta_effective_len(ti).unwrap_or(0);
+        if i < 0 || i as usize >= len {
+            return Err(Thrown("RangeError: Atomics index out of bounds".into()));
+        }
+        Ok((ti, i as usize, kind))
+    }
+
+    /// Execute an `Atomics.<op>` call. Single-threaded, so read-modify-write ops
+    /// are plain (non-contended); `wait` never blocks (no notifier → "timed-out")
+    /// and `notify` reports 0 woken.
+    pub(crate) fn atomics_op(&mut self, op: &str, args: &[Value]) -> Result<Value, Thrown> {
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        let a2 = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+        // Operations that take no TypedArray receiver.
+        if op == "isLockFree" {
+            let n = self.to_integer_or_zero(a0)?;
+            return Ok(Value::bool(matches!(n, 1 | 2 | 4 | 8)));
+        }
+        if op == "pause" {
+            return Ok(Value::UNDEFINED);
+        }
+        let (ti, i, kind) = self.atomic_validate(a0, a1)?;
+        let is_bigint = native::TA_KINDS[kind as usize].2;
+        // wait/notify need Int32Array or BigInt64Array; wait additionally needs a
+        // SharedArrayBuffer. No real waiters in a single agent.
+        if op == "wait" || op == "notify" {
+            if !matches!(kind, 5 | 9) {
+                return Err(Thrown(format!(
+                    "TypeError: Atomics.{op} requires an Int32Array or BigInt64Array"
+                )));
+            }
+            if op == "wait" {
+                let shared = matches!(self.heap.get(ti),
+                    HeapObj::TypedArray { buffer, .. } if self.shared_buffers.contains(buffer));
+                if !shared {
+                    return Err(Thrown("TypeError: Atomics.wait requires a SharedArrayBuffer".into()));
+                }
+                let cur = self.ta_element_get(ti, i);
+                let eq = if is_bigint {
+                    self.to_bigint(a2)? == self.to_bigint(cur)?
+                } else {
+                    self.to_integer_or_zero(a2)? == (cur.as_f64() as i64)
+                };
+                // Equal value would block; with no notifier this returns "timed-out".
+                return Ok(self.alloc_str(if eq { "timed-out" } else { "not-equal" }.to_string()));
+            }
+            return Ok(Value::num(0.0));
+        }
+        // load / store / read-modify-write.
+        if is_bigint {
+            let v_in = if op == "load" { 0 } else { self.to_bigint(a2)? };
+            let cur = self.ta_element_get(ti, i);
+            let old = self.to_bigint(cur)?;
+            match op {
+                "load" => Ok(self.make_bigint(old)),
+                "store" => {
+                    let nv = self.make_bigint(v_in);
+                    self.ta_element_set(ti, i, nv)?;
+                    Ok(self.make_bigint(v_in))
+                }
+                "compareExchange" => {
+                    let repl = self.to_bigint(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+                    if old == v_in {
+                        let nv = self.make_bigint(repl);
+                        self.ta_element_set(ti, i, nv)?;
+                    }
+                    Ok(self.make_bigint(old))
+                }
+                _ => {
+                    let new = match op {
+                        "add" => old.wrapping_add(v_in),
+                        "sub" => old.wrapping_sub(v_in),
+                        "and" => old & v_in,
+                        "or" => old | v_in,
+                        "xor" => old ^ v_in,
+                        "exchange" => v_in,
+                        _ => old,
+                    };
+                    let nv = self.make_bigint(new);
+                    self.ta_element_set(ti, i, nv)?;
+                    Ok(self.make_bigint(old))
+                }
+            }
+        } else {
+            let v_in = if op == "load" { 0 } else { self.to_integer_or_zero(a2)? };
+            let cur = self.ta_element_get(ti, i);
+            let old_i = cur.as_f64() as i64;
+            match op {
+                "load" => Ok(cur),
+                "store" => {
+                    self.ta_element_set(ti, i, Value::num(v_in as f64))?;
+                    Ok(Value::num(v_in as f64))
+                }
+                "compareExchange" => {
+                    let repl =
+                        self.to_integer_or_zero(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+                    if old_i == v_in {
+                        self.ta_element_set(ti, i, Value::num(repl as f64))?;
+                    }
+                    Ok(cur)
+                }
+                _ => {
+                    let new_i = match op {
+                        "add" => old_i.wrapping_add(v_in),
+                        "sub" => old_i.wrapping_sub(v_in),
+                        "and" => old_i & v_in,
+                        "or" => old_i | v_in,
+                        "xor" => old_i ^ v_in,
+                        "exchange" => v_in,
+                        _ => old_i,
+                    };
+                    self.ta_element_set(ti, i, Value::num(new_i as f64))?;
+                    Ok(cur)
+                }
+            }
+        }
+    }
+
     /// `new <TA>(length | buffer[,off[,len]] | typedArray | array/iterable)`.
     pub(crate) fn build_typed_array(&mut self, kind: u8, args: &[Value]) -> Result<Value, Thrown> {
         let size = native::TA_KINDS[kind as usize].1;
