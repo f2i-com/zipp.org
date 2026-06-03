@@ -1882,12 +1882,30 @@ impl<'p> Vm<'p> {
         match name {
             "toJSON" => Ok(Some(self.alloc_str(instant_to_string(ns)))),
             "toString" => {
-                // Default time zone is UTC ("Z"); a timeZone option is not yet supported.
                 let (unit, digits, omit, mode) = self.time_precision(a0)?;
+                // The `timeZone` option: undefined -> UTC shown as "Z"; otherwise the
+                // instant is expressed in that zone and the numeric offset is shown.
+                let tz_v = if self.is_object_value(a0) {
+                    self.get_prop(a0, "timeZone")?
+                } else {
+                    Value::UNDEFINED
+                };
+                let (offset, tz_str) = if tz_v == Value::UNDEFINED {
+                    (0i64, "Z".to_string())
+                } else {
+                    let (_, off) = self.parse_tz_arg(tz_v)?;
+                    (off, format_offset(off))
+                };
                 let rounded = round_increment(ns, unit, &mode);
-                let t = ns_to_time(rounded.rem_euclid(DAY_NS));
-                let (y, mo, d) = epoch_days_to_iso(rounded.div_euclid(DAY_NS) as i64);
-                let s = format!("{}T{}Z", iso_date_string(y, mo, d), format_time_part(&t, digits, omit));
+                let local = rounded + offset as i128;
+                let t = ns_to_time(local.rem_euclid(DAY_NS));
+                let (y, mo, d) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
+                let s = format!(
+                    "{}T{}{}",
+                    iso_date_string(y, mo, d),
+                    format_time_part(&t, digits, omit),
+                    tz_str
+                );
                 Ok(Some(self.alloc_str(s)))
             }
             "valueOf" => Err(Thrown("TypeError: Called Temporal.Instant.prototype.valueOf".into())),
