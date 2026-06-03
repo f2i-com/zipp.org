@@ -125,8 +125,12 @@ impl<'p> Vm<'p> {
         let idx = val.heap_index();
         match ctor {
             C::Array => matches!(self.heap.get(idx), HeapObj::Array(_)),
+            // Spec instanceof: is %Function.prototype% in `val`'s prototype chain?
+            // Catches plain functions/closures AND bound functions, natives, and
+            // the builtin constructor objects (Array/Object/Map/…) — all of which
+            // chain to %Function.prototype% — not just literal Func/Closure values.
             C::Function => {
-                matches!(self.heap.get(idx), HeapObj::Func(_) | HeapObj::Closure { .. })
+                self.fn_proto != 0 && self.is_prototype_of(Value::heap(self.fn_proto), val)
             }
             // Every non-primitive (array, object, function, error) is an Object.
             C::Object => matches!(

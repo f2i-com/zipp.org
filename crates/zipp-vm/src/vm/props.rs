@@ -312,13 +312,13 @@ impl<'p> Vm<'p> {
             return Value::heap(builtin_proto);
         }
         // kind: 0=plain/instance object, 1=callable, 2=array, 3=other.
-        let (class, kind) = match self.heap.get(idx) {
-            HeapObj::Object(m) => (m.class, 0u8),
+        let (class, is_ctor, kind) = match self.heap.get(idx) {
+            HeapObj::Object(m) => (m.class, m.is_ctor, 0u8),
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
-                (None, 1)
+                (None, false, 1)
             }
-            HeapObj::Array(_) => (None, 2),
-            _ => (None, 3),
+            HeapObj::Array(_) => (None, false, 2),
+            _ => (None, false, 3),
         };
         // A generator/async/async-generator function's [[Prototype]] is the
         // matching dynamic-function intrinsic prototype, not %Function.prototype%.
@@ -333,6 +333,14 @@ impl<'p> Vm<'p> {
                     if let Some(p) = self.prototype_of(Value::heap(cidx)) {
                         return p;
                     }
+                }
+                // A constructor object (Array/Object/Map/… built as a callable
+                // Object with no explicit [[Prototype]] and no class link) IS a
+                // function, so its [[Prototype]] is %Function.prototype% — making
+                // `Array instanceof Function` true and
+                // `getPrototypeOf(Array) === Function.prototype`.
+                if is_ctor && self.fn_proto != 0 {
+                    return Value::heap(self.fn_proto);
                 }
                 if self.obj_proto != 0 {
                     Value::heap(self.obj_proto)
