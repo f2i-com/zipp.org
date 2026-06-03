@@ -27,7 +27,10 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::Generator {
             func: func_id,
             closure,
-            state: GenState::Suspended(0),
+            // `usize::MAX` = not-yet-started — distinct from a genuine yield/await
+            // parked at ip 0 (which previously collided with this sentinel and made
+            // the resume re-run from the top).
+            state: GenState::Suspended(usize::MAX),
             regs,
         }))
     }
@@ -99,7 +102,7 @@ impl<'p> Vm<'p> {
                 }
                 // First next() runs from ip 0; a later one resumes after the Yield,
                 // delivering the sent value into the yield expression's dst.
-                let ip = if resume_ip == 0 {
+                let ip = if resume_ip == usize::MAX {
                     0
                 } else {
                     if let Instr::Yield { dst, .. } =
@@ -340,7 +343,10 @@ impl<'p> Vm<'p> {
         let idx = self.heap.alloc(HeapObj::AsyncState(Box::new(AsyncStateData {
             func: func_id,
             closure,
-            state: GenState::Suspended(0),
+            // `usize::MAX` = not-yet-started — distinct from a genuine yield/await
+            // parked at ip 0 (which previously collided with this sentinel and made
+            // the resume re-run from the top).
+            state: GenState::Suspended(usize::MAX),
             regs,
             result,
             handlers: Vec::new(),
@@ -369,6 +375,10 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
             func: func_id,
             closure,
+            // NOTE: async generators keep the legacy `Suspended(0)` "fresh"
+            // sentinel for now — switching them to `usize::MAX` (as plain
+            // generators / async functions do) regressed AsyncGeneratorPrototype,
+            // so their first-instruction-yield edge stays a known limitation.
             state: GenState::Suspended(0),
             regs,
             handlers: Vec::new(),
@@ -511,6 +521,7 @@ impl<'p> Vm<'p> {
         // Resume after the suspending op, delivering the sent/awaited value. The
         // op at `resume_ip` is a Yield (resumed by `.next(v)`) or Await (resumed
         // by a settled promise) — both write the value into the op's `dst`.
+        // (Async generators use the legacy `0` fresh sentinel — see alloc note.)
         let outcome = if resume_ip == 0 {
             self.run_loop(stop)
         } else {
@@ -864,7 +875,7 @@ impl<'p> Vm<'p> {
             handlers: saved_handlers,
         });
         // Position the resume point and deliver the awaited value / rejection.
-        let outcome = if resume_ip == 0 {
+        let outcome = if resume_ip == usize::MAX {
             self.run_loop(stop)
         } else {
             match input {
