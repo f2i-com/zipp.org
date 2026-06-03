@@ -206,6 +206,121 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto }))
     }
 
+    /// The hole-skipping iteration methods (forEach/map/filter/some/every/reduce/
+    /// reduceRight) run against an array-like *object* by visiting only indices
+    /// where HasProperty is true — unlike the dense-snapshot fast path, this
+    /// honours absent indices (own or inherited holes), per the spec.
+    pub(crate) fn array_like_iterate(
+        &mut self,
+        this: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let _gc = self.gc_lock_guard();
+        let lv = self.get_prop(this, "length")?;
+        let lenf = self.to_number_coerce(lv)?;
+        let len: usize = if lenf.is_finite() && lenf > 0.0 {
+            (lenf as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
+        } else {
+            0
+        };
+        let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+        if !self.is_callable(cb) {
+            return Err(Thrown(format!("TypeError: {name} callback is not a function")));
+        }
+        let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        let idxv = |k: usize| Value::num(k as f64);
+
+        match name {
+            "forEach" => {
+                for k in 0..len {
+                    if self.has_property(this, idxv(k)) {
+                        let val = self.get_index(this, idxv(k))?;
+                        self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                    }
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            "map" => {
+                let mut out = vec![Value::UNDEFINED; len];
+                for k in 0..len {
+                    if self.has_property(this, idxv(k)) {
+                        let val = self.get_index(this, idxv(k))?;
+                        out[k] = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                    }
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "filter" => {
+                let mut out = Vec::new();
+                for k in 0..len {
+                    if self.has_property(this, idxv(k)) {
+                        let val = self.get_index(this, idxv(k))?;
+                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        if self.truthy(r) {
+                            out.push(val);
+                        }
+                    }
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+            }
+            "some" => {
+                for k in 0..len {
+                    if self.has_property(this, idxv(k)) {
+                        let val = self.get_index(this, idxv(k))?;
+                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        if self.truthy(r) {
+                            return Ok(Some(Value::bool(true)));
+                        }
+                    }
+                }
+                Ok(Some(Value::bool(false)))
+            }
+            "every" => {
+                for k in 0..len {
+                    if self.has_property(this, idxv(k)) {
+                        let val = self.get_index(this, idxv(k))?;
+                        let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                        if !self.truthy(r) {
+                            return Ok(Some(Value::bool(false)));
+                        }
+                    }
+                }
+                Ok(Some(Value::bool(true)))
+            }
+            "reduce" | "reduceRight" => {
+                let right = name == "reduceRight";
+                let order: Vec<usize> =
+                    if right { (0..len).rev().collect() } else { (0..len).collect() };
+                let mut acc = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let mut started = args.len() >= 2;
+                for k in order {
+                    if !self.has_property(this, idxv(k)) {
+                        continue;
+                    }
+                    let val = self.get_index(this, idxv(k))?;
+                    if !started {
+                        acc = val;
+                        started = true;
+                    } else {
+                        acc = self.call_value(
+                            cb,
+                            Value::UNDEFINED,
+                            &[acc, val, idxv(k), this],
+                        )?;
+                    }
+                }
+                if !started {
+                    return Err(Thrown(
+                        "TypeError: Reduce of empty array with no initial value".into(),
+                    ));
+                }
+                Ok(Some(acc))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         // Suspend GC for the whole method: callback-driven arms (map/filter/
         // reduce/sort/…) hold un-rooted working sets across interpreter re-entry,
@@ -218,19 +333,29 @@ impl<'p> Vm<'p> {
         // For a non-array receiver, snapshot its `length` + indexed elements into a
         // temp array and run the (read-only) method against that. Mutating methods
         // still require a real array (they fall through to their HeapObj::Array arms).
-        if !matches!(self.heap.get(idx), HeapObj::Array(_))
-            && matches!(
+        if !matches!(self.heap.get(idx), HeapObj::Array(_)) {
+            // Hole-skipping callback methods iterate the array-like object with
+            // HasProperty per index (a dense snapshot would treat holes as
+            // present-undefined and wrongly invoke the callback on them).
+            if matches!(
                 name,
                 "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
-                    | "find" | "findIndex" | "findLast" | "findLastIndex" | "indexOf"
+            ) {
+                return self.array_like_iterate(Value::heap(idx), name, args);
+            }
+            // Read-only methods that treat a hole as undefined snapshot to a dense
+            // temp array and run against that.
+            if matches!(
+                name,
+                "find" | "findIndex" | "findLast" | "findLastIndex" | "indexOf"
                     | "lastIndexOf" | "includes" | "join" | "toString" | "slice" | "at"
                     | "concat" | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
                     | "toSpliced" | "entries" | "keys" | "values" | "toLocaleString"
-            )
-        {
-            let elems = self.array_like_read(idx);
-            let tmp = self.heap.alloc(HeapObj::Array(elems));
-            return self.array_method(tmp, name, args);
+            ) {
+                let elems = self.array_like_read(idx);
+                let tmp = self.heap.alloc(HeapObj::Array(elems));
+                return self.array_method(tmp, name, args);
+            }
         }
         match name {
             "push" => {
