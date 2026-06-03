@@ -185,6 +185,62 @@ pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
     Some([h, mi, sec, sub[0], sub[1], sub[2]])
 }
 
+/// True if a bare time-candidate (annotations already stripped, no time
+/// designator) is ALSO a valid ISO date / year-month / month-day form — which
+/// makes it ambiguous as a Temporal time, so the grammar then requires an
+/// explicit `T`. Rejects e.g. "2021-12"/"1214"/"202112"/"12-14" (valid date
+/// forms) while letting "2021-13"/"1314"/"0000" (invalid month/day → a time)
+/// through. Mirrors the spec's disambiguation of CalendarTime vs DateSpec.
+pub(crate) fn ambiguous_with_date(s: &str) -> bool {
+    if parse_iso_date(s).is_some() {
+        return true; // a full date (incl. basic YYYYMMDD) is unambiguously a date
+    }
+    let b = s.as_bytes();
+    let alld = |x: &[u8]| !x.is_empty() && x.iter().all(u8::is_ascii_digit);
+    let two = |x: &[u8]| (x[0] - b'0') as i64 * 10 + (x[1] - b'0') as i64;
+    let vm = |m: i64| (1..=12).contains(&m);
+    let vmd = |m: i64, d: i64| vm(m) && d >= 1 && d <= days_in_month(1972, m);
+    match b.len() {
+        4 if alld(b) => vmd(two(&b[0..2]), two(&b[2..4])), // MMDD
+        5 if b[2] == b'-' && alld(&b[0..2]) && alld(&b[3..5]) => vmd(two(&b[0..2]), two(&b[3..5])), // MM-DD
+        6 if alld(b) => vm(two(&b[4..6])),                 // YYYYMM
+        7 if b[4] == b'-' && alld(&b[0..4]) && alld(&b[5..7]) => vm(two(&b[5..7])), // YYYY-MM
+        _ => false,
+    }
+}
+
+/// ParseTemporalTimeString: a bare time, OR a full date-time whose time part is
+/// extracted, optionally followed by a UTC-offset and/or annotation suffix.
+/// `None` if invalid, or if a bare date-like string is given with no time
+/// designator (ambiguous — the grammar requires a `T`). A date-only string
+/// (e.g. "2021-08-19") is therefore rejected (no implicit midnight).
+pub(crate) fn parse_temporal_time(s: &str) -> Option<[i64; 6]> {
+    let s = s.trim();
+    let main = match s.find('[') {
+        Some(i) => s[..i].trim_end(),
+        None => s,
+    };
+    // Explicit time designator "T<time>".
+    if let Some(rest) = main.strip_prefix(['T', 't']) {
+        return parse_iso_time(rest);
+    }
+    // "<date>T<time>" (or space-separated): the date must be valid; take the time.
+    if let Some(ti) = main.find(['T', 't']) {
+        parse_iso_date(&main[..ti])?;
+        return parse_iso_time(&main[ti + 1..]);
+    }
+    if let Some(si) = main.find(' ') {
+        if parse_iso_date(&main[..si]).is_some() {
+            return parse_iso_time(&main[si + 1..]);
+        }
+    }
+    // Bare string, no designator: reject if it is a valid date form (ambiguous).
+    if ambiguous_with_date(main) {
+        return None;
+    }
+    parse_iso_time(main)
+}
+
 /// Parse "YYYY-MM-DD[THH:MM:SS.fff]" → [y,mo,d,h,mi,s,ms,us,ns] (time defaults 0).
 pub(crate) fn parse_iso_datetime(s: &str) -> Option<[i64; 9]> {
     let s = s.trim();
@@ -807,9 +863,12 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
         Some(b'-') | Some(b'+') => (if bytes[0] == b'-' { -1i64 } else { 1 }, &s[1..]),
         _ => (1, s),
     };
-    // Year: 4 digits (or 6 for expanded). Then "-MM-DD" (separators optional).
+    // Year: 4 digits, OR 6 for an expanded year — but an expanded ±YYYYYY year
+    // REQUIRES the sign, so without one the year is always 4 digits (this lets
+    // basic-format dates like "19761118" parse as 1976-11-18, not year 197611).
+    let signed = matches!(bytes.first(), Some(b'-') | Some(b'+'));
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let ylen = if digits.len() >= 6 { 6 } else { 4 };
+    let ylen = if signed && digits.len() >= 6 { 6 } else { 4 };
     if digits.len() < ylen {
         return None;
     }

@@ -802,7 +802,7 @@ impl<'p> Vm<'p> {
                 if !temporal_string_ok(&s, true) {
                     return Err(Thrown(format!("RangeError: invalid time string '{s}'")));
                 }
-                return parse_iso_time(&s)
+                return parse_temporal_time(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid time string '{s}'")));
             }
             if self.is_object_value(v) {
