@@ -1633,15 +1633,28 @@ impl<'a> FnCompiler<'a> {
         let binding = name.as_deref().map(|n| self.resolve(n));
         let is_block_local =
             matches!(binding, Some(Binding::Local(_)) | Some(Binding::LocalCell(_)));
-        if self.is_script && !is_block_local {
-            // Top-level (or no-conflict block function): bind the name to a global;
-            // the VM materialises the function object at startup. A top-level
-            // function's free vars are all globals, so it never captures.
+        if self.is_script && !is_block_local && !has_upvalues {
+            // Top-level (or no-conflict block function) with no captures: bind the
+            // name to a global; the VM materialises the function object at startup.
             if let Some(n) = &name {
                 let slot = self.cx.global_slot(n);
                 proto.name_global = Some(slot);
             }
             self.cx.functions.push(proto);
+        } else if self.is_script && !is_block_local {
+            // A script-level BLOCK function that captures enclosing block-locals
+            // can't be a startup-materialised global Func — its captured cells
+            // don't exist at startup, and its UpvalGet ops would run with no
+            // closure. Build the CLOSURE at the declaration point (capturing the
+            // live cells) and store it into the function's global var slot.
+            self.cx.functions.push(proto);
+            if let Some(n) = &name {
+                let slot = self.cx.global_slot(n) as u32;
+                let tmp = self.temp();
+                self.emit(Instr::MakeClosure { dst: tmp, func_id: id });
+                self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                self.next_reg -= 1;
+            }
         } else {
             // Nested function, or a script-level conflict-skip block function:
             // create the function object now into the local the hoisting pre-pass
