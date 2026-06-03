@@ -1062,6 +1062,25 @@ impl<'a> FnCompiler<'a> {
         Binding::Global(slot as u32)
     }
 
+    /// Annex B (B.3.3.3): a block-level function declaration is normally given an
+    /// extra function/global-scoped `var` binding, but that extension is SKIPPED
+    /// when replacing it with `var <name>` would be an early error — i.e. when
+    /// `name` is lexically declared (`let`/`const`/`class`) in an ENCLOSING block.
+    /// Then the function stays purely block-scoped. We approximate the early-error
+    /// check by looking for `name` in an enclosing block scope (skipping the base
+    /// function/script scope `[0]` — top-level lexicals are globals — and the
+    /// current block being populated `[last]`). Only consulted at script level;
+    /// inside a function body block functions are always block-local already.
+    fn block_fn_conflicts(&self, name: &str) -> bool {
+        let n = self.scopes.len();
+        if n < 2 {
+            return false;
+        }
+        self.scopes[1..n - 1]
+            .iter()
+            .any(|s| s.iter().any(|(nm, _)| nm == name))
+    }
+
     fn add_const(&mut self, v: Value) -> u32 {
         let i = self.constants.len() as u32;
         self.constants.push(v);
@@ -1112,11 +1131,18 @@ impl<'a> FnCompiler<'a> {
                 // at script top level, `func_decl` binds block functions to globals
                 // (Annex B hoisting), so a local here would shadow that with an
                 // uninitialized slot.
-                if !self.is_script {
-                    for st in &b.body {
-                        if let S::FunctionDeclaration(f) = st {
-                            if let Some(id) = &f.id {
-                                self.declare_local(id.name.as_str());
+                for st in &b.body {
+                    if let S::FunctionDeclaration(f) = st {
+                        if let Some(id) = &f.id {
+                            // Inside a function body, block functions are always
+                            // block-local. At script level they normally hoist to
+                            // a global (Annex B) and so are NOT pre-declared here —
+                            // UNLESS the name conflicts with an enclosing-block
+                            // lexical binding, which suppresses the extension and
+                            // keeps the function block-local (conflict-skip).
+                            let nm = id.name.as_str();
+                            if !self.is_script || self.block_fn_conflicts(nm) {
+                                self.declare_local(nm);
                             }
                         }
                     }
@@ -1588,33 +1614,38 @@ impl<'a> FnCompiler<'a> {
         proto.source = self.cx.src_slice(f.span.start, f.span.end);
         let id = self.cx.functions.len() as u32;
         let has_upvalues = !proto.upvalues.is_empty();
-        if self.is_script {
-            // Top-level: bind the name to a global; the VM materialises the
-            // function object at startup. A top-level function's free vars are
-            // all globals, so it never captures — no MakeClosure needed.
+        // Resolve the name once. A script-level function hoists to a GLOBAL var
+        // binding (Annex B), UNLESS its name was pre-declared as a block-local
+        // because it conflicts with an enclosing-block lexical binding
+        // (conflict-skip) — then it binds locally like a nested-function block fn.
+        let binding = name.as_deref().map(|n| self.resolve(n));
+        let is_block_local =
+            matches!(binding, Some(Binding::Local(_)) | Some(Binding::LocalCell(_)));
+        if self.is_script && !is_block_local {
+            // Top-level (or no-conflict block function): bind the name to a global;
+            // the VM materialises the function object at startup. A top-level
+            // function's free vars are all globals, so it never captures.
             if let Some(n) = &name {
                 let slot = self.cx.global_slot(n);
                 proto.name_global = Some(slot);
             }
             self.cx.functions.push(proto);
         } else {
-            // Nested: create the function object now into the local the hoisting
-            // pre-pass reserved for this name. If it captures, build a closure;
-            // otherwise a plain function object. The name's own binding may be a
-            // plain register or a cell (when a sibling/inner function captures
-            // this function name).
+            // Nested function, or a script-level conflict-skip block function:
+            // create the function object now into the local the hoisting pre-pass
+            // reserved for this name. If it captures, build a closure; otherwise a
+            // plain function object. The name's binding may be a plain register or
+            // a cell (when a sibling/inner function captures this function name).
             self.cx.functions.push(proto);
-            if let Some(n) = &name {
-                match self.resolve(n) {
-                    Binding::Local(reg) => self.emit_make_callable(reg, id, has_upvalues),
-                    Binding::LocalCell(cell) => {
-                        let tmp = self.temp();
-                        self.emit_make_callable(tmp, id, has_upvalues);
-                        self.emit(Instr::CellSet { cell, src: tmp });
-                        self.next_reg -= 1;
-                    }
-                    _ => {}
+            match binding {
+                Some(Binding::Local(reg)) => self.emit_make_callable(reg, id, has_upvalues),
+                Some(Binding::LocalCell(cell)) => {
+                    let tmp = self.temp();
+                    self.emit_make_callable(tmp, id, has_upvalues);
+                    self.emit(Instr::CellSet { cell, src: tmp });
+                    self.next_reg -= 1;
                 }
+                _ => {}
             }
         }
         Ok(())
