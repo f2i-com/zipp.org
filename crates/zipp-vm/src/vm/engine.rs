@@ -527,6 +527,17 @@ impl<'p> Vm<'p> {
                 ));
             }
         }
+        // A built-in constructor object called as a plain function (passed as a
+        // callback, or via .call/.apply). String/Number/Boolean coerce; the rest
+        // construct. (Direct `String(x)` calls are compiler-lowered, so this only
+        // fires for indirect invocations.)
+        if callee.is_heap() {
+            if let HeapObj::Object(m) = self.heap.get(callee.heap_index()) {
+                if m.is_ctor {
+                    return self.call_ctor_as_function(callee, args);
+                }
+            }
+        }
         let (func_id, closure) = self.resolve_callable(callee)?;
         let (is_gen, is_async) = {
             let p = &self.program.functions[func_id as usize];

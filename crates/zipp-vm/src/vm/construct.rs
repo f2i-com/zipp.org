@@ -468,12 +468,70 @@ impl<'p> Vm<'p> {
     /// arrays. Throws a TypeError for a non-iterable. Allocations happen after the
     /// heap borrow is released (two phases).
     /// Whether `v` is a user-callable value (function or closure).
+    /// A built-in constructor object invoked WITHOUT `new` — e.g. passed as a
+    /// `map`/`filter` callback or called via `.call`/`.apply`. String/Number/
+    /// Boolean coerce their argument to a primitive (matching the compiler's
+    /// lowered direct-call form); every other core constructor constructs.
+    pub(crate) fn call_ctor_as_function(&mut self, callee: Value, args: &[Value]) -> Result<Value, Thrown> {
+        let proto = match self.heap.get(callee.heap_index()) {
+            HeapObj::Object(m) => m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index()),
+            _ => None,
+        };
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        if let Some(p) = proto {
+            if p == self.str_proto && self.str_proto != 0 {
+                let s = if args.is_empty() {
+                    String::new()
+                } else if a0.is_heap()
+                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Symbol { .. })
+                {
+                    // String(symbol) yields its "Symbol(desc)" text, not a TypeError.
+                    self.display(a0)
+                } else {
+                    self.to_js_string(a0)?
+                };
+                return Ok(self.alloc_str(s));
+            }
+            if p == self.num_proto && self.num_proto != 0 {
+                let n = if args.is_empty() { 0.0 } else { self.to_number_coerce(a0)? };
+                return Ok(Value::num(n));
+            }
+            if p == self.bool_proto && self.bool_proto != 0 {
+                return Ok(Value::bool(!args.is_empty() && self.truthy(a0)));
+            }
+            if p == self.date_proto && self.date_proto != 0 {
+                // Date() as a function ignores its args and returns the string
+                // form of the current time.
+                let now = self.construct(callee, &[])?;
+                let s = self.to_js_string(now)?;
+                return Ok(self.alloc_str(s));
+            }
+        }
+        // Other core constructors (Map/Set/Promise/Temporal/…) require `new`;
+        // calling them as a function is a TypeError. (Legacy call-without-new
+        // forms like Array()/Object()/Error() are compiler-lowered elsewhere and
+        // never reach here.)
+        let name = match self.heap.get(callee.heap_index()) {
+            HeapObj::Object(m) => m
+                .get("name")
+                .and_then(|n| self.heap.str_cow(n.heap_index()).map(|s| s.into_owned()))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        Err(Thrown(format!("TypeError: constructor {name} requires 'new'")))
+    }
+
     pub(crate) fn is_callable(&self, v: Value) -> bool {
         v.is_heap()
-            && matches!(
-                self.heap.get(v.heap_index()),
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
-            )
+            && match self.heap.get(v.heap_index()) {
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                    true
+                }
+                // A built-in constructor object (String/Number/Array/…) is callable
+                // (typeof is "function") — it can be passed as a callback.
+                HeapObj::Object(m) => m.is_ctor,
+                _ => false,
+            }
     }
 
     /// `obj.hasOwnProperty(key)` — own data/accessor property, array index/length,
