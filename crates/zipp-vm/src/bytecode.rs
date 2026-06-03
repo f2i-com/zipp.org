@@ -445,6 +445,11 @@ pub struct FuncProto {
     /// True for an `async function` body: calling it builds an AsyncState, runs
     /// to the first await, and returns a Promise; never whole-function JITed.
     pub is_async: bool,
+    /// True when this function runs in strict mode (own `"use strict"` directive,
+    /// a strict enclosing scope, a class body, or module code). Strict functions
+    /// receive `this` exactly as passed; sloppy functions called with a nullish
+    /// `this` substitute the global object (OrdinaryCallBindThis, ThisMode global).
+    pub is_strict: bool,
     pub constants: Vec<Value>,
     /// Heap-string constants referenced by `LoadConst` need their text; this
     /// parallels `constants` for the string case (resolved at load time).

@@ -342,6 +342,13 @@ struct Compiler {
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
     eval_mode: bool,
+    /// Strictness of the lexical scope currently being compiled. Set on entry to
+    /// a function/arrow body (inherited from the enclosing scope, OR'd with the
+    /// body's own `"use strict"` directive), forced `true` inside class bodies,
+    /// and seeded from module-ness for the top-level script. A function records
+    /// this into `FuncProto.is_strict`; the VM uses it to decide `this`
+    /// substitution at the call site.
+    in_strict: bool,
 }
 
 impl Compiler {
@@ -354,6 +361,7 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             source,
             eval_mode: false,
+            in_strict: false,
         }
     }
 
@@ -377,6 +385,9 @@ impl Compiler {
     }
 
     fn compile(&mut self, prog: &ox::Program) -> R<()> {
+        // Module code is always strict; a script is sloppy unless its directive
+        // prologue says `"use strict"` (folded in by `compile_function_body`).
+        self.in_strict = prog.source_type.is_module();
         // Reserve function id 0 for the top-level script body; fill it last so
         // nested function ids are stable as we discover them.
         self.functions.push(placeholder("<script>"));
@@ -454,7 +465,13 @@ impl Compiler {
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
         let eval_completion = is_script && self.eval_mode;
+        // Strict if the enclosing scope is strict OR this body opens with a
+        // `"use strict"` directive. Propagate it to `cx` for the duration of the
+        // body so nested functions/arrows inherit it; restore the parent's after.
+        let parent_strict = self.in_strict;
+        let is_strict = parent_strict || has_use_strict(directives);
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.cx.in_strict = is_strict;
         fc.is_script = is_script;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
@@ -505,6 +522,7 @@ impl Compiler {
         for s in body {
             fc.stmt(s)?;
         }
+        fc.cx.in_strict = parent_strict; // restore: nested compiles are done
         // An eval script returns its accumulated completion value; everything else
         // returns undefined.
         if let Some(cr) = fc.completion_reg {
@@ -524,6 +542,7 @@ impl Compiler {
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator,
             is_async,
+            is_strict,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
@@ -561,7 +580,10 @@ impl Compiler {
             names.extend(param_pattern_leaves(pa));
         }
         let captured = capture::captured_locals(&names, body);
+        // Class bodies are always strict, regardless of the enclosing scope.
+        let parent_strict = self.in_strict;
         let mut fc = FnCompiler::new(self, params, rest, captured, Vec::new());
+        fc.cx.in_strict = true;
         fc.super_class = super_class;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
@@ -610,6 +632,7 @@ impl Compiler {
         for s in body {
             fc.stmt(s)?;
         }
+        fc.cx.in_strict = parent_strict; // restore after the (strict) class body
         fc.emit(Instr::ReturnUndefined);
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         Ok(FuncProto {
@@ -621,6 +644,7 @@ impl Compiler {
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator,
             is_async,
+            is_strict: true,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -638,7 +662,10 @@ impl Compiler {
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
+        let parent_strict = self.in_strict;
+        let is_strict = parent_strict || has_use_strict(&a.body.directives);
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.cx.in_strict = is_strict;
         fc.in_async = a.r#async;
         fc.emit_param_defaults(&a.params)?;
         fc.bind_pattern_params(&a.params)?;
@@ -669,6 +696,7 @@ impl Compiler {
             }
             fc.emit(Instr::ReturnUndefined);
         }
+        fc.cx.in_strict = parent_strict; // restore: nested compiles are done
         let upvalues: Vec<UpvalSource> =
             fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         Ok(FuncProto {
@@ -680,6 +708,7 @@ impl Compiler {
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator: false,
             is_async: a.r#async,
+            is_strict,
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -740,12 +769,26 @@ fn placeholder(name: &str) -> FuncProto {
         arguments_reg: None,
         is_generator: false,
         is_async: false,
+        is_strict: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
         name_global: None,
         upvalues: Vec::new(),
         source: String::new(),
     }
+}
+
+/// True if a directive prologue opens with `"use strict"`. Per spec the match is
+/// against the directive's RAW source (so an escaped `"use strict"` does NOT
+/// count); oxc's `Directive.directive` holds exactly that unescaped-but-raw text.
+fn has_use_strict(directives: &[ox::Directive]) -> bool {
+    directives.iter().any(|d| d.directive.as_str() == "use strict")
+}
+
+/// A function's directive prologue (empty when the function has no body), used to
+/// detect its own `"use strict"`.
+fn fn_directives<'a>(f: &'a ox::Function<'a>) -> &'a [ox::Directive<'a>] {
+    f.body.as_ref().map(|b| b.directives.as_slice()).unwrap_or(&[])
 }
 
 /// Per-function compilation state.
@@ -1532,7 +1575,7 @@ impl<'a> FnCompiler<'a> {
             rest.as_deref(),
             Some(&f.params),
             body,
-            &[], // directives only matter for eval-script completion
+            fn_directives(f), // body prologue: drives `"use strict"` strictness
             false,
             f.generator,
             f.r#async,
@@ -2118,7 +2161,7 @@ impl<'a> FnCompiler<'a> {
             rest.as_deref(),
             Some(&f.params),
             body,
-            &[], // directives only matter for eval-script completion
+            fn_directives(f), // body prologue: drives `"use strict"` strictness
             false,
             f.generator,
             f.r#async,

@@ -608,9 +608,17 @@ impl<'p> Vm<'p> {
             }
         }
         let (func_id, closure) = self.resolve_callable(callee)?;
-        let (is_gen, is_async) = {
+        let (is_gen, is_async, is_strict) = {
             let p = self.func(func_id as usize);
-            (p.is_generator, p.is_async)
+            (p.is_generator, p.is_async, p.is_strict)
+        };
+        // OrdinaryCallBindThis: a sloppy (non-strict) function called with a
+        // nullish `this` binds the global object instead. Strict functions —
+        // and built-ins, which never reach here — receive `this` as passed.
+        let this = if !is_strict && this.is_nullish() && self.global_this != 0 {
+            Value::heap(self.global_this)
+        } else {
+            this
         };
         // An `async function*` builds a suspended AsyncGenerator (an async
         // iterator); it doesn't run until `.next()`.

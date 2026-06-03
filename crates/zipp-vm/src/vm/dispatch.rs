@@ -2526,6 +2526,14 @@ impl<'p> Vm<'p> {
         let proto = self.func(func_id as usize);
         let callee_regs = (proto.reg_count as usize).max(1);
         let callee_params = proto.param_count as usize;
+        let is_strict = proto.is_strict;
+        // OrdinaryCallBindThis: a sloppy callee invoked with a nullish `this`
+        // (e.g. a bare `f()`) binds the global object instead.
+        let this_val = if !is_strict && this_val.is_nullish() && self.global_this != 0 {
+            Value::heap(self.global_this)
+        } else {
+            this_val
+        };
 
         let new_base = self.regs.len();
         // Never grow past the pinned capacity (would realloc and dangle a live
