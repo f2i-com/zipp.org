@@ -571,6 +571,21 @@ impl<'p> Vm<'p> {
                 let s = self.to_js_string(now)?;
                 return Ok(self.alloc_str(s));
             }
+            // Array/Object/RegExp construct identically when called as a plain
+            // function: `Array(1,2)`===`new Array(1,2)`, `Object(x)`===ToObject(x),
+            // `RegExp(p,f)`===`new RegExp(p,f)`. (String/Number/Boolean above
+            // return PRIMITIVES, not wrappers, so they stay special-cased.)
+            if (p == self.arr_proto && self.arr_proto != 0)
+                || (p == self.obj_proto && self.obj_proto != 0)
+                || (p == self.regexp_proto && self.regexp_proto != 0)
+            {
+                return self.construct(callee, args);
+            }
+        }
+        // The error constructors also construct when called without `new`
+        // (`TypeError(msg)` === `new TypeError(msg)`).
+        if self.error_ctors.iter().any(|&c| c == ci && c != 0) {
+            return self.construct(callee, args);
         }
         // Other core constructors (Map/Set/Promise/Temporal/…) require `new`;
         // calling them as a function is a TypeError. (Legacy call-without-new
