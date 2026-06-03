@@ -55,6 +55,8 @@ impl<'p> Vm<'p> {
             proto_of: std::collections::HashMap::new(),
             fn_props: std::collections::HashMap::new(),
             arr_props: std::collections::HashMap::new(),
+            ab_max: std::collections::HashMap::new(),
+            ta_tracking: std::collections::HashSet::new(),
             deleted_callable_intrinsics: std::collections::HashSet::new(),
             obj_proto: 0,
             fn_proto: 0,

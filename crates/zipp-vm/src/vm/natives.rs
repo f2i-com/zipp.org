@@ -1438,6 +1438,14 @@ impl<'p> Vm<'p> {
                 }
                 self.arraybuffer_method(this.heap_index(), "slice", args)?.unwrap_or(Value::UNDEFINED)
             }
+            ARRAYBUFFER_RESIZE => {
+                if !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::ArrayBuffer { .. })) {
+                    return Err(Thrown(
+                        "TypeError: ArrayBuffer.prototype.resize called on incompatible receiver".into(),
+                    ));
+                }
+                self.arraybuffer_method(this.heap_index(), "resize", args)?.unwrap_or(Value::UNDEFINED)
+            }
             PROXY_REVOCABLE => {
                 // Proxy.revocable(target, handler) → { proxy, revoke }.
                 let p = self.make_proxy(a0, a1)?;

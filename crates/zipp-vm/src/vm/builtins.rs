@@ -198,7 +198,8 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn ta_len_kind(&self, idx: u32) -> (usize, u8) {
         match self.heap.get(idx) {
-            HeapObj::TypedArray { length, kind, .. } => (*length, *kind),
+            // Effective length (0 if out of bounds on a resized buffer).
+            HeapObj::TypedArray { kind, .. } => (self.ta_effective_len(idx).unwrap_or(0), *kind),
             _ => (0, 0),
         }
     }
@@ -241,18 +242,13 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         // ValidateTypedArray: nearly every TypedArray prototype method throws a
-        // TypeError when the underlying buffer is detached (subarray is the one
-        // exception — it just builds another view).
-        if name != "subarray" {
-            let buf = match self.heap.get(idx) {
-                HeapObj::TypedArray { buffer, .. } => *buffer,
-                _ => 0,
-            };
-            if matches!(self.heap.get(buf), HeapObj::ArrayBuffer { detached: true, .. }) {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot perform {name} on a TypedArray with a detached buffer"
-                )));
-            }
+        // TypeError when the view is out of bounds — a detached buffer, or (on a
+        // resizable buffer that shrank) an offset/length that no longer fits.
+        // subarray is the one exception (it just builds another view).
+        if name != "subarray" && self.ta_effective_len(idx).is_none() {
+            return Err(Thrown(format!(
+                "TypeError: Cannot perform {name} on an out-of-bounds or detached TypedArray"
+            )));
         }
         let (len, kind) = self.ta_len_kind(idx);
         let recv = Value::heap(idx);
@@ -690,14 +686,27 @@ impl<'p> Vm<'p> {
     pub(crate) fn arraybuffer_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         let len = self.array_buffer_len(idx);
         match name {
-            "slice" => {
-                let rel = |v: Value, def: usize, this: &Self| -> usize {
-                    if v == Value::UNDEFINED {
-                        return def;
-                    }
-                    let n = this.value_num(v);
-                    if n < 0.0 { ((len as f64 + n).max(0.0)) as usize } else { (n as usize).min(len) }
+            // `ArrayBuffer.prototype.resize(newLength)` — only for a resizable
+            // buffer (created with maxByteLength); grows with zero-fill, shrinks
+            // by truncation, within [0, maxByteLength].
+            "resize" => {
+                let max = match self.ab_max.get(&idx) {
+                    Some(&m) => m,
+                    None => return Err(Thrown("TypeError: ArrayBuffer is not resizable".into())),
                 };
+                if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown("TypeError: Cannot resize a detached ArrayBuffer".into()));
+                }
+                let n = self.to_integer_or_zero(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                if n < 0 || n as usize > max {
+                    return Err(Thrown("RangeError: ArrayBuffer resize length out of range".into()));
+                }
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(idx) {
+                    data.resize(n as usize, 0u8);
+                }
+                Ok(Some(Value::UNDEFINED))
+            }
+            "slice" => {
                 let start = self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
                 let end = self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
                 let slice: Vec<u8> = match self.heap.get(idx) {

@@ -820,7 +820,8 @@ impl<'p> Vm<'p> {
                     m.define("BYTES_PER_ELEMENT", Value::num(size as f64), proto_attr);
                 }
             }
-            let arraybuffer_proto = build(self, &[("slice", ARRAYBUFFER_SLICE)], None);
+            let arraybuffer_proto =
+                build(self, &[("slice", ARRAYBUFFER_SLICE), ("resize", ARRAYBUFFER_RESIZE)], None);
             self.proto_of.insert(arraybuffer_proto, Value::heap(obj_proto));
             self.arraybuffer_proto = arraybuffer_proto;
             let arraybuffer_ctor = build(self, &[], Some(arraybuffer_proto));

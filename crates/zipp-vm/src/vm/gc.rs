@@ -219,6 +219,8 @@ impl Vm<'_> {
         self.fn_props.retain(|&k, _| marks[k as usize]);
         self.arr_props.retain(|&k, _| marks[k as usize]);
         self.zdt_tz.retain(|&k, _| marks[k as usize]);
+        self.ab_max.retain(|&k, _| marks[k as usize]);
+        self.ta_tracking.retain(|&k| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
         let _ = free_before;

@@ -175,6 +175,13 @@ pub struct Vm<'p> {
     /// map, so its (rare) named own properties live here — exactly mirroring
     /// `fn_props` for callables. Numeric indices + `length` stay in the Vec.
     arr_props: std::collections::HashMap<u32, ObjMap>,
+    /// Resizable ArrayBuffers: heap idx → maxByteLength. Presence marks a buffer
+    /// as resizable (a side table avoids changing the ArrayBuffer heap variant).
+    ab_max: std::collections::HashMap<u32, usize>,
+    /// Length-tracking TypedArrays/DataViews (created on a resizable buffer with
+    /// no explicit length): heap idx set. Their effective length follows the
+    /// buffer's current byte length.
+    ta_tracking: std::collections::HashSet<u32>,
     /// Callables expose `name`/`length` as synthesized own properties (computed
     /// from the proto, not stored). They're `configurable: true`, so `delete
     /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |

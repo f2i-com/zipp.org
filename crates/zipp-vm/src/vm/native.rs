@@ -212,6 +212,7 @@ pub const DV_PROTO_METHODS: &[&str] = &[
 ];
 pub const DV_METHOD_BASE: u16 = 372;
 pub const ARRAYBUFFER_SLICE: u16 = 396;
+pub const ARRAYBUFFER_RESIZE: u16 = 399;
 pub const PROXY_REVOCABLE: u16 = 397;
 pub const PROXY_REVOKE: u16 = 398;
 /// Temporal.Duration.prototype instance methods (dispatched by name via
@@ -560,6 +561,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     }
     if id == ARRAYBUFFER_SLICE {
         return Some(("slice", 2));
+    }
+    if id == ARRAYBUFFER_RESIZE {
+        return Some(("resize", 1));
     }
     // Temporal.<Type>.prototype method natives: name + length as own properties.
     for (base, methods) in [

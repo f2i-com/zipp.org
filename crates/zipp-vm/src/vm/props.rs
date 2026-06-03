@@ -798,20 +798,21 @@ impl<'p> Vm<'p> {
             return Ok(raw);
         }
         // TypedArray / ArrayBuffer / DataView instance properties.
-        if let HeapObj::TypedArray { buffer, kind, byte_offset, length } = self.heap.get(obj.heap_index()) {
-            let (buffer, kind, byte_offset, length) = (*buffer, *kind, *byte_offset, *length);
+        if let HeapObj::TypedArray { buffer, kind, byte_offset, .. } = self.heap.get(obj.heap_index()) {
+            let (buffer, kind, byte_offset) = (*buffer, *kind, *byte_offset);
             let size = native::TA_KINDS[kind as usize].1;
             // A canonical numeric string index reads the element.
             if let Ok(i) = key.parse::<usize>() {
                 return Ok(self.ta_element_get(obj.heap_index(), i));
             }
-            // A TypedArray over a detached buffer reports length/byteLength/
-            // byteOffset as 0.
-            let detached = matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. });
+            // Out of bounds (detached, or shrunk past this view) reports
+            // length/byteLength/byteOffset as 0; a length-tracking view reflects
+            // the buffer's current size.
+            let eff = self.ta_effective_len(obj.heap_index());
             return Ok(match key {
-                "length" => Value::num(if detached { 0.0 } else { length as f64 }),
-                "byteLength" => Value::num(if detached { 0.0 } else { (length * size) as f64 }),
-                "byteOffset" => Value::num(if detached { 0.0 } else { byte_offset as f64 }),
+                "length" => Value::num(eff.unwrap_or(0) as f64),
+                "byteLength" => Value::num((eff.unwrap_or(0) * size) as f64),
+                "byteOffset" => Value::num(if eff.is_none() { 0.0 } else { byte_offset as f64 }),
                 "BYTES_PER_ELEMENT" => Value::num(size as f64),
                 "buffer" => Value::heap(buffer),
                 "@@toStringTag" => self.alloc_str(native::TA_KINDS[kind as usize].0.to_string()),
@@ -820,8 +821,15 @@ impl<'p> Vm<'p> {
         }
         if let HeapObj::ArrayBuffer { data, .. } = self.heap.get(obj.heap_index()) {
             let len = data.len();
+            let ai = obj.heap_index();
+            let max = self.ab_max.get(&ai).copied();
             return Ok(match key {
                 "byteLength" => Value::num(len as f64),
+                "maxByteLength" => Value::num(max.unwrap_or(len) as f64),
+                "resizable" => Value::bool(max.is_some()),
+                "detached" => Value::bool(
+                    matches!(self.heap.get(ai), HeapObj::ArrayBuffer { detached: true, .. }),
+                ),
                 _ => self.proto_member(self.arraybuffer_proto, key),
             });
         }

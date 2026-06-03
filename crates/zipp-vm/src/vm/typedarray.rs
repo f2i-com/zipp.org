@@ -26,6 +26,36 @@ impl<'p> Vm<'p> {
             _ => 0,
         }
     }
+    /// Effective element length of a TypedArray view, accounting for a resizable
+    /// backing buffer. `None` means the view is out of bounds — detached, its
+    /// offset is past the (shrunk) buffer, or a fixed-length view no longer fits;
+    /// methods then treat it like a detached buffer. A length-tracking view's
+    /// length follows the buffer. For a non-resizable buffer this returns the
+    /// fixed length unchanged (the ta_tracking set is empty in the common case).
+    pub(crate) fn ta_effective_len(&self, ta_idx: u32) -> Option<usize> {
+        let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
+                (*buffer, *kind, *byte_offset, *length)
+            }
+            _ => return None,
+        };
+        let buf_len = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data.len(),
+            _ => return None,
+        };
+        let size = native::TA_KINDS[kind as usize].1;
+        if self.ta_tracking.contains(&ta_idx) {
+            if byte_offset > buf_len {
+                return None;
+            }
+            Some((buf_len - byte_offset) / size)
+        } else {
+            if byte_offset.checked_add(length.checked_mul(size)?)? > buf_len {
+                return None;
+            }
+            Some(length)
+        }
+    }
     pub(crate) fn alloc_array_buffer(&mut self, byte_len: usize) -> u32 {
         let idx = self.heap.alloc(HeapObj::ArrayBuffer { data: vec![0u8; byte_len], detached: false });
         if self.arraybuffer_proto != 0 {
@@ -47,13 +77,13 @@ impl<'p> Vm<'p> {
     /// 64-bit BigInt kinds). Out-of-bounds → undefined.
     pub(crate) fn ta_element_get(&mut self, ta_idx: u32, i: usize) -> Value {
         let (kind, bytes) = {
-            let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
-                HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
-                    (*buffer, *kind, *byte_offset, *length)
+            let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
+                HeapObj::TypedArray { buffer, kind, byte_offset, .. } => {
+                    (*buffer, *kind, *byte_offset)
                 }
                 _ => return Value::UNDEFINED,
             };
-            if i >= length {
+            if i >= self.ta_effective_len(ta_idx).unwrap_or(0) {
                 return Value::UNDEFINED;
             }
             let size = native::TA_KINDS[kind as usize].1;
@@ -122,10 +152,8 @@ impl<'p> Vm<'p> {
     /// Write `v` to element `i` of a TypedArray (ToNumber/ToBigInt then encode per
     /// the element kind). Out-of-bounds → silent no-op (after coercion).
     pub(crate) fn ta_element_set(&mut self, ta_idx: u32, i: usize, v: Value) -> Result<(), Thrown> {
-        let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
-                (*buffer, *kind, *byte_offset, *length)
-            }
+        let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
             _ => return Ok(()),
         };
         let size = native::TA_KINDS[kind as usize].1;
@@ -146,7 +174,8 @@ impl<'p> Vm<'p> {
             let f = self.to_number(v)?;
             ta_encode(kind, f)
         };
-        if i >= length {
+        // Re-check bounds after coercion (a valueOf could have resized the buffer).
+        if i >= self.ta_effective_len(ta_idx).unwrap_or(0) {
             return Ok(());
         }
         if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buffer) {
@@ -173,7 +202,9 @@ impl<'p> Vm<'p> {
         if n > MAX_ARRAY_BUFFER_LEN as f64 {
             return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
         }
-        // `maxByteLength` (resizable ArrayBuffer) is at least validated for range.
+        // `maxByteLength` (resizable ArrayBuffer): validated, then recorded so the
+        // buffer is `resizable` and `resize` accepts up to that length.
+        let mut max_byte_length: Option<usize> = None;
         if let Some(&opt) = args.get(1) {
             if self.is_object_value(opt) {
                 let mbl = self.get_prop(opt, "maxByteLength")?;
@@ -185,10 +216,15 @@ impl<'p> Vm<'p> {
                     if m < n {
                         return Err(Thrown("RangeError: maxByteLength < byteLength".into()));
                     }
+                    max_byte_length = Some(m as usize);
                 }
             }
         }
-        Ok(Value::heap(self.alloc_array_buffer(n as usize)))
+        let buf = self.alloc_array_buffer(n as usize);
+        if let Some(m) = max_byte_length {
+            self.ab_max.insert(buf, m);
+        }
+        Ok(Value::heap(buf))
     }
 
     /// `new <TA>(length | buffer[,off[,len]] | typedArray | array/iterable)`.
@@ -202,6 +238,9 @@ impl<'p> Vm<'p> {
                 _ => 0,
             };
             let buf_len = self.array_buffer_len(buf);
+            // A length-tracking view: no explicit length on a resizable buffer.
+            let explicit_len = matches!(args.get(2), Some(&v) if v != Value::UNDEFINED);
+            let tracking = !explicit_len && self.ab_max.contains_key(&buf);
             let length = match args.get(2) {
                 Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
                 _ => {
@@ -214,7 +253,11 @@ impl<'p> Vm<'p> {
             if byte_offset % size != 0 || byte_offset + length * size > buf_len {
                 return Err(Thrown("RangeError: invalid TypedArray length/offset".into()));
             }
-            return Ok(self.alloc_typed_array(buf, kind, byte_offset, length));
+            let ta = self.alloc_typed_array(buf, kind, byte_offset, length);
+            if tracking {
+                self.ta_tracking.insert(ta.heap_index());
+            }
+            return Ok(ta);
         }
         // new TA(typedArray) / new TA(array | iterable | array-like) → copy
         // element-by-element.
