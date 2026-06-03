@@ -495,6 +495,27 @@ impl<'p> Vm<'p> {
             m.define("@@toStringTag", gen_tag, tag_data);
         }
         self.gen_proto = gen_proto;
+        // %AsyncIteratorPrototype% (@@asyncIterator returns self) and
+        // %AsyncGeneratorPrototype% (next/return/throw returning Promises +
+        // @@toStringTag "AsyncGenerator"), chained appropriately. Async-generator
+        // instances delegate here.
+        let async_iter_root = build(self, &[("@@asyncIterator", ITER_SELF)], None);
+        self.proto_of.insert(async_iter_root, Value::heap(obj_proto));
+        let asyncgen_proto = build(
+            self,
+            &[
+                ("next", native::ASYNCGEN_NEXT),
+                ("return", native::ASYNCGEN_RETURN),
+                ("throw", native::ASYNCGEN_THROW),
+            ],
+            None,
+        );
+        self.proto_of.insert(asyncgen_proto, Value::heap(async_iter_root));
+        let asyncgen_tag = self.alloc_str("AsyncGenerator".to_string());
+        if let HeapObj::Object(m) = self.heap.get_mut(asyncgen_proto) {
+            m.define("@@toStringTag", asyncgen_tag, tag_data);
+        }
+        self.asyncgen_proto = asyncgen_proto;
         // The `Iterator` constructor (abstract): prototype = %Iterator.prototype%,
         // static `Iterator.from`. name "Iterator", length 0.
         let iter_ctor = build(self, &[("from", ITER_FROM)], Some(iter_root));
@@ -530,6 +551,28 @@ impl<'p> Vm<'p> {
         let (ag_ctor, ag_proto) = self.build_dynamic_fn_intrinsic("AsyncGeneratorFunction");
         self.asyncgen_fn_ctor = ag_ctor;
         self.asyncgen_fn_proto = ag_proto;
+        // Link %GeneratorFunction.prototype%.prototype === %GeneratorPrototype% and
+        // %AsyncGeneratorFunction.prototype%.prototype === %AsyncGeneratorPrototype%
+        // ({writable:false, enumerable:false, configurable:true}) — this is how the
+        // GeneratorPrototype / AsyncGeneratorPrototype tests reach those intrinsics
+        // (getPrototypeOf(generatorFn).prototype).
+        let proto_nw = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        for (fn_proto, inst_proto) in
+            [(self.gen_fn_proto, self.gen_proto), (self.asyncgen_fn_proto, self.asyncgen_proto)]
+        {
+            if fn_proto != 0 && inst_proto != 0 {
+                let pv = Value::heap(inst_proto);
+                if let HeapObj::Object(m) = self.heap.get_mut(fn_proto) {
+                    m.define("prototype", pv, proto_nw);
+                }
+            }
+        }
         // Default @@iterator: Map → entries, Set → values (alias to the same fn).
         let map_entries = match self.heap.get(map_proto) {
             HeapObj::Object(m) => m.get("entries"),

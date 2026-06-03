@@ -171,6 +171,7 @@ impl<'p> Vm<'p> {
             iterator_proto_root: 0,
             iterator_helper_proto: 0,
             gen_proto: 0,
+            asyncgen_proto: 0,
             iterator_ctor: 0,
             dollar262: 0,
             array_iter_proto: 0,

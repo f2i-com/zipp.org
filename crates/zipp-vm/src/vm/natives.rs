@@ -1517,6 +1517,22 @@ impl<'p> Vm<'p> {
                 self.generator_method(this.heap_index(), name, args)?
                     .unwrap_or(Value::UNDEFINED)
             }
+            ASYNCGEN_NEXT | ASYNCGEN_RETURN | ASYNCGEN_THROW => {
+                let name = match id {
+                    ASYNCGEN_NEXT => "next",
+                    ASYNCGEN_RETURN => "return",
+                    _ => "throw",
+                };
+                if !this.is_heap()
+                    || !matches!(self.heap.get(this.heap_index()), HeapObj::AsyncGenerator(_))
+                {
+                    return Err(Thrown(format!(
+                        "TypeError: {name} called on a non-async-generator object"
+                    )));
+                }
+                self.async_generator_method(this.heap_index(), name, args)
+                    .unwrap_or(Value::UNDEFINED)
+            }
             _ if (SAB_GETTER_BASE..SAB_GETTER_BASE + SAB_GETTERS.len() as u16).contains(&id) => {
                 let name = SAB_GETTERS[(id - SAB_GETTER_BASE) as usize];
                 if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {

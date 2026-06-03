@@ -367,6 +367,10 @@ pub struct Vm<'p> {
     /// throw + @@iterator + @@toStringTag, chaining to %Iterator.prototype% so a
     /// generator inherits the iterator-helper methods (`g().map(...)` etc.).
     gen_proto: u32,
+    /// `%AsyncGeneratorPrototype%` — async-generator instances: next/return/throw
+    /// (returning Promises) + @@asyncIterator + @@toStringTag, chaining to
+    /// %AsyncIteratorPrototype%.
+    asyncgen_proto: u32,
     iterator_ctor: u32,
     /// The test262 `$262` host object (0 until set up).
     dollar262: u32,

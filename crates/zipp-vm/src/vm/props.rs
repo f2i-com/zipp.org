@@ -298,6 +298,7 @@ impl<'p> Vm<'p> {
             HeapObj::Iterator { proto, .. } => *proto,
             HeapObj::IterHelper { .. } => self.iterator_helper_proto,
             HeapObj::Generator { .. } => self.gen_proto,
+            HeapObj::AsyncGenerator(_) => self.asyncgen_proto,
             HeapObj::Boxed { kind, .. } => match kind {
                 0 => self.str_proto,
                 1 => self.num_proto,
@@ -1234,6 +1235,10 @@ impl<'p> Vm<'p> {
             // methods). So `g().next`, `g().map`, `g()[Symbol.iterator]` all resolve.
             HeapObj::Generator { .. } => {
                 let p = self.gen_proto;
+                self.proto_chain_get(p, key, obj)
+            }
+            HeapObj::AsyncGenerator(_) => {
+                let p = self.asyncgen_proto;
                 self.proto_chain_get(p, key, obj)
             }
             // A boxed primitive: `length` (String box) reads the wrapped string;

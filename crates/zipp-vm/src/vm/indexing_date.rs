@@ -79,6 +79,9 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::Native(_)
                 | HeapObj::Iterator { .. }
+                | HeapObj::IterHelper { .. }
+                | HeapObj::Generator { .. }
+                | HeapObj::AsyncGenerator(_)
                 | HeapObj::Date(_)
                 | HeapObj::Promise { .. }
                 | HeapObj::WeakMap { .. }

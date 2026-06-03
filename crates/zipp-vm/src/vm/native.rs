@@ -204,6 +204,10 @@ pub const DISPOSABLE_DISPOSE_ASYNC: u16 = 846;
 pub const GEN_NEXT: u16 = 850;
 pub const GEN_RETURN: u16 = 851;
 pub const GEN_THROW: u16 = 852;
+/// `%AsyncGeneratorPrototype%` next/return/throw (dispatch to async_generator_method).
+pub const ASYNCGEN_NEXT: u16 = 853;
+pub const ASYNCGEN_RETURN: u16 = 854;
+pub const ASYNCGEN_THROW: u16 = 855;
 // String static methods.
 pub const STR_FROM_CHAR_CODE: u16 = 311;
 pub const STR_FROM_CODE_POINT: u16 = 312;
@@ -803,6 +807,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GEN_NEXT => ("next", 1),
         GEN_RETURN => ("return", 1),
         GEN_THROW => ("throw", 1),
+        ASYNCGEN_NEXT => ("next", 1),
+        ASYNCGEN_RETURN => ("return", 1),
+        ASYNCGEN_THROW => ("throw", 1),
         STR_FROM_CHAR_CODE => ("fromCharCode", 1),
         STR_FROM_CODE_POINT => ("fromCodePoint", 1),
         STR_RAW => ("raw", 1),
