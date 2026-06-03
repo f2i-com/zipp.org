@@ -425,6 +425,7 @@ impl Compiler {
             None,
             None,
             &prog.body,
+            &prog.directives,
             true,
             false, // top-level script is not a generator
             false, // top-level script is not async
@@ -445,6 +446,7 @@ impl Compiler {
         rest: Option<&str>,
         params_ast: Option<&ox::FormalParameters>,
         body: &[ox::Statement],
+        directives: &[ox::Directive],
         is_script: bool,
         is_generator: bool,
         is_async: bool,
@@ -463,6 +465,14 @@ impl Compiler {
             let cr = fc.alloc_reg();
             fc.emit(Instr::LoadUndefined { dst: cr });
             fc.completion_reg = Some(cr);
+            // A directive prologue is a string-literal expression statement whose
+            // value is a completion value (`eval("'use strict'")` === "use
+            // strict"). Directives run before the body, so seed the completion with
+            // each (the last wins) — body expression statements then overwrite it.
+            for d in directives {
+                let idx = fc.add_string_const(d.expression.value.as_str());
+                fc.emit(Instr::LoadConst { dst: cr, idx });
+            }
         }
         if !is_script {
             fc.reserve_arguments(); // non-arrow functions bind `arguments`
@@ -1491,6 +1501,7 @@ impl<'a> FnCompiler<'a> {
             rest.as_deref(),
             Some(&f.params),
             body,
+            &[], // directives only matter for eval-script completion
             false,
             f.generator,
             f.r#async,
@@ -2076,6 +2087,7 @@ impl<'a> FnCompiler<'a> {
             rest.as_deref(),
             Some(&f.params),
             body,
+            &[], // directives only matter for eval-script completion
             false,
             f.generator,
             f.r#async,
