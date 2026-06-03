@@ -290,7 +290,7 @@ pub const PROXY_REVOKE: u16 = 398;
 /// Temporal.Duration.prototype instance methods (dispatched by name via
 /// `temporal_method`), at TEMPORAL_M_BASE + index.
 pub const TEMPORAL_DURATION_METHODS: &[&str] =
-    &["with", "negated", "abs", "toString", "toJSON", "valueOf"];
+    &["with", "negated", "abs", "toString", "toJSON", "valueOf", "add", "subtract", "round", "total"];
 pub const TEMPORAL_M_BASE: u16 = 400;
 pub const TEMPORAL_DURATION_FROM: u16 = 410;
 pub const TEMPORAL_DURATION_COMPARE: u16 = 411;
@@ -672,7 +672,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
             let m = methods[(id - base) as usize];
             let len: u8 = match m {
                 "with" | "add" | "subtract" | "until" | "since" | "round" | "equals"
-                | "withPlainTime" | "withTimeZone" | "withCalendar" | "withPlainDate"
+                | "total" | "withPlainTime" | "withTimeZone" | "withCalendar" | "withPlainDate"
                 | "toZonedDateTime" | "toZonedDateTimeISO" => 1,
                 _ => 0,
             };
