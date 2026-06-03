@@ -622,9 +622,7 @@ impl<'p> Vm<'p> {
                 };
                 self.alloc_str(out)
             }
-            ARR_IS_ARRAY => {
-                Value::bool(a0.is_heap() && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_)))
-            }
+            ARR_IS_ARRAY => Value::bool(self.value_is_array(a0)),
             ARR_FROM => self.array_from(this, a0, a1, args.get(2).copied().unwrap_or(Value::UNDEFINED))?,
             ARR_OF => Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec()))),
             // `%TypedArray%.from(src, mapFn?)` / `.of(...items)` — `this` is the

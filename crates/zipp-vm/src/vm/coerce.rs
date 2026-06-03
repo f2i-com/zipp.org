@@ -45,6 +45,27 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// IsArray(v) (ES 7.2.2): true for an Array exotic, recursing through Proxy
+    /// targets (a revoked or non-array proxy is not an array). Used by
+    /// `Array.isArray` and the `IsArray` op so `Array.isArray(new Proxy([], …))`
+    /// is true. (The revoked-proxy-throws nuance is approximated as `false`.)
+    pub(crate) fn value_is_array(&self, v: Value) -> bool {
+        if !v.is_heap() {
+            return false;
+        }
+        let mut idx = v.heap_index();
+        for _ in 0..1000 {
+            match self.heap.get(idx) {
+                HeapObj::Array(_) => return true,
+                HeapObj::Proxy { target, revoked, .. } if !*revoked && target.is_heap() => {
+                    idx = target.heap_index();
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// IsConcatSpreadable(O) (ES 23.1.3.1.1): a `Symbol.isConcatSpreadable`
     /// ("@@isConcatSpreadable") flag overrides — when present it is ToBoolean'd;
     /// otherwise the value is spreadable iff it is an Array. Non-objects are never
