@@ -104,7 +104,15 @@ impl Value {
     #[inline(always)]
     pub fn num(n: f64) -> Value {
         // Exact-integer narrowing: keeps hot integer code in the int domain.
-        if n.fract() == 0.0 && n >= i32::MIN as f64 && n <= i32::MAX as f64 {
+        // EXCEPT negative zero — narrowing -0.0 to int 0 would lose its sign
+        // (breaking `1/-0` === -Infinity, `Object.is(-0,+0)`, SameValue, etc.), so
+        // -0.0 is kept as a double. (+0.0 still narrows: the `== 0.0` short-circuits
+        // for non-zero integers, so this only costs a sign check at exactly zero.)
+        if n.fract() == 0.0
+            && n >= i32::MIN as f64
+            && n <= i32::MAX as f64
+            && !(n == 0.0 && n.is_sign_negative())
+        {
             return Value::int(n as i32);
         }
         if n.is_nan() {

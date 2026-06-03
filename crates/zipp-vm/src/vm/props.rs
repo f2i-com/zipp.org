@@ -534,8 +534,11 @@ impl<'p> Vm<'p> {
                 let change_enum = d_en.is_some_and(|b| b != a.enumerable);
                 let change_kind = is_accessor != a.accessor;
                 let make_writable = !a.writable && d_wr == Some(true);
+                // A non-writable data property may only be "redefined" to the same
+                // value — compared with SameValue (so -0 vs +0 and NaN vs NaN are
+                // handled per spec, unlike `==`).
                 let change_frozen_value =
-                    !a.accessor && !a.writable && value.is_some_and(|v| v != oldv);
+                    !a.accessor && !a.writable && value.is_some_and(|v| !self.same_value(v, oldv));
                 if make_cfg || change_enum || change_kind || make_writable || change_frozen_value {
                     return Err(Thrown(format!("TypeError: Cannot redefine property: {key}")));
                 }

@@ -379,9 +379,16 @@ impl<'p> Vm<'p> {
                     Instr::Neg { dst, a } => {
                         let va = self.get(base, a);
                         let r = if va.is_int() {
-                            match va.as_int().checked_neg() {
-                                Some(v) => Value::int(v),
-                                None => Value::num(-(va.as_int() as f64)),
+                            let i = va.as_int();
+                            if i == 0 {
+                                // `-0` is the negative-zero DOUBLE, not integer 0
+                                // (so `1/-0` is -Infinity, `Object.is(-0,+0)` false).
+                                Value::num(-0.0)
+                            } else {
+                                match i.checked_neg() {
+                                    Some(v) => Value::int(v),
+                                    None => Value::num(-(i as f64)),
+                                }
                             }
                         } else if let Some(n) = self.bigint_value(va) {
                             self.make_bigint(n.wrapping_neg())
