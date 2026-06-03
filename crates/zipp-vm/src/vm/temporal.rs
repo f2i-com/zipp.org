@@ -1640,6 +1640,16 @@ impl<'p> Vm<'p> {
         Err(Thrown("TypeError: timeZone is not a string or object".into()))
     }
 
+    /// `Temporal.Now.*` time-zone argument: `undefined` is the system zone (UTC
+    /// here, no tz database), otherwise validate it via ToTemporalTimeZoneIdentifier
+    /// (a string id or a ZonedDateTime; anything else throws). Returns (id, offset-ns).
+    pub(crate) fn now_tz_id(&mut self, arg: Value) -> Result<(String, i64), Thrown> {
+        if arg == Value::UNDEFINED {
+            return Ok(("UTC".to_string(), 0));
+        }
+        self.parse_tz_arg(arg)
+    }
+
     /// Parse a `relativeTo` option into a date-time [y,mo,d,h,…] anchor (a
     /// ZonedDateTime uses its local wall-clock; otherwise PlainDate/PlainDateTime/
     /// string/object coercion).

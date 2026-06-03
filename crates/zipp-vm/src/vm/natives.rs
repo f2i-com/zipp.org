@@ -1844,26 +1844,36 @@ impl<'p> Vm<'p> {
                 let (ry, m, d) = self.to_plain_month_day_overflow(a0, reject)?;
                 self.make_plain_month_day(m, d, ry)?
             }
-            // Temporal.Now — no timezone DB, so everything reports UTC.
+            // Temporal.Now — no timezone DB, so a named zone reports UTC, but a
+            // numeric-offset zone shifts the wall-clock. The time-zone arg is
+            // still validated (invalid string -> RangeError, wrong type -> TypeError).
             NOW_INSTANT => {
                 let ns = Self::now_epoch_ns();
                 self.make_instant(ns)?
             }
             NOW_PLAINDATETIME_ISO => {
-                let ns = Self::now_epoch_ns();
+                let (_, offset) = self.now_tz_id(a0)?;
+                let ns = Self::now_epoch_ns() + offset as i128;
                 let days = ns.div_euclid(DAY_NS);
                 let t = ns_to_time(ns.rem_euclid(DAY_NS));
                 let (y, mo, d) = epoch_days_to_iso(days as i64);
                 self.make_plain_date_time([y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]])?
             }
             NOW_PLAINDATE_ISO => {
-                let ns = Self::now_epoch_ns();
+                let (_, offset) = self.now_tz_id(a0)?;
+                let ns = Self::now_epoch_ns() + offset as i128;
                 let (y, mo, d) = epoch_days_to_iso(ns.div_euclid(DAY_NS) as i64);
                 self.make_plain_date(y, mo, d)?
             }
             NOW_PLAINTIME_ISO => {
-                let ns = Self::now_epoch_ns();
+                let (_, offset) = self.now_tz_id(a0)?;
+                let ns = Self::now_epoch_ns() + offset as i128;
                 self.make_plain_time(ns_to_time(ns.rem_euclid(DAY_NS)))?
+            }
+            NOW_ZONEDDATETIME_ISO => {
+                let (id, offset) = self.now_tz_id(a0)?;
+                let ns = Self::now_epoch_ns();
+                self.alloc_zdt(ns, offset, id)
             }
             NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
             // ── Intl ──

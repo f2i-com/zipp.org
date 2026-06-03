@@ -1259,6 +1259,7 @@ impl<'p> Vm<'p> {
                 ("plainDateISO", NOW_PLAINDATE_ISO),
                 ("plainTimeISO", NOW_PLAINTIME_ISO),
                 ("timeZoneId", NOW_TIMEZONE_ID),
+                ("zonedDateTimeISO", NOW_ZONEDDATETIME_ISO),
             ] {
                 let v = Value::heap(self.heap.alloc(HeapObj::Native(id)));
                 nown.define(n, v, method_attr);

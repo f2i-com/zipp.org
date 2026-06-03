@@ -363,6 +363,7 @@ pub const NOW_PLAINDATETIME_ISO: u16 = 541;
 pub const NOW_PLAINDATE_ISO: u16 = 542;
 pub const NOW_PLAINTIME_ISO: u16 = 543;
 pub const NOW_TIMEZONE_ID: u16 = 544;
+pub const NOW_ZONEDDATETIME_ISO: u16 = 545;
 /// Intl namespace + per-service method native ids.
 pub const INTL_GET_CANONICAL_LOCALES: u16 = 560;
 pub const INTL_SUPPORTED_VALUES_OF: u16 = 561;
@@ -680,6 +681,12 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         }
     }
     Some(match id {
+        NOW_INSTANT => ("instant", 0),
+        NOW_PLAINDATETIME_ISO => ("plainDateTimeISO", 0),
+        NOW_PLAINDATE_ISO => ("plainDateISO", 0),
+        NOW_PLAINTIME_ISO => ("plainTimeISO", 0),
+        NOW_TIMEZONE_ID => ("timeZoneId", 0),
+        NOW_ZONEDDATETIME_ISO => ("zonedDateTimeISO", 0),
         OBJ_DEFINE_PROPERTY => ("defineProperty", 3),
         OBJ_DEFINE_PROPERTIES => ("defineProperties", 2),
         OBJ_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),
