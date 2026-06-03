@@ -2040,7 +2040,18 @@ impl<'p> Vm<'p> {
                 if kind == 2 {
                     self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
                 } else if kind == 5 {
-                    self.boolean_method(this, m)
+                    self.boolean_method(this, m)?
+                } else if kind == 1 && matches!(m, "toString" | "valueOf") {
+                    // String.prototype.toString/valueOf are NOT generic: thisStringValue
+                    // requires `this` to be a String (primitive or wrapper, already
+                    // unwrapped above), else TypeError — unlike the coercing methods below.
+                    if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                        this
+                    } else {
+                        return Err(Thrown(format!(
+                            "TypeError: String.prototype.{m} requires that 'this' be a String"
+                        )));
+                    }
                 } else if kind == 1 {
                     // String methods are generic: RequireObjectCoercible(this) then
                     // ToString(this), so `String.prototype.slice.call(123, …)` works.

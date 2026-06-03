@@ -98,7 +98,7 @@ impl<'p> Vm<'p> {
                 0 => self.string_method(v.heap_index(), name, args),
                 1 => self.number_method(v, name, args),
                 _ => match name {
-                    "toString" | "valueOf" => Ok(Some(self.boolean_method(v, name))),
+                    "toString" | "valueOf" => Ok(Some(self.boolean_method(v, name)?)),
                     _ => Ok(None),
                 },
             };

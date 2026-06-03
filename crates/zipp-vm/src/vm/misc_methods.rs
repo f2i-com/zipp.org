@@ -186,12 +186,28 @@ impl<'p> Vm<'p> {
     }
 
     /// `Boolean.prototype.toString`/`valueOf` on a boolean value.
-    pub(crate) fn boolean_method(&mut self, recv: Value, name: &str) -> Value {
-        match name {
-            "toString" => self.alloc_str(if recv == Value::bool(true) { "true" } else { "false" }.to_string()),
-            "valueOf" => recv,
+    pub(crate) fn boolean_method(&mut self, recv: Value, name: &str) -> Result<Value, Thrown> {
+        // thisBooleanValue: the receiver must be a boolean primitive (or a Boolean
+        // wrapper, normally already unwrapped by the caller). Anything else is a
+        // TypeError — `Boolean.prototype.toString.call(5)` must throw, not coerce.
+        let b = if recv.is_bool() {
+            recv
+        } else if let Some(HeapObj::Boxed { kind: 2, value }) =
+            recv.is_heap().then(|| self.heap.get(recv.heap_index()))
+        {
+            *value
+        } else {
+            return Err(Thrown(format!(
+                "TypeError: Boolean.prototype.{name} requires that 'this' be a Boolean"
+            )));
+        };
+        Ok(match name {
+            "toString" => {
+                self.alloc_str(if b == Value::bool(true) { "true" } else { "false" }.to_string())
+            }
+            "valueOf" => b,
             _ => Value::UNDEFINED,
-        }
+        })
     }
 
     /// Resolve `cb` to the native entry of a COMPILED, non-capturing JIT function
