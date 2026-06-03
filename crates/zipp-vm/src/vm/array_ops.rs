@@ -374,6 +374,40 @@ impl<'p> Vm<'p> {
         Ok(Some(this))
     }
 
+    /// `Array.prototype.fill` against an array-like *object* via Set, so a
+    /// throwing setter, a non-writable/frozen slot, a symbol length, or a
+    /// throwing index coercion propagates (abrupt completion). Real arrays use
+    /// the dense fast path.
+    pub(crate) fn array_like_fill(
+        &mut self,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let _gc = self.gc_lock_guard();
+        let lv = self.get_prop(this, "length")?;
+        let lenf = self.to_number_coerce(lv)?;
+        let len: i64 = if lenf.is_nan() || lenf <= 0.0 {
+            0
+        } else {
+            lenf.floor().min(9_007_199_254_740_991.0) as i64
+        };
+        let rel = |i: i64| -> i64 { if i < 0 { (len + i).max(0) } else { i.min(len) } };
+        let value = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
+        let mut k = rel(s0);
+        let e0 = if args.len() >= 3 && args[2] != Value::UNDEFINED {
+            self.to_integer_or_zero(args[2])?
+        } else {
+            len
+        };
+        let end = rel(e0);
+        while k < end {
+            self.set_index(this, Value::num(k as f64), value)?;
+            k += 1;
+        }
+        Ok(Some(this))
+    }
+
     pub(crate) fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         // Suspend GC for the whole method: callback-driven arms (map/filter/
         // reduce/sort/…) hold un-rooted working sets across interpreter re-entry,
@@ -401,6 +435,9 @@ impl<'p> Vm<'p> {
             // completions a dense snapshot would swallow.
             if name == "copyWithin" {
                 return self.array_like_copy_within(Value::heap(idx), args);
+            }
+            if name == "fill" {
+                return self.array_like_fill(Value::heap(idx), args);
             }
             // Read-only methods that treat a hole as undefined snapshot to a dense
             // temp array and run against that.
