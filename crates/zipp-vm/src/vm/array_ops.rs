@@ -321,6 +321,59 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `Array.prototype.copyWithin` against an array-like *object* via the generic
+    /// Get/Set/HasProperty/DeletePropertyOrThrow protocol, so it propagates abrupt
+    /// completions (a throwing length/index coercion, or a non-configurable target
+    /// that can't be deleted → TypeError). Real arrays use the dense fast path.
+    pub(crate) fn array_like_copy_within(
+        &mut self,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let _gc = self.gc_lock_guard();
+        let lv = self.get_prop(this, "length")?;
+        let lenf = self.to_number_coerce(lv)?;
+        // ToLength: clamp to [0, 2^53-1].
+        let len: i64 = if lenf.is_nan() || lenf <= 0.0 {
+            0
+        } else {
+            lenf.floor().min(9_007_199_254_740_991.0) as i64
+        };
+        let rel = |i: i64| -> i64 { if i < 0 { (len + i).max(0) } else { i.min(len) } };
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let mut to = rel(self.to_integer_or_zero(arg0)?);
+        let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
+        let mut from = rel(s0);
+        let e0 = if args.len() >= 3 && args[2] != Value::UNDEFINED {
+            self.to_integer_or_zero(args[2])?
+        } else {
+            len
+        };
+        let mut count = (rel(e0) - from).min(len - to).max(0);
+        let mut dir = 1i64;
+        if from < to && to < from + count {
+            dir = -1;
+            from += count - 1;
+            to += count - 1;
+        }
+        while count > 0 {
+            let fk = Value::num(from as f64);
+            if self.has_property(this, fk) {
+                let v = self.get_index(this, fk)?;
+                self.set_index(this, Value::num(to as f64), v)?;
+            } else {
+                let deleted = self.delete_property(this, &to.to_string())?;
+                if !self.truthy(deleted) {
+                    return Err(Thrown(format!("TypeError: cannot delete property '{to}'")));
+                }
+            }
+            from += dir;
+            to += dir;
+            count -= 1;
+        }
+        Ok(Some(this))
+    }
+
     pub(crate) fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         // Suspend GC for the whole method: callback-driven arms (map/filter/
         // reduce/sort/…) hold un-rooted working sets across interpreter re-entry,
@@ -342,6 +395,12 @@ impl<'p> Vm<'p> {
                 "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
             ) {
                 return self.array_like_iterate(Value::heap(idx), name, args);
+            }
+            // copyWithin mutates an array-like in place via the generic protocol
+            // (Get/Set/HasProperty/DeletePropertyOrThrow), propagating abrupt
+            // completions a dense snapshot would swallow.
+            if name == "copyWithin" {
+                return self.array_like_copy_within(Value::heap(idx), args);
             }
             // Read-only methods that treat a hole as undefined snapshot to a dense
             // temp array and run against that.
