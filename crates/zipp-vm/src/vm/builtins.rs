@@ -652,14 +652,24 @@ impl<'p> Vm<'p> {
             _ => return Ok(None),
         };
         let size = native::TA_KINDS[kind as usize].1;
-        let pos = self.value_num(args.first().copied().unwrap_or(Value::UNDEFINED)) as usize;
+        // ToIndex-ish: a negative / non-finite offset must be out of range (a
+        // RangeError below), NOT a wrapping `as usize` that then indexes OOB.
+        let pos = {
+            let f = self.value_num(args.first().copied().unwrap_or(Value::UNDEFINED));
+            if f >= 0.0 && f.is_finite() {
+                f as usize
+            } else {
+                usize::MAX
+            }
+        };
         // get(pos, littleEndian?) / set(pos, value, littleEndian?)
         let little_endian = if op == 0 {
             self.truthy(args.get(1).copied().unwrap_or(Value::UNDEFINED))
         } else {
             self.truthy(args.get(2).copied().unwrap_or(Value::UNDEFINED))
         };
-        if pos + size > byte_length {
+        // Overflow-safe (`pos` may be usize::MAX for an out-of-range offset).
+        if size > byte_length || pos > byte_length - size {
             return Err(Thrown("RangeError: Offset is outside the bounds of the DataView".into()));
         }
         let abs = byte_offset + pos;
@@ -671,7 +681,7 @@ impl<'p> Vm<'p> {
                     HeapObj::ArrayBuffer { data, .. } => data,
                     _ => return Ok(Some(Value::UNDEFINED)),
                 };
-                if abs + size > data.len() {
+                if size > data.len() || abs > data.len() - size {
                     return Err(Thrown("RangeError: DataView out of bounds".into()));
                 }
                 b[..size].copy_from_slice(&data[abs..abs + size]);
@@ -762,7 +772,14 @@ impl<'p> Vm<'p> {
                 let start = self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
                 let end = self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
                 let slice: Vec<u8> = match self.heap.get(idx) {
-                    HeapObj::ArrayBuffer { data, .. } => data[start..end.max(start)].to_vec(),
+                    HeapObj::ArrayBuffer { data, .. } => {
+                        // A coerced index may have detached/shrunk the buffer between
+                        // ta_rel_index and here — clamp to the current length.
+                        let dl = data.len();
+                        let s = start.min(dl);
+                        let e = end.max(start).min(dl);
+                        data[s..e].to_vec()
+                    }
                     _ => Vec::new(),
                 };
                 let new_idx = self.alloc_array_buffer(slice.len());
@@ -826,7 +843,14 @@ impl<'p> Vm<'p> {
                 let start = self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
                 let end = self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
                 let slice: Vec<u8> = match self.heap.get(idx) {
-                    HeapObj::ArrayBuffer { data, .. } => data[start..end.max(start)].to_vec(),
+                    HeapObj::ArrayBuffer { data, .. } => {
+                        // A coerced index may have detached/shrunk the buffer between
+                        // ta_rel_index and here — clamp to the current length.
+                        let dl = data.len();
+                        let s = start.min(dl);
+                        let e = end.max(start).min(dl);
+                        data[s..e].to_vec()
+                    }
                     _ => Vec::new(),
                 };
                 let new_idx = self.alloc_array_buffer(slice.len());

@@ -1036,10 +1036,18 @@ impl<'p> Vm<'p> {
                 let end = norm_index(i32c(e0), len);
                 let count = (end - start).min(len - target).max(0);
                 if count > 0 {
+                    // A coerced arg's valueOf may have resized the array between
+                    // capturing `len` and here, so guard every index against the
+                    // CURRENT length (don't panic on a shrunk array).
                     let snapshot = self.array_snapshot(idx);
+                    let snap_len = snapshot.len();
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        let cur = items.len();
                         for k in 0..count {
-                            items[(target + k) as usize] = snapshot[(start + k) as usize];
+                            let (ti, si) = ((target + k) as usize, (start + k) as usize);
+                            if ti < cur && si < snap_len {
+                                items[ti] = snapshot[si];
+                            }
                         }
                     }
                     self.heap.bump_version(idx);
