@@ -1118,6 +1118,11 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => {
                 if key == "length" {
                     Ok(len_value(items.len()))
+                } else if let Some(i) = key.parse::<u32>().ok().filter(|i| i.to_string() == key) {
+                    // Element access via a canonical numeric STRING key (`arr["0"]`,
+                    // object-pattern destructuring `{0: x} = arr`): GetProp must read
+                    // the element, like GetIndex.
+                    Ok(items.get(i as usize).copied().unwrap_or(Value::UNDEFINED))
                 } else if key == "raw" {
                     // A tagged-template strings array's `.raw` (side table).
                     Ok(self.template_raws.get(&obj.heap_index()).copied().unwrap_or(Value::UNDEFINED))
