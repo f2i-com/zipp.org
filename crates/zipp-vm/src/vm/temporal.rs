@@ -1267,6 +1267,11 @@ impl<'p> Vm<'p> {
                     let inc_ns = unit_ns(&smallest) * inc;
                     let rounded = round_increment(total_ns, inc_ns, &mode);
                     Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                } else if matches!(smallest.as_str(), "year" | "month" | "week") {
+                    // Calendar-unit largest + smallest: round against the anchor
+                    // calendar (time-of-day included via epoch nanoseconds).
+                    let r = round_relative_datetime_diff(dt1, dt2, &smallest, &largest, &mode);
+                    Ok(Some(self.make_duration(r)))
                 } else {
                     Ok(Some(self.make_duration(df)))
                 }
@@ -2614,6 +2619,51 @@ fn dt_add_dur(start: [i64; 9], f: [i64; 10]) -> [i64; 9] {
 fn dt_epoch_ns(dt: [i64; 9]) -> i128 {
     (iso_to_epoch_days(dt[0], dt[1], dt[2]) as i128) * DAY_NS
         + time_to_ns(&[dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]])
+}
+
+/// Round the date-time difference dt1→dt2 to a calendar `smallest` unit
+/// (year/month/week), then balance to `largest`. Like round_relative_date_diff
+/// but the fraction toward the next unit is measured in epoch NANOSECONDS, so
+/// the time-of-day contributes (NudgeToCalendarUnit for PlainDateTime/ZDT).
+fn round_relative_datetime_diff(
+    dt1: [i64; 9],
+    dt2: [i64; 9],
+    smallest: &str,
+    largest: &str,
+    mode: &str,
+) -> [i64; 10] {
+    let si = ["year", "month", "week"].iter().position(|&x| x == smallest).unwrap_or(2);
+    let ns1 = dt_epoch_ns(dt1);
+    let ns2 = dt_epoch_ns(dt2);
+    let sign = (ns2 > ns1) as i64 - (ns2 < ns1) as i64;
+    if sign == 0 {
+        return [0; 10];
+    }
+    let count = difference_datetime(dt1, dt2, smallest)[si];
+    let mk = |k: i64| -> [i64; 10] {
+        let mut d = [0i64; 10];
+        d[si] = k;
+        d
+    };
+    let lower = dt_add_dur(dt1, mk(count));
+    let ld = dt_epoch_ns(lower);
+    let rounded = if ld == ns2 {
+        count
+    } else {
+        let upper = dt_add_dur(dt1, mk(count + sign));
+        let ud = dt_epoch_ns(upper);
+        let progress = if ud != ld { (ns2 - ld) as f64 / (ud - ld) as f64 } else { 0.0 };
+        round_fraction(count, sign, progress, mode)
+    };
+    let mut f = [0i64; 10];
+    if si == 1 && largest == "year" {
+        let end = dt_add_dur(dt1, mk(rounded));
+        let d = difference_iso_date((dt1[0], dt1[1], dt1[2]), (end[0], end[1], end[2]), "year");
+        f[..4].copy_from_slice(&d);
+    } else {
+        f[si] = rounded;
+    }
+    f
 }
 
 /// `Duration.total(unit)` relative to a start date-time: the (possibly fractional)
