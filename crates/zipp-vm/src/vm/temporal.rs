@@ -1643,6 +1643,16 @@ impl<'p> Vm<'p> {
             if matches!(self.heap.get(rel.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
                 return Ok(self.zdt_local(rel.heap_index()));
             }
+            // A property bag carrying a `timeZone` is a ZonedDateTime-like: the
+            // time zone is validated (a non-string/non-object is a TypeError, an
+            // invalid string a RangeError), then the wall-clock date/time is the
+            // anchor. (A plain string relativeTo isn't an object, so it skips this.)
+            if self.is_object_value(rel) {
+                let tz = self.get_prop(rel, "timeZone")?;
+                if tz != Value::UNDEFINED {
+                    self.parse_tz_arg(tz)?;
+                }
+            }
         }
         self.to_plain_date_time(rel)
     }
