@@ -326,15 +326,17 @@ impl<'p> Vm<'p> {
                 if !self.is_callable(a0) {
                     return Err(Thrown(format!("TypeError: {name} callback is not a function")));
                 }
-                let snap = self.ta_snapshot(idx);
                 let mut mapped: Vec<Value> = Vec::new();
                 let order: Vec<usize> = if name == "findLast" || name == "findLastIndex" {
-                    (0..snap.len()).rev().collect()
+                    (0..len).rev().collect()
                 } else {
-                    (0..snap.len()).collect()
+                    (0..len).collect()
                 };
                 for &i in &order {
-                    let e = snap[i];
+                    // Read each element fresh (the spec re-Gets per iteration, so a
+                    // callback that mutates the TypedArray is observed — values are
+                    // not cached before iteration).
+                    let e = self.ta_element_get(idx, i);
                     let r = self.call_value(a0, a1, &[e, Value::num(i as f64), recv])?;
                     match name {
                         "forEach" => {}
@@ -386,11 +388,10 @@ impl<'p> Vm<'p> {
                 if !self.is_callable(a0) {
                     return Err(Thrown(format!("TypeError: {name} callback is not a function")));
                 }
-                let snap = self.ta_snapshot(idx);
                 let order: Vec<usize> = if name == "reduceRight" {
-                    (0..snap.len()).rev().collect()
+                    (0..len).rev().collect()
                 } else {
-                    (0..snap.len()).collect()
+                    (0..len).collect()
                 };
                 let mut acc;
                 let mut start = 0;
@@ -400,11 +401,13 @@ impl<'p> Vm<'p> {
                     if order.is_empty() {
                         return Err(Thrown("TypeError: Reduce of empty array with no initial value".into()));
                     }
-                    acc = snap[order[0]];
+                    acc = self.ta_element_get(idx, order[0]);
                     start = 1;
                 }
                 for &i in &order[start..] {
-                    acc = self.call_value(a0, Value::UNDEFINED, &[acc, snap[i], Value::num(i as f64), recv])?;
+                    // Read each element fresh (not cached) per the spec.
+                    let e = self.ta_element_get(idx, i);
+                    acc = self.call_value(a0, Value::UNDEFINED, &[acc, e, Value::num(i as f64), recv])?;
                 }
                 Ok(Some(acc))
             }
