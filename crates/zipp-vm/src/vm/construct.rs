@@ -12,6 +12,30 @@ impl<'p> Vm<'p> {
     /// own Func properties, then run the constructor (if any) with `this` = the
     /// new object. A constructor that returns an object/array replaces the
     /// instance (JS semantics); otherwise the instance is returned.
+    /// `new Function(p1, …, pN, body)` / `Function(...)`: the leading arguments
+    /// are parameter source (comma-joined exactly as written, so `("a,b","c")`
+    /// works too); the last is the function body. Reuses `do_eval`: the
+    /// completion value of evaluating a parenthesized function expression IS the
+    /// function. A malformed body/parameter list surfaces as the parser's
+    /// SyntaxError. The result runs in global scope (it captures nothing).
+    pub(crate) fn build_function(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let (params, body) = if args.is_empty() {
+            (String::new(), String::new())
+        } else {
+            let body = self.to_js_string(args[args.len() - 1])?;
+            let mut parts: Vec<String> = Vec::with_capacity(args.len() - 1);
+            for a in &args[..args.len() - 1] {
+                parts.push(self.to_js_string(*a)?);
+            }
+            (parts.join(","), body)
+        };
+        // The newline before `)` defends against a `//` comment in the last
+        // parameter; the wrapper parens make the body a function EXPRESSION whose
+        // value (the function) becomes the eval completion value.
+        let source = format!("(function anonymous({params}\n) {{\n{body}\n}})");
+        self.do_eval(&source)
+    }
+
     pub(crate) fn construct(&mut self, cv: Value, args: &[Value]) -> Result<Value, Thrown> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
@@ -25,6 +49,9 @@ impl<'p> Vm<'p> {
         }
         // ArrayBuffer / DataView / TypedArray constructors used as values.
         let ci = cv.heap_index();
+        if ci == self.function_ctor && ci != 0 {
+            return self.build_function(args);
+        }
         if ci == self.arraybuffer_ctor && ci != 0 {
             return self.build_array_buffer(args);
         }
@@ -473,6 +500,11 @@ impl<'p> Vm<'p> {
     /// Boolean coerce their argument to a primitive (matching the compiler's
     /// lowered direct-call form); every other core constructor constructs.
     pub(crate) fn call_ctor_as_function(&mut self, callee: Value, args: &[Value]) -> Result<Value, Thrown> {
+        // `Function(args, body)` (called WITHOUT `new`) behaves exactly like
+        // `new Function(...)` — both compile and return a fresh function.
+        if callee.heap_index() == self.function_ctor && self.function_ctor != 0 {
+            return self.build_function(args);
+        }
         let proto = match self.heap.get(callee.heap_index()) {
             HeapObj::Object(m) => m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index()),
             _ => None,

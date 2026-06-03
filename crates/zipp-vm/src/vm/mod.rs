@@ -217,6 +217,10 @@ pub struct Vm<'p> {
     /// resolve as values and `getPrototypeOf` returns them. 0 until set up.
     obj_proto: u32,
     fn_proto: u32,
+    /// The `Function` constructor object — identified in `construct` /
+    /// `call_ctor_as_function` so `new Function(args, body)` / `Function(...)`
+    /// compile and return a real function (via `do_eval` of a function literal).
+    function_ctor: u32,
     arr_proto: u32,
     /// `String.prototype` — primitive string values delegate here for method
     /// access (`"x".charAt`, `"x".slice`, …, as values), 0 until `setup_globals`.

@@ -256,6 +256,7 @@ impl<'p> Vm<'p> {
         );
         let array_ctor = build(self, &[("isArray", ARR_IS_ARRAY), ("from", ARR_FROM), ("of", ARR_OF)], Some(arr_proto));
         let function_ctor = build(self, &[], Some(fn_proto));
+        self.function_ctor = function_ctor;
         let string_ctor = build(
             self,
             &[

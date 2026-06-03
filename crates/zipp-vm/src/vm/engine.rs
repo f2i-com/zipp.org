@@ -78,6 +78,7 @@ impl<'p> Vm<'p> {
             deleted_callable_intrinsics: std::collections::HashSet::new(),
             obj_proto: 0,
             fn_proto: 0,
+            function_ctor: 0,
             arr_proto: 0,
             str_proto: 0,
             map_proto: 0,

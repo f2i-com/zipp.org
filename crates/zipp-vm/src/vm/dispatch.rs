@@ -243,12 +243,20 @@ impl<'p> Vm<'p> {
                     Instr::LoadGlobal { dst, idx } => {
                         let v = self.globals[idx as usize];
                         if v.is_uninitialized() {
-                            // Referenced but never declared → ReferenceError.
+                            // Referenced but never declared → ReferenceError. The
+                            // name is in `program.global_names`, or — for a slot an
+                            // `eval` drew from the EVAL_POOL — in `eval_global_map`.
                             let name = self
                                 .program
                                 .global_names
                                 .get(idx as usize)
                                 .map(|s| s.as_str())
+                                .or_else(|| {
+                                    self.eval_global_map
+                                        .iter()
+                                        .find(|(_, &v)| v == idx)
+                                        .map(|(k, _)| k.as_str())
+                                })
                                 .unwrap_or("?");
                             return Err(Thrown(format!("ReferenceError: {name} is not defined")));
                         }
