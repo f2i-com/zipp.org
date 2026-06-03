@@ -1893,6 +1893,18 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            ZDT_GET_TZ_TRANSITION => {
+                if !this.is_heap()
+                    || !matches!(self.heap.get(this.heap_index()), HeapObj::Temporal { kind: 7, .. })
+                {
+                    return Err(Thrown(
+                        "TypeError: getTimeZoneTransition called on a non-ZonedDateTime".into(),
+                    ));
+                }
+                let _ = self.read_direction_option(a0)?;
+                // Offset / single-offset (UTC) time zones have no transitions.
+                Value::NULL
+            }
             // ── Intl ──
             INTL_GET_CANONICAL_LOCALES => {
                 let list = self.canonicalize_locale_list(a0)?;

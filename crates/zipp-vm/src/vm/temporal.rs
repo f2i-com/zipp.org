@@ -1655,6 +1655,31 @@ impl<'p> Vm<'p> {
         self.parse_tz_arg(arg)
     }
 
+    /// GetDirectionOption (ZonedDateTime.getTimeZoneTransition): the arg is a
+    /// "next"/"previous" string, or an options bag whose `direction` is one of
+    /// those. A non-string/non-object arg -> TypeError; a missing direction ->
+    /// RangeError; a non-"next"/"previous" string -> RangeError; a Symbol value
+    /// -> TypeError (via ToString).
+    pub(crate) fn read_direction_option(&mut self, arg: Value) -> Result<String, Thrown> {
+        let dir_v = if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
+            arg
+        } else if self.is_object_value(arg) {
+            self.get_prop(arg, "direction")?
+        } else {
+            return Err(Thrown(
+                "TypeError: direction must be a string or an options object".into(),
+            ));
+        };
+        if dir_v == Value::UNDEFINED {
+            return Err(Thrown("RangeError: a direction option is required".into()));
+        }
+        let s = self.to_js_string(dir_v)?;
+        if s != "next" && s != "previous" {
+            return Err(Thrown(format!("RangeError: invalid direction option '{s}'")));
+        }
+        Ok(s)
+    }
+
     /// Parse a `relativeTo` option into a date-time [y,mo,d,h,…] anchor (a
     /// ZonedDateTime uses its local wall-clock; otherwise PlainDate/PlainDateTime/
     /// string/object coercion).

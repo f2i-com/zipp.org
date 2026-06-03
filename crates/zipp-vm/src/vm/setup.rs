@@ -1327,6 +1327,11 @@ impl<'p> Vm<'p> {
                     p.define("toLocaleString", v, method_attr);
                 }
             }
+            // ZonedDateTime.prototype.getTimeZoneTransition (offset zones -> null).
+            let gtzt = Value::heap(self.heap.alloc(HeapObj::Native(ZDT_GET_TZ_TRANSITION)));
+            if let HeapObj::Object(p) = self.heap.get_mut(self.zoneddatetime_proto) {
+                p.define("getTimeZoneTransition", gtzt, method_attr);
+            }
             // ── Intl namespace + service constructors ──
             let intl_services: Vec<(u8, &str, f64, Vec<(&str, u16)>, bool)> = vec![
                 (
