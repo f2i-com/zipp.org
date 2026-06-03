@@ -1417,7 +1417,7 @@ impl<'p> Vm<'p> {
                                     None => self.object_get_own_property_descriptor(a0, &key),
                                 }
                             }
-                            S::ObjectGetOwnPropertyNames => self.object_own_property_names(a0),
+                            S::ObjectGetOwnPropertyNames => self.object_own_property_names(a0)?,
                             S::ObjectGetPrototypeOf => self.object_get_prototype_of(a0),
                             S::ObjectCreate => {
                                 let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
@@ -1577,19 +1577,19 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ObjectKeys { dst, obj } => {
                         let o = self.get(base, obj);
-                        let v = self.object_enum_own(o, EnumWhat::Keys);
+                        let v = self.object_enum_own(o, EnumWhat::Keys)?;
                         self.set(base, dst, v);
                         ip += 1;
                     }
                     Instr::ObjectValues { dst, obj } => {
                         let o = self.get(base, obj);
-                        let v = self.object_enum_own(o, EnumWhat::Values);
+                        let v = self.object_enum_own(o, EnumWhat::Values)?;
                         self.set(base, dst, v);
                         ip += 1;
                     }
                     Instr::ObjectEntries { dst, obj } => {
                         let o = self.get(base, obj);
-                        let v = self.object_enum_own(o, EnumWhat::Entries);
+                        let v = self.object_enum_own(o, EnumWhat::Entries)?;
                         self.set(base, dst, v);
                         ip += 1;
                     }

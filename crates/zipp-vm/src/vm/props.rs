@@ -10,7 +10,72 @@ use crate::value::Value;
 impl<'p> Vm<'p> {
     /// Own ENUMERABLE keys / values / [k,v] entries of `obj` as an array (the
     /// shared core of `Object.keys`/`values`/`entries`).
-    pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Value {
+    /// A Proxy's `ownKeys` trap result as a list of property-key Values, or None
+    /// for a non-proxy. With no trap, delegates to the target's own (string) keys.
+    /// The trap result must be an Array.
+    pub(crate) fn proxy_own_keys(&mut self, obj: Value) -> Result<Option<Vec<Value>>, Thrown> {
+        if !obj.is_heap() {
+            return Ok(None);
+        }
+        let (target, handler, revoked) = match self.proxy_parts(obj.heap_index()) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if revoked {
+            return Err(Thrown("TypeError: Cannot perform 'ownKeys' on a revoked proxy".into()));
+        }
+        match self.proxy_trap(handler, "ownKeys")? {
+            Some(trap) => {
+                let r = self.call_value(trap, handler, &[target])?;
+                match r.is_heap().then(|| self.heap.get(r.heap_index())) {
+                    Some(HeapObj::Array(items)) => Ok(Some(items.clone())),
+                    _ => Err(Thrown(
+                        "TypeError: proxy [[OwnPropertyKeys]] must return an Array".into(),
+                    )),
+                }
+            }
+            None => {
+                let names = self.object_own_property_names(target)?;
+                Ok(Some(self.array_snapshot(names.heap_index())))
+            }
+        }
+    }
+
+    pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
+        // A Proxy enumerates via its ownKeys trap, keeping the STRING keys whose
+        // [[GetOwnProperty]] (the gopd trap) reports enumerable.
+        if let Some(keys) = self.proxy_own_keys(obj)? {
+            let mut out: Vec<Value> = Vec::new();
+            for k in keys {
+                if !(k.is_heap() && self.heap.is_str_like(k.heap_index())) {
+                    continue; // Object.keys/values/entries skip Symbol keys
+                }
+                let ks = self.display(k);
+                let desc = match self.proxy_gopd(obj, &ks)? {
+                    Some(d) => d,
+                    None => Value::UNDEFINED,
+                };
+                if desc.is_undefined() {
+                    continue;
+                }
+                let en = self.get_prop(desc, "enumerable")?;
+                if !self.truthy(en) {
+                    continue;
+                }
+                match what {
+                    EnumWhat::Keys => out.push(k),
+                    EnumWhat::Values => {
+                        let v = self.get_member(obj, &ks, obj)?;
+                        out.push(v);
+                    }
+                    EnumWhat::Entries => {
+                        let v = self.get_member(obj, &ks, obj)?;
+                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))));
+                    }
+                }
+            }
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+        }
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Object(m) => spec_key_order(&m.keys)
@@ -47,7 +112,7 @@ impl<'p> Vm<'p> {
                 }
             })
             .collect();
-        Value::heap(self.heap.alloc(HeapObj::Array(out)))
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
     }
 
     /// Build a data property descriptor object `{value, writable, enumerable,
@@ -202,7 +267,16 @@ impl<'p> Vm<'p> {
     }
 
     /// `Object.getOwnPropertyNames(obj)` — all own string keys (enumerable or not).
-    pub(crate) fn object_own_property_names(&mut self, obj: Value) -> Value {
+    pub(crate) fn object_own_property_names(&mut self, obj: Value) -> Result<Value, Thrown> {
+        // A Proxy reports its keys via the ownKeys trap; getOwnPropertyNames keeps
+        // the STRING keys.
+        if let Some(keys) = self.proxy_own_keys(obj)? {
+            let strs: Vec<Value> = keys
+                .into_iter()
+                .filter(|k| k.is_heap() && self.heap.is_str_like(k.heap_index()))
+                .collect();
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(strs))));
+        }
         // Collect the key strings under the (immutable) heap borrow, then allocate
         // the result strings afterwards (alloc needs `&mut self`).
         let mut keys: Vec<String> = Vec::new();
@@ -263,7 +337,7 @@ impl<'p> Vm<'p> {
             }
         }
         let names: Vec<Value> = keys.into_iter().map(|k| self.alloc_str(k)).collect();
-        Value::heap(self.heap.alloc(HeapObj::Array(names)))
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(names))))
     }
 
     /// `Object.getPrototypeOf(obj)` — the prototype: a class instance's is its

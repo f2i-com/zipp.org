@@ -73,11 +73,11 @@ impl<'p> Vm<'p> {
                     None => self.object_get_own_property_descriptor(a0, &key),
                 }
             }
-            OBJ_GET_OWN_NAMES => self.object_own_property_names(a0),
+            OBJ_GET_OWN_NAMES => self.object_own_property_names(a0)?,
             OBJ_GET_PROTO => self.object_get_prototype_of(a0),
-            OBJ_KEYS => self.object_enum_own(a0, EnumWhat::Keys),
-            OBJ_VALUES => self.object_enum_own(a0, EnumWhat::Values),
-            OBJ_ENTRIES => self.object_enum_own(a0, EnumWhat::Entries),
+            OBJ_KEYS => self.object_enum_own(a0, EnumWhat::Keys)?,
+            OBJ_VALUES => self.object_enum_own(a0, EnumWhat::Values)?,
+            OBJ_ENTRIES => self.object_enum_own(a0, EnumWhat::Entries)?,
             OBJ_ASSIGN => self.object_assign(args)?,
             OBJ_CREATE => {
                 let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
@@ -753,7 +753,7 @@ impl<'p> Vm<'p> {
             }
             OBJ_GET_OWN_DESCS => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let names = self.object_own_property_names(o);
+                let names = self.object_own_property_names(o)?;
                 let keys: Vec<Value> = match self.heap.get(names.heap_index()) {
                     HeapObj::Array(items) => items.clone(),
                     _ => Vec::new(),
@@ -1020,7 +1020,7 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.ownKeys called on non-object".into()));
                 }
-                self.object_own_property_names(a0)
+                self.object_own_property_names(a0)?
             }
             REFLECT_GET_PROTO => {
                 if !self.is_object_value(a0) {
