@@ -206,7 +206,7 @@ impl<'p> Vm<'p> {
         if prev != 0 {
             self.set_regexp_last_index(re, 0);
         }
-        let result = self.regexp_exec(re, input)?;
+        let result = self.regexp_exec_abstract(re, input)?;
         let cur = match self.heap.get(re) {
             HeapObj::RegExp { last_index, .. } => *last_index,
             _ => 0,
@@ -220,6 +220,34 @@ impl<'p> Vm<'p> {
         self.get_prop(result, "index")
     }
 
+    /// RegExpExec (ES 22.2.7.1): the exec PROTOCOL. When the regex has a callable
+    /// own/inherited `exec` (honouring a user override), call it with the subject
+    /// string and require an Object-or-null result; otherwise fall back to the
+    /// builtin RegExpBuiltinExec. The `@@match`/`@@search` (non-global) cores route
+    /// through this so a custom `re.exec` governs the result.
+    pub(crate) fn regexp_exec_abstract(&mut self, re: u32, input: Value) -> Result<Value, Thrown> {
+        let re_v = Value::heap(re);
+        let exec = self.get_prop(re_v, "exec")?;
+        if self.is_callable(exec) {
+            let s_str = self.to_js_string(input)?;
+            let s = self.alloc_str(s_str);
+            let r = self.call_value(exec, re_v, &[s])?;
+            let is_object = r.is_heap()
+                && !matches!(
+                    self.heap.get(r.heap_index()),
+                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                );
+            if r != Value::NULL && !is_object {
+                return Err(Thrown(
+                    "TypeError: RegExp exec method returned something other than an Object or null"
+                        .into(),
+                ));
+            }
+            return Ok(r);
+        }
+        self.regexp_exec(re, input)
+    }
+
     /// RegExp.prototype[Symbol.match] core: a non-global regex returns the exec
     /// result (array or null); a global regex returns the array of matched
     /// substrings (or null) and resets lastIndex. Shared by String.match.
@@ -227,7 +255,7 @@ impl<'p> Vm<'p> {
         let global =
             matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
         if !global {
-            return self.regexp_exec(re, input);
+            return self.regexp_exec_abstract(re, input);
         }
         let s = self.to_js_string(input)?;
         let strs: Vec<String> = match self.heap.get(re) {

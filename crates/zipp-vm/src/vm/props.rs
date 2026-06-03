@@ -875,6 +875,26 @@ impl<'p> Vm<'p> {
         // Cloned out of the heap borrow before any allocation.
         if let HeapObj::RegExp { source, flags, last_index, .. } = self.heap.get(obj.heap_index()) {
             let (s, f, li) = (source.clone(), flags.clone(), *last_index);
+            // A custom own property (`re.exec = fn`, `re.x = …`) in the side table
+            // shadows the prototype. The regexp's own/accessor keys
+            // (lastIndex/source/flags/flag-booleans) always come from
+            // regexp_get_prop, so a stray side-table entry for one is ignored.
+            if !is_regexp_own_key(key) {
+                let entry = self
+                    .arr_props
+                    .get(&obj.heap_index())
+                    .and_then(|m| m.pos(key).map(|i| (m.vals[i], m.attrs[i])));
+                if let Some((raw, attr)) = entry {
+                    if attr.accessor {
+                        return if raw == Value::UNDEFINED {
+                            Ok(Value::UNDEFINED)
+                        } else {
+                            self.call_value(raw, receiver, &[])
+                        };
+                    }
+                    return Ok(raw);
+                }
+            }
             return self.regexp_get_prop(&s, &f, li, key);
         }
         // An Array's named (non-index) own properties (arr.foo, and a match

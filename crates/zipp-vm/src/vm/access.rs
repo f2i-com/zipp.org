@@ -284,7 +284,11 @@ impl<'p> Vm<'p> {
                 | HeapObj::Date(_)
                 | HeapObj::Promise { .. }
                 | HeapObj::Boxed { .. }
+                | HeapObj::RegExp { .. }
         ) {
+            // (`re.lastIndex = …` was handled above; a `re.exec = fn` override or
+            // any `re.x = …` lands in the side table. RegExp accessor keys
+            // source/flags/… are read back via regexp_get_prop, not from here.)
             let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             if added {
                 self.heap.bump_version(idx);
