@@ -321,6 +321,13 @@ pub struct Vm<'p> {
     /// %Error.prototype% so `instanceof Error` holds.
     suppressederror_ctor: u32,
     suppressederror_proto: u32,
+    /// `ShadowRealm` ctor + prototype, and the set of branded instances. Note the
+    /// realm is NOT truly isolated (evaluate reuses the shared global eval path);
+    /// isolation-specific tests won't pass, but structure + evaluate of a string
+    /// to a primitive + the argument/return TypeError checks do.
+    shadowrealm_ctor: u32,
+    shadowrealm_proto: u32,
+    shadow_realms: std::collections::HashSet<u32>,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.

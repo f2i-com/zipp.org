@@ -1533,6 +1533,9 @@ impl<'p> Vm<'p> {
                 self.async_generator_method(this.heap_index(), name, args)
                     .unwrap_or(Value::UNDEFINED)
             }
+            SHADOWREALM_EVALUATE | SHADOWREALM_IMPORTVALUE => {
+                self.shadowrealm_op(id, this, args)?
+            }
             _ if (SAB_GETTER_BASE..SAB_GETTER_BASE + SAB_GETTERS.len() as u16).contains(&id) => {
                 let name = SAB_GETTERS[(id - SAB_GETTER_BASE) as usize];
                 if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {

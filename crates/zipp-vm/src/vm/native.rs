@@ -208,6 +208,9 @@ pub const GEN_THROW: u16 = 852;
 pub const ASYNCGEN_NEXT: u16 = 853;
 pub const ASYNCGEN_RETURN: u16 = 854;
 pub const ASYNCGEN_THROW: u16 = 855;
+/// `ShadowRealm.prototype.evaluate` / `.importValue`.
+pub const SHADOWREALM_EVALUATE: u16 = 856;
+pub const SHADOWREALM_IMPORTVALUE: u16 = 857;
 // String static methods.
 pub const STR_FROM_CHAR_CODE: u16 = 311;
 pub const STR_FROM_CODE_POINT: u16 = 312;
@@ -810,6 +813,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         ASYNCGEN_NEXT => ("next", 1),
         ASYNCGEN_RETURN => ("return", 1),
         ASYNCGEN_THROW => ("throw", 1),
+        SHADOWREALM_EVALUATE => ("evaluate", 1),
+        SHADOWREALM_IMPORTVALUE => ("importValue", 2),
         STR_FROM_CHAR_CODE => ("fromCharCode", 1),
         STR_FROM_CODE_POINT => ("fromCodePoint", 1),
         STR_RAW => ("raw", 1),

@@ -50,6 +50,64 @@ impl<'p> Vm<'p> {
         self.do_eval(&source)
     }
 
+    /// `ShadowRealm.prototype.evaluate` / `.importValue`. NOTE: not truly isolated
+    /// (evaluate reuses the shared global eval path), so cross-realm isolation is
+    /// not enforced; argument/return-type validation and primitive results are.
+    pub(crate) fn shadowrealm_op(&mut self, op: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        if !(this.is_heap() && self.shadow_realms.contains(&this.heap_index())) {
+            return Err(Thrown("TypeError: receiver is not a ShadowRealm".into()));
+        }
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match op {
+            native::SHADOWREALM_EVALUATE => {
+                let is_str = a0.is_heap()
+                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. });
+                if !is_str {
+                    return Err(Thrown(
+                        "TypeError: ShadowRealm.prototype.evaluate expects a string".into(),
+                    ));
+                }
+                let code = self.display(a0);
+                // An error thrown by the evaluated code can't cross the realm
+                // boundary, so it surfaces as a TypeError in the calling realm.
+                let result = match self.do_eval(&code) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Err(Thrown(
+                            "TypeError: ShadowRealm evaluate threw (error wrapped at the realm boundary)".into(),
+                        ))
+                    }
+                };
+                // Only primitives and callables may cross the boundary.
+                if result.is_heap() {
+                    if self.is_callable(result) {
+                        return Ok(result); // v1: returned unwrapped (WrappedFunction TBD)
+                    }
+                    if matches!(
+                        self.heap.get(result.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                    ) {
+                        return Ok(result);
+                    }
+                    return Err(Thrown(
+                        "TypeError: ShadowRealm evaluate result is not a primitive or callable".into(),
+                    ));
+                }
+                Ok(result)
+            }
+            native::SHADOWREALM_IMPORTVALUE => {
+                // Module loading is unsupported; return a rejected promise.
+                let p = self.alloc_promise();
+                let e = self.alloc_error_from_message(
+                    "TypeError: ShadowRealm.prototype.importValue is not supported",
+                );
+                self.reject(p, e);
+                Ok(Value::heap(p))
+            }
+            _ => Ok(Value::UNDEFINED),
+        }
+    }
+
     /// `new SuppressedError(error, suppressed, message)`: an error object with
     /// own `error` + `suppressed` (always) and `message` (only if provided),
     /// linked to %SuppressedError.prototype%.
@@ -283,6 +341,14 @@ impl<'p> Vm<'p> {
         }
         if ci == self.suppressederror_ctor && ci != 0 {
             return self.build_suppressed_error(args);
+        }
+        if ci == self.shadowrealm_ctor && ci != 0 {
+            let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            if self.shadowrealm_proto != 0 {
+                self.proto_of.insert(idx, Value::heap(self.shadowrealm_proto));
+            }
+            self.shadow_realms.insert(idx);
+            return Ok(Value::heap(idx));
         }
         if ci == self.dataview_ctor && ci != 0 {
             return self.build_data_view(args);

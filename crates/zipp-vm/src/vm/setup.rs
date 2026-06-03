@@ -1685,6 +1685,35 @@ impl<'p> Vm<'p> {
                 m.define("constructor", Value::heap(ctor), method_attr);
             }
         }
+        // ShadowRealm: evaluate + importValue + @@toStringTag "ShadowRealm".
+        {
+            let p = build(
+                self,
+                &[
+                    ("evaluate", native::SHADOWREALM_EVALUATE),
+                    ("importValue", native::SHADOWREALM_IMPORTVALUE),
+                ],
+                None,
+            );
+            self.proto_of.insert(p, Value::heap(obj_proto));
+            let tag = self.alloc_str("ShadowRealm".to_string());
+            let data_nw = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("@@toStringTag", tag, data_nw);
+            }
+            self.shadowrealm_proto = p;
+            let ctor = build(self, &[], Some(p));
+            self.shadowrealm_ctor = ctor;
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("constructor", Value::heap(ctor), method_attr);
+            }
+        }
         // Bare global functions as first-class values (the call form is GlobalFn).
         let parse_int_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_INT));
         let parse_float_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_FLOAT));
@@ -1747,6 +1776,7 @@ impl<'p> Vm<'p> {
                 "DisposableStack" => Some(self.disposablestack_ctor),
                 "AsyncDisposableStack" => Some(self.asyncdisposablestack_ctor),
                 "SuppressedError" => Some(self.suppressederror_ctor),
+                "ShadowRealm" => Some(self.shadowrealm_ctor),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -1768,7 +1798,7 @@ impl<'p> Vm<'p> {
                     let len = match name.as_str() {
                         "Date" => 7.0,
                         "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator"
-                        | "DisposableStack" | "AsyncDisposableStack" => 0.0,
+                        | "DisposableStack" | "AsyncDisposableStack" | "ShadowRealm" => 0.0,
                         "AggregateError" => 2.0, // (errors, message?)
                         "SuppressedError" => 3.0, // (error, suppressed, message?)
                         "RegExp" => 2.0,         // (pattern, flags)
