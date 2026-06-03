@@ -699,14 +699,16 @@ impl<'p> Vm<'p> {
                         let consts = &self.func(func_id as usize).string_constants;
                         let excluded =
                             &consts[exclude_start as usize..exclude_start as usize + exclude_count as usize];
-                        // Copy src's own keys except the destructured siblings.
-                        let pairs: Vec<(String, Value)> = if s.is_heap() {
+                        // Copy src's own enumerable keys except the destructured
+                        // siblings — Getting each (CopyDataProperties), so a getter's
+                        // VALUE is copied (not the accessor) and a throw propagates.
+                        let keys: Vec<String> = if s.is_heap() {
                             match self.heap.get(s.heap_index()) {
                                 HeapObj::Object(map) => spec_key_order(&map.keys)
                                     .into_iter()
                                     .filter(|&i| map.attrs[i].enumerable)
-                                    .map(|i| (map.keys[i].clone(), map.vals[i]))
-                                    .filter(|(k, _)| !excluded.iter().any(|e| e == k))
+                                    .map(|i| map.keys[i].clone())
+                                    .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
                                 _ => Vec::new(),
                             }
@@ -714,7 +716,8 @@ impl<'p> Vm<'p> {
                             Vec::new()
                         };
                         let mut m = ObjMap::new();
-                        for (k, v) in pairs {
+                        for k in keys {
+                            let v = self.get_prop(s, &k)?;
                             m.set(&k, v);
                         }
                         let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
@@ -729,13 +732,13 @@ impl<'p> Vm<'p> {
                             let kv = self.get(base, keys_base + i);
                             excluded.push(self.to_property_key(kv)?);
                         }
-                        let pairs: Vec<(String, Value)> = if s.is_heap() {
+                        let keys: Vec<String> = if s.is_heap() {
                             match self.heap.get(s.heap_index()) {
                                 HeapObj::Object(map) => spec_key_order(&map.keys)
                                     .into_iter()
                                     .filter(|&i| map.attrs[i].enumerable)
-                                    .map(|i| (map.keys[i].clone(), map.vals[i]))
-                                    .filter(|(k, _)| !excluded.iter().any(|e| e == k))
+                                    .map(|i| map.keys[i].clone())
+                                    .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
                                 _ => Vec::new(),
                             }
@@ -743,7 +746,8 @@ impl<'p> Vm<'p> {
                             Vec::new()
                         };
                         let mut m = ObjMap::new();
-                        for (k, v) in pairs {
+                        for k in keys {
+                            let v = self.get_prop(s, &k)?;
                             m.set(&k, v);
                         }
                         let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));

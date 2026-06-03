@@ -757,18 +757,24 @@ impl<'p> Vm<'p> {
                     .map(|(i, c)| (i.to_string(), self.alloc_str(c.to_string())))
                     .collect()
             } else {
-                match self.heap.get(src.heap_index()) {
-                    // Object.assign copies own ENUMERABLE properties only.
+                // Collect the source's own ENUMERABLE keys, then Get each — so a
+                // getter is invoked and its VALUE is copied (not the accessor
+                // function), and a throwing getter propagates, per CopyDataProperties.
+                let keys: Vec<String> = match self.heap.get(src.heap_index()) {
                     HeapObj::Object(map) => spec_key_order(&map.keys)
                         .into_iter()
                         .filter(|&i| map.attrs[i].enumerable)
-                        .map(|i| (map.keys[i].clone(), map.vals[i]))
+                        .map(|i| map.keys[i].clone())
                         .collect(),
-                    HeapObj::Array(items) => {
-                        items.iter().enumerate().map(|(i, &v)| (i.to_string(), v)).collect()
-                    }
+                    HeapObj::Array(items) => (0..items.len()).map(|i| i.to_string()).collect(),
                     _ => Vec::new(),
+                };
+                let mut pv = Vec::with_capacity(keys.len());
+                for k in keys {
+                    let v = self.get_prop(src, &k)?;
+                    pv.push((k, v));
                 }
+                pv
             };
             for (k, v) in pairs {
                 if let HeapObj::Object(map) = self.heap.get_mut(tidx) {
