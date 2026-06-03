@@ -883,11 +883,14 @@ impl<'p> Vm<'p> {
             // A SharedArrayBuffer: `growable` (not `resizable`), never `detached`,
             // methods/@@toStringTag from %SharedArrayBuffer.prototype%.
             let shared = self.shared_buffers.contains(&ai);
+            let immut = self.immutable_buffers.contains(&ai);
             return Ok(match key {
                 "byteLength" => Value::num(len as f64),
+                // An immutable buffer is fixed-size and never resizable.
                 "maxByteLength" => Value::num(max.unwrap_or(len) as f64),
+                "immutable" if !shared => Value::bool(immut),
                 "growable" if shared => Value::bool(max.is_some()),
-                "resizable" if !shared => Value::bool(max.is_some()),
+                "resizable" if !shared => Value::bool(max.is_some() && !immut),
                 "detached" if !shared => Value::bool(
                     matches!(self.heap.get(ai), HeapObj::ArrayBuffer { detached: true, .. }),
                 ),

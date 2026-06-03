@@ -1457,6 +1457,25 @@ impl<'p> Vm<'p> {
                 }
                 self.arraybuffer_method(this.heap_index(), "resize", args)?.unwrap_or(Value::UNDEFINED)
             }
+            ARRAYBUFFER_TRANSFER_IMMUTABLE | ARRAYBUFFER_SLICE_IMMUTABLE => {
+                let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                if shared
+                    || !matches!(
+                        this.is_heap().then(|| self.heap.get(this.heap_index())),
+                        Some(HeapObj::ArrayBuffer { .. })
+                    )
+                {
+                    return Err(Thrown(
+                        "TypeError: ArrayBuffer immutable method called on incompatible receiver".into(),
+                    ));
+                }
+                let name = if id == ARRAYBUFFER_TRANSFER_IMMUTABLE {
+                    "transferToImmutable"
+                } else {
+                    "sliceToImmutable"
+                };
+                self.arraybuffer_method(this.heap_index(), name, args)?.unwrap_or(Value::UNDEFINED)
+            }
             ARRAYBUFFER_ISVIEW => Value::bool(
                 a0.is_heap()
                     && matches!(

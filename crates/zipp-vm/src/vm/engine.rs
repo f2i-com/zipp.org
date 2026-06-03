@@ -135,6 +135,7 @@ impl<'p> Vm<'p> {
             sab_ctor: 0,
             sab_proto: 0,
             shared_buffers: std::collections::HashSet::new(),
+            immutable_buffers: std::collections::HashSet::new(),
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),

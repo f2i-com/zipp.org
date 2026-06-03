@@ -227,6 +227,7 @@ impl Vm<'_> {
         self.ab_max.retain(|&k, _| marks[k as usize]);
         self.ta_tracking.retain(|&k| marks[k as usize]);
         self.shared_buffers.retain(|&k| marks[k as usize]);
+        self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.dispose_stacks.retain(|&k, _| marks[k as usize]);
         self.async_stacks.retain(|&k| marks[k as usize]);
         self.shadow_realms.retain(|&k| marks[k as usize]);

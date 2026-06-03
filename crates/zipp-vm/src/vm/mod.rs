@@ -304,6 +304,10 @@ pub struct Vm<'p> {
     sab_proto: u32,
     /// Heap indices of ArrayBuffers that are actually SharedArrayBuffers.
     shared_buffers: std::collections::HashSet<u32>,
+    /// Heap indices of ArrayBuffers that are immutable (ES2026): their `immutable`
+    /// getter is true, they are never resizable/detachable, and writes through a
+    /// TypedArray view throw a TypeError.
+    immutable_buffers: std::collections::HashSet<u32>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).

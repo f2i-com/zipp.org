@@ -744,6 +744,45 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::heap(new_idx)))
             }
+            // ES2026: copy the buffer's bytes into a new IMMUTABLE ArrayBuffer and
+            // detach the original (transfer semantics).
+            "transferToImmutable" => {
+                if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown(
+                        "TypeError: Cannot transfer a detached ArrayBuffer".into(),
+                    ));
+                }
+                let bytes: Vec<u8> = match self.heap.get(idx) {
+                    HeapObj::ArrayBuffer { data, .. } => data.clone(),
+                    _ => Vec::new(),
+                };
+                let new_idx = self.alloc_array_buffer(bytes.len());
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
+                    data.copy_from_slice(&bytes);
+                }
+                self.immutable_buffers.insert(new_idx);
+                // Detach the source.
+                if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(idx) {
+                    data.clear();
+                    *detached = true;
+                }
+                Ok(Some(Value::heap(new_idx)))
+            }
+            // ES2026: like slice but the result is an immutable ArrayBuffer.
+            "sliceToImmutable" => {
+                let start = self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
+                let end = self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
+                let slice: Vec<u8> = match self.heap.get(idx) {
+                    HeapObj::ArrayBuffer { data, .. } => data[start..end.max(start)].to_vec(),
+                    _ => Vec::new(),
+                };
+                let new_idx = self.alloc_array_buffer(slice.len());
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
+                    data.copy_from_slice(&slice);
+                }
+                self.immutable_buffers.insert(new_idx);
+                Ok(Some(Value::heap(new_idx)))
+            }
             _ => Ok(None),
         }
     }
