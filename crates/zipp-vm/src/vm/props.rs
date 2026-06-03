@@ -43,6 +43,78 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// A Proxy's `isExtensible` trap. `Some(result)` for a proxy (the trap boolean,
+    /// or the target's extensibility when no trap); `None` for a non-proxy.
+    pub(crate) fn proxy_is_extensible(&mut self, obj: Value) -> Result<Option<bool>, Thrown> {
+        if !obj.is_heap() {
+            return Ok(None);
+        }
+        let (target, handler, revoked) = match self.proxy_parts(obj.heap_index()) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if revoked {
+            return Err(Thrown("TypeError: Cannot perform 'isExtensible' on a revoked proxy".into()));
+        }
+        match self.proxy_trap(handler, "isExtensible")? {
+            Some(trap) => {
+                let r = self.call_value(trap, handler, &[target])?;
+                Ok(Some(self.truthy(r)))
+            }
+            None => {
+                if let Some(b) = self.proxy_is_extensible(target)? {
+                    return Ok(Some(b)); // nested proxy target
+                }
+                let ext = match self.heap.get(target.heap_index()) {
+                    HeapObj::Object(m) => m.extensible,
+                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) => false,
+                    _ => self.arr_props.get(&target.heap_index()).map_or(true, |m| m.extensible),
+                };
+                Ok(Some(ext))
+            }
+        }
+    }
+
+    /// A Proxy's `preventExtensions` trap. `Some(success)` for a proxy; `None` for
+    /// a non-proxy. With no trap, marks the target non-extensible.
+    pub(crate) fn proxy_prevent_extensions(&mut self, obj: Value) -> Result<Option<bool>, Thrown> {
+        if !obj.is_heap() {
+            return Ok(None);
+        }
+        let (target, handler, revoked) = match self.proxy_parts(obj.heap_index()) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if revoked {
+            return Err(Thrown(
+                "TypeError: Cannot perform 'preventExtensions' on a revoked proxy".into(),
+            ));
+        }
+        match self.proxy_trap(handler, "preventExtensions")? {
+            Some(trap) => {
+                let r = self.call_value(trap, handler, &[target])?;
+                Ok(Some(self.truthy(r)))
+            }
+            None => {
+                if let Some(b) = self.proxy_prevent_extensions(target)? {
+                    return Ok(Some(b)); // nested proxy target
+                }
+                let ti = target.heap_index();
+                if matches!(self.heap.get(ti), HeapObj::Object(_)) {
+                    if let HeapObj::Object(m) = self.heap.get_mut(ti) {
+                        m.extensible = false;
+                    }
+                } else if !matches!(
+                    self.heap.get(ti),
+                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                ) {
+                    self.arr_props.entry(ti).or_insert_with(ObjMap::new).extensible = false;
+                }
+                Ok(Some(true))
+            }
+        }
+    }
+
     /// A Proxy's `ownKeys` trap result as a list of property-key Values, or None
     /// for a non-proxy. With no trap, delegates to the target's own (string) keys.
     /// The trap result must be an Array.

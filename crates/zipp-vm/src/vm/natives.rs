@@ -790,6 +790,16 @@ impl<'p> Vm<'p> {
             // Objects keep their own `extensible` flag; primitives are immutable.
             OBJ_FREEZE | OBJ_SEAL | OBJ_PREVENT_EXT => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if id == OBJ_PREVENT_EXT {
+                    if let Some(ok) = self.proxy_prevent_extensions(o)? {
+                        if !ok {
+                            return Err(Thrown(
+                                "TypeError: Object.preventExtensions 'preventExtensions' trap returned falsish".into(),
+                            ));
+                        }
+                        return Ok(o);
+                    }
+                }
                 if o.is_heap() {
                     let idx = o.heap_index();
                     match self.heap.get(idx) {
@@ -821,6 +831,11 @@ impl<'p> Vm<'p> {
             }
             OBJ_IS_FROZEN | OBJ_IS_SEALED | OBJ_IS_EXT => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if id == OBJ_IS_EXT {
+                    if let Some(b) = self.proxy_is_extensible(o)? {
+                        return Ok(Value::bool(b));
+                    }
+                }
                 // A non-object (primitive, incl. heap string/symbol/bigint) is
                 // non-extensible and vacuously frozen/sealed. An exotic object's
                 // flags live in `arr_props` (default: extensible, not frozen/sealed).
@@ -1087,6 +1102,9 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.isExtensible called on non-object".into()));
                 }
+                if let Some(b) = self.proxy_is_extensible(a0)? {
+                    return Ok(Value::bool(b));
+                }
                 let ext = match self.heap.get(a0.heap_index()) {
                     HeapObj::Object(m) => m.extensible,
                     _ => self.arr_props.get(&a0.heap_index()).map_or(true, |m| m.extensible),
@@ -1096,6 +1114,9 @@ impl<'p> Vm<'p> {
             REFLECT_PREVENT_EXT => {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.preventExtensions called on non-object".into()));
+                }
+                if let Some(b) = self.proxy_prevent_extensions(a0)? {
+                    return Ok(Value::bool(b));
                 }
                 let idx = a0.heap_index();
                 if matches!(self.heap.get(idx), HeapObj::Object(_)) {
