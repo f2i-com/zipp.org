@@ -865,6 +865,7 @@ impl<'p> Vm<'p> {
                 "inLeapYear" => Value::bool(is_leap_year(y)),
                 "monthCode" => self.alloc_str(format!("M{m:02}")),
                 "calendarId" => self.alloc_str("iso8601".to_string()),
+                "era" | "eraYear" => Value::UNDEFINED,
                 _ => self.proto_member(self.plaindate_proto, key),
             });
         }
@@ -908,6 +909,7 @@ impl<'p> Vm<'p> {
                 "inLeapYear" => Value::bool(is_leap_year(y)),
                 "monthCode" => self.alloc_str(format!("M{m:02}")),
                 "calendarId" => self.alloc_str("iso8601".to_string()),
+                "era" | "eraYear" => Value::UNDEFINED,
                 _ => self.proto_member(self.plaindatetime_proto, key),
             });
         }

@@ -386,13 +386,14 @@ pub const TEMP_G_DURATION: &[&str] = &[
 pub const TEMP_G_PLAINDATE: &[&str] = &[
     "year", "month", "day", "dayOfWeek", "dayOfYear", "weekOfYear", "daysInMonth",
     "daysInYear", "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId",
+    "era", "eraYear",
 ];
 pub const TEMP_G_PLAINTIME: &[&str] =
     &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
 pub const TEMP_G_PLAINDATETIME: &[&str] = &[
     "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
     "nanosecond", "dayOfWeek", "dayOfYear", "weekOfYear", "daysInMonth", "daysInYear",
-    "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId",
+    "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId", "era", "eraYear",
 ];
 pub const TEMP_G_INSTANT: &[&str] =
     &["epochMilliseconds", "epochNanoseconds", "epochSeconds", "epochMicroseconds"];
