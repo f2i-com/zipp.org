@@ -1292,6 +1292,21 @@ impl<'p> Vm<'p> {
                     Instr::InstanceOfDyn { dst, val, ctor } => {
                         let v = self.get(base, val);
                         let c = self.get(base, ctor);
+                        // `Symbol.hasInstance`: if the RHS defines a callable
+                        // @@hasInstance, it fully governs `instanceof` — invoke it
+                        // with the LHS and coerce the result to boolean. (Ordinary
+                        // functions/classes have no own @@hasInstance here, so they
+                        // fall through to the prototype-chain check below.)
+                        if c.is_heap() {
+                            let hi = self.get_prop(c, "@@hasInstance")?;
+                            if self.is_callable(hi) {
+                                let res = self.call_value(hi, c, &[v])?;
+                                let b = self.truthy(res);
+                                self.set(base, dst, Value::bool(b));
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // A class uses its `extends` chain; a constructor FUNCTION
                         // checks whether `F.prototype` is in `v`'s prototype chain.
                         let kind = if c.is_heap() {
@@ -1309,7 +1324,13 @@ impl<'p> Vm<'p> {
                         let r = match kind {
                             1 => v.is_heap() && self.instance_of_class(v, c.heap_index()),
                             2 => self.instanceof_via_proto(v, c),
-                            _ => false,
+                            // RHS is neither callable nor has @@hasInstance: TypeError
+                            // (`x instanceof {}`, `x instanceof 5`, `x instanceof null`).
+                            _ => {
+                                return Err(Thrown(
+                                    "TypeError: Right-hand side of 'instanceof' is not callable".into(),
+                                ))
+                            }
                         };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
