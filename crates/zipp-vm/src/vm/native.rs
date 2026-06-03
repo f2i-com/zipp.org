@@ -339,6 +339,22 @@ pub const DURATION_FIELDS: [&str; 10] = [
     "years", "months", "weeks", "days", "hours", "minutes", "seconds",
     "milliseconds", "microseconds", "nanoseconds",
 ];
+
+/// Duration fields in the spec's alphabetical read order, paired with their index
+/// into the `[y,mo,w,d,h,mi,s,ms,us,ns]` field array (ToTemporalDuration and
+/// Duration.prototype.with read property-bag fields alphabetically).
+pub const DURATION_FIELDS_ALPHA: [(usize, &str); 10] = [
+    (3, "days"),
+    (4, "hours"),
+    (8, "microseconds"),
+    (7, "milliseconds"),
+    (5, "minutes"),
+    (1, "months"),
+    (9, "nanoseconds"),
+    (6, "seconds"),
+    (2, "weeks"),
+    (0, "years"),
+];
 /// Temporal prototype field getters. Each unique field name has a getter native
 /// at TEMPORAL_GETTER_BASE + its index in TEMPORAL_GETTER_FIELDS; the handler
 /// brand-checks `this` is a Temporal instance and reads the field. These are

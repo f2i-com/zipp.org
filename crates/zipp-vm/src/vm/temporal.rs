@@ -90,10 +90,12 @@ impl<'p> Vm<'p> {
                 return parse_iso_duration(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid duration string '{s}'")));
             }
-            if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+            if self.is_object_value(v) {
                 let mut ff = [0f64; 10];
                 let mut any = false;
-                for (i, name) in native::DURATION_FIELDS.iter().enumerate() {
+                // Read fields alphabetically (observable order); a Proxy bag is
+                // accepted too (is_object_value, not just a plain Object).
+                for &(i, name) in native::DURATION_FIELDS_ALPHA.iter() {
                     let pv = self.get_prop(v, name)?;
                     if pv != Value::UNDEFINED {
                         any = true;
@@ -146,10 +148,11 @@ impl<'p> Vm<'p> {
             "negated" => Ok(Some(self.make_duration(f.map(|x| -x)))),
             "abs" => Ok(Some(self.make_duration(f.map(|x| x.abs())))),
             "with" => {
-                // Override the supplied fields (a plain partial-duration object).
+                // Override the supplied fields (a partial-duration object), reading
+                // them in the spec's alphabetical order.
                 let mut nf = f.map(|x| x as f64);
                 let mut any = false;
-                for (i, name) in native::DURATION_FIELDS.iter().enumerate() {
+                for &(i, name) in native::DURATION_FIELDS_ALPHA.iter() {
                     let pv = self.get_prop(a0, name)?;
                     if pv != Value::UNDEFINED {
                         any = true;
