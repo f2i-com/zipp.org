@@ -1123,6 +1123,7 @@ impl<'p> Vm<'p> {
                 // Own-property miss: walk the class chain for an inherited method
                 // (return its func) or getter (invoke it with this = obj).
                 let class = map.class;
+                let is_ctor = map.is_ctor;
                 let (mut method, mut getter) = (None, None);
                 let mut cur = class;
                 while let Some(cidx) = cur {
@@ -1155,6 +1156,10 @@ impl<'p> Vm<'p> {
                     p.is_heap().then_some(p)
                 } else if let Some(cidx) = class {
                     self.prototype_of(Value::heap(cidx))
+                } else if is_ctor && self.fn_proto != 0 {
+                    // A constructor object (Array/Object/…) inherits Function.prototype
+                    // methods (`Array.bind`, `Object.call`), matching its [[Prototype]].
+                    Some(Value::heap(self.fn_proto))
                 } else if self.obj_proto != 0 && obj.heap_index() != self.obj_proto {
                     Some(Value::heap(self.obj_proto))
                 } else {
