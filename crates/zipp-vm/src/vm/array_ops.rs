@@ -494,16 +494,20 @@ impl<'p> Vm<'p> {
             }
             // `Array.prototype.toString()` is `join()` with the default "," sep.
             "join" | "toString" => {
-                let sep = if name == "toString" || args.is_empty() {
+                // ToString the separator (undefined -> ","), and ToString each
+                // element — invoking a custom `toString`/`@@toPrimitive`, not the
+                // infallible `display`. (to_js_string short-circuits primitives to
+                // `display`, so a numeric/string array join stays on the fast path.)
+                let sep = if name == "toString" || arg0 == Value::UNDEFINED {
                     ",".to_string()
                 } else {
-                    self.display(arg0)
+                    self.to_js_string(arg0)?
                 };
                 let snapshot = self.array_snapshot(idx);
-                let parts: Vec<String> = snapshot
-                    .iter()
-                    .map(|v| if v.is_nullish() { String::new() } else { self.display(*v) })
-                    .collect();
+                let mut parts: Vec<String> = Vec::with_capacity(snapshot.len());
+                for v in snapshot {
+                    parts.push(if v.is_nullish() { String::new() } else { self.to_js_string(v)? });
+                }
                 Ok(Some(self.alloc_str(parts.join(&sep))))
             }
             "at" => {
