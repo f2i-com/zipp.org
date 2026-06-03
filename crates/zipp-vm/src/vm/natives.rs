@@ -1446,6 +1446,33 @@ impl<'p> Vm<'p> {
                 }
                 self.arraybuffer_method(this.heap_index(), "resize", args)?.unwrap_or(Value::UNDEFINED)
             }
+            ARRAYBUFFER_ISVIEW => Value::bool(
+                a0.is_heap()
+                    && matches!(
+                        self.heap.get(a0.heap_index()),
+                        HeapObj::TypedArray { .. } | HeapObj::DataView { .. }
+                    ),
+            ),
+            _ if (BUFFER_GETTER_BASE..BUFFER_GETTER_BASE + BUFFER_GETTERS.len() as u16)
+                .contains(&id) =>
+            {
+                let (name, kind) = BUFFER_GETTERS[(id - BUFFER_GETTER_BASE) as usize];
+                let ok = this.is_heap()
+                    && matches!(
+                        (kind, self.heap.get(this.heap_index())),
+                        (0, HeapObj::ArrayBuffer { .. })
+                            | (1, HeapObj::TypedArray { .. })
+                            | (2, HeapObj::DataView { .. })
+                    );
+                if !ok {
+                    return Err(Thrown(format!(
+                        "TypeError: get {name} called on an incompatible receiver"
+                    )));
+                }
+                // The instance arm of get_member computes the value directly (it
+                // never consults this proto accessor, so there's no recursion).
+                self.get_member(this, name, this)?
+            }
             PROXY_REVOCABLE => {
                 // Proxy.revocable(target, handler) → { proxy, revoke }.
                 let p = self.make_proxy(a0, a1)?;

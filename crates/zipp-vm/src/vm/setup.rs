@@ -824,7 +824,7 @@ impl<'p> Vm<'p> {
                 build(self, &[("slice", ARRAYBUFFER_SLICE), ("resize", ARRAYBUFFER_RESIZE)], None);
             self.proto_of.insert(arraybuffer_proto, Value::heap(obj_proto));
             self.arraybuffer_proto = arraybuffer_proto;
-            let arraybuffer_ctor = build(self, &[], Some(arraybuffer_proto));
+            let arraybuffer_ctor = build(self, &[("isView", ARRAYBUFFER_ISVIEW)], Some(arraybuffer_proto));
             self.arraybuffer_ctor = arraybuffer_ctor;
             if let HeapObj::Object(m) = self.heap.get_mut(arraybuffer_proto) {
                 m.define("constructor", Value::heap(arraybuffer_ctor), method_attr);
@@ -837,6 +837,30 @@ impl<'p> Vm<'p> {
             let dataview_proto = build(self, &dv_methods, None);
             self.proto_of.insert(dataview_proto, Value::heap(obj_proto));
             self.dataview_proto = dataview_proto;
+            // Register byteLength/maxByteLength/resizable/detached (ArrayBuffer),
+            // byteLength/byteOffset/length (%TypedArray%.prototype), and byteLength/
+            // byteOffset (DataView) as real accessor properties, so their
+            // descriptors expose a brand-checked `get`.
+            let acc = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: Value::UNDEFINED,
+            };
+            for (g, &(name, kind)) in native::BUFFER_GETTERS.iter().enumerate() {
+                let getter = Value::heap(
+                    self.heap.alloc(HeapObj::Native(native::BUFFER_GETTER_BASE + g as u16)),
+                );
+                let target = match kind {
+                    0 => arraybuffer_proto,
+                    1 => ta_base_proto,
+                    _ => dataview_proto,
+                };
+                if let HeapObj::Object(m) = self.heap.get_mut(target) {
+                    m.define(name, getter, acc);
+                }
+            }
             // `Proxy`: a constructor with no `.prototype`; `Proxy.revocable` static.
             let revocable = Value::heap(self.heap.alloc(HeapObj::Native(PROXY_REVOCABLE)));
             let mut pm = ObjMap::new();

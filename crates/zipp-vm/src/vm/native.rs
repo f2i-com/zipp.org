@@ -213,6 +213,20 @@ pub const DV_PROTO_METHODS: &[&str] = &[
 pub const DV_METHOD_BASE: u16 = 372;
 pub const ARRAYBUFFER_SLICE: u16 = 396;
 pub const ARRAYBUFFER_RESIZE: u16 = 399;
+pub const ARRAYBUFFER_ISVIEW: u16 = 760;
+/// Accessor getters for ArrayBuffer / TypedArray / DataView instance properties,
+/// registered as real accessor properties on the protos (so getOwnPropertyDescriptor
+/// finds a `get` and a brand-checked invocation works). `kind`: 0 = ArrayBuffer,
+/// 1 = TypedArray (on %TypedArray%.prototype), 2 = DataView.
+pub const BUFFER_GETTER_BASE: u16 = 761;
+pub const BUFFER_GETTERS: &[(&str, u8)] = &[
+    ("byteLength", 0),
+    ("maxByteLength", 0),
+    ("resizable", 0),
+    ("detached", 0),
+    ("byteLength", 2),
+    ("byteOffset", 2),
+];
 pub const PROXY_REVOCABLE: u16 = 397;
 pub const PROXY_REVOKE: u16 = 398;
 /// Temporal.Duration.prototype instance methods (dispatched by name via
