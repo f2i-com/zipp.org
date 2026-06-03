@@ -302,6 +302,27 @@ pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
     })
 }
 
+/// Compile an `eval` code string. Identical to [`compile_program`] except the
+/// top-level script returns its *completion value* (the value of the last
+/// evaluated expression statement) — what `eval("1 + 1")` must yield. The VM
+/// installs the resulting functions into its runtime function table and remaps
+/// the program's independently-numbered global slots onto the live globals.
+pub fn compile_eval(prog: &ox::Program, source: &str) -> R<Program> {
+    let mut c = Compiler::new(source.to_string());
+    c.eval_mode = true;
+    c.compile(prog)?;
+    for (i, f) in c.functions.iter_mut().enumerate() {
+        rewrite_string_accumulators(f, i == 0);
+    }
+    Ok(Program {
+        functions: c.functions,
+        global_count: c.globals.len() as u32,
+        classes: c.classes,
+        global_names: c.globals,
+        hoisted_globals: c.hoisted_globals,
+    })
+}
+
 struct Compiler {
     functions: Vec<FuncProto>,
     /// Global name → slot.
@@ -317,6 +338,10 @@ struct Compiler {
     /// The full program source, kept so each function can record its exact
     /// source slice (by oxc span) for `Function.prototype.toString`.
     source: String,
+    /// True when compiling an `eval` code string: the top-level script returns
+    /// its *completion value* (the value of the last evaluated expression
+    /// statement) instead of `undefined`.
+    eval_mode: bool,
 }
 
 impl Compiler {
@@ -328,6 +353,7 @@ impl Compiler {
             class_names: Vec::new(),
             hoisted_globals: Vec::new(),
             source,
+            eval_mode: false,
         }
     }
 
@@ -425,10 +451,19 @@ impl Compiler {
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
+        let eval_completion = is_script && self.eval_mode;
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.is_script = is_script;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
+        // eval completion-value accumulator: a low, never-reclaimed register
+        // (allocated right after `this`/params, below every statement's
+        // save/restore high-water) seeded to `undefined`.
+        if eval_completion {
+            let cr = fc.alloc_reg();
+            fc.emit(Instr::LoadUndefined { dst: cr });
+            fc.completion_reg = Some(cr);
+        }
         if !is_script {
             fc.reserve_arguments(); // non-arrow functions bind `arguments`
         }
@@ -460,7 +495,13 @@ impl Compiler {
         for s in body {
             fc.stmt(s)?;
         }
-        fc.emit(Instr::ReturnUndefined);
+        // An eval script returns its accumulated completion value; everything else
+        // returns undefined.
+        if let Some(cr) = fc.completion_reg {
+            fc.emit(Instr::Return { src: cr });
+        } else {
+            fc.emit(Instr::ReturnUndefined);
+        }
 
         let upvalues: Vec<UpvalSource> =
             fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
@@ -734,6 +775,10 @@ struct FnCompiler<'a> {
     /// let/const/var) bind to globals rather than registers, so only genuinely
     /// nested functions ever capture.
     is_script: bool,
+    /// For an `eval` top-level script: a persistent register that accumulates the
+    /// completion value (last evaluated expression statement). `Return`ed at the
+    /// end instead of `undefined`. `None` outside eval mode / in nested functions.
+    completion_reg: Option<Reg>,
     /// This function's own bindings that some nested function captures; these
     /// are boxed into heap cells at declaration so the closure shares the slot.
     captured: HashSet<String>,
@@ -802,6 +847,7 @@ impl<'a> FnCompiler<'a> {
             in_async: false,
             pending_label: None,
             is_script: false,
+            completion_reg: None,
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
             captured,
@@ -996,7 +1042,12 @@ impl<'a> FnCompiler<'a> {
         match s {
             S::ExpressionStatement(e) => {
                 let r = self.expr(&e.expression)?;
-                let _ = r; // value discarded
+                // eval completion: remember this expression's value (the last one
+                // executed wins, matching the spec's expression-completion value).
+                if let Some(cr) = self.completion_reg {
+                    self.emit(Instr::Move { dst: cr, src: r });
+                }
+                let _ = r; // value otherwise discarded
             }
             S::VariableDeclaration(d) => self.var_decl(d)?,
             S::BlockStatement(b) => {

@@ -149,6 +149,11 @@ impl<'p> Vm<'p> {
             if ip == 0
                 && self.jit_enabled
                 && self.jit_recurse_depth == 0
+                // Runtime `eval`/`new Function` functions live past the program's
+                // function table (leaked boxes addressed via `func()`); the JIT
+                // indexes `program.functions` directly, so never JIT them — they
+                // always interpret.
+                && (func_id as usize) < self.main_func_count
                 && !self.func(func_id as usize).is_generator
                 && !self.func(func_id as usize).is_async
             {
@@ -1412,7 +1417,11 @@ impl<'p> Vm<'p> {
                         // exit or a guard bail). Gated like the function JIT:
                         // enabled, and not inside a native self-recursion.
                         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-                        if self.jit_enabled && self.jit_recurse_depth == 0 && t < ip {
+                        if self.jit_enabled
+                            && self.jit_recurse_depth == 0
+                            && (func_id as usize) < self.main_func_count
+                            && t < ip
+                        {
                             if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                 ip = resume;
                                 continue;

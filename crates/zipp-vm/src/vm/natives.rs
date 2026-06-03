@@ -1329,6 +1329,17 @@ impl<'p> Vm<'p> {
             GLOBAL_PARSE_FLOAT => Value::num(parse_float(&self.display(a0))),
             GLOBAL_IS_NAN => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan()),
             GLOBAL_IS_FINITE => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite()),
+            GLOBAL_EVAL => {
+                // eval(x): if x is not a String, return it unchanged (spec 19.2.1).
+                let is_str = a0.is_heap()
+                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. });
+                if !is_str {
+                    a0
+                } else {
+                    let code = self.display(a0);
+                    return self.do_eval(&code);
+                }
+            }
             // String static methods.
             STR_FROM_CHAR_CODE => {
                 let mut s = String::new();

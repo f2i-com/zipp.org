@@ -1398,6 +1398,7 @@ impl<'p> Vm<'p> {
         let parse_float_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_FLOAT));
         let is_nan_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_NAN));
         let is_finite_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_FINITE));
+        let eval_fn = self.heap.alloc(HeapObj::Native(GLOBAL_EVAL));
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -1453,6 +1454,7 @@ impl<'p> Vm<'p> {
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
                 "isFinite" => Some(is_finite_fn),
+                "eval" => Some(eval_fn),
                 "globalThis" => Some(global_this),
                 "$262" => Some(self.dollar262),
                 // The 11 TypedArray constructors (Int8Array … BigUint64Array).

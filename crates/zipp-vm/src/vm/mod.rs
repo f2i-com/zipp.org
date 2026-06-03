@@ -37,6 +37,14 @@ const MAX_FRAMES: usize = 100_000;
 /// native run, never concurrent), so this caps fields-per-region, not total.
 const FIELD_POOL: usize = 64;
 
+/// Extra global slots reserved past the JIT field pool for globals *created or
+/// first referenced inside `eval`* (sloppy `x = 1`, `var x`, hoisted function
+/// declarations, and reads of builtins the main program never named). Sized once
+/// at startup so the globals Vec never reallocates at runtime (the JIT pins its
+/// base pointer); `eval` draws from this pool by name and throws once it is
+/// exhausted rather than growing the Vec.
+const EVAL_POOL: usize = 1024;
+
 /// Sentinel `closure` value for a frame whose callee is a plain (capture-free)
 /// function rather than a closure. Real heap indices are always `< u32::MAX`.
 const NO_CLOSURE: u32 = u32::MAX;
@@ -126,6 +134,13 @@ pub struct Vm<'p> {
     /// Number of functions in the compile-time `program` (the boundary between
     /// program function ids and runtime `eval_funcs` ids).
     main_func_count: usize,
+    /// Globals introduced by `eval`: maps a global NAME (one not present in the
+    /// compile-time `program.global_names`) to the EVAL_POOL slot it was assigned.
+    /// Persists across `eval` calls so repeated evals see each other's globals.
+    eval_global_map: std::collections::HashMap<String, u32>,
+    /// Next free EVAL_POOL slot. Starts at `global_count + FIELD_POOL`; bumped as
+    /// new eval globals are assigned, capped at `+ EVAL_POOL`.
+    eval_global_next: u32,
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
     /// `super` call can reach its lexical superclass value at runtime.
     class_values: Vec<Option<Value>>,

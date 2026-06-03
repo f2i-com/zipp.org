@@ -34,7 +34,8 @@ impl<'p> Vm<'p> {
         // on pool slots, and the interpreter syncs object.field ↔ pool slot around
         // the native run. Sized once here so the globals Vec never reallocates at
         // runtime (the JIT pins its base pointer).
-        let mut globals = vec![Value::UNDEFINED; program.global_count as usize + FIELD_POOL];
+        let mut globals =
+            vec![Value::UNDEFINED; program.global_count as usize + FIELD_POOL + EVAL_POOL];
         // Real global slots start as the never-declared sentinel: a LoadGlobal of
         // one throws ReferenceError unless a builtin (setup_globals), a hoisted
         // function, a top-level `var` (hoisted to undefined just below), or a
@@ -53,6 +54,8 @@ impl<'p> Vm<'p> {
             program,
             eval_funcs: Vec::new(),
             main_func_count: program.functions.len(),
+            eval_global_map: std::collections::HashMap::new(),
+            eval_global_next: program.global_count + FIELD_POOL as u32,
             class_values: vec![None; program.classes.len()],
             heap,
             globals,
@@ -630,4 +633,113 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Resolve a global NAME referenced inside an `eval` to a live global slot.
+    /// Names already in the compile-time program reuse their slot; genuinely new
+    /// names (sloppy `x = 1`, `var x`, hoisted fns, or builtins the program never
+    /// named) draw a fresh EVAL_POOL slot, seeded UNINITIALIZED so a read before a
+    /// write is a ReferenceError (matching sloppy global-scope semantics).
+    fn eval_global_slot(&mut self, name: &str) -> Result<u32, Thrown> {
+        if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
+            return Ok(i as u32);
+        }
+        if let Some(&s) = self.eval_global_map.get(name) {
+            return Ok(s);
+        }
+        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
+        if self.eval_global_next >= cap {
+            return Err(Thrown(
+                "EvalError: too many distinct globals introduced by eval".into(),
+            ));
+        }
+        let s = self.eval_global_next;
+        self.eval_global_next += 1;
+        self.eval_global_map.insert(name.to_string(), s);
+        self.globals[s as usize] = Value::UNINITIALIZED;
+        Ok(s)
+    }
+
+    /// Parse, compile, and run an `eval` code string (indirect eval — global,
+    /// sloppy scope), returning its completion value. ADDITIVE: the broader suite
+    /// never reaches this (calling `eval` previously threw ReferenceError), so it
+    /// cannot regress non-eval programs. v1 limitation: class declarations inside
+    /// eval throw EvalError (they need a runtime class table).
+    pub(crate) fn do_eval(&mut self, code: &str) -> Result<Value, Thrown> {
+        use crate::bytecode::{FuncProto, Instr};
+        // 1. Parse.
+        let allocator = oxc_allocator::Allocator::default();
+        let ret = oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::default()).parse();
+        if !ret.errors.is_empty() {
+            return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
+        }
+        // 2. Compile in eval mode (top-level returns its completion value).
+        let eval_prog = match crate::compile::compile_eval(&ret.program, code) {
+            Ok(p) => p,
+            Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
+        };
+        if !eval_prog.classes.is_empty() {
+            return Err(Thrown(
+                "EvalError: class declarations inside eval are not yet supported".into(),
+            ));
+        }
+        // 3. Remap the eval program's own global-slot numbering onto live slots.
+        let mut gmap: Vec<u32> = Vec::with_capacity(eval_prog.global_names.len());
+        for name in &eval_prog.global_names {
+            gmap.push(self.eval_global_slot(name)?);
+        }
+        // 4. Re-index function-id and global-slot operands, leak each FuncProto
+        //    (stable address — raw pointers live into it), append to the table.
+        let base_func = (self.main_func_count + self.eval_funcs.len()) as u32;
+        let mut new_funcs: Vec<&'static FuncProto> =
+            Vec::with_capacity(eval_prog.functions.len());
+        for mut f in eval_prog.functions {
+            for ins in f.code.iter_mut() {
+                match ins {
+                    Instr::MakeFunc { func_id, .. } | Instr::MakeClosure { func_id, .. } => {
+                        *func_id += base_func;
+                    }
+                    Instr::LoadGlobal { idx, .. }
+                    | Instr::LoadGlobalOrUndefined { idx, .. }
+                    | Instr::StoreGlobal { idx, .. } => {
+                        *idx = gmap[*idx as usize];
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(s) = f.name_global {
+                f.name_global = Some(gmap[s as usize] as u16);
+            }
+            new_funcs.push(Box::leak(Box::new(f)));
+        }
+        for r in new_funcs {
+            self.eval_funcs.push(r);
+        }
+        // 5. Hoist eval `var` names to undefined (only if still uninitialized).
+        for &slot in &eval_prog.hoisted_globals {
+            let rs = gmap[slot as usize] as usize;
+            if self.globals[rs].bits() == Value::UNINITIALIZED.bits() {
+                self.globals[rs] = Value::UNDEFINED;
+            }
+        }
+        // 6. Hoist eval top-level function declarations into their global slots.
+        let count = self.eval_funcs.len();
+        let start = (base_func as usize) - self.main_func_count;
+        for local in start..count {
+            let global_id = (self.main_func_count + local) as u32;
+            if let Some(slot) = self.eval_funcs[local].name_global {
+                let v = Value::heap(self.heap.alloc(HeapObj::Func(global_id)));
+                if (slot as usize) < self.globals.len() {
+                    self.globals[slot as usize] = v;
+                }
+            }
+        }
+        // 7. Run the eval script function (global id `base_func`) to completion in
+        //    global scope (`this` = globalThis), returning its completion value.
+        let script = Value::heap(self.heap.alloc(HeapObj::Func(base_func)));
+        let this = if self.global_this != 0 {
+            Value::heap(self.global_this)
+        } else {
+            Value::UNDEFINED
+        };
+        self.call_value(script, this, &[])
+    }
 }

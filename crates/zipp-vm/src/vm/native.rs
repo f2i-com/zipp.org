@@ -162,6 +162,10 @@ pub const GLOBAL_PARSE_INT: u16 = 307;
 pub const GLOBAL_PARSE_FLOAT: u16 = 308;
 pub const GLOBAL_IS_NAN: u16 = 309;
 pub const GLOBAL_IS_FINITE: u16 = 310;
+/// `eval` — the global function. Reference identity matters (`this === eval`,
+/// passed as a thisArg) and calling it parses+runs a code string (indirect eval,
+/// global scope). Picked clear of every BASE range (max ~767).
+pub const GLOBAL_EVAL: u16 = 800;
 // String static methods.
 pub const STR_FROM_CHAR_CODE: u16 = 311;
 pub const STR_FROM_CODE_POINT: u16 = 312;
@@ -745,6 +749,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_PARSE_FLOAT => ("parseFloat", 1),
         GLOBAL_IS_NAN => ("isNaN", 1),
         GLOBAL_IS_FINITE => ("isFinite", 1),
+        GLOBAL_EVAL => ("eval", 1),
         STR_FROM_CHAR_CODE => ("fromCharCode", 1),
         STR_FROM_CODE_POINT => ("fromCodePoint", 1),
         STR_RAW => ("raw", 1),
