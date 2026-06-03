@@ -590,6 +590,24 @@ impl<'p> Vm<'p> {
                         let aidx = self.get(base, arr).heap_index();
                         let vv = self.get(base, val);
                         if spread {
+                            // An array whose Array.prototype[Symbol.iterator] was
+                            // replaced spreads via the iterator protocol (the inline
+                            // fast path below assumes the default iterator).
+                            if vv.is_heap()
+                                && matches!(self.heap.get(vv.heap_index()), HeapObj::Array(_))
+                            {
+                                let m = self.get_prop(vv, "@@iterator")?;
+                                if m.bits() != self.default_array_iter.bits()
+                                    && self.is_callable(m)
+                                {
+                                    let elems = self.iterate_to_vec(vv)?;
+                                    if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                                        dst_items.extend(elems);
+                                    }
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                             // A generator or a custom iterable (object) is drained
                             // via the iterator protocol (iterate_to_vec also errors
                             // for a plain, non-iterable object, as a spread should).
