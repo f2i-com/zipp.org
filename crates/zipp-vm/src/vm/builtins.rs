@@ -221,6 +221,21 @@ impl<'p> Vm<'p> {
     /// `%TypedArray%.prototype` methods (most mirror Array.prototype, but map/filter/
     /// slice/etc. return TypedArrays and `sort` is numeric by default). `idx` is the
     /// receiver TypedArray's heap index.
+    /// Resolve a TypedArray relative index argument (negative counts from the
+    /// end) into [0,len], via ToInteger — which throws on a Symbol and honours a
+    /// valueOf (abrupt completion); `undefined` yields `def`.
+    fn ta_rel_index(&mut self, v: Value, def: usize, len: usize) -> Result<usize, Thrown> {
+        if v == Value::UNDEFINED {
+            return Ok(def);
+        }
+        let n = self.to_integer_or_zero(v)?;
+        Ok(if n < 0 {
+            ((len as i64) + n).max(0) as usize
+        } else {
+            (n as usize).min(len)
+        })
+    }
+
     pub(crate) fn typed_array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         if !matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
             return Ok(None);
@@ -243,25 +258,12 @@ impl<'p> Vm<'p> {
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-        // Resolve a relative index (negative = from end) into [0,len].
-        let rel = |v: Value, def: usize, this: &Self| -> usize {
-            if v == Value::UNDEFINED {
-                return def;
-            }
-            let n = this.value_num(v);
-            if n.is_nan() {
-                0
-            } else if n < 0.0 {
-                ((len as f64 + n).max(0.0)) as usize
-            } else {
-                (n as usize).min(len)
-            }
-        };
         match name {
             "at" => {
-                let n = self.value_num(a0);
-                let i = if n < 0.0 { len as f64 + n } else { n };
-                Ok(Some(if i >= 0.0 && (i as usize) < len {
+                // ToInteger(index): throws on a Symbol, honours a valueOf.
+                let n = self.to_integer_or_zero(a0)?;
+                let i = if n < 0 { len as i64 + n } else { n };
+                Ok(Some(if i >= 0 && (i as usize) < len {
                     self.ta_element_get(idx, i as usize)
                 } else {
                     Value::UNDEFINED
@@ -407,8 +409,8 @@ impl<'p> Vm<'p> {
                 Ok(Some(acc))
             }
             "fill" => {
-                let start = rel(a1, 0, self);
-                let end = rel(args.get(2).copied().unwrap_or(Value::UNDEFINED), len, self);
+                let start = self.ta_rel_index(a1, 0, len)?;
+                let end = self.ta_rel_index(args.get(2).copied().unwrap_or(Value::UNDEFINED), len, len)?;
                 for i in start..end {
                     self.ta_element_set(idx, i, a0)?;
                 }
@@ -473,14 +475,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.ta_build_from(kind, &snap)?))
             }
             "slice" => {
-                let start = rel(a0, 0, self);
-                let end = rel(a1, len, self);
+                let start = self.ta_rel_index(a0, 0, len)?;
+                let end = self.ta_rel_index(a1, len, len)?;
                 let vals: Vec<Value> = (start..end.max(start)).map(|i| self.ta_element_get(idx, i)).collect();
                 Ok(Some(self.ta_build_from(kind, &vals)?))
             }
             "subarray" => {
-                let start = rel(a0, 0, self);
-                let end = rel(a1, len, self);
+                let start = self.ta_rel_index(a0, 0, len)?;
+                let end = self.ta_rel_index(a1, len, len)?;
                 let (buffer, byte_offset) = match self.heap.get(idx) {
                     HeapObj::TypedArray { buffer, byte_offset, .. } => (*buffer, *byte_offset),
                     _ => return Ok(None),
@@ -519,9 +521,9 @@ impl<'p> Vm<'p> {
                 Ok(Some(recv))
             }
             "copyWithin" => {
-                let target = rel(a0, 0, self);
-                let start = rel(a1, 0, self);
-                let end = rel(args.get(2).copied().unwrap_or(Value::UNDEFINED), len, self);
+                let target = self.ta_rel_index(a0, 0, len)?;
+                let start = self.ta_rel_index(a1, 0, len)?;
+                let end = self.ta_rel_index(args.get(2).copied().unwrap_or(Value::UNDEFINED), len, len)?;
                 let src: Vec<Value> = (start..end.max(start)).map(|i| self.ta_element_get(idx, i)).collect();
                 for (k, v) in src.into_iter().enumerate() {
                     if target + k < len {
@@ -693,8 +695,8 @@ impl<'p> Vm<'p> {
                     let n = this.value_num(v);
                     if n < 0.0 { ((len as f64 + n).max(0.0)) as usize } else { (n as usize).min(len) }
                 };
-                let start = rel(args.first().copied().unwrap_or(Value::UNDEFINED), 0, self);
-                let end = rel(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, self);
+                let start = self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
+                let end = self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
                 let slice: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => data[start..end.max(start)].to_vec(),
                     _ => Vec::new(),
