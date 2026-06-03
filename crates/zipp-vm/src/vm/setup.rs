@@ -1598,6 +1598,30 @@ impl<'p> Vm<'p> {
                 m.define("constructor", Value::heap(ctor), method_attr);
             }
         }
+        // SuppressedError (ES2026): an error carrying `error` + `suppressed`. Its
+        // prototype chains to %Error.prototype% (so `instanceof Error` holds) and
+        // the ctor's [[Prototype]] is %Error%.
+        {
+            let p = build(self, &[], None);
+            if self.error_protos[0] != 0 {
+                self.proto_of.insert(p, Value::heap(self.error_protos[0]));
+            }
+            let name_v = self.alloc_str("SuppressedError".to_string());
+            let empty_v = self.alloc_str(String::new());
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("name", name_v, method_attr);
+                m.define("message", empty_v, method_attr);
+            }
+            self.suppressederror_proto = p;
+            let ctor = build(self, &[], Some(p));
+            if self.error_ctors[0] != 0 {
+                self.proto_of.insert(ctor, Value::heap(self.error_ctors[0]));
+            }
+            self.suppressederror_ctor = ctor;
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("constructor", Value::heap(ctor), method_attr);
+            }
+        }
         // Bare global functions as first-class values (the call form is GlobalFn).
         let parse_int_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_INT));
         let parse_float_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_FLOAT));
@@ -1659,6 +1683,7 @@ impl<'p> Vm<'p> {
                 "Atomics" => Some(atomics_ns),
                 "DisposableStack" => Some(self.disposablestack_ctor),
                 "AsyncDisposableStack" => Some(self.asyncdisposablestack_ctor),
+                "SuppressedError" => Some(self.suppressederror_ctor),
                 "parseInt" => Some(parse_int_fn),
                 "parseFloat" => Some(parse_float_fn),
                 "isNaN" => Some(is_nan_fn),
@@ -1682,6 +1707,7 @@ impl<'p> Vm<'p> {
                         "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator"
                         | "DisposableStack" | "AsyncDisposableStack" => 0.0,
                         "AggregateError" => 2.0, // (errors, message?)
+                        "SuppressedError" => 3.0, // (error, suppressed, message?)
                         "RegExp" => 2.0,         // (pattern, flags)
                         "Proxy" => 2.0,          // (target, handler)
                         // TypedArray ctors take (length | buffer, byteOffset, length).

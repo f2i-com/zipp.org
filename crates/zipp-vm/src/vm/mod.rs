@@ -316,6 +316,11 @@ pub struct Vm<'p> {
     asyncdisposablestack_ctor: u32,
     asyncdisposablestack_proto: u32,
     async_stacks: std::collections::HashSet<u32>,
+    /// `SuppressedError` ctor + prototype (ES2026). Unlike the 8 standard errors,
+    /// it carries `error` + `suppressed` own properties; its prototype chains to
+    /// %Error.prototype% so `instanceof Error` holds.
+    suppressederror_ctor: u32,
+    suppressederror_proto: u32,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.

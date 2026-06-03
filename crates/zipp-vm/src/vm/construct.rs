@@ -50,6 +50,40 @@ impl<'p> Vm<'p> {
         self.do_eval(&source)
     }
 
+    /// `new SuppressedError(error, suppressed, message)`: an error object with
+    /// own `error` + `suppressed` (always) and `message` (only if provided),
+    /// linked to %SuppressedError.prototype%.
+    pub(crate) fn build_suppressed_error(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let error = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let suppressed = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+        let message = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+        // message ToString runs first (may execute user code) — before any alloc.
+        let msg_val = if message != Value::UNDEFINED {
+            let s = self.to_js_string(message)?;
+            Some(self.alloc_str(s))
+        } else {
+            None
+        };
+        let attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let mut m = ObjMap::new();
+        if let Some(mv) = msg_val {
+            m.define("message", mv, attr);
+        }
+        m.define("error", error, attr);
+        m.define("suppressed", suppressed, attr);
+        let idx = self.heap.alloc(HeapObj::Object(m));
+        if self.suppressederror_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.suppressederror_proto));
+        }
+        Ok(Value::heap(idx))
+    }
+
     /// Allocate a fresh `DisposableStack` instance (a plain object linked to
     /// %DisposableStack.prototype%, with an empty, not-yet-disposed disposer stack).
     pub(crate) fn alloc_disposable_stack(&mut self, is_async: bool) -> u32 {
@@ -246,6 +280,9 @@ impl<'p> Vm<'p> {
         }
         if ci == self.asyncdisposablestack_ctor && ci != 0 {
             return Ok(Value::heap(self.alloc_disposable_stack(true)));
+        }
+        if ci == self.suppressederror_ctor && ci != 0 {
+            return self.build_suppressed_error(args);
         }
         if ci == self.dataview_ctor && ci != 0 {
             return self.build_data_view(args);
@@ -706,6 +743,9 @@ impl<'p> Vm<'p> {
         }
         if ci == self.asyncgen_fn_ctor && self.asyncgen_fn_ctor != 0 {
             return self.build_function_kind(args, 3);
+        }
+        if ci == self.suppressederror_ctor && self.suppressederror_ctor != 0 {
+            return self.build_suppressed_error(args);
         }
         let proto = match self.heap.get(callee.heap_index()) {
             HeapObj::Object(m) => m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index()),

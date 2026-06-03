@@ -141,6 +141,8 @@ impl<'p> Vm<'p> {
             asyncdisposablestack_ctor: 0,
             asyncdisposablestack_proto: 0,
             async_stacks: std::collections::HashSet::new(),
+            suppressederror_ctor: 0,
+            suppressederror_proto: 0,
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,
