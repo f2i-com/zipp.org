@@ -188,6 +188,7 @@ pub const ATOMICS_METHODS: &[(&str, u8)] = &[
     ("store", 3),
     ("isLockFree", 1),
     ("wait", 4),
+    ("waitAsync", 4),
     ("notify", 3),
     ("pause", 0),
 ];

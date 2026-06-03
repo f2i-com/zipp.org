@@ -290,6 +290,50 @@ impl<'p> Vm<'p> {
         }
         let (ti, i, kind) = self.atomic_validate(a0, a1)?;
         let is_bigint = native::TA_KINDS[kind as usize].2;
+        // waitAsync(ta, index, value, timeout) -> { async, value }. Single agent:
+        // never truly blocks. value differs -> {async:false, value:"not-equal"};
+        // matches with timeout 0 -> {async:false, value:"timed-out"}; matches with
+        // a positive timeout -> {async:true, value:<pending promise>} (no notifier).
+        if op == "waitAsync" {
+            if !matches!(kind, 5 | 9) {
+                return Err(Thrown(
+                    "TypeError: Atomics.waitAsync requires an Int32Array or BigInt64Array".into(),
+                ));
+            }
+            let cur = self.ta_element_get(ti, i);
+            let eq = if is_bigint {
+                self.to_bigint(a2)? == self.to_bigint(cur)?
+            } else {
+                self.to_integer_or_zero(a2)? == (cur.as_f64() as i64)
+            };
+            // ToNumber(timeout): NaN/absent -> +Infinity; clamp to >= 0.
+            let t_raw = self.to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+            let timeout = if t_raw.is_nan() { f64::INFINITY } else { t_raw.max(0.0) };
+            let (is_async, value) = if !eq {
+                (false, self.alloc_str("not-equal".to_string()))
+            } else if timeout == 0.0 {
+                (false, self.alloc_str("timed-out".to_string()))
+            } else {
+                // Would block; no notifier in a single agent, so the promise stays
+                // pending (a real engine resolves it on notify or timeout).
+                (true, Value::heap(self.alloc_promise()))
+            };
+            let mut m = crate::heap::ObjMap::new();
+            let attr = crate::heap::PropAttr {
+                writable: true,
+                enumerable: true,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            m.define("async", Value::bool(is_async), attr);
+            m.define("value", value, attr);
+            let obj = self.heap.alloc(HeapObj::Object(m));
+            if self.obj_proto != 0 {
+                self.proto_of.insert(obj, Value::heap(self.obj_proto));
+            }
+            return Ok(Value::heap(obj));
+        }
         // wait/notify need Int32Array or BigInt64Array; wait additionally needs a
         // SharedArrayBuffer. No real waiters in a single agent.
         if op == "wait" || op == "notify" {
