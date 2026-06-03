@@ -367,8 +367,10 @@ pub(crate) fn parse_iso_year_month(s: &str) -> Option<(i64, i64, i64)> {
         Some(b'-') | Some(b'+') => (if bytes[0] == b'-' { -1i64 } else { 1 }, &s[1..]),
         _ => (1, s),
     };
+    // An expanded 6-digit year requires the ± sign; basic "YYYYMM" is 4-digit year.
+    let signed = matches!(bytes.first(), Some(b'-') | Some(b'+'));
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let ylen = if digits.len() >= 6 { 6 } else { 4 };
+    let ylen = if signed && digits.len() >= 6 { 6 } else { 4 };
     if digits.len() < ylen {
         return None;
     }
@@ -392,8 +394,10 @@ pub(crate) fn parse_iso_year_month(s: &str) -> Option<(i64, i64, i64)> {
 /// Parse "MM-DD" / "--MM-DD" (or a fuller ISO date) → (referenceISOYear, month, day).
 pub(crate) fn parse_iso_month_day(s: &str) -> Option<(i64, i64, i64)> {
     let s = s.trim();
-    if let Some((y, m, d)) = parse_iso_date(s) {
-        return Some((y, m, d));
+    // A full date string yields its month/day with the ISO reference year 1972
+    // (a leap year, so "02-29" stays valid), NOT the string's own year.
+    if let Some((_, m, d)) = parse_iso_date(s) {
+        return Some((1972, m, d));
     }
     let body = s.strip_prefix("--").unwrap_or(s);
     if body.len() < 4 {
