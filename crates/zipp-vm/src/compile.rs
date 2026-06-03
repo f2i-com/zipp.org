@@ -1062,6 +1062,22 @@ impl<'a> FnCompiler<'a> {
             S::VariableDeclaration(d) => self.var_decl(d)?,
             S::BlockStatement(b) => {
                 self.push_scope();
+                // Hoist block-level function declarations: declare each as a local
+                // in this block scope first, so `func_decl` binds it (and forward
+                // references / calls within the block resolve to the local rather
+                // than an undeclared global). Only inside a real function body —
+                // at script top level, `func_decl` binds block functions to globals
+                // (Annex B hoisting), so a local here would shadow that with an
+                // uninitialized slot.
+                if !self.is_script {
+                    for st in &b.body {
+                        if let S::FunctionDeclaration(f) = st {
+                            if let Some(id) = &f.id {
+                                self.declare_local(id.name.as_str());
+                            }
+                        }
+                    }
+                }
                 for st in &b.body {
                     self.stmt(st)?;
                 }
