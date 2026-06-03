@@ -117,6 +117,15 @@ pub(crate) enum EnumWhat {
 
 pub struct Vm<'p> {
     program: &'p Program,
+    /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
+    /// `Box<FuncProto>` so its address is stable (the whole-function JIT and the
+    /// run loop hold raw pointers into FuncProtos, so they must never move). A
+    /// unified `func_id` addresses `program.functions` for `id < main_func_count`
+    /// and `eval_funcs[id - main_func_count]` beyond it.
+    eval_funcs: Vec<&'static crate::bytecode::FuncProto>,
+    /// Number of functions in the compile-time `program` (the boundary between
+    /// program function ids and runtime `eval_funcs` ids).
+    main_func_count: usize,
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
     /// `super` call can reach its lexical superclass value at runtime.
     class_values: Vec<Option<Value>>,

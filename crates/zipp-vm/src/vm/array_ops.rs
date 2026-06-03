@@ -49,7 +49,7 @@ impl<'p> Vm<'p> {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                 if ups.is_empty() {
                     let proto: *const crate::bytecode::FuncProto =
-                        &self.program.functions[fid as usize];
+                        self.func(fid as usize);
                     // SAFETY: program functions are immutable during execution;
                     // the raw ptr dodges the self.jit (&mut) vs self.program (&)
                     // borrow conflict (same pattern as native_cb_entry).
@@ -110,7 +110,7 @@ impl<'p> Vm<'p> {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                 if ups.is_empty() {
                     let proto: *const crate::bytecode::FuncProto =
-                        &self.program.functions[fid as usize];
+                        self.func(fid as usize);
                     // SAFETY: as the map branch above.
                     let proto_ref = unsafe { &*proto };
                     let min_window = if proto_ref.param_count >= 2 { 3 } else { 2 };
@@ -703,7 +703,7 @@ impl<'p> Vm<'p> {
                     if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                         if ups.is_empty() {
                             let proto: *const crate::bytecode::FuncProto =
-                                &self.program.functions[fid as usize];
+                                self.func(fid as usize);
                             // SAFETY: immutable program functions; raw ptr dodges
                             // the jit-vs-program borrow conflict (as elsewhere).
                             let proto_ref = unsafe { &*proto };

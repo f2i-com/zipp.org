@@ -217,7 +217,7 @@ impl<'p> Vm<'p> {
         }
         if self.jit.get(fid).is_none() {
             let proto: *const crate::bytecode::FuncProto =
-                &self.program.functions[fid as usize];
+                self.func(fid as usize);
             // SAFETY: program functions are immutable during execution; the raw
             // ptr dodges the self.jit (&mut) vs self.program (&) borrow conflict.
             let proto_ref = unsafe { &*proto };
@@ -229,7 +229,7 @@ impl<'p> Vm<'p> {
             self.jit.compile(fid, proto_ref, jit_self_call_at as usize, self_val);
         }
         let entry = self.jit.get(fid)?.entry();
-        let proto = &self.program.functions[fid as usize];
+        let proto = self.func(fid as usize);
         Some((entry, (proto.reg_count as usize).max(1), proto.param_count as usize))
     }
 

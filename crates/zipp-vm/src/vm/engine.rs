@@ -8,6 +8,19 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
+    /// Resolve a (unified) function id to its FuncProto: a compile-time program
+    /// function for `id < main_func_count`, else a runtime `eval`/`new Function`
+    /// function. Both sources have stable addresses (the leaked eval boxes and
+    /// the borrowed program), so raw pointers taken from the result stay valid.
+    #[inline]
+    pub(crate) fn func(&self, id: usize) -> &crate::bytecode::FuncProto {
+        if id < self.main_func_count {
+            &self.program.functions[id]
+        } else {
+            self.eval_funcs[id - self.main_func_count]
+        }
+    }
+
     pub fn new(program: &'p Program) -> Vm<'p> {
         let mut heap = Heap::new();
         // Pre-load string constants of every function into the heap so
@@ -38,6 +51,8 @@ impl<'p> Vm<'p> {
         let _ = &mut heap;
         Vm {
             program,
+            eval_funcs: Vec::new(),
+            main_func_count: program.functions.len(),
             class_values: vec![None; program.classes.len()],
             heap,
             globals,
@@ -192,7 +207,7 @@ impl<'p> Vm<'p> {
             Some(e) => e,
             None => return crate::codegen::SELF_CALL_DEOPT,
         };
-        let proto = &self.program.functions[func_id as usize];
+        let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let params = proto.param_count as usize;
 
@@ -303,7 +318,7 @@ impl<'p> Vm<'p> {
         args: *const u64,
         argc: usize,
     ) -> u64 {
-        let proto = &self.program.functions[func_id as usize];
+        let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let params = proto.param_count as usize;
 
@@ -433,7 +448,7 @@ impl<'p> Vm<'p> {
         // an anonymous/nested function not hoisted to a global).
         self.hoist_functions();
 
-        let top = &self.program.functions[0];
+        let top = self.func(0);
         let base = 0usize;
         let top_regs = top.reg_count as usize;
         self.regs.resize(top_regs, Value::UNDEFINED);
@@ -542,7 +557,7 @@ impl<'p> Vm<'p> {
         }
         let (func_id, closure) = self.resolve_callable(callee)?;
         let (is_gen, is_async) = {
-            let p = &self.program.functions[func_id as usize];
+            let p = self.func(func_id as usize);
             (p.is_generator, p.is_async)
         };
         // An `async function*` builds a suspended AsyncGenerator (an async
@@ -562,9 +577,13 @@ impl<'p> Vm<'p> {
         if self.frames.len() >= MAX_FRAMES {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
-        let proto = &self.program.functions[func_id as usize];
-        let callee_regs = (proto.reg_count as usize).max(1);
-        let callee_params = proto.param_count as usize;
+        // Copy the scalar layout fields out so the FuncProto borrow (which now
+        // spans the whole `&self` via `func()`) ends before the `self.regs` /
+        // `self.heap` mutations below.
+        let (callee_regs, callee_params, rest_reg, arguments_reg) = {
+            let proto = self.func(func_id as usize);
+            ((proto.reg_count as usize).max(1), proto.param_count as usize, proto.rest_reg, proto.arguments_reg)
+        };
 
         let new_base = self.regs.len();
         // Never grow past the pinned capacity (would realloc and dangle a live
@@ -579,7 +598,7 @@ impl<'p> Vm<'p> {
             self.regs[new_base + 1 + i] = args[i];
         }
         // Rest parameter: gather any args beyond the fixed params into an array.
-        if let Some(rreg) = proto.rest_reg {
+        if let Some(rreg) = rest_reg {
             let extra: Vec<Value> = args.get(callee_params..).unwrap_or(&[]).to_vec();
             let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
             self.regs[new_base + rreg as usize] = arr;
@@ -587,7 +606,7 @@ impl<'p> Vm<'p> {
         // `arguments`: ALL actual args (not just the declared params), so a
         // callback invoked here (e.g. an array-method callback that reads
         // `arguments[2]`) sees every argument — matching the direct Call op.
-        if let Some(areg) = proto.arguments_reg {
+        if let Some(areg) = arguments_reg {
             let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
             self.regs[new_base + areg as usize] = arr;
         }

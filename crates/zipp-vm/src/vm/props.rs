@@ -637,17 +637,17 @@ impl<'p> Vm<'p> {
         };
         match self.heap.get(obj.heap_index()) {
             HeapObj::Func(fid) => {
-                let p = &self.program.functions[*fid as usize];
+                let p = self.func(*fid as usize);
                 Some((clean(&p.name), p.param_count as i32))
             }
             HeapObj::Closure { func, .. } => {
-                let p = &self.program.functions[*func as usize];
+                let p = self.func(*func as usize);
                 Some((clean(&p.name), p.param_count as i32))
             }
             HeapObj::Class(c) => {
                 let len = c
                     .ctor
-                    .map(|f| self.program.functions[f as usize].param_count as i32)
+                    .map(|f| self.func(f as usize).param_count as i32)
                     .unwrap_or(0);
                 Some((clean(&c.name), len))
             }

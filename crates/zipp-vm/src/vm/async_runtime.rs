@@ -12,7 +12,7 @@ impl<'p> Vm<'p> {
     /// Generator whose DETACHED register window holds `this` + the bound args
     /// (incl. a rest array). Resumed later by `generator_method`.
     pub(crate) fn alloc_generator(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
-        let proto = &self.program.functions[func_id as usize];
+        let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
@@ -103,7 +103,7 @@ impl<'p> Vm<'p> {
                     0
                 } else {
                     if let Instr::Yield { dst, .. } =
-                        self.program.functions[fid as usize].code[resume_ip]
+                        self.func(fid as usize).code[resume_ip]
                     {
                         self.regs[new_base + dst as usize] = arg0;
                     }
@@ -324,7 +324,7 @@ impl<'p> Vm<'p> {
     /// to its first `await` (or to completion / a throw). Returns the activation's
     /// result Promise — the value an `async` call evaluates to.
     pub(crate) fn alloc_async(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
-        let proto = &self.program.functions[func_id as usize];
+        let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
@@ -354,7 +354,7 @@ impl<'p> Vm<'p> {
     /// Calling an `async function*` builds a suspended AsyncGenerator (an async
     /// iterator). It does NOT run until the first `.next()`.
     pub(crate) fn alloc_async_generator(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
-        let proto = &self.program.functions[func_id as usize];
+        let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
@@ -431,7 +431,7 @@ impl<'p> Vm<'p> {
                 GenState::Suspended(ip) => {
                     ip == 0
                         || matches!(
-                            self.program.functions[g.func as usize].code.get(ip),
+                            self.func(g.func as usize).code.get(ip),
                             Some(Instr::Yield { .. })
                         )
                 }
@@ -516,7 +516,7 @@ impl<'p> Vm<'p> {
         } else {
             match input {
                 Resume::Value(v) => {
-                    let dst = match self.program.functions[fid as usize].code[resume_ip] {
+                    let dst = match self.func(fid as usize).code[resume_ip] {
                         Instr::Yield { dst, .. } => Some(dst),
                         Instr::Await { dst, .. } => Some(dst),
                         _ => None,
@@ -870,7 +870,7 @@ impl<'p> Vm<'p> {
             match input {
                 Resume::Value(v) => {
                     if let Instr::Await { dst, .. } =
-                        self.program.functions[fid as usize].code[resume_ip]
+                        self.func(fid as usize).code[resume_ip]
                     {
                         self.regs[new_base + dst as usize] = v;
                     }

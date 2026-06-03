@@ -124,7 +124,7 @@ impl<'p> Vm<'p> {
             let base = self.frames[frame_idx].base;
             let mut ip = self.frames[frame_idx].ip;
             let cur_closure = self.frames[frame_idx].closure;
-            let code: *const Vec<Instr> = &self.program.functions[func_id as usize].code;
+            let code: *const Vec<Instr> = &self.func(func_id as usize).code;
             // SAFETY: `code` borrows immutable program data that outlives the
             // loop; we never mutate program functions during execution.
             let code: &Vec<Instr> = unsafe { &*code };
@@ -149,8 +149,8 @@ impl<'p> Vm<'p> {
             if ip == 0
                 && self.jit_enabled
                 && self.jit_recurse_depth == 0
-                && !self.program.functions[func_id as usize].is_generator
-                && !self.program.functions[func_id as usize].is_async
+                && !self.func(func_id as usize).is_generator
+                && !self.func(func_id as usize).is_async
             {
                 if let Some((result, bail)) = self.try_run_jit(func_id, base) {
                     if bail == crate::codegen::NO_BAIL {
@@ -179,7 +179,7 @@ impl<'p> Vm<'p> {
                     ip = bail as usize;
                 } else if self.jit.record_and_should_compile(func_id) {
                     let proto: *const crate::bytecode::FuncProto =
-                        &self.program.functions[func_id as usize];
+                        self.func(func_id as usize);
                     // SAFETY: program functions are immutable during execution.
                     let proto_ref = unsafe { &*proto };
                     // The self-function's current global Value (a heap Func),
@@ -207,7 +207,7 @@ impl<'p> Vm<'p> {
                 let instr = &code[ip];
                 match *instr {
                     Instr::LoadConst { dst, idx } => {
-                        let v = self.program.functions[func_id as usize].constants[idx as usize];
+                        let v = self.func(func_id as usize).constants[idx as usize];
                         // String constants are stored with a sentinel; resolve
                         // to a freshly-interned heap string the first time.
                         let resolved = self.resolve_const(func_id, v);
@@ -904,7 +904,7 @@ impl<'p> Vm<'p> {
                         // `super.name` read: resolve on the superclass's prototype
                         // with `this` = the current receiver (so a getter sees it).
                         let key =
-                            self.program.functions[func_id as usize].string_constants[name as usize].clone();
+                            self.func(func_id as usize).string_constants[name as usize].clone();
                         let parent = self
                             .super_parent(home_class_id)
                             .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
@@ -945,7 +945,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperSet { home_class_id, name, val } => {
                         let key =
-                            self.program.functions[func_id as usize].string_constants[name as usize].clone();
+                            self.func(func_id as usize).string_constants[name as usize].clone();
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
                         self.super_set(home_class_id, &key, this, v)?;
@@ -1419,7 +1419,7 @@ impl<'p> Vm<'p> {
                             }
                             if self.jit.record_region(func_id, t as u32) {
                                 let proto: *const crate::bytecode::FuncProto =
-                                    &self.program.functions[func_id as usize];
+                                    self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
                                 let proto_ref = unsafe { &*proto };
                                 self.jit.compile_region(
@@ -1546,7 +1546,7 @@ impl<'p> Vm<'p> {
                         // index from a local register (the local was boxed via
                         // MakeCell); a ParentUpval source forwards one of this
                         // frame's own captured cells.
-                        let sources = &self.program.functions[func_id as usize].upvalues;
+                        let sources = &self.func(func_id as usize).upvalues;
                         let mut cells = Vec::with_capacity(sources.len());
                         for src in sources {
                             let cell = match *src {
@@ -1682,7 +1682,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::GetProp { dst, obj, name } => {
                         let o = self.get(base, obj);
-                        let key = self.program.functions[func_id as usize]
+                        let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
                         let r = self.get_prop(o, &key)?;
@@ -1692,7 +1692,7 @@ impl<'p> Vm<'p> {
                     Instr::SetProp { obj, name, val } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key = self.program.functions[func_id as usize]
+                        let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
                         self.set_prop(o, &key, v)?;
@@ -1700,7 +1700,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::DeleteProp { dst, obj, name } => {
                         let o = self.get(base, obj);
-                        let key = self.program.functions[func_id as usize]
+                        let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
                         let r = self.delete_property(o, &key)?;
@@ -1780,8 +1780,8 @@ impl<'p> Vm<'p> {
                         let (fid, closure) = self.resolve_callable(callee_v)?;
                         // An `async function*` returns an AsyncGenerator (checked
                         // before the plain-generator/async cases since it is both).
-                        if self.program.functions[fid as usize].is_generator
-                            && self.program.functions[fid as usize].is_async
+                        if self.func(fid as usize).is_generator
+                            && self.func(fid as usize).is_async
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -1791,7 +1791,7 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         // A generator function returns a Generator object, unrun.
-                        if self.program.functions[fid as usize].is_generator {
+                        if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                             let g = self.alloc_generator(fid, closure, Value::UNDEFINED, &argv);
@@ -1801,7 +1801,7 @@ impl<'p> Vm<'p> {
                         }
                         // An async function runs to its first `await` then returns
                         // its result Promise.
-                        if self.program.functions[fid as usize].is_async {
+                        if self.func(fid as usize).is_async {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                             let p = self.alloc_async(fid, closure, Value::UNDEFINED, &argv);
@@ -1903,8 +1903,8 @@ impl<'p> Vm<'p> {
                         }
                         let (fid, closure) = self.resolve_callable(prop)?;
                         // An `async function*` method returns an AsyncGenerator.
-                        if self.program.functions[fid as usize].is_generator
-                            && self.program.functions[fid as usize].is_async
+                        if self.func(fid as usize).is_generator
+                            && self.func(fid as usize).is_async
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -1914,7 +1914,7 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         // A generator method returns a Generator object, unrun.
-                        if self.program.functions[fid as usize].is_generator {
+                        if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                             let g = self.alloc_generator(fid, closure, recv, &argv);
@@ -1924,7 +1924,7 @@ impl<'p> Vm<'p> {
                         }
                         // An async method runs to its first `await` then returns
                         // its result Promise.
-                        if self.program.functions[fid as usize].is_async {
+                        if self.func(fid as usize).is_async {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                             let p = self.alloc_async(fid, closure, recv, &argv);
@@ -1966,8 +1966,8 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let (fid, closure) = self.resolve_callable(method)?;
-                        if self.program.functions[fid as usize].is_generator
-                            && self.program.functions[fid as usize].is_async
+                        if self.func(fid as usize).is_generator
+                            && self.func(fid as usize).is_async
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
@@ -1976,7 +1976,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        if self.program.functions[fid as usize].is_generator {
+                        if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                             let g = self.alloc_generator(fid, closure, recv, &argv);
@@ -1984,7 +1984,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        if self.program.functions[fid as usize].is_async {
+                        if self.func(fid as usize).is_async {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
                             let p = self.alloc_async(fid, closure, recv, &argv);
@@ -2339,7 +2339,7 @@ impl<'p> Vm<'p> {
         if let Some(ref p) = field_plan {
             let obj = self.globals[p.obj_global as usize];
             for &(name_idx, slot) in &p.fields {
-                let key = self.program.functions[p.func_id as usize].string_constants
+                let key = self.func(p.func_id as usize).string_constants
                     [name_idx as usize]
                     .clone();
                 let v = self.get_prop(obj, &key).unwrap_or(Value::UNDEFINED);
@@ -2359,7 +2359,7 @@ impl<'p> Vm<'p> {
         if let Some(ref p) = field_plan {
             let obj = self.globals[p.obj_global as usize];
             for &(name_idx, slot) in &p.fields {
-                let key = self.program.functions[p.func_id as usize].string_constants
+                let key = self.func(p.func_id as usize).string_constants
                     [name_idx as usize]
                     .clone();
                 let v = self.globals[slot as usize];
@@ -2478,7 +2478,7 @@ impl<'p> Vm<'p> {
         if self.frames.len() >= MAX_FRAMES {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
-        let proto = &self.program.functions[func_id as usize];
+        let proto = self.func(func_id as usize);
         let callee_regs = (proto.reg_count as usize).max(1);
         let callee_params = proto.param_count as usize;
 
@@ -2498,7 +2498,7 @@ impl<'p> Vm<'p> {
             self.regs[new_base + 1 + i] = v;
         }
         // Rest parameter: collect args beyond the fixed params into a fresh array.
-        if let Some(rreg) = self.program.functions[func_id as usize].rest_reg {
+        if let Some(rreg) = self.func(func_id as usize).rest_reg {
             let extra: Vec<Value> = ((arg_base as usize + callee_params)
                 ..(arg_base as usize + argc as usize))
                 .map(|i| self.regs[caller_base + i])
@@ -2507,7 +2507,7 @@ impl<'p> Vm<'p> {
             self.regs[new_base + rreg as usize] = arr;
         }
         // `arguments`: an array of ALL actual args (a function that references it).
-        if let Some(areg) = self.program.functions[func_id as usize].arguments_reg {
+        if let Some(areg) = self.func(func_id as usize).arguments_reg {
             let argsv: Vec<Value> = (0..argc as usize)
                 .map(|i| self.regs[caller_base + arg_base as usize + i])
                 .collect();

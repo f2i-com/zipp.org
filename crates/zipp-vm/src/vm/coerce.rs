@@ -862,7 +862,7 @@ impl<'p> Vm<'p> {
     /// names start with `<`). Class methods are stored as `Class.method`; show
     /// just the method part, as node does.
     pub(crate) fn func_label(&self, fid: u32) -> String {
-        let name = &self.program.functions[fid as usize].name;
+        let name = &self.func(fid as usize).name;
         if name.is_empty() || name.starts_with('<') {
             "[Function (anonymous)]".into()
         } else {
@@ -1054,7 +1054,7 @@ impl<'p> Vm<'p> {
         // String constants are encoded as `Value::heap(STRING_CONST_BIT | i)`.
         if v.is_heap() && (v.heap_index() & STRING_CONST_BIT) != 0 {
             let si = (v.heap_index() & !STRING_CONST_BIT) as usize;
-            let s = self.program.functions[func_id as usize].string_constants[si].clone();
+            let s = self.func(func_id as usize).string_constants[si].clone();
             return self.alloc_str(s);
         }
         v

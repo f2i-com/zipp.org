@@ -16,8 +16,8 @@ impl<'p> Vm<'p> {
             return String::new();
         }
         let raw: String = match self.heap.get(v.heap_index()) {
-            HeapObj::Func(id) => self.program.functions[*id as usize].name.clone(),
-            HeapObj::Closure { func, .. } => self.program.functions[*func as usize].name.clone(),
+            HeapObj::Func(id) => self.func(*id as usize).name.clone(),
+            HeapObj::Closure { func, .. } => self.func(*func as usize).name.clone(),
             HeapObj::Class(c) => c.name.clone(),
             HeapObj::Native(nid) => native::static_name_length(*nid)
                 .map(|(n, _)| n.to_string())
@@ -596,11 +596,11 @@ impl<'p> Vm<'p> {
                 // (natives, bound, classes) renders in the `[native code]` form.
                 let stored: Option<String> = match self.heap.get(this.heap_index()) {
                     HeapObj::Func(id) => {
-                        let s = &self.program.functions[*id as usize].source;
+                        let s = &self.func(*id as usize).source;
                         (!s.is_empty()).then(|| s.clone())
                     }
                     HeapObj::Closure { func, .. } => {
-                        let s = &self.program.functions[*func as usize].source;
+                        let s = &self.func(*func as usize).source;
                         (!s.is_empty()).then(|| s.clone())
                     }
                     // A class value renders as its whole `class … { … }` source.
