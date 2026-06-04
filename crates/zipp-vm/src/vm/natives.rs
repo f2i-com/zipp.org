@@ -1011,27 +1011,97 @@ impl<'p> Vm<'p> {
                 // ToPropertyKey once (an object key may have a side-effecting
                 // toString); reuse the coerced key Value for set_index so it isn't
                 // coerced a second time.
+                let receiver = args.get(3).copied().unwrap_or(a0);
                 let kv = self.coerce_index_key(a1)?;
                 let key = self.key_of(kv);
-                // success = not blocked by a non-writable own data property, an
-                // accessor without a setter, or a new key on a non-extensible object.
-                let ok = match self.heap.get(a0.heap_index()) {
-                    HeapObj::Object(m) => match m.pos(&key) {
-                        Some(i) => {
-                            if m.attrs[i].accessor {
-                                m.attrs[i].setter != Value::UNDEFINED
-                            } else {
-                                m.attrs[i].writable
+                // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
+                // (target's own, then up the prototype chain). Only ordinary Object
+                // links carry inline descriptors here; a class-instance/exotic link
+                // falls back to the simpler target-write below.
+                let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
+                let mut fell_back = false;
+                let mut cur = a0;
+                loop {
+                    match self.heap.get(cur.heap_index()) {
+                        HeapObj::Object(m) => {
+                            if let Some(i) = m.pos(&key) {
+                                governing =
+                                    Some((m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter));
+                                break;
+                            }
+                            if m.class.is_some() {
+                                fell_back = true; // class-chain members aren't inline attrs
+                                break;
                             }
                         }
-                        None => m.extensible,
-                    },
-                    _ => true,
-                };
-                if ok {
-                    self.set_index(a0, kv, value)?;
+                        _ => {
+                            fell_back = true;
+                            break;
+                        }
+                    }
+                    let p = self.object_get_prototype_of(cur);
+                    if !p.is_heap() {
+                        break;
+                    }
+                    cur = p;
                 }
-                Value::bool(ok)
+                let result = if fell_back {
+                    let ok = match self.heap.get(a0.heap_index()) {
+                        HeapObj::Object(m) => match m.pos(&key) {
+                            Some(i) => {
+                                if m.attrs[i].accessor {
+                                    m.attrs[i].setter != Value::UNDEFINED
+                                } else {
+                                    m.attrs[i].writable
+                                }
+                            }
+                            None => m.extensible,
+                        },
+                        _ => true,
+                    };
+                    if ok {
+                        self.set_index(a0, kv, value)?;
+                    }
+                    ok
+                } else {
+                    match governing {
+                        // Accessor: invoke its setter with the RECEIVER as `this`.
+                        Some((true, _, setter)) => {
+                            if setter == Value::UNDEFINED {
+                                false
+                            } else {
+                                self.call_value(setter, receiver, &[value])?;
+                                true
+                            }
+                        }
+                        // Non-writable data property: rejected.
+                        Some((false, false, _)) => false,
+                        // Writable data property, or a new property: write to the
+                        // RECEIVER (CreateDataProperty / overwrite its data prop),
+                        // rejecting a non-object receiver or a conflicting own prop.
+                        _ => {
+                            if !self.is_object_value(receiver) {
+                                false
+                            } else {
+                                let rown = match self.heap.get(receiver.heap_index()) {
+                                    HeapObj::Object(m) => {
+                                        m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
+                                    }
+                                    _ => None,
+                                };
+                                match rown {
+                                    Some((true, _)) => false,      // accessor own prop on receiver
+                                    Some((false, false)) => false, // non-writable data on receiver
+                                    _ => {
+                                        self.set_index(receiver, kv, value)?;
+                                        true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                Value::bool(result)
             }
             REFLECT_HAS => {
                 if !self.is_object_value(a0) {
