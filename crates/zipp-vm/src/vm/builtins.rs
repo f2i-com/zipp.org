@@ -527,6 +527,11 @@ impl<'p> Vm<'p> {
             }
             "sort" => {
                 let cmp = a0;
+                if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
+                    return Err(Thrown(
+                        "TypeError: the comparator argument must be a function or undefined".into(),
+                    ));
+                }
                 let mut snap = self.ta_snapshot(idx);
                 if self.is_callable(cmp) {
                     // Comparator sort (stable insertion to allow VM re-entry).
@@ -567,8 +572,36 @@ impl<'p> Vm<'p> {
                 Ok(Some(recv))
             }
             "set" => {
-                let offset = if a1 == Value::UNDEFINED { 0 } else { self.value_num(a1) as usize };
+                // offset = ToIntegerOrInfinity (throws on a Symbol / abrupt valueOf);
+                // a negative offset is a RangeError (not a wrapping `as usize`).
+                let offset = if a1 == Value::UNDEFINED {
+                    0
+                } else {
+                    let n = self.to_integer_or_zero(a1)?;
+                    if n < 0 {
+                        return Err(Thrown("RangeError: offset is out of bounds".into()));
+                    }
+                    n as usize
+                };
+                // A BigInt typed array only mixes with a BigInt source (checked up
+                // front when the source is itself a TypedArray).
+                let target_big = native::TA_KINDS[kind as usize].2;
+                if a0.is_heap() {
+                    if let HeapObj::TypedArray { kind: sk, .. } = self.heap.get(a0.heap_index()) {
+                        if native::TA_KINDS[*sk as usize].2 != target_big {
+                            return Err(Thrown(
+                                "TypeError: cannot mix BigInt and other types when setting a TypedArray"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
                 let src = self.iterate_or_arraylike(a0)?;
+                if offset + src.len() > len {
+                    return Err(Thrown(
+                        "RangeError: source array is too long for the target offset".into(),
+                    ));
+                }
                 for (k, v) in src.into_iter().enumerate() {
                     self.ta_element_set(idx, offset + k, v)?;
                 }
