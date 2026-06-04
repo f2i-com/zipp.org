@@ -427,7 +427,11 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::Native(_) => {
                     if has_length {
                         keys.push("length".to_string());
                     }
@@ -545,9 +549,11 @@ impl<'p> Vm<'p> {
         // kind: 0=plain/instance object, 1=callable, 2=array, 3=other.
         let (class, is_ctor, kind) = match self.heap.get(idx) {
             HeapObj::Object(m) => (m.class, m.is_ctor, 0u8),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
-                (None, false, 1)
-            }
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::Native(_) => (None, false, 1),
             HeapObj::Array(_) => (None, false, 2),
             _ => (None, false, 3),
         };
@@ -983,6 +989,9 @@ impl<'p> Vm<'p> {
                 let p = self.func(*func as usize);
                 Some((clean(&p.name), p.param_count as i32))
             }
+            // The resolve/reject functions of `new Promise(executor)`: anonymous
+            // (name ""), length 1, with %Function.prototype% as [[Prototype]].
+            HeapObj::BoundResolver { .. } => Some((String::new(), 1)),
             HeapObj::Class(c) => {
                 let len = c
                     .ctor
