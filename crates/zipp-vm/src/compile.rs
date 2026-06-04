@@ -2004,8 +2004,10 @@ impl<'a> FnCompiler<'a> {
         let mut method_defs: Vec<(String, u32)> = Vec::new();
         for (mname, func) in &methods {
             let (params, rest, body) = function_parts(func)?;
+            // A method's `.name` is the bare property key (`"m"` / `"#m"`), NOT
+            // class-qualified — `toString` uses `proto.source`, set below.
             let mut proto = self.cx.compile_class_fn(
-                &format!("{cname}.{mname}"),
+                mname,
                 &params,
                 rest.as_deref(),
                 Some(&*func.params),
@@ -2028,7 +2030,7 @@ impl<'a> FnCompiler<'a> {
         for (gname, func) in &getters {
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("{cname}.get {gname}"),
+                &format!("get {gname}"),
                 &params,
                 rest.as_deref(),
                 Some(&*func.params),
@@ -2051,7 +2053,7 @@ impl<'a> FnCompiler<'a> {
         for (sname, func) in &setters {
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("{cname}.set {sname}"),
+                &format!("set {sname}"),
                 &params,
                 rest.as_deref(),
                 Some(&*func.params),
@@ -2074,7 +2076,7 @@ impl<'a> FnCompiler<'a> {
         for (sname, func) in &statics {
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("{cname}.{sname}"),
+                sname,
                 &params,
                 rest.as_deref(),
                 Some(&*func.params),
@@ -2097,7 +2099,7 @@ impl<'a> FnCompiler<'a> {
         for (gname, func) in &static_getters {
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("{cname}.static get {gname}"),
+                &format!("get {gname}"),
                 &params,
                 rest.as_deref(),
                 Some(&*func.params),
@@ -2119,7 +2121,7 @@ impl<'a> FnCompiler<'a> {
         for (sname, func) in &static_setters {
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
-                &format!("{cname}.static set {sname}"),
+                &format!("set {sname}"),
                 &params,
                 rest.as_deref(),
                 Some(&*func.params),
