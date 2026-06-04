@@ -1429,12 +1429,22 @@ impl<'p> Vm<'p> {
                                 self.reject(p, a0);
                                 Value::heap(p)
                             }
-                            S::PromiseAll => self.promise_combine(crate::heap::CombKind::All, a0)?,
-                            S::PromiseAllSettled => {
-                                self.promise_combine(crate::heap::CombKind::AllSettled, a0)?
+                            S::PromiseAll => {
+                                let c = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                self.promise_combine(crate::heap::CombKind::All, a0, c)?
                             }
-                            S::PromiseRace => self.promise_combine(crate::heap::CombKind::Race, a0)?,
-                            S::PromiseAny => self.promise_combine(crate::heap::CombKind::Any, a0)?,
+                            S::PromiseAllSettled => {
+                                let c = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                self.promise_combine(crate::heap::CombKind::AllSettled, a0, c)?
+                            }
+                            S::PromiseRace => {
+                                let c = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                self.promise_combine(crate::heap::CombKind::Race, a0, c)?
+                            }
+                            S::PromiseAny => {
+                                let c = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                self.promise_combine(crate::heap::CombKind::Any, a0, c)?
+                            }
                             S::ObjectDefineProperty => {
                                 self.require_object_coercible(a0)?; // Type(O) must be Object
                                 let key =

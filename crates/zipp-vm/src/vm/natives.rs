@@ -1723,10 +1723,12 @@ impl<'p> Vm<'p> {
                         self.reject(p, a);
                         Value::heap(p)
                     }
-                    PROMISE_ALL => self.promise_combine(crate::heap::CombKind::All, a)?,
-                    PROMISE_ALLSETTLED => self.promise_combine(crate::heap::CombKind::AllSettled, a)?,
-                    PROMISE_RACE => self.promise_combine(crate::heap::CombKind::Race, a)?,
-                    _ => self.promise_combine(crate::heap::CombKind::Any, a)?, // PROMISE_ANY
+                    PROMISE_ALL => self.promise_combine(crate::heap::CombKind::All, a, this)?,
+                    PROMISE_ALLSETTLED => {
+                        self.promise_combine(crate::heap::CombKind::AllSettled, a, this)?
+                    }
+                    PROMISE_RACE => self.promise_combine(crate::heap::CombKind::Race, a, this)?,
+                    _ => self.promise_combine(crate::heap::CombKind::Any, a, this)?, // PROMISE_ANY
                 }
             }
             // `%TypedArray%.prototype.<m>` invoked as a value (`.map.call(ta, …)`).

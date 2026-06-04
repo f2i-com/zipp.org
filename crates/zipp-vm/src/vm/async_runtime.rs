@@ -782,22 +782,55 @@ impl<'p> Vm<'p> {
     /// `Promise.all/allSettled/race/any(iterable)`. Coerces each input to a
     /// promise and subscribes a native combinator reaction; the shared
     /// `Combinator` state settles the returned promise per the combinator's rule.
-    pub(crate) fn promise_combine(&mut self, kind: crate::heap::CombKind, iterable: Value) -> Result<Value, Thrown> {
+    pub(crate) fn promise_combine(
+        &mut self,
+        kind: crate::heap::CombKind,
+        iterable: Value,
+        ctor: Value,
+    ) -> Result<Value, Thrown> {
         use crate::heap::CombKind;
-        // GetIterator / iteration abrupt completion → a REJECTED promise, not a
-        // synchronous throw (IfAbruptRejectPromise): `Promise.all(1)` rejects with
-        // a TypeError rather than throwing out of the call.
+        let result = self.alloc_promise();
+        // GetPromiseResolve(C): `promiseResolve = Get(C, "resolve")`, which must be
+        // callable. This is the spec-observable step the tests check (overriding
+        // `Promise.resolve` is visible, and a non-callable resolve rejects). When C
+        // isn't a usable object we fall back to internal coercion. An abrupt Get or
+        // a non-callable resolve rejects the result (IfAbruptRejectPromise).
+        let promise_resolve = if self.is_object_value(ctor) {
+            match self.get_prop(ctor, "resolve") {
+                Ok(r) => Some(r),
+                Err(Thrown(msg)) => {
+                    let err = match self.pending_throw.take() {
+                        Some(v) => v,
+                        None => self.alloc_error_from_message(&msg),
+                    };
+                    self.reject(result, err);
+                    return Ok(Value::heap(result));
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(pr) = promise_resolve {
+            if !self.is_callable(pr) {
+                let err = self.alloc_error_from_message("TypeError: Promise.resolve is not a function");
+                self.reject(result, err);
+                return Ok(Value::heap(result));
+            }
+        }
+        // GetIterator / iteration abrupt completion → reject (IfAbruptRejectPromise):
+        // `Promise.all(1)` rejects with a TypeError rather than throwing.
         let inputs = match self.iterate_to_vec(iterable) {
             Ok(v) => v,
             Err(Thrown(msg)) => {
-                let result = self.alloc_promise();
-                let err = self.alloc_error_from_message(&msg);
+                let err = match self.pending_throw.take() {
+                    Some(v) => v,
+                    None => self.alloc_error_from_message(&msg),
+                };
                 self.reject(result, err);
                 return Ok(Value::heap(result));
             }
         };
         let total = inputs.len() as u32;
-        let result = self.alloc_promise();
         if total == 0 {
             // Empty-iterable terminal cases (race stays pending forever).
             match kind {
@@ -820,7 +853,25 @@ impl<'p> Vm<'p> {
             result,
         });
         for (i, inp) in inputs.into_iter().enumerate() {
-            let p = self.to_promise(inp);
+            // nextPromise = Call(promiseResolve, C, «nextValue») — OBSERVABLE (a
+            // custom/overridden `resolve` is invoked once per value). A throw here
+            // rejects the result (already-subscribed elements are absorbed by the
+            // one-shot settle).
+            let next = match promise_resolve {
+                Some(pr) => match self.call_value(pr, ctor, &[inp]) {
+                    Ok(v) => v,
+                    Err(Thrown(msg)) => {
+                        let err = match self.pending_throw.take() {
+                            Some(v) => v,
+                            None => self.alloc_error_from_message(&msg),
+                        };
+                        self.reject(result, err);
+                        return Ok(Value::heap(result));
+                    }
+                },
+                None => inp,
+            };
+            let p = self.to_promise(next);
             let resolver = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
                 combinator: comb,
                 index: i as u32,
