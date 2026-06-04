@@ -362,6 +362,14 @@ impl<'p> Vm<'p> {
             return parse_bigint_str(t)
                 .ok_or_else(|| Thrown(format!("SyntaxError: Cannot convert {t} to a BigInt")));
         }
+        // ToBigInt step 1: an object is first taken through ToPrimitive(number)
+        // (honouring Symbol.toPrimitive / valueOf / toString), then re-dispatched.
+        // to_primitive_number always yields a primitive or throws, so this recurses
+        // at most once into a non-object branch above.
+        if self.is_object_value(v) {
+            let prim = self.to_primitive_number(v)?;
+            return self.to_bigint(prim);
+        }
         Err(Thrown("TypeError: Cannot convert this value to a BigInt".into()))
     }
 
