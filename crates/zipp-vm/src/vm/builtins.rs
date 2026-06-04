@@ -391,7 +391,14 @@ impl<'p> Vm<'p> {
             }
             "join" => {
                 let sep = if a0 == Value::UNDEFINED { ",".to_string() } else { self.to_js_string(a0)? };
-                let parts: Vec<String> = (0..len).map(|i| self.ta_elem_string(idx, i)).collect();
+                // The element COUNT is fixed at entry; a detach (or resizable shrink)
+                // during separator ToString makes each now-out-of-range element read
+                // as "" (Get → undefined → ""), so e.g. a detached length-3 array
+                // joins to ",,".
+                let eff = self.ta_effective_len(idx).unwrap_or(0);
+                let parts: Vec<String> = (0..len)
+                    .map(|i| if i < eff { self.ta_elem_string(idx, i) } else { String::new() })
+                    .collect();
                 Ok(Some(self.alloc_str(parts.join(&sep))))
             }
             "toString" => {
@@ -419,17 +426,30 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(parts.join(","))))
             }
             "indexOf" | "lastIndexOf" | "includes" => {
-                let snap = self.ta_snapshot(idx);
-                let len = snap.len() as i64;
-                // fromIndex (ToInteger). lastIndexOf defaults to len-1 and counts
-                // negatives from the end; indexOf/includes clamp to [0, len].
+                // Length is fixed at method entry (ValidateTypedArray already ran).
+                // An empty array returns the not-found result BEFORE coercing
+                // fromIndex, so a fromIndex valueOf never runs on an empty array.
+                let entry_len = self.ta_effective_len(idx).unwrap_or(0) as i64;
+                if entry_len == 0 {
+                    return Ok(Some(if name == "includes" {
+                        Value::bool(false)
+                    } else {
+                        Value::num(-1.0)
+                    }));
+                }
+                // fromIndex (ToInteger) may run a valueOf that detaches the buffer.
+                // lastIndexOf defaults to len-1; indexOf/includes default to 0.
                 let from = if args.len() >= 2 {
                     self.to_integer_or_zero(a1)?
                 } else if name == "lastIndexOf" {
-                    len - 1
+                    entry_len - 1
                 } else {
                     0
                 };
+                // Snapshot AFTER coercion: a detach during fromIndex coercion leaves
+                // an empty snapshot, so the search correctly reports not-found.
+                let snap = self.ta_snapshot(idx);
+                let len = snap.len() as i64;
                 let mut found: i64 = -1;
                 if name == "lastIndexOf" {
                     let hi = if from < 0 { len + from } else { from.min(len - 1) };
@@ -558,10 +578,22 @@ impl<'p> Vm<'p> {
                 Ok(Some(acc))
             }
             "fill" => {
+                // ToBigInt/ToNumber(value) runs ONCE and FIRST — its valueOf before
+                // the start/end ToInteger coercions, per spec (so the value is
+                // coerced a single time and in the right order). The coerced Value
+                // is built after the index coercions so it needs no GC rooting.
+                let is_big = native::TA_KINDS[kind as usize].2;
+                let big = if is_big { self.to_bigint(a0)? } else { 0 };
+                let num = if is_big { 0.0 } else { self.to_number_coerce(a0)? };
                 let start = self.ta_rel_index(a1, 0, len)?;
                 let end = self.ta_rel_index(args.get(2).copied().unwrap_or(Value::UNDEFINED), len, len)?;
+                let v = if is_big {
+                    Value::heap(self.heap.alloc(HeapObj::BigInt(big)))
+                } else {
+                    Value::num(num)
+                };
                 for i in start..end {
-                    self.ta_element_set(idx, i, a0)?;
+                    self.ta_element_set(idx, i, v)?;
                 }
                 Ok(Some(recv))
             }
