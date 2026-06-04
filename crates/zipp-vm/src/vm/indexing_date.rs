@@ -280,16 +280,17 @@ impl<'p> Vm<'p> {
                 }
                 Ok(())
             }
-            HeapObj::Object(_) => {
-                // Route through set_prop so bracket assignment honours property
-                // attributes (writable / accessors / extensibility) exactly like
-                // dot assignment — propertyHelper.js's writability probe uses
-                // `obj[key] = v`, so a raw map.set silently reported every
-                // non-writable property as writable.
+            // Plain objects AND every other heap receiver (Date / boxed primitive /
+            // Map / Set / Promise / Weak* / RegExp / …) route through set_prop so a
+            // computed write `obj[k] = v` is stored (in the object map or the
+            // arr_props side table) and read back symmetrically by get_index — and
+            // honours property attributes / accessors / extensibility. (Previously a
+            // numeric-index write on these exotic receivers was silently dropped, so
+            // `Array.prototype.<m>.call(dateLike, …)` saw zero elements.)
+            _ => {
                 let k = self.key_of(key);
                 self.set_prop(obj, &k, val)
             }
-            _ => Ok(()),
         }
     }
 

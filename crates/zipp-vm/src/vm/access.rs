@@ -372,6 +372,14 @@ impl<'p> Vm<'p> {
             // (`re.lastIndex = …` was handled above; a `re.exec = fn` override or
             // any `re.x = …` lands in the side table. RegExp accessor keys
             // source/flags/… are read back via regexp_get_prop, not from here.)
+            // A non-extensible exotic object rejects a NEW own property (sloppy
+            // no-op), mirroring the plain-object arm below — its extensibility lives
+            // in the arr_props side table's flag (set by Object.preventExtensions).
+            if let Some(m) = self.arr_props.get(&idx) {
+                if m.pos(key).is_none() && !m.extensible {
+                    return Ok(());
+                }
+            }
             let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             if added {
                 self.heap.bump_version(idx);
