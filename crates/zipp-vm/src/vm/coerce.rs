@@ -832,6 +832,35 @@ impl<'p> Vm<'p> {
         Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
     }
 
+    /// OrdinaryToPrimitive(O, methodNames) (ES 7.1.1.1): try each method name in
+    /// `order` — `["valueOf","toString"]` for hint "number", `["toString","valueOf"]`
+    /// for hint "string" — and return the first primitive result; TypeError if none.
+    /// Used by `Date.prototype[Symbol.toPrimitive]`.
+    pub(crate) fn ordinary_to_primitive(
+        &mut self,
+        v: Value,
+        order: [&str; 2],
+    ) -> Result<Value, Thrown> {
+        for name in order {
+            let f = self.get_prop(v, name)?;
+            if self.is_callable(f) {
+                let r = self.call_value(f, v, &[])?;
+                let is_primitive = !r.is_heap()
+                    || matches!(
+                        self.heap.get(r.heap_index()),
+                        HeapObj::Str(_)
+                            | HeapObj::Cons { .. }
+                            | HeapObj::BigInt(_)
+                            | HeapObj::Symbol { .. }
+                    );
+                if is_primitive {
+                    return Ok(r);
+                }
+            }
+        }
+        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+    }
+
     /// String COERCION (`String(v)`, `'' + v`, property keys). Arrays join with
     /// commas; objects become `[object Object]` — JS `toString` semantics.
     pub(crate) fn display(&self, v: Value) -> String {

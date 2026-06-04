@@ -183,6 +183,35 @@ impl<'p> Vm<'p> {
                     ));
                 }
             }
+            DATE_TO_PRIMITIVE => {
+                // `Date.prototype[Symbol.toPrimitive](hint)`: O must be an Object.
+                // hint "string"/"default" → OrdinaryToPrimitive(O, "string"),
+                // hint "number" → OrdinaryToPrimitive(O, "number"); any other hint
+                // (including a non-string value) is a TypeError. The hint is matched
+                // by exact string value (no coercion), per spec.
+                if !self.is_object_value(this) {
+                    return Err(Thrown(
+                        "TypeError: Date.prototype[Symbol.toPrimitive] called on a non-object".into(),
+                    ));
+                }
+                let hint = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let hint_s = if hint.is_heap() && self.heap.is_str_like(hint.heap_index()) {
+                    self.to_js_string(hint)?
+                } else {
+                    String::new()
+                };
+                let order: [&str; 2] = match hint_s.as_str() {
+                    "string" | "default" => ["toString", "valueOf"],
+                    "number" => ["valueOf", "toString"],
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: Date.prototype[Symbol.toPrimitive] called with an invalid hint"
+                                .into(),
+                        ))
+                    }
+                };
+                self.ordinary_to_primitive(this, order)?
+            }
             SYMBOL_DESCRIPTION_GET => {
                 // `get Symbol.prototype.description` → the symbol's description.
                 match this.is_heap().then(|| self.heap.get(this.heap_index())) {

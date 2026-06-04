@@ -373,6 +373,9 @@ pub const ZDT_GET_TZ_TRANSITION: u16 = 547;
 /// Temporal.PlainDateTime.prototype.withPlainTime (standalone id — the PDT_M_BASE
 /// block is full). Keeps the date, replaces the time (default midnight).
 pub const PDT_WITH_PLAIN_TIME: u16 = 548;
+/// `Date.prototype[Symbol.toPrimitive]` — OrdinaryToPrimitive with hint "string"
+/// for "string"/"default" and "number" for "number"; any other hint is a TypeError.
+pub const DATE_TO_PRIMITIVE: u16 = 549;
 /// Intl namespace + per-service method native ids.
 pub const INTL_GET_CANONICAL_LOCALES: u16 = 560;
 pub const INTL_SUPPORTED_VALUES_OF: u16 = 561;
@@ -702,6 +705,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         TEMPORAL_TO_LOCALE_STRING => ("toLocaleString", 0),
         ZDT_GET_TZ_TRANSITION => ("getTimeZoneTransition", 1),
         PDT_WITH_PLAIN_TIME => ("withPlainTime", 0),
+        DATE_TO_PRIMITIVE => ("[Symbol.toPrimitive]", 1),
         OBJ_DEFINE_PROPERTY => ("defineProperty", 3),
         OBJ_DEFINE_PROPERTIES => ("defineProperties", 2),
         OBJ_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),

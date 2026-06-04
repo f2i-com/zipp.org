@@ -263,6 +263,20 @@ impl<'p> Vm<'p> {
         self.set_proto = set_proto;
         self.map_proto = map_proto;
         self.date_proto = date_proto;
+        // Date.prototype[Symbol.toPrimitive]: { writable:false, enumerable:false,
+        // configurable:true } per spec (the only @@toPrimitive on a built-in proto
+        // besides Symbol's). Standalone native — date_methods only holds named ones.
+        let date_to_prim = Value::heap(self.heap.alloc(HeapObj::Native(DATE_TO_PRIMITIVE)));
+        let sym_fn_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        if let HeapObj::Object(p) = self.heap.get_mut(date_proto) {
+            p.define("@@toPrimitive", date_to_prim, sym_fn_attr);
+        }
         self.promise_proto = promise_proto;
         self.num_proto = num_proto;
         self.bool_proto = bool_proto;

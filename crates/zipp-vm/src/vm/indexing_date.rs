@@ -423,7 +423,12 @@ impl<'p> Vm<'p> {
             _ => f64::NAN,
         };
         let mut comp = [p.0, p.1, p.2, p.3, p.4, p.5, p.6];
-        let mut any_nan = false;
+        // Every component setter (setFullYear, setMonth, … setMilliseconds) has at
+        // least one REQUIRED argument — the field at `start`. Calling it with no
+        // args reads ToNumber(undefined) = NaN for that field, so the result is
+        // NaN (Invalid Date). (Trailing optional args still default to the current
+        // component value, handled by `comp` starting from the present parts.)
+        let mut any_nan = args.is_empty();
         // Coerce ALL args (ToNumber, invoking valueOf in order) before deciding.
         for (i, &v) in args.iter().enumerate() {
             if start + i >= 7 {
