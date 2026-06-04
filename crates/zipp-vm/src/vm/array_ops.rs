@@ -466,6 +466,18 @@ impl<'p> Vm<'p> {
                     | "concat" | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
                     | "toSpliced" | "entries" | "keys" | "values" | "toLocaleString"
             ) {
+                // with/toReversed/toSorted/toSpliced build a result of the source
+                // length via ArrayCreate(len), which throws RangeError for
+                // len > 2^32-1 — BEFORE reading any element (a throwing index getter
+                // must not run first).
+                if matches!(name, "with" | "toReversed" | "toSorted" | "toSpliced") {
+                    let lv = self.get_prop(Value::heap(idx), "length")?;
+                    let n = self.to_number_coerce(lv)?;
+                    let len = if n.is_finite() && n > 0.0 { n.floor() } else { 0.0 };
+                    if len > 4_294_967_295.0 {
+                        return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                }
                 let elems = self.array_like_read(idx);
                 let tmp = self.heap.alloc(HeapObj::Array(elems));
                 return self.array_method(tmp, name, args);
