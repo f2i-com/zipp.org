@@ -2293,10 +2293,19 @@ impl<'p> Vm<'p> {
                     };
                     self.string_method(s_idx, m, args)?.unwrap_or(Value::UNDEFINED)
                 } else if !this.is_heap() {
-                    return Err(Thrown(format!(
-                        "TypeError: prototype method {m} called on {}",
-                        self.display(this)
-                    )));
+                    // Array.prototype methods are generic: a primitive `this` is
+                    // ToObject-coerced (a Number/Boolean wrapper has length 0, so
+                    // the method runs trivially). null/undefined still throw, as do
+                    // primitive receivers for the non-generic kinds.
+                    if kind == 0 && this != Value::NULL && this != Value::UNDEFINED {
+                        let boxed = self.to_object(this)?;
+                        self.array_method(boxed.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                    } else {
+                        return Err(Thrown(format!(
+                            "TypeError: prototype method {m} called on {}",
+                            self.display(this)
+                        )));
+                    }
                 } else {
                     let r = match kind {
                         0 => self.array_method(this.heap_index(), m, args)?,
