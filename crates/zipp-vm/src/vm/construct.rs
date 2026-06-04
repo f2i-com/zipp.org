@@ -1107,8 +1107,14 @@ impl<'p> Vm<'p> {
                 // by invoking it (so for-of uses the overridden iterator).
                 HeapObj::Array(_) => {
                     let m = self.get_prop(v, "@@iterator")?;
-                    if m.bits() != self.default_array_iter.bits() && self.is_callable(m) {
-                        return self.call_value(m, v, &[]);
+                    if m.bits() != self.default_array_iter.bits() {
+                        if self.is_callable(m) {
+                            return self.call_value(m, v, &[]);
+                        }
+                        // @@iterator deleted/poisoned (undefined / non-callable):
+                        // GetIterator throws rather than falling back to the dense
+                        // positional walk.
+                        return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
                     }
                 }
                 _ => {}
@@ -1168,7 +1174,16 @@ impl<'p> Vm<'p> {
             // the iterator protocol (array destructuring uses it per spec).
             HeapObj::Array(_) => {
                 let it = self.get_prop(v, "@@iterator")?;
-                it.bits() != self.default_array_iter.bits() && self.is_callable(it)
+                if it.bits() == self.default_array_iter.bits() {
+                    false // the default array iterator → direct positional indexing
+                } else if self.is_callable(it) {
+                    true // a replaced, callable @@iterator → drain via the protocol
+                } else {
+                    // @@iterator was deleted or poisoned (undefined / non-callable):
+                    // GetIterator throws a TypeError rather than silently falling
+                    // back to positional indexing.
+                    return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+                }
             }
             _ => false,
         };
