@@ -2593,6 +2593,15 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
     if t.is_empty() {
         return None;
     }
+    // A full ISO string carrying a `[tz]` annotation: the time zone is the bracket
+    // content (e.g. "2016-12-31T23:59:60+00:00[UTC]" -> "UTC", "…[+01:46]" -> the
+    // offset zone). A leading `!` critical flag is stripped.
+    if let Some(lb) = t.find('[') {
+        let rb = t[lb..].find(']').map(|r| lb + r)?;
+        let inner = &t[lb + 1..rb];
+        let inner = inner.strip_prefix('!').unwrap_or(inner);
+        return parse_time_zone(inner);
+    }
     if t.eq_ignore_ascii_case("UTC") {
         return Some(("UTC".to_string(), 0));
     }
