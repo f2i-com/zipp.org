@@ -462,7 +462,26 @@ impl<'p> Vm<'p> {
             }
         }
         let own = match self.heap.get(idx) {
-            HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
+            HeapObj::Object(m) => {
+                if let Some(i) = m.pos(key) {
+                    Some((m.attrs[i], m.vals[i]))
+                } else if idx == self.global_this && self.global_this != 0 {
+                    // globalThis own properties: built-in globals are
+                    // { writable, enumerable:false, configurable }; the value
+                    // globals NaN/Infinity/undefined are { false, false, false }.
+                    if let Some(v) = self.global_by_name(key) {
+                        return match key {
+                            "NaN" | "Infinity" | "undefined" => {
+                                self.make_data_descriptor(v, false, false, false)
+                            }
+                            _ => self.make_data_descriptor(v, true, false, true),
+                        };
+                    }
+                    None
+                } else {
+                    None
+                }
+            }
             HeapObj::Array(items) => {
                 if key == "length" {
                     let len = len_value(items.len());
@@ -1428,12 +1447,27 @@ impl<'p> Vm<'p> {
     /// `globalThis.<name>`: the value of the reserved global slot named `name`
     /// (or None if there is no such global). Backs property access on globalThis.
     pub(crate) fn global_by_name(&self, name: &str) -> Option<Value> {
-        let slot = self.program.global_names.iter().position(|n| n == name)?;
-        // A never-declared slot reads as "absent" for `globalThis.x` (→ undefined),
-        // not the internal sentinel.
-        match self.globals.get(slot).copied() {
-            Some(v) if v.is_uninitialized() => None,
-            other => other,
+        if let Some(slot) = self.program.global_names.iter().position(|n| n == name) {
+            // A never-declared slot reads as "absent"; fall through to the
+            // built-in table below rather than exposing the internal sentinel.
+            match self.globals.get(slot).copied() {
+                Some(v) if v.is_uninitialized() => {}
+                Some(v) => return Some(v),
+                None => {}
+            }
+        }
+        // Standard built-in globals (Object, Array, Math, eval, parseInt, …) are
+        // own properties of the global object even when the running program never
+        // referenced them as a bare identifier (so no compiler slot was reserved).
+        if let Some(&idx) = self.builtin_globals.get(name) {
+            return Some(Value::heap(idx));
+        }
+        // The value-properties of the global object (non-heap globals).
+        match name {
+            "NaN" => Some(Value::num(f64::NAN)),
+            "Infinity" => Some(Value::num(f64::INFINITY)),
+            "undefined" => Some(Value::UNDEFINED),
+            _ => None,
         }
     }
 
