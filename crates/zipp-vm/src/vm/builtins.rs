@@ -582,7 +582,40 @@ impl<'p> Vm<'p> {
                 };
                 let size = native::TA_KINDS[kind as usize].1;
                 let new_len = end.saturating_sub(start);
-                Ok(Some(self.alloc_typed_array(buffer, kind, byte_offset + start * size, new_len)))
+                let new_offset = byte_offset + start * size;
+                // TypedArraySpeciesCreate(O, «buffer, beginByteOffset, newLength»):
+                // a custom constructor[@@species] builds the sub-view.
+                let ctor = self.get_prop(recv, "constructor")?;
+                let species = if ctor == Value::UNDEFINED {
+                    Value::UNDEFINED
+                } else if !self.is_object_value(ctor) {
+                    return Err(Thrown("TypeError: constructor property is not an object".into()));
+                } else {
+                    let s = self.get_prop(ctor, "@@species")?;
+                    if s == Value::NULL {
+                        Value::UNDEFINED
+                    } else {
+                        s
+                    }
+                };
+                if species == Value::UNDEFINED {
+                    return Ok(Some(self.alloc_typed_array(buffer, kind, new_offset, new_len)));
+                }
+                if !self.is_constructor(species) {
+                    return Err(Thrown(
+                        "TypeError: TypedArray [Symbol.species] is not a constructor".into(),
+                    ));
+                }
+                let result = self.construct(
+                    species,
+                    &[Value::heap(buffer), Value::num(new_offset as f64), Value::num(new_len as f64)],
+                )?;
+                if !matches!(self.heap.get(result.heap_index()), HeapObj::TypedArray { .. }) {
+                    return Err(Thrown(
+                        "TypeError: TypedArray [Symbol.species] did not return a TypedArray".into(),
+                    ));
+                }
+                Ok(Some(result))
             }
             "sort" => {
                 let cmp = a0;
