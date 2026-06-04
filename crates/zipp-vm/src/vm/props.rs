@@ -959,13 +959,61 @@ impl<'p> Vm<'p> {
                     let desc_obj = Value::heap(self.heap.alloc(HeapObj::Object(m)));
                     let kv = self.key_to_value(key);
                     let r = self.call_value(trap, handler, &[target, kv, desc_obj])?;
-                    if self.truthy(r) {
-                        Ok(())
-                    } else {
-                        Err(Thrown(format!(
+                    if !self.truthy(r) {
+                        return Err(Thrown(format!(
                             "TypeError: proxy 'defineProperty' trap returned falsish for property '{key}'"
-                        )))
+                        )));
                     }
+                    // [[DefineOwnProperty]] invariant (10.5.6 steps 16-21): validate
+                    // the truthy trap result against the target's descriptor.
+                    let target_desc = self.object_get_own_property_descriptor(target, key);
+                    let extensible = self.is_extensible(target)?;
+                    let setting_config_false = cf == Some(false);
+                    if target_desc == Value::UNDEFINED {
+                        if !extensible {
+                            return Err(Thrown(
+                                "TypeError: proxy can't define a property on a non-extensible target".into(),
+                            ));
+                        }
+                        if setting_config_false {
+                            return Err(Thrown(
+                                "TypeError: proxy can't define a non-configurable property absent from the target".into(),
+                            ));
+                        }
+                    } else {
+                        let t_cfg = self.get_prop(target_desc, "configurable")?;
+                        let t_configurable = self.truthy(t_cfg);
+                        if setting_config_false && t_configurable {
+                            return Err(Thrown(
+                                "TypeError: proxy can't redefine a configurable target property as non-configurable".into(),
+                            ));
+                        }
+                        if !t_configurable {
+                            if cf == Some(true) {
+                                return Err(Thrown(
+                                    "TypeError: proxy can't redefine a non-configurable target property as configurable".into(),
+                                ));
+                            }
+                            let t_wr = self.get_prop(target_desc, "writable")?;
+                            let t_writable = self.truthy(t_wr);
+                            if !t_writable {
+                                if wr == Some(true) {
+                                    return Err(Thrown(
+                                        "TypeError: proxy can't make a non-configurable non-writable target property writable".into(),
+                                    ));
+                                }
+                                if let Some(v) = value {
+                                    let t_val = self.get_prop(target_desc, "value")?;
+                                    if !self.same_value(v, t_val) {
+                                        return Err(Thrown(
+                                            "TypeError: proxy can't change the value of a non-configurable non-writable target property".into(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
                 }
             };
         }
@@ -1280,6 +1328,22 @@ impl<'p> Vm<'p> {
             value.or(existing.map(|(_, v)| v)).unwrap_or(Value::UNDEFINED)
         };
         Ok((attr, stored))
+    }
+
+    /// IsExtensible(O): a Proxy delegates to its trap; an ordinary object reads its
+    /// `extensible` flag; an exotic object reads the arr_props side-table flag
+    /// (default extensible). Used by the Proxy trap-invariant checks.
+    pub(crate) fn is_extensible(&mut self, obj: Value) -> Result<bool, Thrown> {
+        if let Some(b) = self.proxy_is_extensible(obj)? {
+            return Ok(b);
+        }
+        if !obj.is_heap() {
+            return Ok(false);
+        }
+        Ok(match self.heap.get(obj.heap_index()) {
+            HeapObj::Object(m) => m.extensible,
+            _ => self.arr_props.get(&obj.heap_index()).map_or(true, |m| m.extensible),
+        })
     }
 
     /// The per-index override for an array element, if `defineProperty` gave index

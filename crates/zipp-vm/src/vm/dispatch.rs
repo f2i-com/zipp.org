@@ -1320,7 +1320,24 @@ impl<'p> Vm<'p> {
                                     let ks = self.key_of(k);
                                     let kv = self.key_to_value(&ks);
                                     let res = self.call_value(trap, handler, &[target, kv])?;
-                                    self.truthy(res)
+                                    let present = self.truthy(res);
+                                    // [[HasProperty]] invariant: a `false` result is
+                                    // illegal when the target has the own property and
+                                    // it is non-configurable, or the target is
+                                    // non-extensible.
+                                    if !present {
+                                        let desc =
+                                            self.object_get_own_property_descriptor(target, &ks);
+                                        if desc != Value::UNDEFINED {
+                                            let cfg = self.get_prop(desc, "configurable")?;
+                                            if !self.truthy(cfg) || !self.is_extensible(target)? {
+                                                return Err(Thrown(
+                                                    "TypeError: proxy 'has' returned false for a non-configurable / non-extensible-target own property".into(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    present
                                 }
                                 None => self.has_property(target, k),
                             }
