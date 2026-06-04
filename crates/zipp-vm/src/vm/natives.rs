@@ -79,7 +79,7 @@ impl<'p> Vm<'p> {
                 self.require_object_coercible(a0)?; // ToObject(O)
                 self.object_own_property_names(a0)?
             }
-            OBJ_GET_PROTO => self.object_get_prototype_of(a0),
+            OBJ_GET_PROTO => self.get_prototype_of_checked(a0)?,
             OBJ_KEYS => {
                 self.require_object_coercible(a0)?; // ToObject(O)
                 self.object_enum_own(a0, EnumWhat::Keys)?
@@ -1221,7 +1221,7 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.getPrototypeOf called on non-object".into()));
                 }
-                self.object_get_prototype_of(a0)
+                self.get_prototype_of_checked(a0)?
             }
             REFLECT_SET_PROTO => {
                 if !self.is_object_value(a0) {
@@ -1567,7 +1567,7 @@ impl<'p> Vm<'p> {
                 self.require_object_coercible(this)?; // ToObject(this)
                 self.lookup_accessor(this, &key, id == OBJPROTO_LOOKUP_SETTER)
             }
-            OBJPROTO_PROTO_GET => self.object_get_prototype_of(this),
+            OBJPROTO_PROTO_GET => self.get_prototype_of_checked(this)?,
             OBJPROTO_PROTO_SET => {
                 // Only an object or null changes the prototype; primitives are ignored.
                 if this.is_heap() && (self.is_object_value(a0) || a0 == Value::NULL) {

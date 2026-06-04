@@ -1462,7 +1462,7 @@ impl<'p> Vm<'p> {
                                 self.require_object_coercible(a0)?; // ToObject(O)
                                 self.object_own_property_names(a0)?
                             }
-                            S::ObjectGetPrototypeOf => self.object_get_prototype_of(a0),
+                            S::ObjectGetPrototypeOf => self.get_prototype_of_checked(a0)?,
                             S::ObjectCreate => {
                                 let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
                                 if a0 != Value::UNDEFINED {

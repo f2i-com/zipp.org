@@ -716,6 +716,60 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// FALLIBLE [[GetPrototypeOf]] for the PUBLIC reflective entry points
+    /// (`Object.getPrototypeOf`, `Reflect.getPrototypeOf`, the `__proto__`
+    /// getter). Identical to `object_get_prototype_of` for ordinary objects, but
+    /// a Proxy enforces its trap invariants — a revoked handler, a non-callable
+    /// trap, a non-Object/Null result, or a result that disagrees with a
+    /// non-extensible target's real prototype all throw TypeError (the infallible
+    /// path silently degraded these to null, which internal proto-chain walks
+    /// such as `instanceof` still use).
+    pub(crate) fn get_prototype_of_checked(&mut self, obj: Value) -> Result<Value, Thrown> {
+        if obj.is_heap() {
+            if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
+                if revoked {
+                    return Err(Thrown(
+                        "TypeError: Cannot perform 'getPrototypeOf' on a proxy that has been revoked"
+                            .into(),
+                    ));
+                }
+                let trap = match self.proxy_trap(handler, "getPrototypeOf")? {
+                    Some(t) => t,
+                    None => return self.get_prototype_of_checked(target),
+                };
+                let handler_proto = self.call_value(trap, handler, &[target])?;
+                if handler_proto != Value::NULL && !self.is_object_value(handler_proto) {
+                    return Err(Thrown(
+                        "TypeError: proxy 'getPrototypeOf' trap must return an object or null".into(),
+                    ));
+                }
+                // Non-extensible target: the trap result must equal the target's
+                // actual [[Prototype]] (SameValue).
+                let ext = match self.proxy_is_extensible(target)? {
+                    Some(b) => b,
+                    None => match self.heap.get(target.heap_index()) {
+                        HeapObj::Object(m) => m.extensible,
+                        _ => self
+                            .arr_props
+                            .get(&target.heap_index())
+                            .map_or(true, |m| m.extensible),
+                    },
+                };
+                if !ext {
+                    let target_proto = self.object_get_prototype_of(target);
+                    if !self.same_value(handler_proto, target_proto) {
+                        return Err(Thrown(
+                            "TypeError: proxy 'getPrototypeOf' must return the target's prototype when the target is not extensible"
+                                .into(),
+                        ));
+                    }
+                }
+                return Ok(handler_proto);
+            }
+        }
+        Ok(self.object_get_prototype_of(obj))
+    }
+
     /// Read a property-descriptor object's fields (present-or-absent) for
     /// `Object.defineProperty`. Throws if `desc` is not an object.
     pub(crate) fn read_descriptor(
