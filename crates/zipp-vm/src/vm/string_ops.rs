@@ -378,7 +378,13 @@ impl<'p> Vm<'p> {
                 if cur >= target {
                     return Ok(Some(self.alloc_str(s.clone())));
                 }
-                let pad = if args.len() >= 2 { self.display(args[1]) } else { " ".to_string() };
+                // ToString(fillString) — a Symbol/abrupt fill throws (after the
+                // length early-return above, matching the spec's StringPad order).
+                let pad = if args.len() >= 2 && args[1] != Value::UNDEFINED {
+                    self.to_js_string(args[1])?
+                } else {
+                    " ".to_string()
+                };
                 let padchars: Vec<char> = pad.chars().collect();
                 if padchars.is_empty() {
                     return Ok(Some(self.alloc_str(s.clone())));
