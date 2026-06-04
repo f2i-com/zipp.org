@@ -443,7 +443,14 @@ impl<'p> Vm<'p> {
             return match self.proxy_trap(handler, "construct")? {
                 Some(trap) => {
                     let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
-                    self.call_value(trap, handler, &[target, arr, cv])
+                    let res = self.call_value(trap, handler, &[target, arr, cv])?;
+                    // ProxyConstruct: the trap result must be an Object.
+                    if !self.is_object_value(res) {
+                        return Err(Thrown(
+                            "TypeError: proxy [[Construct]] must return an object".into(),
+                        ));
+                    }
+                    Ok(res)
                 }
                 None => self.construct(target, args),
             };

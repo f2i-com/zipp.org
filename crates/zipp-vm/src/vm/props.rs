@@ -132,12 +132,40 @@ impl<'p> Vm<'p> {
         match self.proxy_trap(handler, "ownKeys")? {
             Some(trap) => {
                 let r = self.call_value(trap, handler, &[target])?;
-                match r.is_heap().then(|| self.heap.get(r.heap_index())) {
-                    Some(HeapObj::Array(items)) => Ok(Some(items.clone())),
-                    _ => Err(Thrown(
-                        "TypeError: proxy [[OwnPropertyKeys]] must return an Array".into(),
-                    )),
+                let items = match r.is_heap().then(|| self.heap.get(r.heap_index())) {
+                    Some(HeapObj::Array(items)) => items.clone(),
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: proxy [[OwnPropertyKeys]] must return an Array".into(),
+                        ))
+                    }
+                };
+                // CreateListFromArrayLike with «String, Symbol» element-type check
+                // and the no-duplicate-entries invariant (spec 10.5.11 steps 8-9).
+                let mut seen: Vec<String> = Vec::with_capacity(items.len());
+                for k in &items {
+                    let is_str = k.is_heap() && self.heap.is_str_like(k.heap_index());
+                    let is_sym =
+                        k.is_heap() && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. });
+                    if !is_str && !is_sym {
+                        return Err(Thrown(
+                            "TypeError: ownKeys trap result must contain only Strings and Symbols"
+                                .into(),
+                        ));
+                    }
+                    let id = if is_str {
+                        format!("s:{}", self.display(*k))
+                    } else {
+                        format!("y:{}", k.heap_index())
+                    };
+                    if seen.contains(&id) {
+                        return Err(Thrown(
+                            "TypeError: ownKeys trap result must not contain duplicate entries".into(),
+                        ));
+                    }
+                    seen.push(id);
                 }
+                Ok(Some(items))
             }
             None => {
                 let names = self.object_own_property_names(target)?;
