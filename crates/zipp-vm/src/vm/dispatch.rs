@@ -1072,10 +1072,33 @@ impl<'p> Vm<'p> {
                                 if !self.is_callable(adder) {
                                     return Err(Thrown("TypeError: Map.prototype.set is not callable".into()));
                                 }
-                                for e in self.iterate_to_vec(sv)? {
-                                    let k = self.get_index(e, Value::int(0))?;
-                                    let v = self.get_index(e, Value::int(1))?;
-                                    self.call_value(adder, m, &[k, v])?;
+                                // AddEntriesFromIterable: step the iterator lazily;
+                                // each entry must be an Object; read k/v and call the
+                                // adder; an abrupt completion runs IteratorClose.
+                                let iter = self.get_iterator_object(sv)?;
+                                loop {
+                                    let e = match self.iterator_step(iter)? {
+                                        Some(v) => v,
+                                        None => break,
+                                    };
+                                    if !self.is_object_value(e) {
+                                        let _ = self.iterator_close(iter);
+                                        return Err(Thrown(
+                                            "TypeError: Map iterable entry is not an object".into(),
+                                        ));
+                                    }
+                                    let k = match self.get_index(e, Value::int(0)) {
+                                        Ok(k) => k,
+                                        Err(err) => { let _ = self.iterator_close(iter); return Err(err); }
+                                    };
+                                    let v = match self.get_index(e, Value::int(1)) {
+                                        Ok(v) => v,
+                                        Err(err) => { let _ = self.iterator_close(iter); return Err(err); }
+                                    };
+                                    if let Err(err) = self.call_value(adder, m, &[k, v]) {
+                                        let _ = self.iterator_close(iter);
+                                        return Err(err);
+                                    }
                                 }
                             }
                         }
@@ -1091,8 +1114,17 @@ impl<'p> Vm<'p> {
                                 if !self.is_callable(adder) {
                                     return Err(Thrown("TypeError: Set.prototype.add is not callable".into()));
                                 }
-                                for e in self.iterate_to_vec(sv)? {
-                                    self.call_value(adder, set_v, &[e])?;
+                                // Lazy iteration + IteratorClose on an abrupt adder.
+                                let iter = self.get_iterator_object(sv)?;
+                                loop {
+                                    let e = match self.iterator_step(iter)? {
+                                        Some(v) => v,
+                                        None => break,
+                                    };
+                                    if let Err(err) = self.call_value(adder, set_v, &[e]) {
+                                        let _ = self.iterator_close(iter);
+                                        return Err(err);
+                                    }
                                 }
                             }
                         }

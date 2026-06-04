@@ -1201,6 +1201,17 @@ impl<'p> Vm<'p> {
     /// has one, requiring an Object result (TypeError otherwise). Skips generators
     /// (driven directly via generator_method, not a prototype `return`) and
     /// non-objects. Shared by destructuring and `for-of` break.
+    /// GetIterator(iterable) via @@iterator — returns a REAL iterator object (not
+    /// `get_iterator`'s array fast-path, which can't be stepped by iterator_step).
+    /// Used by the Map/Set constructors' AddEntriesFromIterable.
+    pub(crate) fn get_iterator_object(&mut self, iterable: Value) -> Result<Value, Thrown> {
+        let m = self.get_prop(iterable, "@@iterator")?;
+        if !self.is_callable(m) {
+            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(iterable))));
+        }
+        self.call_value(m, iterable, &[])
+    }
+
     pub(crate) fn iterator_close(&mut self, iter: Value) -> Result<(), Thrown> {
         if !iter.is_heap() {
             return Ok(());
