@@ -2071,6 +2071,22 @@ impl<'p> Vm<'p> {
                         return Ok(v);
                     }
                 }
+                // Poison-pill: `caller`/`arguments` on a STRICT or BOUND function are
+                // %ThrowTypeError% accessors (AddRestrictedFunctionProperties); a
+                // sloppy function inherits neither and reads undefined (no throw).
+                if key == "caller" || key == "arguments" {
+                    let poison = match self.heap.get(obj.heap_index()) {
+                        HeapObj::Bound { .. } => true,
+                        HeapObj::Func(fid) => self.func(*fid as usize).is_strict,
+                        HeapObj::Closure { func, .. } => self.func(*func as usize).is_strict,
+                        _ => false,
+                    };
+                    if poison {
+                        return Err(Thrown(format!(
+                            "TypeError: '{key}' may not be accessed on strict-mode or bound functions"
+                        )));
+                    }
+                }
                 // Inherited methods: a generator/async function starts at its
                 // dynamic-function intrinsic prototype (so `gen.constructor` is
                 // %GeneratorFunction%), else %Function.prototype% (call/apply/bind),
