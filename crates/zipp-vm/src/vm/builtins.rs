@@ -980,26 +980,85 @@ impl<'p> Vm<'p> {
                 if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
                     return Err(Thrown("TypeError: Cannot slice a detached ArrayBuffer".into()));
                 }
-                let slice: Vec<u8> = match self.heap.get(idx) {
-                    HeapObj::ArrayBuffer { data, .. } => {
-                        let dl = data.len();
-                        let s = start.min(dl);
-                        let e = end.max(start).min(dl);
-                        data[s..e].to_vec()
+                let dl = match self.heap.get(idx) {
+                    HeapObj::ArrayBuffer { data, .. } => data.len(),
+                    _ => 0,
+                };
+                let s = start.min(dl);
+                let e = end.max(start).min(dl);
+                let new_len = e - s;
+                let is_shared = self.shared_buffers.contains(&idx);
+                // SpeciesConstructor(O, %ArrayBuffer%): a user constructor[@@species]
+                // builds the result; the default allocs a plain (or shared) buffer.
+                let ctor = self.get_prop(Value::heap(idx), "constructor")?;
+                let species = if ctor == Value::UNDEFINED {
+                    Value::UNDEFINED
+                } else if !self.is_object_value(ctor) {
+                    return Err(Thrown("TypeError: ArrayBuffer constructor is not an object".into()));
+                } else {
+                    let sp = self.get_prop(ctor, "@@species")?;
+                    if sp == Value::NULL { Value::UNDEFINED } else { sp }
+                };
+                let new_idx = if species == Value::UNDEFINED {
+                    let b = self.alloc_array_buffer(new_len);
+                    if is_shared {
+                        self.shared_buffers.insert(b);
+                        if self.sab_proto != 0 {
+                            self.proto_of.insert(b, Value::heap(self.sab_proto));
+                        }
                     }
+                    b
+                } else {
+                    if !self.is_constructor(species) {
+                        return Err(Thrown(
+                            "TypeError: ArrayBuffer [Symbol.species] is not a constructor".into(),
+                        ));
+                    }
+                    let result = self.construct(species, &[Value::num(new_len as f64)])?;
+                    // Validate: an ArrayBuffer, not shared (for a non-shared source),
+                    // not detached, not the SAME buffer, and large enough.
+                    let ridx = match result.is_heap().then(|| self.heap.get(result.heap_index())) {
+                        Some(HeapObj::ArrayBuffer { .. }) => result.heap_index(),
+                        _ => {
+                            return Err(Thrown(
+                                "TypeError: ArrayBuffer [Symbol.species] did not return an ArrayBuffer".into(),
+                            ))
+                        }
+                    };
+                    if !is_shared && self.shared_buffers.contains(&ridx) {
+                        return Err(Thrown(
+                            "TypeError: ArrayBuffer.prototype.slice species returned a SharedArrayBuffer".into(),
+                        ));
+                    }
+                    if matches!(self.heap.get(ridx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                        return Err(Thrown(
+                            "TypeError: ArrayBuffer.prototype.slice species returned a detached buffer".into(),
+                        ));
+                    }
+                    if ridx == idx {
+                        return Err(Thrown(
+                            "TypeError: ArrayBuffer.prototype.slice species returned the source buffer".into(),
+                        ));
+                    }
+                    if self.array_buffer_len(ridx) < new_len {
+                        return Err(Thrown(
+                            "TypeError: ArrayBuffer.prototype.slice species buffer is too small".into(),
+                        ));
+                    }
+                    ridx
+                };
+                // The species construction may have detached the source — re-check.
+                if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown(
+                        "TypeError: source ArrayBuffer detached during species construction".into(),
+                    ));
+                }
+                let slice: Vec<u8> = match self.heap.get(idx) {
+                    HeapObj::ArrayBuffer { data, .. } => data[s..e].to_vec(),
                     _ => Vec::new(),
                 };
-                let new_idx = self.alloc_array_buffer(slice.len());
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
-                    data.copy_from_slice(&slice);
-                }
-                // `SharedArrayBuffer.prototype.slice` returns a SharedArrayBuffer
-                // (mark it shared AND link it to %SharedArrayBuffer.prototype%).
-                if self.shared_buffers.contains(&idx) {
-                    self.shared_buffers.insert(new_idx);
-                    if self.sab_proto != 0 {
-                        self.proto_of.insert(new_idx, Value::heap(self.sab_proto));
-                    }
+                    data[..slice.len()].copy_from_slice(&slice);
                 }
                 Ok(Some(Value::heap(new_idx)))
             }

@@ -368,6 +368,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Promise { .. }
                 | HeapObj::Boxed { .. }
                 | HeapObj::RegExp { .. }
+                | HeapObj::ArrayBuffer { .. }
+                | HeapObj::DataView { .. }
         ) {
             // (`re.lastIndex = …` was handled above; a `re.exec = fn` override or
             // any `re.x = …` lands in the side table. RegExp accessor keys
