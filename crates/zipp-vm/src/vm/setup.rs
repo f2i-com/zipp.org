@@ -1606,10 +1606,21 @@ impl<'p> Vm<'p> {
                 ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
                 ("SQRT2", std::f64::consts::SQRT_2),
             ];
+            // Math[Symbol.toStringTag] = "Math" (so Object.prototype.toString is
+            // "[object Math]"); non-writable/enumerable, configurable.
+            let mtag = self.alloc_str("Math".to_string());
+            let tag_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                 for &(n, v) in consts {
                     m.define(n, Value::num(v), proto_attr);
                 }
+                m.define("@@toStringTag", mtag, tag_attr);
             }
             idx
         };
