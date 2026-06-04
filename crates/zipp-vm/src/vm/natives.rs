@@ -671,6 +671,13 @@ impl<'p> Vm<'p> {
                     // A class value renders as its whole `class … { … }` source.
                     HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
                     HeapObj::Native(_) | HeapObj::Bound { .. } => None,
+                    // A callable Proxy (its target is callable) is a function for
+                    // toString purposes — render the `[native code]` form, not throw.
+                    HeapObj::Proxy { target, revoked, .. }
+                        if !*revoked && self.is_callable(*target) =>
+                    {
+                        None
+                    }
                     _ => {
                         return Err(Thrown(
                             "TypeError: Function.prototype.toString requires that 'this' be a Function"
