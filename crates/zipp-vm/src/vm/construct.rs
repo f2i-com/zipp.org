@@ -989,10 +989,36 @@ impl<'p> Vm<'p> {
                     || c.static_setters.iter().any(|(n, _)| n == key)
                     || self.callable_has_intrinsic(obj, key)
             }
-            // Functions/closures/etc.: assigned own props (`fn.x`) + name/length.
-            _ => {
+            // Functions/closures: assigned own props (`fn.x`) + name/length.
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
                 self.fn_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
                     || self.callable_has_intrinsic(obj, key)
+            }
+            // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*, …)
+            // keep their named own props in the arr_props side table; a boxed String
+            // also owns the wrapped string's chars + `length`.
+            _ => {
+                if self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some()) {
+                    return true;
+                }
+                if let HeapObj::Boxed { kind: 0, value } = self.heap.get(obj.heap_index()) {
+                    let clen = match self.heap.get(value.heap_index()) {
+                        HeapObj::Str(s) => Some(s.char_len),
+                        HeapObj::Cons { len, .. } => Some(*len),
+                        _ => None,
+                    };
+                    if let Some(n) = clen {
+                        if key == "length" {
+                            return true;
+                        }
+                        if let Ok(i) = key.parse::<usize>() {
+                            if i.to_string() == key && i < n {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
             }
         }
     }

@@ -137,7 +137,41 @@ impl<'p> Vm<'p> {
                 }
                 false
             }
-            _ => false,
+            _ => {
+                let k = self.key_of(key);
+                // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*,
+                // …) keep their named own props in the arr_props side table.
+                if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                    return true;
+                }
+                // A boxed String wrapper exposes the wrapped string's chars +
+                // `length` as integer-indexed own properties.
+                if let HeapObj::Boxed { kind: 0, value } = self.heap.get(idx) {
+                    let v = *value;
+                    let clen = match self.heap.get(v.heap_index()) {
+                        HeapObj::Str(s) => Some(s.char_len),
+                        HeapObj::Cons { len, .. } => Some(*len),
+                        _ => None,
+                    };
+                    if let Some(n) = clen {
+                        if let Some(i) = array_index(key) {
+                            if i < n {
+                                return true;
+                            }
+                        }
+                        if k == "length" {
+                            return true;
+                        }
+                    }
+                }
+                // Continue up an explicit prototype chain (e.g. a descriptor object
+                // inheriting `writable`); the builtin protos carry no descriptor
+                // fields, so this &self-cheap walk is sufficient.
+                match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+                    Some(p) => self.has_property(p, key),
+                    None => false,
+                }
+            }
         }
     }
 
