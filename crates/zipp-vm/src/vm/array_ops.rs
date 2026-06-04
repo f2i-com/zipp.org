@@ -252,6 +252,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::UNDEFINED))
             }
             "map" => {
+                // map does ArraySpeciesCreate(O, len); for a non-array O that is
+                // ArrayCreate(len), which throws RangeError when len > 2^32-1 — and
+                // it happens BEFORE any element is visited. (forEach/some/every/
+                // reduce create no array, and filter creates length 0, so only map
+                // validates here.)
+                if lenf.is_finite() && lenf.floor() > 4_294_967_295.0 {
+                    return Err(Thrown("RangeError: Invalid array length".into()));
+                }
                 let mut out = vec![Value::UNDEFINED; len];
                 for k in 0..len {
                     if self.has_property(this, idxv(k)) {
