@@ -63,21 +63,35 @@ impl<'p> Vm<'p> {
                 a0
             }
             OBJ_DEFINE_PROPERTIES => {
+                self.require_object_coercible(a0)?; // Type(O) must be Object
                 self.object_define_properties(a0, a1)?;
                 a0
             }
             OBJ_GET_OWN_DESC => {
                 let key = self.to_property_key(a1)?;
+                self.require_object_coercible(a0)?; // ToObject(O)
                 match self.proxy_gopd(a0, &key)? {
                     Some(d) => d,
                     None => self.object_get_own_property_descriptor(a0, &key),
                 }
             }
-            OBJ_GET_OWN_NAMES => self.object_own_property_names(a0)?,
+            OBJ_GET_OWN_NAMES => {
+                self.require_object_coercible(a0)?; // ToObject(O)
+                self.object_own_property_names(a0)?
+            }
             OBJ_GET_PROTO => self.object_get_prototype_of(a0),
-            OBJ_KEYS => self.object_enum_own(a0, EnumWhat::Keys)?,
-            OBJ_VALUES => self.object_enum_own(a0, EnumWhat::Values)?,
-            OBJ_ENTRIES => self.object_enum_own(a0, EnumWhat::Entries)?,
+            OBJ_KEYS => {
+                self.require_object_coercible(a0)?; // ToObject(O)
+                self.object_enum_own(a0, EnumWhat::Keys)?
+            }
+            OBJ_VALUES => {
+                self.require_object_coercible(a0)?;
+                self.object_enum_own(a0, EnumWhat::Values)?
+            }
+            OBJ_ENTRIES => {
+                self.require_object_coercible(a0)?;
+                self.object_enum_own(a0, EnumWhat::Entries)?
+            }
             OBJ_ASSIGN => self.object_assign(args)?,
             OBJ_CREATE => {
                 let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
@@ -91,13 +105,21 @@ impl<'p> Vm<'p> {
             }
             PROTO_HAS_OWN => {
                 let k = self.to_property_key(a0)?;
+                self.require_object_coercible(this)?; // ToObject(this)
                 Value::bool(self.has_own_property(this, &k))
             }
             PROTO_PROP_ENUM => {
                 let k = self.to_property_key(a0)?;
+                self.require_object_coercible(this)?; // ToObject(this)
                 Value::bool(self.own_is_enumerable(this, &k))
             }
-            PROTO_IS_PROTO_OF => Value::bool(self.is_prototype_of(this, a0)),
+            // isPrototypeOf: a non-object argument is `false` BEFORE ToObject(this).
+            PROTO_IS_PROTO_OF => {
+                if self.is_object_value(a0) {
+                    self.require_object_coercible(this)?;
+                }
+                Value::bool(self.is_prototype_of(this, a0))
+            }
             PROTO_VALUE_OF => this,
             PROTO_TO_STRING => {
                 let tag = self.object_to_string_tag(this)?;
@@ -1427,6 +1449,7 @@ impl<'p> Vm<'p> {
             }
             OBJPROTO_LOOKUP_GETTER | OBJPROTO_LOOKUP_SETTER => {
                 let key = self.to_property_key(a0)?;
+                self.require_object_coercible(this)?; // ToObject(this)
                 self.lookup_accessor(this, &key, id == OBJPROTO_LOOKUP_SETTER)
             }
             OBJPROTO_PROTO_GET => self.object_get_prototype_of(this),

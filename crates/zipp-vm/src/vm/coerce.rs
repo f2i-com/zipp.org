@@ -148,6 +148,17 @@ impl<'p> Vm<'p> {
     /// undefined become a fresh ordinary object; an existing object (array,
     /// function, …) is returned unchanged. `Boxed.kind`: 0=String, 1=Number,
     /// 2=Boolean, 3=Symbol, 4=BigInt.
+    /// RequireObjectCoercible: `null`/`undefined` cannot be converted to an
+    /// object, so methods that ToObject their `this` throw a TypeError on them.
+    pub(crate) fn require_object_coercible(&self, v: Value) -> Result<(), Thrown> {
+        if v == Value::NULL || v == Value::UNDEFINED {
+            return Err(Thrown(
+                "TypeError: cannot convert null or undefined to an object".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn to_object(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_number() {
             return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 1, value: v })));
