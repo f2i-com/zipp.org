@@ -1454,7 +1454,11 @@ impl<'p> Vm<'p> {
                                 a0
                             }
                             S::ObjectDefineProperties => {
-                                self.require_object_coercible(a0)?;
+                                if !self.is_object_value(a0) {
+                                    return Err(Thrown(
+                                        "TypeError: Object.defineProperties called on non-object".into(),
+                                    ));
+                                }
                                 let props = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                                 self.object_define_properties(a0, props)?;
                                 a0
@@ -1472,8 +1476,16 @@ impl<'p> Vm<'p> {
                                 self.require_object_coercible(a0)?; // ToObject(O)
                                 self.object_own_property_names(a0)?
                             }
-                            S::ObjectGetPrototypeOf => self.get_prototype_of_checked(a0)?,
+                            S::ObjectGetPrototypeOf => {
+                                self.require_object_coercible(a0)?; // ToObject(O)
+                                self.get_prototype_of_checked(a0)?
+                            }
                             S::ObjectCreate => {
+                                if a0 != Value::NULL && !self.is_object_value(a0) {
+                                    return Err(Thrown(
+                                        "TypeError: Object prototype may only be an Object or null".into(),
+                                    ));
+                                }
                                 let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
                                 if a0 != Value::UNDEFINED {
                                     self.proto_of.insert(o.heap_index(), a0);

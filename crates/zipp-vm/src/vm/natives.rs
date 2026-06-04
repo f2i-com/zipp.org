@@ -63,7 +63,13 @@ impl<'p> Vm<'p> {
                 a0
             }
             OBJ_DEFINE_PROPERTIES => {
-                self.require_object_coercible(a0)?; // Type(O) must be Object
+                // Object.defineProperties(O, Properties): Type(O) must be Object
+                // (a number/string/bool primitive throws, not just null/undefined).
+                if !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Object.defineProperties called on non-object".into(),
+                    ));
+                }
                 self.object_define_properties(a0, a1)?;
                 a0
             }
@@ -79,7 +85,10 @@ impl<'p> Vm<'p> {
                 self.require_object_coercible(a0)?; // ToObject(O)
                 self.object_own_property_names(a0)?
             }
-            OBJ_GET_PROTO => self.get_prototype_of_checked(a0)?,
+            OBJ_GET_PROTO => {
+                self.require_object_coercible(a0)?; // ToObject(O): null/undefined throw
+                self.get_prototype_of_checked(a0)?
+            }
             OBJ_KEYS => {
                 self.require_object_coercible(a0)?; // ToObject(O)
                 self.object_enum_own(a0, EnumWhat::Keys)?
@@ -94,6 +103,12 @@ impl<'p> Vm<'p> {
             }
             OBJ_ASSIGN => self.object_assign(args)?,
             OBJ_CREATE => {
+                // Object.create(O, Properties): O must be Object or null.
+                if a0 != Value::NULL && !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Object prototype may only be an Object or null".into(),
+                    ));
+                }
                 let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
                 if a0 != Value::UNDEFINED {
                     self.proto_of.insert(o.heap_index(), a0);
@@ -807,12 +822,20 @@ impl<'p> Vm<'p> {
             }
             OBJ_HAS_OWN => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.require_object_coercible(o)?; // ToObject(O): null/undefined throw
                 let k = self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 Value::bool(self.has_own_property(o, &k))
             }
             OBJ_SET_PROTO_OF => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let proto = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // RequireObjectCoercible(O); proto must be Object or null.
+                self.require_object_coercible(o)?;
+                if proto != Value::NULL && !self.is_object_value(proto) {
+                    return Err(Thrown(
+                        "TypeError: Object prototype may only be an Object or null".into(),
+                    ));
+                }
                 match self.proxy_set_prototype_of(o, proto)? {
                     Some(true) => {}
                     Some(false) => {
@@ -829,6 +852,7 @@ impl<'p> Vm<'p> {
                 o
             }
             OBJ_GET_OWN_SYMBOLS => {
+                self.require_object_coercible(a0)?; // ToObject(O): null/undefined throw
                 // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
                 // back to their Symbol values via the prop_key registry.
                 let mut syms: Vec<Value> = Vec::new();
@@ -859,6 +883,7 @@ impl<'p> Vm<'p> {
             }
             OBJ_GET_OWN_DESCS => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.require_object_coercible(o)?; // ToObject(O): null/undefined throw
                 let names = self.object_own_property_names(o)?;
                 let keys: Vec<Value> = match self.heap.get(names.heap_index()) {
                     HeapObj::Array(items) => items.clone(),

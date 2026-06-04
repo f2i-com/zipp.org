@@ -1298,9 +1298,11 @@ impl<'p> Vm<'p> {
     /// `Object.defineProperties(obj, props)` — define each own enumerable key of
     /// `props` as a descriptor on `obj`.
     pub(crate) fn object_define_properties(&mut self, obj: Value, props: Value) -> Result<(), Thrown> {
-        if !props.is_heap() {
-            return Ok(());
-        }
+        // ObjectDefineProperties: props = ToObject(Properties) — null/undefined
+        // throw (to_object boxes them like Object(), so guard first); other
+        // primitives box (a String's index chars then fail ToPropertyDescriptor).
+        self.require_object_coercible(props)?;
+        let props = self.to_object(props)?;
         let pidx = props.heap_index();
         let enum_keys = |m: &ObjMap| -> Vec<String> {
             m.keys
