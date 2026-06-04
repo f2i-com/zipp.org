@@ -1905,6 +1905,17 @@ impl<'p> Vm<'p> {
                 // Offset / single-offset (UTC) time zones have no transitions.
                 Value::NULL
             }
+            PDT_WITH_PLAIN_TIME => {
+                if !this.is_heap()
+                    || !matches!(self.heap.get(this.heap_index()), HeapObj::Temporal { kind: 3, .. })
+                {
+                    return Err(Thrown(
+                        "TypeError: withPlainTime called on a non-PlainDateTime".into(),
+                    ));
+                }
+                self.temporal_method(this.heap_index(), "withPlainTime", args)?
+                    .unwrap_or(Value::UNDEFINED)
+            }
             // ── Intl ──
             INTL_GET_CANONICAL_LOCALES => {
                 let list = self.canonicalize_locale_list(a0)?;

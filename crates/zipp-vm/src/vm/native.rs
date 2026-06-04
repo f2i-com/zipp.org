@@ -370,6 +370,9 @@ pub const TEMPORAL_TO_LOCALE_STRING: u16 = 546;
 /// Temporal.ZonedDateTime.prototype.getTimeZoneTransition (standalone id — the
 /// ZDT_M_BASE block is full). Offset/UTC zones have no transitions -> null.
 pub const ZDT_GET_TZ_TRANSITION: u16 = 547;
+/// Temporal.PlainDateTime.prototype.withPlainTime (standalone id — the PDT_M_BASE
+/// block is full). Keeps the date, replaces the time (default midnight).
+pub const PDT_WITH_PLAIN_TIME: u16 = 548;
 /// Intl namespace + per-service method native ids.
 pub const INTL_GET_CANONICAL_LOCALES: u16 = 560;
 pub const INTL_SUPPORTED_VALUES_OF: u16 = 561;
@@ -695,6 +698,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         NOW_ZONEDDATETIME_ISO => ("zonedDateTimeISO", 0),
         TEMPORAL_TO_LOCALE_STRING => ("toLocaleString", 0),
         ZDT_GET_TZ_TRANSITION => ("getTimeZoneTransition", 1),
+        PDT_WITH_PLAIN_TIME => ("withPlainTime", 0),
         OBJ_DEFINE_PROPERTY => ("defineProperty", 3),
         OBJ_DEFINE_PROPERTIES => ("defineProperties", 2),
         OBJ_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),

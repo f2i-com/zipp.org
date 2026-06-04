@@ -1332,6 +1332,11 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(p) = self.heap.get_mut(self.zoneddatetime_proto) {
                 p.define("getTimeZoneTransition", gtzt, method_attr);
             }
+            // PlainDateTime.prototype.withPlainTime (standalone id; PDT block full).
+            let wpt = Value::heap(self.heap.alloc(HeapObj::Native(PDT_WITH_PLAIN_TIME)));
+            if let HeapObj::Object(p) = self.heap.get_mut(self.plaindatetime_proto) {
+                p.define("withPlainTime", wpt, method_attr);
+            }
             // ── Intl namespace + service constructors ──
             let intl_services: Vec<(u8, &str, f64, Vec<(&str, u16)>, bool)> = vec![
                 (

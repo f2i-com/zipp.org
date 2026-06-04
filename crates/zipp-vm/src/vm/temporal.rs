@@ -1160,6 +1160,13 @@ impl<'p> Vm<'p> {
                     nd.0, nd.1, nd.2, f[3], f[4], f[5], f[6], f[7], f[8],
                 ])?))
             }
+            "withPlainTime" => {
+                // Keep the date, replace the time (ToTemporalTime; default midnight).
+                let nt = if a0 == Value::UNDEFINED { [0i64; 6] } else { self.to_plain_time(a0)? };
+                Ok(Some(self.make_plain_date_time([
+                    date[0], date[1], date[2], nt[0], nt[1], nt[2], nt[3], nt[4], nt[5],
+                ])?))
+            }
             "toZonedDateTime" => {
                 let (id, offset) = self.parse_tz_arg(a0)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
