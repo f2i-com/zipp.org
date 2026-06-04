@@ -212,6 +212,25 @@ impl<'p> Vm<'p> {
                 };
                 self.ordinary_to_primitive(this, order)?
             }
+            DATE_TO_JSON => {
+                // Date.prototype.toJSON(key): generic, NOT Date-branded.
+                //   O = ToObject(this); tv = ToPrimitive(O, number);
+                //   if tv is a non-finite Number, return null;
+                //   return Invoke(O, "toISOString").
+                let o = self.to_object(this)?;
+                let tv = self.to_primitive_number(o)?;
+                if tv.is_double() && !tv.as_f64().is_finite() {
+                    Value::NULL
+                } else {
+                    let m = self.get_prop(o, "toISOString")?;
+                    if !self.is_callable(m) {
+                        return Err(Thrown(
+                            "TypeError: Date.prototype.toJSON: toISOString is not callable".into(),
+                        ));
+                    }
+                    self.call_value(m, o, &[])?
+                }
+            }
             SYMBOL_DESCRIPTION_GET => {
                 // `get Symbol.prototype.description` → the symbol's description.
                 match this.is_heap().then(|| self.heap.get(this.heap_index())) {

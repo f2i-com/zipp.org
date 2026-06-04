@@ -385,6 +385,10 @@ pub const PDT_WITH_PLAIN_TIME: u16 = 548;
 /// `Date.prototype[Symbol.toPrimitive]` — OrdinaryToPrimitive with hint "string"
 /// for "string"/"default" and "number" for "number"; any other hint is a TypeError.
 pub const DATE_TO_PRIMITIVE: u16 = 549;
+/// `Date.prototype.toJSON(key)` — generic: ToObject(this), ToPrimitive(number),
+/// `null` for a non-finite time value, else Invoke(O, "toISOString"). Not
+/// Date-branded (works on any object with a callable `toISOString`).
+pub const DATE_TO_JSON: u16 = 550;
 /// Intl namespace + per-service method native ids.
 pub const INTL_GET_CANONICAL_LOCALES: u16 = 560;
 pub const INTL_SUPPORTED_VALUES_OF: u16 = 561;
@@ -715,6 +719,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         ZDT_GET_TZ_TRANSITION => ("getTimeZoneTransition", 1),
         PDT_WITH_PLAIN_TIME => ("withPlainTime", 0),
         DATE_TO_PRIMITIVE => ("[Symbol.toPrimitive]", 1),
+        DATE_TO_JSON => ("toJSON", 1),
         OBJ_DEFINE_PROPERTY => ("defineProperty", 3),
         OBJ_DEFINE_PROPERTIES => ("defineProperties", 2),
         OBJ_GET_OWN_DESC => ("getOwnPropertyDescriptor", 2),

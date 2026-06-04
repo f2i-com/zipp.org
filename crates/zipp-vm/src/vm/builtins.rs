@@ -62,7 +62,7 @@ impl<'p> Vm<'p> {
         // whatever is actually installed — for an unshadowed receiver that is the
         // same type native, just reached via one call_value instead of inline.
         if (recv.is_number() || recv.is_heap())
-            && matches!(name, "toString" | "valueOf" | "toLocaleString")
+            && matches!(name, "toString" | "valueOf" | "toLocaleString" | "toJSON")
         {
             return Ok(None);
         }

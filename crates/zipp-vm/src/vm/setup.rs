@@ -274,8 +274,12 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
+        // toJSON is GENERIC (ToObject + Invoke toISOString), not Date-branded —
+        // register the standalone native (overrides the brand-checked proto-method).
+        let date_to_json = Value::heap(self.heap.alloc(HeapObj::Native(DATE_TO_JSON)));
         if let HeapObj::Object(p) = self.heap.get_mut(date_proto) {
             p.define("@@toPrimitive", date_to_prim, sym_fn_attr);
+            p.define("toJSON", date_to_json, method_attr);
         }
         self.promise_proto = promise_proto;
         self.num_proto = num_proto;
