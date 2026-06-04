@@ -29,7 +29,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Class(_)
                 | HeapObj::Native(_)
                 | HeapObj::Bound { .. }
-                | HeapObj::BoundResolver { .. } => "function",
+                | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
                 HeapObj::Proxy { target, .. } => self.type_of(*target), // typeof = target's
                 HeapObj::Symbol { .. } => "symbol",

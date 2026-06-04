@@ -1389,9 +1389,12 @@ impl<'p> Vm<'p> {
                 let p = self.func(*func as usize);
                 Some((clean(&p.name), p.param_count as i32))
             }
-            // The resolve/reject functions of `new Promise(executor)`: anonymous
+            // The resolve/reject functions of `new Promise(executor)`, and the
+            // Promise.all/allSettled/any resolve/reject ELEMENT functions: anonymous
             // (name ""), length 1, with %Function.prototype% as [[Prototype]].
-            HeapObj::BoundResolver { .. } => Some((String::new(), 1)),
+            HeapObj::BoundResolver { .. } | HeapObj::CombinatorResolver { .. } => {
+                Some((String::new(), 1))
+            }
             HeapObj::Class(c) => {
                 let len = c
                     .ctor

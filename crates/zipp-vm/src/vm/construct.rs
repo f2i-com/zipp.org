@@ -992,8 +992,14 @@ impl<'p> Vm<'p> {
                     || c.static_setters.iter().any(|(n, _)| n == key)
                     || self.callable_has_intrinsic(obj, key)
             }
-            // Functions/closures: assigned own props (`fn.x`) + name/length.
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+            // Functions/closures + the native resolve/reject + combinator element
+            // functions: assigned own props (`fn.x`) + the synthesized name/length.
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Native(_)
+            | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. } => {
                 self.fn_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
                     || self.callable_has_intrinsic(obj, key)
             }
