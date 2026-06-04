@@ -194,25 +194,20 @@ impl<'p> Vm<'p> {
 
     /// RegExp.prototype[Symbol.search] core: reset lastIndex to 0, exec, restore
     /// lastIndex, return the match index or -1. Shared by String.prototype.search.
-    pub(crate) fn regexp_search_impl(&mut self, re: u32, input: Value) -> Result<Value, Thrown> {
-        let prev = match self.heap.get(re) {
-            HeapObj::RegExp { last_index, .. } => *last_index,
-            _ => {
-                return Err(Thrown(
-                    "TypeError: RegExp.prototype[Symbol.search] called on a non-RegExp".into(),
-                ))
-            }
-        };
-        if prev != 0 {
-            self.set_regexp_last_index(re, 0);
+    pub(crate) fn regexp_search_impl(&mut self, rx: Value, input: Value) -> Result<Value, Thrown> {
+        // @@search (22.2.6.12) is spec-generic over any Object `rx`: save lastIndex
+        // (Get), zero it (Set) unless already 0, RegExpExec, restore it if exec
+        // changed it — all via the observable get/set_prop protocol, honouring a
+        // user lastIndex getter/setter and a custom `exec`.
+        let prev = self.get_prop(rx, "lastIndex")?;
+        let zero = Value::int(0);
+        if !self.same_value(prev, zero) {
+            self.set_prop(rx, "lastIndex", zero)?;
         }
-        let result = self.regexp_exec_abstract(re, input)?;
-        let cur = match self.heap.get(re) {
-            HeapObj::RegExp { last_index, .. } => *last_index,
-            _ => 0,
-        };
-        if cur != prev {
-            self.set_regexp_last_index(re, prev);
+        let result = self.regexp_exec_abstract(rx.heap_index(), input)?;
+        let cur = self.get_prop(rx, "lastIndex")?;
+        if !self.same_value(cur, prev) {
+            self.set_prop(rx, "lastIndex", prev)?;
         }
         if result == Value::NULL {
             return Ok(Value::int(-1));

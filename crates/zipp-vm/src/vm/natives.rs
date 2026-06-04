@@ -539,13 +539,14 @@ impl<'p> Vm<'p> {
                 self.alloc_str(out)
             }
             REGEXP_SYM_SEARCH => {
-                if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. })
-                {
+                // Spec-generic: Type(this) need only be Object (a plain object with
+                // a custom `exec`/`lastIndex` works); RegExpExec dispatches to its exec.
+                if !self.is_object_value(this) {
                     return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.search] called on a non-RegExp".into(),
+                        "TypeError: RegExp.prototype[Symbol.search] called on a non-object".into(),
                     ));
                 }
-                self.regexp_search_impl(this.heap_index(), a0)?
+                self.regexp_search_impl(this, a0)?
             }
             REGEXP_SYM_MATCH => {
                 if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. })

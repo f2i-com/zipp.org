@@ -180,7 +180,7 @@ impl<'p> Vm<'p> {
             }
             "search" => {
                 let re = self.to_regexp_arg(arg0)?;
-                Ok(Some(self.regexp_search_impl(re, Value::heap(idx))?))
+                Ok(Some(self.regexp_search_impl(Value::heap(re), Value::heap(idx))?))
             }
             "match" => {
                 let re = self.to_regexp_arg(arg0)?;
