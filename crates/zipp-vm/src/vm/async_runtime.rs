@@ -894,94 +894,152 @@ impl<'p> Vm<'p> {
                 return Ok(Value::heap(result));
             }
         }
-        // GetIterator / iteration abrupt completion → reject (IfAbruptRejectPromise):
-        // `Promise.all(1)` rejects with a TypeError rather than throwing.
-        let inputs = match self.iterate_to_vec(iterable) {
-            Ok(v) => v,
+        // GetIterator(iterable): invoke @@iterator to obtain a REAL iterator object
+        // (not the array fast-path, which `get_iterator` returns un-stepped) so the
+        // lazy step + IteratorClose below work. A non-callable @@iterator / abrupt →
+        // reject (IfAbruptRejectPromise).
+        let iter = match self.get_prop(iterable, "@@iterator") {
+            Ok(m) if self.is_callable(m) => match self.call_value(m, iterable, &[]) {
+                Ok(it) => it,
+                Err(Thrown(msg)) => {
+                    self.reject_with_thrown(result, &msg);
+                    return Ok(Value::heap(result));
+                }
+            },
+            Ok(_) => {
+                let disp = self.display(iterable);
+                let e = self.alloc_error_from_message(&format!("TypeError: {disp} is not iterable"));
+                self.reject(result, e);
+                return Ok(Value::heap(result));
+            }
             Err(Thrown(msg)) => {
-                let err = match self.pending_throw.take() {
-                    Some(v) => v,
-                    None => self.alloc_error_from_message(&msg),
-                };
-                self.reject(result, err);
+                self.reject_with_thrown(result, &msg);
                 return Ok(Value::heap(result));
             }
         };
-        let total = inputs.len() as u32;
-        if total == 0 {
-            // Empty-iterable terminal cases (race stays pending forever).
-            match kind {
-                CombKind::All | CombKind::AllSettled => {
-                    let arr = Value::heap(self.heap.alloc(HeapObj::Array(Vec::new())));
-                    self.resolve(result, arr);
-                }
-                CombKind::Any => {
-                    let e = self.alloc_aggregate_error(Vec::new());
-                    self.reject(result, e);
-                }
-                CombKind::Race => {}
-            }
-            return Ok(Value::heap(result));
-        }
+        // remainingElementsCount starts at 1 (the iteration itself); each element
+        // bumps it, each settling element decrements it, and completing the
+        // iteration decrements it — when it hits 0 the combinator resolves/rejects.
+        // results/settled grow as the iterator is stepped (LAZY, so an abrupt
+        // Call(promiseResolve)/Invoke(.then) can IteratorClose the live iterator).
         let comb = self.heap.alloc(HeapObj::Combinator {
             kind,
-            results: vec![Value::UNDEFINED; total as usize],
-            remaining: total,
+            results: Vec::new(),
+            remaining: 1,
             result,
-            settled: vec![false; total as usize],
+            settled: Vec::new(),
         });
-        for (i, inp) in inputs.into_iter().enumerate() {
-            // nextPromise = Call(promiseResolve, C, «nextValue») — OBSERVABLE (a
-            // custom/overridden `resolve` is invoked once per value). A throw here
-            // rejects the result (already-subscribed elements are absorbed by the
-            // one-shot settle).
+        loop {
+            // IteratorStep; a throwing next() leaves the iterator done → no close.
+            let val = match self.iterator_step(iter) {
+                Ok(Some(v)) => v,
+                Ok(None) => break,
+                Err(Thrown(msg)) => {
+                    self.reject_with_thrown(result, &msg);
+                    return Ok(Value::heap(result));
+                }
+            };
+            let index = match self.heap.get_mut(comb) {
+                HeapObj::Combinator { results, settled, remaining, .. } => {
+                    let i = results.len() as u32;
+                    results.push(Value::UNDEFINED);
+                    settled.push(false);
+                    *remaining += 1;
+                    i
+                }
+                _ => break,
+            };
+            // nextPromise = Call(promiseResolve, C, «val») — OBSERVABLE. An abrupt
+            // here closes the (still-open) iterator, then rejects with the ORIGINAL
+            // error (IteratorClose preserves the throw).
             let next = match promise_resolve {
-                Some(pr) => match self.call_value(pr, ctor, &[inp]) {
+                Some(pr) => match self.call_value(pr, ctor, &[val]) {
                     Ok(v) => v,
                     Err(Thrown(msg)) => {
-                        let err = match self.pending_throw.take() {
-                            Some(v) => v,
-                            None => self.alloc_error_from_message(&msg),
-                        };
+                        let err = self.take_thrown(&msg);
+                        let _ = self.iterator_close(iter);
                         self.reject(result, err);
                         return Ok(Value::heap(result));
                     }
                 },
-                // No usable constructor (the lowered direct-call op): coerce the
-                // input to a native promise so the Invoke(.then) below has a `then`.
-                None => Value::heap(self.to_promise(inp)),
+                // No usable constructor: coerce to a native promise for the Invoke.
+                None => Value::heap(self.to_promise(val)),
             };
-            // Distinct fulfill/reject elements so a custom thenable that calls a
-            // callback DIRECTLY knows which step to run; via a native reaction the
-            // kind comes from the reaction list (is_reject is then unused).
             let res_f = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
                 combinator: comb,
-                index: i as u32,
+                index,
                 is_reject: false,
             }));
             let res_r = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
                 combinator: comb,
-                index: i as u32,
+                index,
                 is_reject: true,
             }));
-            // Invoke(nextPromise, "then", «res_f, res_r») — OBSERVABLE (an
-            // overridden/custom `then` is invoked). An abrupt Get/Call rejects the
-            // result (the already-subscribed elements are absorbed by the one-shot
-            // settle + the per-index [[AlreadyCalled]] guard).
+            // Invoke(nextPromise, "then", «res_f, res_r») — OBSERVABLE; abrupt →
+            // close + reject with the original error.
             let outcome = match self.get_prop(next, "then") {
                 Ok(then_fn) => self.call_value(then_fn, next, &[res_f, res_r]),
                 Err(e) => Err(e),
             };
             if let Err(Thrown(msg)) = outcome {
-                let err = match self.pending_throw.take() {
-                    Some(v) => v,
-                    None => self.alloc_error_from_message(&msg),
-                };
+                let err = self.take_thrown(&msg);
+                let _ = self.iterator_close(iter);
                 self.reject(result, err);
                 return Ok(Value::heap(result));
             }
         }
+        // Iteration complete: drop the initial count. Race never uses the counter
+        // (it settles on the first element), so its empty form stays pending.
+        if !matches!(kind, CombKind::Race) {
+            if let HeapObj::Combinator { remaining, .. } = self.heap.get_mut(comb) {
+                *remaining -= 1;
+            }
+            self.combinator_finish(comb);
+        }
         Ok(Value::heap(result))
+    }
+
+    /// Reject promise `p` with the live thrown value (`pending_throw`), falling
+    /// back to reconstructing an error from the message.
+    fn reject_with_thrown(&mut self, p: u32, msg: &str) {
+        let e = self.take_thrown(msg);
+        self.reject(p, e);
+    }
+
+    /// The live thrown value (`pending_throw`), or a fresh error from the message.
+    fn take_thrown(&mut self, msg: &str) -> Value {
+        match self.pending_throw.take() {
+            Some(v) => v,
+            None => self.alloc_error_from_message(msg),
+        }
+    }
+
+    /// When a combinator's remainingElementsCount reaches 0, settle its result:
+    /// All/AllSettled resolve with the collected array, Any rejects with an
+    /// AggregateError of the collected reasons. A no-op while count > 0 or for Race.
+    fn combinator_finish(&mut self, comb: u32) {
+        use crate::heap::CombKind;
+        let (ckind, result, remaining) = match self.heap.get(comb) {
+            HeapObj::Combinator { kind, result, remaining, .. } => (*kind, *result, *remaining),
+            _ => return,
+        };
+        if remaining != 0 || ckind == CombKind::Race {
+            return;
+        }
+        let collected = match self.heap.get(comb) {
+            HeapObj::Combinator { results, .. } => results.clone(),
+            _ => return,
+        };
+        match ckind {
+            CombKind::Any => {
+                let e = self.alloc_aggregate_error(collected);
+                self.reject(result, e);
+            }
+            _ => {
+                let arr = Value::heap(self.heap.alloc(HeapObj::Array(collected)));
+                self.resolve(result, arr);
+            }
+        }
     }
 
     /// Perform one combinator step: the input at `index` settled (`kind`) with
@@ -1018,38 +1076,18 @@ impl<'p> Vm<'p> {
             (CombKind::All, ReactionKind::Fulfill)
             | (CombKind::Any, ReactionKind::Reject)
             | (CombKind::AllSettled, _) => {
-                // Record the per-input outcome and decrement the outstanding count.
+                // Record the per-input outcome and decrement the outstanding count;
+                // combinator_finish settles the result when it reaches 0.
                 let stored = if ckind == CombKind::AllSettled {
                     self.make_settled_record(kind, value)
                 } else {
                     value
                 };
-                let done = if let HeapObj::Combinator { results, remaining, .. } =
-                    self.heap.get_mut(comb)
-                {
+                if let HeapObj::Combinator { results, remaining, .. } = self.heap.get_mut(comb) {
                     results[index as usize] = stored;
                     *remaining -= 1;
-                    *remaining == 0
-                } else {
-                    false
-                };
-                if done {
-                    let collected = match self.heap.get(comb) {
-                        HeapObj::Combinator { results, .. } => results.clone(),
-                        _ => Vec::new(),
-                    };
-                    match ckind {
-                        CombKind::Any => {
-                            // All inputs rejected → AggregateError of the reasons.
-                            let e = self.alloc_aggregate_error(collected);
-                            self.reject(result, e);
-                        }
-                        _ => {
-                            let arr = Value::heap(self.heap.alloc(HeapObj::Array(collected)));
-                            self.resolve(result, arr);
-                        }
-                    }
                 }
+                self.combinator_finish(comb);
             }
         }
     }
