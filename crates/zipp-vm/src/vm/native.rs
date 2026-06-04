@@ -113,13 +113,15 @@ pub const WM_GET: u16 = 290;
 pub const WM_SET: u16 = 291;
 pub const WM_HAS: u16 = 292;
 pub const WM_DELETE: u16 = 293;
-// WeakMap ES2025 upsert (free ids in the 311-317 gap).
-pub const WM_GET_OR_INSERT: u16 = 311;
-pub const WM_GET_OR_INSERT_COMPUTED: u16 = 312;
+// WeakMap ES2025 upsert. NB: 311-314 are NOT free — they are already owned by
+// STR_FROM_CHAR_CODE/STR_FROM_CODE_POINT/STR_RAW/DATE_NOW (line 232+), so these
+// use genuinely-unused ids above the current max (857).
+pub const WM_GET_OR_INSERT: u16 = 858;
+pub const WM_GET_OR_INSERT_COMPUTED: u16 = 859;
 /// `get Set.prototype.size` / `get Map.prototype.size` — brand-checked accessor
 /// getters (so `getOwnPropertyDescriptor(Set.prototype,"size").get` is a real fn).
-pub const SET_SIZE_GET: u16 = 313;
-pub const MAP_SIZE_GET: u16 = 314;
+pub const SET_SIZE_GET: u16 = 860;
+pub const MAP_SIZE_GET: u16 = 861;
 pub const WS_ADD: u16 = 294;
 pub const WS_HAS: u16 = 295;
 pub const WS_DELETE: u16 = 296;

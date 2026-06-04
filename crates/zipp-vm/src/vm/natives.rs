@@ -1662,11 +1662,14 @@ impl<'p> Vm<'p> {
             DATE_PARSE => Value::num(parse_date(&self.display(a0))),
             DATE_UTC => Value::num(self.date_utc_ms(args)?),
             STR_RAW => {
-                // String.raw(template, ...subs): interleave template.raw[i] with subs[i].
-                let raw = self.get_prop(a0, "raw")?;
-                if !raw.is_heap() {
-                    return Ok(self.alloc_str(String::new()));
-                }
+                // String.raw(template, ...subs): ToObject(template.raw), then
+                // interleave ToString(raw[i]) with ToString(subs[i]). ToObject of a
+                // nullish `raw` throws TypeError, and ToString throws on a Symbol —
+                // both must propagate (display() would have swallowed them).
+                self.require_object_coercible(a0)?; // ToObject(template)
+                let raw0 = self.get_prop(a0, "raw")?;
+                self.require_object_coercible(raw0)?; // ToObject(template.raw)
+                let raw = self.to_object(raw0)?;
                 let len_v = self.get_prop(raw, "length")?;
                 let n = self.to_number(len_v)?;
                 let raw_len = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
@@ -1674,12 +1677,14 @@ impl<'p> Vm<'p> {
                 let mut out = String::new();
                 for i in 0..raw_len {
                     let seg = self.get_index(raw, Value::int(i as i32))?;
-                    out.push_str(&self.display(seg));
+                    let seg = self.to_js_string(seg)?;
+                    out.push_str(&seg);
                     if i + 1 == raw_len {
                         break;
                     }
                     if let Some(sub) = subs.get(i) {
-                        out.push_str(&self.display(*sub));
+                        let sub = self.to_js_string(*sub)?;
+                        out.push_str(&sub);
                     }
                 }
                 self.alloc_str(out)
