@@ -818,28 +818,25 @@ impl<'p> Vm<'p> {
             _ => return Ok(None),
         };
         let size = native::TA_KINDS[kind as usize].1;
-        // ToIndex-ish: a negative / non-finite offset must be out of range (a
-        // RangeError below), NOT a wrapping `as usize` that then indexes OOB.
-        let pos = {
-            let f = self.value_num(args.first().copied().unwrap_or(Value::UNDEFINED));
-            if f >= 0.0 && f.is_finite() {
-                f as usize
-            } else {
-                usize::MAX
-            }
-        };
-        // get(pos, littleEndian?) / set(pos, value, littleEndian?)
+        // requestIndex = ToIndex(arg0): runs valueOf/toString and throws RangeError
+        // on a negative / too-large index — BEFORE the bounds check (and, for set*,
+        // before the value conversion below) per GetViewValue/SetViewValue order.
+        let pos = self.to_index(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+        // get(pos, littleEndian?) / set(pos, value, littleEndian?). ToBoolean never
+        // throws, so its position relative to the bounds check is unobservable.
         let little_endian = if op == 0 {
             self.truthy(args.get(1).copied().unwrap_or(Value::UNDEFINED))
         } else {
             self.truthy(args.get(2).copied().unwrap_or(Value::UNDEFINED))
         };
-        // Overflow-safe (`pos` may be usize::MAX for an out-of-range offset).
-        if size > byte_length || pos > byte_length - size {
-            return Err(Thrown("RangeError: Offset is outside the bounds of the DataView".into()));
-        }
+        let bounds_ok = size <= byte_length && pos <= byte_length - size;
         let abs = byte_offset + pos;
         if op == 0 {
+            if !bounds_ok {
+                return Err(Thrown(
+                    "RangeError: Offset is outside the bounds of the DataView".into(),
+                ));
+            }
             // read
             let mut b = [0u8; 8];
             {
@@ -881,6 +878,13 @@ impl<'p> Vm<'p> {
                 let f = self.to_number_coerce(v)?;
                 ta_encode(kind, f)
             };
+            // SetViewValue converts the VALUE before checking the bounds — so a
+            // throwing valueOf wins over an out-of-range offset.
+            if !bounds_ok {
+                return Err(Thrown(
+                    "RangeError: Offset is outside the bounds of the DataView".into(),
+                ));
+            }
             if !little_endian {
                 bytes[..size].reverse();
             }
