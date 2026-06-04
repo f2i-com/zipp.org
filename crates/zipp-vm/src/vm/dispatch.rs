@@ -1430,19 +1430,19 @@ impl<'p> Vm<'p> {
                                 Value::heap(p)
                             }
                             S::PromiseAll => {
-                                let c = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                let c = self.promise_ctor_value();
                                 self.promise_combine(crate::heap::CombKind::All, a0, c)?
                             }
                             S::PromiseAllSettled => {
-                                let c = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                let c = self.promise_ctor_value();
                                 self.promise_combine(crate::heap::CombKind::AllSettled, a0, c)?
                             }
                             S::PromiseRace => {
-                                let c = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                let c = self.promise_ctor_value();
                                 self.promise_combine(crate::heap::CombKind::Race, a0, c)?
                             }
                             S::PromiseAny => {
-                                let c = self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                let c = self.promise_ctor_value();
                                 self.promise_combine(crate::heap::CombKind::Any, a0, c)?
                             }
                             S::ObjectDefineProperty => {

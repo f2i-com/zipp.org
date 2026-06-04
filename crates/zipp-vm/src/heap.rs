@@ -364,11 +364,14 @@ pub enum HeapObj {
     /// Shared state for a Promise combinator (`all`/`allSettled`/`race`/`any`).
     /// `results` collects per-input outcomes (sized to the input count);
     /// `remaining` counts inputs still outstanding; `result` is the combinator's
-    /// own promise (settled when the combinator's condition is met).
-    Combinator { kind: CombKind, results: Vec<Value>, remaining: u32, result: u32 },
-    /// A native reaction that performs one combinator step when its subscribed
-    /// input settles — identifying the `combinator` and the input's `index`.
-    CombinatorResolver { combinator: u32, index: u32 },
+    /// own promise (settled when the combinator's condition is met). `settled`
+    /// is the per-index [[AlreadyCalled]] guard: a misbehaving thenable that calls
+    /// a resolve/reject element more than once is ignored after the first.
+    Combinator { kind: CombKind, results: Vec<Value>, remaining: u32, result: u32, settled: Vec<bool> },
+    /// A native resolve/reject element for a combinator: performs one combinator
+    /// step (`is_reject` selects fulfill vs reject when CALLED directly by a custom
+    /// thenable; via the native reaction the kind comes from the reaction list).
+    CombinatorResolver { combinator: u32, index: u32, is_reject: bool },
     /// A suspended generator (`function*`). Owns a DETACHED register window (off
     /// the contiguous live `regs` Vec, so the JIT's pinned-capacity invariant
     /// holds while parked); `func`/`closure` re-create the frame on resume, and

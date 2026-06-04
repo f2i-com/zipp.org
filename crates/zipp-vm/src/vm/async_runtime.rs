@@ -782,6 +782,18 @@ impl<'p> Vm<'p> {
     /// `Promise.all/allSettled/race/any(iterable)`. Coerces each input to a
     /// promise and subscribes a native combinator reaction; the shared
     /// `Combinator` state settles the returned promise per the combinator's rule.
+    /// The `Promise` constructor value, for the lowered `Promise.all/race/...`
+    /// ops where the receiver `this` isn't threaded. Resolved via
+    /// `Promise.prototype.constructor` (so `Get(C, "resolve")` reaches an
+    /// overridden `Promise.resolve`).
+    pub(crate) fn promise_ctor_value(&mut self) -> Value {
+        if self.promise_proto == 0 {
+            return Value::UNDEFINED;
+        }
+        self.get_prop(Value::heap(self.promise_proto), "constructor")
+            .unwrap_or(Value::UNDEFINED)
+    }
+
     pub(crate) fn promise_combine(
         &mut self,
         kind: crate::heap::CombKind,
@@ -851,6 +863,7 @@ impl<'p> Vm<'p> {
             results: vec![Value::UNDEFINED; total as usize],
             remaining: total,
             result,
+            settled: vec![false; total as usize],
         });
         for (i, inp) in inputs.into_iter().enumerate() {
             // nextPromise = Call(promiseResolve, C, «nextValue») — OBSERVABLE (a
@@ -869,15 +882,39 @@ impl<'p> Vm<'p> {
                         return Ok(Value::heap(result));
                     }
                 },
-                None => inp,
+                // No usable constructor (the lowered direct-call op): coerce the
+                // input to a native promise so the Invoke(.then) below has a `then`.
+                None => Value::heap(self.to_promise(inp)),
             };
-            let p = self.to_promise(next);
-            let resolver = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
+            // Distinct fulfill/reject elements so a custom thenable that calls a
+            // callback DIRECTLY knows which step to run; via a native reaction the
+            // kind comes from the reaction list (is_reject is then unused).
+            let res_f = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
                 combinator: comb,
                 index: i as u32,
+                is_reject: false,
             }));
-            // Both settle paths route to the resolver (it dispatches on the kind).
-            self.then_internal(p, resolver, resolver, None);
+            let res_r = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
+                combinator: comb,
+                index: i as u32,
+                is_reject: true,
+            }));
+            // Invoke(nextPromise, "then", «res_f, res_r») — OBSERVABLE (an
+            // overridden/custom `then` is invoked). An abrupt Get/Call rejects the
+            // result (the already-subscribed elements are absorbed by the one-shot
+            // settle + the per-index [[AlreadyCalled]] guard).
+            let outcome = match self.get_prop(next, "then") {
+                Ok(then_fn) => self.call_value(then_fn, next, &[res_f, res_r]),
+                Err(e) => Err(e),
+            };
+            if let Err(Thrown(msg)) = outcome {
+                let err = match self.pending_throw.take() {
+                    Some(v) => v,
+                    None => self.alloc_error_from_message(&msg),
+                };
+                self.reject(result, err);
+                return Ok(Value::heap(result));
+            }
         }
         Ok(Value::heap(result))
     }
@@ -891,6 +928,23 @@ impl<'p> Vm<'p> {
             HeapObj::Combinator { kind, result, .. } => (*kind, *result),
             _ => return,
         };
+        // [[AlreadyCalled]]: a custom thenable may invoke a resolve/reject element
+        // (or both) more than once for the same index — only the first counts.
+        let already = match self.heap.get_mut(comb) {
+            HeapObj::Combinator { settled, .. } => {
+                let s = &mut settled[index as usize];
+                if *s {
+                    true
+                } else {
+                    *s = true;
+                    false
+                }
+            }
+            _ => return,
+        };
+        if already {
+            return;
+        }
         match (ckind, kind) {
             (CombKind::Race, ReactionKind::Fulfill) => self.resolve(result, value),
             (CombKind::Race, ReactionKind::Reject) => self.reject(result, value),
@@ -1136,8 +1190,10 @@ impl<'p> Vm<'p> {
                         }
                         return;
                     }
-                    // A combinator reaction (Promise.all/allSettled/race/any).
-                    if let HeapObj::CombinatorResolver { combinator, index } =
+                    // A combinator reaction (Promise.all/allSettled/race/any). The
+                    // kind comes from the reaction list (is_reject is for the
+                    // direct-call path only).
+                    if let HeapObj::CombinatorResolver { combinator, index, .. } =
                         self.heap.get(callback.heap_index())
                     {
                         let (c, i) = (*combinator, *index);

@@ -944,6 +944,9 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
                     true
                 }
+                // A combinator resolve/reject element is a function (it is passed to
+                // each element's `then`, so `then` must accept + register it).
+                HeapObj::CombinatorResolver { .. } => true,
                 // A class constructor IS callable (typeof is "function"): it can be
                 // bound (`C.bind()`) and passed where a function is expected. Calling
                 // one without `new` still throws (the Call op / call_value route a

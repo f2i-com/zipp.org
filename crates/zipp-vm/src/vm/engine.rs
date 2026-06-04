@@ -576,6 +576,17 @@ impl<'p> Vm<'p> {
                 }
                 return Ok(Value::UNDEFINED);
             }
+            // A combinator resolve/reject element invoked directly (a custom
+            // thenable calling the `then` callback): run the combinator step.
+            if let HeapObj::CombinatorResolver { combinator, index, is_reject } =
+                self.heap.get(callee.heap_index())
+            {
+                let (c, i, isr) = (*combinator, *index, *is_reject);
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let kind = if isr { ReactionKind::Reject } else { ReactionKind::Fulfill };
+                self.combinator_step(c, i, kind, arg);
+                return Ok(Value::UNDEFINED);
+            }
         }
         // %Function.prototype% is itself a callable that returns undefined.
         if callee.is_heap() && self.fn_proto != 0 && callee.heap_index() == self.fn_proto {
