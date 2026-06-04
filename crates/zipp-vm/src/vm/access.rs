@@ -88,6 +88,22 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // The same for a non-configurable NAMED (non-index) own property stored in
+        // the arr_props side table — Array/Arguments/TypedArray/Map/Set/Date/…
+        // `defineProperty`'d named props. Canonical integer-index keys are excluded
+        // (they route through the array-index-override path below, which carries
+        // its own configurable check); without this, `delete obj.x` on such a prop
+        // removed it unconditionally, so verifyProperty's deletion probe wrongly
+        // reported a non-configurable property as configurable.
+        if key.parse::<usize>().map_or(true, |i| i.to_string() != key) {
+            if let Some(m) = self.arr_props.get(&idx) {
+                if let Some(p) = m.pos(key) {
+                    if !m.attrs[p].configurable {
+                        return Value::bool(false);
+                    }
+                }
+            }
+        }
         // A TypedArray's in-bounds integer index is a non-configurable exotic own
         // property: `delete ta[0]` fails (false). An out-of-range / non-index key
         // falls through to the named-property (arr_props) deletion below.
