@@ -15,6 +15,16 @@ impl<'p> Vm<'p> {
     /// The window is always released (truncate) before returning — including on a
     /// callback error — so a thrown callback never leaks register slots.
     pub(crate) fn array_each(&mut self, idx: u32, cb: Value, mode: EachMode, this_arg: Value) -> Result<Option<Value>, Thrown> {
+        // IsCallable(callback) precedes iteration: map/filter/forEach on an EMPTY
+        // array with a non-callable callback must still throw TypeError.
+        if !self.is_callable(cb) {
+            let m = match mode {
+                EachMode::Map => "map",
+                EachMode::Filter => "filter",
+                EachMode::ForEach => "forEach",
+            };
+            return Err(Thrown(format!("TypeError: {m} callback is not a function")));
+        }
         // `out` (and the snapshot) hold values not reachable from the GC roots
         // while the callback re-enters the interpreter — suspend GC for the scope.
         let _gc = self.gc_lock_guard();
@@ -670,6 +680,11 @@ impl<'p> Vm<'p> {
             // doesn't fit); the callback receives (element, index).
             "find" | "findIndex" | "some" | "every" => {
                 let cb = arg0;
+                // IsCallable(callback) is checked before any iteration, so an empty
+                // array with a non-callable predicate still throws (spec step 3/4).
+                if !self.is_callable(cb) {
+                    return Err(Thrown(format!("TypeError: {name} predicate is not a function")));
+                }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
                 let snapshot = self.array_snapshot(idx);
@@ -857,6 +872,9 @@ impl<'p> Vm<'p> {
             "flatMap" => {
                 // map(cb) then flatten one level (array results spliced in).
                 let cb = arg0;
+                if !self.is_callable(cb) {
+                    return Err(Thrown("TypeError: flatMap mapper is not a function".into()));
+                }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
                 let snapshot = self.array_snapshot(idx);
@@ -875,6 +893,9 @@ impl<'p> Vm<'p> {
             }
             "findLast" | "findLastIndex" => {
                 let cb = arg0;
+                if !self.is_callable(cb) {
+                    return Err(Thrown(format!("TypeError: {name} predicate is not a function")));
+                }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
                 let snapshot = self.array_snapshot(idx);
