@@ -141,6 +141,11 @@ impl Vm<'_> {
                         Resume::Value(v) | Resume::Throw(v) => root_val!(*v),
                     }
                 }
+                Microtask::ThenableJob { thenable, then, promise } => {
+                    root_val!(*thenable);
+                    root_val!(*then);
+                    root_idx!(*promise);
+                }
             }
         }
         for f in &self.frames {

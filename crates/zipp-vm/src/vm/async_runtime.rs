@@ -279,6 +279,31 @@ impl<'p> Vm<'p> {
                 self.then_internal(inner, Value::UNDEFINED, Value::UNDEFINED, Some(p));
                 return;
             }
+            // Thenable adoption (the Promise resolve function, steps 8-12): an
+            // object with a callable `then` is adopted — defer
+            // `then.call(value, resolveFn, rejectFn)` to a microtask (spec ordering).
+            // A throwing `then` GETTER rejects the promise.
+            if self.is_object_value(value) {
+                let then = match self.get_prop(value, "then") {
+                    Ok(t) => t,
+                    Err(Thrown(msg)) => {
+                        let e = match self.pending_throw.take() {
+                            Some(v) => v,
+                            None => self.alloc_error_from_message(&msg),
+                        };
+                        self.reject(p, e);
+                        return;
+                    }
+                };
+                if self.is_callable(then) {
+                    self.microtasks.push_back(Microtask::ThenableJob {
+                        thenable: value,
+                        then,
+                        promise: p,
+                    });
+                    return;
+                }
+            }
         }
         self.settle(p, PromiseState::Fulfilled, value);
     }
@@ -1217,6 +1242,25 @@ impl<'p> Vm<'p> {
                     self.drive_async_gen(activation, input);
                 } else {
                     self.drive_async(activation, input);
+                }
+            }
+            // PromiseResolveThenableJob: run then.call(thenable, resolveFn, rejectFn).
+            // The resolving functions settle `promise` (one-shot via settle's Pending
+            // guard, so a thenable that calls both / twice is handled). A throwing
+            // `then` rejects the promise (a no-op if it already settled).
+            Microtask::ThenableJob { thenable, then, promise } => {
+                let res = Value::heap(
+                    self.heap.alloc(HeapObj::BoundResolver { promise, is_reject: false }),
+                );
+                let rej = Value::heap(
+                    self.heap.alloc(HeapObj::BoundResolver { promise, is_reject: true }),
+                );
+                if let Err(Thrown(msg)) = self.call_value(then, thenable, &[res, rej]) {
+                    let e = match self.pending_throw.take() {
+                        Some(v) => v,
+                        None => self.alloc_error_from_message(&msg),
+                    };
+                    self.reject(promise, e);
                 }
             }
         }

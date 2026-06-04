@@ -110,6 +110,9 @@ pub(crate) enum Resume {
 pub(crate) enum Microtask {
     Reaction { callback: Value, arg: Value, dependent: u32, kind: ReactionKind, finally: bool },
     AsyncResume { activation: u32, input: Resume },
+    /// PromiseResolveThenableJob: resolving `promise` with a thenable defers
+    /// `then.call(thenable, resolveFn, rejectFn)` to this microtask (spec ordering).
+    ThenableJob { thenable: Value, then: Value, promise: u32 },
 }
 
 /// Native (built-in) function ids — the discriminant carried by `HeapObj::Native`.
