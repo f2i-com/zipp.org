@@ -1071,6 +1071,35 @@ impl<'p> Vm<'p> {
                 match self.proxy_set_prototype_of(a0, a1)? {
                     Some(b) => Value::bool(b),
                     None => {
+                        // [[SetPrototypeOf]] guards: a same-proto change is a no-op
+                        // success; a non-extensible target rejects a real change; a
+                        // proto chain that loops back to the target is rejected.
+                        let cur = self.object_get_prototype_of(a0);
+                        if cur == a1 {
+                            return Ok(Value::bool(true));
+                        }
+                        let extensible = match self.heap.get(a0.heap_index()) {
+                            HeapObj::Object(m) => m.extensible,
+                            _ => true,
+                        };
+                        if !extensible {
+                            return Ok(Value::bool(false));
+                        }
+                        let mut p = a1;
+                        while p.is_heap() {
+                            if p.heap_index() == a0.heap_index() {
+                                return Ok(Value::bool(false)); // cycle
+                            }
+                            // A Proxy's [[GetPrototypeOf]] may be exotic — stop here.
+                            if self.proxy_parts(p.heap_index()).is_some() {
+                                break;
+                            }
+                            let next = self.object_get_prototype_of(p);
+                            if !next.is_heap() {
+                                break;
+                            }
+                            p = next;
+                        }
                         self.proto_of.insert(a0.heap_index(), a1);
                         Value::bool(true)
                     }
