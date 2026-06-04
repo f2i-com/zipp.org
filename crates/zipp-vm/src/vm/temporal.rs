@@ -2510,7 +2510,17 @@ fn annotations_valid(ann: &str) -> bool {
             None => (false, content),
         };
         if let Some(eq) = body.find('=') {
-            if &body[..eq] == "u-ca" {
+            let key = &body[..eq];
+            // AnnotationKey grammar: (a-z | _) then (a-z | _ | 0-9 | -)*. An
+            // upper-cased or otherwise malformed key (e.g. "U-CA", "FOO") is a
+            // syntax error — NOT an ignorable unknown annotation.
+            let key_char = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_';
+            let valid_key = key.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+                && key.bytes().all(key_char);
+            if !valid_key {
+                return false;
+            }
+            if key == "u-ca" {
                 cal_count += 1;
                 cal_critical |= critical;
             } else if critical {
