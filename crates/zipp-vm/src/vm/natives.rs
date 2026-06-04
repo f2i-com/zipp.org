@@ -1429,6 +1429,22 @@ impl<'p> Vm<'p> {
             WM_DELETE => self.weakmap_method(this, "delete", args)?,
             WM_GET_OR_INSERT => self.weakmap_method(this, "getOrInsert", args)?,
             WM_GET_OR_INSERT_COMPUTED => self.weakmap_method(this, "getOrInsertComputed", args)?,
+            SET_SIZE_GET => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                Some(HeapObj::Set(items)) => Value::num(items.len() as f64),
+                _ => {
+                    return Err(Thrown(
+                        "TypeError: get Set.prototype.size called on incompatible receiver".into(),
+                    ))
+                }
+            },
+            MAP_SIZE_GET => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                Some(HeapObj::Map { keys, .. }) => Value::num(keys.len() as f64),
+                _ => {
+                    return Err(Thrown(
+                        "TypeError: get Map.prototype.size called on incompatible receiver".into(),
+                    ))
+                }
+            },
             WS_ADD => self.weakset_method(this, "add", args)?,
             WS_HAS => self.weakset_method(this, "has", args)?,
             WS_DELETE => self.weakset_method(this, "delete", args)?,

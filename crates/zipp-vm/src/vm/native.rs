@@ -116,6 +116,10 @@ pub const WM_DELETE: u16 = 293;
 // WeakMap ES2025 upsert (free ids in the 311-317 gap).
 pub const WM_GET_OR_INSERT: u16 = 311;
 pub const WM_GET_OR_INSERT_COMPUTED: u16 = 312;
+/// `get Set.prototype.size` / `get Map.prototype.size` — brand-checked accessor
+/// getters (so `getOwnPropertyDescriptor(Set.prototype,"size").get` is a real fn).
+pub const SET_SIZE_GET: u16 = 313;
+pub const MAP_SIZE_GET: u16 = 314;
 pub const WS_ADD: u16 = 294;
 pub const WS_HAS: u16 = 295;
 pub const WS_DELETE: u16 = 296;
@@ -831,6 +835,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         WM_SET => ("set", 2),
         WM_GET_OR_INSERT => ("getOrInsert", 2),
         WM_GET_OR_INSERT_COMPUTED => ("getOrInsertComputed", 2),
+        SET_SIZE_GET => ("get size", 0),
+        MAP_SIZE_GET => ("get size", 0),
         WM_HAS => ("has", 1),
         WM_DELETE => ("delete", 1),
         WS_ADD => ("add", 1),

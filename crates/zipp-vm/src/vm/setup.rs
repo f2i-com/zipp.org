@@ -262,6 +262,24 @@ impl<'p> Vm<'p> {
         // method-as-value access to them (get_prop), mirroring arr_proto/str_proto.
         self.set_proto = set_proto;
         self.map_proto = map_proto;
+        // `get Set.prototype.size` / `get Map.prototype.size` as real accessor
+        // properties (the value still resolves via the fast get_member path). The
+        // getter is brand-checked; { enumerable:false, configurable:true }.
+        let size_acc = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: true,
+            setter: Value::UNDEFINED,
+        };
+        let set_size = Value::heap(self.heap.alloc(HeapObj::Native(SET_SIZE_GET)));
+        let map_size = Value::heap(self.heap.alloc(HeapObj::Native(MAP_SIZE_GET)));
+        if let HeapObj::Object(p) = self.heap.get_mut(set_proto) {
+            p.define("size", set_size, size_acc);
+        }
+        if let HeapObj::Object(p) = self.heap.get_mut(map_proto) {
+            p.define("size", map_size, size_acc);
+        }
         self.date_proto = date_proto;
         // Date.prototype[Symbol.toPrimitive]: { writable:false, enumerable:false,
         // configurable:true } per spec (the only @@toPrimitive on a built-in proto
