@@ -233,6 +233,12 @@ pub struct Vm<'p> {
     /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |
     /// 1=length)`. Empty in normal programs; only `delete` on these keys fills it.
     deleted_callable_intrinsics: std::collections::HashSet<(u32, u8)>,
+    /// Heap indices of derived-class instances whose `super(...)` has run during
+    /// construction (set by the SuperCtor ops, read+cleared in `construct`). A
+    /// derived constructor that returns `undefined` without `super()` having run
+    /// throws a ReferenceError. Transient — entries live only across one
+    /// in-flight `construct`.
+    super_called: std::collections::HashSet<u32>,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods

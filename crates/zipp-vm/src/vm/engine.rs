@@ -96,6 +96,7 @@ impl<'p> Vm<'p> {
             ab_max: std::collections::HashMap::new(),
             ta_tracking: std::collections::HashSet::new(),
             deleted_callable_intrinsics: std::collections::HashSet::new(),
+            super_called: std::collections::HashSet::new(),
             obj_proto: 0,
             fn_proto: 0,
             function_ctor: 0,

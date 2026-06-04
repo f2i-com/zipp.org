@@ -604,10 +604,31 @@ impl<'p> Vm<'p> {
             // returns an object/array replaces the instance.
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
-                let ret = self.call_value(f, obj, args)?;
+                let result = self.call_value(f, obj, args);
+                // Capture + clear the super() signal BEFORE propagating any throw,
+                // so a constructor that threw never leaves a stale entry (the heap
+                // index could later be reused by another instance).
+                let super_called = self.super_called.remove(&obj.heap_index());
+                let ret = result?;
                 // Any object return replaces the new instance.
                 if self.is_object_value(ret) {
                     return Ok(ret);
+                }
+                if parent.is_some() {
+                    // A DERIVED class constructor may only return an object or
+                    // undefined — any other value throws (a base class silently
+                    // ignores a primitive return and yields `this`).
+                    if ret != Value::UNDEFINED {
+                        return Err(Thrown(
+                            "TypeError: Derived constructors may only return object or undefined".into(),
+                        ));
+                    }
+                    // …and `this` must have been initialised by `super(...)`.
+                    if !super_called {
+                        return Err(Thrown(
+                            "ReferenceError: Must call super constructor in derived class before returning from derived constructor".into(),
+                        ));
+                    }
                 }
             }
         } else {
@@ -620,6 +641,8 @@ impl<'p> Vm<'p> {
                 let f = self.ctor_value(fid, &ctor_ups);
                 self.call_value(f, obj, &[])?;
             }
+            // Clear any super() mark a nested parent ctor left on this instance.
+            self.super_called.remove(&obj.heap_index());
         }
         Ok(obj)
     }

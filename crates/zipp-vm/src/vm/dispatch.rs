@@ -933,6 +933,9 @@ impl<'p> Vm<'p> {
                             args.push(self.get(base, arg_base + i));
                         }
                         self.run_class_ctor(parent, this, &args)?;
+                        if this.is_heap() {
+                            self.super_called.insert(this.heap_index());
+                        }
                         ip += 1;
                     }
                     Instr::SuperCtorSpread { home_class_id, args } => {
@@ -942,6 +945,9 @@ impl<'p> Vm<'p> {
                         let args_v = self.get(base, args);
                         let arg_vec = self.array_snapshot(args_v.heap_index());
                         self.run_class_ctor(parent, this, &arg_vec)?;
+                        if this.is_heap() {
+                            self.super_called.insert(this.heap_index());
+                        }
                         ip += 1;
                     }
                     Instr::SuperMethod { dst, home_class_id, name, arg_base, argc } => {
