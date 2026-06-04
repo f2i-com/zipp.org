@@ -1009,6 +1009,62 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(recv)) // chainable
             }
+            "getOrInsert" => {
+                // Existing value wins; otherwise insert `value` and return it.
+                let key = normalize_zero(a0);
+                let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let existing = match self.heap.get(idx) {
+                    HeapObj::Map { keys, vals } => {
+                        keys.iter().position(|k| self.same_value_zero(*k, key)).map(|i| vals[i])
+                    }
+                    _ => None,
+                };
+                if let Some(v) = existing {
+                    return Ok(Some(v));
+                }
+                if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                    keys.push(key);
+                    vals.push(val);
+                }
+                Ok(Some(val))
+            }
+            "getOrInsertComputed" => {
+                let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_callable(cb) {
+                    return Err(Thrown(
+                        "TypeError: the callback argument must be a function".into(),
+                    ));
+                }
+                let key = normalize_zero(a0);
+                let existing = match self.heap.get(idx) {
+                    HeapObj::Map { keys, vals } => {
+                        keys.iter().position(|k| self.same_value_zero(*k, key)).map(|i| vals[i])
+                    }
+                    _ => None,
+                };
+                if let Some(v) = existing {
+                    return Ok(Some(v));
+                }
+                // Compute (may re-enter and mutate the map), then set key -> value
+                // (overwriting if the callback inserted it) and return value.
+                let val = self.call_value(cb, Value::UNDEFINED, &[key])?;
+                let pos = match self.heap.get(idx) {
+                    HeapObj::Map { keys, .. } => {
+                        keys.iter().position(|k| self.same_value_zero(*k, key))
+                    }
+                    _ => None,
+                };
+                if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                    match pos {
+                        Some(i) => vals[i] = val,
+                        None => {
+                            keys.push(key);
+                            vals.push(val);
+                        }
+                    }
+                }
+                Ok(Some(val))
+            }
             "delete" => {
                 let pos = match self.heap.get(idx) {
                     HeapObj::Map { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),

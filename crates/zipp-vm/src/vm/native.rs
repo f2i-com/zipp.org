@@ -612,6 +612,9 @@ pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
     ("toLocaleTimeString", 6, 0), ("toString", 6, 0), ("toTimeString", 6, 0), ("toUTCString", 6, 0),
     ("toGMTString", 6, 0), ("getYear", 6, 0), ("setYear", 6, 1),
     ("valueOf", 6, 0),
+    // Map.prototype upsert proposal (kind 4) — appended here (not in the Map
+    // block) so existing entries keep their native ids.
+    ("getOrInsert", 4, 2), ("getOrInsertComputed", 4, 2),
 ];
 
 /// `(name, kind)` for a prototype-method native id, if it is one.
