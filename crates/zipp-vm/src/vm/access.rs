@@ -277,6 +277,22 @@ impl<'p> Vm<'p> {
         // result's `index`/`input`/`groups` — lives in the arr_props side table
         // (numeric indices + `length` were handled above). Mirrors fn_props.
         if matches!(self.heap.get(idx), HeapObj::Array(_)) {
+            // A canonical numeric-string key is an array INDEX (`arr["0"] = v` is
+            // `arr[0] = v`) — write to the dense elements, extending with holes.
+            // (A huge index past the dense limit, or a non-canonical key, falls
+            // through to the arr_props side table as a named property.)
+            if let Ok(n) = key.parse::<usize>() {
+                if n.to_string() == key && n < crate::vm::MAX_DENSE_ARRAY_LEN {
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        if n >= items.len() {
+                            items.resize(n + 1, Value::UNDEFINED);
+                        }
+                        items[n] = val;
+                    }
+                    self.heap.bump_version(idx);
+                    return Ok(());
+                }
+            }
             let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             if added {
                 self.heap.bump_version(idx);
