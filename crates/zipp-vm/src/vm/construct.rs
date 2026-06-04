@@ -916,6 +916,12 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
                     true
                 }
+                // A class constructor IS callable (typeof is "function"): it can be
+                // bound (`C.bind()`) and passed where a function is expected. Calling
+                // one without `new` still throws (the Call op / call_value route a
+                // Class to resolve_callable, which rejects it) — per spec that throw
+                // is "class constructor cannot be invoked without 'new'".
+                HeapObj::Class(_) => true,
                 // A built-in constructor object (String/Number/Array/…) is callable
                 // (typeof is "function") — it can be passed as a callback.
                 HeapObj::Object(m) => m.is_ctor,

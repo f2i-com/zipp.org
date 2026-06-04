@@ -755,10 +755,34 @@ impl<'p> Vm<'p> {
                     }
                     Instr::MakeClass { dst, class_id, parent } => {
                         let cd = self.class_def(class_id as usize).clone();
-                        let parent_idx = parent.and_then(|p| {
-                            let pv = self.get(base, p);
-                            pv.is_heap().then(|| pv.heap_index())
-                        });
+                        // `extends superclass`: the superclass must be `null` (proto
+                        // parent null) or a constructor — anything else (a plain
+                        // object, a number, …) is a TypeError per ClassDefinition-
+                        // Evaluation, thrown here at class creation.
+                        let parent_idx = match parent {
+                            Some(p) => {
+                                let pv = self.get(base, p);
+                                // Symbol/BigInt HAVE a [[Construct]] (it throws on a
+                                // `super()` call) so they ARE valid extends values
+                                // even though `new Symbol()` throws — IsConstructor is
+                                // true for them, unlike e.g. `parseInt`.
+                                let ctor_like = self.is_constructor(pv)
+                                    || (pv.is_heap()
+                                        && (pv.heap_index() == self.symbol_ctor
+                                            || pv.heap_index() == self.bigint_ctor));
+                                if pv == Value::NULL {
+                                    None
+                                } else if !ctor_like {
+                                    return Err(Thrown(
+                                        "TypeError: Class extends value is not a constructor or null"
+                                            .into(),
+                                    ));
+                                } else {
+                                    Some(pv.heap_index())
+                                }
+                            }
+                            None => None,
+                        };
                         // Materialize each method as a callable value once
                         // (instances share these): a plain Func, or a Closure over
                         // this frame when the method closes over an enclosing local.
