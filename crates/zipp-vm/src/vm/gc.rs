@@ -148,6 +148,10 @@ impl Vm<'_> {
                 }
             }
         }
+        if let Some((resolve, reject)) = &self.cap_capture {
+            root_val!(*resolve);
+            root_val!(*reject);
+        }
         for f in &self.frames {
             root_idx!(f.closure);
         }

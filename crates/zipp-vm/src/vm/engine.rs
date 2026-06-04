@@ -86,6 +86,7 @@ impl<'p> Vm<'p> {
             pending_throw: None,
             pending_yield: None,
             pending_await: None,
+            cap_capture: None,
             microtasks: std::collections::VecDeque::new(),
             template_raws: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),

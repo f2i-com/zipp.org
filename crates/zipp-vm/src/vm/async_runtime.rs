@@ -807,6 +807,40 @@ impl<'p> Vm<'p> {
     /// `Promise.all/allSettled/race/any(iterable)`. Coerces each input to a
     /// promise and subscribes a native combinator reaction; the shared
     /// `Combinator` state settles the returned promise per the combinator's rule.
+    /// NewPromiseCapability(C): construct `C` with a capturing executor and return
+    /// `(promise, resolve, reject)`. Works for the native Promise and any subclass
+    /// that chains through `super()` (the executor is invoked synchronously with
+    /// callable resolve/reject). Throws if C isn't a constructor, the executor
+    /// isn't called, or resolve/reject aren't callable.
+    pub(crate) fn new_promise_capability(
+        &mut self,
+        c: Value,
+    ) -> Result<(Value, Value, Value), Thrown> {
+        if !self.is_constructor(c) {
+            return Err(Thrown("TypeError: NewPromiseCapability requires a constructor".into()));
+        }
+        // Save/restore for a nested capability; clear so the executor's
+        // already-called check starts fresh.
+        let saved = self.cap_capture.take();
+        let executor = Value::heap(self.heap.alloc(HeapObj::Native(native::CAP_EXECUTOR)));
+        let constructed = self.construct(c, &[executor]);
+        let captured = self.cap_capture.take();
+        self.cap_capture = saved;
+        let promise = constructed?;
+        let (resolve, reject) = match captured {
+            Some(rr) => rr,
+            None => {
+                return Err(Thrown(
+                    "TypeError: Promise resolve/reject were not set by the executor".into(),
+                ))
+            }
+        };
+        if !self.is_callable(resolve) || !self.is_callable(reject) {
+            return Err(Thrown("TypeError: Promise resolve or reject is not callable".into()));
+        }
+        Ok((promise, resolve, reject))
+    }
+
     /// The `Promise` constructor value, for the lowered `Promise.all/race/...`
     /// ops where the receiver `this` isn't threaded. Resolved via
     /// `Promise.prototype.constructor` (so `Get(C, "resolve")` reaches an
@@ -826,7 +860,13 @@ impl<'p> Vm<'p> {
         ctor: Value,
     ) -> Result<Value, Thrown> {
         use crate::heap::CombKind;
-        let result = self.alloc_promise();
+        // NewPromiseCapability(C) — the result is a C-typed promise (a subclass
+        // instance when `this` is a Promise subclass). A throwing/invalid capability
+        // (executor not called / called twice / non-callable resolve-reject) throws
+        // synchronously per ReturnIfAbrupt. The instance is a HeapObj::Promise, so
+        // the existing self.resolve/reject(result) settle it directly.
+        let cap_promise = self.new_promise_capability(ctor)?.0;
+        let result = cap_promise.heap_index();
         // GetPromiseResolve(C): `promiseResolve = Get(C, "resolve")`, which must be
         // callable. This is the spec-observable step the tests check (overriding
         // `Promise.resolve` is visible, and a non-callable resolve rejects). When C

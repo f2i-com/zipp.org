@@ -122,6 +122,9 @@ pub const WM_GET_OR_INSERT_COMPUTED: u16 = 859;
 /// getters (so `getOwnPropertyDescriptor(Set.prototype,"size").get` is a real fn).
 pub const SET_SIZE_GET: u16 = 860;
 pub const MAP_SIZE_GET: u16 = 861;
+/// The GetCapabilitiesExecutor for NewPromiseCapability: captures (resolve,
+/// reject) into `vm.cap_capture`; throws if called a second time.
+pub const CAP_EXECUTOR: u16 = 862;
 pub const WS_ADD: u16 = 294;
 pub const WS_HAS: u16 = 295;
 pub const WS_DELETE: u16 = 296;
@@ -839,6 +842,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         WM_GET_OR_INSERT_COMPUTED => ("getOrInsertComputed", 2),
         SET_SIZE_GET => ("get size", 0),
         MAP_SIZE_GET => ("get size", 0),
+        CAP_EXECUTOR => ("", 2),
         WM_HAS => ("has", 1),
         WM_DELETE => ("delete", 1),
         WS_ADD => ("add", 1),

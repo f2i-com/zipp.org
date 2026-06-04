@@ -189,6 +189,11 @@ pub struct Vm<'p> {
     /// activation, mirroring `pending_yield`. Unlike generators, async activations
     /// PRESERVE handlers across a suspension so `try { await p } catch` works.
     pending_await: Option<(Value, usize, Vec<Handler>)>,
+    /// Scratch slot for NewPromiseCapability: the capturing executor (CAP_EXECUTOR)
+    /// writes its (resolve, reject) arguments here during `new C(executor)`, which
+    /// `new_promise_capability` `.take()`s immediately after construction. `Some`
+    /// while a capture is in flight (a second executor call → TypeError).
+    cap_capture: Option<(Value, Value)>,
     /// FIFO microtask queue — the entire event loop (no timers/IO exist). Drained
     /// to empty by `drain_microtasks` after the main script returns; a microtask
     /// may enqueue more, which run in the same drain.

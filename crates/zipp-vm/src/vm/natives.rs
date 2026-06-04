@@ -1445,6 +1445,19 @@ impl<'p> Vm<'p> {
                     ))
                 }
             },
+            // GetCapabilitiesExecutor: capture (resolve, reject); a second call
+            // (capability.[[Resolve]] already set) is a TypeError.
+            CAP_EXECUTOR => {
+                if self.cap_capture.is_some() {
+                    return Err(Thrown(
+                        "TypeError: Promise capability executor already invoked".into(),
+                    ));
+                }
+                let resolve = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let reject = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                self.cap_capture = Some((resolve, reject));
+                Value::UNDEFINED
+            }
             WS_ADD => self.weakset_method(this, "add", args)?,
             WS_HAS => self.weakset_method(this, "has", args)?,
             WS_DELETE => self.weakset_method(this, "delete", args)?,
