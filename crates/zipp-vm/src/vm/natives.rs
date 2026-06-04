@@ -591,6 +591,11 @@ impl<'p> Vm<'p> {
                 self.call_value(this, a0, &callargs)?
             }
             FN_BIND => {
+                if !self.is_callable(this) {
+                    return Err(Thrown(
+                        "TypeError: Function.prototype.bind called on a non-callable".into(),
+                    ));
+                }
                 let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
                 Value::heap(self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound }))
             }

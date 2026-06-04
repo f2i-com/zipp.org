@@ -580,6 +580,16 @@ impl<'p> Vm<'p> {
             }
             return Ok(obj);
         }
+        // `new (boundFn)(...)`: [[Construct]] forwards to the bound target with the
+        // bound arguments prepended (the bound `this` is ignored for construction).
+        let bound_parts = match self.heap.get(cv.heap_index()) {
+            HeapObj::Bound { target, args: bargs, .. } => Some((*target, bargs.clone())),
+            _ => None,
+        };
+        if let Some((target, bargs)) = bound_parts {
+            let combined: Vec<Value> = bargs.into_iter().chain(args.iter().copied()).collect();
+            return self.construct(target, &combined);
+        }
         let (ctor, ctor_ups, has_explicit, parent) = match self.heap.get(cv.heap_index()) {
             HeapObj::Class(c) => (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent),
             _ => return Err(Thrown("TypeError: value is not a constructor".into())),
