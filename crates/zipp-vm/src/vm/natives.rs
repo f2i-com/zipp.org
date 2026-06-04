@@ -1427,6 +1427,8 @@ impl<'p> Vm<'p> {
             WM_SET => self.weakmap_method(this, "set", args)?,
             WM_HAS => self.weakmap_method(this, "has", args)?,
             WM_DELETE => self.weakmap_method(this, "delete", args)?,
+            WM_GET_OR_INSERT => self.weakmap_method(this, "getOrInsert", args)?,
+            WM_GET_OR_INSERT_COMPUTED => self.weakmap_method(this, "getOrInsertComputed", args)?,
             WS_ADD => self.weakset_method(this, "add", args)?,
             WS_HAS => self.weakset_method(this, "has", args)?,
             WS_DELETE => self.weakset_method(this, "delete", args)?,

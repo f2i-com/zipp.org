@@ -417,7 +417,14 @@ impl<'p> Vm<'p> {
         // to NewWeakMap/NewWeakSet.
         let weakmap_proto = build(
             self,
-            &[("get", WM_GET), ("set", WM_SET), ("has", WM_HAS), ("delete", WM_DELETE)],
+            &[
+                ("get", WM_GET),
+                ("set", WM_SET),
+                ("has", WM_HAS),
+                ("delete", WM_DELETE),
+                ("getOrInsert", WM_GET_OR_INSERT),
+                ("getOrInsertComputed", WM_GET_OR_INSERT_COMPUTED),
+            ],
             None,
         );
         let weakset_proto = build(self, &[("add", WS_ADD), ("has", WS_HAS), ("delete", WS_DELETE)], None);

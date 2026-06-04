@@ -113,6 +113,9 @@ pub const WM_GET: u16 = 290;
 pub const WM_SET: u16 = 291;
 pub const WM_HAS: u16 = 292;
 pub const WM_DELETE: u16 = 293;
+// WeakMap ES2025 upsert (free ids in the 311-317 gap).
+pub const WM_GET_OR_INSERT: u16 = 311;
+pub const WM_GET_OR_INSERT_COMPUTED: u16 = 312;
 pub const WS_ADD: u16 = 294;
 pub const WS_HAS: u16 = 295;
 pub const WS_DELETE: u16 = 296;
@@ -826,6 +829,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         MATH_RANDOM => ("random", 0),
         WM_GET => ("get", 1),
         WM_SET => ("set", 2),
+        WM_GET_OR_INSERT => ("getOrInsert", 2),
+        WM_GET_OR_INSERT_COMPUTED => ("getOrInsertComputed", 2),
         WM_HAS => ("has", 1),
         WM_DELETE => ("delete", 1),
         WS_ADD => ("add", 1),

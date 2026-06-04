@@ -1269,6 +1269,19 @@ impl<'p> Vm<'p> {
     /// `WeakMap.prototype.{get,set,has,delete}`. Brand-checked (the receiver must be
     /// a WeakMap, so `WeakMap.prototype.set.call(aMap)` throws) and keys must be
     /// objects. No GC, so entries are held strongly (unobservable without GC).
+    /// CanBeHeldWeakly(v) (ES 7.3.X): a value usable as a WeakMap/WeakSet/WeakRef
+    /// key/target — any Object, or a Symbol that is NOT in the global Symbol
+    /// registry (a `Symbol.for` result cannot be held weakly).
+    pub(crate) fn can_be_held_weakly(&self, v: Value) -> bool {
+        if self.is_object_value(v) {
+            return true;
+        }
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
+            return !self.symbol_registry.values().any(|&s| s.bits() == v.bits());
+        }
+        false
+    }
+
     pub(crate) fn weakmap_method(&mut self, this: Value, name: &str, args: &[Value]) -> Result<Value, Thrown> {
         if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::WeakMap { .. }) {
             return Err(Thrown(format!(
@@ -1295,7 +1308,7 @@ impl<'p> Vm<'p> {
                 Ok(Value::bool(found))
             }
             "set" => {
-                if !self.is_object_value(a0) {
+                if !self.can_be_held_weakly(a0) {
                     return Err(Thrown("TypeError: Invalid value used as weak map key".into()));
                 }
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -1313,6 +1326,47 @@ impl<'p> Vm<'p> {
                     }
                 }
                 Ok(this) // chainable
+            }
+            // ES2025 upsert: existing value wins, else insert `value` (getOrInsert)
+            // or the callback's result (getOrInsertComputed) and return it.
+            "getOrInsert" | "getOrInsertComputed" => {
+                if !self.can_be_held_weakly(a0) {
+                    return Err(Thrown("TypeError: Invalid value used as weak map key".into()));
+                }
+                let computed = name == "getOrInsertComputed";
+                let cb = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if computed && !self.is_callable(cb) {
+                    return Err(Thrown("TypeError: the callback argument must be a function".into()));
+                }
+                let existing = match self.heap.get(idx) {
+                    HeapObj::WeakMap { keys, vals } => {
+                        keys.iter().position(|k| self.same_value_zero(*k, a0)).map(|i| vals[i])
+                    }
+                    _ => None,
+                };
+                if let Some(v) = existing {
+                    return Ok(v);
+                }
+                let val = if computed {
+                    // The callback may re-enter and mutate; re-find after.
+                    self.call_value(cb, Value::UNDEFINED, &[a0])?
+                } else {
+                    cb // getOrInsert's `value` argument
+                };
+                let pos = match self.heap.get(idx) {
+                    HeapObj::WeakMap { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),
+                    _ => None,
+                };
+                if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
+                    match pos {
+                        Some(i) => vals[i] = val,
+                        None => {
+                            keys.push(a0);
+                            vals.push(val);
+                        }
+                    }
+                }
+                Ok(val)
             }
             "delete" => {
                 let pos = match self.heap.get(idx) {
@@ -1348,7 +1402,7 @@ impl<'p> Vm<'p> {
                 Ok(Value::bool(found))
             }
             "add" => {
-                if !self.is_object_value(a0) {
+                if !self.can_be_held_weakly(a0) {
                     return Err(Thrown("TypeError: Invalid value used in weak set".into()));
                 }
                 let present = match self.heap.get(idx) {
