@@ -95,6 +95,26 @@ impl<'p> Vm<'p> {
                 Some(i) => i < *len,
                 None => self.display(key) == "length",
             },
+            // A TypedArray's integer-indexed exotic own properties (`0 in ta`),
+            // then any named own prop (`ta.constructor` override in arr_props),
+            // then the %TypedArray%.prototype chain (`"subarray" in ta`).
+            HeapObj::TypedArray { .. } => {
+                let k = self.key_of(key);
+                // A CanonicalNumericIndexString is absorbed by the integer-indexed
+                // exotic [[HasProperty]]: present iff it's a VALID integer index,
+                // and never inherited from the prototype (so `TA.prototype[5]`
+                // does not make `5 in ta` true on a shorter array).
+                if self.is_canonical_numeric_index(&k) {
+                    return self.ta_valid_index(idx, &k).is_some();
+                }
+                if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                    return true;
+                }
+                match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+                    Some(p) => self.has_property(p, key),
+                    None => false,
+                }
+            }
             HeapObj::Map { .. } | HeapObj::Set(_) => self.display(key) == "size",
             // Static members (data + `static get`/`set` accessors) are own
             // properties of the class value and are inherited up the chain.

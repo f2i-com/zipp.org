@@ -87,6 +87,14 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // A TypedArray's in-bounds integer index is a non-configurable exotic own
+        // property: `delete ta[0]` fails (false). An out-of-range / non-index key
+        // falls through to the named-property (arr_props) deletion below.
+        if matches!(self.heap.get(idx), HeapObj::TypedArray { .. })
+            && self.ta_valid_index(idx, key).is_some()
+        {
+            return Value::bool(false);
+        }
         // A callable's `name`/`length` are configurable: record the deletion so
         // the synthesized property stops appearing (own-property queries + reads).
         if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
@@ -108,6 +116,11 @@ impl<'p> Vm<'p> {
                 }
             }
             HeapObj::Class(c) => c.statics.remove(key),
+            // A TypedArray's named/symbol own property lives in arr_props (its
+            // integer indices were handled above — they can't be deleted).
+            HeapObj::TypedArray { .. } => {
+                self.arr_props.get_mut(&idx).map_or(false, |m| m.remove(key))
+            }
             // A function's assigned own property (`delete fn.x`).
             _ => self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key)),
         };

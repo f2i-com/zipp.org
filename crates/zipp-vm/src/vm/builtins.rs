@@ -238,6 +238,34 @@ impl<'p> Vm<'p> {
             _ => (0, 0),
         }
     }
+
+    /// IsValidIntegerIndex for a TypedArray: `key` is the canonical string of a
+    /// non-negative integer `n` (so "0".."N", rejecting "01"/"-0"/"1.5"/"x") and
+    /// `0 <= n < length`. Returns `Some(n)` for an in-bounds integer index — the
+    /// integer-indexed exotic own properties — else `None`. (`idx` must be a
+    /// TypedArray; a non-TA has length 0 so every key returns `None`.)
+    pub(crate) fn ta_valid_index(&self, idx: u32, key: &str) -> Option<usize> {
+        let n: usize = key.parse().ok()?;
+        if n.to_string() != key {
+            return None;
+        }
+        (n < self.ta_len_kind(idx).0).then_some(n)
+    }
+
+    /// CanonicalNumericIndexString(key) (ES 7.1.21): `key` is "-0", or the canonical
+    /// `Number→String` form of a numeric value (so it round-trips: "0","1","1.5",
+    /// "NaN","Infinity" yes; "01","1.0","foo" no). Such a key is ABSORBED by a
+    /// TypedArray's integer-indexed exotic methods — HasProperty / DefineOwnProperty
+    /// never consult the prototype or named props for it.
+    pub(crate) fn is_canonical_numeric_index(&self, key: &str) -> bool {
+        if key == "-0" {
+            return true;
+        }
+        match key.parse::<f64>() {
+            Ok(n) => crate::vm::helpers_num2::fmt_f64(n) == key,
+            Err(_) => false,
+        }
+    }
     /// Snapshot a TypedArray's elements as Values (numbers / BigInts).
     pub(crate) fn ta_snapshot(&mut self, idx: u32) -> Vec<Value> {
         let len = self.ta_len_kind(idx).0;

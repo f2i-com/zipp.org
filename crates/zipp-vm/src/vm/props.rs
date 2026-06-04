@@ -209,6 +209,37 @@ impl<'p> Vm<'p> {
             }
             return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
         }
+        // A TypedArray enumerates its integer indices `0..length` (all enumerable),
+        // then any enumerable named own prop. Handled before the generic match
+        // because reading each element needs `&mut self` (ta_element_get).
+        if obj.is_heap() && matches!(self.heap.get(obj.heap_index()), HeapObj::TypedArray { .. }) {
+            let idx = obj.heap_index();
+            let len = self.ta_len_kind(idx).0;
+            let mut pairs: Vec<(String, Value)> = Vec::with_capacity(len);
+            for i in 0..len {
+                let v = self.ta_element_get(idx, i);
+                pairs.push((i.to_string(), v));
+            }
+            if let Some(m) = self.arr_props.get(&idx) {
+                for (i, k) in m.keys.iter().enumerate() {
+                    if m.attrs[i].enumerable && !is_hidden_key(k) {
+                        pairs.push((k.clone(), m.vals[i]));
+                    }
+                }
+            }
+            let out: Vec<Value> = pairs
+                .into_iter()
+                .map(|(k, v)| match what {
+                    EnumWhat::Keys => self.alloc_str(k),
+                    EnumWhat::Values => v,
+                    EnumWhat::Entries => {
+                        let ks = self.alloc_str(k);
+                        Value::heap(self.heap.alloc(HeapObj::Array(vec![ks, v])))
+                    }
+                })
+                .collect();
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+        }
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Object(m) => spec_key_order(&m.keys)
@@ -430,6 +461,16 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
                 self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
             }
+            // A TypedArray's integer-indexed element: a data descriptor
+            // { writable:true, enumerable:true, configurable:true }. A named own
+            // prop (constructor override) still comes from arr_props (the tail).
+            HeapObj::TypedArray { .. } => {
+                if let Some(i) = self.ta_valid_index(idx, key) {
+                    let v = self.ta_element_get(idx, i);
+                    return self.make_data_descriptor(v, true, true, true);
+                }
+                self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
+            }
             // Exotic objects (Map/Set/Date/Promise/…) keep defineProperty'd own
             // properties in the generic arr_props side table.
             _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
@@ -476,6 +517,18 @@ impl<'p> Vm<'p> {
                         keys.push(i.to_string());
                     }
                     keys.push("length".to_string());
+                    if let Some(m) = self.arr_props.get(&idx) {
+                        keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                    }
+                }
+                // A TypedArray's own keys: its integer indices `0..length` first
+                // (the exotic own properties; `length`/`buffer`/… live on the
+                // prototype), then any named own props in the arr_props side table.
+                HeapObj::TypedArray { .. } => {
+                    let len = self.ta_len_kind(idx).0;
+                    for i in 0..len {
+                        keys.push(i.to_string());
+                    }
                     if let Some(m) = self.arr_props.get(&idx) {
                         keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
                     }
@@ -831,13 +884,34 @@ impl<'p> Vm<'p> {
             }
             // else: named key → generic path.
         }
-        // TypedArray: a numeric-index data descriptor writes the element.
-        if let HeapObj::TypedArray { .. } = self.heap.get(idx) {
-            let (value, get, set, ..) = self.read_descriptor(desc)?;
-            if get.is_none() && set.is_none() {
-                if let Ok(i) = key.parse::<usize>() {
-                    self.ta_element_set(idx, i, value.unwrap_or(Value::UNDEFINED))?;
-                }
+        // TypedArray integer-indexed [[DefineOwnProperty]] (ES 10.4.5.3). A
+        // CanonicalNumericIndexString key is absorbed by the exotic behaviour:
+        //   * read the descriptor FIRST (ToPropertyDescriptor may run getters that
+        //     detach/resize the buffer), THEN re-check IsValidIntegerIndex;
+        //   * an out-of-range / non-integer index (or detached buffer) -> false;
+        //   * the slot is configurable/enumerable/writable data only, so an
+        //     accessor or a {configurable|enumerable|writable: false} descriptor
+        //     is rejected; a present `value` is written via IntegerIndexedElementSet.
+        // A NON-numeric key (`ta.foo`) falls through to the generic named-property
+        // path below (arr_props).
+        if matches!(self.heap.get(idx), HeapObj::TypedArray { .. })
+            && self.is_canonical_numeric_index(key)
+        {
+            let (value, get, set, wr, en, cf) = self.read_descriptor(desc)?;
+            let valid_i = self.ta_valid_index(idx, key);
+            if valid_i.is_none()
+                || get.is_some()
+                || set.is_some()
+                || cf == Some(false)
+                || en == Some(false)
+                || wr == Some(false)
+            {
+                return Err(Thrown(format!(
+                    "TypeError: cannot define property '{key}' on a TypedArray"
+                )));
+            }
+            if let Some(v) = value {
+                self.ta_element_set(idx, valid_i.unwrap(), v)?;
             }
             return Ok(());
         }
