@@ -475,6 +475,10 @@ impl<'p> Vm<'p> {
                             keys.push(map.keys[i].clone());
                         }
                     }
+                    // InternalizeJSONProperty visits keys in EnumerableOwnPropertyNames
+                    // order: integer indices ascending, then the rest in insertion order.
+                    let ord = spec_key_order(&keys);
+                    let keys = ord.into_iter().map(|i| keys[i].clone()).collect();
                     Kind::Obj(keys)
                 }
                 _ => Kind::Other,
