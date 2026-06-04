@@ -483,6 +483,21 @@ impl<'p> Vm<'p> {
                 return self.array_method(tmp, name, args);
             }
         }
+        // A REAL array that carries an arr_props side table may hold a
+        // defineProperty'd index ACCESSOR — its getter lives in arr_props while the
+        // dense slot is only an undefined placeholder. The dense fast paths below
+        // read that placeholder and never invoke the getter, so route the callback
+        // methods through the generic HasProperty/Get protocol (which calls
+        // get_index → array_index_override → the getter). Arrays without a side
+        // table keep the fast snapshot path (zero perf impact on the common case).
+        if self.arr_props.contains_key(&idx)
+            && matches!(
+                name,
+                "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
+            )
+        {
+            return self.array_like_iterate(Value::heap(idx), name, args);
+        }
         match name {
             "push" => {
                 let mut last = Value::UNDEFINED;
