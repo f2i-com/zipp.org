@@ -1055,8 +1055,15 @@ impl<'p> Vm<'p> {
         if v == Value::NULL || v == Value::UNDEFINED {
             return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
         }
+        // A non-iterable PRIMITIVE — a number or boolean (non-heap), or a Symbol /
+        // BigInt (heap primitives) — has no `@@iterator`, so GetIterator throws.
+        // (Strings are heap and ARE iterable; they fall through to the positional
+        // fast path below. Plain objects without `@@iterator` are left lenient.)
         if !v.is_heap() {
-            return Ok(v);
+            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+        }
+        if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. } | HeapObj::BigInt(_)) {
+            return Err(Thrown("TypeError: value is not iterable".into()));
         }
         let drain = match self.heap.get(v.heap_index()) {
             HeapObj::Generator { .. } => true,

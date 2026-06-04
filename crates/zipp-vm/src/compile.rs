@@ -504,8 +504,7 @@ impl Compiler {
         // Apply default parameter values (`function f(x = expr)`) before the body:
         // for each defaulted param, `if (x === undefined) x = expr`.
         if let Some(pa) = params_ast {
-            fc.emit_param_defaults(pa)?;
-            fc.bind_pattern_params(pa)?;
+            fc.bind_params(pa)?;
         }
         // A (sync) generator runs its parameter prologue eagerly at call time and
         // is then created suspended here; mark the body entry. (Async generators
@@ -607,8 +606,7 @@ impl Compiler {
         fc.in_async = is_async;
         fc.reserve_arguments(); // class methods/ctors bind `arguments`
         if let Some(pa) = params_ast {
-            fc.emit_param_defaults(pa)?;
-            fc.bind_pattern_params(pa)?;
+            fc.bind_params(pa)?;
         }
         // A (sync) generator method runs its parameter prologue eagerly at call
         // and is created suspended here (a constructor is never a generator, so no
@@ -691,8 +689,7 @@ impl Compiler {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = is_strict;
         fc.in_async = a.r#async;
-        fc.emit_param_defaults(&a.params)?;
-        fc.bind_pattern_params(&a.params)?;
+        fc.bind_params(&a.params)?;
         if a.expression {
             // `x => expr`: the body is a single ExpressionStatement to return.
             let mut returned = false;
@@ -3940,66 +3937,63 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    /// Emit default-value init for `x = default` parameters: `if (x === undefined)
-    /// x = default`. Runs once at function entry, before the body. Param regs are
-    /// already bound (captured ones boxed), so reads/writes go through resolve +
-    /// load_binding/store_binding (handling plain locals and cells uniformly).
-    fn emit_param_defaults(&mut self, params: &ox::FormalParameters) -> R<()> {
-        for item in &params.items {
-            // oxc stores a parameter default in `initializer` (the pattern stays a
-            // plain BindingIdentifier), e.g. `function f(x = 5)`.
-            let default = match &item.initializer {
-                Some(d) => d,
-                None => continue,
-            };
-            let name = match &item.pattern {
-                ox::BindingPattern::BindingIdentifier(id) => id.name.to_string(),
-                _ => continue, // destructuring patterns aren't in the subset
-            };
-            let b = self.resolve(&name);
-            let save = self.next_reg;
-            let prtmp = self.alloc_reg();
-            let pr = self.load_binding(&b, prtmp);
-            let undef = self.alloc_reg();
-            self.emit(Instr::LoadUndefined { dst: undef });
-            let cond = self.alloc_reg();
-            self.emit(Instr::Eq { dst: cond, a: pr, b: undef });
-            let jf = self.here();
-            self.emit(Instr::JumpIfFalse { cond, target: 0 }); // skip when x !== undefined
-            let dtmp = self.alloc_reg();
-            // `function f(x = function(){})` ⇒ the default takes the name "x".
-            let dv = self.compile_named_init(dtmp, default, &name)?;
-            self.store_binding(&b, dv);
-            let end = self.here();
-            self.patch_jump(jf, end);
-            // The init temps are dead before the body; reclaim them (max_reg has
-            // already captured the high-water) so body locals reuse the registers.
-            self.next_reg = save;
+    /// Bind all parameters at function entry, strictly LEFT-TO-RIGHT, applying each
+    /// one's `= default` and (for a destructuring pattern) extracting it before
+    /// moving to the next. The single interleaved pass is required by the spec:
+    /// a later parameter's default may reference an earlier (already-bound)
+    /// parameter — `function f([x, y] = [1, 2], z = x + y)` must see x, y bound
+    /// when it evaluates `z`. (A two-pass "all defaults, then all destructuring"
+    /// order would read those names before the pattern extracted them.)
+    fn bind_params(&mut self, params: &ox::FormalParameters) -> R<()> {
+        for (i, item) in params.items.iter().enumerate() {
+            match &item.pattern {
+                // `x = default`: if (x === undefined) x = default.
+                ox::BindingPattern::BindingIdentifier(id) => {
+                    if let Some(default) = &item.initializer {
+                        let name = id.name.to_string();
+                        self.emit_ident_param_default(&name, default)?;
+                    }
+                }
+                // A destructuring pattern: apply its parameter-level default to the
+                // incoming argument register (when undefined) BEFORE extracting.
+                ox::BindingPattern::ObjectPattern(_) | ox::BindingPattern::ArrayPattern(_) => {
+                    if let Some(default) = &item.initializer {
+                        self.apply_default_in_place((i + 1) as Reg, default)?;
+                    }
+                    self.declare_pattern(&item.pattern)?;
+                    let save = self.next_reg;
+                    self.extract_pattern(&item.pattern, (i + 1) as Reg)?;
+                    self.next_reg = save;
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
 
-    /// Destructure any pattern parameters (`function f({a}, [b]) {…}`) at function
-    /// entry: the i-th argument sits in register i+1, so declare the pattern's
-    /// leaves and extract them from that register. Runs after emit_param_defaults.
-    fn bind_pattern_params(&mut self, params: &ox::FormalParameters) -> R<()> {
-        for (i, item) in params.items.iter().enumerate() {
-            if !matches!(
-                &item.pattern,
-                ox::BindingPattern::ObjectPattern(_) | ox::BindingPattern::ArrayPattern(_)
-            ) {
-                continue;
-            }
-            // A parameter-level default (`function f([a,b] = [1,2])`) applies to the
-            // incoming argument register when it's undefined, BEFORE destructuring.
-            if let Some(default) = &item.initializer {
-                self.apply_default_in_place((i + 1) as Reg, default)?;
-            }
-            self.declare_pattern(&item.pattern)?;
-            let save = self.next_reg;
-            self.extract_pattern(&item.pattern, (i + 1) as Reg)?;
-            self.next_reg = save;
-        }
+    /// Emit `if (x === undefined) x = default` for one identifier parameter. Param
+    /// regs are already bound (captured ones boxed), so reads/writes go through
+    /// resolve + load_binding/store_binding (plain locals and cells uniformly).
+    fn emit_ident_param_default(&mut self, name: &str, default: &ox::Expression) -> R<()> {
+        let b = self.resolve(name);
+        let save = self.next_reg;
+        let prtmp = self.alloc_reg();
+        let pr = self.load_binding(&b, prtmp);
+        let undef = self.alloc_reg();
+        self.emit(Instr::LoadUndefined { dst: undef });
+        let cond = self.alloc_reg();
+        self.emit(Instr::Eq { dst: cond, a: pr, b: undef });
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond, target: 0 }); // skip when x !== undefined
+        let dtmp = self.alloc_reg();
+        // `function f(x = function(){})` ⇒ the default takes the name "x".
+        let dv = self.compile_named_init(dtmp, default, name)?;
+        self.store_binding(&b, dv);
+        let end = self.here();
+        self.patch_jump(jf, end);
+        // The init temps are dead before the body; reclaim them (max_reg has
+        // already captured the high-water) so body locals reuse the registers.
+        self.next_reg = save;
         Ok(())
     }
 
