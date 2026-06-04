@@ -182,16 +182,22 @@ impl<'p> Vm<'p> {
             };
             for k in key_list {
                 let ks = self.to_js_string(k)?;
-                let value = self.get_member(iterables, &ks, iterables)?;
+                // Any abrupt completion while opening closes the already-opened
+                // iterators (in reverse) before propagating.
+                let value = match self.get_member(iterables, &ks, iterables) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = self.iz_close_except(&iters, usize::MAX);
+                        return Err(e);
+                    }
+                };
                 match self.get_iterator_flattenable(value) {
                     Ok(it) => {
                         iters.push(it);
                         keys.push(k);
                     }
                     Err(e) => {
-                        for &op in &iters {
-                            let _ = self.iterator_close(op);
-                        }
+                        let _ = self.iz_close_except(&iters, usize::MAX);
                         return Err(e);
                     }
                 }
@@ -206,17 +212,16 @@ impl<'p> Vm<'p> {
                     Ok(Some(value)) => match self.get_iterator_flattenable(value) {
                         Ok(it) => iters.push(it),
                         Err(e) => {
+                            // Close the input iterator + the already-opened inner
+                            // iterators (in reverse), then propagate.
                             let _ = self.iterator_close(input_iter);
-                            for &op in &iters {
-                                let _ = self.iterator_close(op);
-                            }
+                            let _ = self.iz_close_except(&iters, usize::MAX);
                             return Err(e);
                         }
                     },
                     Err(e) => {
-                        for &op in &iters {
-                            let _ = self.iterator_close(op);
-                        }
+                        // The input iterator's step threw; close the opened inners.
+                        let _ = self.iz_close_except(&iters, usize::MAX);
                         return Err(e);
                     }
                 }
@@ -267,6 +272,23 @@ impl<'p> Vm<'p> {
                 items[i] = Value::NULL;
             }
         }
+    }
+
+    /// Close every still-open iterator in `iters` EXCEPT index `except`, in
+    /// reverse order (spec IfAbruptCloseIterators closes highest-index first).
+    /// Returns the first close error (if any). A `null` slot is already closed.
+    fn iz_close_except(&mut self, iters: &[Value], except: usize) -> Option<Thrown> {
+        let mut err = None;
+        for j in (0..iters.len()).rev() {
+            if j != except && iters[j] != Value::NULL {
+                if let Err(e) = self.iterator_close(iters[j]) {
+                    if err.is_none() {
+                        err = Some(e);
+                    }
+                }
+            }
+        }
+        err
     }
 
     /// Close every still-open iterator of a zip helper (for `.return()`).
@@ -320,17 +342,24 @@ impl<'p> Vm<'p> {
             0 => {
                 // shortest: any exhausted iterator finishes the zip; close the rest.
                 for i in 0..count {
-                    match self.iterator_step(iters[i])? {
-                        None => {
+                    match self.iterator_step(iters[i]) {
+                        Ok(None) => {
+                            // Normal completion: close the others — a close error
+                            // surfaces (the completion was not abrupt).
                             self.ih_set_done(idx);
-                            for (j, &it) in iters.iter().enumerate() {
-                                if j != i && it != Value::NULL {
-                                    let _ = self.iterator_close(it);
-                                }
+                            if let Some(e) = self.iz_close_except(&iters, i) {
+                                return Err(e);
                             }
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
-                        Some(v) => results[i] = v,
+                        Ok(Some(v)) => results[i] = v,
+                        Err(e) => {
+                            // Abrupt: close the others (their errors are swallowed —
+                            // the original abrupt completion wins).
+                            self.ih_set_done(idx);
+                            let _ = self.iz_close_except(&iters, i);
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -342,14 +371,19 @@ impl<'p> Vm<'p> {
                         results[i] = pad(i);
                         continue;
                     }
-                    match self.iterator_step(iters[i])? {
-                        None => {
+                    match self.iterator_step(iters[i]) {
+                        Ok(None) => {
                             self.iz_close_slot(idx, i);
                             results[i] = pad(i);
                         }
-                        Some(v) => {
+                        Ok(Some(v)) => {
                             results[i] = v;
                             all_done = false;
+                        }
+                        Err(e) => {
+                            self.ih_set_done(idx);
+                            let _ = self.iz_close_except(&iters, i);
+                            return Err(e);
                         }
                     }
                 }
@@ -361,21 +395,27 @@ impl<'p> Vm<'p> {
             _ => {
                 // strict: every iterator must end on the same step.
                 for i in 0..count {
-                    match self.iterator_step(iters[i])? {
-                        None => {
+                    match self.iterator_step(iters[i]) {
+                        Ok(None) => {
                             self.ih_set_done(idx);
                             if i == 0 {
                                 // The rest must also be done now.
                                 for j in 1..count {
-                                    match self.iterator_step(iters[j])? {
-                                        None => {}
-                                        Some(_) => {
+                                    match self.iterator_step(iters[j]) {
+                                        Ok(None) => {}
+                                        Ok(Some(_)) => {
                                             for &it in iters.iter().skip(j + 1) {
                                                 let _ = self.iterator_close(it);
                                             }
                                             return Err(Thrown(
                                                 "TypeError: Iterator.zip strict: iterators have different lengths".into(),
                                             ));
+                                        }
+                                        Err(e) => {
+                                            for &it in iters.iter().skip(j + 1) {
+                                                let _ = self.iterator_close(it);
+                                            }
+                                            return Err(e);
                                         }
                                     }
                                 }
@@ -389,7 +429,13 @@ impl<'p> Vm<'p> {
                                 "TypeError: Iterator.zip strict: iterators have different lengths".into(),
                             ));
                         }
-                        Some(v) => results[i] = v,
+                        Ok(Some(v)) => results[i] = v,
+                        Err(e) => {
+                            // Abrupt step: close the others, the original wins.
+                            self.ih_set_done(idx);
+                            let _ = self.iz_close_except(&iters, i);
+                            return Err(e);
+                        }
                     }
                 }
             }
