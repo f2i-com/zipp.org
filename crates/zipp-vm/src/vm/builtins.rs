@@ -398,6 +398,26 @@ impl<'p> Vm<'p> {
                 let parts: Vec<String> = (0..len).map(|i| self.ta_elem_string(idx, i)).collect();
                 Ok(Some(self.alloc_str(parts.join(","))))
             }
+            "toLocaleString" => {
+                // ToString(Invoke(element, "toLocaleString")) for each element,
+                // joined by ",". Unlike toString this calls the element's own
+                // toLocaleString and uses a real ToString, so a throwing
+                // toLocaleString / toString / valueOf propagates as an abrupt
+                // completion (the elements are numbers/bigints, never nullish).
+                let mut parts: Vec<String> = Vec::with_capacity(len);
+                for i in 0..len {
+                    let el = self.ta_element_get(idx, i);
+                    let f = self.get_prop(el, "toLocaleString")?;
+                    let s = if self.is_callable(f) {
+                        let r = self.call_value(f, el, &[])?;
+                        self.to_js_string(r)?
+                    } else {
+                        self.to_js_string(el)?
+                    };
+                    parts.push(s);
+                }
+                Ok(Some(self.alloc_str(parts.join(","))))
+            }
             "indexOf" | "lastIndexOf" | "includes" => {
                 let snap = self.ta_snapshot(idx);
                 let len = snap.len() as i64;

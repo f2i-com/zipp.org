@@ -278,6 +278,9 @@ pub const TA_PROTO_METHODS: &[&str] = &[
     "filter", "find", "findIndex", "findLast", "findLastIndex", "every", "some", "reduce",
     "reduceRight", "fill", "reverse", "slice", "subarray", "sort", "copyWithin", "set",
     "keys", "values", "entries", "@@iterator", "toReversed", "toSorted", "with",
+    // NB: append-only — ids are TA_METHOD_BASE + index, and DV_METHOD_BASE (372)
+    // follows this list; keep new entries before that boundary.
+    "toLocaleString",
 ];
 pub const TA_METHOD_BASE: u16 = 340;
 /// `DataView.prototype` get/set method names (registered at DV_METHOD_BASE+i).
@@ -671,7 +674,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         let m = TA_PROTO_METHODS[(id - TA_METHOD_BASE) as usize];
         let len: u8 = match m {
             "reverse" | "keys" | "values" | "entries" | "toString" | "@@iterator"
-            | "toReversed" => 0,
+            | "toReversed" | "toLocaleString" => 0,
             "slice" | "subarray" | "copyWithin" | "with" => 2,
             _ => 1,
         };
