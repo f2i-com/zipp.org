@@ -226,6 +226,11 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class(_) => true,
             // The built-in constructor globals (Object/Array/Map/…) are constructors.
             HeapObj::Object(m) => m.is_ctor,
+            // A bound function exposes [[Construct]] iff its target does.
+            HeapObj::Bound { target, .. } => self.is_constructor(*target),
+            // A non-revoked Proxy is a constructor iff its target is (the
+            // `construct` trap is only callable when the target has [[Construct]]).
+            HeapObj::Proxy { target, revoked, .. } => !*revoked && self.is_constructor(*target),
             _ => false,
         }
     }

@@ -1585,19 +1585,30 @@ impl<'p> Vm<'p> {
                 Value::num(self.eval_math_args(op, args)?)
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
-            PROMISE_RESOLVE => {
-                let p = self.to_promise(args.first().copied().unwrap_or(Value::UNDEFINED));
-                Value::heap(p)
+            PROMISE_RESOLVE | PROMISE_REJECT | PROMISE_ALL | PROMISE_ALLSETTLED | PROMISE_RACE
+            | PROMISE_ANY => {
+                // These static methods read `this` as the constructor C (for the
+                // result's NewPromiseCapability); a non-constructor `this` is a
+                // TypeError. (The single-offset model still builds a native Promise.)
+                if !self.is_constructor(this) {
+                    return Err(Thrown(
+                        "TypeError: Promise static method called on a non-constructor".into(),
+                    ));
+                }
+                let a = args.first().copied().unwrap_or(Value::UNDEFINED);
+                match id {
+                    PROMISE_RESOLVE => Value::heap(self.to_promise(a)),
+                    PROMISE_REJECT => {
+                        let p = self.alloc_promise();
+                        self.reject(p, a);
+                        Value::heap(p)
+                    }
+                    PROMISE_ALL => self.promise_combine(crate::heap::CombKind::All, a)?,
+                    PROMISE_ALLSETTLED => self.promise_combine(crate::heap::CombKind::AllSettled, a)?,
+                    PROMISE_RACE => self.promise_combine(crate::heap::CombKind::Race, a)?,
+                    _ => self.promise_combine(crate::heap::CombKind::Any, a)?, // PROMISE_ANY
+                }
             }
-            PROMISE_REJECT => {
-                let p = self.alloc_promise();
-                self.reject(p, args.first().copied().unwrap_or(Value::UNDEFINED));
-                Value::heap(p)
-            }
-            PROMISE_ALL => self.promise_combine(crate::heap::CombKind::All, args.first().copied().unwrap_or(Value::UNDEFINED))?,
-            PROMISE_ALLSETTLED => self.promise_combine(crate::heap::CombKind::AllSettled, args.first().copied().unwrap_or(Value::UNDEFINED))?,
-            PROMISE_RACE => self.promise_combine(crate::heap::CombKind::Race, args.first().copied().unwrap_or(Value::UNDEFINED))?,
-            PROMISE_ANY => self.promise_combine(crate::heap::CombKind::Any, args.first().copied().unwrap_or(Value::UNDEFINED))?,
             // `%TypedArray%.prototype.<m>` invoked as a value (`.map.call(ta, …)`).
             _ if (TA_METHOD_BASE..TA_METHOD_BASE + TA_PROTO_METHODS.len() as u16).contains(&id) => {
                 let m = TA_PROTO_METHODS[(id - TA_METHOD_BASE) as usize];
