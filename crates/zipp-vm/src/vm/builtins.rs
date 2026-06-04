@@ -1515,12 +1515,21 @@ impl<'p> Vm<'p> {
                     HeapObj::Set(items) => items.clone(),
                     _ => Vec::new(),
                 };
-                // GetSetRecord: a real Set uses its elements directly; any other
-                // value must be a Set-like object ({size: number, has, keys}) —
-                // read size (ToNumber, observable) / has / keys in spec order, then
-                // materialize its elements via keys().
-                let other_items: Vec<Value> = match a0.is_heap().then(|| self.heap.get(a0.heap_index())) {
-                    Some(HeapObj::Set(items)) => items.clone(),
+                // GetSetRecord (read size / has / keys in spec order) WITHOUT yet
+                // calling keys(): a real Set uses its elements directly; a Set-like
+                // ({size, has, keys}) keeps its has/keys methods so the size-favoured
+                // branches use has() rather than iterating its keys.
+                let (other_real, other_size, other_has, other_keys): (
+                    Option<Vec<Value>>,
+                    i64,
+                    Value,
+                    Value,
+                ) = match a0.is_heap().then(|| self.heap.get(a0.heap_index())) {
+                    Some(HeapObj::Set(items)) => {
+                        let items = items.clone();
+                        let n = items.len() as i64;
+                        (Some(items), n, Value::UNDEFINED, Value::UNDEFINED)
+                    }
                     _ => {
                         if !self.is_object_value(a0) {
                             return Err(Thrown(
@@ -1531,13 +1540,19 @@ impl<'p> Vm<'p> {
                         if raw_size.is_heap()
                             && matches!(self.heap.get(raw_size.heap_index()), HeapObj::BigInt(_))
                         {
-                            return Err(Thrown(
-                                "TypeError: Set-like 'size' cannot be a BigInt".into(),
-                            ));
+                            return Err(Thrown("TypeError: Set-like 'size' cannot be a BigInt".into()));
                         }
                         let num_size = self.to_number_coerce(raw_size)?;
                         if num_size.is_nan() {
                             return Err(Thrown("TypeError: Set-like 'size' is NaN".into()));
+                        }
+                        let int_size = if num_size.is_infinite() {
+                            i64::MAX
+                        } else {
+                            num_size.trunc() as i64
+                        };
+                        if int_size < 0 {
+                            return Err(Thrown("RangeError: Set-like 'size' is negative".into()));
                         }
                         let has = self.get_prop(a0, "has")?;
                         if !self.is_callable(has) {
@@ -1547,48 +1562,117 @@ impl<'p> Vm<'p> {
                         if !self.is_callable(keys) {
                             return Err(Thrown("TypeError: Set-like 'keys' is not callable".into()));
                         }
-                        let kiter = self.call_value(keys, a0, &[])?;
-                        // -0 from keys() normalizes to +0 (SameValueZero).
-                        self.iterate_to_vec(kiter)?
-                            .into_iter()
-                            .map(|v| if v.is_number() && v.as_f64() == 0.0 { Value::int(0) } else { v })
-                            .collect()
+                        (None, int_size, has, keys)
                     }
                 };
-                let has = |hay: &[Value], v: Value, vm: &Self| hay.iter().any(|x| vm.same_value_zero(*x, v));
+                let mem = |hay: &[Value], v: Value, vm: &Self| hay.iter().any(|x| vm.same_value_zero(*x, v));
+                let this_size = this_items.len() as i64;
                 let result = match name {
+                    // union / symmetricDifference always iterate the other set.
                     "union" => {
                         let mut r = this_items.clone();
-                        for &v in &other_items {
-                            if !has(&r, v, self) {
+                        for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                            if !mem(&r, v, self) {
                                 r.push(v);
                             }
                         }
-                        Value::heap(self.heap.alloc(HeapObj::Set(r)))
-                    }
-                    "intersection" => {
-                        let r: Vec<Value> =
-                            this_items.iter().copied().filter(|&v| has(&other_items, v, self)).collect();
-                        Value::heap(self.heap.alloc(HeapObj::Set(r)))
-                    }
-                    "difference" => {
-                        let r: Vec<Value> =
-                            this_items.iter().copied().filter(|&v| !has(&other_items, v, self)).collect();
                         Value::heap(self.heap.alloc(HeapObj::Set(r)))
                     }
                     "symmetricDifference" => {
+                        let okeys = self.set_rec_keys(&other_real, other_keys, a0)?;
                         let mut r: Vec<Value> =
-                            this_items.iter().copied().filter(|&v| !has(&other_items, v, self)).collect();
-                        for &v in &other_items {
-                            if !has(&this_items, v, self) && !has(&r, v, self) {
+                            this_items.iter().copied().filter(|&v| !mem(&okeys, v, self)).collect();
+                        for v in okeys {
+                            if !mem(&this_items, v, self) && !mem(&r, v, self) {
                                 r.push(v);
                             }
                         }
                         Value::heap(self.heap.alloc(HeapObj::Set(r)))
                     }
-                    "isSubsetOf" => Value::bool(this_items.iter().all(|&v| has(&other_items, v, self))),
-                    "isSupersetOf" => Value::bool(other_items.iter().all(|&v| has(&this_items, v, self))),
-                    _ => Value::bool(!this_items.iter().any(|&v| has(&other_items, v, self))), // isDisjointFrom
+                    // intersection / difference / isDisjointFrom use has() when this
+                    // is the smaller side (and must NOT iterate the other's keys).
+                    "intersection" => {
+                        let mut r: Vec<Value> = Vec::new();
+                        if this_size <= other_size {
+                            for &e in &this_items {
+                                if self.set_rec_has(&other_real, other_has, a0, e)? && !mem(&r, e, self) {
+                                    r.push(e);
+                                }
+                            }
+                        } else {
+                            for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                                if mem(&this_items, v, self) && !mem(&r, v, self) {
+                                    r.push(v);
+                                }
+                            }
+                        }
+                        Value::heap(self.heap.alloc(HeapObj::Set(r)))
+                    }
+                    "difference" => {
+                        let mut r = this_items.clone();
+                        if this_size <= other_size {
+                            let mut keep: Vec<Value> = Vec::new();
+                            for &e in &r {
+                                if !self.set_rec_has(&other_real, other_has, a0, e)? {
+                                    keep.push(e);
+                                }
+                            }
+                            r = keep;
+                        } else {
+                            for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                                r.retain(|&x| !self.same_value_zero(x, v));
+                            }
+                        }
+                        Value::heap(self.heap.alloc(HeapObj::Set(r)))
+                    }
+                    "isSubsetOf" => {
+                        if this_size > other_size {
+                            Value::bool(false)
+                        } else {
+                            let mut ok = true;
+                            for &e in &this_items {
+                                if !self.set_rec_has(&other_real, other_has, a0, e)? {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            Value::bool(ok)
+                        }
+                    }
+                    "isSupersetOf" => {
+                        if this_size < other_size {
+                            Value::bool(false)
+                        } else {
+                            let mut ok = true;
+                            for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                                if !mem(&this_items, v, self) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            Value::bool(ok)
+                        }
+                    }
+                    _ => {
+                        // isDisjointFrom
+                        let mut disjoint = true;
+                        if this_size <= other_size {
+                            for &e in &this_items {
+                                if self.set_rec_has(&other_real, other_has, a0, e)? {
+                                    disjoint = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                                if mem(&this_items, v, self) {
+                                    disjoint = false;
+                                    break;
+                                }
+                            }
+                        }
+                        Value::bool(disjoint)
+                    }
                 };
                 Ok(Some(result))
             }
@@ -1596,4 +1680,41 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Set-operation membership test against the OTHER set: a real Set checks its
+    /// elements directly; a Set-like calls its `has` method. (Calling `has` rather
+    /// than iterating `keys` is required by the spec for the size-favoured branch
+    /// of intersection/difference/isSubsetOf/isDisjointFrom.)
+    fn set_rec_has(
+        &mut self,
+        real: &Option<Vec<Value>>,
+        has_fn: Value,
+        obj: Value,
+        v: Value,
+    ) -> Result<bool, Thrown> {
+        if let Some(items) = real {
+            return Ok(items.iter().any(|x| self.same_value_zero(*x, v)));
+        }
+        let r = self.call_value(has_fn, obj, &[v])?;
+        Ok(self.truthy(r))
+    }
+
+    /// Materialize the OTHER set's elements: a real Set clones them; a Set-like
+    /// calls `keys()` and drains the iterator (normalizing -0 → +0). Only invoked
+    /// by the branches that genuinely iterate the other set.
+    fn set_rec_keys(
+        &mut self,
+        real: &Option<Vec<Value>>,
+        keys_fn: Value,
+        obj: Value,
+    ) -> Result<Vec<Value>, Thrown> {
+        if let Some(items) = real {
+            return Ok(items.clone());
+        }
+        let kiter = self.call_value(keys_fn, obj, &[])?;
+        Ok(self
+            .iterate_to_vec(kiter)?
+            .into_iter()
+            .map(|v| if v.is_number() && v.as_f64() == 0.0 { Value::int(0) } else { v })
+            .collect())
+    }
 }
