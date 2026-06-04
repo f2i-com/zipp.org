@@ -240,6 +240,60 @@ impl<'p> Vm<'p> {
                 .collect();
             return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
         }
+        // An Array enumerates its dense indices `0..length` (skipping any special
+        // index defineProperty made non-enumerable), then its enumerable named own
+        // props. Handled before the generic match because reading an accessor index
+        // or a special value needs `&mut self` (get_index / get_member).
+        if obj.is_heap() && matches!(self.heap.get(obj.heap_index()), HeapObj::Array(_)) {
+            let idx = obj.heap_index();
+            let len = match self.heap.get(idx) {
+                HeapObj::Array(items) => items.len(),
+                _ => 0,
+            };
+            let mut ks: Vec<String> = Vec::new();
+            for i in 0..len {
+                if self.array_index_override(idx, i).map_or(true, |(a, _)| a.enumerable) {
+                    ks.push(i.to_string());
+                }
+            }
+            if let Some(m) = self.arr_props.get(&idx) {
+                for (j, k) in m.keys.iter().enumerate() {
+                    if !m.attrs[j].enumerable || is_hidden_key(k) {
+                        continue;
+                    }
+                    // A special index key is already covered by the dense range.
+                    if let Ok(n) = k.parse::<usize>() {
+                        if n.to_string() == k.as_str() && n < len {
+                            continue;
+                        }
+                    }
+                    ks.push(k.clone());
+                }
+            }
+            let mut out: Vec<Value> = Vec::with_capacity(ks.len());
+            for k in ks {
+                if matches!(what, EnumWhat::Keys) {
+                    let kv = self.alloc_str(k);
+                    out.push(kv);
+                    continue;
+                }
+                let v = match k.parse::<usize>() {
+                    Ok(n) if n.to_string() == k.as_str() => {
+                        self.get_index(obj, Value::num(n as f64))?
+                    }
+                    _ => self.get_member(obj, &k, obj)?,
+                };
+                match what {
+                    EnumWhat::Values => out.push(v),
+                    EnumWhat::Entries => {
+                        let kv = self.alloc_str(k);
+                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))));
+                    }
+                    EnumWhat::Keys => {}
+                }
+            }
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+        }
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Object(m) => spec_key_order(&m.keys)
@@ -414,14 +468,22 @@ impl<'p> Vm<'p> {
                     let len = len_value(items.len());
                     return self.make_data_descriptor(len, true, false, false);
                 }
-                match key.parse::<usize>() {
-                    Ok(i) if i < items.len() => {
-                        let v = items[i];
-                        return self.make_data_descriptor(v, true, true, true);
+                let dense_len = items.len();
+                // A special index override (defineProperty'd attrs/accessor) OR a
+                // named own property in arr_props wins; else a dense in-range index
+                // is a default { writable, enumerable, configurable } data property.
+                let ovr =
+                    self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|p| (m.attrs[p], m.vals[p])));
+                if ovr.is_some() {
+                    ovr
+                } else {
+                    match key.parse::<usize>() {
+                        Ok(i) if i.to_string() == key && i < dense_len => {
+                            let v = items[i];
+                            return self.make_data_descriptor(v, true, true, true);
+                        }
+                        _ => None,
                     }
-                    // A named (non-index) own property lives in arr_props; let the
-                    // shared tail render it as a data/accessor descriptor.
-                    _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
                 }
             }
             // Class static members: data props, plus `static get`/`set` rendered
@@ -513,12 +575,30 @@ impl<'p> Vm<'p> {
                         .cloned(),
                 ),
                 HeapObj::Array(items) => {
-                    for i in 0..items.len() {
+                    let dense_len = items.len();
+                    for i in 0..dense_len {
                         keys.push(i.to_string());
                     }
                     keys.push("length".to_string());
                     if let Some(m) = self.arr_props.get(&idx) {
-                        keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                        // Named own props only — a special index key in arr_props is
+                        // already covered by the dense `0..len` range above.
+                        keys.extend(
+                            m.keys
+                                .iter()
+                                .filter(|k| {
+                                    if is_hidden_key(k) {
+                                        return false;
+                                    }
+                                    if let Ok(n) = k.parse::<usize>() {
+                                        if n.to_string() == k.as_str() && n < dense_len {
+                                            return false;
+                                        }
+                                    }
+                                    true
+                                })
+                                .cloned(),
+                        );
                     }
                 }
                 // A TypedArray's own keys: its integer indices `0..length` first
@@ -890,32 +970,76 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
-        // Array: a numeric-index data descriptor sets the element; `length` resizes.
-        // (Index accessors / extra named props aren't modeled — accepted as a no-op
-        // so the definition doesn't abort the program, matching common test setup.)
+        // Array: a numeric index honours the FULL descriptor (attributes +
+        // accessors), `length` resizes, a named key falls through to the generic
+        // arr_props path. A fully-default DATA descriptor lives in the dense Vec
+        // (the fast common case); any non-default attribute / accessor is stored in
+        // the arr_props side table keyed by the index, which then overrides the
+        // dense slot for reads/writes/descriptors (the dense slot is kept as a
+        // placeholder so `length` still counts the index).
         if let HeapObj::Array(_) = self.heap.get(idx) {
-            // A numeric-index data descriptor sets the element; `length` resizes.
-            // A named (non-index) property falls through to the generic path below
-            // (target 3 -> arr_props) with full descriptor semantics. read_descriptor
-            // (which may run getters) is therefore invoked exactly once per path.
+            // Only a CANONICAL decimal (`"0"`, `"10"`) is an array index; `"00"` /
+            // `" 1"` are ordinary named properties → generic path.
             if let Ok(i) = key.parse::<usize>() {
-                if i >= crate::vm::MAX_DENSE_ARRAY_LEN {
-                    return Err(Thrown(
-                        "RangeError: array index exceeds the engine's dense-array limit".into(),
-                    ));
-                }
-                let (value, get, set, ..) = self.read_descriptor(desc)?;
-                if get.is_none() && set.is_none() {
-                    let v = value.unwrap_or(Value::UNDEFINED);
-                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        if i >= items.len() {
-                            items.resize(i + 1, Value::UNDEFINED);
+                if i.to_string() == key {
+                    if i >= crate::vm::MAX_DENSE_ARRAY_LEN {
+                        return Err(Thrown(
+                            "RangeError: array index exceeds the engine's dense-array limit".into(),
+                        ));
+                    }
+                    let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
+                    let key_i = i.to_string();
+                    // Current descriptor of index i: a special arr_props entry wins;
+                    // else the dense slot (a default data property) if in range.
+                    let (dense_len, dense_val) = match self.heap.get(idx) {
+                        HeapObj::Array(items) => (items.len(), items.get(i).copied()),
+                        _ => (0, None),
+                    };
+                    let plain = PropAttr {
+                        writable: true,
+                        enumerable: true,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    };
+                    let existing = self
+                        .array_index_override(idx, i)
+                        .or_else(|| dense_val.map(|v| (plain, v)));
+                    let extensible = self.arr_props.get(&idx).map_or(true, |m| m.extensible);
+                    let (attr, stored) = self.merge_property_descriptor(
+                        &key_i, existing, extensible, value, get, set, d_wr, d_en, d_cf,
+                    )?;
+                    let is_default_data = !attr.accessor
+                        && attr.writable
+                        && attr.enumerable
+                        && attr.configurable;
+                    if is_default_data {
+                        // Lives in the dense Vec; drop any stale special override.
+                        if let Some(m) = self.arr_props.get_mut(&idx) {
+                            m.remove(&key_i);
                         }
-                        items[i] = v;
+                        if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                            if i >= items.len() {
+                                items.resize(i + 1, Value::UNDEFINED);
+                            }
+                            items[i] = stored;
+                        }
+                    } else {
+                        // Special: store in arr_props and keep a dense placeholder so
+                        // `length` counts the index.
+                        if i >= dense_len {
+                            if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                                items.resize(i + 1, Value::UNDEFINED);
+                            }
+                        }
+                        self.arr_props
+                            .entry(idx)
+                            .or_insert_with(ObjMap::new)
+                            .define(&key_i, stored, attr);
                     }
                     self.heap.bump_version(idx);
+                    return Ok(());
                 }
-                return Ok(());
             }
             if key == "length" {
                 let (value, ..) = self.read_descriptor(desc)?;
@@ -1001,6 +1125,54 @@ impl<'p> Vm<'p> {
             3 => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
             _ => self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
+        let extensible = match self.heap.get(idx) {
+            HeapObj::Object(m) => m.extensible,
+            _ => true,
+        };
+        let (attr, stored) = self
+            .merge_property_descriptor(key, existing, extensible, value, get, set, d_wr, d_en, d_cf)?;
+        match target {
+            0 => {
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    m.define(key, stored, attr);
+                }
+            }
+            1 => {
+                if let HeapObj::Class(c) = self.heap.get_mut(idx) {
+                    c.statics.define(key, stored, attr);
+                }
+            }
+            3 => {
+                self.arr_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
+            }
+            _ => {
+                self.fn_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
+            }
+        }
+        self.heap.bump_version(idx);
+        Ok(())
+    }
+
+    /// ValidateAndApplyPropertyDescriptor: merge a (partial) descriptor over the
+    /// current property `existing` (its attrs + stored value; for an accessor the
+    /// value is the getter and `attrs.setter` the setter), applying the spec's
+    /// non-configurable-redefinition checks. Returns the (attrs, stored-value) to
+    /// write, or a TypeError for an illegal redefinition / a new property on a
+    /// non-extensible object. Shared by every defineProperty target (plain object,
+    /// class static, arr_props, fn_props, and array indices).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn merge_property_descriptor(
+        &mut self,
+        key: &str,
+        existing: Option<(PropAttr, Value)>,
+        extensible: bool,
+        value: Option<Value>,
+        get: Option<Value>,
+        set: Option<Value>,
+        d_wr: Option<bool>,
+        d_en: Option<bool>,
+        d_cf: Option<bool>,
+    ) -> Result<(PropAttr, Value), Thrown> {
         let is_accessor = get.is_some() || set.is_some();
         // Start from the existing attrs (redefine) or all-false (new property).
         let (mut wr, mut en, mut cf) = match existing {
@@ -1051,16 +1223,10 @@ impl<'p> Vm<'p> {
             }
         }
         // Defining a brand-new property requires the object to be extensible.
-        if existing.is_none() {
-            let extensible = match self.heap.get(idx) {
-                HeapObj::Object(m) => m.extensible,
-                _ => true,
-            };
-            if !extensible {
-                return Err(Thrown(format!(
-                    "TypeError: Cannot define property {key}, object is not extensible"
-                )));
-            }
+        if existing.is_none() && !extensible {
+            return Err(Thrown(format!(
+                "TypeError: Cannot define property {key}, object is not extensible"
+            )));
         }
         // When redefining an existing accessor with only one half present, the
         // missing half is preserved (spec keeps fields absent from the new desc).
@@ -1082,26 +1248,20 @@ impl<'p> Vm<'p> {
         } else {
             value.or(existing.map(|(_, v)| v)).unwrap_or(Value::UNDEFINED)
         };
-        match target {
-            0 => {
-                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                    m.define(key, stored, attr);
-                }
-            }
-            1 => {
-                if let HeapObj::Class(c) = self.heap.get_mut(idx) {
-                    c.statics.define(key, stored, attr);
-                }
-            }
-            3 => {
-                self.arr_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
-            }
-            _ => {
-                self.fn_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
-            }
-        }
-        self.heap.bump_version(idx);
-        Ok(())
+        Ok((attr, stored))
+    }
+
+    /// The per-index override for an array element, if `defineProperty` gave index
+    /// `i` non-default attributes or an accessor. Stored in the `arr_props` side
+    /// table keyed by the canonical decimal string; when present it is authoritative
+    /// for that index (the dense slot is a placeholder kept only so `length` counts
+    /// it). Returns `(attrs, stored)` — `stored` is the value, or the getter for an
+    /// accessor. Cheap miss: arrays with no side table return `None` after one
+    /// HashMap probe.
+    pub(crate) fn array_index_override(&self, arr_idx: u32, i: usize) -> Option<(PropAttr, Value)> {
+        let m = self.arr_props.get(&arr_idx)?;
+        let p = m.pos(&i.to_string())?;
+        Some((m.attrs[p], m.vals[p]))
     }
 
     /// `Object.defineProperties(obj, props)` — define each own enumerable key of

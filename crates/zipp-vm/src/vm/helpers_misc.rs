@@ -117,6 +117,12 @@ pub(crate) extern "win64" fn jit_get_index(
     }
     // SAFETY: read-only view; the running region holds no conflicting borrow.
     let vm = unsafe { &*(vm as *const Vm) };
+    // An array with a side table may carry a defineProperty'd index whose value or
+    // accessor lives in arr_props — deopt so the interpreter's override-aware
+    // get_index runs (keeps JIT/interpreter parity).
+    if arr.is_heap() && vm.arr_props.contains_key(&arr.heap_index()) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     match vm.heap.get(arr.heap_index()) {
         HeapObj::Array(items) => match array_index(key) {
             // In range → the element; out of range / negative / non-integral →
@@ -173,6 +179,11 @@ pub(crate) extern "win64" fn jit_set_index(
     // SAFETY: exclusive view; the running region holds no conflicting borrow and
     // pins only the register file (not the array's Vec, which may reallocate).
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // A side table may hold a special index (accessor / non-writable / arr_props
+    // value) — deopt to the interpreter's override-aware set_prop for parity.
+    if arr.is_heap() && vm.arr_props.contains_key(&arr.heap_index()) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
             let len = items.len();

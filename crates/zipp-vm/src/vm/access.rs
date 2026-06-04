@@ -102,6 +102,30 @@ impl<'p> Vm<'p> {
                 .insert((idx, if key == "name" { 0 } else { 1 }));
             return Value::bool(true);
         }
+        // Deleting a canonical array index: a non-configurable special override
+        // (defineProperty'd) refuses deletion; otherwise drop the override (if any)
+        // and clear the dense slot.
+        if let HeapObj::Array(_) = self.heap.get(idx) {
+            if let Ok(i) = key.parse::<usize>() {
+                if i.to_string() == key {
+                    if let Some((a, _)) = self.array_index_override(idx, i) {
+                        if !a.configurable {
+                            return Value::bool(false);
+                        }
+                        if let Some(m) = self.arr_props.get_mut(&idx) {
+                            m.remove(key);
+                        }
+                    }
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        if i < items.len() {
+                            items[i] = Value::UNDEFINED;
+                        }
+                    }
+                    self.heap.bump_version(idx);
+                    return Value::bool(true);
+                }
+            }
+        }
         let removed = match self.heap.get_mut(idx) {
             HeapObj::Object(map) => map.remove(key),
             HeapObj::Array(items) => {
@@ -283,6 +307,16 @@ impl<'p> Vm<'p> {
             // through to the arr_props side table as a named property.)
             if let Ok(n) = key.parse::<usize>() {
                 if n.to_string() == key && n < crate::vm::MAX_DENSE_ARRAY_LEN {
+                    // A special (defineProperty'd) index lives in arr_props and
+                    // overrides the dense slot. Its accessor / non-writable cases
+                    // were already handled by the own_attr block above, so only a
+                    // writable special data index reaches here — update it in place
+                    // (preserving its attributes).
+                    if self.array_index_override(idx, n).is_some() {
+                        self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+                        self.heap.bump_version(idx);
+                        return Ok(());
+                    }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         if n >= items.len() {
                             items.resize(n + 1, Value::UNDEFINED);

@@ -109,12 +109,27 @@ impl<'p> Vm<'p> {
             return self.get_prop(obj, &k);
         }
         match self.heap.get(obj.heap_index()) {
-            HeapObj::Array(items) => {
+            HeapObj::Array(_) => {
+                let aidx = obj.heap_index();
                 // Numeric key (incl. an integral double like 1.0 — the JIT region
-                // produces f64 indices): direct element access, else undefined.
+                // produces f64 indices): a defineProperty'd special index (accessor
+                // or non-default-attribute data) in arr_props overrides the dense
+                // slot; else direct element access, else undefined.
                 if let Some(i) = array_index(key) {
-                    if i < items.len() {
-                        return Ok(items[i]);
+                    if let Some((a, v)) = self.array_index_override(aidx, i) {
+                        if a.accessor {
+                            return if v == Value::UNDEFINED {
+                                Ok(Value::UNDEFINED)
+                            } else {
+                                self.call_value(v, obj, &[])
+                            };
+                        }
+                        return Ok(v);
+                    }
+                    if let HeapObj::Array(items) = self.heap.get(aidx) {
+                        if i < items.len() {
+                            return Ok(items[i]);
+                        }
                     }
                     return Ok(Value::UNDEFINED);
                 }
@@ -122,7 +137,9 @@ impl<'p> Vm<'p> {
                 // (a computed method name / `@@iterator`, mirroring dot access).
                 let k = self.key_of(key);
                 if k == "length" {
-                    return Ok(len_value(items.len()));
+                    if let HeapObj::Array(items) = self.heap.get(aidx) {
+                        return Ok(len_value(items.len()));
+                    }
                 }
                 self.get_prop(obj, &k)
             }
@@ -227,6 +244,19 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(idx), HeapObj::Array(_)) && array_index(key).is_none() {
             let k = self.key_of(key);
             return self.set_prop(obj, &k, val);
+        }
+        // A defineProperty'd special index (accessor / non-writable / arr_props
+        // value) is handled by set_prop's own-property path (override-aware) — its
+        // setter must fire, a non-writable write must no-op, and a writable write
+        // updates arr_props rather than the dense placeholder. The dense fast path
+        // below handles the common plain element.
+        if let Some(i) = array_index(key) {
+            if matches!(self.heap.get(idx), HeapObj::Array(_))
+                && self.array_index_override(idx, i).is_some()
+            {
+                let k = self.key_of(key);
+                return self.set_prop(obj, &k, val);
+            }
         }
         // Assigning past the dense-array cap (`a[2**31] = v`) would eagerly grow
         // the Vec to billions of holes and OOM — zipp has no sparse arrays, so
