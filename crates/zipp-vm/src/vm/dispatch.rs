@@ -1346,42 +1346,9 @@ impl<'p> Vm<'p> {
                         // ToPropertyKey: an object key is ToString-coerced (toString/
                         // valueOf), not rendered "[object Object]".
                         let k = self.coerce_index_key(k)?;
-                        // Proxy `has` trap (or fall through to the target).
-                        let r = if let Some((target, handler, revoked)) =
-                            o.is_heap().then(|| self.proxy_parts(o.heap_index())).flatten()
-                        {
-                            if revoked {
-                                return Err(Thrown("TypeError: Cannot perform 'has' on a revoked proxy".into()));
-                            }
-                            match self.proxy_trap(handler, "has")? {
-                                Some(trap) => {
-                                    let ks = self.key_of(k);
-                                    let kv = self.key_to_value(&ks);
-                                    let res = self.call_value(trap, handler, &[target, kv])?;
-                                    let present = self.truthy(res);
-                                    // [[HasProperty]] invariant: a `false` result is
-                                    // illegal when the target has the own property and
-                                    // it is non-configurable, or the target is
-                                    // non-extensible.
-                                    if !present {
-                                        let desc =
-                                            self.object_get_own_property_descriptor(target, &ks);
-                                        if desc != Value::UNDEFINED {
-                                            let cfg = self.get_prop(desc, "configurable")?;
-                                            if !self.truthy(cfg) || !self.is_extensible(target)? {
-                                                return Err(Thrown(
-                                                    "TypeError: proxy 'has' returned false for a non-configurable / non-extensible-target own property".into(),
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    present
-                                }
-                                None => self.has_property(target, k),
-                            }
-                        } else {
-                            self.has_property(o, k)
-                        };
+                        // Proxy-aware [[HasProperty]]: dispatches a `has` trap when
+                        // the proxy is the receiver OR sits in the prototype chain.
+                        let r = self.has_property_dyn(o, k)?;
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }

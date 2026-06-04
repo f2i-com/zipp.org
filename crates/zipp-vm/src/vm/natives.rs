@@ -1215,7 +1215,7 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: Reflect.has called on non-object".into()));
                 }
                 let kv = self.coerce_index_key(a1)?;
-                Value::bool(self.has_property(a0, kv))
+                Value::bool(self.has_property_dyn(a0, kv)?)
             }
             REFLECT_DELETE => {
                 if !self.is_object_value(a0) {

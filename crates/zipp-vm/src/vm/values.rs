@@ -212,6 +212,91 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`
+    /// but is `&mut` so it can dispatch a `has` trap — both when `obj` itself is a
+    /// Proxy AND when a Proxy sits in the prototype chain (e.g.
+    /// `Object.create(proxy)`), which the immutable `has_property` cannot do.
+    pub(crate) fn has_property_dyn(&mut self, obj: Value, key: Value) -> Result<bool, Thrown> {
+        if !obj.is_heap() {
+            return Ok(false);
+        }
+        let idx = obj.heap_index();
+        // A Proxy: dispatch the `has` trap (with the post-trap invariant), or
+        // forward to the target's [[HasProperty]] when there is no trap.
+        if let Some((target, handler, revoked)) = self.proxy_parts(idx) {
+            if revoked {
+                return Err(Thrown("TypeError: Cannot perform 'has' on a revoked proxy".into()));
+            }
+            return match self.proxy_trap(handler, "has")? {
+                Some(trap) => {
+                    let ks = self.key_of(key);
+                    let kv = self.key_to_value(&ks);
+                    let res = self.call_value(trap, handler, &[target, kv])?;
+                    let present = self.truthy(res);
+                    // A `false` result is illegal when the target has the own
+                    // property non-configurable, or the target is non-extensible.
+                    if !present {
+                        let desc = self.object_get_own_property_descriptor(target, &ks);
+                        if desc != Value::UNDEFINED {
+                            let cfg = self.get_prop(desc, "configurable")?;
+                            if !self.truthy(cfg) || !self.is_extensible(target)? {
+                                return Err(Thrown(
+                                    "TypeError: proxy 'has' returned false for a non-configurable / non-extensible-target own property".into(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(present)
+                }
+                None => self.has_property_dyn(target, key),
+            };
+        }
+        // A plain object: own data property or an inherited method/getter/setter
+        // on the class chain; else walk the [[Prototype]] (which may be a Proxy)
+        // via has_property_dyn, using has_property's proto resolution. Each
+        // `self.heap.get` borrow is scoped so the recursive &mut call is free.
+        if matches!(self.heap.get(idx), HeapObj::Object(_)) {
+            let k = self.key_of(key);
+            if matches!(self.heap.get(idx), HeapObj::Object(m) if m.get(&k).is_some()) {
+                return Ok(true);
+            }
+            let mut cur = match self.heap.get(idx) {
+                HeapObj::Object(m) => m.class,
+                _ => None,
+            };
+            while let Some(cidx) = cur {
+                let step = match self.heap.get(cidx) {
+                    HeapObj::Class(c) => Some((
+                        c.methods.iter().any(|(n, _)| *n == k)
+                            || c.getters.iter().any(|(n, _)| *n == k)
+                            || c.setters.iter().any(|(n, _)| *n == k),
+                        c.parent,
+                    )),
+                    _ => None,
+                };
+                match step {
+                    Some((true, _)) => return Ok(true),
+                    Some((false, parent)) => cur = parent,
+                    None => break,
+                }
+            }
+            let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                p.is_heap().then_some(p)
+            } else if self.obj_proto != 0 && idx != self.obj_proto {
+                Some(Value::heap(self.obj_proto))
+            } else {
+                None
+            };
+            return match proto {
+                Some(p) => self.has_property_dyn(p, key),
+                None => Ok(false),
+            };
+        }
+        // Other heap kinds (Array / Str / TypedArray / …) carry no Proxy in their
+        // built-in prototype chain, so the exact immutable walk suffices.
+        Ok(self.has_property(obj, key))
+    }
+
     /// `val instanceof <built-in ctor>`. With no user prototype chain the result
     /// is structural: by heap kind for Array/Object/Function, and by the `name`
     /// field for the Error family (any error subtype satisfies `instanceof
