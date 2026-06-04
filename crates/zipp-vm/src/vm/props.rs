@@ -655,6 +655,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Closure { .. }
                 | HeapObj::Bound { .. }
                 | HeapObj::BoundResolver { .. }
+                | HeapObj::CombinatorResolver { .. }
                 | HeapObj::Native(_) => {
                     if has_length {
                         keys.push("length".to_string());
@@ -806,6 +807,7 @@ impl<'p> Vm<'p> {
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
             | HeapObj::BoundResolver { .. }
+            | HeapObj::CombinatorResolver { .. }
             | HeapObj::Native(_) => (None, false, 1),
             HeapObj::Array(_) => (None, false, 2),
             _ => (None, false, 3),
