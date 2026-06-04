@@ -32,6 +32,22 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// thisSymbolValue(value): the underlying Symbol primitive for a Symbol
+    /// `this`, OR a boxed Symbol wrapper (`Object(sym)` → Boxed{kind:3}); else a
+    /// TypeError. Lets the Symbol.prototype methods work on a wrapper receiver.
+    fn this_symbol_value(&self, this: Value, method: &str) -> Result<Value, Thrown> {
+        if this.is_heap() {
+            match self.heap.get(this.heap_index()) {
+                HeapObj::Symbol { .. } => return Ok(this),
+                HeapObj::Boxed { kind: 3, value } => return Ok(*value),
+                _ => {}
+            }
+        }
+        Err(Thrown(format!(
+            "TypeError: Symbol.prototype.{method} requires that 'this' be a Symbol"
+        )))
+    }
+
     /// Invoke a native (built-in) function by id with `this` and `args`. Backs
     /// first-class builtin values (`Object.defineProperty`, `Array.isArray`,
     /// `Object.prototype.hasOwnProperty`, `Function.prototype.call`, …).
@@ -164,44 +180,21 @@ impl<'p> Vm<'p> {
             }
             SYMBOL_TO_STRING => {
                 // `Symbol.prototype.toString` → "Symbol(description)".
-                let desc = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::Symbol { desc, .. }) => *desc,
-                    _ => {
-                        return Err(Thrown(
-                            "TypeError: Symbol.prototype.toString requires that 'this' be a Symbol"
-                                .into(),
-                        ))
-                    }
+                let sym = self.this_symbol_value(this, "toString")?;
+                let desc = match self.heap.get(sym.heap_index()) {
+                    HeapObj::Symbol { desc, .. } => *desc,
+                    _ => Value::UNDEFINED,
                 };
                 let d = if desc == Value::UNDEFINED { String::new() } else { self.display(desc) };
                 self.alloc_str(format!("Symbol({d})"))
             }
             SYMBOL_VALUE_OF => {
                 // `Symbol.prototype.valueOf` → the Symbol primitive itself.
-                if matches!(
-                    this.is_heap().then(|| self.heap.get(this.heap_index())),
-                    Some(HeapObj::Symbol { .. })
-                ) {
-                    this
-                } else {
-                    return Err(Thrown(
-                        "TypeError: Symbol.prototype.valueOf requires that 'this' be a Symbol".into(),
-                    ));
-                }
+                self.this_symbol_value(this, "valueOf")?
             }
             SYMBOL_TO_PRIMITIVE => {
                 // `Symbol.prototype[Symbol.toPrimitive](hint)` → the Symbol itself.
-                if matches!(
-                    this.is_heap().then(|| self.heap.get(this.heap_index())),
-                    Some(HeapObj::Symbol { .. })
-                ) {
-                    this
-                } else {
-                    return Err(Thrown(
-                        "TypeError: Symbol.prototype[Symbol.toPrimitive] requires that 'this' be a Symbol"
-                            .into(),
-                    ));
-                }
+                self.this_symbol_value(this, "[Symbol.toPrimitive]")?
             }
             DATE_TO_PRIMITIVE => {
                 // `Date.prototype[Symbol.toPrimitive](hint)`: O must be an Object.
@@ -253,14 +246,10 @@ impl<'p> Vm<'p> {
             }
             SYMBOL_DESCRIPTION_GET => {
                 // `get Symbol.prototype.description` → the symbol's description.
-                match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::Symbol { desc, .. }) => *desc,
-                    _ => {
-                        return Err(Thrown(
-                            "TypeError: Symbol.prototype.description getter requires that 'this' be a Symbol"
-                                .into(),
-                        ))
-                    }
+                let sym = self.this_symbol_value(this, "description")?;
+                match self.heap.get(sym.heap_index()) {
+                    HeapObj::Symbol { desc, .. } => *desc,
+                    _ => Value::UNDEFINED,
                 }
             }
             STR_ITERATOR => {
@@ -1241,7 +1230,7 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.ownKeys called on non-object".into()));
                 }
-                self.object_own_property_names(a0)?
+                self.object_own_keys(a0)?
             }
             REFLECT_GET_PROTO => {
                 if !self.is_object_value(a0) {

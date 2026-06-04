@@ -163,7 +163,9 @@ pub(crate) fn time_clip(n: f64) -> f64 {
     if !n.is_finite() || n.abs() > 8.64e15 {
         f64::NAN
     } else {
-        n.trunc()
+        // Spec step 3 is `ToInteger(time) + (+0)`: the `+ 0.0` exists to normalize a
+        // truncated -0 to +0 (Rust's (-0.0).trunc() preserves the negative-zero bit).
+        n.trunc() + 0.0
     }
 }
 

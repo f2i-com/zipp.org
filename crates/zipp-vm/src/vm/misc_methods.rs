@@ -158,7 +158,12 @@ impl<'p> Vm<'p> {
                 let digits = if arg == Value::UNDEFINED {
                     None
                 } else {
-                    let d = int_arg(self, 0)?;
+                    let d = int_arg(self, 0)?; // ToNumber side effect (valueOf) first
+                    // A NaN/Infinity receiver returns "NaN"/"Infinity" BEFORE the
+                    // RangeError on the digits argument (spec steps 4 & 7).
+                    if !n.is_finite() {
+                        return Ok(Some(self.alloc_str(fmt_exponential(n, None))));
+                    }
                     if d < 0.0 || d > 100.0 {
                         return Err(Thrown(
                             "RangeError: toExponential() argument must be between 0 and 100".into(),
@@ -173,7 +178,12 @@ impl<'p> Vm<'p> {
                 if arg == Value::UNDEFINED {
                     return Ok(Some(self.alloc_str(self.display(nv))));
                 }
-                let p = int_arg(self, 0)?;
+                let p = int_arg(self, 0)?; // ToNumber side effect (valueOf) first
+                // A NaN/Infinity receiver returns "NaN"/"Infinity" BEFORE the
+                // RangeError on the precision argument (spec steps 4 & 7).
+                if !n.is_finite() {
+                    return Ok(Some(self.alloc_str(self.display(nv))));
+                }
                 if p < 1.0 || p > 100.0 {
                     return Err(Thrown(
                         "RangeError: toPrecision() argument must be between 1 and 100".into(),
