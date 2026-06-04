@@ -1042,7 +1042,13 @@ impl<'p> Vm<'p> {
                 }
             }
             if key == "length" {
-                let (value, ..) = self.read_descriptor(desc)?;
+                // `length` is a non-configurable, non-enumerable, WRITABLE data
+                // property (ArraySetLength, 15.4.5.1). Reject making it configurable
+                // or enumerable, or turning it into an accessor.
+                let (value, get, set, _d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
+                if get.is_some() || set.is_some() || d_cf == Some(true) || d_en == Some(true) {
+                    return Err(Thrown("TypeError: Cannot redefine property: length".into()));
+                }
                 if let Some(v) = value {
                     let n = self.to_number_coerce(v)?;
                     if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
@@ -1053,8 +1059,33 @@ impl<'p> Vm<'p> {
                             "RangeError: array length exceeds the engine's dense-array limit".into(),
                         ));
                     }
+                    let new_len = n as usize;
+                    let cur_len = match self.heap.get(idx) {
+                        HeapObj::Array(items) => items.len(),
+                        _ => 0,
+                    };
+                    // Shrinking past a NON-configurable index is forbidden: the
+                    // element can't be deleted, so length stops there and a
+                    // TypeError is thrown (ArraySetLength steps 16-17).
+                    if new_len < cur_len {
+                        for i in new_len..cur_len {
+                            if let Some((a, _)) = self.array_index_override(idx, i) {
+                                if !a.configurable {
+                                    return Err(Thrown(
+                                        "TypeError: Cannot redefine property: length".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        // Drop any (configurable) special overrides being truncated.
+                        if let Some(m) = self.arr_props.get_mut(&idx) {
+                            for i in new_len..cur_len {
+                                m.remove(&i.to_string());
+                            }
+                        }
+                    }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        items.resize(n as usize, Value::UNDEFINED);
+                        items.resize(new_len, Value::UNDEFINED);
                     }
                     self.heap.bump_version(idx);
                 }
