@@ -27,6 +27,16 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn get_index(&mut self, obj: Value, key: Value) -> Result<Value, Thrown> {
+        // RequireObjectCoercible(base) precedes ToPropertyKey(key): `null[k]` must
+        // throw TypeError BEFORE evaluating k's toString (sec-evaluate-property-
+        // access-with-expression-key + GetValue). coerce_index_key runs the key's
+        // ToString, so the nullish guard has to come first.
+        if obj.is_nullish() {
+            return Err(Thrown(format!(
+                "TypeError: cannot read property of {}",
+                self.display(obj)
+            )));
+        }
         // A rope must be materialized before random access; no-op (one tag
         // check) for arrays, objects, and already-flat strings.
         if obj.is_heap() {
