@@ -1441,6 +1441,14 @@ impl<'a> FnCompiler<'a> {
                 self.extract_pattern(&ap.left, src)
             }
             P::ObjectPattern(op) => {
+                // RequireObjectCoercible(src): an object pattern with NO named
+                // properties (`{}` or `{...rest}`) never performs a member access,
+                // so without this an empty pattern would silently accept null /
+                // undefined. (A pattern WITH named properties throws via the
+                // GetProp/GetIndex below.)
+                if op.properties.is_empty() {
+                    self.emit(Instr::CheckCoercible { src });
+                }
                 // With a `...rest` AND a computed sibling key, the exclusion set
                 // isn't known until runtime: evaluate each sibling key once into a
                 // contiguous block (reused for extraction + ObjectRestDyn).
@@ -4094,6 +4102,11 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn assign_object_target(&mut self, o: &ox::ObjectAssignmentTarget, src: Reg) -> R<()> {
+        // RequireObjectCoercible(src) for an empty pattern (`({} = x)` /
+        // `({...rest} = x)`) — no member access would otherwise guard null/undefined.
+        if o.properties.is_empty() {
+            self.emit(Instr::CheckCoercible { src });
+        }
         // Computed sibling key + `...rest`: evaluate each sibling key once into a
         // contiguous block (reused for extraction and the ObjectRestDyn exclusion).
         let has_computed = o.rest.is_some()

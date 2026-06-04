@@ -302,6 +302,10 @@ pub enum Instr {
     /// (string/number/boolean/symbol/bigint wrappers), null/undefined → a fresh
     /// object, and an existing object is returned unchanged.
     ToObject { dst: Reg, src: Reg },
+    /// RequireObjectCoercible(src): throw a TypeError if `src` is null/undefined,
+    /// otherwise a no-op. Emitted for an EMPTY object destructuring pattern
+    /// (`var {} = x`) — a non-empty pattern already throws via member access.
+    CheckCoercible { src: Reg },
     /// `dst = new <Error subtype>(arg?, opts?)` — a proto-linked error instance.
     /// `kind` indexes the canonical error list (0=Error, 1=TypeError, …,
     /// 7=AggregateError); `arg` (when present) is coerced to the `message` string.

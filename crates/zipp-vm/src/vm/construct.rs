@@ -1049,6 +1049,12 @@ impl<'p> Vm<'p> {
     /// pulls 2, not forever); everything else (arrays/strings/Map/Set, or a
     /// non-iterable) passes through unchanged.
     pub(crate) fn iter_to_array(&mut self, v: Value, max: u32) -> Result<Value, Thrown> {
+        // Array destructuring uses GetIterator(value), which first does
+        // RequireObjectCoercible — so null/undefined throw a TypeError even for an
+        // empty pattern (`[] = null`), before any element is read.
+        if v == Value::NULL || v == Value::UNDEFINED {
+            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+        }
         if !v.is_heap() {
             return Ok(v);
         }
