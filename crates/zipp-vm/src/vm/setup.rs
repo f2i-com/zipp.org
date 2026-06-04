@@ -532,7 +532,16 @@ impl<'p> Vm<'p> {
         self.asyncgen_proto = asyncgen_proto;
         // The `Iterator` constructor (abstract): prototype = %Iterator.prototype%,
         // static `Iterator.from`. name "Iterator", length 0.
-        let iter_ctor = build(self, &[("from", ITER_FROM), ("concat", ITER_CONCAT)], Some(iter_root));
+        let iter_ctor = build(
+            self,
+            &[
+                ("from", ITER_FROM),
+                ("concat", ITER_CONCAT),
+                ("zip", ITER_ZIP),
+                ("zipKeyed", ITER_ZIPKEYED),
+            ],
+            Some(iter_root),
+        );
         self.iterator_ctor = iter_ctor;
         let iter_name = self.alloc_str("Iterator".to_string());
         if let HeapObj::Object(m) = self.heap.get_mut(iter_ctor) {

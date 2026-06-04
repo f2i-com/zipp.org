@@ -1437,15 +1437,20 @@ impl<'p> Vm<'p> {
                 self.iter_helper_method(id, this, args)?
             }
             ITER_HELPER_NEXT => {
-                if !matches!(
-                    this.is_heap().then(|| self.heap.get(this.heap_index())),
-                    Some(HeapObj::IterHelper { .. })
-                ) {
-                    return Err(Thrown(
-                        "TypeError: Iterator Helper next called on an incompatible receiver".into(),
-                    ));
+                let kind = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::IterHelper { kind, .. }) => *kind,
+                    _ => {
+                        return Err(Thrown(
+                            "TypeError: Iterator Helper next called on an incompatible receiver".into(),
+                        ))
+                    }
+                };
+                // kind 7 = a zip/zipKeyed helper (multi-iterator, lockstep).
+                if kind == 7 {
+                    self.iter_zip_next(this.heap_index())?
+                } else {
+                    self.iter_helper_next(this.heap_index())?
                 }
-                self.iter_helper_next(this.heap_index())?
             }
             ITER_HELPER_RETURN => {
                 if this.is_heap() {
@@ -1462,7 +1467,10 @@ impl<'p> Vm<'p> {
                     if let HeapObj::IterHelper { done, .. } = self.heap.get_mut(this.heap_index()) {
                         *done = true;
                     }
-                    if !was_done {
+                    if !was_done && kind == 7 {
+                        // zip: close every still-open input iterator.
+                        self.iz_close_all(this.heap_index());
+                    } else if !was_done {
                         let target = if kind == 6 { inner } else { source };
                         if self.is_object_value(target) {
                             self.iterator_close(target)?;
@@ -1473,6 +1481,8 @@ impl<'p> Vm<'p> {
             }
             ITER_FROM => self.iterator_from(a0)?,
             ITER_CONCAT => self.iterator_concat(args)?,
+            ITER_ZIP => self.iterator_zip(a0, a1, false)?,
+            ITER_ZIPKEYED => self.iterator_zip(a0, a1, true)?,
             // test262 `$262.detachArrayBuffer(ab)` / `$262.gc()`.
             DOLLAR262_DETACH => {
                 if let Some(buf) = self.as_array_buffer(a0) {

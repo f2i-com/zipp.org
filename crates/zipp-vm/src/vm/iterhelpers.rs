@@ -124,6 +124,298 @@ impl<'p> Vm<'p> {
         Ok(self.make_iter_helper(src, 6, Value::UNDEFINED, 0))
     }
 
+    /// `Iterator.zip(iterables, options)` (keyed=false) / `Iterator.zipKeyed`
+    /// (keyed=true). Opens every input iterator eagerly here (closing any already
+    /// opened on an abrupt completion), reads the options (`mode`:
+    /// shortest/longest/strict, `padding` for longest), then returns an Iterator
+    /// Helper (kind 7) that lazily steps all iterators in lockstep. The multi-
+    /// iterator state is encoded in the helper's existing fields: `source` = an
+    /// Array of the open iterators (a `null` slot is a closed one), `arg` = the
+    /// per-iterator padding Array, `inner` = the key Array (zipKeyed) or undefined.
+    pub(crate) fn iterator_zip(
+        &mut self,
+        iterables: Value,
+        options: Value,
+        keyed: bool,
+    ) -> Result<Value, Thrown> {
+        let _gc = self.gc_lock_guard();
+        let what = if keyed { "zipKeyed" } else { "zip" };
+        if !self.is_object_value(iterables) {
+            return Err(Thrown(format!("TypeError: Iterator.{what} called with a non-object")));
+        }
+        if options != Value::UNDEFINED && !self.is_object_value(options) {
+            return Err(Thrown(format!("TypeError: Iterator.{what} options is not an object")));
+        }
+        // mode: shortest (0, default) / longest (1) / strict (2).
+        let mode: u8 = if options != Value::UNDEFINED {
+            let m = self.get_prop(options, "mode")?;
+            if m == Value::UNDEFINED {
+                0
+            } else {
+                match self.to_js_string(m)?.as_str() {
+                    "shortest" => 0,
+                    "longest" => 1,
+                    "strict" => 2,
+                    _ => return Err(Thrown(format!("TypeError: Iterator.{what} invalid mode"))),
+                }
+            }
+        } else {
+            0
+        };
+        let padding_option = if mode == 1 && options != Value::UNDEFINED {
+            let p = self.get_prop(options, "padding")?;
+            if p != Value::UNDEFINED && !self.is_object_value(p) {
+                return Err(Thrown(format!("TypeError: Iterator.{what} padding is not an object")));
+            }
+            p
+        } else {
+            Value::UNDEFINED
+        };
+        // Open each input iterator (closing the already-open ones on failure).
+        let mut iters: Vec<Value> = Vec::new();
+        let mut keys: Vec<Value> = Vec::new();
+        if keyed {
+            let key_arr = self.object_enum_own(iterables, crate::vm::EnumWhat::Keys)?;
+            let key_list = match self.heap.get(key_arr.heap_index()) {
+                HeapObj::Array(a) => a.clone(),
+                _ => Vec::new(),
+            };
+            for k in key_list {
+                let ks = self.to_js_string(k)?;
+                let value = self.get_member(iterables, &ks, iterables)?;
+                match self.get_iterator_flattenable(value) {
+                    Ok(it) => {
+                        iters.push(it);
+                        keys.push(k);
+                    }
+                    Err(e) => {
+                        for &op in &iters {
+                            let _ = self.iterator_close(op);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        } else {
+            // A real (steppable) iterator over the input — `get_iterator` returns a
+            // plain array unchanged (no `.next()`), so use the @@iterator call form.
+            let input_iter = self.get_iterator_flattenable(iterables)?;
+            loop {
+                match self.iterator_step(input_iter) {
+                    Ok(None) => break,
+                    Ok(Some(value)) => match self.get_iterator_flattenable(value) {
+                        Ok(it) => iters.push(it),
+                        Err(e) => {
+                            let _ = self.iterator_close(input_iter);
+                            for &op in &iters {
+                                let _ = self.iterator_close(op);
+                            }
+                            return Err(e);
+                        }
+                    },
+                    Err(e) => {
+                        for &op in &iters {
+                            let _ = self.iterator_close(op);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let count = iters.len();
+        // Longest-mode padding. For zip the padding option is an ITERABLE (read
+        // `count` values, short → undefined fill); for zipKeyed it is an OBJECT
+        // whose per-key property supplies that key's padding.
+        let mut padding: Vec<Value> = vec![Value::UNDEFINED; count];
+        if mode == 1 && padding_option != Value::UNDEFINED {
+            if keyed {
+                for (i, slot) in padding.iter_mut().enumerate() {
+                    let ks = self.to_js_string(keys[i])?;
+                    *slot = self.get_member(padding_option, &ks, padding_option)?;
+                }
+            } else {
+                let pad_iter = self.get_iterator_flattenable(padding_option)?;
+                for slot in padding.iter_mut() {
+                    match self.iterator_step(pad_iter)? {
+                        Some(v) => *slot = v,
+                        None => break,
+                    }
+                }
+                let _ = self.iterator_close(pad_iter);
+            }
+        }
+        let source = Value::heap(self.heap.alloc(HeapObj::Array(iters)));
+        let arg = Value::heap(self.heap.alloc(HeapObj::Array(padding)));
+        let inner = if keyed {
+            Value::heap(self.heap.alloc(HeapObj::Array(keys)))
+        } else {
+            Value::UNDEFINED
+        };
+        let h = self.make_iter_helper(source, 7, arg, mode as i64);
+        self.ih_set_inner(h.heap_index(), inner);
+        Ok(h)
+    }
+
+    /// Set the i-th open iterator of a zip helper to `null` (closed/exhausted).
+    fn iz_close_slot(&mut self, helper_idx: u32, i: usize) {
+        let source = match self.heap.get(helper_idx) {
+            HeapObj::IterHelper { source, .. } => *source,
+            _ => return,
+        };
+        if let HeapObj::Array(items) = self.heap.get_mut(source.heap_index()) {
+            if i < items.len() {
+                items[i] = Value::NULL;
+            }
+        }
+    }
+
+    /// Close every still-open iterator of a zip helper (for `.return()`).
+    pub(crate) fn iz_close_all(&mut self, helper_idx: u32) {
+        let source = match self.heap.get(helper_idx) {
+            HeapObj::IterHelper { source, .. } => *source,
+            _ => return,
+        };
+        let iters = match self.heap.get(source.heap_index()) {
+            HeapObj::Array(a) => a.clone(),
+            _ => Vec::new(),
+        };
+        for it in iters {
+            if it != Value::NULL {
+                let _ = self.iterator_close(it);
+            }
+        }
+    }
+
+    /// One step of a zip Iterator Helper (kind 7): step every open iterator in
+    /// lockstep and assemble one tuple (an Array for zip, a keyed object for
+    /// zipKeyed) per the mode.
+    pub(crate) fn iter_zip_next(&mut self, idx: u32) -> Result<Value, Thrown> {
+        let _gc = self.gc_lock_guard();
+        let (source, arg, inner, mode, done) = match self.heap.get(idx) {
+            HeapObj::IterHelper { source, arg, inner, n, done, .. } => {
+                (*source, *arg, *inner, *n as u8, *done)
+            }
+            _ => return Err(Thrown("TypeError: Iterator Helper next on incompatible receiver".into())),
+        };
+        if done {
+            return Ok(self.iter_result(Value::UNDEFINED, true));
+        }
+        let iters: Vec<Value> = match self.heap.get(source.heap_index()) {
+            HeapObj::Array(a) => a.clone(),
+            _ => Vec::new(),
+        };
+        let padding: Vec<Value> = match self.heap.get(arg.heap_index()) {
+            HeapObj::Array(a) => a.clone(),
+            _ => Vec::new(),
+        };
+        let count = iters.len();
+        // Zero iterables → the zip iterator is immediately done.
+        if count == 0 {
+            self.ih_set_done(idx);
+            return Ok(self.iter_result(Value::UNDEFINED, true));
+        }
+        let pad = |i: usize| padding.get(i).copied().unwrap_or(Value::UNDEFINED);
+        let mut results: Vec<Value> = vec![Value::UNDEFINED; count];
+        match mode {
+            0 => {
+                // shortest: any exhausted iterator finishes the zip; close the rest.
+                for i in 0..count {
+                    match self.iterator_step(iters[i])? {
+                        None => {
+                            self.ih_set_done(idx);
+                            for (j, &it) in iters.iter().enumerate() {
+                                if j != i && it != Value::NULL {
+                                    let _ = self.iterator_close(it);
+                                }
+                            }
+                            return Ok(self.iter_result(Value::UNDEFINED, true));
+                        }
+                        Some(v) => results[i] = v,
+                    }
+                }
+            }
+            1 => {
+                // longest: continue until all are exhausted, padding the finished.
+                let mut all_done = true;
+                for i in 0..count {
+                    if iters[i] == Value::NULL {
+                        results[i] = pad(i);
+                        continue;
+                    }
+                    match self.iterator_step(iters[i])? {
+                        None => {
+                            self.iz_close_slot(idx, i);
+                            results[i] = pad(i);
+                        }
+                        Some(v) => {
+                            results[i] = v;
+                            all_done = false;
+                        }
+                    }
+                }
+                if all_done {
+                    self.ih_set_done(idx);
+                    return Ok(self.iter_result(Value::UNDEFINED, true));
+                }
+            }
+            _ => {
+                // strict: every iterator must end on the same step.
+                for i in 0..count {
+                    match self.iterator_step(iters[i])? {
+                        None => {
+                            self.ih_set_done(idx);
+                            if i == 0 {
+                                // The rest must also be done now.
+                                for j in 1..count {
+                                    match self.iterator_step(iters[j])? {
+                                        None => {}
+                                        Some(_) => {
+                                            for &it in iters.iter().skip(j + 1) {
+                                                let _ = self.iterator_close(it);
+                                            }
+                                            return Err(Thrown(
+                                                "TypeError: Iterator.zip strict: iterators have different lengths".into(),
+                                            ));
+                                        }
+                                    }
+                                }
+                                return Ok(self.iter_result(Value::UNDEFINED, true));
+                            }
+                            // An earlier iterator yielded a value but this one ended.
+                            for &it in iters.iter().skip(i + 1) {
+                                let _ = self.iterator_close(it);
+                            }
+                            return Err(Thrown(
+                                "TypeError: Iterator.zip strict: iterators have different lengths".into(),
+                            ));
+                        }
+                        Some(v) => results[i] = v,
+                    }
+                }
+            }
+        }
+        // Assemble the tuple: an Array (zip) or a keyed object (zipKeyed).
+        let out = if inner != Value::UNDEFINED {
+            let keys: Vec<Value> = match self.heap.get(inner.heap_index()) {
+                HeapObj::Array(a) => a.clone(),
+                _ => Vec::new(),
+            };
+            let mut m = ObjMap::new();
+            for i in 0..count {
+                let ks = self.to_js_string(keys[i])?;
+                m.set(&ks, results[i]);
+            }
+            // The zipKeyed result is a NULL-prototype ordinary object (its keyed
+            // properties keep the default data attributes from `set`).
+            let o = self.heap.alloc(HeapObj::Object(m));
+            self.proto_of.insert(o, Value::NULL);
+            Value::heap(o)
+        } else {
+            Value::heap(self.heap.alloc(HeapObj::Array(results)))
+        };
+        Ok(self.iter_result(out, false))
+    }
+
     fn make_iter_helper(&mut self, source: Value, kind: u8, arg: Value, n: i64) -> Value {
         let idx = self.heap.alloc(HeapObj::IterHelper {
             source,

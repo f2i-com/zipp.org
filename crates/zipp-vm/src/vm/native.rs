@@ -144,6 +144,12 @@ pub const ITER_CTOR_SET: u16 = 617;
 /// `Iterator.concat(...iterables)` — concatenate iterables into one Iterator
 /// Helper (eager @@iterator validation, lazy per-iterable opening).
 pub const ITER_CONCAT: u16 = 618;
+/// `Iterator.zip(iterables, options)` — zip an iterable of iterables into an
+/// iterator of arrays (shortest/longest/strict modes + longest padding).
+pub const ITER_ZIP: u16 = 619;
+/// `Iterator.zipKeyed(iterables, options)` — like zip but `iterables` is an
+/// object of named iterables and the result yields keyed objects.
+pub const ITER_ZIPKEYED: u16 = 682;
 // The test262 `$262` host object.
 pub const DOLLAR262_DETACH: u16 = 620;
 pub const DOLLAR262_GC: u16 = 621;
@@ -840,6 +846,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         ITER_HELPER_RETURN => ("return", 0),
         ITER_FROM => ("from", 1),
         ITER_CONCAT => ("concat", 0),
+        ITER_ZIP => ("zip", 1),
+        ITER_ZIPKEYED => ("zipKeyed", 1),
         OBJPROTO_DEFINE_GETTER => ("__defineGetter__", 2),
         OBJPROTO_DEFINE_SETTER => ("__defineSetter__", 2),
         OBJPROTO_LOOKUP_GETTER => ("__lookupGetter__", 1),
