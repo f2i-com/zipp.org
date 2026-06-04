@@ -1646,6 +1646,37 @@ impl<'p> Vm<'p> {
                 Value::num(parse_int(&s, radix))
             }
             GLOBAL_PARSE_FLOAT => Value::num(parse_float(&self.display(a0))),
+            // URI codecs. The `extra`/`reserved` byte sets are the ASCII chars
+            // kept verbatim beyond uriUnescaped (encode) / left percent-escaped
+            // (decode). Malformed input → URIError.
+            GLOBAL_ENCODE_URI => {
+                let s = self.to_js_string(a0)?;
+                match uri_encode(&s, b"#;/?:@&=+$,") {
+                    Ok(r) => self.alloc_str(r),
+                    Err(_) => return Err(Thrown("URIError: URI malformed".into())),
+                }
+            }
+            GLOBAL_ENCODE_URI_COMPONENT => {
+                let s = self.to_js_string(a0)?;
+                match uri_encode(&s, b"") {
+                    Ok(r) => self.alloc_str(r),
+                    Err(_) => return Err(Thrown("URIError: URI malformed".into())),
+                }
+            }
+            GLOBAL_DECODE_URI => {
+                let s = self.to_js_string(a0)?;
+                match uri_decode(&s, b";/?:@&=+$,#") {
+                    Ok(r) => self.alloc_str(r),
+                    Err(_) => return Err(Thrown("URIError: URI malformed".into())),
+                }
+            }
+            GLOBAL_DECODE_URI_COMPONENT => {
+                let s = self.to_js_string(a0)?;
+                match uri_decode(&s, b"") {
+                    Ok(r) => self.alloc_str(r),
+                    Err(_) => return Err(Thrown("URIError: URI malformed".into())),
+                }
+            }
             GLOBAL_IS_NAN => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan()),
             GLOBAL_IS_FINITE => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite()),
             GLOBAL_EVAL => {
@@ -2483,4 +2514,104 @@ impl<'p> Vm<'p> {
         })
     }
 
+}
+
+/// The always-unescaped set for the Encode operation: uriAlpha + DecimalDigit +
+/// uriMark. (encodeURI additionally keeps uriReserved + "#"; those extra chars
+/// are passed in by the caller.)
+const URI_UNESCAPED: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.!~*'()";
+
+fn hex_upper(b: u8) -> [u8; 2] {
+    const H: &[u8; 16] = b"0123456789ABCDEF";
+    [H[(b >> 4) as usize], H[(b & 0xF) as usize]]
+}
+
+fn hex_val(b: u8) -> Result<u8, ()> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(()),
+    }
+}
+
+/// Encode (ECMA-262 19.2.6.5): every char not in uriUnescaped ∪ `extra` is
+/// replaced by the percent-encoded uppercase hex of its UTF-8 bytes. Rust `str`
+/// holds only Unicode scalar values, so the lone-surrogate URIError branch is
+/// unreachable here.
+fn uri_encode(s: &str, extra: &[u8]) -> Result<String, ()> {
+    let mut out = String::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        if c.is_ascii() && (URI_UNESCAPED.contains(&(c as u8)) || extra.contains(&(c as u8))) {
+            out.push(c);
+        } else {
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                let h = hex_upper(b);
+                out.push('%');
+                out.push(h[0] as char);
+                out.push(h[1] as char);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode (ECMA-262 19.2.6.4): each `%XX` escape is decoded; a decoded
+/// single-byte char that lies in the `reserved` set is left as its original
+/// `%XX` text (decodeURI keeps uriReserved + "#"; decodeURIComponent keeps
+/// nothing). Multi-byte sequences are validated as UTF-8. Malformed → Err.
+fn uri_decode(s: &str, reserved: &[u8]) -> Result<String, ()> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let read = |at: usize| -> Result<u8, ()> {
+        if at + 2 >= bytes.len() || bytes[at] != b'%' {
+            return Err(());
+        }
+        Ok((hex_val(bytes[at + 1])? << 4) | hex_val(bytes[at + 2])?)
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let b0 = read(i)?;
+        if b0 & 0x80 == 0 {
+            if reserved.contains(&b0) {
+                out.extend_from_slice(&bytes[i..i + 3]); // keep original %XX
+            } else {
+                out.push(b0);
+            }
+            i += 3;
+        } else {
+            // UTF-8 lead byte: 2/3/4 total octets.
+            let n = if b0 >> 5 == 0b110 {
+                2
+            } else if b0 >> 4 == 0b1110 {
+                3
+            } else if b0 >> 3 == 0b11110 {
+                4
+            } else {
+                return Err(());
+            };
+            let mut seq = vec![b0];
+            i += 3;
+            for _ in 1..n {
+                let cb = read(i)?;
+                if cb & 0xC0 != 0x80 {
+                    return Err(());
+                }
+                seq.push(cb);
+                i += 3;
+            }
+            match std::str::from_utf8(&seq) {
+                Ok(valid) => out.extend_from_slice(valid.as_bytes()),
+                Err(_) => return Err(()),
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| ())
 }

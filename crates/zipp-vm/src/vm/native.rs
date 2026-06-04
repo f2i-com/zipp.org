@@ -125,6 +125,12 @@ pub const MAP_SIZE_GET: u16 = 861;
 /// The GetCapabilitiesExecutor for NewPromiseCapability: captures (resolve,
 /// reject) into `vm.cap_capture`; throws if called a second time.
 pub const CAP_EXECUTOR: u16 = 862;
+/// The four global URI codec functions (percent-encode/decode per the Encode/
+/// Decode abstract operations).
+pub const GLOBAL_ENCODE_URI: u16 = 863;
+pub const GLOBAL_ENCODE_URI_COMPONENT: u16 = 864;
+pub const GLOBAL_DECODE_URI: u16 = 865;
+pub const GLOBAL_DECODE_URI_COMPONENT: u16 = 866;
 pub const WS_ADD: u16 = 294;
 pub const WS_HAS: u16 = 295;
 pub const WS_DELETE: u16 = 296;
@@ -881,6 +887,10 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         NUM_IS_SAFE_INTEGER => ("isSafeInteger", 1),
         GLOBAL_PARSE_INT => ("parseInt", 2),
         GLOBAL_PARSE_FLOAT => ("parseFloat", 1),
+        GLOBAL_ENCODE_URI => ("encodeURI", 1),
+        GLOBAL_ENCODE_URI_COMPONENT => ("encodeURIComponent", 1),
+        GLOBAL_DECODE_URI => ("decodeURI", 1),
+        GLOBAL_DECODE_URI_COMPONENT => ("decodeURIComponent", 1),
         GLOBAL_IS_NAN => ("isNaN", 1),
         GLOBAL_IS_FINITE => ("isFinite", 1),
         GLOBAL_EVAL => ("eval", 1),
