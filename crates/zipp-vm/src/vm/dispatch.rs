@@ -1905,7 +1905,7 @@ impl<'p> Vm<'p> {
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let ag = self.alloc_async_generator(fid, closure, Value::UNDEFINED, &argv);
+                            let ag = self.alloc_async_generator(fid, closure, Value::UNDEFINED, &argv)?;
                             self.set(base, dst, ag);
                             ip += 1;
                             continue;
@@ -2029,7 +2029,7 @@ impl<'p> Vm<'p> {
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let ag = self.alloc_async_generator(fid, closure, recv, &argv);
+                            let ag = self.alloc_async_generator(fid, closure, recv, &argv)?;
                             self.set(base, dst, ag);
                             ip += 1;
                             continue;
@@ -2092,7 +2092,7 @@ impl<'p> Vm<'p> {
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let ag = self.alloc_async_generator(fid, closure, recv, &argv);
+                            let ag = self.alloc_async_generator(fid, closure, recv, &argv)?;
                             self.set(base, dst, ag);
                             ip += 1;
                             continue;

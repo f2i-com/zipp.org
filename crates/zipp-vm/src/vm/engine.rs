@@ -622,9 +622,10 @@ impl<'p> Vm<'p> {
             this
         };
         // An `async function*` builds a suspended AsyncGenerator (an async
-        // iterator); it doesn't run until `.next()`.
+        // iterator); it doesn't run until `.next()` (but its parameter prologue
+        // runs eagerly here, so a destructuring throw propagates from the call).
         if is_gen && is_async {
-            return Ok(self.alloc_async_generator(func_id, closure, this, args));
+            return self.alloc_async_generator(func_id, closure, this, args);
         }
         // Calling a generator function builds a suspended Generator, not a frame.
         // (The parameter prologue runs eagerly here, so a destructuring throw

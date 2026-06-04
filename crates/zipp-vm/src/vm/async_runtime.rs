@@ -402,8 +402,17 @@ impl<'p> Vm<'p> {
     }
 
     /// Calling an `async function*` builds a suspended AsyncGenerator (an async
-    /// iterator). It does NOT run until the first `.next()`.
-    pub(crate) fn alloc_async_generator(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
+    /// iterator). Like a sync generator, its parameter prologue (defaults +
+    /// destructuring) runs EAGERLY here at call time — so a destructuring throw
+    /// surfaces synchronously from the call — and it is parked at the `GenStart`
+    /// body-entry marker; the body itself does NOT run until the first `.next()`.
+    pub(crate) fn alloc_async_generator(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
@@ -416,18 +425,45 @@ impl<'p> Vm<'p> {
             let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
             regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
         }
-        Value::heap(self.heap.alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
+        // Run the parameter prologue up to `GenStart` (see `alloc_generator`).
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
+        self.regs.extend_from_slice(&regs);
+        if new_base + reg_count > self.regs_hw {
+            self.regs_hw = new_base + reg_count;
+        }
+        let stop = self.frames.len();
+        self.frames.push(Frame {
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
+            closure,
+            handlers: Vec::new(),
+        });
+        let outcome = self.run_loop(stop);
+        let (state, regs) = if let Some((_v, genstart_ip)) = self.pending_yield.take() {
+            // Suspended at `GenStart`: park at the marker, body runs on first next().
+            (GenState::Suspended(genstart_ip), self.regs.split_off(new_base))
+        } else {
+            // The prologue threw (propagate at the call) or, defensively, the body
+            // ran to completion (a proto with no `GenStart`).
+            self.regs.truncate(new_base);
+            match outcome {
+                Ok(_) => (GenState::Completed, Vec::new()),
+                Err(t) => return Err(t),
+            }
+        };
+        Ok(Value::heap(self.heap.alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
             func: func_id,
             closure,
-            // NOTE: async generators keep the legacy `Suspended(0)` "fresh"
-            // sentinel for now — switching them to `usize::MAX` (as plain
-            // generators / async functions do) regressed AsyncGeneratorPrototype,
-            // so their first-instruction-yield edge stays a known limitation.
-            state: GenState::Suspended(0),
+            state,
             regs,
             handlers: Vec::new(),
             queue: Vec::new(),
-        }))))
+        })))))
     }
 
     /// `.next()`/`.return()`/`.throw()` on an async generator. Each returns a
@@ -486,7 +522,9 @@ impl<'p> Vm<'p> {
                     ip == 0
                         || matches!(
                             self.func(g.func as usize).code.get(ip),
-                            Some(Instr::Yield { .. })
+                            // A `GenStart` marker = freshly constructed (prologue ran
+                            // eagerly), ready to run the body on this first `.next()`.
+                            Some(Instr::Yield { .. } | Instr::GenStart)
                         )
                 }
             },
@@ -565,8 +603,18 @@ impl<'p> Vm<'p> {
         // Resume after the suspending op, delivering the sent/awaited value. The
         // op at `resume_ip` is a Yield (resumed by `.next(v)`) or Await (resumed
         // by a settled promise) — both write the value into the op's `dst`.
-        // (Async generators use the legacy `0` fresh sentinel — see alloc note.)
-        let outcome = if resume_ip == 0 {
+        // A `GenStart` marker means freshly constructed (the prologue already ran
+        // eagerly at the call): run the body from just past it with no value
+        // delivery. (The legacy `0` sentinel — a proto with no marker — runs from
+        // the top.)
+        let is_genstart = matches!(
+            self.func(fid as usize).code.get(resume_ip),
+            Some(Instr::GenStart)
+        );
+        let outcome = if is_genstart {
+            self.frames[stop].ip = resume_ip + 1;
+            self.run_loop(stop)
+        } else if resume_ip == 0 {
             self.run_loop(stop)
         } else {
             match input {
