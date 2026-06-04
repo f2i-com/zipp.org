@@ -171,7 +171,25 @@ impl<'p> Vm<'p> {
         Value::bool(true)
     }
 
-    pub(crate) fn set_prop(&mut self, obj: Value, key: &str, val: Value) -> Result<(), Thrown> {
+    /// A [[Set]] that the receiver's descriptors rejected — a setter-less accessor,
+    /// a non-writable data property, or a new property on a non-extensible object.
+    /// Sloppy code ignores it (a no-op); strict-mode assignment throws a TypeError.
+    pub(crate) fn reject_write(&self, key: &str, strict: bool) -> Result<(), Thrown> {
+        if strict {
+            return Err(Thrown(format!(
+                "TypeError: Cannot assign to read only property '{key}' of object"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_prop(
+        &mut self,
+        obj: Value,
+        key: &str,
+        val: Value,
+        strict: bool,
+    ) -> Result<(), Thrown> {
         if !obj.is_heap() {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
@@ -183,10 +201,15 @@ impl<'p> Vm<'p> {
             return match self.proxy_trap(handler, "set")? {
                 Some(trap) => {
                     let kv = self.key_to_value(key);
-                    self.call_value(trap, handler, &[target, kv, val, obj])?;
+                    let r = self.call_value(trap, handler, &[target, kv, val, obj])?;
+                    if !self.truthy(r) && strict {
+                        return Err(Thrown(format!(
+                            "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
+                        )));
+                    }
                     Ok(())
                 }
-                None => self.set_prop(target, key, val),
+                None => self.set_prop(target, key, val, strict),
             };
         }
         let idx = obj.heap_index();
@@ -234,7 +257,7 @@ impl<'p> Vm<'p> {
         // no-op while the synthesized intrinsic is present. (Once `delete`d it
         // falls through and becomes an ordinary assigned property.)
         if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
-            return Ok(());
+            return self.reject_write(key, strict);
         }
         // An OWN property's descriptor governs assignment: an accessor invokes its
         // setter; a non-writable data property silently ignores the write (sloppy).
@@ -249,11 +272,12 @@ impl<'p> Vm<'p> {
             if a.accessor {
                 if a.setter != Value::UNDEFINED {
                     self.call_value(a.setter, obj, &[val])?;
+                    return Ok(()); // setter invoked ⇒ the write succeeds
                 }
-                return Ok(()); // accessor with no setter ⇒ no-op (sloppy)
+                return self.reject_write(key, strict); // accessor with no setter
             }
             if !a.writable {
-                return Ok(()); // non-writable own data property ⇒ no-op (sloppy)
+                return self.reject_write(key, strict); // non-writable own data property
             }
             // writable own data property → fall through to overwrite its value.
         }
@@ -272,7 +296,7 @@ impl<'p> Vm<'p> {
                     self.call_value(setter, obj, &[val])?;
                     return Ok(());
                 }
-                Some(None) => return Ok(()), // inherited getter-only ⇒ sloppy no-op
+                Some(None) => return self.reject_write(key, strict), // inherited getter-only
                 None => {}                    // no inherited accessor ⇒ data write
             }
         }
@@ -310,7 +334,7 @@ impl<'p> Vm<'p> {
                     self.call_value(setter, obj, &[val])?;
                     return Ok(());
                 }
-                Some(None) => return Ok(()), // getter-only ⇒ sloppy no-op
+                Some(None) => return self.reject_write(key, strict), // getter-only
                 None => {}                    // fall through to a data write
             }
         }
@@ -395,7 +419,7 @@ impl<'p> Vm<'p> {
             // in the arr_props side table's flag (set by Object.preventExtensions).
             if let Some(m) = self.arr_props.get(&idx) {
                 if m.pos(key).is_none() && !m.extensible {
-                    return Ok(());
+                    return self.reject_write(key, strict);
                 }
             }
             let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
@@ -410,7 +434,7 @@ impl<'p> Vm<'p> {
                 // A non-extensible object rejects NEW own properties (sloppy no-op);
                 // existing writable data properties still accept writes.
                 if map.pos(key).is_none() && !map.extensible {
-                    return Ok(());
+                    return self.reject_write(key, strict);
                 }
                 added = map.set(key, val);
             }

@@ -202,12 +202,12 @@ impl<'p> Vm<'p> {
         let prev = self.get_prop(rx, "lastIndex")?;
         let zero = Value::int(0);
         if !self.same_value(prev, zero) {
-            self.set_prop(rx, "lastIndex", zero)?;
+            self.set_prop(rx, "lastIndex", zero, false)?;
         }
         let result = self.regexp_exec_abstract(rx.heap_index(), input)?;
         let cur = self.get_prop(rx, "lastIndex")?;
         if !self.same_value(cur, prev) {
-            self.set_prop(rx, "lastIndex", prev)?;
+            self.set_prop(rx, "lastIndex", prev, false)?;
         }
         if result == Value::NULL {
             return Ok(Value::int(-1));

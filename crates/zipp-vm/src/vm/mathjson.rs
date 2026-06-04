@@ -513,7 +513,7 @@ impl<'p> Vm<'p> {
                         if nv.is_undefined() {
                             self.delete_property(val, &k)?;
                         } else {
-                            self.set_prop(val, &k, nv)?;
+                            self.set_prop(val, &k, nv, false)?;
                         }
                     }
                 }

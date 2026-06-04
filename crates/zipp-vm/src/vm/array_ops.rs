@@ -378,7 +378,7 @@ impl<'p> Vm<'p> {
             let fk = Value::num(from as f64);
             if self.has_property(this, fk) {
                 let v = self.get_index(this, fk)?;
-                self.set_index(this, Value::num(to as f64), v)?;
+                self.set_index(this, Value::num(to as f64), v, false)?;
             } else {
                 let deleted = self.delete_property(this, &to.to_string())?;
                 if !self.truthy(deleted) {
@@ -420,7 +420,7 @@ impl<'p> Vm<'p> {
         };
         let end = rel(e0);
         while k < end {
-            self.set_index(this, Value::num(k as f64), value)?;
+            self.set_index(this, Value::num(k as f64), value, false)?;
             k += 1;
         }
         Ok(Some(this))

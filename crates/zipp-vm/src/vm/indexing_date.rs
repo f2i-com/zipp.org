@@ -210,7 +210,13 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn set_index(&mut self, obj: Value, key: Value, val: Value) -> Result<(), Thrown> {
+    pub(crate) fn set_index(
+        &mut self,
+        obj: Value,
+        key: Value,
+        val: Value,
+        strict: bool,
+    ) -> Result<(), Thrown> {
         if !obj.is_heap() {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
@@ -223,7 +229,7 @@ impl<'p> Vm<'p> {
                 return self.ta_element_set(idx, i, val);
             }
             let k = self.key_of(key);
-            return self.set_prop(obj, &k, val);
+            return self.set_prop(obj, &k, val, strict);
         }
         // Callable / class computed assignment (`fn["x"] = v`, `C["s"] = v`) is
         // property assignment: route through `set_prop` (honours non-writable
@@ -238,14 +244,14 @@ impl<'p> Vm<'p> {
                 | HeapObj::Proxy { .. }
         ) {
             let k = self.key_of(key);
-            return self.set_prop(obj, &k, val);
+            return self.set_prop(obj, &k, val, strict);
         }
         // An Array with a non-index key (`arr["foo"] = v`, `arr.length` is handled
         // in set_prop) is a NAMED property → route through set_prop (-> arr_props),
         // so bracket and dot assignment agree. Numeric indices stay in the Vec.
         if matches!(self.heap.get(idx), HeapObj::Array(_)) && array_index(key).is_none() {
             let k = self.key_of(key);
-            return self.set_prop(obj, &k, val);
+            return self.set_prop(obj, &k, val, strict);
         }
         // A defineProperty'd special index (accessor / non-writable / arr_props
         // value) is handled by set_prop's own-property path (override-aware) — its
@@ -257,7 +263,7 @@ impl<'p> Vm<'p> {
                 && self.array_index_override(idx, i).is_some()
             {
                 let k = self.key_of(key);
-                return self.set_prop(obj, &k, val);
+                return self.set_prop(obj, &k, val, strict);
             }
         }
         // Assigning past the dense-array cap (`a[2**31] = v`) would eagerly grow
@@ -291,7 +297,7 @@ impl<'p> Vm<'p> {
             // `Array.prototype.<m>.call(dateLike, …)` saw zero elements.)
             _ => {
                 let k = self.key_of(key);
-                self.set_prop(obj, &k, val)
+                self.set_prop(obj, &k, val, strict)
             }
         }
     }

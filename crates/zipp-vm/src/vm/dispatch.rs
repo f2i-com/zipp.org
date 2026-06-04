@@ -920,7 +920,7 @@ impl<'p> Vm<'p> {
                             _ => None,
                         };
                         if let Some(key) = key {
-                            self.set_index(this, key, v)?;
+                            self.set_index(this, key, v, false)?;
                         }
                         ip += 1;
                     }
@@ -1884,7 +1884,8 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let v = self.get(base, val);
-                        self.set_index(o, k, v)?;
+                        let strict = self.func(func_id as usize).is_strict;
+                        self.set_index(o, k, v, strict)?;
                         ip += 1;
                     }
                     Instr::DefineAccessor { obj, key, func, is_setter } => {
@@ -1910,7 +1911,8 @@ impl<'p> Vm<'p> {
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
-                        self.set_prop(o, &key, v)?;
+                        let strict = self.func(func_id as usize).is_strict;
+                        self.set_prop(o, &key, v, strict)?;
                         ip += 1;
                     }
                     Instr::DeleteProp { dst, obj, name, strict } => {
@@ -2597,7 +2599,7 @@ impl<'p> Vm<'p> {
                     [name_idx as usize]
                     .clone();
                 let v = self.globals[slot as usize];
-                let _ = self.set_prop(obj, &key, v);
+                let _ = self.set_prop(obj, &key, v, false);
             }
         }
         // Bookkeeping: a resume INSIDE the region is a deopt; evict if chronic.

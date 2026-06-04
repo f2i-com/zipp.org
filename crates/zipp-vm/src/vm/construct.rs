@@ -707,7 +707,7 @@ impl<'p> Vm<'p> {
         if self.is_callable(setter) {
             self.call_value(setter, this, &[v])?;
         } else {
-            self.set_prop(this, key, v)?;
+            self.set_prop(this, key, v, false)?;
         }
         Ok(())
     }
@@ -833,7 +833,7 @@ impl<'p> Vm<'p> {
                             )));
                         }
                     }
-                    self.set_prop(target, &k, v)?;
+                    self.set_prop(target, &k, v, false)?;
                     added_any = true;
                 }
             }
@@ -1407,9 +1407,9 @@ impl<'p> Vm<'p> {
             let len = elems.len();
             let a = self.construct(this_ctor, &[Value::num(len as f64)])?;
             for (i, v) in elems.iter().enumerate() {
-                self.set_index(a, Value::num(i as f64), *v)?;
+                self.set_index(a, Value::num(i as f64), *v, false)?;
             }
-            self.set_prop(a, "length", Value::num(len as f64))?;
+            self.set_prop(a, "length", Value::num(len as f64), false)?;
             return Ok(a);
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))))

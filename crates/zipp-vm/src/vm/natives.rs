@@ -1167,7 +1167,7 @@ impl<'p> Vm<'p> {
                         _ => true,
                     };
                     if ok {
-                        self.set_index(a0, kv, value)?;
+                        self.set_index(a0, kv, value, false)?;
                     }
                     ok
                 } else {
@@ -1200,7 +1200,7 @@ impl<'p> Vm<'p> {
                                     Some((true, _)) => false,      // accessor own prop on receiver
                                     Some((false, false)) => false, // non-writable data on receiver
                                     _ => {
-                                        self.set_index(receiver, kv, value)?;
+                                        self.set_index(receiver, kv, value, false)?;
                                         true
                                     }
                                 }
@@ -1612,7 +1612,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if self.is_object_value(this) {
-                    self.set_prop(this, "@@toStringTag", a0)?;
+                    self.set_prop(this, "@@toStringTag", a0, false)?;
                 }
                 Value::UNDEFINED
             }
@@ -1630,7 +1630,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if self.is_object_value(this) {
-                    self.set_prop(this, "constructor", a0)?;
+                    self.set_prop(this, "constructor", a0, false)?;
                 }
                 Value::UNDEFINED
             }
