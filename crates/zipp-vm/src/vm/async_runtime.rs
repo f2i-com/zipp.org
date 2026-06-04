@@ -906,13 +906,21 @@ impl<'p> Vm<'p> {
     /// Build an `AggregateError`-like object `{name, message, errors}` for a
     /// failed `Promise.any`.
     pub(crate) fn alloc_aggregate_error(&mut self, errors: Vec<Value>) -> Value {
+        // name/message/errors are all non-enumerable own data properties.
+        let attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
         let mut map = ObjMap::new();
         let name = self.alloc_str("AggregateError".to_string());
-        map.set("name", name);
+        map.define("name", name, attr);
         let msg = self.alloc_str("All promises were rejected".to_string());
-        map.set("message", msg);
+        map.define("message", msg, attr);
         let errs = Value::heap(self.heap.alloc(HeapObj::Array(errors)));
-        map.set("errors", errs);
+        map.define("errors", errs, attr);
         Value::heap(self.heap.alloc(HeapObj::Object(map)))
     }
 

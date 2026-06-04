@@ -245,10 +245,21 @@ impl<'p> Vm<'p> {
             Some(m) if m != Value::UNDEFINED => Some(self.to_str_idx(m)),
             _ => None,
         };
+        // `message` is a non-enumerable own data property (ES: CreateNonEnumerable-
+        // DataPropertyOrThrow). `name` is normally inherited from the prototype, but
+        // zipp keeps it own for the structural error_name/instanceof path — also
+        // non-enumerable, so `Object.keys(err)` is `[]` as the spec requires.
+        let attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
         let mut map = ObjMap::new();
-        map.set("name", name_v);
+        map.define("name", name_v, attr);
         if let Some(mi) = msg_idx {
-            map.set("message", Value::heap(mi));
+            map.define("message", Value::heap(mi), attr);
         }
         let obj = self.heap.alloc(HeapObj::Object(map));
         let p = self.error_protos[k];

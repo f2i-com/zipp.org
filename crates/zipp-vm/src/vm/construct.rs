@@ -732,7 +732,18 @@ impl<'p> Vm<'p> {
                     if let Some(m) = msg.filter(|m| *m != Value::UNDEFINED) {
                         let mi = self.to_str_idx(m);
                         if let HeapObj::Object(map) = self.heap.get_mut(obj.heap_index()) {
-                            map.set("message", Value::heap(mi));
+                            // `message` is a non-enumerable own data property.
+                            map.define(
+                                "message",
+                                Value::heap(mi),
+                                PropAttr {
+                                    writable: true,
+                                    enumerable: false,
+                                    configurable: true,
+                                    accessor: false,
+                                    setter: Value::UNDEFINED,
+                                },
+                            );
                         }
                     }
                 }
