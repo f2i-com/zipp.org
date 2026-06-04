@@ -291,21 +291,24 @@ impl<'p> Vm<'p> {
                     ));
                 }
             }
-            BIGINT_AS_INTN => {
-                let bits = self.to_number(a0)?;
-                if !bits.is_finite() || bits < 0.0 {
-                    return Err(Thrown("RangeError: Invalid bits for BigInt.asIntN".into()));
+            BIGINT_AS_INTN | BIGINT_AS_UINTN => {
+                // bits = ToIndex(bits) (RangeError if negative / > 2^53-1) FIRST,
+                // then x = ToBigInt(value) — STRICT: a Number value is a TypeError
+                // (unlike the lenient BigInt() ctor coercion `to_bigint` allows).
+                let bits = self.to_index(a0)?;
+                if a1.is_number() {
+                    return Err(Thrown(
+                        "TypeError: cannot convert a Number to a BigInt".into(),
+                    ));
                 }
                 let x = self.to_bigint(a1)?;
-                self.make_bigint(bigint_as_intn(bits as u32, x))
-            }
-            BIGINT_AS_UINTN => {
-                let bits = self.to_number(a0)?;
-                if !bits.is_finite() || bits < 0.0 {
-                    return Err(Thrown("RangeError: Invalid bits for BigInt.asUintN".into()));
-                }
-                let x = self.to_bigint(a1)?;
-                self.make_bigint(bigint_as_uintn(bits as u32, x))
+                let b = bits.min(u32::MAX as usize) as u32;
+                let r = if id == BIGINT_AS_INTN {
+                    bigint_as_intn(b, x)
+                } else {
+                    bigint_as_uintn(b, x)
+                };
+                self.make_bigint(r)
             }
             REGEXP_EXEC => {
                 if !matches!(
