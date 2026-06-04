@@ -1907,6 +1907,15 @@ impl<'p> Vm<'p> {
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
+                        // PrivateFieldGet brand check: reading a private member
+                        // (`obj.#x`) from an object whose class did not declare it
+                        // is a TypeError (has_property_str walks instance own fields
+                        // + private methods/getters on the class chain).
+                        if is_private_key(&key) && !self.has_property_str(o, &key) {
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot read private member {key} from an object whose class did not declare it"
+                            )));
+                        }
                         let r = self.get_prop(o, &key)?;
                         self.set(base, dst, r);
                         ip += 1;
