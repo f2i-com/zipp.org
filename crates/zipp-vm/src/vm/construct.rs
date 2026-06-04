@@ -771,10 +771,11 @@ impl<'p> Vm<'p> {
     /// keys (object keys, or an array's index strings) onto `target`; returns
     /// `target`. Primitive (incl. null/undefined) sources contribute nothing.
     pub(crate) fn object_assign(&mut self, args: &[Value]) -> Result<Value, Thrown> {
-        let target = args.first().copied().unwrap_or(Value::UNDEFINED);
-        if !target.is_heap() || !matches!(self.heap.get(target.heap_index()), HeapObj::Object(_)) {
-            return Err(Thrown("TypeError: Object.assign target must be an object".into()));
-        }
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        // target = ToObject(arg0): a primitive boxes (so `Object.assign("x")`
+        // returns a String wrapper), null/undefined throw.
+        self.require_object_coercible(arg0)?;
+        let target = self.to_object(arg0)?;
         let tidx = target.heap_index();
         let mut added_any = false;
         for &src in &args[1..] {
@@ -818,6 +819,22 @@ impl<'p> Vm<'p> {
             for (k, v) in pairs {
                 if let HeapObj::Object(map) = self.heap.get_mut(tidx) {
                     added_any |= map.set(&k, v);
+                } else {
+                    // A boxed-primitive target (String/Number/… wrapper). A String
+                    // wrapper's canonical index properties (and "length") are
+                    // read-only, so Object.assign's Set(to, key, v, true) throws.
+                    if let HeapObj::Boxed { kind: 0, value } = self.heap.get(tidx) {
+                        let slen = self.heap_char_len(value.heap_index());
+                        let readonly = k == "length"
+                            || k.parse::<usize>().ok().filter(|n| n.to_string() == k).map_or(false, |n| n < slen);
+                        if readonly {
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot assign to read-only property '{k}' of a String"
+                            )));
+                        }
+                    }
+                    self.set_prop(target, &k, v)?;
+                    added_any = true;
                 }
             }
         }

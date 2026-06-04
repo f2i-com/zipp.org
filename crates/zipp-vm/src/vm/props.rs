@@ -1056,15 +1056,24 @@ impl<'p> Vm<'p> {
         if !props.is_heap() {
             return Ok(());
         }
-        let keys: Vec<String> = match self.heap.get(props.heap_index()) {
-            HeapObj::Object(m) => m
-                .keys
+        let pidx = props.heap_index();
+        let enum_keys = |m: &ObjMap| -> Vec<String> {
+            m.keys
                 .iter()
                 .zip(m.attrs.iter())
                 .filter(|(_, a)| a.enumerable)
                 .map(|(k, _)| k.clone())
-                .collect(),
-            _ => Vec::new(),
+                .collect()
+        };
+        // OwnPropertyKeys(ToObject(props)) filtered to enumerable. The descriptor
+        // bag may be any object — a function (own props in fn_props) or an exotic
+        // object (arr_props) — not only a plain Object.
+        let keys: Vec<String> = match self.heap.get(pidx) {
+            HeapObj::Object(m) => enum_keys(m),
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                self.fn_props.get(&pidx).map(enum_keys).unwrap_or_default()
+            }
+            _ => self.arr_props.get(&pidx).map(enum_keys).unwrap_or_default(),
         };
         for k in keys {
             let desc = self.get_prop(props, &k)?;

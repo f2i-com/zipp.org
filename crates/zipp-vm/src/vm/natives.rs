@@ -120,7 +120,12 @@ impl<'p> Vm<'p> {
                 }
                 Value::bool(self.is_prototype_of(this, a0))
             }
-            PROTO_VALUE_OF => this,
+            PROTO_VALUE_OF => {
+                // Object.prototype.valueOf does ToObject(this), so null/undefined
+                // throw a TypeError (rather than returning the receiver).
+                self.require_object_coercible(this)?;
+                this
+            }
             PROTO_TO_STRING => {
                 let tag = self.object_to_string_tag(this)?;
                 self.alloc_str(format!("[object {tag}]"))
