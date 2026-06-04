@@ -169,8 +169,10 @@ impl<'p> Vm<'p> {
             "matchAll" => {
                 let regexp = arg0;
                 let s_val = Value::heap(idx);
-                let nullish = regexp == Value::NULL || regexp == Value::UNDEFINED;
-                if !nullish {
+                // Per spec the `@@matchAll` method is only consulted when `regexp`
+                // is an OBJECT — a primitive argument must NOT trigger a
+                // `Number.prototype[@@matchAll]` getter etc. (it builds a RegExp).
+                if self.is_object_value(regexp) {
                     // A real RegExp argument must be global (spec: IsRegExp +
                     // RequireObjectCoercible(flags) + 'g' check).
                     if self.as_regexp(regexp).is_some() {
@@ -448,8 +450,12 @@ impl<'p> Vm<'p> {
         repl_v: Value,
         all: bool,
     ) -> Result<Value, Thrown> {
-        // If searchValue has a @@replace method, defer to it (custom search object).
-        if search_v != Value::NULL && search_v != Value::UNDEFINED {
+        // If searchValue is an OBJECT with a @@replace method, defer to it. The
+        // `is_object_value` guard matters: per spec the `@@replace` property is
+        // only accessed when searchValue is an Object, so a primitive searchValue
+        // (a number/string/boolean) must NOT trigger a `Number.prototype[@@replace]`
+        // getter etc.
+        if self.is_object_value(search_v) {
             let m = self.get_prop(search_v, "@@replace")?;
             if self.is_callable(m) {
                 let sval = Value::heap(s_idx);
