@@ -3807,13 +3807,15 @@ impl<'a> FnCompiler<'a> {
             ox::Expression::StaticMemberExpression(m) => {
                 let obj = self.expr(&m.object)?;
                 let name = self.string_name(&m.property.name);
-                self.emit(Instr::DeleteProp { dst, obj, name });
+                let strict = self.cx.in_strict;
+                self.emit(Instr::DeleteProp { dst, obj, name, strict });
                 Ok(dst)
             }
             ox::Expression::ComputedMemberExpression(m) => {
                 let obj = self.expr(&m.object)?;
                 let key = self.expr(&m.expression)?;
-                self.emit(Instr::DeleteIndex { dst, obj, key });
+                let strict = self.cx.in_strict;
+                self.emit(Instr::DeleteIndex { dst, obj, key, strict });
                 Ok(dst)
             }
             ox::Expression::ParenthesizedExpression(p) => self.delete_expr(&p.expression, dst),

@@ -1842,20 +1842,27 @@ impl<'p> Vm<'p> {
                         self.set_prop(o, &key, v)?;
                         ip += 1;
                     }
-                    Instr::DeleteProp { dst, obj, name } => {
+                    Instr::DeleteProp { dst, obj, name, strict } => {
                         let o = self.get(base, obj);
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
                         let r = self.delete_property(o, &key)?;
+                        // Strict mode: a delete that evaluates to false throws.
+                        if strict && r == Value::bool(false) {
+                            return Err(Thrown(format!("TypeError: Cannot delete property '{key}'")));
+                        }
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    Instr::DeleteIndex { dst, obj, key } => {
+                    Instr::DeleteIndex { dst, obj, key, strict } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let ks = self.to_property_key(k)?; // ToPropertyKey (symbol → prop_key, object → ToString)
                         let r = self.delete_property(o, &ks)?;
+                        if strict && r == Value::bool(false) {
+                            return Err(Thrown(format!("TypeError: Cannot delete property '{ks}'")));
+                        }
                         self.set(base, dst, r);
                         ip += 1;
                     }
