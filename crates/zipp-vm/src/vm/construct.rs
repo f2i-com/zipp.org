@@ -573,8 +573,8 @@ impl<'p> Vm<'p> {
             }
             return Ok(obj);
         }
-        let (ctor, has_explicit, parent) = match self.heap.get(cv.heap_index()) {
-            HeapObj::Class(c) => (c.ctor, c.has_explicit_ctor, c.parent),
+        let (ctor, ctor_ups, has_explicit, parent) = match self.heap.get(cv.heap_index()) {
+            HeapObj::Class(c) => (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent),
             _ => return Err(Thrown("TypeError: value is not a constructor".into())),
         };
         // The instance links to its class for method lookup + instanceof; its own
@@ -586,7 +586,7 @@ impl<'p> Vm<'p> {
             // The explicit constructor runs its own `super(...)`; a ctor that
             // returns an object/array replaces the instance.
             if let Some(fid) = ctor {
-                let f = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+                let f = self.ctor_value(fid, &ctor_ups);
                 let ret = self.call_value(f, obj, args)?;
                 if ret.is_heap()
                     && matches!(self.heap.get(ret.heap_index()), HeapObj::Object(_) | HeapObj::Array(_))
@@ -601,11 +601,22 @@ impl<'p> Vm<'p> {
                 self.run_class_ctor(Value::heap(pidx), obj, args)?;
             }
             if let Some(fid) = ctor {
-                let f = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+                let f = self.ctor_value(fid, &ctor_ups);
                 self.call_value(f, obj, &[])?;
             }
         }
         Ok(obj)
+    }
+
+    /// Build the callable for a class constructor: a plain `Func`, or a `Closure`
+    /// over the cells the ctor captured (at class-definition time) when it closes
+    /// over an enclosing-function local.
+    pub(crate) fn ctor_value(&mut self, fid: u32, ups: &[u32]) -> Value {
+        if ups.is_empty() {
+            Value::heap(self.heap.alloc(HeapObj::Func(fid)))
+        } else {
+            Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: ups.to_vec() }))
+        }
     }
 
     /// `v instanceof F` for a constructor FUNCTION `F`: true iff `F.prototype` is
@@ -692,8 +703,8 @@ impl<'p> Vm<'p> {
         if !cval.is_heap() {
             return Ok(());
         }
-        let (ctor, has_explicit, parent) = match self.heap.get(cval.heap_index()) {
-            HeapObj::Class(c) => (c.ctor, c.has_explicit_ctor, c.parent),
+        let (ctor, ctor_ups, has_explicit, parent) = match self.heap.get(cval.heap_index()) {
+            HeapObj::Class(c) => (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent),
             // `super(...)` to a BUILT-IN parent (`class X extends Error`). We model
             // the Error family: set `message` on the instance from the argument
             // (AggregateError takes it as the 2nd arg). The instance's prototype
@@ -714,7 +725,7 @@ impl<'p> Vm<'p> {
         };
         if has_explicit {
             if let Some(fid) = ctor {
-                let f = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+                let f = self.ctor_value(fid, &ctor_ups);
                 self.call_value(f, obj, args)?;
             }
         } else {
@@ -722,7 +733,7 @@ impl<'p> Vm<'p> {
                 self.run_class_ctor(Value::heap(pidx), obj, args)?;
             }
             if let Some(fid) = ctor {
-                let f = Value::heap(self.heap.alloc(HeapObj::Func(fid)));
+                let f = self.ctor_value(fid, &ctor_ups);
                 self.call_value(f, obj, &[])?;
             }
         }

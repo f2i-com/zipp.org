@@ -349,6 +349,11 @@ struct Compiler {
     /// this into `FuncProto.is_strict`; the VM uses it to decide `this`
     /// substitution at the call site.
     in_strict: bool,
+    /// The enclosing-function chain that the methods of the class CURRENTLY being
+    /// compiled close over (set by `compile_class`, read by `compile_class_fn`).
+    /// Empty at script level, so script-level class methods keep free vars as
+    /// globals. Saved/restored around each class to handle nesting.
+    class_enclosing: Vec<EnclosingFn>,
 }
 
 impl Compiler {
@@ -362,6 +367,7 @@ impl Compiler {
             source,
             eval_mode: false,
             in_strict: false,
+            class_enclosing: Vec::new(),
         }
     }
 
@@ -552,7 +558,8 @@ impl Compiler {
     }
 
     /// Compile a class method or constructor. Like `compile_function_body` but
-    /// (a) non-capturing (empty enclosing → free vars resolve to globals) and
+    /// (a) it closes over `class_enclosing` (the function containing the class), so
+    /// a free var resolves to an upvalue, not a global — empty at script level, and
     /// (b) it first emits instance-field initializers `this.field = expr` (only
     /// for the constructor; `fields` is empty for plain methods). `this` is reg 0.
     #[allow(clippy::too_many_arguments)]
@@ -582,7 +589,12 @@ impl Compiler {
         let captured = capture::captured_locals(&names, body);
         // Class bodies are always strict, regardless of the enclosing scope.
         let parent_strict = self.in_strict;
-        let mut fc = FnCompiler::new(self, params, rest, captured, Vec::new());
+        // A class method/ctor/field-init closes over the function that contains
+        // the class (its enclosing chain, stashed by compile_class), so a free var
+        // resolves to an upvalue (not a global). `MakeClass` builds the per-method
+        // closures at runtime. Empty at script level → free vars stay globals.
+        let enclosing = self.class_enclosing.clone();
+        let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = true;
         fc.super_class = super_class;
         fc.in_generator = is_generator;
@@ -1862,6 +1874,13 @@ impl<'a> FnCompiler<'a> {
             source: String::new(), // filled in below once the body is compiled
         });
         self.cx.class_names.push((cname.clone(), class_id));
+        // The methods/ctor/field-inits of this class close over the function that
+        // contains it. Stash that enclosing chain for `compile_class_fn` to read,
+        // saving the outer class's (for a class nested in a method) and restoring
+        // it after the body is compiled.
+        let saved_enclosing = std::mem::take(&mut self.cx.class_enclosing);
+        let chain = self.child_enclosing();
+        self.cx.class_enclosing = chain;
         // `super` resolves its target at RUNTIME via this class's own
         // `ClassData.parent` (set by MakeClass from the evaluated `extends`
         // expression). So methods of a derived class carry THIS class's id as
@@ -2194,6 +2213,7 @@ impl<'a> FnCompiler<'a> {
             static_setters: static_setter_defs,
             source: self.cx.src_slice(class.span.start, class.span.end),
         };
+        self.cx.class_enclosing = saved_enclosing;
         Ok((class_id, static_fields, computed_defs, computed_fields_ordered, static_block_fns))
     }
 

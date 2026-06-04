@@ -262,6 +262,7 @@ fn stmt_refs(s: &ox::Statement, out: &mut HashSet<String>) {
         }
         S::ThrowStatement(t) => expr_refs(&t.argument, out),
         S::LabeledStatement(l) => stmt_refs(&l.body, out),
+        S::ClassDeclaration(c) => class_free(c, out),
         _ => {}
     }
 }
@@ -311,7 +312,7 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
         E::CallExpression(c) => {
             expr_refs(&c.callee, out);
             for arg in &c.arguments {
-                if let Some(e) = arg.as_expression() {
+                if let Some(e) = arg_expr(arg) {
                     expr_refs(e, out);
                 }
             }
@@ -319,7 +320,7 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
         E::NewExpression(n) => {
             expr_refs(&n.callee, out);
             for arg in &n.arguments {
-                if let Some(e) = arg.as_expression() {
+                if let Some(e) = arg_expr(arg) {
                     expr_refs(e, out);
                 }
             }
@@ -354,7 +355,7 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
         }
         E::ArrayExpression(a) => {
             for el in &a.elements {
-                if let Some(e) = el.as_expression() {
+                if let Some(e) = array_el_expr(el) {
                     expr_refs(e, out);
                 }
             }
@@ -378,6 +379,7 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
         }
         E::FunctionExpression(f) => fn_node_free(&f.params, f.body.as_deref(), out),
         E::ArrowFunctionExpression(a) => arrow_free(a, out),
+        E::ClassExpression(c) => class_free(c, out),
         _ => {}
     }
 }
@@ -402,6 +404,64 @@ fn arrow_free(a: &ox::ArrowFunctionExpression, out: &mut HashSet<String>) {
     let param_names = param_names(&a.params);
     let inner = free_vars(&param_names, &a.body.statements);
     out.extend(inner);
+}
+
+/// The operand expression of a call/new argument, including the spread case
+/// (`f(...xs)`): `as_expression()` returns None for a SpreadElement, which would
+/// drop a variable referenced ONLY inside a spread (so it wouldn't be captured).
+fn arg_expr<'a>(a: &'a ox::Argument<'a>) -> Option<&'a ox::Expression<'a>> {
+    match a {
+        ox::Argument::SpreadElement(s) => Some(&s.argument),
+        _ => a.as_expression(),
+    }
+}
+
+/// The operand expression of an array element, including the spread (`[...xs]`).
+fn array_el_expr<'a>(e: &'a ox::ArrayExpressionElement<'a>) -> Option<&'a ox::Expression<'a>> {
+    match e {
+        ox::ArrayExpressionElement::SpreadElement(s) => Some(&s.argument),
+        _ => e.as_expression(),
+    }
+}
+
+/// Names a class body references from OUTSIDE a method's own scope: each
+/// method/getter/setter/constructor's free vars (minus its own params), plus
+/// field initializers, computed keys, static blocks, and the `extends`
+/// expression. The methods/ctor/field-inits are NESTED functions, so an
+/// enclosing local they reference must be boxed — hence this feeds both
+/// `captured_locals` (boxing) and `free_vars` (transitive capture). Over-
+/// inclusion is harmless: it at most boxes an enclosing local used only
+/// directly, which is transparent.
+fn class_free(class: &ox::Class, out: &mut HashSet<String>) {
+    if let Some(sc) = &class.super_class {
+        expr_refs(sc, out);
+    }
+    for el in &class.body.body {
+        match el {
+            ox::ClassElement::MethodDefinition(m) => {
+                fn_node_free(&m.value.params, m.value.body.as_deref(), out);
+                if m.computed {
+                    if let Some(k) = m.key.as_expression() {
+                        expr_refs(k, out);
+                    }
+                }
+            }
+            ox::ClassElement::PropertyDefinition(p) => {
+                if let Some(v) = &p.value {
+                    expr_refs(v, out);
+                }
+                if p.computed {
+                    if let Some(k) = p.key.as_expression() {
+                        expr_refs(k, out);
+                    }
+                }
+            }
+            ox::ClassElement::StaticBlock(b) => {
+                out.extend(free_vars(&[], &b.body));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Union of free vars of functions nested DIRECTLY in `s` (one level down).
@@ -487,6 +547,7 @@ fn collect_nested_free(s: &ox::Statement, out: &mut HashSet<String>) {
         }
         S::ThrowStatement(t) => collect_nested_free_expr(&t.argument, out),
         S::LabeledStatement(l) => collect_nested_free(&l.body, out),
+        S::ClassDeclaration(c) => class_free(c, out),
         _ => {}
     }
 }
@@ -496,6 +557,7 @@ fn collect_nested_free_expr(e: &ox::Expression, out: &mut HashSet<String>) {
     match e {
         E::FunctionExpression(f) => fn_node_free(&f.params, f.body.as_deref(), out),
         E::ArrowFunctionExpression(a) => arrow_free(a, out),
+        E::ClassExpression(c) => class_free(c, out),
         E::ParenthesizedExpression(p) => collect_nested_free_expr(&p.expression, out),
         E::BinaryExpression(b) => {
             collect_nested_free_expr(&b.left, out);

@@ -275,6 +275,11 @@ pub struct ClassData {
     pub computed_field_keys: Vec<Value>,
     /// Exact `class … { … }` source text, for `Function.prototype.toString`.
     pub source: String,
+    /// Upvalue cells captured by the constructor (incl. its field initializers)
+    /// from the frame where the class was defined — supplied when `new` runs the
+    /// ctor. Empty unless the class is nested in a function and its ctor/fields
+    /// close over a local of that function.
+    pub ctor_upvalues: Vec<u32>,
 }
 
 /// Boxed payload of a [`HeapObj::AsyncState`] (see that variant's docs). Boxed for

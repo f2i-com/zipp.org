@@ -759,20 +759,22 @@ impl<'p> Vm<'p> {
                             let pv = self.get(base, p);
                             pv.is_heap().then(|| pv.heap_index())
                         });
-                        // Materialize each method as a Func value once; instances
-                        // share these (no per-access alloc, no per-instance copy).
-                        let mk = |heap: &mut Heap, defs: &[(String, u32)]| -> Vec<(String, Value)> {
-                            defs.iter()
-                                .map(|(n, fid)| {
-                                    (n.clone(), Value::heap(heap.alloc(HeapObj::Func(*fid))))
-                                })
-                                .collect()
-                        };
-                        let methods = mk(&mut self.heap, &cd.methods);
-                        let getters = mk(&mut self.heap, &cd.getters);
-                        let setters = mk(&mut self.heap, &cd.setters);
-                        let static_getters = mk(&mut self.heap, &cd.static_getters);
-                        let static_setters = mk(&mut self.heap, &cd.static_setters);
+                        // Materialize each method as a callable value once
+                        // (instances share these): a plain Func, or a Closure over
+                        // this frame when the method closes over an enclosing local.
+                        let materialize =
+                            |vm: &mut Self, defs: &[(String, u32)]| -> Vec<(String, Value)> {
+                                defs.iter()
+                                    .map(|(n, fid)| {
+                                        (n.clone(), vm.materialize_callable(*fid, base, cur_closure))
+                                    })
+                                    .collect()
+                            };
+                        let methods = materialize(self, &cd.methods);
+                        let getters = materialize(self, &cd.getters);
+                        let setters = materialize(self, &cd.setters);
+                        let static_getters = materialize(self, &cd.static_getters);
+                        let static_setters = materialize(self, &cd.static_setters);
                         let mut statics = ObjMap::new();
                         // Static methods are non-enumerable (writable + configurable),
                         // like instance methods. Static *fields* are added later via
@@ -785,9 +787,18 @@ impl<'p> Vm<'p> {
                             setter: Value::UNDEFINED,
                         };
                         for (n, fid) in &cd.statics {
-                            let fv = Value::heap(self.heap.alloc(HeapObj::Func(*fid)));
+                            let fv = self.materialize_callable(*fid, base, cur_closure);
                             statics.define(n, fv, method_attr);
                         }
+                        // The constructor (incl. field initializers) captures its
+                        // upvalues from this frame now; `new` supplies them later.
+                        let ctor_upvalues = match cd.ctor {
+                            Some(fid) => {
+                                let sources = self.func(fid as usize).upvalues.clone();
+                                self.capture_upvalue_cells(&sources, base, cur_closure)
+                            }
+                            None => Vec::new(),
+                        };
                         let v = Value::heap(self.heap.alloc(HeapObj::Class(Box::new(ClassData {
                             name: cd.name,
                             ctor: cd.ctor,
@@ -801,6 +812,7 @@ impl<'p> Vm<'p> {
                             parent: parent_idx,
                             computed_field_keys: Vec::new(),
                             source: cd.source,
+                            ctor_upvalues,
                         }))));
                         // Remember it so `super` in a derived class can reach it.
                         self.class_values[class_id as usize] = Some(v);
@@ -811,7 +823,7 @@ impl<'p> Vm<'p> {
                         let cv = self.get(base, class);
                         let k = self.get(base, key);
                         let kstr = self.display(k);
-                        let fv = Value::heap(self.heap.alloc(HeapObj::Func(func)));
+                        let fv = self.materialize_callable(func, base, cur_closure);
                         if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
                             if kind == 3 {
                                 // Static method — non-enumerable (like a named one).
@@ -2537,6 +2549,36 @@ impl<'p> Vm<'p> {
         match self.heap.get(closure) {
             HeapObj::Closure { upvalues, .. } => upvalues[idx as usize],
             _ => panic!("UpvalGet/Set in a frame without a closure"),
+        }
+    }
+
+    /// Capture each upvalue cell from the defining frame: a ParentLocal reads the
+    /// boxed cell from a local register; a ParentUpval forwards one of the current
+    /// closure's own cells. Mirrors the `MakeClosure` op.
+    pub(crate) fn capture_upvalue_cells(
+        &self,
+        sources: &[UpvalSource],
+        base: usize,
+        cur_closure: u32,
+    ) -> Vec<u32> {
+        sources
+            .iter()
+            .map(|src| match *src {
+                UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
+                UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+            })
+            .collect()
+    }
+
+    /// Materialize a class member function as a callable value: a plain `Func`
+    /// when it captures nothing, else a `Closure` over the defining frame's cells.
+    pub(crate) fn materialize_callable(&mut self, fid: u32, base: usize, cur_closure: u32) -> Value {
+        let sources = self.func(fid as usize).upvalues.clone();
+        if sources.is_empty() {
+            Value::heap(self.heap.alloc(HeapObj::Func(fid)))
+        } else {
+            let cells = self.capture_upvalue_cells(&sources, base, cur_closure);
+            Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: cells }))
         }
     }
 
