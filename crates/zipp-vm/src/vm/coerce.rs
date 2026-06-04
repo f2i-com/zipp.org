@@ -704,6 +704,19 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// ToIndex(v) (ES 7.1.22): ToIntegerOrInfinity, then a RangeError if the
+    /// result is negative or exceeds 2^53-1. `undefined` → 0. Backs the
+    /// byteOffset/length arguments of the TypedArray/DataView constructors, so
+    /// `new Int8Array(buf, -1)` throws rather than silently clamping to 0 (a bare
+    /// `as usize` cast saturates a negative float to 0).
+    pub(crate) fn to_index(&mut self, v: Value) -> Result<usize, Thrown> {
+        let n = self.to_integer_or_zero(v)?;
+        if n < 0 || (n as i128) > (1i128 << 53) - 1 {
+            return Err(Thrown("RangeError: index is out of range".into()));
+        }
+        Ok(n as usize)
+    }
+
     pub(crate) fn to_number_coerce(&mut self, v: Value) -> Result<f64, Thrown> {
         if !v.is_heap() {
             return self.to_number(v);

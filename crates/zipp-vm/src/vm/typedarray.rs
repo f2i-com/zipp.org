@@ -160,6 +160,15 @@ impl<'p> Vm<'p> {
         let is_bigint = native::TA_KINDS[kind as usize].2;
         // Coerce BEFORE borrowing the buffer mutably (coercion can run user code).
         let bytes: [u8; 8] = if is_bigint {
+            // A BigInt TypedArray element set uses ToBigInt (strict): a Number is a
+            // TypeError (unlike the lenient `BigInt(5)` constructor coercion that
+            // `to_bigint` implements). undefined/null/Symbol already throw in
+            // `to_bigint`; only BigInt/Boolean/String are accepted here.
+            if v.is_number() {
+                return Err(Thrown(
+                    "TypeError: cannot convert a Number to a BigInt typed-array element".into(),
+                ));
+            }
             let n = self.to_bigint(v)?;
             if kind == 9 {
                 let mut o = [0u8; 8];
@@ -435,8 +444,10 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // new TA(buffer, byteOffset?, length?)
         if let Some(buf) = self.as_array_buffer(a0) {
+            // byteOffset/length are ToIndex: a negative or out-of-range value is a
+            // RangeError (a bare `as usize` would silently saturate -1 to 0).
             let byte_offset = match args.get(1) {
-                Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+                Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
                 _ => 0,
             };
             let buf_len = self.array_buffer_len(buf);
@@ -444,7 +455,7 @@ impl<'p> Vm<'p> {
             let explicit_len = matches!(args.get(2), Some(&v) if v != Value::UNDEFINED);
             let tracking = !explicit_len && self.ab_max.contains_key(&buf);
             let length = match args.get(2) {
-                Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+                Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
                 _ => {
                     if buf_len < byte_offset || (buf_len - byte_offset) % size != 0 {
                         return Err(Thrown("RangeError: byte length not a multiple of element size".into()));
@@ -530,11 +541,16 @@ impl<'p> Vm<'p> {
             .ok_or_else(|| Thrown("TypeError: DataView requires an ArrayBuffer".into()))?;
         let buf_len = self.array_buffer_len(buf);
         let byte_offset = match args.get(1) {
-            Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+            Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
             _ => 0,
         };
+        // ToIndex(byteOffset) precedes the bounds check, so a negative offset is a
+        // RangeError before `offset > bufferLength` is consulted.
+        if byte_offset > buf_len {
+            return Err(Thrown("RangeError: invalid DataView offset".into()));
+        }
         let byte_length = match args.get(2) {
-            Some(&v) if v != Value::UNDEFINED => self.to_number(v)? as usize,
+            Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
             _ => buf_len.saturating_sub(byte_offset),
         };
         if byte_offset + byte_length > buf_len {
