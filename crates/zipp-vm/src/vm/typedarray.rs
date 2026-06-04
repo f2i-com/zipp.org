@@ -466,6 +466,14 @@ impl<'p> Vm<'p> {
             if byte_offset % size != 0 || byte_offset + length * size > buf_len {
                 return Err(Thrown("RangeError: invalid TypedArray length/offset".into()));
             }
+            // InitializeTypedArrayFromArrayBuffer step: the buffer must not be
+            // detached (it may have been at entry, or detached by a ToIndex valueOf
+            // on byteOffset/length above).
+            if matches!(self.heap.get(buf), HeapObj::ArrayBuffer { detached: true, .. }) {
+                return Err(Thrown(
+                    "TypeError: Cannot construct a TypedArray on a detached ArrayBuffer".into(),
+                ));
+            }
             let ta = self.alloc_typed_array(buf, kind, byte_offset, length);
             if tracking {
                 self.ta_tracking.insert(ta.heap_index());

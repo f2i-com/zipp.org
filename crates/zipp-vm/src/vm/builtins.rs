@@ -650,6 +650,13 @@ impl<'p> Vm<'p> {
                     }
                 };
                 if species == Value::UNDEFINED {
+                    // The default TypedArrayCreate runs the buffer constructor, which
+                    // throws on a detached buffer — mirror that for the fast path.
+                    if matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. }) {
+                        return Err(Thrown(
+                            "TypeError: Cannot create a subarray view of a detached ArrayBuffer".into(),
+                        ));
+                    }
                     return Ok(Some(self.alloc_typed_array(buffer, kind, new_offset, new_len)));
                 }
                 if !self.is_constructor(species) {
@@ -726,8 +733,16 @@ impl<'p> Vm<'p> {
                     }
                     n as usize
                 };
+                // ToInteger(offset)'s valueOf may have detached the TARGET buffer:
+                // re-check (SetTypedArrayFromArrayLike / FromTypedArray step).
+                if self.ta_effective_len(idx).is_none() {
+                    return Err(Thrown(
+                        "TypeError: Cannot set values on a detached/out-of-bounds TypedArray".into(),
+                    ));
+                }
                 // A BigInt typed array only mixes with a BigInt source (checked up
-                // front when the source is itself a TypedArray).
+                // front when the source is itself a TypedArray); a TypedArray source
+                // must also not be detached.
                 let target_big = native::TA_KINDS[kind as usize].2;
                 if a0.is_heap() {
                     if let HeapObj::TypedArray { kind: sk, .. } = self.heap.get(a0.heap_index()) {
@@ -735,6 +750,11 @@ impl<'p> Vm<'p> {
                             return Err(Thrown(
                                 "TypeError: cannot mix BigInt and other types when setting a TypedArray"
                                     .into(),
+                            ));
+                        }
+                        if self.ta_effective_len(a0.heap_index()).is_none() {
+                            return Err(Thrown(
+                                "TypeError: source TypedArray has a detached buffer".into(),
                             ));
                         }
                     }
