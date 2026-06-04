@@ -109,21 +109,40 @@ impl<'p> Vm<'p> {
             }
             "includes" => {
                 let needle = self.display(arg0);
-                Ok(Some(Value::bool(s.contains(&needle))))
+                let len = char_len(&s) as i64;
+                let pos = if args.len() >= 2 {
+                    self.to_integer_or_zero(args[1])?.clamp(0, len)
+                } else {
+                    0
+                } as usize;
+                let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
+                Ok(Some(Value::bool(s[byte..].contains(&needle))))
             }
             "toUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
             "toLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
-            "slice" | "substring" => {
-                let len = char_len(&s) as i32;
-                let s0 = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)? as i32 };
-                let e0 = if args.len() < 2 { len } else { self.to_integer_or_zero(args[1])? as i32 };
-                let start = norm_index(s0, len);
-                let end = norm_index(e0, len);
+            "slice" => {
+                // Negative indices count from the end; computed in i64 so a
+                // saturated ±Infinity (i64::MIN/MAX) clamps correctly (an `as i32`
+                // would wrap Infinity to -1).
+                let len = char_len(&s) as i64;
+                let norm = |i: i64| if i < 0 { len.saturating_add(i).max(0) } else { i.min(len) };
+                let start = if args.is_empty() { 0 } else { norm(self.to_integer_or_zero(arg0)?) };
+                let end = if args.len() < 2 { len } else { norm(self.to_integer_or_zero(args[1])?) };
                 let out: String = if start < end {
                     s.chars().skip(start as usize).take((end - start) as usize).collect()
                 } else {
                     String::new()
                 };
+                Ok(Some(self.alloc_str(out)))
+            }
+            "substring" => {
+                // Each index clamps to [0,len] (negatives -> 0), then start/end swap
+                // so start <= end (distinct from slice's negative-from-end mapping).
+                let len = char_len(&s) as i64;
+                let s0 = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)?.clamp(0, len) };
+                let e0 = if args.len() < 2 { len } else { self.to_integer_or_zero(args[1])?.clamp(0, len) };
+                let (from, to) = if s0 <= e0 { (s0, e0) } else { (e0, s0) };
+                let out: String = s.chars().skip(from as usize).take((to - from) as usize).collect();
                 Ok(Some(self.alloc_str(out)))
             }
             "repeat" => {
@@ -226,9 +245,20 @@ impl<'p> Vm<'p> {
                 };
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(parts)))))
             }
-            "trim" => Ok(Some(self.alloc_str(s.trim().to_string()))),
-            "trimStart" => Ok(Some(self.alloc_str(s.trim_start().to_string()))),
-            "trimEnd" => Ok(Some(self.alloc_str(s.trim_end().to_string()))),
+            // ECMAScript TrimString whitespace = Unicode White_Space + U+FEFF
+            // (ZWNBSP/BOM), which Rust's char::is_whitespace excludes.
+            "trim" => {
+                let w = |c: char| c == '\u{FEFF}' || c.is_whitespace();
+                Ok(Some(self.alloc_str(s.trim_matches(w).to_string())))
+            }
+            "trimStart" => {
+                let w = |c: char| c == '\u{FEFF}' || c.is_whitespace();
+                Ok(Some(self.alloc_str(s.trim_start_matches(w).to_string())))
+            }
+            "trimEnd" => {
+                let w = |c: char| c == '\u{FEFF}' || c.is_whitespace();
+                Ok(Some(self.alloc_str(s.trim_end_matches(w).to_string())))
+            }
             "startsWith" => {
                 let needle = self.display(arg0);
                 let len = char_len(&s) as i64;
