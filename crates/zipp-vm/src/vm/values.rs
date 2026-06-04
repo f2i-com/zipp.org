@@ -144,6 +144,17 @@ impl<'p> Vm<'p> {
                 if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
                     return true;
                 }
+                // A callable's assigned own properties (`fn.x = …`) live in the
+                // SEPARATE fn_props side table — `"x" in fn` must see them too
+                // (mirrors get_own_property; read_descriptor relies on this for a
+                // Function-object descriptor).
+                if matches!(
+                    self.heap.get(idx),
+                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+                ) && self.fn_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
+                {
+                    return true;
+                }
                 // A boxed String wrapper exposes the wrapped string's chars +
                 // `length` as integer-indexed own properties.
                 if let HeapObj::Boxed { kind: 0, value } = self.heap.get(idx) {
@@ -164,10 +175,36 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                // Continue up an explicit prototype chain (e.g. a descriptor object
-                // inheriting `writable`); the builtin protos carry no descriptor
-                // fields, so this &self-cheap walk is sufficient.
-                match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+                // The prototype chain: an explicit `proto_of`, else the intrinsic
+                // prototype for this object's kind — so inherited methods/accessors
+                // are visible to `in` (`"toFixed" in Object(2.5)`, `"call" in fn`),
+                // mirroring get_member. Without this fallback `in` saw only own
+                // props on a boxed primitive / callable / Date / Promise / …
+                let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                    p.is_heap().then_some(p)
+                } else {
+                    let bp = match self.heap.get(idx) {
+                        HeapObj::Func(_)
+                        | HeapObj::Closure { .. }
+                        | HeapObj::Bound { .. }
+                        | HeapObj::Native(_) => self.fn_proto,
+                        HeapObj::Boxed { kind: 0, .. } => self.str_proto,
+                        HeapObj::Boxed { kind: 1, .. } => self.num_proto,
+                        HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
+                        HeapObj::Boxed { kind: 3, .. } => self.symbol_proto,
+                        HeapObj::Boxed { kind: 4, .. } => self.bigint_proto,
+                        HeapObj::Date(_) => self.date_proto,
+                        HeapObj::Promise { .. } => self.promise_proto,
+                        HeapObj::RegExp { .. } => self.regexp_proto,
+                        HeapObj::WeakMap { .. } => self.weakmap_proto,
+                        HeapObj::WeakSet(_) => self.weakset_proto,
+                        HeapObj::WeakRef(_) => self.weakref_proto,
+                        HeapObj::FinalizationRegistry { .. } => self.finreg_proto,
+                        _ => 0,
+                    };
+                    (bp != 0).then_some(Value::heap(bp))
+                };
+                match proto {
                     Some(p) => self.has_property(p, key),
                     None => false,
                 }
