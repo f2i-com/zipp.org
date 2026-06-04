@@ -1424,20 +1424,25 @@ impl<'p> Vm<'p> {
                     .or_else(|| native::math_method(id).map(|(n, _, l)| (n.to_string(), l as i32)))
                     .or_else(|| native::static_name_length(id).map(|(n, l)| (n.to_string(), l as i32)))
             }
-            // The anonymous functions returned by the Intl format/compare getters
-            // have name "" and length 1 (format) / 2 (compare).
-            HeapObj::Bound { target, .. } if target.is_heap() => {
+            HeapObj::Bound { target, args, .. } if target.is_heap() => {
+                // The anonymous functions returned by the Intl format/compare
+                // getters have name "" and length 1 (format) / 2 (compare).
                 if let HeapObj::Native(tid) = self.heap.get(target.heap_index()) {
                     match *tid {
                         native::INTL_NF_FORMAT | native::INTL_DTF_FORMAT => {
-                            Some((String::new(), 1))
+                            return Some((String::new(), 1));
                         }
-                        native::INTL_COLLATOR_COMPARE => Some((String::new(), 2)),
-                        _ => None,
+                        native::INTL_COLLATOR_COMPARE => return Some((String::new(), 2)),
+                        _ => {}
                     }
-                } else {
-                    None
                 }
+                // A bound function F: name is "bound " + target.name, and length is
+                // max(0, target.length - boundArgsCount) when the target has a
+                // numeric length (BoundFunctionCreate / SetFunctionLength+Name).
+                let nbound = args.len() as i32;
+                let (tname, tlen) =
+                    self.callable_name_length(*target).unwrap_or((String::new(), 0));
+                Some((format!("bound {tname}"), (tlen - nbound).max(0)))
             }
             _ => None,
         }
