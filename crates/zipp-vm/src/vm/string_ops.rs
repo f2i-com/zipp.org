@@ -244,28 +244,42 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(out)))
             }
             "split" => {
-                // lim = ToUint32(limit); `undefined` → no cap. lim 0 → [].
+                // A custom @@split fully overrides the default algorithm and runs
+                // FIRST — before any ToString / ToUint32 — receiving the receiver
+                // and the RAW limit (it does its own coercion). (RegExp's @@split is
+                // wired here too.) Only an OBJECT separator is consulted: a
+                // primitive separator's @@split is NOT accessed (test262
+                // cstm-split-on-*-primitive), it is just ToString'd as a delimiter.
+                if self.is_object_value(arg0) {
+                    let m = self.get_prop(arg0, "@@split")?;
+                    if self.is_callable(m) {
+                        let limit_raw = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                        return Ok(Some(self.call_value(m, arg0, &[Value::heap(idx), limit_raw])?));
+                    }
+                }
+                // lim = ToUint32(ToNumber(limit)) — runs valueOf/@@toPrimitive and
+                // propagates a throw; `undefined` → no cap.
                 let lim = match args.get(1).copied() {
                     Some(v) if v != Value::UNDEFINED => {
-                        let n = self.to_number(v)?;
-                        if n.is_finite() {
-                            (n as i64).rem_euclid(4_294_967_296) as usize
-                        } else {
-                            0
-                        }
+                        crate::vm::helpers_num2::to_uint32(self.to_number_coerce(v)?) as usize
                     }
                     _ => usize::MAX,
                 };
-                let sep = self.display(arg0);
-                let parts: Vec<Value> = if lim == 0 {
-                    Vec::new()
-                } else if args.is_empty() || arg0 == Value::UNDEFINED {
-                    // No separator → the whole string as a single element.
-                    vec![self.alloc_str(s.clone())]
-                } else if sep.is_empty() {
-                    s.chars().take(lim).map(|c| self.alloc_str(c.to_string())).collect()
+                let parts: Vec<Value> = if args.is_empty() || arg0 == Value::UNDEFINED {
+                    // No separator → the whole string as a single element (lim 0 → []).
+                    if lim == 0 { Vec::new() } else { vec![self.alloc_str(s.clone())] }
                 } else {
-                    s.split(&sep).take(lim).map(|p| self.alloc_str(p.to_string())).collect()
+                    // ToString(separator) — runs a user toString (propagating a
+                    // throw) and rejects a Symbol; after ToUint32(limit) and before
+                    // the lim==0 early-out, matching the spec ordering.
+                    let sep = self.to_js_string(arg0)?;
+                    if lim == 0 {
+                        Vec::new()
+                    } else if sep.is_empty() {
+                        s.chars().take(lim).map(|c| self.alloc_str(c.to_string())).collect()
+                    } else {
+                        s.split(&sep).take(lim).map(|p| self.alloc_str(p.to_string())).collect()
+                    }
                 };
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(parts)))))
             }
