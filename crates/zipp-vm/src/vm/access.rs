@@ -345,6 +345,19 @@ impl<'p> Vm<'p> {
                     self.call_value(setter, obj, &[val])?;
                     return Ok(());
                 }
+                // A PRIVATE method or getter-only accessor is not assignable:
+                // `this.#m = v` / `this.#g = v` (incl. compound assignment) throws
+                // TypeError. Gated on a private key — a public method is a writable
+                // prototype data property and stays shadowable, and a private FIELD
+                // is an own data property (so map.get(key) is Some and this branch
+                // is skipped, leaving it writable).
+                if is_private_key(key)
+                    && self.lookup_instance_method_or_getter(map.class, key)
+                {
+                    return Err(Thrown(format!(
+                        "TypeError: Cannot write to private member '{key}': it is a method or a getter-only accessor"
+                    )));
+                }
             }
         }
         // A function value's own property (`fn.x = …`, e.g. `assert.sameValue`)
@@ -565,6 +578,27 @@ impl<'p> Vm<'p> {
             }
         }
         None
+    }
+
+    /// True if `key` resolves to an instance METHOD or GETTER anywhere on the
+    /// class chain. Used (with `lookup_setter` having already returned None) to
+    /// reject a write to a private method / getter-only accessor.
+    pub(crate) fn lookup_instance_method_or_getter(&self, class: Option<u32>, key: &str) -> bool {
+        let mut cur = class;
+        while let Some(cidx) = cur {
+            match self.heap.get(cidx) {
+                HeapObj::Class(c) => {
+                    if c.methods.iter().any(|(k, _)| k == key)
+                        || c.getters.iter().any(|(k, _)| k == key)
+                    {
+                        return true;
+                    }
+                    cur = c.parent;
+                }
+                _ => break,
+            }
+        }
+        false
     }
 
     /// Resolve a static-property write against the class chain starting at heap
