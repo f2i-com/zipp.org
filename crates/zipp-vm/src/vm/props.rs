@@ -1383,11 +1383,11 @@ impl<'p> Vm<'p> {
         match self.heap.get(obj.heap_index()) {
             HeapObj::Func(fid) => {
                 let p = self.func(*fid as usize);
-                Some((clean(&p.name), p.param_count as i32))
+                Some((clean(&p.name), p.length as i32))
             }
             HeapObj::Closure { func, .. } => {
                 let p = self.func(*func as usize);
-                Some((clean(&p.name), p.param_count as i32))
+                Some((clean(&p.name), p.length as i32))
             }
             // The resolve/reject functions of `new Promise(executor)`, and the
             // Promise.all/allSettled/any resolve/reject ELEMENT functions: anonymous
@@ -1398,7 +1398,7 @@ impl<'p> Vm<'p> {
             HeapObj::Class(c) => {
                 let len = c
                     .ctor
-                    .map(|f| self.func(f as usize).param_count as i32)
+                    .map(|f| self.func(f as usize).length as i32)
                     .unwrap_or(0);
                 Some((clean(&c.name), len))
             }

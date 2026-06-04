@@ -445,6 +445,12 @@ pub struct FuncProto {
     pub code: Vec<Instr>,
     pub reg_count: u16,
     pub param_count: u16,
+    /// The function's `.length` property = ExpectedArgumentCount: the number of
+    /// formal parameters BEFORE the first one with a default value, excluding the
+    /// rest parameter. Distinct from `param_count` (which drives arg binding and
+    /// counts every non-rest formal). E.g. `(a, b = 1, c) => …` has param_count 3
+    /// but length 1.
+    pub length: u16,
     /// Register receiving the rest parameter array (`function f(a, ...rest)`),
     /// or `None`. The VM gathers args beyond `param_count` into a fresh array
     /// and stores it here at call setup. Always `param_count + 1` when present.

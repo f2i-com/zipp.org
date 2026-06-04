@@ -548,6 +548,7 @@ impl Compiler {
             code: fc.code,
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
+            length: params_ast.map(expected_arg_count).unwrap_or(params.len() as u16),
             rest_reg: fc.rest_reg,
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator,
@@ -661,6 +662,7 @@ impl Compiler {
             code: fc.code,
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
+            length: params_ast.map(expected_arg_count).unwrap_or(params.len() as u16),
             rest_reg: fc.rest_reg,
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator,
@@ -724,6 +726,7 @@ impl Compiler {
             code: fc.code,
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
+            length: expected_arg_count(&a.params),
             rest_reg: fc.rest_reg,
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator: false,
@@ -785,6 +788,7 @@ fn placeholder(name: &str) -> FuncProto {
         code: Vec::new(),
         reg_count: 0,
         param_count: 0,
+        length: 0,
         rest_reg: None,
         arguments_reg: None,
         is_generator: false,
@@ -5419,6 +5423,26 @@ fn function_parts<'a>(
 /// uses its name; a destructuring pattern (`{a}` / `[a,b]`) gets a synthetic
 /// slot name and is destructured into its leaves at function entry by
 /// `bind_pattern_params`.
+/// ExpectedArgumentCount → the function's `.length`: the count of leading formal
+/// parameters before the first one with a default value (an AssignmentPattern).
+/// A destructuring parameter without a default counts; the rest parameter lives
+/// in `params.rest`, not `items`, so it is excluded automatically.
+fn expected_arg_count(params: &ox::FormalParameters) -> u16 {
+    let mut n = 0u16;
+    for item in &params.items {
+        // A default value lives in `item.initializer` (simple params) or as an
+        // AssignmentPattern (destructuring defaults); the first such param stops
+        // the count.
+        if item.initializer.is_some()
+            || matches!(&item.pattern, ox::BindingPattern::AssignmentPattern(_))
+        {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
 fn param_slot_names(params: &ox::FormalParameters) -> R<Vec<String>> {
     let mut out = Vec::new();
     for (i, item) in params.items.iter().enumerate() {
