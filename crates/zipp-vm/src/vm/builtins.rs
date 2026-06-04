@@ -53,6 +53,19 @@ impl<'p> Vm<'p> {
         name: &str,
         args: &[Value],
     ) -> Result<Option<Value>, Thrown> {
+        // The reassignable prototype methods (`toString`/`valueOf`/
+        // `toLocaleString`) must resolve through the prototype chain, not be
+        // shadowed by the built-in type fast path. After e.g.
+        // `Date.prototype.toString = Object.prototype.toString`, `d.toString()`
+        // must use the override (a user function, or a different built-in). Defer
+        // these three names to the caller's get_prop + call_value, which invokes
+        // whatever is actually installed — for an unshadowed receiver that is the
+        // same type native, just reached via one call_value instead of inline.
+        if (recv.is_number() || recv.is_heap())
+            && matches!(name, "toString" | "valueOf" | "toLocaleString")
+        {
+            return Ok(None);
+        }
         // Number receivers (Int or double) support a small method set.
         if recv.is_number() {
             return self.number_method(recv, name, args);
