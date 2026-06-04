@@ -211,7 +211,10 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Ok(self.display(v))
+        // OrdinaryToPrimitive exhausted both methods without a primitive (each
+        // returned an object, or neither was callable on a null-prototype object):
+        // ToPrimitive throws rather than silently producing "[object Object]".
+        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
     }
 
     /// Whether `v` has a `[[Construct]]` slot — i.e. `new v` / `Reflect.construct`
