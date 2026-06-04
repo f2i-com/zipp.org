@@ -1261,13 +1261,17 @@ impl<'p> Vm<'p> {
             "forEach" => {
                 let cb = a0;
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let (ks, vs) = match self.heap.get(idx) {
-                    HeapObj::Map { keys, vals } => (keys.clone(), vals.clone()),
-                    _ => (Vec::new(), Vec::new()),
-                };
-                for (k, v) in ks.into_iter().zip(vs) {
+                // Walk the LIVE entries by index so a key the callback `set`s during
+                // iteration is visited (sec-map.prototype.foreach).
+                let mut i = 0;
+                loop {
+                    let (k, v) = match self.heap.get(idx) {
+                        HeapObj::Map { keys, vals } if i < keys.len() => (keys[i], vals[i]),
+                        _ => break,
+                    };
                     // callback(value, key, map)
                     self.call_value(cb, this_arg, &[v, k, recv])?;
+                    i += 1;
                 }
                 Ok(Some(Value::UNDEFINED))
             }
@@ -1571,13 +1575,18 @@ impl<'p> Vm<'p> {
             "forEach" => {
                 let cb = a0;
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let items = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.clone(),
-                    _ => Vec::new(),
-                };
-                for v in items {
+                // Iterate the LIVE backing store by index (not a frozen clone) so a
+                // value the callback `add`s during iteration is still visited
+                // (sec-set.prototype.foreach walks the live entries list).
+                let mut i = 0;
+                loop {
+                    let v = match self.heap.get(idx) {
+                        HeapObj::Set(items) if i < items.len() => items[i],
+                        _ => break,
+                    };
                     // callback(value, value, set) — value passed twice, mirroring Map.
                     self.call_value(cb, this_arg, &[v, v, recv])?;
+                    i += 1;
                 }
                 Ok(Some(Value::UNDEFINED))
             }
