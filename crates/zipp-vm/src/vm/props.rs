@@ -654,6 +654,35 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(names))))
     }
 
+    /// `Reflect.ownKeys(obj)` — every own property key: the String keys (in
+    /// `[[OwnPropertyKeys]]` order, integer-index-first then creation order)
+    /// followed by the Symbol keys in creation order. A Proxy's ownKeys trap
+    /// already returns the full Strings+Symbols list, so pass it through.
+    pub(crate) fn object_own_keys(&mut self, obj: Value) -> Result<Value, Thrown> {
+        if let Some(keys) = self.proxy_own_keys(obj)? {
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(keys))));
+        }
+        // String keys (reuses the [[OwnPropertyKeys]] string ordering).
+        let names = self.object_own_property_names(obj)?;
+        let mut out = self.array_snapshot(names.heap_index());
+        // Symbol keys: the `@@`-prefixed own keys mapped back to their Symbols,
+        // in property-creation (insertion) order.
+        if obj.is_heap() {
+            let sym_keys: Vec<String> = match self.heap.get(obj.heap_index()) {
+                HeapObj::Object(m) => {
+                    m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
+                }
+                _ => Vec::new(),
+            };
+            for k in sym_keys {
+                if let Some(&sym) = self.symbol_keys.get(&k) {
+                    out.push(sym);
+                }
+            }
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
     /// `Object.getPrototypeOf(obj)` — the prototype: a class instance's is its
     /// class's `.prototype`; an `Object.create`d object's is the recorded proto;
     /// otherwise `null` (a plain object's real `Object.prototype` isn't modelled).
