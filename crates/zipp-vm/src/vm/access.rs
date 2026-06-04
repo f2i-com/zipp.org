@@ -66,7 +66,23 @@ impl<'p> Vm<'p> {
                     Some(trap) => {
                         let kv = self.key_to_value(key);
                         let r = self.call_value(trap, handler, &[target, kv])?;
-                        Ok(Value::bool(self.truthy(r)))
+                        if !self.truthy(r) {
+                            return Ok(Value::bool(false));
+                        }
+                        // Invariant: a deletion reported successful must be allowed
+                        // by the target — the property must not be non-configurable,
+                        // and (if it exists) the target must be extensible.
+                        let desc = self.object_get_own_property_descriptor(target, key);
+                        if desc != Value::UNDEFINED {
+                            let cfg = self.get_prop(desc, "configurable")?;
+                            if !self.truthy(cfg) {
+                                return Err(Thrown("TypeError: 'deleteProperty' on proxy: trap returned truish for property which is non-configurable in the proxy target".into()));
+                            }
+                            if !self.is_extensible(target)? {
+                                return Err(Thrown("TypeError: 'deleteProperty' on proxy: trap returned truish for property but the proxy target is non-extensible".into()));
+                            }
+                        }
+                        Ok(Value::bool(true))
                     }
                     None => Ok(self.delete_prop(target, key)),
                 };
@@ -202,10 +218,30 @@ impl<'p> Vm<'p> {
                 Some(trap) => {
                     let kv = self.key_to_value(key);
                     let r = self.call_value(trap, handler, &[target, kv, val, obj])?;
-                    if !self.truthy(r) && strict {
-                        return Err(Thrown(format!(
-                            "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
-                        )));
+                    if !self.truthy(r) {
+                        if strict {
+                            return Err(Thrown(format!(
+                                "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
+                            )));
+                        }
+                        return Ok(());
+                    }
+                    // Invariant: a non-configurable, non-writable target data
+                    // property can't be reported set to a different value; a
+                    // non-configurable accessor with no setter can't be set at all.
+                    if let Some((is_data, value, writable, _, has_set)) =
+                        self.proxy_target_desc(target, key)?
+                    {
+                        if is_data && !writable && !self.same_value(val, value) {
+                            return Err(Thrown(format!(
+                                "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
+                            )));
+                        }
+                        if !is_data && !has_set {
+                            return Err(Thrown(format!(
+                                "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable accessor property without a setter"
+                            )));
+                        }
                     }
                     Ok(())
                 }

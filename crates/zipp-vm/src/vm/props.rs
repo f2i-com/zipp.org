@@ -11,6 +11,38 @@ impl<'p> Vm<'p> {
     /// Own ENUMERABLE keys / values / [k,v] entries of `obj` as an array (the
     /// shared core of `Object.keys`/`values`/`entries`).
     /// A Proxy's `setPrototypeOf` trap. `Some(success)` for a proxy (the trap's
+    /// For the Proxy get/set trap invariants: the TARGET's own property descriptor
+    /// reduced to `(is_data, value, writable, has_getter, has_setter)`. Returns
+    /// `None` when the target has no own property OR the property is configurable
+    /// (in which case no invariant applies and the trap result stands).
+    pub(crate) fn proxy_target_desc(
+        &mut self,
+        target: Value,
+        key: &str,
+    ) -> Result<Option<(bool, Value, bool, bool, bool)>, Thrown> {
+        let desc = self.object_get_own_property_descriptor(target, key);
+        if desc == Value::UNDEFINED {
+            return Ok(None);
+        }
+        let cfg = self.get_prop(desc, "configurable")?;
+        if self.truthy(cfg) {
+            return Ok(None);
+        }
+        // A data descriptor carries an own "value" key; an accessor carries get/set.
+        let is_data =
+            matches!(self.heap.get(desc.heap_index()), HeapObj::Object(m) if m.pos("value").is_some());
+        if is_data {
+            let wv = self.get_prop(desc, "writable")?;
+            let writable = self.truthy(wv);
+            let value = self.get_prop(desc, "value")?;
+            Ok(Some((true, value, writable, false, false)))
+        } else {
+            let g = self.get_prop(desc, "get")?;
+            let s = self.get_prop(desc, "set")?;
+            Ok(Some((false, Value::UNDEFINED, false, g != Value::UNDEFINED, s != Value::UNDEFINED)))
+        }
+    }
+
     /// boolean, or the target update when no trap); `None` for a non-proxy.
     pub(crate) fn proxy_set_prototype_of(
         &mut self,
@@ -32,7 +64,20 @@ impl<'p> Vm<'p> {
         match self.proxy_trap(handler, "setPrototypeOf")? {
             Some(trap) => {
                 let r = self.call_value(trap, handler, &[target, proto])?;
-                Ok(Some(self.truthy(r)))
+                if !self.truthy(r) {
+                    return Ok(Some(false));
+                }
+                // Invariant: if the target is non-extensible, the proxy's prototype
+                // must match the target's actual prototype.
+                if !self.is_extensible(target)? {
+                    let target_proto = self.object_get_prototype_of(target);
+                    if !self.same_value(proto, target_proto) {
+                        return Err(Thrown(
+                            "TypeError: 'setPrototypeOf' on proxy: trap returned truish for setting a new prototype on the non-extensible proxy target".into(),
+                        ));
+                    }
+                }
+                Ok(Some(true))
             }
             None => {
                 if target.is_heap() {
@@ -59,7 +104,14 @@ impl<'p> Vm<'p> {
         match self.proxy_trap(handler, "isExtensible")? {
             Some(trap) => {
                 let r = self.call_value(trap, handler, &[target])?;
-                Ok(Some(self.truthy(r)))
+                let result = self.truthy(r);
+                // Invariant: the trap result must equal IsExtensible(target).
+                if result != self.is_extensible(target)? {
+                    return Err(Thrown(
+                        "TypeError: 'isExtensible' on proxy: trap result does not reflect extensibility of proxy target".into(),
+                    ));
+                }
+                Ok(Some(result))
             }
             None => {
                 if let Some(b) = self.proxy_is_extensible(target)? {
@@ -93,7 +145,14 @@ impl<'p> Vm<'p> {
         match self.proxy_trap(handler, "preventExtensions")? {
             Some(trap) => {
                 let r = self.call_value(trap, handler, &[target])?;
-                Ok(Some(self.truthy(r)))
+                let result = self.truthy(r);
+                // Invariant: a true result requires the target to be non-extensible.
+                if result && self.is_extensible(target)? {
+                    return Err(Thrown(
+                        "TypeError: 'preventExtensions' on proxy: trap returned truish but the proxy target is extensible".into(),
+                    ));
+                }
+                Ok(Some(result))
             }
             None => {
                 if let Some(b) = self.proxy_prevent_extensions(target)? {
@@ -1663,7 +1722,22 @@ impl<'p> Vm<'p> {
                 return match self.proxy_trap(handler, "get")? {
                     Some(trap) => {
                         let kv = self.key_to_value(key);
-                        self.call_value(trap, handler, &[target, kv, obj])
+                        let r = self.call_value(trap, handler, &[target, kv, obj])?;
+                        // Invariant: a non-configurable, non-writable target data
+                        // property must be reported with its actual value; a
+                        // non-configurable accessor with no getter must report
+                        // undefined.
+                        if let Some((is_data, value, writable, has_get, _)) =
+                            self.proxy_target_desc(target, key)?
+                        {
+                            if is_data && !writable && !self.same_value(r, value) {
+                                return Err(Thrown("TypeError: 'get' on proxy: property is a read-only and non-configurable data property on the proxy target but the proxy did not return its actual value".into()));
+                            }
+                            if !is_data && !has_get && r != Value::UNDEFINED {
+                                return Err(Thrown("TypeError: 'get' on proxy: property is a non-configurable accessor property on the proxy target and does not have a getter function".into()));
+                            }
+                        }
+                        Ok(r)
                     }
                     None => self.get_member(target, key, receiver),
                 };
