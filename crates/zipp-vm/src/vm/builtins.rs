@@ -606,11 +606,21 @@ impl<'p> Vm<'p> {
             "slice" => {
                 let start = self.ta_rel_index(a0, 0, len)?;
                 let end = self.ta_rel_index(a1, len, len)?;
-                let vals: Vec<Value> = (start..end.max(start)).map(|i| self.ta_element_get(idx, i)).collect();
-                // Result via TypedArraySpeciesCreate (constructor[@@species]).
-                let dest = self.ta_species_create(idx, vals.len())?;
-                for (i, v) in vals.iter().enumerate() {
-                    self.ta_element_set(dest.heap_index(), i, *v)?;
+                let count = end.max(start) - start;
+                // TypedArraySpeciesCreate (constructor[@@species]) FIRST — it can run
+                // user code that detaches the source buffer.
+                let dest = self.ta_species_create(idx, count)?;
+                // Per spec %TypedArray%.prototype.slice: when count > 0, re-check
+                // IsDetachedBuffer(O) AFTER the species create and throw TypeError.
+                // ta_effective_len returns None for a detached / out-of-bounds source.
+                if count > 0 && self.ta_effective_len(idx).is_none() {
+                    return Err(Thrown(
+                        "TypeError: Cannot slice a TypedArray backed by a detached buffer".into(),
+                    ));
+                }
+                for i in 0..count {
+                    let v = self.ta_element_get(idx, start + i);
+                    self.ta_element_set(dest.heap_index(), i, v)?;
                 }
                 Ok(Some(dest))
             }
