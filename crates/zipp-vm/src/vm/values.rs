@@ -12,6 +12,14 @@ impl<'p> Vm<'p> {
     /// class instance's inherited methods/getters, array indices / `length`,
     /// Map/Set `size`, and class static members. `in` on a primitive throws
     /// in JS; here it's `false` (rare).
+    /// `[[HasProperty]]` for a fixed string key — walks the prototype chain
+    /// (unlike has_own_property). Allocates a transient key string; used by
+    /// ToPropertyDescriptor, where an inherited/accessor field counts as present.
+    pub(crate) fn has_property_str(&mut self, obj: Value, key: &str) -> bool {
+        let k = self.alloc_str(key.to_string());
+        self.has_property(obj, k)
+    }
+
     pub(crate) fn has_property(&self, obj: Value, key: Value) -> bool {
         if !obj.is_heap() {
             return false;

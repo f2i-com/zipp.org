@@ -598,24 +598,33 @@ impl<'p> Vm<'p> {
         if !self.is_object_value(desc) {
             return Err(Thrown("TypeError: Property description must be an object".into()));
         }
-        // Presence uses [[HasProperty]]-on-own across object/class/function bags.
-        let present = |vm: &Self, k: &str| -> bool { vm.has_own_property(desc, k) };
-        let value = if present(self, "value") { Some(self.get_prop(desc, "value")?) } else { None };
-        let get = if present(self, "get") { Some(self.get_prop(desc, "get")?) } else { None };
-        let set = if present(self, "set") { Some(self.get_prop(desc, "set")?) } else { None };
-        let writable = if present(self, "writable") {
+        // Presence uses [[HasProperty]] (walks the prototype chain), so a
+        // descriptor whose value/writable/enumerable/configurable/get/set is
+        // INHERITED (or an accessor on the prototype) is recognized. Each field's
+        // value is then fetched with get_prop (which also walks the chain + runs
+        // getters). Gather presence first (so the &mut get_prop calls don't clash).
+        let p_value = self.has_property_str(desc, "value");
+        let p_get = self.has_property_str(desc, "get");
+        let p_set = self.has_property_str(desc, "set");
+        let p_writable = self.has_property_str(desc, "writable");
+        let p_enumerable = self.has_property_str(desc, "enumerable");
+        let p_configurable = self.has_property_str(desc, "configurable");
+        let value = if p_value { Some(self.get_prop(desc, "value")?) } else { None };
+        let get = if p_get { Some(self.get_prop(desc, "get")?) } else { None };
+        let set = if p_set { Some(self.get_prop(desc, "set")?) } else { None };
+        let writable = if p_writable {
             let v = self.get_prop(desc, "writable")?;
             Some(self.truthy(v))
         } else {
             None
         };
-        let enumerable = if present(self, "enumerable") {
+        let enumerable = if p_enumerable {
             let v = self.get_prop(desc, "enumerable")?;
             Some(self.truthy(v))
         } else {
             None
         };
-        let configurable = if present(self, "configurable") {
+        let configurable = if p_configurable {
             let v = self.get_prop(desc, "configurable")?;
             Some(self.truthy(v))
         } else {
