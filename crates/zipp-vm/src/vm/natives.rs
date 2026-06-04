@@ -1040,7 +1040,9 @@ impl<'p> Vm<'p> {
                         ));
                     }
                 }
-                let arg_vec = if a1.is_heap() { self.array_snapshot(a1.heap_index()) } else { Vec::new() };
+                // CreateListFromArrayLike(argumentsList): a non-object arglist (incl.
+                // a missing 2nd arg) is a TypeError; an array-LIKE is read via Get.
+                let arg_vec = self.create_list_from_array_like(a1)?;
                 self.construct(target, &arg_vec)?
             }
             REFLECT_GET => {
@@ -1171,7 +1173,9 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: Reflect.deleteProperty called on non-object".into()));
                 }
                 let key = self.to_property_key(a1)?;
-                self.delete_prop(a0, &key)
+                // delete_property (not delete_prop) so a Proxy target's
+                // deleteProperty trap runs.
+                self.delete_property(a0, &key)?
             }
             REFLECT_OWN_KEYS => {
                 if !self.is_object_value(a0) {
@@ -1240,8 +1244,11 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: Property description must be an object".into()));
                 }
                 let key = self.to_property_key(a1)?;
-                // Reflect.defineProperty returns false (not throw) when the definition
-                // is rejected (non-configurable redefine, non-extensible new key).
+                // ToPropertyDescriptor(desc) is validated FIRST: an invalid
+                // descriptor (a non-callable get/set, or mixed accessor+data) is a
+                // THROW that propagates — only a rejected [[DefineOwnProperty]]
+                // (non-configurable redefine, non-extensible new key) returns false.
+                self.read_descriptor(desc)?;
                 match self.object_define_property(a0, &key, desc) {
                     Ok(()) => Value::bool(true),
                     Err(_) => Value::bool(false),
