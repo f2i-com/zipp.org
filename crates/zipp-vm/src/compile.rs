@@ -507,6 +507,12 @@ impl Compiler {
             fc.emit_param_defaults(pa)?;
             fc.bind_pattern_params(pa)?;
         }
+        // A (sync) generator runs its parameter prologue eagerly at call time and
+        // is then created suspended here; mark the body entry. (Async generators
+        // keep their legacy fresh-start model for now.)
+        if is_generator && !is_async {
+            fc.emit(Instr::GenStart);
+        }
 
         // Hoist function declarations in this body so calls resolve before the
         // textual definition. Top-level names become globals (the VM
@@ -603,6 +609,12 @@ impl Compiler {
         if let Some(pa) = params_ast {
             fc.emit_param_defaults(pa)?;
             fc.bind_pattern_params(pa)?;
+        }
+        // A (sync) generator method runs its parameter prologue eagerly at call
+        // and is created suspended here (a constructor is never a generator, so no
+        // field initializers precede the body for this case).
+        if is_generator && !is_async {
+            fc.emit(Instr::GenStart);
         }
         // Instance field initializers: `this.field = expr` (this = reg 0).
         for (fname, finit) in fields {

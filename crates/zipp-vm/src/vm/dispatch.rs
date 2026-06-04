@@ -1914,7 +1914,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let g = self.alloc_generator(fid, closure, Value::UNDEFINED, &argv);
+                            let g = self.alloc_generator(fid, closure, Value::UNDEFINED, &argv)?;
                             self.set(base, dst, g);
                             ip += 1;
                             continue;
@@ -2038,7 +2038,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let g = self.alloc_generator(fid, closure, recv, &argv);
+                            let g = self.alloc_generator(fid, closure, recv, &argv)?;
                             self.set(base, dst, g);
                             ip += 1;
                             continue;
@@ -2100,7 +2100,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            let g = self.alloc_generator(fid, closure, recv, &argv);
+                            let g = self.alloc_generator(fid, closure, recv, &argv)?;
                             self.set(base, dst, g);
                             ip += 1;
                             continue;
@@ -2271,6 +2271,17 @@ impl<'p> Vm<'p> {
                         self.frames.pop();
                         self.pending_yield = Some((v, ip));
                         return Ok(v);
+                    }
+                    Instr::GenStart => {
+                        // Body-entry marker reached during the eager call-time run of
+                        // a generator's parameter prologue. Suspend exactly like a
+                        // valueless yield: pop the frame, leave the window live for
+                        // `alloc_generator` to park, and record this ip so the first
+                        // `.next()` resumes just past it (the resume path delivers no
+                        // sent value here because this is not a `Yield`).
+                        self.frames.pop();
+                        self.pending_yield = Some((Value::UNDEFINED, ip));
+                        return Ok(Value::UNDEFINED);
                     }
                     Instr::Await { val, .. } => {
                         // Suspend the async activation: pop the frame ENTRY but

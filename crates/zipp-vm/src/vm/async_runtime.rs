@@ -11,7 +11,13 @@ impl<'p> Vm<'p> {
     /// Calling a `function*` does NOT run its body — it allocates a suspended
     /// Generator whose DETACHED register window holds `this` + the bound args
     /// (incl. a rest array). Resumed later by `generator_method`.
-    pub(crate) fn alloc_generator(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
+    pub(crate) fn alloc_generator(
+        &mut self,
+        func_id: u32,
+        closure: u32,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
@@ -24,15 +30,53 @@ impl<'p> Vm<'p> {
             let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
             regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
         }
-        Value::heap(self.heap.alloc(HeapObj::Generator {
+        // FunctionDeclarationInstantiation runs eagerly at CALL time: splice the
+        // window onto the live register file and run the parameter prologue
+        // (defaults + destructuring) up to the `GenStart` body-entry marker. A
+        // destructuring throw or a default's side effect therefore happens at the
+        // call, per spec — not at the first `.next()`. The generator is then parked
+        // AT the marker; the first `.next()` resumes just past it to run the body.
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
+        self.regs.extend_from_slice(&regs);
+        if new_base + reg_count > self.regs_hw {
+            self.regs_hw = new_base + reg_count;
+        }
+        let stop = self.frames.len();
+        self.frames.push(Frame {
             func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
             closure,
-            // `usize::MAX` = not-yet-started — distinct from a genuine yield/await
-            // parked at ip 0 (which previously collided with this sentinel and made
-            // the resume re-run from the top).
-            state: GenState::Suspended(usize::MAX),
-            regs,
-        }))
+            handlers: Vec::new(),
+        });
+        let outcome = self.run_loop(stop);
+        if let Some((_v, genstart_ip)) = self.pending_yield.take() {
+            // Suspended at `GenStart`: the post-prologue window is live at the top.
+            let back = self.regs.split_off(new_base);
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Generator {
+                func: func_id,
+                closure,
+                state: GenState::Suspended(genstart_ip),
+                regs: back,
+            })));
+        }
+        // No marker was reached — either the prologue threw (propagate at the call
+        // site) or, defensively (a proto with no `GenStart`), the body ran to
+        // completion. Either way the window is reclaimed.
+        self.regs.truncate(new_base);
+        match outcome {
+            Ok(_) => Ok(Value::heap(self.heap.alloc(HeapObj::Generator {
+                func: func_id,
+                closure,
+                state: GenState::Completed,
+                regs: Vec::new(),
+            }))),
+            Err(t) => Err(t),
+        }
     }
 
     /// Resume / query a generator (`gen.next(v)` / `gen.return(v)` / `gen.throw(e)`).

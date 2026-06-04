@@ -142,6 +142,13 @@ pub enum Instr {
     /// `dst = yield val` — suspend the current generator, handing `val` out as
     /// the yielded value. On resume the value passed to `.next(v)` lands in `dst`.
     Yield { dst: Reg, val: Reg },
+    /// Generator body entry marker — emitted for a (sync) generator right after the
+    /// parameter prologue (defaults + destructuring). FunctionDeclarationInstantiation
+    /// runs eagerly at call time (so a destructuring throw or default side-effect
+    /// happens at the call, not the first `.next()`); the generator is then created
+    /// suspended AT this marker, and the first `.next()` resumes just past it to run
+    /// the body. Behaves like a valueless `yield` that is consumed during construction.
+    GenStart,
     /// `dst = await val` — suspend the async activation on the awaited value's
     /// promise; on resume the settled value lands in `dst` (a rejection is thrown
     /// in at this point so an enclosing `try`/`catch` sees it).

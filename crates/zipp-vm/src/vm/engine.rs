@@ -627,8 +627,10 @@ impl<'p> Vm<'p> {
             return Ok(self.alloc_async_generator(func_id, closure, this, args));
         }
         // Calling a generator function builds a suspended Generator, not a frame.
+        // (The parameter prologue runs eagerly here, so a destructuring throw
+        // propagates from the call.)
         if is_gen {
-            return Ok(self.alloc_generator(func_id, closure, this, args));
+            return self.alloc_generator(func_id, closure, this, args);
         }
         // Calling an async function runs synchronously up to the first `await`,
         // then returns its result Promise.
