@@ -939,12 +939,19 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::UNDEFINED))
             }
             "slice" => {
+                // IsDetachedBuffer(O) -> TypeError (per spec, before index coercion).
+                if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown("TypeError: Cannot slice a detached ArrayBuffer".into()));
+                }
                 let start = self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
                 let end = self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
+                // A coercing index argument may have detached the buffer — re-check
+                // and throw (rather than clamping the now-empty data to a 0 slice).
+                if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown("TypeError: Cannot slice a detached ArrayBuffer".into()));
+                }
                 let slice: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => {
-                        // A coerced index may have detached/shrunk the buffer between
-                        // ta_rel_index and here — clamp to the current length.
                         let dl = data.len();
                         let s = start.min(dl);
                         let e = end.max(start).min(dl);
