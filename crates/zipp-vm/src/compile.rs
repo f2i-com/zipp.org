@@ -354,6 +354,9 @@ struct Compiler {
     /// Empty at script level, so script-level class methods keep free vars as
     /// globals. Saved/restored around each class to handle nesting.
     class_enclosing: Vec<EnclosingFn>,
+    /// Global slots bound by a top-level `const` (immutable): assignment to one
+    /// is a runtime TypeError.
+    const_globals: HashSet<u32>,
 }
 
 impl Compiler {
@@ -368,6 +371,7 @@ impl Compiler {
             eval_mode: false,
             in_strict: false,
             class_enclosing: Vec::new(),
+            const_globals: HashSet::new(),
         }
     }
 
@@ -867,6 +871,10 @@ struct FnCompiler<'a> {
     /// Registers currently holding a CELL (a boxed captured binding), so reads/
     /// writes of them go through CellGet/CellSet.
     cell_regs: HashSet<Reg>,
+    /// Registers bound by a `const` (immutable local): assignment to one is a
+    /// runtime TypeError. Each const local has a unique register, so reassignment
+    /// is detected by register identity (no name-shadowing ambiguity).
+    const_regs: HashSet<Reg>,
     /// Upvalues this function captures, built lazily as free vars are resolved:
     /// (name, source-in-parent). Index in this Vec is the runtime upvalue index.
     /// Shared (`Rc<RefCell>`) so nested functions can append transitively.
@@ -935,6 +943,7 @@ impl<'a> FnCompiler<'a> {
             loop_ctx: Vec::new(),
             captured,
             cell_regs: HashSet::new(),
+            const_regs: HashSet::new(),
             upvalues: Rc::new(RefCell::new(Vec::new())),
             enclosing,
         };
@@ -1315,6 +1324,10 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn var_decl(&mut self, d: &ox::VariableDeclaration) -> R<()> {
+        // A `const` binding is immutable: record its slot/register so a later
+        // assignment throws a TypeError (initialization below never goes through
+        // store_binding, so it is unaffected).
+        let is_const = d.kind == ox::VariableDeclarationKind::Const;
         for decl in &d.declarations {
             // Destructuring declaration (`let {a,b} = o`, `let [x,...r] = arr`):
             // declare every leaf binding, evaluate the initializer once into a
@@ -1355,6 +1368,9 @@ impl<'a> FnCompiler<'a> {
             let block_scoped_lexical = d.kind.is_lexical() && self.scopes.len() > 1;
             if self.is_script && !block_scoped_lexical {
                 let slot = self.cx.global_slot(name) as u32;
+                if is_const {
+                    self.cx.const_globals.insert(slot);
+                }
                 let tmp = self.temp();
                 let v = if let Some(init) = &decl.init {
                     self.compile_named_init(tmp, init, name)?
@@ -1371,6 +1387,9 @@ impl<'a> FnCompiler<'a> {
             // ordinary declarations land in a stable register. declare_local
             // boxes the register into a cell if a nested function captures it.
             let reg = self.declare_local(name);
+            if is_const {
+                self.const_regs.insert(reg);
+            }
             let is_cell = self.cell_regs.contains(&reg);
             if let Some(init) = &decl.init {
                 if is_cell {
@@ -3882,19 +3901,22 @@ impl<'a> FnCompiler<'a> {
         };
         let binding = self.resolve(&name);
         if let Binding::Local(r) = binding {
-            // Plain register local: mutate in place.
-            if u.prefix {
-                self.emit(Instr::AddInt { dst: r, a: r, imm: delta });
-                if r != dst {
-                    self.emit(Instr::Move { dst, src: r });
+            if !self.const_regs.contains(&r) {
+                // Plain mutable register local: mutate in place.
+                if u.prefix {
+                    self.emit(Instr::AddInt { dst: r, a: r, imm: delta });
+                    if r != dst {
+                        self.emit(Instr::Move { dst, src: r });
+                    }
+                } else {
+                    self.emit(Instr::Move { dst, src: r }); // yield old value
+                    self.emit(Instr::AddInt { dst: r, a: r, imm: delta });
                 }
-            } else {
-                self.emit(Instr::Move { dst, src: r }); // yield old value
-                self.emit(Instr::AddInt { dst: r, a: r, imm: delta });
+                return Ok(dst);
             }
-            return Ok(dst);
         }
-        // Cell / upvalue / global: read into `dst`, compute, store back.
+        // Cell / upvalue / global / const-local: read into `dst`, compute, store
+        // back (store_binding throws for a const after the read + increment).
         let cur = self.load_binding(&binding, dst); // == dst
         if u.prefix {
             self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta });
@@ -3932,6 +3954,22 @@ impl<'a> FnCompiler<'a> {
 
     /// Emit a write of `src` to `binding`.
     fn store_binding(&mut self, b: &Binding, src: Reg) {
+        // Assignment to a `const` binding is a runtime TypeError (PutValue on an
+        // immutable binding). The RHS has already been evaluated into `src` (its
+        // side effects must happen first), so emit the throw now. Initialization
+        // uses Move/CellSet/StoreGlobal directly, never this path.
+        let is_const = match b {
+            Binding::Local(r) | Binding::LocalCell(r) => self.const_regs.contains(r),
+            Binding::Global(idx) => self.cx.const_globals.contains(idx),
+            Binding::Upvalue(_) => false, // a const captured by a closure: not tracked
+        };
+        if is_const {
+            let e = self.alloc_reg();
+            self.emit(Instr::NewError { dst: e, kind: 1, arg: None, opts: None });
+            self.emit(Instr::Throw { src: e });
+            self.next_reg -= 1;
+            return;
+        }
         match b {
             Binding::Local(r) => {
                 if *r != src {
@@ -4457,23 +4495,27 @@ impl<'a> FnCompiler<'a> {
             Op::Assign => {
                 // `x = function(){}` / `x = class {}` names the anonymous value
                 // after the target (NamedEvaluation), like a declaration.
+                // A const local takes the store_binding path so the RHS is evaluated
+                // (side effects) and the assignment then throws a TypeError.
                 if let Binding::Local(r) = binding {
-                    // Plain local: evaluate the RHS directly into its register.
-                    let v = self.compile_named_init(r, &a.right, &name)?;
-                    if v != r {
-                        self.emit(Instr::Move { dst: r, src: v });
+                    if !self.const_regs.contains(&r) {
+                        // Plain mutable local: evaluate the RHS directly into its reg.
+                        let v = self.compile_named_init(r, &a.right, &name)?;
+                        if v != r {
+                            self.emit(Instr::Move { dst: r, src: v });
+                        }
+                        if r != dst {
+                            self.emit(Instr::Move { dst, src: r });
+                        }
+                        return Ok(dst);
                     }
-                    if r != dst {
-                        self.emit(Instr::Move { dst, src: r });
-                    }
-                } else {
-                    // Cell / upvalue / global: evaluate into dst, then store.
-                    let v = self.compile_named_init(dst, &a.right, &name)?;
-                    if v != dst {
-                        self.emit(Instr::Move { dst, src: v });
-                    }
-                    self.store_binding(&binding, dst);
                 }
+                // Cell / upvalue / global / const-local: evaluate into dst, store.
+                let v = self.compile_named_init(dst, &a.right, &name)?;
+                if v != dst {
+                    self.emit(Instr::Move { dst, src: v });
+                }
+                self.store_binding(&binding, dst);
                 Ok(dst)
             }
             // Logical assignment: `x ||= y` / `x &&= y` / `x ??= y` only assign
@@ -4498,18 +4540,21 @@ impl<'a> FnCompiler<'a> {
             // >>= >>>= |= ^= &=`).
             other => {
                 if let Binding::Local(r) = binding {
-                    // Plain local: compute in place.
-                    let rhs = self.expr(&a.right)?;
-                    let instr = compound_assign_instr(other, r, r, rhs)
-                        .ok_or("unsupported assignment operator (zipp-vm v1)")?;
-                    self.emit(instr);
-                    if r != dst {
-                        self.emit(Instr::Move { dst, src: r });
+                    if !self.const_regs.contains(&r) {
+                        // Plain mutable local: compute in place.
+                        let rhs = self.expr(&a.right)?;
+                        let instr = compound_assign_instr(other, r, r, rhs)
+                            .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                        self.emit(instr);
+                        if r != dst {
+                            self.emit(Instr::Move { dst, src: r });
+                        }
+                        return Ok(dst);
                     }
-                    return Ok(dst);
                 }
-                // Cell / upvalue / global: load current → dst, compute → dst,
-                // store back through the binding.
+                // Cell / upvalue / global / const-local: load current → dst, compute
+                // → dst, store back through the binding (store_binding throws for a
+                // const, after the RHS + arithmetic side effects).
                 let cur = self.load_binding(&binding, dst); // == dst
                 let rhs = self.expr(&a.right)?;
                 let instr = compound_assign_instr(other, dst, cur, rhs)
