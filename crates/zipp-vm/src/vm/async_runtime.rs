@@ -865,7 +865,7 @@ impl<'p> Vm<'p> {
         // (executor not called / called twice / non-callable resolve-reject) throws
         // synchronously per ReturnIfAbrupt. The instance is a HeapObj::Promise, so
         // the existing self.resolve/reject(result) settle it directly.
-        let cap_promise = self.new_promise_capability(ctor)?.0;
+        let (cap_promise, _cap_resolve, cap_reject) = self.new_promise_capability(ctor)?;
         let result = cap_promise.heap_index();
         // GetPromiseResolve(C): `promiseResolve = Get(C, "resolve")`, which must be
         // callable. This is the spec-observable step the tests check (overriding
@@ -958,7 +958,10 @@ impl<'p> Vm<'p> {
                     Err(Thrown(msg)) => {
                         let err = self.take_thrown(&msg);
                         let _ = self.iterator_close(iter);
-                        self.reject(result, err);
+                        // IfAbruptRejectPromise: settle through the capability's
+                        // observable [[Reject]] (a custom constructor's reject is
+                        // visibly invoked), not the internal reject.
+                        self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
                         return Ok(Value::heap(result));
                     }
                 },

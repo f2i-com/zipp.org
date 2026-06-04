@@ -1776,11 +1776,38 @@ impl<'p> Vm<'p> {
                 }
                 let a = args.first().copied().unwrap_or(Value::UNDEFINED);
                 match id {
-                    PROMISE_RESOLVE => Value::heap(self.to_promise(a)),
+                    PROMISE_RESOLVE => {
+                        // Promise.resolve(x): the native Promise ctor takes the fast
+                        // path; a custom `this` runs NewPromiseCapability(this) and
+                        // observably Calls its resolve — returning x unchanged when x
+                        // is already a promise whose .constructor === this.
+                        if this == self.promise_ctor_value() {
+                            Value::heap(self.to_promise(a))
+                        } else {
+                            let already = a.is_heap()
+                                && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. })
+                                && self.get_prop(a, "constructor")? == this;
+                            if already {
+                                a
+                            } else {
+                                let (promise, resolve, _) = self.new_promise_capability(this)?;
+                                self.call_value(resolve, Value::UNDEFINED, &[a])?;
+                                promise
+                            }
+                        }
+                    }
                     PROMISE_REJECT => {
-                        let p = self.alloc_promise();
-                        self.reject(p, a);
-                        Value::heap(p)
+                        // As PROMISE_RESOLVE: a custom `this` settles through its own
+                        // capability's reject function.
+                        if this == self.promise_ctor_value() {
+                            let p = self.alloc_promise();
+                            self.reject(p, a);
+                            Value::heap(p)
+                        } else {
+                            let (promise, _, reject) = self.new_promise_capability(this)?;
+                            self.call_value(reject, Value::UNDEFINED, &[a])?;
+                            promise
+                        }
                     }
                     PROMISE_ALL => self.promise_combine(crate::heap::CombKind::All, a, this)?,
                     PROMISE_ALLSETTLED => {
