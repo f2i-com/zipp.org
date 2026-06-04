@@ -254,6 +254,54 @@ impl<'p> Vm<'p> {
         Ok(ta)
     }
 
+    /// TypedArraySpeciesCreate(exemplar, «count»): the result TypedArray that
+    /// slice/map/filter/etc. build. SpeciesConstructor reads exemplar.constructor
+    /// then its [[Symbol.species]] — undefined/null (or no constructor) yields a
+    /// default zero-filled view of the exemplar's kind; otherwise the species must
+    /// be a constructor, Construct(species,«count») must return a TypedArray, and
+    /// its length must be >= count. The caller writes the elements afterwards.
+    pub(crate) fn ta_species_create(&mut self, exemplar_idx: u32, count: usize) -> Result<Value, Thrown> {
+        let (_, kind) = self.ta_len_kind(exemplar_idx);
+        let ctor = self.get_prop(Value::heap(exemplar_idx), "constructor")?;
+        let species = if ctor == Value::UNDEFINED {
+            Value::UNDEFINED
+        } else if !self.is_object_value(ctor) {
+            return Err(Thrown("TypeError: constructor property is not an object".into()));
+        } else {
+            let s = self.get_prop(ctor, "@@species")?;
+            if s == Value::NULL {
+                Value::UNDEFINED
+            } else {
+                s
+            }
+        };
+        if species == Value::UNDEFINED {
+            // Default constructor: a fresh zero-filled view of the exemplar's kind.
+            let size = native::TA_KINDS[kind as usize].1;
+            let buf = self.alloc_array_buffer(count * size);
+            return Ok(self.alloc_typed_array(buf, kind, 0, count));
+        }
+        if !self.is_constructor(species) {
+            return Err(Thrown("TypeError: TypedArray [Symbol.species] is not a constructor".into()));
+        }
+        let result = self.construct(species, &[Value::num(count as f64)])?;
+        match result.is_heap().then(|| self.heap.get(result.heap_index())) {
+            Some(HeapObj::TypedArray { length, .. }) => {
+                if *length < count {
+                    return Err(Thrown(
+                        "TypeError: species-created TypedArray is shorter than required".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Thrown(
+                    "TypeError: TypedArray [Symbol.species] did not return a TypedArray".into(),
+                ))
+            }
+        }
+        Ok(result)
+    }
+
     /// `%TypedArray%.prototype` methods (most mirror Array.prototype, but map/filter/
     /// slice/etc. return TypedArrays and `sort` is numeric by default). `idx` is the
     /// receiver TypedArray's heap index.
@@ -406,8 +454,14 @@ impl<'p> Vm<'p> {
                     }
                 }
                 Ok(Some(match name {
-                    "map" => self.ta_build_from(kind, &mapped)?,
-                    "filter" => self.ta_build_from(kind, &mapped)?,
+                    "map" | "filter" => {
+                        // Result via TypedArraySpeciesCreate (constructor[@@species]).
+                        let dest = self.ta_species_create(idx, mapped.len())?;
+                        for (i, v) in mapped.iter().enumerate() {
+                            self.ta_element_set(dest.heap_index(), i, *v)?;
+                        }
+                        dest
+                    }
                     "find" | "findLast" => Value::UNDEFINED,
                     "findIndex" | "findLastIndex" => Value::num(-1.0),
                     "every" => Value::bool(true),
@@ -512,7 +566,12 @@ impl<'p> Vm<'p> {
                 let start = self.ta_rel_index(a0, 0, len)?;
                 let end = self.ta_rel_index(a1, len, len)?;
                 let vals: Vec<Value> = (start..end.max(start)).map(|i| self.ta_element_get(idx, i)).collect();
-                Ok(Some(self.ta_build_from(kind, &vals)?))
+                // Result via TypedArraySpeciesCreate (constructor[@@species]).
+                let dest = self.ta_species_create(idx, vals.len())?;
+                for (i, v) in vals.iter().enumerate() {
+                    self.ta_element_set(dest.heap_index(), i, *v)?;
+                }
+                Ok(Some(dest))
             }
             "subarray" => {
                 let start = self.ta_rel_index(a0, 0, len)?;

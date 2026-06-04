@@ -573,9 +573,9 @@ impl<'p> Vm<'p> {
                 self.proto_of.insert(obj.heap_index(), proto);
             }
             let ret = self.call_value(cv, obj, args)?;
-            if ret.is_heap()
-                && matches!(self.heap.get(ret.heap_index()), HeapObj::Object(_) | HeapObj::Array(_))
-            {
+            // A constructor that returns ANY object (TypedArray/Map/Date/… too, not
+            // just a plain object/array) replaces the new instance with it.
+            if self.is_object_value(ret) {
                 return Ok(ret);
             }
             return Ok(obj);
@@ -595,9 +595,8 @@ impl<'p> Vm<'p> {
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
                 let ret = self.call_value(f, obj, args)?;
-                if ret.is_heap()
-                    && matches!(self.heap.get(ret.heap_index()), HeapObj::Object(_) | HeapObj::Array(_))
-                {
+                // Any object return replaces the new instance.
+                if self.is_object_value(ret) {
                     return Ok(ret);
                 }
             }

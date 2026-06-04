@@ -270,6 +270,25 @@ impl<'p> Vm<'p> {
             }
             return Ok(());
         }
+        // A TypedArray's extra NAMED own property (`ta.constructor = {}`, used by
+        // species lookup) lives in the arr_props side table; a canonical numeric
+        // index still writes to the buffer (or is ignored when out of bounds).
+        if matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
+            if let Ok(n) = key.parse::<usize>() {
+                if n.to_string() == key {
+                    let (tlen, _) = self.ta_len_kind(idx);
+                    if n < tlen {
+                        self.ta_element_set(idx, n, val)?;
+                    }
+                    return Ok(());
+                }
+            }
+            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+            if added {
+                self.heap.bump_version(idx);
+            }
+            return Ok(());
+        }
         // An exotic object's extra own property (`mapInst.x = 1`) lives in the same
         // arr_props side table that get_member / defineProperty use for it, so the
         // write is readable (parity with the defineProperty path).
