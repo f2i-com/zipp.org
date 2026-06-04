@@ -8,6 +8,21 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
+    /// IsRegExp(v) (ES 7.2.8): a `@@match` property overrides — when present it is
+    /// ToBoolean'd; otherwise true iff `v` is a RegExp exotic. Non-objects are not
+    /// regexps. Used by `String.prototype.{includes,startsWith,endsWith}`, which
+    /// reject a regexp searchString.
+    pub(crate) fn is_regexp(&mut self, v: Value) -> Result<bool, Thrown> {
+        if !self.is_object_value(v) {
+            return Ok(false);
+        }
+        let m = self.get_prop(v, "@@match")?;
+        if m != Value::UNDEFINED {
+            return Ok(self.truthy(m));
+        }
+        Ok(matches!(self.heap.get(v.heap_index()), HeapObj::RegExp { .. }))
+    }
+
     /// The i-th char of a flat string by heap index, WITHOUT cloning the string —
     /// O(1) for ASCII (i-th byte), else an O(i) scalar scan. `None` if out of range
     /// or not a flat string. (A full-string clone here would make `charCodeAt(i)`
@@ -108,7 +123,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::int(pos)))
             }
             "includes" => {
-                let needle = self.display(arg0);
+                if self.is_regexp(arg0)? {
+                    return Err(Thrown(
+                        "TypeError: String.prototype.includes argument must not be a RegExp".into(),
+                    ));
+                }
+                let needle = self.to_js_string(arg0)?;
                 let len = char_len(&s) as i64;
                 let pos = if args.len() >= 2 {
                     self.to_integer_or_zero(args[1])?.clamp(0, len)
@@ -262,7 +282,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(s.trim_end_matches(w).to_string())))
             }
             "startsWith" => {
-                let needle = self.display(arg0);
+                if self.is_regexp(arg0)? {
+                    return Err(Thrown(
+                        "TypeError: String.prototype.startsWith argument must not be a RegExp".into(),
+                    ));
+                }
+                let needle = self.to_js_string(arg0)?;
                 let len = char_len(&s) as i64;
                 let pos =
                     if args.len() >= 2 { self.to_integer_or_zero(args[1])?.clamp(0, len) } else { 0 }
@@ -271,7 +296,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool(s[byte..].starts_with(&needle))))
             }
             "endsWith" => {
-                let needle = self.display(arg0);
+                if self.is_regexp(arg0)? {
+                    return Err(Thrown(
+                        "TypeError: String.prototype.endsWith argument must not be a RegExp".into(),
+                    ));
+                }
+                let needle = self.to_js_string(arg0)?;
                 let len = char_len(&s) as i64;
                 let end = if args.len() >= 2 && args[1] != Value::UNDEFINED {
                     self.to_integer_or_zero(args[1])?.clamp(0, len)
