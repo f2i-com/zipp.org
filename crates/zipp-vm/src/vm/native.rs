@@ -141,6 +141,9 @@ pub const ITER_TAG_GET: u16 = 614;
 pub const ITER_TAG_SET: u16 = 615;
 pub const ITER_CTOR_GET: u16 = 616;
 pub const ITER_CTOR_SET: u16 = 617;
+/// `Iterator.concat(...iterables)` — concatenate iterables into one Iterator
+/// Helper (eager @@iterator validation, lazy per-iterable opening).
+pub const ITER_CONCAT: u16 = 618;
 // The test262 `$262` host object.
 pub const DOLLAR262_DETACH: u16 = 620;
 pub const DOLLAR262_GC: u16 = 621;
@@ -836,6 +839,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         ITER_HELPER_NEXT => ("next", 0),
         ITER_HELPER_RETURN => ("return", 0),
         ITER_FROM => ("from", 1),
+        ITER_CONCAT => ("concat", 0),
         OBJPROTO_DEFINE_GETTER => ("__defineGetter__", 2),
         OBJPROTO_DEFINE_SETTER => ("__defineSetter__", 2),
         OBJPROTO_LOOKUP_GETTER => ("__lookupGetter__", 1),

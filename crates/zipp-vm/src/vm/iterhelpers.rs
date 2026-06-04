@@ -98,6 +98,32 @@ impl<'p> Vm<'p> {
         Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))))
     }
 
+    /// `Iterator.concat(...items)` (ES2025). Each item must be an Object with a
+    /// callable `@@iterator`; the method is read ONCE here (eagerly, in argument
+    /// order) and paired with its iterable. The returned Iterator Helper opens
+    /// each iterable lazily — only when iteration reaches it — and yields all of
+    /// its values before moving to the next.
+    pub(crate) fn iterator_concat(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let mut pairs: Vec<Value> = Vec::with_capacity(args.len());
+        for &item in args {
+            if !self.is_object_value(item) {
+                return Err(Thrown(
+                    "TypeError: Iterator.concat argument is not an object".into(),
+                ));
+            }
+            // GetMethod(item, @@iterator): undefined/null/non-callable all reject.
+            let method = self.get_prop(item, "@@iterator")?;
+            if !self.is_callable(method) {
+                return Err(Thrown(
+                    "TypeError: Iterator.concat argument is not iterable".into(),
+                ));
+            }
+            pairs.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![item, method]))));
+        }
+        let src = Value::heap(self.heap.alloc(HeapObj::Array(pairs)));
+        Ok(self.make_iter_helper(src, 6, Value::UNDEFINED, 0))
+    }
+
     fn make_iter_helper(&mut self, source: Value, kind: u8, arg: Value, n: i64) -> Value {
         let idx = self.heap.alloc(HeapObj::IterHelper {
             source,
@@ -372,6 +398,40 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                     }
+                }
+                6 => {
+                    // concat: `source` is an Array of [iterable, method] pairs;
+                    // `cidx` is the next pair to open; `inner` is the currently-open
+                    // iterator (or UNDEFINED). Drain `inner`, then open the next pair.
+                    if inner != Value::UNDEFINED {
+                        match self.iterator_step(inner)? {
+                            Some(v) => return Ok(self.iter_result(v, false)),
+                            None => self.ih_set_inner(idx, Value::UNDEFINED),
+                        }
+                    }
+                    let pairs = match self.heap.get(source.heap_index()) {
+                        HeapObj::Array(items) => items.clone(),
+                        _ => Vec::new(),
+                    };
+                    if (cidx as usize) >= pairs.len() {
+                        self.ih_set_done(idx);
+                        return Ok(self.iter_result(Value::UNDEFINED, true));
+                    }
+                    let (iterable, method) = match self.heap.get(pairs[cidx as usize].heap_index()) {
+                        HeapObj::Array(p) => (p[0], p[1]),
+                        _ => (Value::UNDEFINED, Value::UNDEFINED),
+                    };
+                    self.ih_inc_idx(idx);
+                    let it = self.call_value(method, iterable, &[])?;
+                    if !self.is_object_value(it) {
+                        self.ih_set_done(idx);
+                        return Err(Thrown(
+                            "TypeError: Iterator.concat: the iterator method did not return an object"
+                                .into(),
+                        ));
+                    }
+                    self.ih_set_inner(idx, it);
+                    continue;
                 }
                 _ => {
                     // 5 = passthrough wrapper (Iterator.from of a foreign iterator)

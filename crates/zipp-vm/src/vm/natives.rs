@@ -1449,13 +1449,30 @@ impl<'p> Vm<'p> {
             }
             ITER_HELPER_RETURN => {
                 if this.is_heap() {
+                    let (kind, source, inner, was_done) = match self.heap.get(this.heap_index()) {
+                        HeapObj::IterHelper { kind, source, inner, done, .. } => {
+                            (*kind, *source, *inner, *done)
+                        }
+                        _ => (0, Value::UNDEFINED, Value::UNDEFINED, true),
+                    };
+                    // Mark done first (a re-entrant return is then a no-op), then
+                    // close the underlying iterator — `inner` for concat (its
+                    // `source` is the pair-array), else `source`. Skip if already
+                    // done or not yet started (no live underlying iterator).
                     if let HeapObj::IterHelper { done, .. } = self.heap.get_mut(this.heap_index()) {
                         *done = true;
+                    }
+                    if !was_done {
+                        let target = if kind == 6 { inner } else { source };
+                        if self.is_object_value(target) {
+                            self.iterator_close(target)?;
+                        }
                     }
                 }
                 self.iter_result(Value::UNDEFINED, true)
             }
             ITER_FROM => self.iterator_from(a0)?,
+            ITER_CONCAT => self.iterator_concat(args)?,
             // test262 `$262.detachArrayBuffer(ab)` / `$262.gc()`.
             DOLLAR262_DETACH => {
                 if let Some(buf) = self.as_array_buffer(a0) {
