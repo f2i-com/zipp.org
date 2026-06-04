@@ -108,7 +108,9 @@ impl<'p> Vm<'p> {
         };
         match name {
             "indexOf" => {
-                let needle = self.display(arg0);
+                // ToString(searchString) (honours @@toPrimitive/toString/valueOf,
+                // throws on a Symbol) BEFORE ToInteger(position) — spec arg order.
+                let needle = self.to_js_string(arg0)?;
                 // Optional fromIndex (ToInteger, a char position) to start at.
                 let from = if args.len() >= 2 {
                     self.to_integer_or_zero(args[1])?.max(0) as usize
@@ -312,9 +314,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool(s[..byte].ends_with(&needle))))
             }
             "concat" => {
+                // Each argument is ToString-coerced (honours @@toPrimitive/toString/
+                // valueOf, throws on a Symbol), not rendered via display().
                 let mut out = s.clone();
                 for a in args {
-                    out.push_str(&self.display(*a));
+                    let part = self.to_js_string(*a)?;
+                    out.push_str(&part);
                 }
                 Ok(Some(self.alloc_str(out)))
             }
@@ -412,7 +417,8 @@ impl<'p> Vm<'p> {
             "toLocaleUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
             "toLocaleLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
             "lastIndexOf" => {
-                let needle = self.display(arg0);
+                // ToString(searchString) before the position coercion (spec order).
+                let needle = self.to_js_string(arg0)?;
                 let sc: Vec<char> = s.chars().collect();
                 let nc: Vec<char> = needle.chars().collect();
                 let len = sc.len();
