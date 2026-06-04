@@ -293,12 +293,56 @@ impl<'p> Vm<'p> {
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call_value(trap, handler, &[target, kv])?;
+                // The target's own property + extensibility drive the [[GetOwnProperty]]
+                // invariants. (Only checked for an ordinary Object target; an exotic
+                // target skips them, matching the prior lenient behavior.)
+                let (ordinary, t_own, t_cfg, t_wr, t_acc, t_ext) =
+                    match self.heap.get(target.heap_index()) {
+                        HeapObj::Object(m) => {
+                            let ext = m.extensible;
+                            match m.pos(key) {
+                                Some(i) => (
+                                    true,
+                                    true,
+                                    m.attrs[i].configurable,
+                                    m.attrs[i].writable,
+                                    m.attrs[i].accessor,
+                                    ext,
+                                ),
+                                None => (true, false, false, false, false, ext),
+                            }
+                        }
+                        _ => (false, false, false, false, false, true),
+                    };
                 if r.is_undefined() {
+                    // Can't report a non-configurable own prop (or any own prop of a
+                    // non-extensible target) as non-existent.
+                    if ordinary && t_own && (!t_cfg || !t_ext) {
+                        return Err(Thrown(
+                            "TypeError: proxy getOwnPropertyDescriptor cannot report an existing non-configurable or non-extensible-target property as undefined".into(),
+                        ));
+                    }
                     return Ok(Some(Value::UNDEFINED));
                 }
                 // ToPropertyDescriptor (read_descriptor) requires an object, then we
                 // re-emit a COMPLETE descriptor (missing fields take their defaults).
                 let (value, get, set, wr, en, cf) = self.read_descriptor(r)?;
+                // A non-configurable reported descriptor requires a matching
+                // non-configurable target property (and, for a non-writable data
+                // descriptor, a non-writable target).
+                if ordinary && !cf.unwrap_or(false) {
+                    if !t_own || t_cfg {
+                        return Err(Thrown(
+                            "TypeError: proxy getOwnPropertyDescriptor reported a non-configurable descriptor for a configurable or non-existent property".into(),
+                        ));
+                    }
+                    let is_accessor = get.is_some() || set.is_some();
+                    if !is_accessor && !wr.unwrap_or(false) && !t_acc && t_wr {
+                        return Err(Thrown(
+                            "TypeError: proxy getOwnPropertyDescriptor reported a non-writable descriptor for a writable property".into(),
+                        ));
+                    }
+                }
                 let normalized = if get.is_some() || set.is_some() {
                     self.make_accessor_descriptor(
                         get.unwrap_or(Value::UNDEFINED),
