@@ -25,7 +25,10 @@ impl<'p> Vm<'p> {
         // also honours an array-like whose `length` is an object with valueOf.
         let lv = self.get_prop(this, "length")?;
         let len = self.to_number_coerce(lv)?;
-        let len = if len.is_finite() && len > 0.0 {
+        // ToLength: a positive `len` (including +Infinity / "Infinity" / a huge
+        // finite) clamps to MAX_DENSE_ARRAY_LEN; NaN and ≤0 (incl. -Infinity) → 0.
+        // `len as usize` saturates for +Infinity, so the `.min` bounds it.
+        let len = if len > 0.0 {
             (len as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
         } else {
             0

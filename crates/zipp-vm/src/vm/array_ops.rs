@@ -229,7 +229,9 @@ impl<'p> Vm<'p> {
         let _gc = self.gc_lock_guard();
         let lv = self.get_prop(this, "length")?;
         let lenf = self.to_number_coerce(lv)?;
-        let len: usize = if lenf.is_finite() && lenf > 0.0 {
+        // ToLength: a positive length (incl. +Infinity / "Infinity" / a huge finite)
+        // clamps to MAX_DENSE_ARRAY_LEN; NaN and ≤0 (incl. -Infinity) → 0.
+        let len: usize = if lenf > 0.0 {
             (lenf as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
         } else {
             0

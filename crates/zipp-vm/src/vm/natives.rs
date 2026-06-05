@@ -2508,9 +2508,13 @@ impl<'p> Vm<'p> {
             _ if native::proto_method(id).is_some() => {
                 let (m, kind, _len) = native::proto_method(id).unwrap();
                 // A boxed primitive receiver unwraps to its [[PrimitiveValue]] so the
-                // method runs on the primitive (`new Number(5).toFixed(2)`).
+                // method runs on the primitive (`new Number(5).toFixed(2)`). The generic
+                // Array methods (kind 0) are the exception: a `new Boolean/Number/String`
+                // wrapper must stay intact so its own array-like props (length + indexed
+                // elements) remain visible and the callback's receiver argument is the
+                // original wrapper (`obj instanceof Boolean`, `toString.call(obj)`).
                 let this = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::Boxed { value, .. }) => *value,
+                    Some(HeapObj::Boxed { value, .. }) if kind != 0 => *value,
                     _ => this,
                 };
                 // Number/Boolean receivers are primitive values; the rest are heap.
