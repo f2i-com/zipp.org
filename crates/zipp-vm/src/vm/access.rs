@@ -7,6 +7,21 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Outcome of walking the prototype chain for an OrdinarySet `[[Set]]` whose
+/// receiver has no own data property for the key.
+enum ProtoSet {
+    /// An inherited accessor with a setter — invoke it with the receiver.
+    Setter(Value),
+    /// An inherited getter-only accessor — assignment is a no-op (sloppy) / throw.
+    GetterOnly,
+    /// A Proxy in the chain handled the write via its `set` trap (`true` = ok,
+    /// `false` = trap returned falsish → no-op/throw).
+    Proxy(bool),
+    /// No accessor or proxy governs the write — write an own data property on the
+    /// receiver (shadowing any inherited data property).
+    DataWrite,
+}
+
 impl<'p> Vm<'p> {
     /// JS `typeof` type-name. `null` is `"object"` (a historic quirk); functions
     /// and closures are `"function"`; arrays and objects are `"object"`.
@@ -454,13 +469,15 @@ impl<'p> Vm<'p> {
             _ => false,
         } && self.arr_props.get(&idx).map_or(true, |m| m.pos(key).is_none());
         if needs_proto_walk {
-            match self.proto_accessor_setter(idx, key) {
-                Some(Some(setter)) => {
+            match self.proto_chain_set(idx, key, val, obj)? {
+                ProtoSet::Setter(setter) => {
                     self.call_value(setter, obj, &[val])?;
                     return Ok(());
                 }
-                Some(None) => return self.reject_write(key, strict), // inherited getter-only
-                None => {}                    // no inherited accessor ⇒ data write
+                ProtoSet::GetterOnly => return self.reject_write(key, strict),
+                ProtoSet::Proxy(true) => return Ok(()), // chain proxy's set trap handled it
+                ProtoSet::Proxy(false) => return self.reject_write(key, strict),
+                ProtoSet::DataWrite => {} // no inherited accessor/proxy ⇒ own-data write
             }
         }
         // A class instance with an inherited `set x(v)` accessor: assigning a
@@ -690,24 +707,43 @@ impl<'p> Vm<'p> {
     /// * `Some(None)` — a getter-only accessor (assignment is a sloppy no-op);
     /// * `None` — no accessor reached (a data property shadows / the chain ends),
     ///   so the caller writes an own data property.
-    fn proto_accessor_setter(&mut self, start_idx: u32, key: &str) -> Option<Option<Value>> {
+    fn proto_chain_set(&mut self, start_idx: u32, key: &str, val: Value, receiver: Value) -> Result<ProtoSet, Thrown> {
         let mut cur = self.object_get_prototype_of(Value::heap(start_idx));
-        for _ in 0..64 {
+        for _ in 0..1000 {
             if !cur.is_heap() {
-                return None;
+                return Ok(ProtoSet::DataWrite);
             }
-            if let HeapObj::Object(m) = self.heap.get(cur.heap_index()) {
+            let cidx = cur.heap_index();
+            // A Proxy in the chain delegates the write to its [[Set]] with the
+            // ORIGINAL receiver (OrdinarySet step: parent.[[Set]](P,V,Receiver)). A
+            // `set` trap fires; with no trap it forwards to the target's [[Set]] —
+            // continue the walk from the target with the same receiver.
+            if self.proxy_parts(cidx).is_some() {
+                match self.proxy_set_bool(cur, key, val, receiver)? {
+                    Some(ok) => return Ok(ProtoSet::Proxy(ok)),
+                    None => {
+                        let target = self.proxy_parts(cidx).map(|(t, _, _)| t).unwrap_or(Value::NULL);
+                        cur = target;
+                        continue;
+                    }
+                }
+            }
+            if let HeapObj::Object(m) = self.heap.get(cidx) {
                 if let Some(i) = m.pos(key) {
                     let a = m.attrs[i];
                     if a.accessor {
-                        return Some((a.setter != Value::UNDEFINED).then_some(a.setter));
+                        return Ok(if a.setter != Value::UNDEFINED {
+                            ProtoSet::Setter(a.setter)
+                        } else {
+                            ProtoSet::GetterOnly
+                        });
                     }
-                    return None; // inherited data property → own-data shadow
+                    return Ok(ProtoSet::DataWrite); // inherited data property → own-data shadow
                 }
             }
             cur = self.object_get_prototype_of(cur);
         }
-        None
+        Ok(ProtoSet::DataWrite)
     }
 
     /// Install an object-literal accessor (`{ get k(){…} }` / `{ set k(v){…} }`)
