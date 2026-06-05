@@ -133,6 +133,9 @@ pub const GLOBAL_DECODE_URI: u16 = 865;
 pub const GLOBAL_DECODE_URI_COMPONENT: u16 = 866;
 /// `Function.prototype[Symbol.hasInstance]` — OrdinaryHasInstance as a method.
 pub const FN_HAS_INSTANCE: u16 = 867;
+/// %ThrowTypeError% — the shared get/set accessor of `Function.prototype`'s
+/// restricted `caller`/`arguments` properties; always throws a TypeError.
+pub const FN_THROW_TYPE_ERROR: u16 = 868;
 pub const WS_ADD: u16 = 294;
 pub const WS_HAS: u16 = 295;
 pub const WS_DELETE: u16 = 296;
@@ -897,6 +900,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_DECODE_URI => ("decodeURI", 1),
         GLOBAL_DECODE_URI_COMPONENT => ("decodeURIComponent", 1),
         FN_HAS_INSTANCE => ("[Symbol.hasInstance]", 1),
+        FN_THROW_TYPE_ERROR => ("", 0),
         GLOBAL_IS_NAN => ("isNaN", 1),
         GLOBAL_IS_FINITE => ("isFinite", 1),
         GLOBAL_EVAL => ("eval", 1),

@@ -317,8 +317,22 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
+        // AddRestrictedFunctionProperties: `caller` and `arguments` are accessor
+        // properties whose get AND set are both the single %ThrowTypeError%
+        // intrinsic, { enumerable:false, configurable:true }. Ordinary functions
+        // have no own caller/arguments and inherit these throwing accessors.
+        let thrower = Value::heap(self.heap.alloc(HeapObj::Native(FN_THROW_TYPE_ERROR)));
+        let restricted_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: true,
+            setter: thrower,
+        };
         if let HeapObj::Object(p) = self.heap.get_mut(fn_proto) {
             p.define("@@hasInstance", fn_has_instance, non_config_attr);
+            p.define("caller", thrower, restricted_attr);
+            p.define("arguments", thrower, restricted_attr);
         }
         let object_ctor = build(
             self,

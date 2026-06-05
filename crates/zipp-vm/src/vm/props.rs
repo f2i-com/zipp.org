@@ -2375,8 +2375,11 @@ impl<'p> Vm<'p> {
                     }
                 }
                 // Poison-pill: `caller`/`arguments` on a STRICT or BOUND function are
-                // %ThrowTypeError% accessors (AddRestrictedFunctionProperties); a
-                // sloppy function inherits neither and reads undefined (no throw).
+                // the %ThrowTypeError% accessors (AddRestrictedFunctionProperties).
+                // A sloppy function reads `undefined` here (zipp exposes no legacy own
+                // caller/arguments) — handled explicitly so the inherited throwing
+                // accessor on Function.prototype is not leaked as a value by the
+                // proto-chain walk below.
                 if key == "caller" || key == "arguments" {
                     let poison = match self.heap.get(obj.heap_index()) {
                         HeapObj::Bound { .. } => true,
@@ -2389,6 +2392,7 @@ impl<'p> Vm<'p> {
                             "TypeError: '{key}' may not be accessed on strict-mode or bound functions"
                         )));
                     }
+                    return Ok(Value::UNDEFINED);
                 }
                 // Inherited methods: a generator/async function starts at its
                 // dynamic-function intrinsic prototype (so `gen.constructor` is

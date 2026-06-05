@@ -413,6 +413,22 @@ impl<'p> Vm<'p> {
             self.heap.get(idx),
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
         ) {
+            // `caller`/`arguments` on a STRICT or BOUND function are the inherited
+            // %ThrowTypeError% accessors — assigning either throws, mirroring the
+            // read poison (props.rs). A sloppy function keeps its ordinary write.
+            if key == "caller" || key == "arguments" {
+                let restricted = match self.heap.get(idx) {
+                    HeapObj::Bound { .. } => true,
+                    HeapObj::Func(fid) => self.func(*fid as usize).is_strict,
+                    HeapObj::Closure { func, .. } => self.func(*func as usize).is_strict,
+                    _ => false,
+                };
+                if restricted {
+                    return Err(Thrown(format!(
+                        "TypeError: '{key}' may not be assigned on strict-mode or bound functions"
+                    )));
+                }
+            }
             // Reassigning `fn.prototype = obj` redirects what `new fn()` / the
             // `.prototype` getter see (the lazily-cached prototype object).
             if key == "prototype" && val.is_heap() {

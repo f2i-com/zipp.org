@@ -207,6 +207,13 @@ impl<'p> Vm<'p> {
                 // `Function.prototype[Symbol.hasInstance](V)` → OrdinaryHasInstance.
                 Value::bool(self.ordinary_has_instance(this, a0)?)
             }
+            FN_THROW_TYPE_ERROR => {
+                // %ThrowTypeError%: the restricted caller/arguments accessor — read
+                // OR write of Function.prototype.caller/arguments throws here.
+                return Err(Thrown(
+                    "TypeError: 'caller' and 'arguments' may not be accessed on this function".into(),
+                ));
+            }
             DATE_TO_PRIMITIVE => {
                 // `Date.prototype[Symbol.toPrimitive](hint)`: O must be an Object.
                 // hint "string"/"default" → OrdinaryToPrimitive(O, "string"),
