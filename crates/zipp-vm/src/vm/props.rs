@@ -224,11 +224,82 @@ impl<'p> Vm<'p> {
                     }
                     seen.push(id);
                 }
+                // Target-key invariants (10.5.11 steps 10-22). Partition the target's
+                // own keys into configurable / non-configurable, keyed by the same
+                // identity scheme as `seen` (string content / symbol heap index).
+                let extensible = self.is_extensible(target)?;
+                let tkeys_v = self.object_own_keys(target)?;
+                let tkeys = self.array_snapshot(tkeys_v.heap_index());
+                let (mut config, mut nonconfig): (Vec<String>, Vec<String>) =
+                    (Vec::new(), Vec::new());
+                for tk in &tkeys {
+                    let id = if tk.is_heap()
+                        && matches!(self.heap.get(tk.heap_index()), HeapObj::Symbol { .. })
+                    {
+                        format!("y:{}", tk.heap_index())
+                    } else {
+                        format!("s:{}", self.display(*tk))
+                    };
+                    let ks = self.key_of(*tk);
+                    let desc = self.object_get_own_property_descriptor(target, &ks);
+                    let cfg = if desc.is_undefined() {
+                        true
+                    } else {
+                        let c = self.get_prop(desc, "configurable")?;
+                        self.truthy(c)
+                    };
+                    if cfg {
+                        config.push(id);
+                    } else {
+                        nonconfig.push(id);
+                    }
+                }
+                // Fast path: an extensible target with no non-configurable keys
+                // imposes no further constraint on the trap result.
+                if !(extensible && nonconfig.is_empty()) {
+                    let mut unchecked = seen.clone();
+                    // Every non-configurable own key MUST appear in the trap result.
+                    for key in &nonconfig {
+                        match unchecked.iter().position(|u| u == key) {
+                            Some(p) => {
+                                unchecked.remove(p);
+                            }
+                            None => {
+                                return Err(Thrown(
+                                    "TypeError: proxy [[OwnPropertyKeys]] must include all non-configurable keys of the target".into(),
+                                ))
+                            }
+                        }
+                    }
+                    // A non-extensible target: the trap result must contain EXACTLY
+                    // the target's own keys (every configurable key present, none extra).
+                    if !extensible {
+                        for key in &config {
+                            match unchecked.iter().position(|u| u == key) {
+                                Some(p) => {
+                                    unchecked.remove(p);
+                                }
+                                None => {
+                                    return Err(Thrown(
+                                        "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must contain all of its own keys".into(),
+                                    ))
+                                }
+                            }
+                        }
+                        if !unchecked.is_empty() {
+                            return Err(Thrown(
+                                "TypeError: proxy [[OwnPropertyKeys]] of a non-extensible target must not contain extra keys".into(),
+                            ));
+                        }
+                    }
+                }
                 Ok(Some(items))
             }
             None => {
-                let names = self.object_own_property_names(target)?;
-                Ok(Some(self.array_snapshot(names.heap_index())))
+                // No trap: forward the target's full own-key list (Strings AND
+                // Symbols, so getOwnPropertySymbols/Reflect.ownKeys see symbol keys).
+                let keys = self.object_own_keys(target)?;
+                Ok(Some(self.array_snapshot(keys.heap_index())))
             }
         }
     }
