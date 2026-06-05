@@ -368,6 +368,88 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `indexOf` / `lastIndexOf` / `includes` over the generic [[Get]]/[[HasProperty]]
+    /// protocol (ES 23.1.3.x), used whenever the receiver is an array-like object OR
+    /// a real array carrying an `arr_props` side table (a defineProperty'd index
+    /// accessor, or a prototype-inherited index). Unlike the dense snapshot fast path
+    /// this: invokes accessor getters, walks the prototype chain, never materialises
+    /// an absent index (HasProperty is consulted for indexOf/lastIndexOf), reads
+    /// `length` live and coerces `fromIndex` AFTER it, and propagates a throwing index
+    /// getter. `includes` reads EVERY index via Get (no HasProperty — a hole counts as
+    /// undefined) and compares with SameValueZero; indexOf/lastIndexOf use HasProperty
+    /// and strict equality.
+    pub(crate) fn array_like_search(
+        &mut self,
+        this: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        let _gc = self.gc_lock_guard();
+        let search = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let lv = self.get_prop(this, "length")?;
+        let lenf = self.to_number_coerce(lv)?;
+        // ToLength (clamped to the dense-array ceiling, as elsewhere).
+        let len: i64 = if lenf > 0.0 {
+            lenf.min(crate::vm::MAX_DENSE_ARRAY_LEN as f64) as i64
+        } else {
+            0
+        };
+        let idxv = |k: i64| Value::num(k as f64);
+        if len == 0 {
+            return Ok(Some(if name == "includes" {
+                Value::bool(false)
+            } else {
+                Value::int(-1)
+            }));
+        }
+        // fromIndex (ToIntegerOrInfinity), coerced AFTER reading length so its
+        // valueOf side effects observe the current length.
+        let has_from = args.len() >= 2;
+        let from_raw = if has_from { self.to_integer_or_zero(args[1])? } else { 0 };
+        match name {
+            "lastIndexOf" => {
+                // Default search start is len-1; n>=0 → min(n, len-1); n<0 → len+n.
+                let mut k = if has_from {
+                    if from_raw >= 0 { from_raw.min(len - 1) } else { len + from_raw }
+                } else {
+                    len - 1
+                };
+                while k >= 0 {
+                    if self.has_property(this, idxv(k)) {
+                        let v = self.get_index(this, idxv(k))?;
+                        if self.values_strict_eq(v, search) {
+                            return Ok(Some(Value::int(k as i32)));
+                        }
+                    }
+                    k -= 1;
+                }
+                Ok(Some(Value::int(-1)))
+            }
+            // indexOf / includes share the forward start: n>=0 → n; n<0 → len+n (≥0).
+            _ => {
+                let mut k = if from_raw >= 0 { from_raw } else { (len + from_raw).max(0) };
+                let is_includes = name == "includes";
+                while k < len {
+                    // includes visits every index (a hole reads as undefined);
+                    // indexOf skips holes via HasProperty.
+                    if is_includes {
+                        let v = self.get_index(this, idxv(k))?;
+                        if self.same_value_zero(v, search) {
+                            return Ok(Some(Value::bool(true)));
+                        }
+                    } else if self.has_property(this, idxv(k)) {
+                        let v = self.get_index(this, idxv(k))?;
+                        if self.values_strict_eq(v, search) {
+                            return Ok(Some(Value::int(k as i32)));
+                        }
+                    }
+                    k += 1;
+                }
+                Ok(Some(if is_includes { Value::bool(false) } else { Value::int(-1) }))
+            }
+        }
+    }
+
     /// `Array.prototype.copyWithin` against an array-like *object* via the generic
     /// Get/Set/HasProperty/DeletePropertyOrThrow protocol, so it propagates abrupt
     /// completions (a throwing length/index coercion, or a non-configurable target
@@ -729,12 +811,18 @@ impl<'p> Vm<'p> {
             if matches!(name, "pop" | "push" | "shift" | "unshift" | "reverse" | "splice") {
                 return self.array_like_mutate(Value::heap(idx), name, args);
             }
+            // indexOf/lastIndexOf/includes via the generic HasProperty/Get protocol —
+            // invokes inherited/accessor getters, never materialises an absent index,
+            // and propagates a throwing getter (a dense snapshot would do none of these).
+            if matches!(name, "indexOf" | "lastIndexOf" | "includes") {
+                return self.array_like_search(Value::heap(idx), name, args);
+            }
             // Read-only methods that treat a hole as undefined snapshot to a dense
             // temp array and run against that.
             if matches!(
                 name,
-                "find" | "findIndex" | "findLast" | "findLastIndex" | "indexOf"
-                    | "lastIndexOf" | "includes" | "join" | "toString" | "slice" | "at"
+                "find" | "findIndex" | "findLast" | "findLastIndex"
+                    | "join" | "toString" | "slice" | "at"
                     | "concat" | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
                     | "toSpliced" | "entries" | "keys" | "values" | "toLocaleString"
             ) {
@@ -769,6 +857,14 @@ impl<'p> Vm<'p> {
             )
         {
             return self.array_like_iterate(Value::heap(idx), name, args);
+        }
+        // Likewise route the SEARCH methods off the dense fast path when the array
+        // carries a side table (a defineProperty'd index accessor must have its
+        // getter invoked, not the dense undefined placeholder read).
+        if self.arr_props.contains_key(&idx)
+            && matches!(name, "indexOf" | "lastIndexOf" | "includes")
+        {
+            return self.array_like_search(Value::heap(idx), name, args);
         }
         match name {
             "push" => {
