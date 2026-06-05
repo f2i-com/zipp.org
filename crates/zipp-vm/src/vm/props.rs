@@ -531,6 +531,48 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
     }
 
+    /// EnumerateObjectProperties (for-in): the own + INHERITED enumerable string
+    /// keys, walking the [[Prototype]] chain, with shadowing dedup — a key seen at a
+    /// nearer level (enumerable OR not) hides the same key on farther prototypes.
+    /// Symbol keys are excluded; built-in prototype methods are non-enumerable so
+    /// they never appear. Returns a HeapObj::Array of string keys. (Object.keys/
+    /// values/entries stay own-only via object_enum_own — only for-in walks up.)
+    pub(crate) fn for_in_keys(&mut self, obj: Value) -> Result<Value, Thrown> {
+        // `out` holds heap key strings while object_enum_own / object_own_property_names
+        // re-enter and allocate — suspend GC for the scope.
+        let _gc = self.gc_lock_guard();
+        let mut out: Vec<Value> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cur = obj;
+        for _ in 0..100_000 {
+            if !cur.is_heap() {
+                break;
+            }
+            // Emit this level's enumerable string keys not already shadowed
+            // (object_enum_own is Proxy-aware: ownKeys trap + per-key gopd check).
+            let enum_keys = self.object_enum_own(cur, EnumWhat::Keys)?;
+            let enum_snap = self.array_snapshot(enum_keys.heap_index());
+            for k in &enum_snap {
+                let ks = self.display(*k);
+                if seen.insert(ks) {
+                    out.push(*k);
+                }
+            }
+            // Record EVERY own string key at this level (incl. non-enumerable) so it
+            // shadows the same key on farther prototypes.
+            let all_names = self.object_own_property_names(cur)?;
+            let all_snap = self.array_snapshot(all_names.heap_index());
+            for k in &all_snap {
+                seen.insert(self.display(*k));
+            }
+            cur = self.object_get_prototype_of(cur);
+            if cur == Value::NULL {
+                break;
+            }
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
     /// Build a data property descriptor object `{value, writable, enumerable,
     /// configurable}` (for `Object.getOwnPropertyDescriptor`).
     pub(crate) fn make_data_descriptor(&mut self, value: Value, w: bool, e: bool, c: bool) -> Value {

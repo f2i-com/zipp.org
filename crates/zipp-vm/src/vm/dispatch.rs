@@ -1727,6 +1727,19 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::ForInKeys { dst, obj } => {
+                        let o = self.get(base, obj);
+                        // ForIn/OfHeadEvaluation: a null/undefined receiver iterates
+                        // nothing (no ToObject error), so yield an empty key list.
+                        let v = if o.is_nullish() {
+                            Value::heap(self.heap.alloc(HeapObj::Array(Vec::new())))
+                        } else {
+                            let o = self.to_object(o)?;
+                            self.for_in_keys(o)?
+                        };
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::ObjectValues { dst, obj } => {
                         let o = self.get(base, obj);
                         self.require_object_coercible(o)?;

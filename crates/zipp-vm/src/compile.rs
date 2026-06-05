@@ -2958,7 +2958,7 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::Move { dst: obj_reg, src: v });
         }
         let keys_reg = self.declare_local("<forin.keys>");
-        self.emit(Instr::ObjectKeys { dst: keys_reg, obj: obj_reg });
+        self.emit(Instr::ForInKeys { dst: keys_reg, obj: obj_reg });
         let len_reg = self.declare_local("<forin.len>");
         self.emit(Instr::LenOf { dst: len_reg, obj: keys_reg });
         let idx_reg = self.declare_local("<forin.idx>");

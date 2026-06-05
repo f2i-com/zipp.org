@@ -333,9 +333,13 @@ pub enum Instr {
     /// `RegExp(...)` call WITHOUT `new`: then a RegExp pattern with no flags whose
     /// `constructor` is RegExp is returned unchanged (RegExp ctor step 2.b).
     NewRegExp { dst: Reg, pattern: Reg, flags: Reg, is_construct: bool },
-    /// `dst = <array of obj's own enumerable string keys>` — drives `for-in`.
+    /// `dst = <array of obj's own enumerable string keys>` — Object.keys backing.
     /// For an array, the keys are the index strings "0".."len-1".
     ObjectKeys { dst: Reg, obj: Reg },
+    /// `dst = <for-in key list>` — own + INHERITED enumerable string keys, walking
+    /// the [[Prototype]] chain with shadowing dedup (vs `ObjectKeys`, own-only).
+    /// null/undefined receiver → empty (for-in over nullish does not throw).
+    ForInKeys { dst: Reg, obj: Reg },
     /// `dst = Object.values(obj)` — array of the object's own values (or array
     /// elements).
     ObjectValues { dst: Reg, obj: Reg },
