@@ -1384,15 +1384,23 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
-                    Instr::HasProp { dst, key, obj } => {
+                    Instr::HasProp { dst, key, obj, brand } => {
                         let k = self.get(base, key);
                         let o = self.get(base, obj);
                         // ToPropertyKey: an object key is ToString-coerced (toString/
                         // valueOf), not rendered "[object Object]".
                         let k = self.coerce_index_key(k)?;
-                        // Proxy-aware [[HasProperty]]: dispatches a `has` trap when
-                        // the proxy is the receiver OR sits in the prototype chain.
-                        let r = self.has_property_dyn(o, k)?;
+                        // A private name (`#x`) is not a string property key: a
+                        // regular `in` (and Reflect.has) reports it absent. The
+                        // ergonomic brand check `#x in obj` sets `brand` and skips
+                        // this filter so it still observes the private element.
+                        let r = if !brand && is_private_key(&self.key_of(k)) {
+                            false
+                        } else {
+                            // Proxy-aware [[HasProperty]]: dispatches a `has` trap
+                            // when the proxy is the receiver OR is in the proto chain.
+                            self.has_property_dyn(o, k)?
+                        };
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }

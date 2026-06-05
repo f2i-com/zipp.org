@@ -261,7 +261,11 @@ pub enum Instr {
     InstanceOfDyn { dst: Reg, val: Reg, ctor: Reg },
     /// `dst = (key in obj)` — true when `obj` has the property `key` (own or, for
     /// a class instance, inherited; array indices / `length`; Map/Set `size`).
-    HasProp { dst: Reg, key: Reg, obj: Reg },
+    /// `brand` is set ONLY for the ergonomic private brand check `#x in obj` (whose
+    /// key is the reserved `#x` string): it bypasses the private-key reflection
+    /// filter that a regular `in` applies, so `#x in obj` sees the private element
+    /// while `'#x' in obj` does not.
+    HasProp { dst: Reg, key: Reg, obj: Reg, brand: bool },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },

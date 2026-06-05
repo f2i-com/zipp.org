@@ -3377,7 +3377,8 @@ impl<'a> FnCompiler<'a> {
                 let idx = self.add_string_const(&private_key(&p.left.name));
                 self.emit(Instr::LoadConst { dst: kr, idx });
                 let obj = self.expr(&p.right)?;
-                self.emit(Instr::HasProp { dst, key: kr, obj });
+                // Ergonomic brand check: bypass the private-key reflection filter.
+                self.emit(Instr::HasProp { dst, key: kr, obj, brand: true });
                 Ok(dst)
             }
             E::ChainExpression(ce) => self.chain_expr(ce, dst),
@@ -3809,7 +3810,7 @@ impl<'a> FnCompiler<'a> {
         if matches!(b.operator, Op::In) {
             let key = self.expr(&b.left)?;
             let obj = self.expr(&b.right)?;
-            self.emit(Instr::HasProp { dst, key, obj });
+            self.emit(Instr::HasProp { dst, key, obj, brand: false });
             return Ok(dst);
         }
         // `a - <int literal>` and `a + <int literal>` → AddInt fast path, but
