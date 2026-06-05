@@ -8,6 +8,21 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
+    /// The live value at dense index `i` of array `idx`, or `None` when `i` is past
+    /// the array's CURRENT length (e.g. a callback shortened it mid-iteration). The
+    /// callback methods' per-element tails read through this so they observe
+    /// in-place element mutations and a shortened length — the spec re-does
+    /// `Get(O, k)` / `HasProperty(O, k)` live each iteration rather than reading a
+    /// once-taken snapshot. (The JIT/native kernels only inline call-free numeric
+    /// callbacks, which cannot mutate the receiver, so the leading run is unaffected
+    /// and stays a snapshot read.)
+    pub(crate) fn array_live_get(&self, idx: u32, i: usize) -> Option<Value> {
+        match self.heap.get(idx) {
+            HeapObj::Array(items) if i < items.len() => Some(items[i]),
+            _ => None,
+        }
+    }
+
     /// Shared driver for `map`/`filter`/`forEach` (callback args = [element,
     /// index]). Uses the native callback fast path when the callback is a
     /// compiled non-capturing function: a single reused register window, a direct
@@ -181,7 +196,19 @@ impl<'p> Vm<'p> {
 
         let mut err = None;
         for i in start..snapshot.len() {
-            let v = snapshot[i];
+            // Live read (the callback may have mutated this element or shortened the
+            // array): a present index uses its current value; an index now past the
+            // live length is absent — `map` keeps a placeholder so its result length
+            // stays the original, `filter`/`forEach` skip it (HasProperty is false).
+            let v = match self.array_live_get(idx, i) {
+                Some(v) => v,
+                None => {
+                    if matches!(mode, EachMode::Map) {
+                        out.push(Value::UNDEFINED);
+                    }
+                    continue;
+                }
+            };
             let args = [v, Value::int(i as i32), receiver];
             match self.run_cb_elem(native, win, cb, &args, this_arg) {
                 Ok(r) => match mode {
@@ -724,12 +751,25 @@ impl<'p> Vm<'p> {
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
-                let snapshot = self.array_snapshot(idx);
-                for (i, v) in snapshot.iter().enumerate() {
-                    let r = self.call_value(cb, this_arg, &[*v, Value::int(i as i32), receiver])?;
+                // `len` is captured once; each element is read LIVE (a callback may
+                // mutate it or shorten the array). For an index now past the live
+                // length: `find`/`findIndex` still visit it with `undefined` (they do
+                // not HasProperty-skip), while `some`/`every` skip it.
+                let len = self.array_snapshot(idx).len();
+                for i in 0..len {
+                    let v = match self.array_live_get(idx, i) {
+                        Some(v) => v,
+                        None => {
+                            if name == "some" || name == "every" {
+                                continue;
+                            }
+                            Value::UNDEFINED
+                        }
+                    };
+                    let r = self.call_value(cb, this_arg, &[v, Value::int(i as i32), receiver])?;
                     let t = self.truthy(r);
                     match name {
-                        "find" if t => return Ok(Some(*v)),
+                        "find" if t => return Ok(Some(v)),
                         "findIndex" if t => return Ok(Some(Value::int(i as i32))),
                         "some" if t => return Ok(Some(Value::bool(true))),
                         "every" if !t => return Ok(Some(Value::bool(false))),
@@ -838,7 +878,13 @@ impl<'p> Vm<'p> {
                 let mut err = None;
                 let receiver = Value::heap(idx);
                 for i in start..snapshot.len() {
-                    let cbargs = [acc, snapshot[i], Value::int(i as i32), receiver];
+                    // Live read; skip an index now past the live length (the callback
+                    // shortened the array) — reduce HasProperty-skips absent indices.
+                    let v = match self.array_live_get(idx, i) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    let cbargs = [acc, v, Value::int(i as i32), receiver];
                     match self.run_cb_elem(native, win, cb, &cbargs, Value::UNDEFINED) {
                         Ok(r) => acc = r,
                         Err(e) => {
@@ -898,10 +944,16 @@ impl<'p> Vm<'p> {
                 let receiver = Value::heap(idx);
                 while i > 0 {
                     i -= 1;
+                    // Live read; skip an index now past the live length (a callback
+                    // shortened the array) — reduceRight HasProperty-skips absent ones.
+                    let v = match self.array_live_get(idx, i) {
+                        Some(v) => v,
+                        None => continue,
+                    };
                     acc = self.call_value(
                         cb,
                         Value::UNDEFINED,
-                        &[acc, snapshot[i], Value::int(i as i32), receiver],
+                        &[acc, v, Value::int(i as i32), receiver],
                     )?;
                 }
                 Ok(Some(acc))
