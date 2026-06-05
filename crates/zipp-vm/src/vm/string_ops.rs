@@ -553,6 +553,7 @@ impl<'p> Vm<'p> {
                     &search,
                     &[],
                     &[],
+                    false, // a string search has no named captures: `$<…>` is literal
                     &s[..pos],
                     &s[pos + search.len()..],
                 );

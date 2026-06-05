@@ -83,6 +83,7 @@ impl<'p> Vm<'p> {
         whole: &str,
         groups: &[Option<String>],
         named: &[(String, Option<String>)],
+        named_defined: bool,
         pre: &str,
         post: &str,
     ) -> String {
@@ -110,7 +111,13 @@ impl<'p> Vm<'p> {
                         i += 2;
                     }
                     b'<' => {
-                        if let Some(end) = tmpl[i + 2..].find('>') {
+                        // `$<name>` substitutes the named capture (or "" if absent)
+                        // when named captures are present; otherwise (no groups
+                        // object / namedCaptures undefined) "$<" is a literal.
+                        if !named_defined {
+                            out.push('$');
+                            i += 1;
+                        } else if let Some(end) = tmpl[i + 2..].find('>') {
                             let name = &tmpl[i + 2..i + 2 + end];
                             if let Some((_, Some(g))) = named.iter().find(|(n, _)| n == name) {
                                 out.push_str(g);
@@ -213,6 +220,129 @@ impl<'p> Vm<'p> {
             return Ok(Value::int(-1));
         }
         self.get_prop(result, "index")
+    }
+
+    /// RegExp.prototype[Symbol.replace] (ES 22.2.6.11) — the OBSERVABLE protocol:
+    /// generic over any Object `rx`, honouring a user `exec`/`flags`/`lastIndex`,
+    /// reading each result's `0`/`length`/`index`/group-N/`groups` via Get, and
+    /// building the replacement from THOSE values. Reuses `regexp_exec_abstract` so a
+    /// user `exec` governs the matches. (zipp indexes strings by Unicode scalar, so
+    /// AdvanceStringIndex advances one scalar.)
+    pub(crate) fn regexp_symbol_replace(
+        &mut self,
+        rx: Value,
+        string: Value,
+        replace_value: Value,
+    ) -> Result<Value, Thrown> {
+        let s = self.to_js_string(string)?;
+        let s_chars: Vec<char> = s.chars().collect();
+        let length_s = s_chars.len();
+        let s_val = self.alloc_str(s.clone());
+        let functional = self.is_callable(replace_value);
+        let replace_str = if functional { String::new() } else { self.to_js_string(replace_value)? };
+        // flags / global / fullUnicode are observable (Get, ToString).
+        let flags_v = self.get_prop(rx, "flags")?;
+        let flags = self.to_js_string(flags_v)?;
+        let global = flags.contains('g');
+        if global {
+            self.set_prop(rx, "lastIndex", Value::int(0), false)?;
+        }
+        // Collect all exec results through the exec protocol (honouring user `exec`).
+        let mut results: Vec<Value> = Vec::new();
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            if guard > 5_000_000 {
+                break;
+            }
+            let result = self.regexp_exec_abstract(rx.heap_index(), s_val)?;
+            if result == Value::NULL {
+                break;
+            }
+            results.push(result);
+            if !global {
+                break;
+            }
+            // An empty match advances lastIndex so the loop makes progress.
+            let match0 = self.get_prop(result, "0")?;
+            if self.to_js_string(match0)?.is_empty() {
+                let li_v = self.get_prop(rx, "lastIndex")?;
+                let this_index = self.to_integer_or_zero(li_v)?.max(0) as usize;
+                self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), false)?;
+            }
+        }
+        // Build the accumulated result, reading each match's fields via Get.
+        let mut accumulated = String::new();
+        let mut next_pos: usize = 0;
+        for result in results {
+            let len_v = self.get_prop(result, "length")?;
+            let n_captures = (self.to_integer_or_zero(len_v)?.max(0) as usize).saturating_sub(1);
+            let matched_v = self.get_prop(result, "0")?;
+            let matched = self.to_js_string(matched_v)?;
+            let match_len = matched.chars().count();
+            let pos_v = self.get_prop(result, "index")?;
+            let position = self.to_integer_or_zero(pos_v)?.clamp(0, length_s as i64) as usize;
+            let mut captures: Vec<Option<String>> = Vec::with_capacity(n_captures);
+            for n in 1..=n_captures {
+                let cap_v = self.get_prop(result, &n.to_string())?;
+                captures.push(if cap_v == Value::UNDEFINED {
+                    None
+                } else {
+                    Some(self.to_js_string(cap_v)?)
+                });
+            }
+            let named_v = self.get_prop(result, "groups")?;
+            let named_defined = named_v != Value::UNDEFINED;
+            let replacement = if functional {
+                let mut argv: Vec<Value> = Vec::with_capacity(n_captures + 4);
+                argv.push(self.alloc_str(matched.clone()));
+                for c in &captures {
+                    argv.push(match c {
+                        Some(g) => self.alloc_str(g.clone()),
+                        None => Value::UNDEFINED,
+                    });
+                }
+                argv.push(Value::num(position as f64));
+                argv.push(s_val);
+                if named_defined {
+                    argv.push(named_v);
+                }
+                let r = self.call_value(replace_value, Value::UNDEFINED, &argv)?;
+                self.to_js_string(r)?
+            } else {
+                // GetSubstitution: read the named-capture group object's own props.
+                let named_list: Vec<(String, Option<String>)> = if named_defined && named_v.is_heap() {
+                    let keys: Vec<String> = match self.heap.get(named_v.heap_index()) {
+                        HeapObj::Object(m) => m.keys.clone(),
+                        _ => Vec::new(),
+                    };
+                    let mut v = Vec::with_capacity(keys.len());
+                    for k in keys {
+                        let val = self.get_prop(named_v, &k)?;
+                        let sv = if val == Value::UNDEFINED { None } else { Some(self.to_js_string(val)?) };
+                        v.push((k, sv));
+                    }
+                    v
+                } else {
+                    Vec::new()
+                };
+                let pre: String = s_chars[..position].iter().collect();
+                let post_start = (position + match_len).min(length_s);
+                let post: String = s_chars[post_start..].iter().collect();
+                self.expand_replacement(&replace_str, &matched, &captures, &named_list, named_defined, &pre, &post)
+            };
+            if position >= next_pos {
+                let prefix: String = s_chars[next_pos..position].iter().collect();
+                accumulated.push_str(&prefix);
+                accumulated.push_str(&replacement);
+                next_pos = position + match_len;
+            }
+        }
+        if next_pos < length_s {
+            let tail: String = s_chars[next_pos..].iter().collect();
+            accumulated.push_str(&tail);
+        }
+        Ok(self.alloc_str(accumulated))
     }
 
     /// RegExpExec (ES 22.2.7.1): the exec PROTOCOL. When the regex has a callable
@@ -545,8 +675,15 @@ impl<'p> Vm<'p> {
                     .named_groups()
                     .map(|(n, r)| (n.to_string(), r.map(|r| s[r].to_string())))
                     .collect();
-                let rep =
-                    self.expand_replacement(&repl_str, &whole, &groups, &named, &s[..st], &s[en..]);
+                let rep = self.expand_replacement(
+                    &repl_str,
+                    &whole,
+                    &groups,
+                    &named,
+                    !named.is_empty(),
+                    &s[..st],
+                    &s[en..],
+                );
                 out.push_str(&rep);
             }
             last = en;

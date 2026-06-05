@@ -574,21 +574,15 @@ impl<'p> Vm<'p> {
                 self.regexp_split_impl(this.heap_index(), a0, a1)?
             }
             REGEXP_SYM_REPLACE => {
-                if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. })
-                {
+                // RegExp.prototype[Symbol.replace] is generic over any Object `this`
+                // (a plain object with a custom `exec` works); the observable
+                // protocol lives in regexp_symbol_replace.
+                if !self.is_object_value(this) {
                     return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.replace] called on a non-RegExp".into(),
+                        "TypeError: RegExp.prototype[Symbol.replace] called on a non-object".into(),
                     ));
                 }
-                let s = self.to_js_string(a0)?;
-                let re = this.heap_index();
-                let global =
-                    matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
-                if global {
-                    self.set_regexp_last_index(re, 0);
-                }
-                let out = self.regex_replace(&s, re, a1, global)?;
-                self.alloc_str(out)
+                self.regexp_symbol_replace(this, a0, a1)?
             }
             REGEXP_SYM_MATCHALL => {
                 // RegExp.prototype[Symbol.matchAll](string): an iterator over all
