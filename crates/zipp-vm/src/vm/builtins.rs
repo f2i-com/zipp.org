@@ -224,6 +224,14 @@ impl<'p> Vm<'p> {
                 // Map/Set/Promise/etc instead carry a @@toStringTag (handled below).
                 HeapObj::Date(_) => "Date",
                 HeapObj::RegExp { .. } => "RegExp",
+                // The built-in prototype objects are themselves exotics of their
+                // type (Number.prototype is a Number, String.prototype a String,
+                // …), so Object.prototype.toString tags them by that type. zipp
+                // allocates them as plain HeapObj::Object, so match their heap idx.
+                _ if self.num_proto != 0 && this.heap_index() == self.num_proto => "Number",
+                _ if self.str_proto != 0 && this.heap_index() == self.str_proto => "String",
+                _ if self.bool_proto != 0 && this.heap_index() == self.bool_proto => "Boolean",
+                _ if self.arr_proto != 0 && this.heap_index() == self.arr_proto => "Array",
                 _ if self.error_name(this.heap_index()).is_some() => "Error",
                 _ => "Object",
             }
