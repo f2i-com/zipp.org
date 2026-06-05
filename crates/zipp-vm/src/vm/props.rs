@@ -2066,6 +2066,30 @@ impl<'p> Vm<'p> {
                     return Ok(raw);
                 }
             }
+            // `get RegExp.prototype.flags` (no own override): build the string by
+            // reading each per-flag accessor off the RECEIVER in canonical order — so
+            // a throwing `global`/`unicode`/… getter or a per-flag own override is
+            // observed (e.g. by `@@match`/`@@replace`, which read Get(rx,"flags")),
+            // rather than synthesizing from the internal flag string.
+            if key == "flags" {
+                let mut out = String::new();
+                for (prop, ch) in [
+                    ("hasIndices", 'd'),
+                    ("global", 'g'),
+                    ("ignoreCase", 'i'),
+                    ("multiline", 'm'),
+                    ("dotAll", 's'),
+                    ("unicode", 'u'),
+                    ("unicodeSets", 'v'),
+                    ("sticky", 'y'),
+                ] {
+                    let v = self.get_prop(receiver, prop)?;
+                    if self.truthy(v) {
+                        out.push(ch);
+                    }
+                }
+                return Ok(self.alloc_str(out));
+            }
             return self.regexp_get_prop(&s, &f, li, key);
         }
         // An Array's named (non-index) own properties (arr.foo, and a match
