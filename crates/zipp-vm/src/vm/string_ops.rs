@@ -276,8 +276,12 @@ impl<'p> Vm<'p> {
                         return Ok(Some(self.call_value(searcher, arg0, &[Value::heap(idx)])?));
                     }
                 }
-                let re = self.to_regexp_arg(arg0)?;
-                Ok(Some(self.regexp_search_impl(Value::heap(re), Value::heap(idx))?))
+                // Build a RegExp from the (non-object) argument, then Invoke its
+                // @@search — honouring a monkeypatched RegExp.prototype[@@search]
+                // (the unpatched native routes through regexp_search_impl, same result).
+                let rxv = Value::heap(self.to_regexp_arg(arg0)?);
+                let searcher = self.get_prop(rxv, "@@search")?;
+                Ok(Some(self.call_value(searcher, rxv, &[Value::heap(idx)])?))
             }
             "match" => {
                 // An OBJECT regexp's `@@match` overrides the default (a real RegExp's
@@ -289,8 +293,12 @@ impl<'p> Vm<'p> {
                         return Ok(Some(self.call_value(matcher, arg0, &[Value::heap(idx)])?));
                     }
                 }
-                let re = self.to_regexp_arg(arg0)?;
-                Ok(Some(self.regexp_match_impl(re, Value::heap(idx))?))
+                // Build a RegExp, then Invoke its @@match — honouring a monkeypatched
+                // RegExp.prototype[@@match] (the unpatched native routes through
+                // regexp_match_impl, same result).
+                let rxv = Value::heap(self.to_regexp_arg(arg0)?);
+                let matcher = self.get_prop(rxv, "@@match")?;
+                Ok(Some(self.call_value(matcher, rxv, &[Value::heap(idx)])?))
             }
             "matchAll" => {
                 let regexp = arg0;
