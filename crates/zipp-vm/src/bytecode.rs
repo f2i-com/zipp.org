@@ -408,8 +408,16 @@ pub enum Instr {
     PopFinally,
     /// End of a `finally` block: resume the completion in `kind_reg`/`val_reg` —
     /// re-leave a pending `return` (chaining through any outer finally), re-raise a
-    /// pending throw, or fall through on normal completion.
+    /// pending throw, resume a pending `break`/`continue` jump (chaining through any
+    /// intervening finally), or fall through on normal completion.
     EndFinally { kind_reg: Reg, val_reg: Reg },
+    /// A `break`/`continue` that exits one or more `try` blocks: route through every
+    /// intervening `finally` (running each, popping any intervening `catch`) before
+    /// landing at `target`. `floor` is the handler-stack depth at the target
+    /// loop/switch — routing pops handlers until the stack is back to `floor`. Only
+    /// emitted when there ARE handlers to unwind; a plain `break`/`continue` uses
+    /// `Jump` (so JIT-eligible loops stay eligible).
+    JumpFinally { target: u32, floor: u16 },
 
     /// Attach `raw` (an array) as the `.raw` of a tagged-template strings array
     /// `arr` (arrays can't hold named props, so it lands in a VM side table).

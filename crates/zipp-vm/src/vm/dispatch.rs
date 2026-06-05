@@ -108,6 +108,29 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// Route a `break`/`continue` (`JumpFinally`) that exits one or more `try`
+    /// blocks. Pops handlers in the current frame until the stack is back to
+    /// `floor` (the handler depth at the target loop): a `Catch` being exited is
+    /// discarded, and the first `Finally` encountered is run first — a kind-3
+    /// (jump) completion is deposited (the `floor` packed into the kind word's
+    /// upper bits, the jump `target` in the value register) so `EndFinally`
+    /// resumes the unwind toward `target`. Returns the finally body to run, or
+    /// `None` when the stack is already at `floor` (jump straight to `target`).
+    pub(crate) fn route_jump_through_finally(&mut self, target: u32, floor: usize) -> Option<u32> {
+        let top = self.frames.len() - 1;
+        let base = self.frames[top].base;
+        while self.frames[top].handlers.len() > floor {
+            let h = self.frames[top].handlers.pop().unwrap();
+            if let Handler::Finally { target: ftarget, kind_reg, val_reg } = h {
+                self.regs[base + kind_reg as usize] = Value::int(3 | ((floor as i32) << 2));
+                self.regs[base + val_reg as usize] = Value::int(target as i32);
+                return Some(ftarget);
+            }
+            // A `Catch` handler being exited has no body to run — discard it.
+        }
+        None
+    }
+
     /// The inner execution loop: runs ops in the current frame until a frame
     /// transition (a call pushes / a return pops) or a throw. Returns the value
     /// when the `stop_depth` frame returns, or `Err` to begin unwinding.
@@ -2292,9 +2315,13 @@ impl<'p> Vm<'p> {
                     }
                     Instr::EndFinally { kind_reg, val_reg } => {
                         // Resume the completion deposited when this finally was
-                        // entered: 1 = return (re-leave through any outer finally,
-                        // else return), 2 = throw (re-raise), else 0 = normal.
-                        match self.regs[base + kind_reg as usize].as_int() {
+                        // entered. The low 2 bits are the kind: 1 = return (re-leave
+                        // through any outer finally, else return), 2 = throw
+                        // (re-raise), 3 = break/continue jump (resume the unwind
+                        // toward the jump target, `floor` in the upper bits), else
+                        // 0 = normal.
+                        let raw = self.regs[base + kind_reg as usize].as_int();
+                        match raw & 3 {
                             1 => {
                                 let v = self.regs[base + val_reg as usize];
                                 if let Some(target) = self.route_through_finally(1, v) {
@@ -2313,9 +2340,26 @@ impl<'p> Vm<'p> {
                                 self.pending_throw = Some(v);
                                 return Err(Thrown(self.throw_message(v)));
                             }
+                            3 => {
+                                let jump_target = self.regs[base + val_reg as usize].as_int() as u32;
+                                let floor = (raw >> 2) as usize;
+                                match self.route_jump_through_finally(jump_target, floor) {
+                                    Some(target) => ip = target as usize,
+                                    None => ip = jump_target as usize,
+                                }
+                            }
                             _ => {
                                 ip += 1;
                             }
+                        }
+                    }
+                    Instr::JumpFinally { target, floor } => {
+                        // A `break`/`continue` exiting one or more `try` blocks:
+                        // run each intervening `finally` first, popping any
+                        // intervening `catch`, then land at `target`.
+                        match self.route_jump_through_finally(target, floor as usize) {
+                            Some(t) => ip = t as usize,
+                            None => ip = target as usize,
                         }
                     }
                     Instr::SetRaw { arr, raw } => {

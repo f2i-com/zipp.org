@@ -902,6 +902,13 @@ struct FnCompiler<'a> {
     /// collects the jump ips to patch to the loop's end (break) and continue
     /// point (continue).
     loop_ctx: Vec<LoopCtx>,
+    /// Count of `try` handlers (catch and finally) statically active at the
+    /// current compilation point — mirrors the runtime handler-stack depth here.
+    /// A `break`/`continue` whose target loop has a SMALLER handler depth must
+    /// unwind the difference (running any intervening `finally`), so it compiles
+    /// to `JumpFinally` instead of `Jump`. Maintained across try/catch/finally
+    /// regions (see `try_with_finally` / `try_catch_only`).
+    handler_depth: usize,
 }
 
 /// Pending `break`/`continue` jumps for one enclosing breakable construct. A
@@ -914,14 +921,29 @@ struct LoopCtx {
     /// The label attached to this loop/switch (`outer: for …`), for labeled
     /// `break outer` / `continue outer`.
     label: Option<String>,
+    /// The `handler_depth` in effect where this loop/switch was entered — the
+    /// `floor` a `break`/`continue` targeting it must unwind the handler stack to.
+    handler_depth: usize,
 }
 
 impl LoopCtx {
-    fn loop_frame(label: Option<String>) -> LoopCtx {
-        LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new(), is_loop: true, label }
+    fn loop_frame(label: Option<String>, handler_depth: usize) -> LoopCtx {
+        LoopCtx {
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            is_loop: true,
+            label,
+            handler_depth,
+        }
     }
-    fn switch_frame(label: Option<String>) -> LoopCtx {
-        LoopCtx { break_jumps: Vec::new(), continue_jumps: Vec::new(), is_loop: false, label }
+    fn switch_frame(label: Option<String>, handler_depth: usize) -> LoopCtx {
+        LoopCtx {
+            break_jumps: Vec::new(),
+            continue_jumps: Vec::new(),
+            is_loop: false,
+            label,
+            handler_depth,
+        }
     }
 }
 
@@ -954,6 +976,7 @@ impl<'a> FnCompiler<'a> {
             completion_reg: None,
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
+            handler_depth: 0,
             captured,
             cell_regs: HashSet::new(),
             const_regs: HashSet::new(),
@@ -1227,47 +1250,44 @@ impl<'a> FnCompiler<'a> {
                 self.for_in_statement(f)?
             }
             S::BreakStatement(b) => {
-                let j = self.here();
-                self.emit(Instr::Jump { target: 0 });
                 // `break label` targets the labeled loop/switch; bare `break` the
                 // innermost.
-                let target = match &b.label {
+                let idx = match &b.label {
                     Some(lbl) => self
                         .loop_ctx
-                        .iter_mut()
-                        .rev()
-                        .find(|c| c.label.as_deref() == Some(lbl.name.as_str())),
-                    None => self.loop_ctx.last_mut(),
+                        .iter()
+                        .rposition(|c| c.label.as_deref() == Some(lbl.name.as_str())),
+                    None => self.loop_ctx.len().checked_sub(1),
                 };
-                match target {
-                    Some(ctx) => ctx.break_jumps.push(j),
+                let idx = match idx {
+                    Some(i) => i,
                     None => return Err("`break` target not found (outside a loop / unknown label)".into()),
-                }
+                };
+                self.emit_loop_jump(idx, true);
             }
             S::ContinueStatement(c) => {
-                let j = self.here();
-                self.emit(Instr::Jump { target: 0 });
                 // `continue [label]` targets the (labeled) enclosing LOOP, skipping
                 // switch frames.
-                let target = match &c.label {
+                let idx = match &c.label {
                     Some(lbl) => self
                         .loop_ctx
-                        .iter_mut()
-                        .rev()
-                        .find(|c| c.is_loop && c.label.as_deref() == Some(lbl.name.as_str())),
-                    None => self.loop_ctx.iter_mut().rev().find(|c| c.is_loop),
+                        .iter()
+                        .rposition(|ctx| ctx.is_loop && ctx.label.as_deref() == Some(lbl.name.as_str())),
+                    None => self.loop_ctx.iter().rposition(|ctx| ctx.is_loop),
                 };
-                match target {
-                    Some(ctx) => ctx.continue_jumps.push(j),
+                let idx = match idx {
+                    Some(i) => i,
                     None => return Err("`continue` target not found (outside a loop / unknown label)".into()),
-                }
+                };
+                self.emit_loop_jump(idx, false);
             }
             S::LabeledStatement(l) => {
                 if let S::BlockStatement(b) = &l.body {
                     // `label: { … break label … }` — a break-only target around a
                     // block (continue to a block label is invalid, and naturally
                     // won't match: the frame is not a loop).
-                    self.loop_ctx.push(LoopCtx::switch_frame(Some(l.label.name.to_string())));
+                    self.loop_ctx
+                        .push(LoopCtx::switch_frame(Some(l.label.name.to_string()), self.handler_depth));
                     self.push_scope();
                     for s in &b.body {
                         self.stmt(s)?;
@@ -2379,7 +2399,7 @@ impl<'a> FnCompiler<'a> {
         let cond = self.expr(&w.test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 });
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
         self.stmt(&w.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         for c in ctx.continue_jumps {
@@ -2473,7 +2493,7 @@ impl<'a> FnCompiler<'a> {
             }
             None => None,
         };
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -2505,12 +2525,13 @@ impl<'a> FnCompiler<'a> {
     /// jump past catch. The catch lands the thrown value in `e_reg` and runs.
     ///
     /// With a `finally`: a `PushFinally` wraps the whole construct. Every exit from
-    /// the try/catch — normal completion, `return`, or a throw (caught here or
-    /// propagating) — routes through the single finally block, which `EndFinally`
-    /// closes by resuming the recorded completion (continue / re-return / re-throw,
-    /// chaining through any outer finally). NOTE: `break`/`continue` that exit a
-    /// `try/finally` still skip the finally (a remaining gap); return/throw/normal
-    /// are handled.
+    /// the try/catch — normal completion, `return`, a throw (caught here or
+    /// propagating), or a `break`/`continue` that leaves the construct — routes
+    /// through the single finally block, which `EndFinally` closes by resuming the
+    /// recorded completion (fall through / re-return / re-throw / resume-jump),
+    /// chaining through any outer finally. `break`/`continue` exit via `JumpFinally`
+    /// (emitted by `emit_loop_jump` when the target's handler depth is below the
+    /// current one).
     fn try_statement(&mut self, t: &ox::TryStatement) -> R<()> {
         match &t.finalizer {
             Some(finalizer) => self.try_with_finally(t, finalizer),
@@ -2527,11 +2548,17 @@ impl<'a> FnCompiler<'a> {
         // catch_reg/target patched once known.
         self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
 
+        // The catch handler is active throughout the try body (a `break`/`continue`
+        // exiting it must pop the stale handler — see `emit_loop_jump`).
+        self.handler_depth += 1;
         self.push_scope();
         for s in &t.block.body {
             self.stmt(s)?;
         }
         self.pop_scope();
+        // After the try body the catch handler is no longer active (the catch body
+        // runs with it already popped by the unwind).
+        self.handler_depth -= 1;
 
         let handler = t.handler.as_ref().ok_or("try requires catch or finally")?;
         // Normal completion of the try: pop the handler, skip the catch.
@@ -2568,11 +2595,16 @@ impl<'a> FnCompiler<'a> {
 
         let fin_push = self.here();
         self.emit(Instr::PushFinally { target: 0, kind_reg, val_reg });
+        // The finally handler is active for the whole try/catch (a `break`/
+        // `continue` exiting it must route through the finally — see
+        // `emit_loop_jump`).
+        self.handler_depth += 1;
 
         let has_catch = t.handler.is_some();
         let catch_push = if has_catch {
             let at = self.here();
             self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
+            self.handler_depth += 1; // catch handler active during the try body
             Some(at)
         } else {
             None
@@ -2590,6 +2622,7 @@ impl<'a> FnCompiler<'a> {
         let mut normal_jumps: Vec<u32> = Vec::new();
         if has_catch {
             self.emit(Instr::PopHandler);
+            self.handler_depth -= 1; // catch popped; finally still active for catch body
         }
         self.emit_leave_finally_normal(kind_reg);
         normal_jumps.push(self.here());
@@ -2603,6 +2636,10 @@ impl<'a> FnCompiler<'a> {
             normal_jumps.push(self.here());
             self.emit(Instr::Jump { target: 0 });
         }
+
+        // The finally handler is popped before its own body runs (a `break`/
+        // `return` inside the finally routes to OUTER handlers).
+        self.handler_depth -= 1;
 
         // Finally entry.
         let fin_start = self.here();
@@ -2676,7 +2713,7 @@ impl<'a> FnCompiler<'a> {
 
     fn do_while_statement(&mut self, d: &ox::DoWhileStatement) -> R<()> {
         let top = self.here();
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
         self.stmt(&d.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -2728,7 +2765,7 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::Jump { target: 0 });
 
         // Pass 2: case bodies, in source order (fall-through is natural).
-        self.loop_ctx.push(LoopCtx::switch_frame(self.pending_label.take()));
+        self.loop_ctx.push(LoopCtx::switch_frame(self.pending_label.take(), self.handler_depth));
         let mut body_start: Vec<u32> = Vec::with_capacity(s.cases.len());
         for c in &s.cases {
             body_start.push(self.here());
@@ -2850,7 +2887,7 @@ impl<'a> FnCompiler<'a> {
         }
         self.next_reg = save; // reclaim done + elem temps
 
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         for c in ctx.continue_jumps {
@@ -2945,7 +2982,7 @@ impl<'a> FnCompiler<'a> {
         }
         self.next_reg = save;
 
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take()));
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
@@ -2967,8 +3004,30 @@ impl<'a> FnCompiler<'a> {
         match &mut self.code[at as usize] {
             Instr::Jump { target: t }
             | Instr::JumpIfFalse { target: t, .. }
-            | Instr::JumpIfTrue { target: t, .. } => *t = target,
+            | Instr::JumpIfTrue { target: t, .. }
+            | Instr::JumpFinally { target: t, .. } => *t = target,
             _ => panic!("patch_jump on non-jump"),
+        }
+    }
+
+    /// Emit a `break`/`continue` jump targeting `loop_ctx[idx]`. When the target's
+    /// handler depth is below the current one, the jump exits one or more `try`
+    /// blocks: emit `JumpFinally` (routes through each intervening `finally`,
+    /// popping any intervening `catch`); otherwise a plain `Jump` (so loops without
+    /// an enclosing `try` stay JIT-eligible). Records the jump ip so the loop
+    /// epilogue patches its target.
+    fn emit_loop_jump(&mut self, idx: usize, is_break: bool) {
+        let floor = self.loop_ctx[idx].handler_depth;
+        let j = self.here();
+        if self.handler_depth > floor {
+            self.emit(Instr::JumpFinally { target: 0, floor: floor as u16 });
+        } else {
+            self.emit(Instr::Jump { target: 0 });
+        }
+        if is_break {
+            self.loop_ctx[idx].break_jumps.push(j);
+        } else {
+            self.loop_ctx[idx].continue_jumps.push(j);
         }
     }
 
