@@ -377,23 +377,43 @@ impl<'p> Vm<'p> {
     /// result (array or null); a global regex returns the array of matched
     /// substrings (or null) and resets lastIndex. Shared by String.match.
     pub(crate) fn regexp_match_impl(&mut self, re: u32, input: Value) -> Result<Value, Thrown> {
-        let global =
-            matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
-        if !global {
+        // OBSERVABLE @@match (22.2.6.8), generic over any Object `rx`: read
+        // ToString(Get(rx,"flags")); a non-global match is just RegExpExec; a global
+        // match loops RegExpExec (honouring a user `exec`) collecting ToString(Get(
+        // result,"0")), resets lastIndex first, and advances past an empty match.
+        let rx = Value::heap(re);
+        let flags_v = self.get_prop(rx, "flags")?;
+        let flags = self.to_js_string(flags_v)?;
+        if !flags.contains('g') {
             return self.regexp_exec_abstract(re, input);
         }
-        let s = self.to_js_string(input)?;
-        let strs: Vec<String> = match self.heap.get(re) {
-            HeapObj::RegExp { regex, .. } => {
-                regex.find_iter(&s).map(|m| s[m.range()].to_string()).collect()
+        let s_str = self.to_js_string(input)?;
+        let s_val = self.alloc_str(s_str);
+        self.set_prop(rx, "lastIndex", Value::int(0), false)?;
+        let mut elems: Vec<Value> = Vec::new();
+        let mut guard = 0u32;
+        loop {
+            guard += 1;
+            if guard > 5_000_000 {
+                break;
             }
-            _ => Vec::new(),
-        };
-        self.set_regexp_last_index(re, 0);
-        if strs.is_empty() {
+            let result = self.regexp_exec_abstract(re, s_val)?;
+            if result == Value::NULL {
+                break;
+            }
+            let m0 = self.get_prop(result, "0")?;
+            let match_str = self.to_js_string(m0)?;
+            let is_empty = match_str.is_empty();
+            elems.push(self.alloc_str(match_str));
+            if is_empty {
+                let li_v = self.get_prop(rx, "lastIndex")?;
+                let this_index = self.to_integer_or_zero(li_v)?.max(0) as usize;
+                self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), false)?;
+            }
+        }
+        if elems.is_empty() {
             return Ok(Value::NULL);
         }
-        let elems: Vec<Value> = strs.into_iter().map(|m| self.alloc_str(m)).collect();
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))))
     }
 

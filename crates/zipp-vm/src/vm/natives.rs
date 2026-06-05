@@ -556,10 +556,11 @@ impl<'p> Vm<'p> {
                 self.regexp_search_impl(this, a0)?
             }
             REGEXP_SYM_MATCH => {
-                if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. })
-                {
+                // Generic over any Object `this` (the observable protocol lives in
+                // regexp_match_impl, honouring a user `exec`/`flags`/`lastIndex`).
+                if !self.is_object_value(this) {
                     return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.match] called on a non-RegExp".into(),
+                        "TypeError: RegExp.prototype[Symbol.match] called on a non-object".into(),
                     ));
                 }
                 self.regexp_match_impl(this.heap_index(), a0)?
