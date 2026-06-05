@@ -606,6 +606,14 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::num(num)
                 };
+                // The value/start/end coercions above may have run user code (a
+                // valueOf / @@toPrimitive) that detached the buffer — re-check before
+                // writing (spec step: a detached buffer here is a TypeError).
+                if self.ta_effective_len(idx).is_none() {
+                    return Err(Thrown(
+                        "TypeError: Cannot fill a detached or out-of-bounds TypedArray".into(),
+                    ));
+                }
                 for i in start..end {
                     self.ta_element_set(idx, i, v)?;
                 }
@@ -779,6 +787,14 @@ impl<'p> Vm<'p> {
                 let target = self.ta_rel_index(a0, 0, len)?;
                 let start = self.ta_rel_index(a1, 0, len)?;
                 let end = self.ta_rel_index(args.get(2).copied().unwrap_or(Value::UNDEFINED), len, len)?;
+                // The target/start/end coercions above may have run user code that
+                // detached the buffer — re-check before copying (a detached buffer
+                // here is a TypeError, not a silent no-op).
+                if self.ta_effective_len(idx).is_none() {
+                    return Err(Thrown(
+                        "TypeError: Cannot copyWithin a detached or out-of-bounds TypedArray".into(),
+                    ));
+                }
                 let src: Vec<Value> = (start..end.max(start)).map(|i| self.ta_element_get(idx, i)).collect();
                 for (k, v) in src.into_iter().enumerate() {
                     if target + k < len {
