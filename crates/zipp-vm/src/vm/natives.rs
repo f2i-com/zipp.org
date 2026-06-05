@@ -744,9 +744,30 @@ impl<'p> Vm<'p> {
                 let kind = match kind {
                     Some(k) => k as u8,
                     None => {
+                        // The abstract %TypedArray% intrinsic IS a constructor for
+                        // from/of, so its source is evaluated first (any
+                        // IterableToList / array-like length+element error
+                        // propagates) BEFORE the abstract-construct TypeError fires
+                        // at the final TypedArrayCreate step.
+                        if this.is_heap()
+                            && self.ta_base_ctor != 0
+                            && this.heap_index() == self.ta_base_ctor
+                        {
+                            if id == TA_FROM {
+                                self.array_from(
+                                    Value::UNDEFINED,
+                                    a0,
+                                    a1,
+                                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                                )?;
+                            }
+                            return Err(Thrown(
+                                "TypeError: Abstract class TypedArray not directly constructable".into(),
+                            ));
+                        }
                         return Err(Thrown(
                             "TypeError: this is not a TypedArray constructor".into(),
-                        ))
+                        ));
                     }
                 };
                 let arr = if id == TA_FROM {
