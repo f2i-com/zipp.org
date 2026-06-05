@@ -425,70 +425,99 @@ impl<'p> Vm<'p> {
         input: Value,
         limit: Value,
     ) -> Result<Value, Thrown> {
-        let s = self.to_js_string(input)?;
-        // ToUint32(limit); undefined -> 2^32-1. lim == 0 yields the empty array.
-        let lim: usize = if limit == Value::UNDEFINED {
-            u32::MAX as usize
+        // OBSERVABLE @@split (22.2.6.14), generic over any Object `rx`:
+        // SpeciesConstructor(rx, %RegExp%) builds a sticky (`y`) splitter, then a
+        // loop calls RegExpExec (honouring a user `exec`) reading lastIndex/length/
+        // captures via Get. zipp indexes by Unicode scalar (AdvanceStringIndex = +1).
+        let rx = Value::heap(re);
+        let s_str = self.to_js_string(input)?;
+        let s_chars: Vec<char> = s_str.chars().collect();
+        let size = s_chars.len();
+        // SpeciesConstructor(rx, %RegExp%).
+        let default_ctor = Value::heap(self.regexp_ctor);
+        let c = {
+            let ctor = self.get_prop(rx, "constructor")?;
+            if ctor == Value::UNDEFINED {
+                default_ctor
+            } else {
+                let sp = self.get_prop(ctor, "@@species")?;
+                if sp == Value::UNDEFINED || sp == Value::NULL {
+                    default_ctor
+                } else if self.is_constructor(sp) {
+                    sp
+                } else {
+                    return Err(Thrown(
+                        "TypeError: Symbol.split species constructor is not a constructor".into(),
+                    ));
+                }
+            }
+        };
+        // flags (observable) + force the sticky `y` flag on the splitter copy.
+        let flags_v = self.get_prop(rx, "flags")?;
+        let flags = self.to_js_string(flags_v)?;
+        let new_flags = if flags.contains('y') { flags } else { format!("{flags}y") };
+        let new_flags_v = self.alloc_str(new_flags);
+        let splitter = self.construct(c, &[rx, new_flags_v])?;
+        let lim: u64 = if limit == Value::UNDEFINED {
+            u32::MAX as u64
         } else {
-            to_uint32(self.to_number_coerce(limit)?) as usize
+            to_uint32(self.to_number_coerce(limit)?) as u64
         };
+        let mut a: Vec<Value> = Vec::new();
         if lim == 0 {
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(Vec::new()))));
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))));
         }
-        // Empty input: [] if the pattern matches the empty string, else [""].
-        if s.is_empty() {
-            let matches_empty = matches!(self.heap.get(re), HeapObj::RegExp { regex, .. } if regex.find(&s).is_some());
-            let parts = if matches_empty { Vec::new() } else { vec![self.alloc_str(String::new())] };
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(parts))));
+        let s_val = self.alloc_str(s_str.clone());
+        // Empty input: one exec; if it matches, the result is empty, else [S].
+        if size == 0 {
+            let z = self.regexp_exec_abstract(splitter.heap_index(), s_val)?;
+            if z == Value::NULL {
+                a.push(s_val);
+            }
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))));
         }
-        // Collect matches with the text of each capturing group (group 0 excluded;
-        // `captures` holds groups 1..n, None for a non-participating group).
-        let matches: Vec<(usize, usize, Vec<Option<String>>)> = match self.heap.get(re) {
-            HeapObj::RegExp { regex, .. } => regex
-                .find_iter(&s)
-                .map(|m| {
-                    let caps = m
-                        .captures
-                        .iter()
-                        .map(|c| c.as_ref().map(|r| s[r.clone()].to_string()))
-                        .collect();
-                    (m.start(), m.end(), caps)
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        let mut parts: Vec<Value> = Vec::new();
-        let mut last = 0usize;
-        'outer: for (st, en, caps) in matches {
-            // The spec only processes matches before the end of the string; a match
-            // AT the end (e.g. an empty match at position length) is not a split
-            // point — the trailing piece S[last..] covers it.
-            if st >= s.len() {
+        let mut p: usize = 0;
+        let mut q: usize = 0;
+        let mut guard = 0u32;
+        while q < size {
+            guard += 1;
+            if guard > 5_000_000 {
                 break;
             }
-            if st < last || (st == en && st == last) {
-                continue; // skip overlapping / empty-at-cursor matches
+            self.set_prop(splitter, "lastIndex", Value::num(q as f64), false)?;
+            let z = self.regexp_exec_abstract(splitter.heap_index(), s_val)?;
+            if z == Value::NULL {
+                q += 1;
+                continue;
             }
-            parts.push(self.alloc_str(s[last..st].to_string()));
-            if parts.len() >= lim {
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(parts))));
+            // e = min(ToLength(Get(splitter,"lastIndex")), size).
+            let li_v = self.get_prop(splitter, "lastIndex")?;
+            let e = (self.to_integer_or_zero(li_v)?.max(0) as usize).min(size);
+            if e == p {
+                q += 1;
+                continue;
             }
-            // Spec @@split emits each capturing group between the pieces.
-            for c in &caps {
-                match c {
-                    Some(t) => parts.push(self.alloc_str(t.clone())),
-                    None => parts.push(Value::UNDEFINED),
+            let t: String = s_chars[p..q].iter().collect();
+            a.push(self.alloc_str(t));
+            if a.len() as u64 == lim {
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))));
+            }
+            p = e;
+            // Each capturing group (1..n) is emitted between the pieces.
+            let zlen_v = self.get_prop(z, "length")?;
+            let n_captures = (self.to_integer_or_zero(zlen_v)?.max(0) as usize).saturating_sub(1);
+            for i in 1..=n_captures {
+                let cap = self.get_prop(z, &i.to_string())?;
+                a.push(cap);
+                if a.len() as u64 == lim {
+                    return Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))));
                 }
-                if parts.len() >= lim {
-                    break 'outer;
-                }
             }
-            last = en;
+            q = p;
         }
-        if parts.len() < lim {
-            parts.push(self.alloc_str(s[last..].to_string()));
-        }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Array(parts))))
+        let tail: String = s_chars[p..].iter().collect();
+        a.push(self.alloc_str(tail));
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))))
     }
 
     pub(crate) fn regexp_get_prop(

@@ -566,10 +566,11 @@ impl<'p> Vm<'p> {
                 self.regexp_match_impl(this.heap_index(), a0)?
             }
             REGEXP_SYM_SPLIT => {
-                if !this.is_heap() || !matches!(self.heap.get(this.heap_index()), HeapObj::RegExp { .. })
-                {
+                // Generic over any Object `this` (the observable protocol —
+                // SpeciesConstructor + sticky splitter — lives in regexp_split_impl).
+                if !self.is_object_value(this) {
                     return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.split] called on a non-RegExp".into(),
+                        "TypeError: RegExp.prototype[Symbol.split] called on a non-object".into(),
                     ));
                 }
                 self.regexp_split_impl(this.heap_index(), a0, a1)?
