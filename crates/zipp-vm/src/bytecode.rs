@@ -329,8 +329,10 @@ pub enum Instr {
     BigIntFrom { dst: Reg, arg: Reg },
     /// `dst = new RegExp(pattern, flags)` — compile a regex (`/pat/flags` literal
     /// and the constructor both lower here). `pattern`/`flags` are string regs;
-    /// a bad pattern throws SyntaxError.
-    NewRegExp { dst: Reg, pattern: Reg, flags: Reg },
+    /// a bad pattern throws SyntaxError. `is_construct` is false ONLY for a
+    /// `RegExp(...)` call WITHOUT `new`: then a RegExp pattern with no flags whose
+    /// `constructor` is RegExp is returned unchanged (RegExp ctor step 2.b).
+    NewRegExp { dst: Reg, pattern: Reg, flags: Reg, is_construct: bool },
     /// `dst = <array of obj's own enumerable string keys>` — drives `for-in`.
     /// For an array, the keys are the index strings "0".."len-1".
     ObjectKeys { dst: Reg, obj: Reg },

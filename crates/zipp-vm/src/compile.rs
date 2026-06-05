@@ -3009,7 +3009,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadConst { dst: pt, idx: pat });
                 let ft = self.temp();
                 self.emit(Instr::LoadConst { dst: ft, idx: flg });
-                self.emit(Instr::NewRegExp { dst, pattern: pt, flags: ft });
+                self.emit(Instr::NewRegExp { dst, pattern: pt, flags: ft, is_construct: true });
                 self.next_reg -= 2;
                 Ok(dst)
             }
@@ -3151,7 +3151,7 @@ impl<'a> FnCompiler<'a> {
                     }
                     // `new RegExp(pattern?, flags?)` — pattern may be a string or a RegExp.
                     if id.name == "RegExp" {
-                        return self.emit_regexp(&n.arguments, dst);
+                        return self.emit_regexp(&n.arguments, dst, true);
                     }
                     // `new Map(iter?)` / `new Set(iter?)` / `new WeakMap(iter?)` /
                     // `new WeakSet(iter?)`.
@@ -4718,7 +4718,7 @@ impl<'a> FnCompiler<'a> {
     /// either with `new` or bare). `arg` is the optional message argument.
     /// Emit `NewRegExp` for `RegExp(pattern?, flags?)` / `new RegExp(...)` — the
     /// VM coerces a string/RegExp pattern and the flags (undefined → defaults).
-    fn emit_regexp(&mut self, args: &[ox::Argument], dst: Reg) -> R<Reg> {
+    fn emit_regexp(&mut self, args: &[ox::Argument], dst: Reg, is_construct: bool) -> R<Reg> {
         let pt = self.temp();
         match args.first().and_then(|a| a.as_expression()) {
             Some(e) => {
@@ -4739,7 +4739,7 @@ impl<'a> FnCompiler<'a> {
             }
             None => self.emit(Instr::LoadUndefined { dst: ft }),
         }
-        self.emit(Instr::NewRegExp { dst, pattern: pt, flags: ft });
+        self.emit(Instr::NewRegExp { dst, pattern: pt, flags: ft, is_construct });
         self.next_reg -= 2;
         Ok(dst)
     }
@@ -4895,10 +4895,12 @@ impl<'a> FnCompiler<'a> {
                 return Ok(dst);
             }
         }
-        // `RegExp(pattern?, flags?)` (no `new`) → same as `new RegExp(...)`.
+        // `RegExp(pattern?, flags?)` (no `new`) → like `new RegExp(...)`, except a
+        // RegExp pattern with no flags + a RegExp `constructor` returns it unchanged
+        // (is_construct: false signals the runtime short-circuit).
         if let ox::Expression::Identifier(id) = &c.callee {
             if id.name == "RegExp" {
-                return self.emit_regexp(&c.arguments, dst);
+                return self.emit_regexp(&c.arguments, dst, false);
             }
         }
         // `BigInt(x)` → conversion (BigIntFrom op). No arg → undefined (→ TypeError

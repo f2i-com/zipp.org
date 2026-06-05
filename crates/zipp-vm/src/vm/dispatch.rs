@@ -1853,10 +1853,22 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
-                    Instr::NewRegExp { dst, pattern, flags } => {
+                    Instr::NewRegExp { dst, pattern, flags, is_construct } => {
                         let p = self.get(base, pattern);
                         let f = self.get(base, flags);
-                        let v = self.build_regexp(p, f)?;
+                        // `RegExp(re)` (NOT `new`) with no flags returns `re`
+                        // unchanged when re's `constructor` is RegExp (ctor step 2.b).
+                        let mut short = None;
+                        if !is_construct && f.is_undefined() && self.regexp_ctor != 0 && self.is_regexp(p)? {
+                            let c = self.get_prop(p, "constructor")?;
+                            if self.same_value(c, Value::heap(self.regexp_ctor)) {
+                                short = Some(p);
+                            }
+                        }
+                        let v = match short {
+                            Some(v) => v,
+                            None => self.build_regexp(p, f)?,
+                        };
                         self.set(base, dst, v);
                         ip += 1;
                     }
