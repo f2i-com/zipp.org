@@ -875,6 +875,12 @@ struct FnCompiler<'a> {
     /// runtime TypeError. Each const local has a unique register, so reassignment
     /// is detected by register identity (no name-shadowing ambiguity).
     const_regs: HashSet<Reg>,
+    /// Parameter names currently in the Temporal Dead Zone while a parameter
+    /// default initializer is being compiled: a default that references the
+    /// parameter itself (`(x = x)`) or a later parameter (`(x = y, y)`) reads a
+    /// name in this set and throws a ReferenceError. Empty except inside
+    /// `bind_params`.
+    param_tdz: HashSet<String>,
     /// Upvalues this function captures, built lazily as free vars are resolved:
     /// (name, source-in-parent). Index in this Vec is the runtime upvalue index.
     /// Shared (`Rc<RefCell>`) so nested functions can append transitively.
@@ -944,6 +950,7 @@ impl<'a> FnCompiler<'a> {
             captured,
             cell_regs: HashSet::new(),
             const_regs: HashSet::new(),
+            param_tdz: HashSet::new(),
             upvalues: Rc::new(RefCell::new(Vec::new())),
             enclosing,
         };
@@ -3053,6 +3060,15 @@ impl<'a> FnCompiler<'a> {
                     }
                     _ => {}
                 }
+                // A parameter referenced before its own left-to-right
+                // initialization — `(x = x)` (self) or `(x = y, y)` (forward) — is
+                // in the Temporal Dead Zone: reading it throws a ReferenceError.
+                if self.param_tdz.contains(id.name.as_str()) {
+                    let e = self.alloc_reg();
+                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None });
+                    self.emit(Instr::Throw { src: e });
+                    return Ok(dst);
+                }
                 match self.resolve(id.name.as_str()) {
                     Binding::Local(r) => Ok(r), // already in a register
                     Binding::LocalCell(cell) => {
@@ -4005,7 +4021,24 @@ impl<'a> FnCompiler<'a> {
     /// when it evaluates `z`. (A two-pass "all defaults, then all destructuring"
     /// order would read those names before the pattern extracted them.)
     fn bind_params(&mut self, params: &ox::FormalParameters) -> R<()> {
+        // Ordered identifier-parameter names, for Temporal-Dead-Zone tracking of a
+        // default initializer that references the parameter itself or a later one.
+        let param_names: Vec<Option<String>> = params
+            .items
+            .iter()
+            .map(|item| match &item.pattern {
+                ox::BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                _ => None,
+            })
+            .collect();
         for (i, item) in params.items.iter().enumerate() {
+            // While compiling param i's default, param i and every LATER identifier
+            // parameter are in the TDZ (a self/forward reference throws); earlier
+            // parameters are already bound, so backward references resolve normally.
+            self.param_tdz.clear();
+            for n in param_names.iter().skip(i).flatten() {
+                self.param_tdz.insert(n.clone());
+            }
             match &item.pattern {
                 // `x = default`: if (x === undefined) x = default.
                 ox::BindingPattern::BindingIdentifier(id) => {
@@ -4028,6 +4061,7 @@ impl<'a> FnCompiler<'a> {
                 _ => {}
             }
         }
+        self.param_tdz.clear(); // the body resolves parameters normally
         Ok(())
     }
 
