@@ -181,10 +181,29 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(s.repeat(n as usize))))
             }
             "search" => {
+                // Per spec, an OBJECT regexp's `@@search` method overrides the
+                // default (a real RegExp's RegExp.prototype[@@search] is found here
+                // too, routing through the same regexp_search_impl). A primitive
+                // argument is NOT consulted — it builds a RegExp. Mirrors `matchAll`.
+                if self.is_object_value(arg0) {
+                    let searcher = self.get_prop(arg0, "@@search")?;
+                    if searcher != Value::UNDEFINED && searcher != Value::NULL {
+                        return Ok(Some(self.call_value(searcher, arg0, &[Value::heap(idx)])?));
+                    }
+                }
                 let re = self.to_regexp_arg(arg0)?;
                 Ok(Some(self.regexp_search_impl(Value::heap(re), Value::heap(idx))?))
             }
             "match" => {
+                // An OBJECT regexp's `@@match` overrides the default (a real RegExp's
+                // RegExp.prototype[@@match] routes through the same regexp_match_impl);
+                // a primitive argument builds a RegExp. Mirrors `matchAll`.
+                if self.is_object_value(arg0) {
+                    let matcher = self.get_prop(arg0, "@@match")?;
+                    if matcher != Value::UNDEFINED && matcher != Value::NULL {
+                        return Ok(Some(self.call_value(matcher, arg0, &[Value::heap(idx)])?));
+                    }
+                }
                 let re = self.to_regexp_arg(arg0)?;
                 Ok(Some(self.regexp_match_impl(re, Value::heap(idx))?))
             }
