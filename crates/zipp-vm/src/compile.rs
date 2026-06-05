@@ -4671,7 +4671,11 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::Move { dst, src: cur });
                 }
                 let j = self.emit_logical_skip(a.operator, dst);
-                let v = self.expr_into(&a.right, dst)?;
+                // NamedEvaluation: `x ||= function(){}` / `&&=` / `??=` names the
+                // anonymous fn/arrow/class after the identifier LHS (IsIdentifierRef),
+                // matching plain `=`. `compile_named_init` no-ops to `expr_into` for a
+                // non-anonymous RHS, so a named/expression RHS is unaffected.
+                let v = self.compile_named_init(dst, &a.right, &name)?;
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
