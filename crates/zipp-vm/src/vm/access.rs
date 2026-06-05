@@ -199,6 +199,53 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// A Proxy's `[[Set]]` for `Reflect.set`, surfacing the trap's BOOLEAN result
+    /// (which a plain assignment via `set_prop` swallows in non-strict mode).
+    /// `Some(b)` when `obj` is a proxy with a `set` trap — `b` is the trap's
+    /// truthiness after the [[Set]] invariants (a violation throws). `None` when
+    /// `obj` is not a proxy or has no `set` trap (the caller forwards via its
+    /// ordinary [[Set]] path). A revoked proxy throws.
+    pub(crate) fn proxy_set_bool(
+        &mut self,
+        obj: Value,
+        key: &str,
+        val: Value,
+        receiver: Value,
+    ) -> Result<Option<bool>, Thrown> {
+        let (target, handler, revoked) = match self.proxy_parts(obj.heap_index()) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        if revoked {
+            return Err(Thrown("TypeError: Cannot perform 'set' on a revoked proxy".into()));
+        }
+        let trap = match self.proxy_trap(handler, "set")? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let kv = self.key_to_value(key);
+        let r = self.call_value(trap, handler, &[target, kv, val, receiver])?;
+        if !self.truthy(r) {
+            return Ok(Some(false));
+        }
+        // Same post-invariants as set_prop's proxy branch: a non-configurable,
+        // non-writable target data property can't be reported set to a different
+        // value; a non-configurable accessor with no setter can't be set at all.
+        if let Some((is_data, value, writable, _, has_set)) = self.proxy_target_desc(target, key)? {
+            if is_data && !writable && !self.same_value(val, value) {
+                return Err(Thrown(format!(
+                    "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable and non-writable data property with a different value"
+                )));
+            }
+            if !is_data && !has_set {
+                return Err(Thrown(format!(
+                    "TypeError: 'set' on proxy: trap returned truish for property '{key}' which exists in the proxy target as a non-configurable accessor property without a setter"
+                )));
+            }
+        }
+        Ok(Some(true))
+    }
+
     pub(crate) fn set_prop(
         &mut self,
         obj: Value,

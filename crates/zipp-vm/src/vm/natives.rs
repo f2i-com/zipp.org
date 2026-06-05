@@ -1154,6 +1154,12 @@ impl<'p> Vm<'p> {
                 let receiver = args.get(3).copied().unwrap_or(a0);
                 let kv = self.coerce_index_key(a1)?;
                 let key = self.key_of(kv);
+                // A Proxy's [[Set]] is its `set` trap: Reflect.set reports the trap's
+                // boolean (an assignment swallows a falsish result). No trap → fall
+                // through to the OrdinarySet/forward path below.
+                if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
+                    return Ok(Value::bool(b));
+                }
                 // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
                 // (target's own, then up the prototype chain). Only ordinary Object
                 // links carry inline descriptors here; a class-instance/exotic link
