@@ -764,6 +764,38 @@ impl<'p> Vm<'p> {
         self.to_number(prim)
     }
 
+    /// ToNumber with FULL strictness — like `to_number_coerce` (ToPrimitive on an
+    /// object, honouring valueOf/@@toPrimitive and propagating an abrupt), but a
+    /// BigInt OR Symbol primitive is a TypeError. The shared `to_number` is
+    /// deliberately lenient on BigInt (so `1n < 2` relational comparison works), so
+    /// the String code-unit/code-point statics (`fromCharCode`/`fromCodePoint`) use
+    /// this instead to reject BigInt/Symbol per spec.
+    pub(crate) fn to_number_strict(&mut self, v: Value) -> Result<f64, Thrown> {
+        // Objects (incl. boxed wrappers) ToPrimitive(number hint) first; an
+        // already-primitive value passes through unchanged.
+        let prim = if v.is_heap()
+            && !matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+            ) {
+            self.to_primitive_number(v)?
+        } else {
+            v
+        };
+        if prim.is_heap() {
+            match self.heap.get(prim.heap_index()) {
+                HeapObj::BigInt(_) => {
+                    return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
+                }
+                HeapObj::Symbol { .. } => {
+                    return Err(Thrown("TypeError: Cannot convert a Symbol value to a number".into()));
+                }
+                _ => {}
+            }
+        }
+        self.to_number(prim)
+    }
+
     /// ToPrimitive's `@@toPrimitive` hook (ES ToPrimitive step 2a-c): if `v` is an
     /// object with a callable `Symbol.toPrimitive` ("@@toPrimitive") method, invoke
     /// it with the hint ("number" / "string" / "default") and require a primitive
@@ -783,9 +815,14 @@ impl<'p> Vm<'p> {
         {
             return Ok(None);
         }
+        // GetMethod(v, @@toPrimitive): undefined/null → no hook (None); a
+        // present-but-not-callable @@toPrimitive is a TypeError, not a fallthrough.
         let f = self.get_prop(v, "@@toPrimitive")?;
-        if !self.is_callable(f) {
+        if f == Value::UNDEFINED || f == Value::NULL {
             return Ok(None);
+        }
+        if !self.is_callable(f) {
+            return Err(Thrown("TypeError: Symbol.toPrimitive is not a function".into()));
         }
         let hv = self.alloc_str(hint.to_string());
         let r = self.call_value(f, v, &[hv])?;

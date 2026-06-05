@@ -1434,14 +1434,15 @@ impl<'p> Vm<'p> {
                             S::NumberIsFinite => Value::bool(num_is_finite(a0)),
                             S::NumberIsSafeInteger => Value::bool(num_is_safe_integer(a0)),
                             S::StringFromCharCode => {
-                                let s: String = args
-                                    .iter()
-                                    .map(|&v| {
-                                        // ToUint16 of each code unit.
-                                        let u = to_uint32(self.to_number(v).unwrap_or(0.0)) as u16;
-                                        char::from_u32(u as u32).unwrap_or('\u{FFFD}')
-                                    })
-                                    .collect();
+                                // ToUint16(ToNumber(v)) per arg — strict ToNumber
+                                // (ToPrimitive-aware, BigInt/Symbol → TypeError, a
+                                // throwing valueOf propagates rather than being
+                                // swallowed to 0).
+                                let mut s = String::new();
+                                for &v in &args {
+                                    let u = to_uint32(self.to_number_strict(v)?) as u16;
+                                    s.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}'));
+                                }
                                 self.alloc_str(s)
                             }
                             S::ObjectAssign => self.object_assign(&args)?,

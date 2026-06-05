@@ -1752,7 +1752,9 @@ impl<'p> Vm<'p> {
             STR_FROM_CHAR_CODE => {
                 let mut s = String::new();
                 for &v in args {
-                    let u = to_uint32(self.to_number(v).unwrap_or(0.0)) as u16;
+                    // ToUint16(ToNumber(v)) — strict ToNumber (ToPrimitive-aware,
+                    // BigInt/Symbol → TypeError, a throwing valueOf propagates).
+                    let u = to_uint32(self.to_number_strict(v)?) as u16;
                     s.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}'));
                 }
                 self.alloc_str(s)
@@ -1760,7 +1762,7 @@ impl<'p> Vm<'p> {
             STR_FROM_CODE_POINT => {
                 let mut s = String::new();
                 for &v in args {
-                    let n = self.to_number(v)?;
+                    let n = self.to_number_strict(v)?;
                     if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
                         return Err(Thrown(format!("RangeError: Invalid code point {n}")));
                     }
