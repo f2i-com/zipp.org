@@ -92,30 +92,36 @@ impl<'p> Vm<'p> {
             OBJ_GET_OWN_DESC => {
                 let key = self.to_property_key(a1)?;
                 self.require_object_coercible(a0)?; // ToObject(O)
-                match self.proxy_gopd(a0, &key)? {
+                let o = self.to_object(a0)?;
+                match self.proxy_gopd(o, &key)? {
                     Some(d) => d,
-                    None => self.object_get_own_property_descriptor(a0, &key),
+                    None => self.object_get_own_property_descriptor(o, &key),
                 }
             }
             OBJ_GET_OWN_NAMES => {
                 self.require_object_coercible(a0)?; // ToObject(O)
-                self.object_own_property_names(a0)?
+                let o = self.to_object(a0)?;
+                self.object_own_property_names(o)?
             }
             OBJ_GET_PROTO => {
                 self.require_object_coercible(a0)?; // ToObject(O): null/undefined throw
-                self.get_prototype_of_checked(a0)?
+                let o = self.to_object(a0)?;
+                self.get_prototype_of_checked(o)?
             }
             OBJ_KEYS => {
                 self.require_object_coercible(a0)?; // ToObject(O)
-                self.object_enum_own(a0, EnumWhat::Keys)?
+                let o = self.to_object(a0)?;
+                self.object_enum_own(o, EnumWhat::Keys)?
             }
             OBJ_VALUES => {
                 self.require_object_coercible(a0)?;
-                self.object_enum_own(a0, EnumWhat::Values)?
+                let o = self.to_object(a0)?;
+                self.object_enum_own(o, EnumWhat::Values)?
             }
             OBJ_ENTRIES => {
                 self.require_object_coercible(a0)?;
-                self.object_enum_own(a0, EnumWhat::Entries)?
+                let o = self.to_object(a0)?;
+                self.object_enum_own(o, EnumWhat::Entries)?
             }
             OBJ_ASSIGN => self.object_assign(args)?,
             OBJ_CREATE => {
@@ -152,10 +158,11 @@ impl<'p> Vm<'p> {
                 Value::bool(self.is_prototype_of(this, a0))
             }
             PROTO_VALUE_OF => {
-                // Object.prototype.valueOf does ToObject(this), so null/undefined
-                // throw a TypeError (rather than returning the receiver).
+                // Object.prototype.valueOf returns ToObject(this): null/undefined
+                // throw a TypeError, and a primitive is boxed into its wrapper object
+                // (so `Object.prototype.valueOf.call(true)` is a Boolean object).
                 self.require_object_coercible(this)?;
-                this
+                self.to_object(this)?
             }
             PROTO_TO_STRING => {
                 let tag = self.object_to_string_tag(this)?;
@@ -897,8 +904,9 @@ impl<'p> Vm<'p> {
                 Value::heap(self.heap.alloc(HeapObj::Object(map)))
             }
             OBJ_GET_OWN_DESCS => {
-                let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                self.require_object_coercible(o)?; // ToObject(O): null/undefined throw
+                let a = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.require_object_coercible(a)?; // ToObject(O): null/undefined throw
+                let o = self.to_object(a)?;
                 let names = self.object_own_property_names(o)?;
                 let keys: Vec<Value> = match self.heap.get(names.heap_index()) {
                     HeapObj::Array(items) => items.clone(),

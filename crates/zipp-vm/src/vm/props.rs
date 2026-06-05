@@ -353,6 +353,51 @@ impl<'p> Vm<'p> {
             }
             return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
         }
+        // A String exotic (boxed `new String(s)` or a string primitive): its own
+        // ENUMERABLE keys are the character indices `0..length` (the exotic chars;
+        // `length` is non-enumerable so it is excluded), then any enumerable assigned
+        // own prop on the wrapper. Handled before the generic match because reading a
+        // character needs `&mut self` (get_index).
+        if let Some((sval, len)) = self.string_exotic_chars(obj) {
+            let mut out: Vec<Value> = Vec::with_capacity(len);
+            for i in 0..len {
+                let kv = self.alloc_str(i.to_string());
+                match what {
+                    EnumWhat::Keys => out.push(kv),
+                    EnumWhat::Values => {
+                        let ch = self.get_index(sval, Value::num(i as f64))?;
+                        out.push(ch);
+                    }
+                    EnumWhat::Entries => {
+                        let ch = self.get_index(sval, Value::num(i as f64))?;
+                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, ch]))));
+                    }
+                }
+            }
+            // Enumerable named own props assigned to the wrapper (`s.foo = …`).
+            let extra: Vec<String> = match self.arr_props.get(&obj.heap_index()) {
+                Some(m) => m
+                    .keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, k)| m.attrs[*i].enumerable && !is_hidden_key(k))
+                    .map(|(_, k)| k.clone())
+                    .collect(),
+                None => Vec::new(),
+            };
+            for k in extra {
+                let v = self.get_member(obj, &k, obj)?;
+                let kv = self.alloc_str(k);
+                match what {
+                    EnumWhat::Keys => out.push(kv),
+                    EnumWhat::Values => out.push(v),
+                    EnumWhat::Entries => {
+                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))))
+                    }
+                }
+            }
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+        }
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Object(m) => spec_key_order(&m.keys)
@@ -509,6 +554,23 @@ impl<'p> Vm<'p> {
 
     /// `Object.getOwnPropertyDescriptor(obj, key)` — the property's descriptor, or
     /// undefined for a missing own property / non-object.
+    /// If `obj` is a primitive String value or a boxed String (`new String(s)`),
+    /// return `(wrapped_string_value, char_len)` — the source of a String exotic's
+    /// own integer-index character properties and its non-writable `length`. The
+    /// reflective `Object.*` methods use this so a string (boxed by ToObject) reports
+    /// those exotic own props. `None` for any non-string value.
+    pub(crate) fn string_exotic_chars(&self, obj: Value) -> Option<(Value, usize)> {
+        if !obj.is_heap() {
+            return None;
+        }
+        let idx = obj.heap_index();
+        if let HeapObj::Boxed { kind: 0, value } = self.heap.get(idx) {
+            let v = *value;
+            return self.heap.str_char_len(v.heap_index()).map(|n| (v, n));
+        }
+        self.heap.str_char_len(idx).map(|n| (obj, n))
+    }
+
     pub(crate) fn object_get_own_property_descriptor(&mut self, obj: Value, key: &str) -> Value {
         if !obj.is_heap() || is_private_key(key) {
             return Value::UNDEFINED; // private names aren't reflectable
@@ -518,6 +580,22 @@ impl<'p> Vm<'p> {
         if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
             if let Some(v) = self.callable_intrinsic_value(obj, key) {
                 return self.make_data_descriptor(v, false, false, true);
+            }
+        }
+        // A String exotic (boxed `new String(s)` or a raw string value): an in-range
+        // integer index is a character data prop { value, writable:false,
+        // enumerable:true, configurable:false }; `length` is a data prop with all
+        // three flags false. Other keys fall through to the wrapper's assigned own
+        // props (the arr_props side table) via the generic match below.
+        if let Some((sval, len)) = self.string_exotic_chars(obj) {
+            if key == "length" {
+                return self.make_data_descriptor(len_value(len), false, false, false);
+            }
+            if let Ok(i) = key.parse::<usize>() {
+                if i.to_string() == key && i < len {
+                    let ch = self.get_index(sval, Value::num(i as f64)).unwrap_or(Value::UNDEFINED);
+                    return self.make_data_descriptor(ch, false, true, false);
+                }
             }
         }
         let own = match self.heap.get(idx) {
@@ -723,6 +801,20 @@ impl<'p> Vm<'p> {
                         keys.push("name".to_string());
                     }
                     if let Some(m) = self.fn_props.get(&idx) {
+                        keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                    }
+                }
+                // A String exotic (boxed `new String(s)` or a raw string): the
+                // character indices `0..length` first, then `length`, then any named
+                // own prop assigned to the wrapper.
+                HeapObj::Boxed { kind: 0, .. } | HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                    if let Some((_, len)) = self.string_exotic_chars(obj) {
+                        for i in 0..len {
+                            keys.push(i.to_string());
+                        }
+                        keys.push("length".to_string());
+                    }
+                    if let Some(m) = self.arr_props.get(&idx) {
                         keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
                     }
                 }

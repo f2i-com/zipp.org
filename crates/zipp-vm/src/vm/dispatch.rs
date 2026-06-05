@@ -1495,20 +1495,23 @@ impl<'p> Vm<'p> {
                             }
                             S::ObjectGetOwnPropertyDescriptor => {
                                 self.require_object_coercible(a0)?; // ToObject(O)
+                                let o = self.to_object(a0)?;
                                 let key =
                                     self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                                match self.proxy_gopd(a0, &key)? {
+                                match self.proxy_gopd(o, &key)? {
                                     Some(d) => d,
-                                    None => self.object_get_own_property_descriptor(a0, &key),
+                                    None => self.object_get_own_property_descriptor(o, &key),
                                 }
                             }
                             S::ObjectGetOwnPropertyNames => {
                                 self.require_object_coercible(a0)?; // ToObject(O)
-                                self.object_own_property_names(a0)?
+                                let o = self.to_object(a0)?;
+                                self.object_own_property_names(o)?
                             }
                             S::ObjectGetPrototypeOf => {
                                 self.require_object_coercible(a0)?; // ToObject(O)
-                                self.get_prototype_of_checked(a0)?
+                                let o = self.to_object(a0)?;
+                                self.get_prototype_of_checked(o)?
                             }
                             S::ObjectCreate => {
                                 if a0 != Value::NULL && !self.is_object_value(a0) {
@@ -1674,6 +1677,7 @@ impl<'p> Vm<'p> {
                     Instr::ObjectKeys { dst, obj } => {
                         let o = self.get(base, obj);
                         self.require_object_coercible(o)?; // ToObject(O)
+                        let o = self.to_object(o)?;
                         let v = self.object_enum_own(o, EnumWhat::Keys)?;
                         self.set(base, dst, v);
                         ip += 1;
@@ -1681,6 +1685,7 @@ impl<'p> Vm<'p> {
                     Instr::ObjectValues { dst, obj } => {
                         let o = self.get(base, obj);
                         self.require_object_coercible(o)?;
+                        let o = self.to_object(o)?;
                         let v = self.object_enum_own(o, EnumWhat::Values)?;
                         self.set(base, dst, v);
                         ip += 1;
@@ -1688,6 +1693,7 @@ impl<'p> Vm<'p> {
                     Instr::ObjectEntries { dst, obj } => {
                         let o = self.get(base, obj);
                         self.require_object_coercible(o)?;
+                        let o = self.to_object(o)?;
                         let v = self.object_enum_own(o, EnumWhat::Entries)?;
                         self.set(base, dst, v);
                         ip += 1;
