@@ -1118,6 +1118,19 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `[[GetOwnProperty]] is not undefined` honouring a Proxy — `Object.hasOwn` /
+    /// `Object.prototype.hasOwnProperty` on a Proxy consult its
+    /// `getOwnPropertyDescriptor` trap (or its target) rather than reporting `false`.
+    /// Non-proxies fall back to the ordinary own-property check.
+    pub(crate) fn has_own_property_dyn(&mut self, obj: Value, key: &str) -> Result<bool, Thrown> {
+        if obj.is_heap() {
+            if let Some(desc) = self.proxy_gopd(obj, key)? {
+                return Ok(desc != Value::UNDEFINED);
+            }
+        }
+        Ok(self.has_own_property(obj, key))
+    }
+
     /// `obj.propertyIsEnumerable(key)` — true if `key` is an own enumerable
     /// property. Array indices are enumerable; `length` is not.
     pub(crate) fn own_is_enumerable(&self, obj: Value, key: &str) -> bool {

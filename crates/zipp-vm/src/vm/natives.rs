@@ -143,7 +143,7 @@ impl<'p> Vm<'p> {
             PROTO_HAS_OWN => {
                 let k = self.to_property_key(a0)?;
                 self.require_object_coercible(this)?; // ToObject(this)
-                Value::bool(self.has_own_property(this, &k))
+                Value::bool(self.has_own_property_dyn(this, &k)?)
             }
             PROTO_PROP_ENUM => {
                 let k = self.to_property_key(a0)?;
@@ -853,7 +853,7 @@ impl<'p> Vm<'p> {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
                 self.require_object_coercible(o)?; // ToObject(O): null/undefined throw
                 let k = self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                Value::bool(self.has_own_property(o, &k))
+                Value::bool(self.has_own_property_dyn(o, &k)?)
             }
             OBJ_SET_PROTO_OF => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);

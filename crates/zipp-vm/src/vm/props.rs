@@ -478,7 +478,13 @@ impl<'p> Vm<'p> {
             ));
         }
         match self.proxy_trap(handler, "getOwnPropertyDescriptor")? {
-            None => Ok(Some(self.object_get_own_property_descriptor(target, key))),
+            // No trap: forward to the target's [[GetOwnProperty]] — which, when the
+            // target is itself a Proxy, must recurse through ITS trap/target rather
+            // than falling to the ordinary path (which ignores proxies).
+            None => match self.proxy_gopd(target, key)? {
+                Some(d) => Ok(Some(d)),
+                None => Ok(Some(self.object_get_own_property_descriptor(target, key))),
+            },
             Some(trap) => {
                 let kv = self.key_to_value(key);
                 let r = self.call_value(trap, handler, &[target, kv])?;
