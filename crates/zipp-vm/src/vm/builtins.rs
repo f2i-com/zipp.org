@@ -664,17 +664,39 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.ta_build_from(kind, &snap)?))
             }
             "with" => {
-                // %TypedArray%.prototype.with(index, value): a copy with one element
-                // replaced. A relative (negative = from end) index out of range is a
-                // RangeError; the value is coerced by ta_build_from.
-                let n = self.value_num(a0);
-                let n = if n.is_nan() { 0.0 } else { n.trunc() };
-                let actual = if n < 0.0 { len as f64 + n } else { n };
+                // %TypedArray%.prototype.with(index, value) (23.2.3.36): a copy with
+                // one element replaced. Spec coercion ORDER, all BEFORE the range
+                // check: (1) ToIntegerOrInfinity(index) — its valueOf, and it THROWS;
+                // (2) ToNumber/ToBigInt(value) — its valueOf, and it THROWS (so a
+                // throwing value surfaces before a RangeError). (Previously the index
+                // used the non-coercing value_num and the range check ran first.)
+                let relative = self.to_number_coerce(a0)?;
+                let relative = if relative.is_nan() { 0.0 } else { relative.trunc() };
+                let actual = if relative < 0.0 { len as f64 + relative } else { relative };
+                let is_big = native::TA_KINDS[kind as usize].2;
+                let coerced = if is_big {
+                    // ToBigInt (strict, as ta_element_set): a Number is a TypeError
+                    // (unlike the lenient BigInt(5) constructor coercion).
+                    if a1.is_number() {
+                        return Err(Thrown(
+                            "TypeError: cannot convert a Number to a BigInt typed-array element".into(),
+                        ));
+                    }
+                    let big = self.to_bigint(a1)?;
+                    Value::heap(self.heap.alloc(HeapObj::BigInt(big)))
+                } else {
+                    let num = self.to_number_coerce(a1)?;
+                    Value::num(num)
+                };
                 if actual < 0.0 || actual >= len as f64 {
                     return Err(Thrown("RangeError: invalid typed array index".into()));
                 }
                 let mut snap = self.ta_snapshot(idx);
-                snap[actual as usize] = a1;
+                // Panic-safe (a resizable buffer's coercion may have shrunk it).
+                match snap.get_mut(actual as usize) {
+                    Some(slot) => *slot = coerced,
+                    None => return Err(Thrown("RangeError: invalid typed array index".into())),
+                }
                 Ok(Some(self.ta_build_from(kind, &snap)?))
             }
             "slice" => {
