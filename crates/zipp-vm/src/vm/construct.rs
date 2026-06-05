@@ -302,7 +302,22 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// `new cv(args)` with newTarget defaulting to the constructor itself (the
+    /// common case for `new` / a plain `Reflect.construct(cv, args)`).
     pub(crate) fn construct(&mut self, cv: Value, args: &[Value]) -> Result<Value, Thrown> {
+        self.construct_with_newtarget(cv, args, cv)
+    }
+
+    /// [[Construct]](argumentsList, newTarget). `new_target` is threaded to a Proxy
+    /// `construct` trap (its 3rd argument) and through a trap-less Proxy's forward to
+    /// the target; the ordinary Func/Class paths build the instance from `cv` (using
+    /// `new_target` for the instance's [[Prototype]] is a separate, larger fix).
+    pub(crate) fn construct_with_newtarget(
+        &mut self,
+        cv: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> Result<Value, Thrown> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
         }
@@ -443,7 +458,8 @@ impl<'p> Vm<'p> {
             return match self.proxy_trap(handler, "construct")? {
                 Some(trap) => {
                     let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
-                    let res = self.call_value(trap, handler, &[target, arr, cv])?;
+                    // The trap's 3rd arg is the REAL newTarget, not the proxy itself.
+                    let res = self.call_value(trap, handler, &[target, arr, new_target])?;
                     // ProxyConstruct: the trap result must be an Object.
                     if !self.is_object_value(res) {
                         return Err(Thrown(
@@ -452,7 +468,8 @@ impl<'p> Vm<'p> {
                     }
                     Ok(res)
                 }
-                None => self.construct(target, args),
+                // No trap: forward to the target's [[Construct]], preserving newTarget.
+                None => self.construct_with_newtarget(target, args, new_target),
             };
         }
         // A core built-in constructor used as a VALUE (`new C()` where C is the

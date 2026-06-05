@@ -1193,7 +1193,10 @@ impl<'p> Vm<'p> {
                 // CreateListFromArrayLike(argumentsList): a non-object arglist (incl.
                 // a missing 2nd arg) is a TypeError; an array-LIKE is read via Get.
                 let arg_vec = self.create_list_from_array_like(a1)?;
-                self.construct(target, &arg_vec)?
+                // newTarget defaults to target when the 3rd arg is absent; thread it
+                // so a Proxy construct trap (and a trap-less forward) sees the real one.
+                let new_target = args.get(2).copied().unwrap_or(target);
+                self.construct_with_newtarget(target, &arg_vec, new_target)?
             }
             REFLECT_GET => {
                 if !self.is_object_value(a0) {
