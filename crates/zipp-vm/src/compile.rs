@@ -3935,11 +3935,16 @@ impl<'a> FnCompiler<'a> {
             }
             Op::Typeof => {
                 // `typeof <unbound identifier>` must yield "undefined", NOT throw
-                // a ReferenceError. A bare identifier that resolves to a global is
-                // read with the non-throwing variant so the never-declared sentinel
-                // degrades to undefined. (`undefined`/`NaN`/`Infinity` are literals,
-                // handled by the normal expr path.)
-                if let ox::Expression::Identifier(id) = &u.argument {
+                // a ReferenceError — and this holds when the identifier is wrapped in
+                // parentheses (`typeof (f)`), so peel them first. A bare identifier
+                // that resolves to a global is read with the non-throwing variant so
+                // the never-declared sentinel degrades to undefined.
+                // (`undefined`/`NaN`/`Infinity` are literals, handled by `expr`.)
+                let mut arg = &u.argument;
+                while let ox::Expression::ParenthesizedExpression(p) = arg {
+                    arg = &p.expression;
+                }
+                if let ox::Expression::Identifier(id) = arg {
                     if !matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
                         if let Binding::Global(idx) = self.resolve(id.name.as_str()) {
                             self.emit(Instr::LoadGlobalOrUndefined { dst, idx });
@@ -3948,7 +3953,7 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                 }
-                let a = self.expr(&u.argument)?;
+                let a = self.expr(arg)?;
                 self.emit(Instr::TypeOf { dst, a });
                 Ok(dst)
             }
