@@ -903,25 +903,25 @@ impl<'p> Vm<'p> {
                 pv
             };
             for (k, v) in pairs {
-                if let HeapObj::Object(map) = self.heap.get_mut(tidx) {
-                    added_any |= map.set(&k, v);
-                } else {
-                    // A boxed-primitive target (String/Number/… wrapper). A String
-                    // wrapper's canonical index properties (and "length") are
-                    // read-only, so Object.assign's Set(to, key, v, true) throws.
-                    if let HeapObj::Boxed { kind: 0, value } = self.heap.get(tidx) {
-                        let slen = self.heap_char_len(value.heap_index());
-                        let readonly = k == "length"
-                            || k.parse::<usize>().ok().filter(|n| n.to_string() == k).map_or(false, |n| n < slen);
-                        if readonly {
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot assign to read-only property '{k}' of a String"
-                            )));
-                        }
+                // Set(to, key, value, true) — STRICT, per CopyDataProperties: a
+                // setter is invoked (and a throwing setter propagates), and a write
+                // rejected by the target's descriptor (non-writable data, setter-
+                // less accessor) or a frozen / sealed / non-extensible target throws
+                // a TypeError rather than silently no-op'ing.
+                if let HeapObj::Boxed { kind: 0, value } = self.heap.get(tidx) {
+                    // A String wrapper's canonical index properties (and "length")
+                    // are read-only.
+                    let slen = self.heap_char_len(value.heap_index());
+                    let readonly = k == "length"
+                        || k.parse::<usize>().ok().filter(|n| n.to_string() == k).map_or(false, |n| n < slen);
+                    if readonly {
+                        return Err(Thrown(format!(
+                            "TypeError: Cannot assign to read-only property '{k}' of a String"
+                        )));
                     }
-                    self.set_prop(target, &k, v, false)?;
-                    added_any = true;
                 }
+                self.set_prop(target, &k, v, true)?;
+                added_any = true;
             }
         }
         if added_any {
