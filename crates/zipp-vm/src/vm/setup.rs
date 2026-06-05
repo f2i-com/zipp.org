@@ -225,6 +225,26 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
+        // %Function.prototype% has own `name` ("") and `length` (0) data properties,
+        // both { writable:false, enumerable:false, configurable:true } — it is itself
+        // a function (one that returns undefined). An ordinary function's OWN
+        // synthesized name/length shadow these (callable_intrinsic_value resolves
+        // first in get_member), so this only surfaces for `Function.prototype.name`
+        // itself or a function whose own `name` was `delete`d (which then reads "").
+        {
+            let empty = self.alloc_str(String::new());
+            let nl_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            if let HeapObj::Object(m) = self.heap.get_mut(self.fn_proto) {
+                m.define("length", Value::int(0), nl_attr);
+                m.define("name", empty, nl_attr);
+            }
+        }
         // Build the Array.prototype / String.prototype method lists from the
         // PROTO_METHODS table (id = PROTO_METHOD_BASE + index), so methods are
         // first-class values (`Array.prototype.map.call(arr, fn)`).

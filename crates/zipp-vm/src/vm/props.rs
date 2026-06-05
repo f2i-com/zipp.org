@@ -2545,6 +2545,13 @@ impl<'p> Vm<'p> {
                     let g = *g;
                     return self.call_value(g, obj, &[]);
                 }
+                // A setter-only own static accessor (`static set name(_)`) is an own
+                // property: reading it returns undefined and does NOT fall through to
+                // %Function.prototype% (e.g. so it doesn't pick up Fp's "" name / 0
+                // length).
+                if c.static_setters.iter().any(|(k, _)| k == key) {
+                    return Ok(Value::UNDEFINED);
+                }
                 let mut cur = c.parent;
                 while let Some(pidx) = cur {
                     match self.heap.get(pidx) {
@@ -2555,6 +2562,9 @@ impl<'p> Vm<'p> {
                             if let Some((_, g)) = pc.static_getters.iter().find(|(k, _)| k == key) {
                                 let g = *g;
                                 return self.call_value(g, obj, &[]);
+                            }
+                            if pc.static_setters.iter().any(|(k, _)| k == key) {
+                                return Ok(Value::UNDEFINED);
                             }
                             cur = pc.parent;
                         }
