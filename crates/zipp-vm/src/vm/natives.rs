@@ -2560,6 +2560,10 @@ impl<'p> Vm<'p> {
             // (`.call`/`.apply`/`.bind` or `m()`): dispatch on the `this` receiver.
             _ if native::proto_method(id).is_some() => {
                 let (m, kind, _len) = native::proto_method(id).unwrap();
+                // The raw receiver BEFORE any boxed-primitive unwrap — the
+                // symbol-consulting String methods pass it (e.g. a `new String`
+                // wrapper) to the argument's @@-method, not the unwrapped primitive.
+                let raw_this = this;
                 // A boxed primitive receiver unwraps to its [[PrimitiveValue]] so the
                 // method runs on the primitive (`new Number(5).toFixed(2)`). The generic
                 // Array methods (kind 0) are the exception: a `new Boolean/Number/String`
@@ -2612,6 +2616,16 @@ impl<'p> Vm<'p> {
                             "TypeError: String.prototype.{m} requires that 'this' be a String"
                         )));
                     }
+                } else if kind == 1
+                    && matches!(m, "replace" | "replaceAll" | "split" | "match" | "search" | "matchAll")
+                {
+                    // These methods must observe the ARGUMENT's well-known Symbol
+                    // method (IsRegExp/flags + GetMethod(@@replace/@@split/@@match/…))
+                    // with the RAW receiver BEFORE ToString(this) — a poison `this`
+                    // (toString throws) must not be coerced first, and an @@-method
+                    // receives the raw receiver. ToString happens only on the
+                    // fall-through plain path (inside string_symbol_method).
+                    self.string_symbol_method(raw_this, m, args)?
                 } else if kind == 1 {
                     // String methods are generic: RequireObjectCoercible(this) then
                     // ToString(this), so `String.prototype.slice.call(123, …)` works.

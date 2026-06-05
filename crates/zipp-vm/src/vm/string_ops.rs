@@ -23,6 +23,80 @@ impl<'p> Vm<'p> {
         Ok(matches!(self.heap.get(v.heap_index()), HeapObj::RegExp { .. }))
     }
 
+    /// The value-form (`.call`/`.apply`) entry for the String.prototype methods that
+    /// consult an argument's well-known Symbol method: replace/replaceAll/split/
+    /// match/search/matchAll. Per spec these do RequireObjectCoercible(this) and
+    /// observe the argument (IsRegExp/flags for replaceAll/matchAll, then
+    /// GetMethod(arg, @@…)) with the RAW receiver BEFORE ToString(this) — so a
+    /// poison `this` is not coerced early and an @@-method receives the raw
+    /// receiver. When no @@-method applies, the receiver is ToString'd and the call
+    /// falls to the default algorithm in `string_method`.
+    pub(crate) fn string_symbol_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        if recv == Value::UNDEFINED || recv == Value::NULL {
+            return Err(Thrown(format!(
+                "TypeError: String.prototype.{name} called on null or undefined"
+            )));
+        }
+        let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let sym = match name {
+            "replace" | "replaceAll" => "@@replace",
+            "split" => "@@split",
+            "match" => "@@match",
+            "search" => "@@search",
+            "matchAll" => "@@matchAll",
+            _ => unreachable!("string_symbol_method called with {name}"),
+        };
+        // replaceAll/matchAll require a RegExp argument to be global — observed
+        // (IsRegExp → Get flags → RequireObjectCoercible → ToString contains 'g')
+        // BEFORE any ToString of the receiver.
+        if (name == "replaceAll" || name == "matchAll")
+            && arg0 != Value::UNDEFINED
+            && arg0 != Value::NULL
+            && self.is_regexp(arg0)?
+        {
+            let flags = self.get_prop(arg0, "flags")?;
+            if flags == Value::UNDEFINED || flags == Value::NULL {
+                return Err(Thrown(format!(
+                    "TypeError: String.prototype.{name} called with a RegExp whose flags is not coercible"
+                )));
+            }
+            let fs = self.to_js_string(flags)?;
+            if !fs.contains('g') {
+                return Err(Thrown(format!(
+                    "TypeError: String.prototype.{name} must be called with a global RegExp"
+                )));
+            }
+        }
+        // GetMethod(arg0, @@sym) with the RAW receiver (a present-but-not-callable
+        // method is a TypeError; null/undefined falls through to the default path).
+        if self.is_object_value(arg0) {
+            let m = self.get_prop(arg0, sym)?;
+            if m != Value::UNDEFINED && m != Value::NULL {
+                if !self.is_callable(m) {
+                    return Err(Thrown(format!("TypeError: {sym} is not a function")));
+                }
+                return match name {
+                    "replace" | "replaceAll" | "split" => {
+                        let extra = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                        self.call_value(m, arg0, &[recv, extra])
+                    }
+                    _ => self.call_value(m, arg0, &[recv]),
+                };
+            }
+        }
+        // No @@-method: ToString(receiver), then the default algorithm. (The default
+        // arms in string_method re-check the @@-method, but it is absent here, so
+        // that is a no-op apart from a redundant property read.)
+        let s = self.to_js_string(recv)?;
+        let s_idx = self.alloc_str(s).heap_index();
+        Ok(self.string_method(s_idx, name, args)?.unwrap_or(Value::UNDEFINED))
+    }
+
     /// The i-th char of a flat string by heap index, WITHOUT cloning the string —
     /// O(1) for ASCII (i-th byte), else an O(i) scalar scan. `None` if out of range
     /// or not a flat string. (A full-string clone here would make `charCodeAt(i)`
