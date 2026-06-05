@@ -504,6 +504,11 @@ impl<'p> Vm<'p> {
                                 Some(v) => Value::int(v),
                                 None => Value::num(va.as_int() as f64 + imm as f64),
                             }
+                        } else if let Some(b) = self.bigint_value(va) {
+                            // `++`/`--` (this op backs every UpdateExpression) on a
+                            // BigInt operand stays a BigInt — ToNumeric keeps the type
+                            // (so `n++` yields `n + 1n`, not the Number coercion).
+                            self.make_bigint(b.wrapping_add(imm as i128))
                         } else {
                             Value::num(self.to_number_coerce(va)? + imm as f64)
                         };
