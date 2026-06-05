@@ -783,6 +783,21 @@ impl<'p> Vm<'p> {
                     }
                     Instr::MakeClass { dst, class_id, parent } => {
                         let cd = self.class_def(class_id as usize).clone();
+                        // A STATIC member named "prototype" is a TypeError at class
+                        // definition (a literal `static prototype` is an early
+                        // SyntaxError; this catches the constant-computed
+                        // `static ['prototype'](){}` / `get`/`set`, which fold to a
+                        // named static. The dynamic `static [expr]` form is caught in
+                        // ClassAddMember.)
+                        if cd.statics.iter().any(|(n, _)| n == "prototype")
+                            || cd.static_getters.iter().any(|(n, _)| n == "prototype")
+                            || cd.static_setters.iter().any(|(n, _)| n == "prototype")
+                        {
+                            return Err(Thrown(
+                                "TypeError: Classes may not have a static property named 'prototype'"
+                                    .into(),
+                            ));
+                        }
                         // `extends superclass`: the superclass must be `null` (proto
                         // parent null) or a constructor — anything else (a plain
                         // object, a number, …) is a TypeError per ClassDefinition-
@@ -875,6 +890,16 @@ impl<'p> Vm<'p> {
                         let cv = self.get(base, class);
                         let k = self.get(base, key);
                         let kstr = self.display(k);
+                        // A STATIC element (method/getter/setter) whose computed key is
+                        // "prototype" is a TypeError at class definition (a literal
+                        // `static prototype(){}` is an early SyntaxError caught by the
+                        // parser; this guards the computed form `static ['prototype']`).
+                        if matches!(kind, 3 | 4 | 5) && kstr == "prototype" {
+                            return Err(Thrown(
+                                "TypeError: Classes may not have a static property named 'prototype'"
+                                    .into(),
+                            ));
+                        }
                         let fv = self.materialize_callable(func, base, cur_closure);
                         if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
                             if kind == 3 {
