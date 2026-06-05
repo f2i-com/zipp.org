@@ -219,6 +219,29 @@ impl<'p> Vm<'p> {
         Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
     }
 
+    /// `ToPrimitive(v, hint String)` returning the primitive Value — which may be a
+    /// Symbol (so `ToPropertyKey` can use it as a symbol key rather than throwing on
+    /// a stringify). Honours `@@toPrimitive`, then OrdinaryToPrimitive (`toString`
+    /// then `valueOf`). A non-object value is already primitive.
+    pub(crate) fn to_primitive_string(&mut self, v: Value) -> Result<Value, Thrown> {
+        if !self.is_object_value(v) {
+            return Ok(v); // already a primitive (string / number / Symbol / …)
+        }
+        if let Some(p) = self.symbol_to_primitive(v, "string")? {
+            return Ok(p);
+        }
+        for name in ["toString", "valueOf"] {
+            let f = self.get_prop(v, name)?;
+            if self.is_callable(f) {
+                let r = self.call_value(f, v, &[])?;
+                if !self.is_object_value(r) {
+                    return Ok(r);
+                }
+            }
+        }
+        Err(Thrown("TypeError: Cannot convert object to primitive value".into()))
+    }
+
     /// Whether `v` has a `[[Construct]]` slot — i.e. `new v` / `Reflect.construct`
     /// is valid. Plain functions and classes qualify; native methods, bound values,
     /// and non-callables do not. (test262's `isConstructor` helper probes this via

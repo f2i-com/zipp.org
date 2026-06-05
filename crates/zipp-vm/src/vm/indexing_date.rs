@@ -20,7 +20,15 @@ impl<'p> Vm<'p> {
                 HeapObj::Symbol { .. } | HeapObj::Str(_) | HeapObj::Cons { .. }
             )
         {
-            let s = self.to_js_string(key)?;
+            // ToPropertyKey: ToPrimitive(key, hint String). A Symbol result (e.g. an
+            // object key whose @@toPrimitive/toString returns a Symbol) stays a
+            // Symbol Value — `key_of` maps it to its "@@…" form — rather than wrongly
+            // throwing on a stringify; any other primitive is ToString'd.
+            let prim = self.to_primitive_string(key)?;
+            if prim.is_heap() && matches!(self.heap.get(prim.heap_index()), HeapObj::Symbol { .. }) {
+                return Ok(prim);
+            }
+            let s = self.to_js_string(prim)?;
             return Ok(self.alloc_str(s));
         }
         Ok(key)

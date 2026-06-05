@@ -463,12 +463,18 @@ impl<'p> Vm<'p> {
     /// this runs user coercion, so it is `&mut self` and fallible — use it for a
     /// caller-supplied property-name argument (e.g. `Object.defineProperty`).
     pub(crate) fn to_property_key(&mut self, key: Value) -> Result<String, Thrown> {
-        if key.is_heap() {
-            if let HeapObj::Symbol { prop_key, .. } = self.heap.get(key.heap_index()) {
+        // ToPropertyKey: ToPrimitive(key, hint String) FIRST — a Symbol result
+        // (from a plain Symbol, or an object whose @@toPrimitive/toString returns a
+        // Symbol) is the property key (its "@@…" form); any other primitive is
+        // ToString'd. (Without the ToPrimitive step, an object key resolving to a
+        // Symbol would wrongly throw "Cannot convert a Symbol value to a string".)
+        let prim = self.to_primitive_string(key)?;
+        if prim.is_heap() {
+            if let HeapObj::Symbol { prop_key, .. } = self.heap.get(prim.heap_index()) {
                 return Ok(prop_key.clone());
             }
         }
-        self.to_js_string(key)
+        self.to_js_string(prim)
     }
 
     /// Allocate a BigInt value.
