@@ -1252,10 +1252,11 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(dep)))
             }
             "finally" => {
-                // `cb` runs (no args) on both settle paths; the original value /
-                // reason forwards (FinallyReaction handles the value pass-through).
-                let dep = self.finally_internal(idx, a0);
-                Ok(Some(Value::heap(dep)))
+                // Generic spec algorithm: Invoke(this, "then", «thenFinally,
+                // catchFinally») via the receiver's own `then`, so an overridden
+                // `then` / custom species constructor are observed (and the original
+                // value/reason forwards through the wrappers). See `promise_finally`.
+                Ok(Some(self.promise_finally(Value::heap(idx), a0)?))
             }
             _ => Ok(None),
         }

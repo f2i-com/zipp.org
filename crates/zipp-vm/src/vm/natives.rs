@@ -214,6 +214,40 @@ impl<'p> Vm<'p> {
                     "TypeError: 'caller' and 'arguments' may not be accessed on this function".into(),
                 ));
             }
+            FINALLY_THEN | FINALLY_CATCH => {
+                // ThenFinally/CatchFinally (bound to [onFinally, C]); invoked by the
+                // receiver's `then` with the fulfilment value / rejection reason as
+                // the trailing arg. Per spec: result = onFinally(); promise =
+                // PromiseResolve(C, result); return promise.then(thunk), where the
+                // thunk passes the original value through (then) or re-throws the
+                // original reason (catch) once `onFinally`'s result settles.
+                let on_finally = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let ctor = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let carried = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                // Hold un-rooted Values across the onFinally / then re-entry.
+                let _gc = self.gc_lock_guard();
+                let result = self.call_value(on_finally, Value::UNDEFINED, &[])?;
+                let promise = self.call_native(PROMISE_RESOLVE, ctor, &[result])?;
+                let thunk_id = if id == FINALLY_THEN { FINALLY_VALUE_THUNK } else { FINALLY_THROWER };
+                let thunk_fn = Value::heap(self.heap.alloc(HeapObj::Native(thunk_id)));
+                let thunk = Value::heap(self.heap.alloc(HeapObj::Bound {
+                    target: thunk_fn,
+                    this: Value::UNDEFINED,
+                    args: vec![carried],
+                }));
+                let then_fn = self.get_prop(promise, "then")?;
+                self.call_value(then_fn, promise, &[thunk])?
+            }
+            FINALLY_VALUE_THUNK => {
+                // `() => value`: ignores its call argument, returns the bound value.
+                args.first().copied().unwrap_or(Value::UNDEFINED)
+            }
+            FINALLY_THROWER => {
+                // `() => { throw reason }`: re-throws the bound reason value.
+                let reason = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.pending_throw = Some(reason);
+                return Err(Thrown(self.throw_message(reason)));
+            }
             DATE_TO_PRIMITIVE => {
                 // `Date.prototype[Symbol.toPrimitive](hint)`: O must be an Object.
                 // hint "string"/"default" → OrdinaryToPrimitive(O, "string"),
@@ -2536,16 +2570,20 @@ impl<'p> Vm<'p> {
                     Some(HeapObj::Boxed { value, .. }) if kind != 0 => *value,
                     _ => this,
                 };
-                // Promise.prototype.then is brand-checked (IsPromise); catch is the
-                // generic `Invoke(this, "then", «undefined, onRejected»)` (so an
-                // overridden / non-callable / throwing `this.then` is observed), not
-                // a direct internal-slot operation. (finally still routes to
-                // promise_method below; its generic form is a separate lever.)
+                // Promise.prototype.then is brand-checked (IsPromise); catch and
+                // finally are generic (they Invoke `this.then`, so an overridden /
+                // non-callable / throwing `this.then`, a thenable receiver, and a
+                // custom species constructor are observed), not direct internal-slot
+                // operations.
                 if kind == 7 {
                     if m == "catch" {
                         let on_r = args.first().copied().unwrap_or(Value::UNDEFINED);
                         let then_fn = self.get_prop(this, "then")?;
                         return Ok(self.call_value(then_fn, this, &[Value::UNDEFINED, on_r])?);
+                    }
+                    if m == "finally" {
+                        let on_finally = args.first().copied().unwrap_or(Value::UNDEFINED);
+                        return Ok(self.promise_finally(this, on_finally)?);
                     }
                     if m == "then"
                         && !matches!(

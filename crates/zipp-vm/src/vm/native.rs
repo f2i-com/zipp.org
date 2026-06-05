@@ -136,6 +136,15 @@ pub const FN_HAS_INSTANCE: u16 = 867;
 /// %ThrowTypeError% — the shared get/set accessor of `Function.prototype`'s
 /// restricted `caller`/`arguments` properties; always throws a TypeError.
 pub const FN_THROW_TYPE_ERROR: u16 = 868;
+/// `Promise.prototype.finally`'s internal anonymous functions. THEN/CATCH are
+/// the ThenFinally/CatchFinally wrappers (bound to `[onFinally, C]`): they call
+/// onFinally, resolve C with its result, then chain a thunk that passes the
+/// original value through / re-throws the original reason. VALUE_THUNK/THROWER
+/// are those bound thunks (bound to `[value]` / `[reason]`).
+pub const FINALLY_THEN: u16 = 869;
+pub const FINALLY_CATCH: u16 = 870;
+pub const FINALLY_VALUE_THUNK: u16 = 871;
+pub const FINALLY_THROWER: u16 = 872;
 pub const WS_ADD: u16 = 294;
 pub const WS_HAS: u16 = 295;
 pub const WS_DELETE: u16 = 296;
@@ -669,6 +678,16 @@ pub fn proto_method(id: u16) -> Option<(&'static str, u8, u8)> {
 /// Reflect.*, Function.prototype.call, …) so it exposes real own `name`/
 /// `length` properties like any function. (Proto methods use `proto_method`.)
 pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
+    // Promise.prototype.finally's internal anonymous functions. ThenFinally/
+    // CatchFinally must present `length` 1; they are handed to `then` as Bound
+    // wrappers over `[onFinally, C]` (2 bound args), and a bound length is
+    // `max(0, target.length - boundCount)`, so the underlying native is length 3
+    // to yield 1. The value-thunk/thrower are bound over 1 arg and present 0.
+    match id {
+        FINALLY_THEN | FINALLY_CATCH => return Some(("", 3)),
+        FINALLY_VALUE_THUNK | FINALLY_THROWER => return Some(("", 0)),
+        _ => {}
+    }
     // Atomics.* methods.
     if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) {
         let (name, len) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];

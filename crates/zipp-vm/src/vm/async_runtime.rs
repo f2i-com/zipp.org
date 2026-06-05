@@ -357,37 +357,67 @@ impl<'p> Vm<'p> {
         dep
     }
 
-    /// `p.finally(cb)`: register a finally reaction on both settle paths (or
-    /// schedule immediately if already settled). Returns the dependent promise.
-    pub(crate) fn finally_internal(&mut self, p: u32, cb: Value) -> u32 {
-        let dep = self.alloc_promise();
-        let (state, result) = match self.heap.get(p) {
-            HeapObj::Promise { state, result, .. } => (*state, *result),
-            _ => return dep,
-        };
-        match state {
-            PromiseState::Pending => {
-                if let HeapObj::Promise { fulfill, reject, .. } = self.heap.get_mut(p) {
-                    fulfill.push(Reaction { callback: cb, dependent: dep, finally: true, is_async: false });
-                    reject.push(Reaction { callback: cb, dependent: dep, finally: true, is_async: false });
-                }
-            }
-            PromiseState::Fulfilled => self.microtasks.push_back(Microtask::Reaction {
-                callback: cb,
-                arg: result,
-                dependent: dep,
-                kind: ReactionKind::Fulfill,
-                finally: true,
-            }),
-            PromiseState::Rejected => self.microtasks.push_back(Microtask::Reaction {
-                callback: cb,
-                arg: result,
-                dependent: dep,
-                kind: ReactionKind::Reject,
-                finally: true,
-            }),
+    /// SpeciesConstructor(promise, %Promise%) for `finally`: the receiver's
+    /// `constructor`'s `@@species` (defaulting to %Promise% when either is absent),
+    /// throwing a TypeError for a non-object `constructor` or a non-constructor
+    /// `@@species`.
+    pub(crate) fn promise_species_constructor(&mut self, this: Value) -> Result<Value, Thrown> {
+        let c = self.get_prop(this, "constructor")?;
+        if c == Value::UNDEFINED {
+            return Ok(self.promise_ctor_value());
         }
-        dep
+        if !self.is_object_value(c) {
+            return Err(Thrown(
+                "TypeError: Promise.prototype.finally: constructor is not an object".into(),
+            ));
+        }
+        let s = self.get_prop(c, "@@species")?;
+        if s == Value::UNDEFINED || s == Value::NULL {
+            return Ok(self.promise_ctor_value());
+        }
+        if !self.is_constructor(s) {
+            return Err(Thrown(
+                "TypeError: Promise.prototype.finally: @@species is not a constructor".into(),
+            ));
+        }
+        Ok(s)
+    }
+
+    /// `Promise.prototype.finally(onFinally)` — the generic spec algorithm. Rather
+    /// than touching internal slots, it Invokes the receiver's OWN `then` with
+    /// ThenFinally/CatchFinally wrappers, so an overridden / non-callable / poisoned
+    /// `then`, a thenable receiver, and a custom species constructor are all
+    /// observed. When `onFinally` is not callable it is passed through as both
+    /// handlers (matching the spec). The wrappers are native FINALLY_THEN/CATCH
+    /// functions bound to `[onFinally, C]` (see `call_native`).
+    pub(crate) fn promise_finally(&mut self, this: Value, on_finally: Value) -> Result<Value, Thrown> {
+        if !self.is_object_value(this) {
+            return Err(Thrown(
+                "TypeError: Promise.prototype.finally called on a non-object".into(),
+            ));
+        }
+        let ctor = self.promise_species_constructor(this)?;
+        let (then_finally, catch_finally) = if !self.is_callable(on_finally) {
+            (on_finally, on_finally)
+        } else {
+            let then_native = Value::heap(self.heap.alloc(HeapObj::Native(native::FINALLY_THEN)));
+            let catch_native = Value::heap(self.heap.alloc(HeapObj::Native(native::FINALLY_CATCH)));
+            let tf = Value::heap(self.heap.alloc(HeapObj::Bound {
+                target: then_native,
+                this: Value::UNDEFINED,
+                args: vec![on_finally, ctor],
+            }));
+            let cf = Value::heap(self.heap.alloc(HeapObj::Bound {
+                target: catch_native,
+                this: Value::UNDEFINED,
+                args: vec![on_finally, ctor],
+            }));
+            (tf, cf)
+        };
+        // Hold the un-rooted wrapper Values across the `then` getter / invocation.
+        let _gc = self.gc_lock_guard();
+        let then = self.get_prop(this, "then")?;
+        self.call_value(then, this, &[then_finally, catch_finally])
     }
 
     // ── async functions ──
