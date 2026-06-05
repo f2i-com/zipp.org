@@ -860,7 +860,25 @@ impl<'p> Vm<'p> {
             }
             "includes" => {
                 let snapshot = self.array_snapshot(idx);
-                let found = snapshot.iter().any(|v| self.values_strict_eq(*v, arg0));
+                let len = snapshot.len() as i64;
+                // fromIndex (ToIntegerOrInfinity): negative counts from the end
+                // (clamped to 0); +Infinity → past the end (never found); -Infinity → 0.
+                let from = if args.len() >= 2 {
+                    let n = self.to_integer_or_zero(args[1])?;
+                    if n >= 0 { n } else { len.saturating_add(n).max(0) }
+                } else {
+                    0
+                };
+                // SameValueZero (NaN matches NaN; +0/-0 equal) — not strict `===`.
+                let mut found = false;
+                let mut k = from;
+                while k < len {
+                    if self.same_value_zero(snapshot[k as usize], arg0) {
+                        found = true;
+                        break;
+                    }
+                    k += 1;
+                }
                 Ok(Some(Value::bool(found)))
             }
             "lastIndexOf" => {
