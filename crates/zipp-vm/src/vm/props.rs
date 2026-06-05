@@ -1973,11 +1973,14 @@ impl<'p> Vm<'p> {
         // Cloned out of the heap borrow before any allocation.
         if let HeapObj::RegExp { source, flags, last_index, .. } = self.heap.get(obj.heap_index()) {
             let (s, f, li) = (source.clone(), flags.clone(), *last_index);
-            // A custom own property (`re.exec = fn`, `re.x = …`) in the side table
-            // shadows the prototype. The regexp's own/accessor keys
-            // (lastIndex/source/flags/flag-booleans) always come from
-            // regexp_get_prop, so a stray side-table entry for one is ignored.
-            if !is_regexp_own_key(key) {
+            // A custom own property (`re.exec = fn`, `re.x = …`, or an
+            // Object.defineProperty'd `flags`/`source`/flag-boolean) in the side
+            // table shadows the prototype AND the synthesized intrinsic accessor —
+            // an own property is more specific than the `%RegExp.prototype%` getter.
+            // `lastIndex` is the exception: it is a struct-backed own data property
+            // (the single source of truth shared with `exec`), so it always resolves
+            // through `regexp_get_prop`, never a side-table entry.
+            if key != "lastIndex" {
                 let entry = self
                     .arr_props
                     .get(&obj.heap_index())

@@ -230,19 +230,12 @@ impl<'p> Vm<'p> {
                 let out = self.regex_replace(&s, re, repl, global)?;
                 Ok(Some(self.alloc_str(out)))
             }
-            "replaceAll" if self.as_regexp(arg0).is_some() => {
-                let re = self.as_regexp(arg0).unwrap();
-                let global =
-                    matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
-                if !global {
-                    return Err(Thrown(
-                        "TypeError: replaceAll must be called with a global RegExp".into(),
-                    ));
-                }
-                let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let out = self.regex_replace(&s, re, repl, true)?;
-                Ok(Some(self.alloc_str(out)))
-            }
+            // `replaceAll` (regexp or otherwise) funnels into `string_replace_plain`,
+            // which performs the spec step-2 checks (IsRegExp → global-flag, GetMethod
+            // @@replace) with the proper observable Get/ToString semantics. (Routing a
+            // real RegExp through the @@replace protocol here, rather than the internal
+            // regex_replace, is what makes a custom `flags`/`@@match`/`@@replace`
+            // observable.)
             "split" => {
                 // A custom @@split fully overrides the default algorithm and runs
                 // FIRST — before any ToString / ToUint32 — receiving the receiver
@@ -506,14 +499,41 @@ impl<'p> Vm<'p> {
         repl_v: Value,
         all: bool,
     ) -> Result<Value, Thrown> {
-        // If searchValue is an OBJECT with a @@replace method, defer to it. The
-        // `is_object_value` guard matters: per spec the `@@replace` property is
-        // only accessed when searchValue is an Object, so a primitive searchValue
-        // (a number/string/boolean) must NOT trigger a `Number.prototype[@@replace]`
-        // getter etc.
+        // replaceAll step 2.b: when searchValue is a RegExp (IsRegExp — reads its
+        // @@match, propagating an abrupt), it must be global — `Get(searchValue,
+        // "flags")` (propagating an abrupt getter) must be object-coercible (a null/
+        // undefined `flags` is a TypeError) and `ToString(flags)` must contain "g".
+        // All of this BEFORE the @@replace delegation and before any ToString of the
+        // receiver/searchValue. String.prototype.replace has no such restriction.
+        if all && search_v != Value::UNDEFINED && search_v != Value::NULL && self.is_regexp(search_v)? {
+            let flags = self.get_prop(search_v, "flags")?;
+            if flags == Value::UNDEFINED || flags == Value::NULL {
+                return Err(Thrown(
+                    "TypeError: String.prototype.replaceAll called with a RegExp whose flags is not coercible"
+                        .into(),
+                ));
+            }
+            let fs = self.to_js_string(flags)?;
+            if !fs.contains('g') {
+                return Err(Thrown(
+                    "TypeError: replaceAll must be called with a global RegExp".into(),
+                ));
+            }
+        }
+        // If searchValue is an OBJECT with a @@replace method, defer to it
+        // (GetMethod: a present-but-not-callable @@replace is a TypeError; null/
+        // undefined falls through). The `is_object_value` guard matters: per spec the
+        // `@@replace` property is only accessed when searchValue is an Object, so a
+        // primitive searchValue (a number/string/boolean) must NOT trigger a
+        // `Number.prototype[@@replace]` getter etc.
         if self.is_object_value(search_v) {
             let m = self.get_prop(search_v, "@@replace")?;
-            if self.is_callable(m) {
+            if m != Value::UNDEFINED && m != Value::NULL {
+                if !self.is_callable(m) {
+                    return Err(Thrown(
+                        "TypeError: searchValue[Symbol.replace] is not a function".into(),
+                    ));
+                }
                 let sval = Value::heap(s_idx);
                 return self.call_value(m, search_v, &[sval, repl_v]);
             }

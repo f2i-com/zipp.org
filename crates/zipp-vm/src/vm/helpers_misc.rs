@@ -466,27 +466,6 @@ pub(crate) fn is_private_key(k: &str) -> bool {
     k.starts_with('#')
 }
 
-/// A RegExp's intrinsic own/accessor keys: the own `lastIndex` plus the
-/// prototype accessor flags. Property GET for these always uses `regexp_get_prop`
-/// (not a side-table entry), so a custom `re.x = …` only shadows OTHER keys
-/// (notably `exec`).
-pub(crate) fn is_regexp_own_key(k: &str) -> bool {
-    matches!(
-        k,
-        "lastIndex"
-            | "source"
-            | "flags"
-            | "global"
-            | "ignoreCase"
-            | "multiline"
-            | "dotAll"
-            | "unicode"
-            | "unicodeSets"
-            | "sticky"
-            | "hasIndices"
-    )
-}
-
 /// BigInt binary operations (see `bigint_binop`).
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // `Add` is handled inline in `add_values` (string-concat fallthrough)
