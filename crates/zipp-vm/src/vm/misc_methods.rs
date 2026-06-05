@@ -334,7 +334,10 @@ impl<'p> Vm<'p> {
 }
 
 /// `Number.prototype.toExponential` formatting → JS form "d.ddde±X" (the exponent
-/// always carries a sign; `digits` None = minimal mantissa).
+/// always carries a sign; `digits` None = minimal mantissa). Spec (21.1.3.2)
+/// differs from Rust's `format!("{:.e}")` in two ways: the sign is "" whenever
+/// x = 0 (so -0 has no '-'), and the mantissa rounds half-AWAY-from-zero (Rust
+/// uses banker's round-half-to-even).
 fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
     if n.is_nan() {
         return "NaN".to_string();
@@ -342,22 +345,75 @@ fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
     if n.is_infinite() {
         return if n < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
     }
-    let raw = match digits {
-        Some(d) => format!("{n:.d$e}"),
-        None => format!("{n:e}"),
-    };
-    match raw.find('e') {
-        Some(epos) => {
-            let (mant, exp) = raw.split_at(epos);
-            let exp = &exp[1..];
-            let (sign, num) = match exp.strip_prefix('-') {
-                Some(r) => ("-", r),
-                None => ("+", exp),
-            };
-            format!("{mant}e{sign}{num}")
-        }
-        None => raw,
+    // x = 0 (incl. -0): no sign.
+    if n == 0.0 {
+        return match digits {
+            Some(d) if d > 0 => format!("0.{}e+0", "0".repeat(d)),
+            _ => "0e+0".to_string(),
+        };
     }
+    let sign = if n < 0.0 { "-" } else { "" };
+    let a = n.abs();
+    let (mant, exp) = match digits {
+        // Minimal mantissa: the shortest round-trip (Rust's default) is correct.
+        None => {
+            let raw = format!("{a:e}");
+            let epos = raw.find('e').unwrap();
+            (raw[..epos].to_string(), raw[epos + 1..].parse::<i32>().unwrap_or(0))
+        }
+        Some(d) => round_exp_half_away(a, d),
+    };
+    format!("{sign}{mant}e{}{}", if exp >= 0 { "+" } else { "-" }, exp.abs())
+}
+
+/// Round a POSITIVE finite `a` to `d` fractional mantissa digits in exponential
+/// form, rounding half-AWAY-from-zero, returning ("D.FFFF", exponent). Works on
+/// the exact decimal digits (formatted at high precision, so the (d+1)th digit is
+/// exact) to avoid the f64 round-trip drift a `*10^d` reconstruction would cause.
+fn round_exp_half_away(a: f64, d: usize) -> (String, i32) {
+    // High-precision digits — exact for the first d+1 fractional places.
+    let guard = d + 25;
+    let raw = format!("{a:.guard$e}");
+    let epos = raw.find('e').unwrap();
+    let mantissa = &raw[..epos]; // "D.FFFF…"
+    let mut exp: i32 = raw[epos + 1..].parse().unwrap_or(0);
+    // Digit string without the '.': 1 leading (integer) digit + `guard` fractional.
+    let mut ds: Vec<u8> = mantissa.bytes().filter(|&b| b != b'.').map(|b| b - b'0').collect();
+    // For a positive value, nearest-rounding (half-away) rounds the kept prefix up
+    // iff the first dropped digit is >= 5 (the >= folds the exact-tie case to up).
+    let keep = 1 + d;
+    let round_up = ds.get(keep).is_some_and(|&dig| dig >= 5);
+    ds.truncate(keep);
+    if round_up {
+        let mut i = ds.len();
+        loop {
+            if i == 0 {
+                ds.insert(0, 1); // carry past the leading digit: 9.. -> 10..
+                break;
+            }
+            i -= 1;
+            if ds[i] == 9 {
+                ds[i] = 0;
+            } else {
+                ds[i] += 1;
+                break;
+            }
+        }
+    }
+    // A carry that grew the integer part to two digits (e.g. 9.99 -> 10.0)
+    // renormalises: drop the extra trailing digit and bump the exponent.
+    if ds.len() > 1 + d {
+        ds.truncate(1 + d);
+        exp += 1;
+    }
+    let int_digit = (b'0' + ds[0]) as char;
+    let mant = if d == 0 {
+        int_digit.to_string()
+    } else {
+        let frac: String = ds[1..].iter().map(|&x| (b'0' + x) as char).collect();
+        format!("{int_digit}.{frac}")
+    };
+    (mant, exp)
 }
 
 /// `Number.prototype.toPrecision` formatting (significant digits → fixed or
