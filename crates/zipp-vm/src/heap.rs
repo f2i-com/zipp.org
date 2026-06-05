@@ -416,8 +416,10 @@ pub enum HeapObj {
     Boxed { kind: u8, value: Value },
     /// A JS `RegExp`. `regex` is the compiled `regress` engine (ECMAScript regex);
     /// `source` is the pattern text, `flags` the JS flag string (`"gi"`); `last_index`
-    /// is the mutable `lastIndex` (a char offset, for `g`/`y` stateful matching).
-    RegExp { regex: Box<regress::Regex>, source: String, flags: String, last_index: usize },
+    /// is the writable `lastIndex` own data property — stored as a raw `Value` (not a
+    /// coerced offset) so an assigned object survives until `exec`/the @@-methods
+    /// apply ToLength, invoking its `valueOf` at the spec-mandated time.
+    RegExp { regex: Box<regress::Regex>, source: String, flags: String, last_index: Value },
     /// A JS `ArrayBuffer` — a raw byte buffer backing TypedArrays/DataViews.
     /// `detached` is set by transfer (we never detach via GC); `data` is the bytes.
     ArrayBuffer { data: Vec<u8>, detached: bool },

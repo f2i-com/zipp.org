@@ -604,6 +604,18 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // A RegExp's `lastIndex` is a writable, non-enumerable, non-configurable own
+        // data property (a `defineProperty` may have cleared its writable flag).
+        if key == "lastIndex" {
+            if let HeapObj::RegExp { last_index, .. } = self.heap.get(idx) {
+                let v = *last_index;
+                let writable = self
+                    .arr_props
+                    .get(&idx)
+                    .map_or(true, |m| m.pos("lastIndex").map_or(true, |i| m.attrs[i].writable));
+                return self.make_data_descriptor(v, writable, false, false);
+            }
+        }
         let own = match self.heap.get(idx) {
             HeapObj::Object(m) => {
                 if let Some(i) = m.pos(key) {
@@ -822,6 +834,18 @@ impl<'p> Vm<'p> {
                     }
                     if let Some(m) = self.arr_props.get(&idx) {
                         keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                    }
+                }
+                // A RegExp's only own property is `lastIndex` (plus any assigned).
+                HeapObj::RegExp { .. } => {
+                    keys.push("lastIndex".to_string());
+                    if let Some(m) = self.arr_props.get(&idx) {
+                        keys.extend(
+                            m.keys
+                                .iter()
+                                .filter(|k| !is_hidden_key(k) && k.as_str() != "lastIndex")
+                                .cloned(),
+                        );
                     }
                 }
                 _ => {}

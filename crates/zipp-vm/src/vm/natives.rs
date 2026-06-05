@@ -414,7 +414,7 @@ impl<'p> Vm<'p> {
                     *r = Box::new(regex);
                     *s = source;
                     *fl = flags;
-                    *last_index = 0;
+                    *last_index = Value::int(0);
                 }
                 this
             }
@@ -629,10 +629,11 @@ impl<'p> Vm<'p> {
                         })
                     );
                     if empty {
-                        let cur = match self.heap.get(matcher_idx) {
+                        let cur_v = match self.heap.get(matcher_idx) {
                             HeapObj::RegExp { last_index, .. } => *last_index,
-                            _ => 0,
+                            _ => Value::int(0),
                         };
+                        let cur = self.to_integer_or_zero(cur_v).unwrap_or(0).max(0) as usize;
                         self.set_regexp_last_index(matcher_idx, cur + 1);
                     }
                 }

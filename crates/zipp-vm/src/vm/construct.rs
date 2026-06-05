@@ -1096,6 +1096,12 @@ impl<'p> Vm<'p> {
                 if self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some()) {
                     return true;
                 }
+                // A RegExp owns `lastIndex` (a writable data property).
+                if key == "lastIndex"
+                    && matches!(self.heap.get(obj.heap_index()), HeapObj::RegExp { .. })
+                {
+                    return true;
+                }
                 if let HeapObj::Boxed { kind: 0, value } = self.heap.get(obj.heap_index()) {
                     let clen = match self.heap.get(value.heap_index()) {
                         HeapObj::Str(s) => Some(s.char_len),

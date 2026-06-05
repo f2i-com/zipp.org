@@ -593,7 +593,7 @@ impl<'p> Vm<'p> {
             .map_err(|e| Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}")))?;
         let idx = self
             .heap
-            .alloc(HeapObj::RegExp { regex: Box::new(regex), source, flags, last_index: 0 });
+            .alloc(HeapObj::RegExp { regex: Box::new(regex), source, flags, last_index: Value::int(0) });
         if self.regexp_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.regexp_proto));
         }

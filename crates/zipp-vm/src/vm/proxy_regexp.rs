@@ -52,7 +52,7 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn set_regexp_last_index(&mut self, idx: u32, n: usize) {
         if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
-            *last_index = n;
+            *last_index = Value::num(n as f64);
         }
     }
 
@@ -524,11 +524,11 @@ impl<'p> Vm<'p> {
         &mut self,
         source: &str,
         flags: &str,
-        last_index: usize,
+        last_index: Value,
         key: &str,
     ) -> Result<Value, Thrown> {
         Ok(match key {
-            "lastIndex" => Value::num(last_index as f64),
+            "lastIndex" => last_index,
             "source" => {
                 let s = self.escaped_source(source);
                 self.alloc_str(s)
@@ -554,9 +554,9 @@ impl<'p> Vm<'p> {
     /// Advances `lastIndex` for a global/sticky regex.
     pub(crate) fn regexp_exec(&mut self, re_idx: u32, input_v: Value) -> Result<Value, Thrown> {
         let input = self.to_js_string(input_v)?;
-        let (global, sticky, has_indices, start_char) = match self.heap.get(re_idx) {
-            HeapObj::RegExp { flags, last_index, .. } => {
-                (flags.contains('g'), flags.contains('y'), flags.contains('d'), *last_index)
+        let (global, sticky, has_indices) = match self.heap.get(re_idx) {
+            HeapObj::RegExp { flags, .. } => {
+                (flags.contains('g'), flags.contains('y'), flags.contains('d'))
             }
             _ => {
                 return Err(Thrown(
@@ -564,8 +564,13 @@ impl<'p> Vm<'p> {
                 ))
             }
         };
+        // ToLength(Get(R,"lastIndex")) — invokes a user `lastIndex.valueOf` (a throw
+        // propagates); read UNCONDITIONALLY per RegExpBuiltinExec, but used as the
+        // search start only for a global/sticky regex (otherwise the start is 0).
+        let li_v = self.get_prop(Value::heap(re_idx), "lastIndex")?;
+        let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
         let stateful = global || sticky;
-        let start = if stateful { start_char } else { 0 };
+        let start = if stateful { li } else { 0 };
         let byte_start = char_to_byte(&input, start);
         let found = if start > input.chars().count() {
             None

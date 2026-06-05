@@ -318,13 +318,11 @@ impl<'p> Vm<'p> {
             if !writable {
                 return self.reject_write(key, strict);
             }
-            // NOTE: `lastIndex` is a plain data property; ToLength is applied when
-            // `exec` reads it, not on assignment, so we must NOT run user coercion
-            // (valueOf/toString) here. A non-numeric assignment is stored as 0
-            // (an engine simplification — the slot is a usize).
-            let n = self.to_number(val).unwrap_or(f64::NAN);
-            let li = if n.is_finite() && n >= 0.0 { n as usize } else { 0 };
-            self.set_regexp_last_index(idx, li);
+            // Store the assigned Value AS-IS — ToLength is applied later by `exec`
+            // / the @@-methods, invoking a user `valueOf`/`toString` then, not now.
+            if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
+                *last_index = val;
+            }
             return Ok(());
         }
         // `arr.length = n` truncates (n < len) or extends-with-holes (n > len) a
