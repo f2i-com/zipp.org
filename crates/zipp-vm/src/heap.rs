@@ -367,7 +367,12 @@ pub enum HeapObj {
     /// own promise (settled when the combinator's condition is met). `settled`
     /// is the per-index [[AlreadyCalled]] guard: a misbehaving thenable that calls
     /// a resolve/reject element more than once is ignored after the first.
-    Combinator { kind: CombKind, results: Vec<Value>, remaining: u32, result: u32, settled: Vec<bool> },
+    /// `cap_resolve`/`cap_reject` are the result capability's [[Resolve]]/[[Reject]]
+    /// functions: the combinator settles its result THROUGH them (per spec), so a
+    /// custom `this`-constructor's executor-provided functions are observably
+    /// invoked. On the native path they are `BoundResolver`s bound to `result`, so
+    /// calling them is identical to `self.resolve/reject(result, …)`.
+    Combinator { kind: CombKind, results: Vec<Value>, remaining: u32, result: u32, settled: Vec<bool>, cap_resolve: Value, cap_reject: Value },
     /// A native resolve/reject element for a combinator: performs one combinator
     /// step (`is_reject` selects fulfill vs reject when CALLED directly by a custom
     /// thenable; via the native reaction the kind comes from the reaction list).

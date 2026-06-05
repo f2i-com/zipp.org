@@ -1965,10 +1965,14 @@ impl<'p> Vm<'p> {
                             }
                             // A bound or native function: run via call_value (fixes
                             // `this`/prepends bound args, or dispatches the builtin).
-                            // %Function.prototype% is also a callable (returns undefined).
+                            // A CombinatorResolver (a Promise.all/race/… resolve/reject
+                            // element) is callable too: a userland thenable invokes it
+                            // directly as `onFulfilled(v)` — route it through call_value
+                            // so it performs its combinator step instead of throwing
+                            // "not a function". %Function.prototype% is also a callable.
                             if matches!(
                                 self.heap.get(callee_v.heap_index()),
-                                HeapObj::Bound { .. } | HeapObj::Native(_)
+                                HeapObj::Bound { .. } | HeapObj::Native(_) | HeapObj::CombinatorResolver { .. }
                             ) || (self.fn_proto != 0 && callee_v.heap_index() == self.fn_proto)
                             {
                                 let argv: Vec<Value> =

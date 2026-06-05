@@ -865,7 +865,7 @@ impl<'p> Vm<'p> {
         // (executor not called / called twice / non-callable resolve-reject) throws
         // synchronously per ReturnIfAbrupt. The instance is a HeapObj::Promise, so
         // the existing self.resolve/reject(result) settle it directly.
-        let (cap_promise, _cap_resolve, cap_reject) = self.new_promise_capability(ctor)?;
+        let (cap_promise, cap_resolve, cap_reject) = self.new_promise_capability(ctor)?;
         let result = cap_promise.heap_index();
         // GetPromiseResolve(C): `promiseResolve = Get(C, "resolve")`, which must be
         // callable. This is the spec-observable step the tests check (overriding
@@ -928,6 +928,8 @@ impl<'p> Vm<'p> {
             remaining: 1,
             result,
             settled: Vec::new(),
+            cap_resolve,
+            cap_reject,
         });
         loop {
             // IteratorStep; a throwing next() leaves the iterator done → no close.
@@ -968,16 +970,23 @@ impl<'p> Vm<'p> {
                 // No usable constructor: coerce to a native promise for the Invoke.
                 None => Value::heap(self.to_promise(val)),
             };
-            let res_f = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
-                combinator: comb,
-                index,
-                is_reject: false,
-            }));
-            let res_r = Value::heap(self.heap.alloc(HeapObj::CombinatorResolver {
-                combinator: comb,
-                index,
-                is_reject: true,
-            }));
+            // onFulfilled / onRejected per PerformPromise{All,AllSettled,Race,Any}: a
+            // per-index "resolveElement"/"rejectElement" (CombinatorResolver) is used
+            // only where the algorithm collects a per-input outcome; otherwise the
+            // SHARED result-capability [[Resolve]]/[[Reject]] is passed directly. So
+            // every Promise.all element sees the SAME reject function, Promise.race
+            // uses the capability pair directly, and Promise.any shares the resolve.
+            let element_resolver = |vm: &mut Self, is_reject: bool| {
+                Value::heap(vm.heap.alloc(HeapObj::CombinatorResolver { combinator: comb, index, is_reject }))
+            };
+            let res_f = match kind {
+                CombKind::Race | CombKind::Any => cap_resolve,
+                CombKind::All | CombKind::AllSettled => element_resolver(self, false),
+            };
+            let res_r = match kind {
+                CombKind::All | CombKind::Race => cap_reject,
+                CombKind::Any | CombKind::AllSettled => element_resolver(self, true),
+            };
             // Invoke(nextPromise, "then", «res_f, res_r») — OBSERVABLE; abrupt →
             // close + reject with the original error.
             let outcome = match self.get_prop(next, "then") {
@@ -1022,8 +1031,10 @@ impl<'p> Vm<'p> {
     /// AggregateError of the collected reasons. A no-op while count > 0 or for Race.
     fn combinator_finish(&mut self, comb: u32) {
         use crate::heap::CombKind;
-        let (ckind, result, remaining) = match self.heap.get(comb) {
-            HeapObj::Combinator { kind, result, remaining, .. } => (*kind, *result, *remaining),
+        let (ckind, remaining, cap_resolve, cap_reject) = match self.heap.get(comb) {
+            HeapObj::Combinator { kind, remaining, cap_resolve, cap_reject, .. } => {
+                (*kind, *remaining, *cap_resolve, *cap_reject)
+            }
             _ => return,
         };
         if remaining != 0 || ckind == CombKind::Race {
@@ -1033,14 +1044,18 @@ impl<'p> Vm<'p> {
             HeapObj::Combinator { results, .. } => results.clone(),
             _ => return,
         };
+        // Settle THROUGH the result capability (per spec): Any rejects with an
+        // AggregateError of the collected reasons; All/AllSettled resolve with the
+        // collected array. (On the native path the cap functions are BoundResolvers
+        // bound to `result`, so this is the same as self.resolve/reject(result, …).)
         match ckind {
             CombKind::Any => {
                 let e = self.alloc_aggregate_error(collected);
-                self.reject(result, e);
+                let _ = self.call_value(cap_reject, Value::UNDEFINED, &[e]);
             }
             _ => {
                 let arr = Value::heap(self.heap.alloc(HeapObj::Array(collected)));
-                self.resolve(result, arr);
+                let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[arr]);
             }
         }
     }
@@ -1050,8 +1065,10 @@ impl<'p> Vm<'p> {
     /// when its rule is met (the one-shot `settle` guard absorbs later inputs).
     pub(crate) fn combinator_step(&mut self, comb: u32, index: u32, kind: ReactionKind, value: Value) {
         use crate::heap::CombKind;
-        let (ckind, result) = match self.heap.get(comb) {
-            HeapObj::Combinator { kind, result, .. } => (*kind, *result),
+        let (ckind, cap_resolve, cap_reject) = match self.heap.get(comb) {
+            HeapObj::Combinator { kind, cap_resolve, cap_reject, .. } => {
+                (*kind, *cap_resolve, *cap_reject)
+            }
             _ => return,
         };
         // [[AlreadyCalled]]: a custom thenable may invoke a resolve/reject element
@@ -1071,11 +1088,22 @@ impl<'p> Vm<'p> {
         if already {
             return;
         }
+        // Each immediate settle goes THROUGH the result capability's
+        // [[Resolve]]/[[Reject]] (observable for a custom `this`-constructor; on the
+        // native path the cap functions resolve/reject `result` directly).
         match (ckind, kind) {
-            (CombKind::Race, ReactionKind::Fulfill) => self.resolve(result, value),
-            (CombKind::Race, ReactionKind::Reject) => self.reject(result, value),
-            (CombKind::All, ReactionKind::Reject) => self.reject(result, value),
-            (CombKind::Any, ReactionKind::Fulfill) => self.resolve(result, value),
+            (CombKind::Race, ReactionKind::Fulfill) => {
+                let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[value]);
+            }
+            (CombKind::Race, ReactionKind::Reject) => {
+                let _ = self.call_value(cap_reject, Value::UNDEFINED, &[value]);
+            }
+            (CombKind::All, ReactionKind::Reject) => {
+                let _ = self.call_value(cap_reject, Value::UNDEFINED, &[value]);
+            }
+            (CombKind::Any, ReactionKind::Fulfill) => {
+                let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[value]);
+            }
             (CombKind::All, ReactionKind::Fulfill)
             | (CombKind::Any, ReactionKind::Reject)
             | (CombKind::AllSettled, _) => {

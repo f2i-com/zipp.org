@@ -330,11 +330,13 @@ impl Vm<'_> {
                 }
             }
             HeapObj::BoundResolver { promise, .. } => m_idx!(*promise),
-            HeapObj::Combinator { results, result, .. } => {
+            HeapObj::Combinator { results, result, cap_resolve, cap_reject, .. } => {
                 for &v in results {
                     m_val!(v);
                 }
                 m_idx!(*result);
+                m_val!(*cap_resolve);
+                m_val!(*cap_reject);
             }
             HeapObj::CombinatorResolver { combinator, .. } => m_idx!(*combinator),
             HeapObj::Generator { closure, regs, .. } => {
