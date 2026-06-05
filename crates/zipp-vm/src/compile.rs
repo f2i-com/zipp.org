@@ -688,11 +688,18 @@ impl Compiler {
         a: &ox::ArrowFunctionExpression,
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
+        super_class: Option<u32>,
     ) -> R<FuncProto> {
         let parent_strict = self.in_strict;
         let is_strict = parent_strict || has_use_strict(&a.body.directives);
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = is_strict;
+        // An arrow has no `super` binding of its own: `super.x` / `super.m()` inside
+        // it resolves LEXICALLY to the enclosing non-arrow method's home class. The
+        // runtime resolves super via the home-class id + the lexical `this` (which
+        // arrows already capture), so propagating the enclosing method's compile-time
+        // home-class id is sufficient.
+        fc.super_class = super_class;
         fc.in_async = a.r#async;
         fc.bind_params(&a.params)?;
         if a.expression {
@@ -2312,7 +2319,8 @@ impl<'a> FnCompiler<'a> {
         names.extend(param_pattern_leaves(&a.params));
         let captured = capture::captured_locals(&names, &a.body.statements);
         let enclosing = self.child_enclosing();
-        let mut proto = self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing)?;
+        let mut proto =
+            self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class)?;
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
         let has_upvalues = !proto.upvalues.is_empty();
