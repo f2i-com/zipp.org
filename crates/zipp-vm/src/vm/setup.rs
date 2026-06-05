@@ -274,6 +274,22 @@ impl<'p> Vm<'p> {
         let str_proto = self.str_proto;
         let num_proto = build(self, &num_methods, None);
         let set_proto = build(self, &set_methods, None);
+        // `Set.prototype.keys` IS `%Set.prototype.values%` — the SAME function object
+        // (24.2.3.x), so `Set.prototype.keys === Set.prototype.values`. `build`
+        // installed two distinct natives; alias the keys slot to the values value
+        // in place (preserving its non-enumerable method attrs). (Map keeps three
+        // distinct functions, so only Set is aliased.)
+        let set_values_fn = match self.heap.get(set_proto) {
+            HeapObj::Object(p) => p.get("values"),
+            _ => None,
+        };
+        if let Some(vfn) = set_values_fn {
+            if let HeapObj::Object(p) = self.heap.get_mut(set_proto) {
+                if let Some(i) = p.pos("keys") {
+                    p.vals[i] = vfn;
+                }
+            }
+        }
         let map_proto = build(self, &map_methods, None);
         let bool_proto = build(self, &bool_methods, None);
         let date_proto = build(self, &date_methods, None);
