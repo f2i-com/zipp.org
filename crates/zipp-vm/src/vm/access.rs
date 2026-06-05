@@ -306,8 +306,18 @@ impl<'p> Vm<'p> {
             }
             return Ok(());
         }
-        // `re.lastIndex = n` — the only writable own property of a RegExp.
+        // `re.lastIndex = n` — a RegExp's one writable data property by default.
         if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+            // `Object.defineProperty` can make it non-writable (recorded in
+            // arr_props): then `Set(R,"lastIndex",..,true)` throws (strict) / is a
+            // silent no-op (sloppy), per OrdinarySet — without touching the slot.
+            let writable = self
+                .arr_props
+                .get(&idx)
+                .map_or(true, |m| m.pos("lastIndex").map_or(true, |i| m.attrs[i].writable));
+            if !writable {
+                return self.reject_write(key, strict);
+            }
             // NOTE: `lastIndex` is a plain data property; ToLength is applied when
             // `exec` reads it, not on assignment, so we must NOT run user coercion
             // (valueOf/toString) here. A non-numeric assignment is stored as 0

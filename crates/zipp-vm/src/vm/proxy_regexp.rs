@@ -209,12 +209,12 @@ impl<'p> Vm<'p> {
         let prev = self.get_prop(rx, "lastIndex")?;
         let zero = Value::int(0);
         if !self.same_value(prev, zero) {
-            self.set_prop(rx, "lastIndex", zero, false)?;
+            self.set_prop(rx, "lastIndex", zero, true)?;
         }
         let result = self.regexp_exec_abstract(rx.heap_index(), input)?;
         let cur = self.get_prop(rx, "lastIndex")?;
         if !self.same_value(cur, prev) {
-            self.set_prop(rx, "lastIndex", prev, false)?;
+            self.set_prop(rx, "lastIndex", prev, true)?;
         }
         if result == Value::NULL {
             return Ok(Value::int(-1));
@@ -245,7 +245,7 @@ impl<'p> Vm<'p> {
         let flags = self.to_js_string(flags_v)?;
         let global = flags.contains('g');
         if global {
-            self.set_prop(rx, "lastIndex", Value::int(0), false)?;
+            self.set_prop(rx, "lastIndex", Value::int(0), true)?;
         }
         // Collect all exec results through the exec protocol (honouring user `exec`).
         let mut results: Vec<Value> = Vec::new();
@@ -268,7 +268,7 @@ impl<'p> Vm<'p> {
             if self.to_js_string(match0)?.is_empty() {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 let this_index = self.to_integer_or_zero(li_v)?.max(0) as usize;
-                self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), false)?;
+                self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), true)?;
             }
         }
         // Build the accumulated result, reading each match's fields via Get.
@@ -408,7 +408,7 @@ impl<'p> Vm<'p> {
             if is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
                 let this_index = self.to_integer_or_zero(li_v)?.max(0) as usize;
-                self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), false)?;
+                self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), true)?;
             }
         }
         if elems.is_empty() {
@@ -484,7 +484,7 @@ impl<'p> Vm<'p> {
             if guard > 5_000_000 {
                 break;
             }
-            self.set_prop(splitter, "lastIndex", Value::num(q as f64), false)?;
+            self.set_prop(splitter, "lastIndex", Value::num(q as f64), true)?;
             let z = self.regexp_exec_abstract(splitter.heap_index(), s_val)?;
             if z == Value::NULL {
                 q += 1;
@@ -581,7 +581,9 @@ impl<'p> Vm<'p> {
             Some(m) => m,
             None => {
                 if stateful {
-                    self.set_regexp_last_index(re_idx, 0);
+                    // RegExpBuiltinExec Set(R,"lastIndex",0,true): a non-writable
+                    // lastIndex makes a failed global/sticky exec throw.
+                    self.set_prop(Value::heap(re_idx), "lastIndex", Value::int(0), true)?;
                 }
                 return Ok(Value::NULL);
             }
@@ -675,7 +677,9 @@ impl<'p> Vm<'p> {
             m.define("indices", indices_v, attr);
         }
         if stateful {
-            self.set_regexp_last_index(re_idx, byte_to_char(&input, mend));
+            // RegExpBuiltinExec Set(R,"lastIndex",e,true): throws if non-writable.
+            let e = byte_to_char(&input, mend) as f64;
+            self.set_prop(Value::heap(re_idx), "lastIndex", Value::num(e), true)?;
         }
         Ok(Value::heap(arr_idx))
     }
