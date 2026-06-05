@@ -234,13 +234,115 @@ impl<'p> Vm<'p> {
         }
         match mode {
             EachMode::ForEach => Ok(Some(Value::UNDEFINED)),
-            _ => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out))))),
+            // map does ArraySpeciesCreate(O, len) — `out.len()` is the source length
+            // in the dense path; filter does ArraySpeciesCreate(O, 0).
+            EachMode::Map => {
+                let n = out.len();
+                Ok(Some(self.array_from_species(receiver, out, n)?))
+            }
+            EachMode::Filter => Ok(Some(self.array_from_species(receiver, out, 0)?)),
         }
     }
 
     /// Allocate a built-in iterator over a snapshot of `items` with prototype `proto`.
     pub(crate) fn make_iterator(&mut self, items: Vec<Value>, proto: u32) -> Value {
         Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto }))
+    }
+
+    /// ArraySpeciesCreate(originalArray, length), but returns `None` to signal that
+    /// the caller should keep its existing fast dense-array path — the constructor is
+    /// the intrinsic `%Array%`, is absent/undefined, or carries no custom `@@species`.
+    /// `Some(target)` is a species-constructed object the caller must populate with
+    /// CreateDataPropertyOrThrow. A non-object (non-undefined) constructor, or a
+    /// non-constructor `@@species`, throws a TypeError (matching the spec step
+    /// "If IsConstructor(C) is false, throw a TypeError exception").
+    pub(crate) fn array_species_create(
+        &mut self,
+        original: Value,
+        len: usize,
+    ) -> Result<Option<Value>, Thrown> {
+        // ArraySpeciesCreate step 1-2: if IsArray(originalArray) is false, return
+        // ArrayCreate(length) — `constructor`/`@@species` are NOT consulted for a
+        // non-array receiver (e.g. `Array.prototype.map.call(typedArray | plainObj)`).
+        if !self.value_is_array(original) {
+            return Ok(None);
+        }
+        let ctor = self.get_prop(original, "constructor")?;
+        let species = if ctor == Value::UNDEFINED {
+            return Ok(None);
+        } else if !self.is_object_value(ctor) {
+            // A non-object, non-undefined `constructor` can never be a constructor,
+            // so ArraySpeciesCreate reaches the IsConstructor(C)-false throw.
+            return Err(Thrown(
+                "TypeError: Array species constructor is not an object".into(),
+            ));
+        } else {
+            let s = self.get_prop(ctor, "@@species")?;
+            if s == Value::NULL {
+                Value::UNDEFINED
+            } else {
+                s
+            }
+        };
+        if species == Value::UNDEFINED {
+            return Ok(None);
+        }
+        // `%Array%` itself as the species is observably identical to ArrayCreate(len),
+        // so keep the fast dense path (and avoid running the Array constructor).
+        if species.is_heap() && self.array_ctor != 0 && species.heap_index() == self.array_ctor {
+            return Ok(None);
+        }
+        if !self.is_constructor(species) {
+            return Err(Thrown(
+                "TypeError: Array species constructor is not a constructor".into(),
+            ));
+        }
+        Ok(Some(self.construct(species, &[Value::num(len as f64)])?))
+    }
+
+    /// CreateDataPropertyOrThrow(O, ToString(index), value): install a fresh
+    /// enumerable, writable, configurable data property (overwriting a configurable
+    /// existing one), throwing a TypeError when the define fails — a non-extensible
+    /// target, or a non-configurable existing property.
+    pub(crate) fn create_data_property_or_throw(
+        &mut self,
+        target: Value,
+        index: usize,
+        value: Value,
+    ) -> Result<(), Thrown> {
+        let mut m = ObjMap::new();
+        m.set("value", value);
+        m.set("writable", Value::TRUE);
+        m.set("enumerable", Value::TRUE);
+        m.set("configurable", Value::TRUE);
+        let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+        let key = index.to_string();
+        self.object_define_property(target, &key, desc)
+    }
+
+    /// Finish a species-aware `Array.prototype` method: build the result array from
+    /// `out`, honouring a custom `@@species` constructor. `species_len` is the length
+    /// ArraySpeciesCreate is invoked with (0 for filter/concat/flat/flatMap, the
+    /// source length for map, the element count for slice/splice). The common
+    /// ordinary-array case takes the fast dense path unchanged; only a custom species
+    /// constructs a target and receives each element via CreateDataPropertyOrThrow.
+    /// GC is suspended for the scope so `out`'s values survive the species ctor call.
+    pub(crate) fn array_from_species(
+        &mut self,
+        original: Value,
+        out: Vec<Value>,
+        species_len: usize,
+    ) -> Result<Value, Thrown> {
+        let _gc = self.gc_lock_guard();
+        match self.array_species_create(original, species_len)? {
+            None => Ok(Value::heap(self.heap.alloc(HeapObj::Array(out)))),
+            Some(target) => {
+                for (i, v) in out.into_iter().enumerate() {
+                    self.create_data_property_or_throw(target, i, v)?;
+                }
+                Ok(target)
+            }
+        }
     }
 
     /// The hole-skipping iteration methods (forEach/map/filter/some/every/reduce/
@@ -296,7 +398,7 @@ impl<'p> Vm<'p> {
                         out[k] = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                     }
                 }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                Ok(Some(self.array_from_species(this, out, len)?))
             }
             "filter" => {
                 let mut out = Vec::new();
@@ -309,7 +411,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                Ok(Some(self.array_from_species(this, out, 0)?))
             }
             "some" => {
                 for k in 0..len {
@@ -723,7 +825,10 @@ impl<'p> Vm<'p> {
                     });
                     k += 1;
                 }
-                let a = Value::heap(self.heap.alloc(HeapObj::Array(deleted)));
+                // splice does ArraySpeciesCreate(O, actualDeleteCount) for the
+                // returned removed-array.
+                let dl = deleted.len();
+                let a = self.array_from_species(this, deleted, dl)?;
                 // Shift the tail to make room for the inserted items.
                 if insert_count < actual_delete {
                     let mut k = actual_start;
@@ -1047,7 +1152,8 @@ impl<'p> Vm<'p> {
                         out.push(e);
                     }
                 }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                // concat does ArraySpeciesCreate(O, 0).
+                Ok(Some(self.array_from_species(this_val, out, 0)?))
             }
             "flat" => {
                 let depth = if args.is_empty() {
@@ -1063,7 +1169,8 @@ impl<'p> Vm<'p> {
                 };
                 let snapshot = self.array_snapshot(idx);
                 let out = self.flatten_array(&snapshot, depth);
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                // flat builds the result via ArraySpeciesCreate(O, 0).
+                Ok(Some(self.array_from_species(Value::heap(idx), out, 0)?))
             }
             "fill" => {
                 let val = arg0;
@@ -1098,7 +1205,9 @@ impl<'p> Vm<'p> {
                 } else {
                     Vec::new()
                 };
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(slice)))))
+                // slice does ArraySpeciesCreate(O, count) where count == slice.len().
+                let n = slice.len();
+                Ok(Some(self.array_from_species(Value::heap(idx), slice, n)?))
             }
             "map" => {
                 self.array_each(idx, arg0, EachMode::Map, args.get(1).copied().unwrap_or(Value::UNDEFINED))
@@ -1348,7 +1457,8 @@ impl<'p> Vm<'p> {
                     }
                     out.push(r);
                 }
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                // flatMap builds the result via ArraySpeciesCreate(O, 0).
+                Ok(Some(self.array_from_species(receiver, out, 0)?))
             }
             "findLast" | "findLastIndex" => {
                 let cb = arg0;
@@ -1423,7 +1533,10 @@ impl<'p> Vm<'p> {
                     _ => Vec::new(),
                 };
                 self.heap.bump_version(idx); // length/contents changed
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(removed)))))
+                // splice returns the removed elements via
+                // ArraySpeciesCreate(O, actualDeleteCount).
+                let n = removed.len();
+                Ok(Some(self.array_from_species(Value::heap(idx), removed, n)?))
             }
             // Array iterators (real iterator objects with .next(), proto =
             // %ArrayIteratorPrototype%). values() is also the default @@iterator.

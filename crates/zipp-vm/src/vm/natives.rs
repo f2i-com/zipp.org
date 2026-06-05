@@ -807,7 +807,28 @@ impl<'p> Vm<'p> {
             }
             ARR_IS_ARRAY => Value::bool(self.value_is_array(a0)),
             ARR_FROM => self.array_from(this, a0, a1, args.get(2).copied().unwrap_or(Value::UNDEFINED))?,
-            ARR_OF => Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec()))),
+            ARR_OF => {
+                // Array.of(...items): A = IsConstructor(this) ? Construct(this,«len»)
+                // : ArrayCreate(len); then CreateDataPropertyOrThrow each item. The
+                // plain `Array.of(...)` receiver is %Array% → fast dense array.
+                let items = args.to_vec();
+                let n = items.len();
+                let use_default = !self.is_constructor(this)
+                    || (this.is_heap()
+                        && self.array_ctor != 0
+                        && this.heap_index() == self.array_ctor);
+                if use_default {
+                    Value::heap(self.heap.alloc(HeapObj::Array(items)))
+                } else {
+                    let _gc = self.gc_lock_guard();
+                    let target = self.construct(this, &[Value::num(n as f64)])?;
+                    for (i, v) in items.into_iter().enumerate() {
+                        self.create_data_property_or_throw(target, i, v)?;
+                    }
+                    self.set_prop(target, "length", Value::num(n as f64), true)?;
+                    target
+                }
+            }
             // `%TypedArray%.from(src, mapFn?)` / `.of(...items)` — `this` is the
             // concrete kind constructor (Int8Array, …); collect the values into a
             // plain Array, then materialize a typed array of that kind.

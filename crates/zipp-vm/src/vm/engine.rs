@@ -109,6 +109,7 @@ impl<'p> Vm<'p> {
             asyncgen_fn_ctor: 0,
             asyncgen_fn_proto: 0,
             arr_proto: 0,
+            array_ctor: 0,
             str_proto: 0,
             map_proto: 0,
             set_proto: 0,
