@@ -223,7 +223,13 @@ impl<'p> Vm<'p> {
                 let len = char_len(&s) as i64;
                 let norm = |i: i64| if i < 0 { len.saturating_add(i).max(0) } else { i.min(len) };
                 let start = if args.is_empty() { 0 } else { norm(self.to_integer_or_zero(arg0)?) };
-                let end = if args.len() < 2 { len } else { norm(self.to_integer_or_zero(args[1])?) };
+                // An absent OR explicitly-`undefined` end defaults to the string
+                // length (ToIntegerOrInfinity is only applied to a defined end).
+                let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
+                    len
+                } else {
+                    norm(self.to_integer_or_zero(args[1])?)
+                };
                 let out: String = if start < end {
                     s.chars().skip(start as usize).take((end - start) as usize).collect()
                 } else {
@@ -236,7 +242,12 @@ impl<'p> Vm<'p> {
                 // so start <= end (distinct from slice's negative-from-end mapping).
                 let len = char_len(&s) as i64;
                 let s0 = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)?.clamp(0, len) };
-                let e0 = if args.len() < 2 { len } else { self.to_integer_or_zero(args[1])?.clamp(0, len) };
+                // An absent OR explicitly-`undefined` end defaults to the length.
+                let e0 = if args.len() < 2 || args[1] == Value::UNDEFINED {
+                    len
+                } else {
+                    self.to_integer_or_zero(args[1])?.clamp(0, len)
+                };
                 let (from, to) = if s0 <= e0 { (s0, e0) } else { (e0, s0) };
                 let out: String = s.chars().skip(from as usize).take((to - from) as usize).collect();
                 Ok(Some(self.alloc_str(out)))
