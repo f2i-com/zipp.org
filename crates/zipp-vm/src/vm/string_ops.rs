@@ -253,17 +253,20 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(out)))
             }
             "repeat" => {
-                let n = self.to_integer_or_zero(arg0)?;
-                if n < 0 {
+                // ToIntegerOrInfinity(count): a NEGATIVE or +Infinity count is a
+                // RangeError — checked on the coerced number BEFORE the empty-string
+                // fast path (`"".repeat(Infinity)` must still throw, not yield "").
+                let nf = self.to_number_coerce(arg0)?;
+                let n_int = if nf.is_nan() { 0.0 } else { nf.trunc() };
+                if n_int < 0.0 || n_int == f64::INFINITY {
                     return Err(Thrown("RangeError: Invalid count value".into()));
                 }
-                // Bound the result (an unbounded build would hang / OOM) — a too-long
-                // string (or count===+Infinity, saturated to i64::MAX here) is a
-                // RangeError per spec. Empty string repeats to "" for any count.
-                if (n as f64) * (s.len() as f64) > (1u64 << 28) as f64 {
+                // Bound the result (an unbounded build would hang / OOM): a too-long
+                // string is a RangeError per spec. (n_int is now finite and ≥ 0.)
+                if n_int * (s.len() as f64) > (1u64 << 28) as f64 {
                     return Err(Thrown("RangeError: Invalid string length".into()));
                 }
-                Ok(Some(self.alloc_str(s.repeat(n as usize))))
+                Ok(Some(self.alloc_str(s.repeat(n_int as usize))))
             }
             "search" => {
                 // Per spec, an OBJECT regexp's `@@search` method overrides the
@@ -474,10 +477,14 @@ impl<'p> Vm<'p> {
             "normalize" => {
                 // Validate the form; engine strings are already normalized for ASCII
                 // (full Unicode normalization isn't modelled).
+                // ToString(form) runs (and may throw — TypeError for a Symbol, or a
+                // propagated toString error) BEFORE the form-name validation, per
+                // spec steps 5-7. `display` is infallible and skips toString, so it
+                // wrongly turned those into the RangeError below.
                 let form = if args.is_empty() || arg0 == Value::UNDEFINED {
                     "NFC".to_string()
                 } else {
-                    self.display(arg0)
+                    self.to_js_string(arg0)?
                 };
                 if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
                     return Err(Thrown(
