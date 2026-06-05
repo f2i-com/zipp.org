@@ -435,8 +435,24 @@ impl<'p> Vm<'p> {
         // at the top.) Only when there's no own property with this key.
         let needs_proto_walk = match self.heap.get(idx) {
             HeapObj::Object(m) => m.class.is_none() && m.pos(key).is_none(),
+            // An EXOTIC receiver's inherited getter-only accessor (RegExp
+            // global/source/flags, Map/Set size) must govern the write: assigning it
+            // is a sloppy no-op / strict TypeError, NOT a new own data property. The
+            // `re.lastIndex` data property is handled (and returns) above this point.
+            HeapObj::RegExp { .. }
+            | HeapObj::Map { .. }
+            | HeapObj::Set(_)
+            | HeapObj::WeakMap { .. }
+            | HeapObj::WeakSet(_)
+            | HeapObj::WeakRef(_)
+            | HeapObj::FinalizationRegistry { .. }
+            | HeapObj::Date(_)
+            | HeapObj::Promise { .. }
+            | HeapObj::Boxed { .. }
+            | HeapObj::ArrayBuffer { .. }
+            | HeapObj::DataView { .. } => true,
             _ => false,
-        };
+        } && self.arr_props.get(&idx).map_or(true, |m| m.pos(key).is_none());
         if needs_proto_walk {
             match self.proto_accessor_setter(idx, key) {
                 Some(Some(setter)) => {
