@@ -1963,6 +1963,10 @@ impl<'p> Vm<'p> {
                     }
                     Instr::DeleteProp { dst, obj, name, strict } => {
                         let o = self.get(base, obj);
+                        // `delete obj.x` does ToObject(base) — null/undefined throw a
+                        // TypeError (RequireObjectCoercible); other primitives box and
+                        // delete returns true.
+                        self.require_object_coercible(o)?;
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
@@ -1978,6 +1982,10 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let ks = self.to_property_key(k)?; // ToPropertyKey (symbol → prop_key, object → ToString)
+                        // `delete obj[k]` does ToObject(base) after ToPropertyKey —
+                        // null/undefined throw a TypeError (other primitives box and
+                        // delete returns true).
+                        self.require_object_coercible(o)?;
                         let r = self.delete_property(o, &ks)?;
                         if strict && r == Value::bool(false) {
                             return Err(Thrown(format!("TypeError: Cannot delete property '{ks}'")));
