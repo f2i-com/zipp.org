@@ -3624,17 +3624,27 @@ impl<'a> FnCompiler<'a> {
                         let fid = self.cx.functions.len() - 1;
                         self.cx.functions[fid].source =
                             self.cx.src_slice(p.span.start, p.span.end);
-                        self.emit(Instr::DefineAccessor {
-                            obj: dst,
-                            key,
+                        let is_setter = matches!(p.kind, ox::PropertyKind::Set);
+                        self.emit(Instr::DefineAccessor { obj: dst, key, func, is_setter });
+                        // SetFunctionName: a getter/setter is named "get k"/"set k"
+                        // (a Symbol key → "get [desc]"), at runtime so a computed key
+                        // is handled too.
+                        self.emit(Instr::SetFnNameFromKey {
                             func,
-                            is_setter: matches!(p.kind, ox::PropertyKind::Set),
+                            key,
+                            prefix: if is_setter { 2 } else { 1 },
                         });
                     } else if p.computed {
                         // Computed key `{[expr]: v}` → SetIndex.
                         let ke = p.key.as_expression().ok_or("unsupported computed object key")?;
                         let key = self.expr(ke)?;
                         let v = self.expr(&p.value)?;
+                        // SetFunctionName: an anonymous function/arrow/class value
+                        // takes the (runtime) computed key as its name — a Symbol key
+                        // becomes "[description]".
+                        if is_anonymous_fn_def(&p.value) {
+                            self.emit(Instr::SetFnNameFromKey { func: v, key, prefix: 0 });
+                        }
                         self.emit(Instr::SetIndex { obj: dst, key, val: v });
                     } else {
                         // Static identifier / string / number literal key.
@@ -3646,9 +3656,15 @@ impl<'a> FnCompiler<'a> {
                         };
                         let name = self.string_name(&key);
                         // `{ fn: function(){}, m(){}, C: class{} }` — an anonymous
-                        // value function/class takes the property key as its name.
+                        // value function/class takes the property key as its name,
+                        // EXCEPT `{ __proto__: fn }` (a proto-setter, not a data
+                        // property): its function value stays anonymous.
                         let vtmp = self.alloc_reg();
-                        let v = self.compile_named_init(vtmp, &p.value, &key)?;
+                        let v = if key == "__proto__" && !p.method {
+                            self.expr_into(&p.value, vtmp)?
+                        } else {
+                            self.compile_named_init(vtmp, &p.value, &key)?
+                        };
                         // Shorthand method `{ m(){}, *g(){}, async a(){} }`: its
                         // toString is the whole `m(){}` (the value-Function span omits
                         // the name/modifiers). Patch the proto just compiled (last).
@@ -5543,6 +5559,19 @@ fn function_parts<'a>(
 /// parameters before the first one with a default value (an AssignmentPattern).
 /// A destructuring parameter without a default counts; the rest parameter lives
 /// in `params.rest`, not `items`, so it is excluded automatically.
+/// IsAnonymousFunctionDefinition: an anonymous function/arrow/class expression
+/// (function/generator/async-function expressions count when they have no `id`).
+/// Such a value takes the property/binding name via NamedEvaluation.
+fn is_anonymous_fn_def(e: &ox::Expression) -> bool {
+    match e {
+        ox::Expression::FunctionExpression(f) => f.id.is_none(),
+        ox::Expression::ArrowFunctionExpression(_) => true,
+        ox::Expression::ClassExpression(c) => c.id.is_none(),
+        ox::Expression::ParenthesizedExpression(p) => is_anonymous_fn_def(&p.expression),
+        _ => false,
+    }
+}
+
 fn expected_arg_count(params: &ox::FormalParameters) -> u16 {
     let mut n = 0u16;
     for item in &params.items {

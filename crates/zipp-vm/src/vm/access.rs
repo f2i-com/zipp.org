@@ -444,6 +444,15 @@ impl<'p> Vm<'p> {
             if key == "prototype" && val.is_heap() {
                 self.prototypes.insert(idx, val.heap_index());
             } else {
+                // An existing NON-WRITABLE own data property (e.g. a function `name`
+                // set by NamedEvaluation/SetFunctionName) rejects assignment.
+                if let Some(m) = self.fn_props.get(&idx) {
+                    if let Some(i) = m.pos(key) {
+                        if !m.attrs[i].accessor && !m.attrs[i].writable {
+                            return self.reject_write(key, strict);
+                        }
+                    }
+                }
                 self.fn_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             }
             return Ok(());

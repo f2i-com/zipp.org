@@ -1912,6 +1912,12 @@ impl<'p> Vm<'p> {
                         self.define_object_accessor(o, &k, f, is_setter);
                         ip += 1;
                     }
+                    Instr::SetFnNameFromKey { func, key, prefix } => {
+                        let f = self.get(base, func);
+                        let k = self.get(base, key);
+                        self.set_fn_name_from_key(f, k, prefix);
+                        ip += 1;
+                    }
                     Instr::GetProp { dst, obj, name } => {
                         let o = self.get(base, obj);
                         let key = self.func(func_id as usize)

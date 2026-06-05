@@ -1747,6 +1747,69 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// SetFunctionName for an object-literal accessor / computed member whose name
+    /// is only known at runtime: `name = prefix + (Symbol key → "[description]" or
+    /// "", else ToString(key))`, with prefix 0=none / 1="get " / 2="set ". Written
+    /// as a non-writable, non-enumerable, configurable own `name` (overriding the
+    /// synthesized intrinsic via callable_has_intrinsic); a Class sets its name
+    /// field. Only a function/class value is named.
+    pub(crate) fn set_fn_name_from_key(&mut self, func: Value, key: Value, prefix: u8) {
+        if !func.is_heap() {
+            return;
+        }
+        let fi = func.heap_index();
+        let is_class = matches!(self.heap.get(fi), HeapObj::Class(_));
+        let is_callable = matches!(
+            self.heap.get(fi),
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+        );
+        if !is_class && !is_callable {
+            return;
+        }
+        let base_name = if key.is_heap() {
+            match self.heap.get(key.heap_index()) {
+                HeapObj::Symbol { desc, .. } => {
+                    let d = *desc;
+                    if d == Value::UNDEFINED {
+                        String::new()
+                    } else {
+                        format!("[{}]", self.display(d))
+                    }
+                }
+                _ => self.display(key),
+            }
+        } else {
+            self.display(key)
+        };
+        let name = match prefix {
+            1 => format!("get {base_name}"),
+            2 => format!("set {base_name}"),
+            _ => base_name,
+        };
+        if is_class {
+            if let HeapObj::Class(c) = self.heap.get_mut(fi) {
+                c.name = name;
+            }
+            return;
+        }
+        let nv = self.alloc_str(name);
+        self.fn_props.entry(fi).or_insert_with(ObjMap::new).define(
+            "name",
+            nv,
+            PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
+        );
+        // The explicit `name` IS the function's name — suppress the synthesized
+        // intrinsic so it doesn't reappear if the explicit one is deleted (the
+        // property is a single configurable own `name`, per SetFunctionName).
+        self.deleted_callable_intrinsics.insert((fi, 0));
+    }
+
     /// Does this callable expose `key` (`name`/`length`) as an own property right
     /// now? True for any named callable unless that intrinsic was `delete`d.
     pub(crate) fn callable_has_intrinsic(&self, obj: Value, key: &str) -> bool {

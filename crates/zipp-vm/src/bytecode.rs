@@ -359,6 +359,12 @@ pub enum Instr {
     /// picks the half. Merges with an existing accessor for the same key (so a
     /// get + set pair on one key becomes a single get/set accessor).
     DefineAccessor { obj: Reg, key: Reg, func: Reg, is_setter: bool },
+    /// SetFunctionName(func, key, prefix) for an object-literal accessor / computed
+    /// member whose name is only known at runtime: name = prefix + key-as-name
+    /// (a Symbol key → "[description]" or "", else ToString(key)); `prefix` is
+    /// 0=none, 1="get ", 2="set ". Written as a non-writable/non-enumerable/
+    /// configurable own `name` (overriding the synthesized intrinsic).
+    SetFnNameFromKey { func: Reg, key: Reg, prefix: u8 },
     /// `dst = obj.<string_constants[name]>` — static property read
     /// (also resolves `.length` for arrays/strings).
     GetProp { dst: Reg, obj: Reg, name: u32 },
