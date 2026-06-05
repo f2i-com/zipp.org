@@ -418,6 +418,29 @@ impl<'p> Vm<'p> {
                     }
                     v
                 }
+                // A function's assigned own properties live in the `fn_props` side
+                // table (e.g. `fn.x = 1`); enumerate the enumerable ones (for
+                // Object.keys/values/entries + for-in), like the getOwnPropertyNames
+                // path already reads them.
+                HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Native(_) => match self.fn_props.get(&obj.heap_index()) {
+                    Some(m) => spec_key_order(&m.keys)
+                        .into_iter()
+                        .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
+                        .map(|i| (m.keys[i].clone(), m.vals[i]))
+                        .collect(),
+                    None => Vec::new(),
+                },
+                // A class's own (static) properties live in `ClassData.statics`
+                // (static methods are non-enumerable; static fields / `Cls.s = …`
+                // assignments are enumerable).
+                HeapObj::Class(c) => spec_key_order(&c.statics.keys)
+                    .into_iter()
+                    .filter(|&i| c.statics.attrs[i].enumerable && !is_hidden_key(&c.statics.keys[i]))
+                    .map(|i| (c.statics.keys[i].clone(), c.statics.vals[i]))
+                    .collect(),
                 _ => Vec::new(),
             }
         } else {

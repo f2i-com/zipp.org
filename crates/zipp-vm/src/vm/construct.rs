@@ -1173,6 +1173,17 @@ impl<'p> Vm<'p> {
                         .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
                         .unwrap_or(false)
             }
+            // A function's assigned own properties live in `fn_props`.
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Native(_) => self
+                .fn_props
+                .get(&obj.heap_index())
+                .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
+                .unwrap_or(false),
+            // A class's own (static) properties live in `ClassData.statics`.
+            HeapObj::Class(c) => c.statics.pos(key).map_or(false, |i| c.statics.attrs[i].enumerable),
             _ => false,
         }
     }
