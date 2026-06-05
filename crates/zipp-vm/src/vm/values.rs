@@ -580,12 +580,22 @@ impl<'p> Vm<'p> {
                 )));
             }
         }
+        // `u` (Unicode) and `v` (UnicodeSets) select mutually-exclusive grammars;
+        // enabling both is a SyntaxError (ParsePattern). (Literal `/x/uv` is caught
+        // earlier by the parser; this guards the `new RegExp(p, "uv")` path.)
+        if seen.contains(&'u') && seen.contains(&'v') {
+            return Err(Thrown(format!(
+                "SyntaxError: Invalid flags supplied to RegExp constructor '{flags}'"
+            )));
+        }
         // The matching flags `regress` understands (g/y/d are JS-level state).
+        // `u` enables Unicode mode and `v` the distinct UnicodeSets grammar (set
+        // operations, nested classes, `\q{…}`, properties-of-strings) — pass each
+        // through verbatim rather than collapsing `v` into `u`.
         let mut rflags = String::new();
         for c in flags.chars() {
             match c {
-                'i' | 'm' | 's' => rflags.push(c),
-                'u' | 'v' if !rflags.contains('u') => rflags.push('u'),
+                'i' | 'm' | 's' | 'u' | 'v' => rflags.push(c),
                 _ => {}
             }
         }

@@ -396,12 +396,13 @@ impl<'p> Vm<'p> {
                     HeapObj::RegExp { source, flags, .. } => (source.clone(), flags.clone()),
                     _ => unreachable!(),
                 };
-                // Rebuild the matcher from the validated source/flags.
+                // Rebuild the matcher from the validated source/flags. Pass `u`
+                // (Unicode) and `v` (UnicodeSets) through verbatim — `regress` reads
+                // them as distinct grammars (kept in sync with `build_regexp`).
                 let mut rflags = String::new();
                 for c in flags.chars() {
                     match c {
-                        'i' | 'm' | 's' => rflags.push(c),
-                        'u' | 'v' if !rflags.contains('u') => rflags.push('u'),
+                        'i' | 'm' | 's' | 'u' | 'v' => rflags.push(c),
                         _ => {}
                     }
                 }
