@@ -2538,6 +2538,28 @@ impl<'p> Vm<'p> {
                     Some(HeapObj::Boxed { value, .. }) if kind != 0 => *value,
                     _ => this,
                 };
+                // Promise.prototype.then is brand-checked (IsPromise); catch is the
+                // generic `Invoke(this, "then", «undefined, onRejected»)` (so an
+                // overridden / non-callable / throwing `this.then` is observed), not
+                // a direct internal-slot operation. (finally still routes to
+                // promise_method below; its generic form is a separate lever.)
+                if kind == 7 {
+                    if m == "catch" {
+                        let on_r = args.first().copied().unwrap_or(Value::UNDEFINED);
+                        let then_fn = self.get_prop(this, "then")?;
+                        return Ok(self.call_value(then_fn, this, &[Value::UNDEFINED, on_r])?);
+                    }
+                    if m == "then"
+                        && !matches!(
+                            this.is_heap().then(|| self.heap.get(this.heap_index())),
+                            Some(HeapObj::Promise { .. })
+                        )
+                    {
+                        return Err(Thrown(
+                            "TypeError: Promise.prototype.then called on a non-Promise".into(),
+                        ));
+                    }
+                }
                 // Number/Boolean receivers are primitive values; the rest are heap.
                 if kind == 2 {
                     self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
