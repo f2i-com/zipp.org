@@ -478,7 +478,7 @@ impl<'p> Vm<'p> {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
                 }
-                let elems = self.array_like_read(idx);
+                let elems = self.array_like_read(idx)?;
                 let tmp = self.heap.alloc(HeapObj::Array(elems));
                 return self.array_method(tmp, name, args);
             }

@@ -13,19 +13,18 @@ impl<'p> Vm<'p> {
     /// Read an array-like receiver's elements (`this.length` coerced via ToLength,
     /// then `this[0 .. length]`) into a Vec — backs the generic Array.prototype
     /// methods invoked via `.call(arrayLike, …)` on a non-array (object or string).
-    pub(crate) fn array_like_read(&mut self, idx: u32) -> Vec<Value> {
+    pub(crate) fn array_like_read(&mut self, idx: u32) -> Result<Vec<Value>, Thrown> {
         let this = Value::heap(idx);
         if let HeapObj::Array(items) = self.heap.get(idx) {
-            return items.clone();
+            return Ok(items.clone());
         }
-        // ToLength(Get(this, "length")): the length value is ToNumber-coerced via
-        // the full ToPrimitive path (`to_number_coerce`), so an array-like whose
-        // `length` is an object with `toString`/`valueOf` (or a getter) is honoured
-        // rather than read as 0 (the bare `&self` `to_number` can't run that code).
-        let len = match self.get_prop(this, "length") {
-            Ok(v) => self.to_number_coerce(v).unwrap_or(0.0),
-            Err(_) => 0.0,
-        };
+        // len = ToLength(Get(this, "length")): a throwing `length` getter, or a
+        // Symbol / throwing-valueOf length, propagates (ReturnIfAbrupt) instead of
+        // being read as 0, so a generic Array.prototype method surfaces the
+        // TypeError before any element/predicate work. The full ToPrimitive path
+        // also honours an array-like whose `length` is an object with valueOf.
+        let lv = self.get_prop(this, "length")?;
+        let len = self.to_number_coerce(lv)?;
         let len = if len.is_finite() && len > 0.0 {
             (len as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
         } else {
@@ -35,7 +34,7 @@ impl<'p> Vm<'p> {
         for i in 0..len {
             out.push(self.get_index(this, Value::int(i as i32)).unwrap_or(Value::UNDEFINED));
         }
-        out
+        Ok(out)
     }
 
     pub(crate) fn array_snapshot(&self, idx: u32) -> Vec<Value> {
