@@ -374,6 +374,20 @@ impl<'p> Vm<'p> {
                 "TypeError: Cannot perform {name} on an out-of-bounds or detached TypedArray"
             )));
         }
+        // A mutating method rejects an IMMUTABLE backing buffer (the ES2025
+        // immutable-arraybuffer write-access-mode check) BEFORE any argument
+        // coercion, comparator call, or element read — even for a length-0 array.
+        if matches!(name, "fill" | "copyWithin" | "sort" | "reverse" | "set") {
+            let buffer = match self.heap.get(idx) {
+                HeapObj::TypedArray { buffer, .. } => *buffer,
+                _ => 0,
+            };
+            if self.immutable_buffers.contains(&buffer) {
+                return Err(Thrown(format!(
+                    "TypeError: Cannot {name} a TypedArray backed by an immutable ArrayBuffer"
+                )));
+            }
+        }
         let (len, kind) = self.ta_len_kind(idx);
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
