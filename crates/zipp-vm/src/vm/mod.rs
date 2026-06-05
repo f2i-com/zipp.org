@@ -233,6 +233,12 @@ pub struct Vm<'p> {
     /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |
     /// 1=length)`. Empty in normal programs; only `delete` on these keys fills it.
     deleted_callable_intrinsics: std::collections::HashSet<(u32, u8)>,
+    /// Names of built-in globals (`Number`, `Date`, …) removed via
+    /// `delete globalThis.X`. They live in `builtin_globals`/`globals`, not as own
+    /// `global_this` entries, so deletion is recorded here and `global_by_name`
+    /// gates on it — making get/has-own/descriptor all agree the property is gone.
+    /// Empty in normal programs; cleared for a name when it's re-defined.
+    deleted_globals: std::collections::HashSet<String>,
     /// Heap indices of derived-class instances whose `super(...)` has run during
     /// construction (set by the SuperCtor ops, read+cleared in `construct`). A
     /// derived constructor that returns `undefined` without `super()` having run

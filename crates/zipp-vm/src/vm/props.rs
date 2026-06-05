@@ -1812,6 +1812,11 @@ impl<'p> Vm<'p> {
     /// `globalThis.<name>`: the value of the reserved global slot named `name`
     /// (or None if there is no such global). Backs property access on globalThis.
     pub(crate) fn global_by_name(&self, name: &str) -> Option<Value> {
+        // A built-in global removed via `delete globalThis.X` reads as absent
+        // everywhere (get / has-own / descriptor all consult this).
+        if self.deleted_globals.contains(name) {
+            return None;
+        }
         if let Some(slot) = self.program.global_names.iter().position(|n| n == name) {
             // A never-declared slot reads as "absent"; fall through to the
             // built-in table below rather than exposing the internal sentinel.

@@ -104,6 +104,29 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // `delete globalThis.X` for a built-in global (Number/Date/…): these live in
+        // builtin_globals/globals and resolve via global_by_name, NOT as own
+        // `global_this` entries — but a prior assignment (e.g. propertyHelper's
+        // writable probe does `global.X = tmp`) may have left a shadowing own entry.
+        // Remove any such entry AND record the deletion so global_by_name (consulted
+        // by get / has-own / descriptor) agrees the property is gone. The value
+        // globals NaN/Infinity/undefined are non-configurable, so they can't be
+        // deleted (any configurable own entry was already removed by the path above
+        // for a user prop; the non-configurable own case returned false earlier).
+        if idx == self.global_this
+            && self.global_this != 0
+            && self.global_by_name(key).is_some()
+        {
+            if matches!(key, "NaN" | "Infinity" | "undefined") {
+                return Value::bool(false);
+            }
+            if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                m.remove(key);
+            }
+            self.deleted_globals.insert(key.to_string());
+            self.heap.bump_version(idx);
+            return Value::bool(true);
+        }
         // The same for a non-configurable NAMED (non-index) own property stored in
         // the arr_props side table — Array/Arguments/TypedArray/Map/Set/Date/…
         // `defineProperty`'d named props. Canonical integer-index keys are excluded
