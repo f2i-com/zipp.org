@@ -825,13 +825,41 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                let src = self.iterate_or_arraylike(a0)?;
-                if offset + src.len() > len {
+                // SetTypedArrayFromTypedArray: a TypedArray source is snapshotted
+                // up front (the source buffer may overlap the target's), then
+                // written with element-type conversion.
+                if a0.is_heap()
+                    && matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
+                {
+                    let src = self.ta_snapshot(a0.heap_index());
+                    if offset + src.len() > len {
+                        return Err(Thrown(
+                            "RangeError: source array is too long for the target offset".into(),
+                        ));
+                    }
+                    for (k, v) in src.into_iter().enumerate() {
+                        self.ta_element_set(idx, offset + k, v)?;
+                    }
+                    return Ok(Some(Value::UNDEFINED));
+                }
+                // SetTypedArrayFromArrayLike: ToLength(Get(src,"length")) (a Symbol
+                // length or a throwing length.valueOf propagates the abrupt
+                // TypeError), then the RangeError bounds check BEFORE reading any
+                // element, then an interleaved Get→ToNumber/ToBigInt→write loop so a
+                // mid-iteration throw leaves the already-written elements in place
+                // ("the values are set until exception"). The source is treated as
+                // an array-like (length + integer indices), NOT iterated — matching
+                // the spec, which never invokes the source's @@iterator.
+                let len_val = self.get_prop(a0, "length")?;
+                let src_len =
+                    self.to_integer_or_zero(len_val)?.clamp(0, (1i64 << 53) - 1) as usize;
+                if offset + src_len > len {
                     return Err(Thrown(
                         "RangeError: source array is too long for the target offset".into(),
                     ));
                 }
-                for (k, v) in src.into_iter().enumerate() {
+                for k in 0..src_len {
+                    let v = self.get_index(a0, Value::num(k as f64))?;
                     self.ta_element_set(idx, offset + k, v)?;
                 }
                 Ok(Some(Value::UNDEFINED))
@@ -854,35 +882,6 @@ impl<'p> Vm<'p> {
             }
             _ => Ok(None),
         }
-    }
-
-    /// Array-like or iterable → Vec of element Values (for `TypedArray.prototype.set`
-    /// and TypedArray construction).
-    pub(crate) fn iterate_or_arraylike(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
-        if let Some(ta) = self.as_typed_array(v) {
-            return Ok(self.ta_snapshot(ta));
-        }
-        if v.is_heap() {
-            match self.heap.get(v.heap_index()) {
-                HeapObj::Array(_)
-                | HeapObj::Set(_)
-                | HeapObj::Map { .. }
-                | HeapObj::Str(_)
-                | HeapObj::Cons { .. }
-                | HeapObj::Generator { .. }
-                | HeapObj::Iterator { .. } => return self.iterate_to_vec(v),
-                _ => {}
-            }
-        }
-        // Array-like object: read length + indices 0..length.
-        let lv = self.get_prop(v, "length")?;
-        let n = self.value_num(lv);
-        let n = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            out.push(self.get_index(v, Value::num(i as f64))?);
-        }
-        Ok(out)
     }
 
     /// `DataView.prototype.get/setInt8 … getFloat64` (+ `byteLength`/`byteOffset`/
