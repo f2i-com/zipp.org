@@ -2568,6 +2568,12 @@ impl<'p> Vm<'p> {
                             let next = self.get_prop(it, "next")?;
                             if self.is_callable(next) {
                                 let res = self.call_value(next, it, &[])?;
+                                // IteratorNext step 3: a non-Object result is a TypeError.
+                                if !self.is_object_value(res) {
+                                    return Err(Thrown(
+                                        "TypeError: iterator result is not an object".into(),
+                                    ));
+                                }
                                 let done = self.get_prop(res, "done")?;
                                 let val = self.get_prop(res, "value")?;
                                 self.set(base, value_dst, val);
