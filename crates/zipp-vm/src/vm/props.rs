@@ -1362,6 +1362,14 @@ impl<'p> Vm<'p> {
         d_cf: Option<bool>,
     ) -> Result<(PropAttr, Value), Thrown> {
         let is_accessor = get.is_some() || set.is_some();
+        // The RESULT kind: a GENERIC descriptor (only enumerable/configurable) over
+        // an existing accessor PRESERVES the accessor — it must not collapse to a
+        // data property holding the getter VALUE. Only a real data descriptor
+        // (value/writable) converts an accessor to data; an accessor descriptor
+        // (get/set) always yields an accessor.
+        let desc_is_data = value.is_some() || d_wr.is_some();
+        let existing_is_accessor = existing.map_or(false, |(a, _)| a.accessor);
+        let result_accessor = is_accessor || (!desc_is_data && existing_is_accessor);
         // Start from the existing attrs (redefine) or all-false (new property).
         let (mut wr, mut en, mut cf) = match existing {
             Some((a, _)) => (a.writable, a.enumerable, a.configurable),
@@ -1424,14 +1432,14 @@ impl<'p> Vm<'p> {
             writable: wr,
             enumerable: en,
             configurable: cf,
-            accessor: is_accessor,
-            setter: if is_accessor {
+            accessor: result_accessor,
+            setter: if result_accessor {
                 set.or(existing_set).unwrap_or(Value::UNDEFINED)
             } else {
                 Value::UNDEFINED
             },
         };
-        let stored = if is_accessor {
+        let stored = if result_accessor {
             get.or(existing_get).unwrap_or(Value::UNDEFINED)
         } else {
             value.or(existing.map(|(_, v)| v)).unwrap_or(Value::UNDEFINED)
