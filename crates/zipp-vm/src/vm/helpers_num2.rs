@@ -180,23 +180,146 @@ pub(crate) fn date_to_iso(ms: f64) -> String {
     }
 }
 
+/// Abbreviated weekday names, `date_parts` weekday order (0 = Sunday).
+const WEEKDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+/// Abbreviated month names, 0-based (`date_parts` month0 order).
+const MONTH: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// A year zero-padded to at least 4 digits, a negative year sign-prefixed
+/// (`-1` → `-0001`, `20` → `0020`, `2014` → `2014`) — the year field shared by the
+/// `Date.prototype.to{,UTC,Date}String` forms.
+fn fmt_year(y: i64) -> String {
+    if y < 0 {
+        format!("-{:04}", -y)
+    } else {
+        format!("{:04}", y)
+    }
+}
+
+/// `Date.prototype.toDateString`: `"Thu Jan 01 1970"` (Weekday Mon DD YYYY, UTC).
+pub(crate) fn date_to_date_string(ms: f64) -> String {
+    let (y, mo0, d, _, _, _, _, wd) = date_parts(ms);
+    format!("{} {} {:02} {}", WEEKDAY[wd as usize], MONTH[mo0 as usize], d, fmt_year(y))
+}
+
+/// `Date.prototype.toTimeString`: `"00:00:00 GMT+0000"`. The engine is UTC-only, so
+/// the zone is always `GMT+0000` and the optional `(Zone Name)` suffix is omitted.
+pub(crate) fn date_to_time_string(ms: f64) -> String {
+    let (_, _, _, h, mi, s, _, _) = date_parts(ms);
+    format!("{:02}:{:02}:{:02} GMT+0000", h, mi, s)
+}
+
+/// `Date.prototype.toString`: DateString + " " + TimeString + TimeZone, e.g.
+/// `"Thu Jan 01 1970 00:00:00 GMT+0000"`. `"Invalid Date"` for a NaN time.
+pub(crate) fn date_to_string(ms: f64) -> String {
+    if ms.is_nan() {
+        return "Invalid Date".to_string();
+    }
+    format!("{} {}", date_to_date_string(ms), date_to_time_string(ms))
+}
+
+/// `Date.prototype.toUTCString` (and its legacy `toGMTString` alias):
+/// `"Thu, 01 Jan 1970 00:00:00 GMT"` (Weekday, DD Mon YYYY HH:MM:SS GMT).
+pub(crate) fn date_to_utc_string(ms: f64) -> String {
+    let (y, mo0, d, h, mi, s, _, wd) = date_parts(ms);
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        WEEKDAY[wd as usize], d, MONTH[mo0 as usize], fmt_year(y), h, mi, s
+    )
+}
+
+/// Parse the human/RFC date forms an engine emits via `toString`/`toUTCString`
+/// (e.g. `"Thu Jan 01 1970 00:00:00 GMT+0000"`, `"Thu, 01 Jan 1970 00:00:00 GMT"`):
+/// a leading weekday, a month name, a day, a 4+-digit (possibly negative) year, a
+/// `HH:MM[:SS]` time, and an optional `GMT±HHMM` / `GMT` / `UTC` zone. The day
+/// precedes the year in both forms. Treated as UTC when no offset is given.
+/// `Date.parse` must accept this engine's own output, so these must round-trip.
+fn parse_rfc_date(s: &str) -> f64 {
+    // Drop a trailing `(Zone Name)`; a `Wkd,` comma is just a separator.
+    let head = match s.find('(') {
+        Some(i) => &s[..i],
+        None => s,
+    };
+    let cleaned = head.replace(',', " ");
+    let mut month0: Option<i64> = None;
+    let mut time: Option<(i64, i64, i64)> = None;
+    let mut offset_min: i64 = 0;
+    let mut nums: Vec<i64> = Vec::new();
+    for tok in cleaned.split_whitespace() {
+        if let Some(m) = MONTH.iter().position(|x| x.eq_ignore_ascii_case(tok)) {
+            month0 = Some(m as i64);
+        } else if tok.contains(':') {
+            let parts: Vec<&str> = tok.split(':').collect();
+            let h = parts.first().and_then(|x| x.parse::<i64>().ok());
+            let mi = parts.get(1).and_then(|x| x.parse::<i64>().ok());
+            let se = parts.get(2).map_or(Some(0), |x| x.parse::<i64>().ok());
+            match (h, mi, se) {
+                (Some(h), Some(mi), Some(se)) => time = Some((h, mi, se)),
+                _ => return f64::NAN,
+            }
+        } else if let Some(rest) = tok.strip_prefix("GMT").or_else(|| tok.strip_prefix("UTC")) {
+            // An optional ±HHMM offset (empty rest = GMT/UTC = +0000).
+            let b = rest.as_bytes();
+            if rest.len() >= 5 && (b[0] == b'+' || b[0] == b'-') {
+                let sign = if b[0] == b'-' { -1 } else { 1 };
+                match (rest[1..3].parse::<i64>().ok(), rest[3..5].parse::<i64>().ok()) {
+                    (Some(oh), Some(om)) => offset_min = sign * (oh * 60 + om),
+                    _ => return f64::NAN,
+                }
+            } else if !rest.is_empty() {
+                return f64::NAN;
+            }
+        } else if WEEKDAY.iter().any(|w| w.eq_ignore_ascii_case(tok)) {
+            // The leading weekday name is ignored (not validated against the date).
+        } else if let Ok(n) = tok.parse::<i64>() {
+            nums.push(n);
+        } else {
+            return f64::NAN;
+        }
+    }
+    let (mo0, (h, mi, se)) = match (month0, time) {
+        (Some(m), Some(t)) => (m, t),
+        _ => return f64::NAN,
+    };
+    if nums.len() != 2 {
+        return f64::NAN;
+    }
+    // UTC = local-with-offset − offset (so GMT-0400 fields move +4h to UTC).
+    ms_from_utc(nums[1], mo0, nums[0], h, mi, se, 0) - offset_min as f64 * 60_000.0
+}
+
 /// Parse the ISO-8601 subset JS accepts (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`,
 /// optionally `THH:mm[:ss[.sss]]` and a trailing `Z`). Treated as UTC. Returns
 /// NaN if unrecognised.
 pub(crate) fn parse_date(s: &str) -> f64 {
     let s = s.trim();
+    // The human/RFC forms (toString/toUTCString) start with a weekday name; the
+    // ISO forms start with a digit or a sign. Date.parse must round-trip both.
+    if s.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
+        return parse_rfc_date(s);
+    }
     let (date, time) = match s.split_once(['T', ' ']) {
         Some((d, t)) => (d, Some(t)),
         None => (s, None),
     };
-    let dp: Vec<&str> = date.split('-').collect();
-    // A leading '-' (negative year) splits into an empty first field; reject.
+    // An ISO extended year carries an explicit sign: `-000001-07-01` (year -1) or
+    // `+002014-03-23`. Strip the sign first so the `-` field split doesn't yield an
+    // empty leading field, then apply it to the parsed year.
+    let (year_sign, date_body) = match date.strip_prefix('-') {
+        Some(rest) => (-1i64, rest),
+        None => (1i64, date.strip_prefix('+').unwrap_or(date)),
+    };
+    let dp: Vec<&str> = date_body.split('-').collect();
     if dp.is_empty() || dp[0].is_empty() {
         return f64::NAN;
     }
     let parse = |x: &str| x.parse::<i64>().ok();
     let year = match parse(dp[0]) {
-        Some(y) => y,
+        // `-000000` (negative-zero extended year) is invalid — year 0 must be
+        // written `+000000`.
+        Some(0) if year_sign < 0 => return f64::NAN,
+        Some(y) => year_sign * y,
         None => return f64::NAN,
     };
     let mo = if dp.len() > 1 { match parse(dp[1]) { Some(v) => v, None => return f64::NAN } } else { 1 };

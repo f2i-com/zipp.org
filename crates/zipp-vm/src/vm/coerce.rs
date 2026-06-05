@@ -992,14 +992,9 @@ impl<'p> Vm<'p> {
                 HeapObj::Combinator { .. } | HeapObj::CombinatorResolver { .. } => {
                     "[object Object]".into()
                 }
-                // `String(date)` / `"" + date` → the date string (ISO here).
-                HeapObj::Date(ms) => {
-                    if ms.is_nan() {
-                        "Invalid Date".into()
-                    } else {
-                        date_to_iso(*ms)
-                    }
-                }
+                // `String(date)` / `"" + date` → ToPrimitive(string) → toString(),
+                // which is the human form (NOT the ISO toISOString used by toJSON).
+                HeapObj::Date(ms) => date_to_string(*ms),
             }
         } else {
             "undefined".into()

@@ -408,14 +408,22 @@ impl<'p> Vm<'p> {
                     self.alloc_str(date_to_iso(ms))
                 }
             }
-            // Simplified: ISO (node's local/tz-formatted strings aren't matched).
-            // toGMTString is a legacy (Annex B) alias of toUTCString.
+            // The human/RFC date string forms (the engine is UTC-only, so the
+            // local `toString`/`toTimeString` zone is always GMT+0000). toGMTString
+            // is a legacy (Annex B) alias of toUTCString; the toLocale* forms reuse
+            // the corresponding non-locale formatter (no Intl locale data).
             "toString" | "toUTCString" | "toGMTString" | "toDateString" | "toTimeString"
             | "toLocaleString" | "toLocaleDateString" | "toLocaleTimeString" => {
                 if ms.is_nan() {
                     self.alloc_str("Invalid Date".to_string())
                 } else {
-                    self.alloc_str(date_to_iso(ms))
+                    let s = match name {
+                        "toDateString" | "toLocaleDateString" => date_to_date_string(ms),
+                        "toTimeString" | "toLocaleTimeString" => date_to_time_string(ms),
+                        "toUTCString" | "toGMTString" => date_to_utc_string(ms),
+                        _ => date_to_string(ms), // toString | toLocaleString
+                    };
+                    self.alloc_str(s)
                 }
             }
             // Legacy (Annex B): getYear = full year - 1900; setYear maps 0..99 to 19xx.
