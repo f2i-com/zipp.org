@@ -978,27 +978,19 @@ impl<'p> Vm<'p> {
                         // any `&mut self` below — and resolves eval functions too.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
-                        let parent = self.super_parent(home_class_id)
-                            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
-                        // Find the method up the parent's class chain.
-                        let mut method = None;
-                        let mut cur = parent.is_heap().then(|| parent.heap_index());
-                        while let Some(cidx) = cur {
-                            match self.heap.get(cidx) {
-                                HeapObj::Class(c) => {
-                                    if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
-                                        method = Some(*v);
-                                        break;
-                                    }
-                                    cur = c.parent;
-                                }
-                                _ => break,
-                            }
-                        }
-                        let m = method.ok_or_else(|| {
-                            Thrown(format!("TypeError: super.{key} is not a function"))
-                        })?;
+                        // super.m() resolves m via the super base (the home object's
+                        // [[Prototype]]) with `this` = the receiver — like a normal
+                        // property get + call (and like SuperMethodComputed). This
+                        // reaches inherited methods, accessors, and base-class super
+                        // (→ %Object.prototype%), not just own parent-class methods.
+                        let proto = self.super_base(home_class_id);
+                        // MakeSuperPropertyReference: RequireObjectCoercible(base).
+                        self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
+                        let m = self.get_member(proto, key, this)?;
+                        if !self.is_callable(m) {
+                            return Err(Thrown(format!("TypeError: super.{key} is not a function")));
+                        }
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
                             args.push(self.get(base, arg_base + i));
@@ -1008,14 +1000,15 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::SuperGet { dst, home_class_id, name } => {
-                        // `super.name` read: resolve on the superclass's prototype
-                        // with `this` = the current receiver (so a getter sees it).
+                        // `super.name` read: resolve on the super base (the home
+                        // object's [[Prototype]]) with `this` = the current receiver
+                        // (so a getter sees it). For a base class the base is
+                        // %Object.prototype%.
                         let key =
                             self.func(func_id as usize).string_constants[name as usize].clone();
-                        let parent = self
-                            .super_parent(home_class_id)
-                            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
-                        let proto = self.prototype_of(parent).unwrap_or(Value::UNDEFINED);
+                        let proto = self.super_base(home_class_id);
+                        // MakeSuperPropertyReference: RequireObjectCoercible(base).
+                        self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
                         let r = self.get_member(proto, &key, this)?;
                         self.set(base, dst, r);
@@ -1024,10 +1017,9 @@ impl<'p> Vm<'p> {
                     Instr::SuperGetComputed { dst, home_class_id, key } => {
                         let kv = self.get(base, key);
                         let ks = self.to_property_key(kv)?;
-                        let parent = self
-                            .super_parent(home_class_id)
-                            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
-                        let proto = self.prototype_of(parent).unwrap_or(Value::UNDEFINED);
+                        let proto = self.super_base(home_class_id);
+                        // MakeSuperPropertyReference: RequireObjectCoercible(base).
+                        self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
                         let r = self.get_member(proto, &ks, this)?;
                         self.set(base, dst, r);
@@ -1036,10 +1028,9 @@ impl<'p> Vm<'p> {
                     Instr::SuperMethodComputed { dst, home_class_id, key, arg_base, argc } => {
                         let kv = self.get(base, key);
                         let ks = self.to_property_key(kv)?;
-                        let parent = self
-                            .super_parent(home_class_id)
-                            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
-                        let proto = self.prototype_of(parent).unwrap_or(Value::UNDEFINED);
+                        let proto = self.super_base(home_class_id);
+                        // MakeSuperPropertyReference: RequireObjectCoercible(base).
+                        self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
                         let m = self.get_member(proto, &ks, this)?;
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);

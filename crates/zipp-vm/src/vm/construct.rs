@@ -774,10 +774,28 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `super.key = v`: PutValue on a super reference. If the superclass's
-    /// prototype chain exposes a setter for `key`, invoke it with `this` = the
-    /// receiver; otherwise create/update an own property on the receiver itself
-    /// (the spec sets on the receiver, not the prototype).
+    /// The super BASE object for a `super.x` reference inside a method of class
+    /// `home_class_id`: GetPrototypeOf(HomeObject), where HomeObject is the class's
+    /// own `prototype`. For `class C extends B` this is `B.prototype`; for a BASE
+    /// class it is `%Object.prototype%` (so `super.toString()` etc. resolve). Returns
+    /// UNDEFINED if unresolvable. (Unlike `super_parent`, this does not require a
+    /// parent class, so `super.x` works in base-class methods.)
+    pub(crate) fn super_base(&mut self, home_class_id: u32) -> Value {
+        let home = match self.class_values.get(home_class_id as usize).copied().flatten() {
+            Some(c) => c,
+            None => return Value::UNDEFINED,
+        };
+        let home_proto = match self.prototype_of(home) {
+            Some(p) => p,
+            None => return Value::UNDEFINED,
+        };
+        self.object_get_prototype_of(home_proto)
+    }
+
+    /// `super.key = v`: PutValue on a super reference. If the super base's prototype
+    /// chain exposes a setter for `key`, invoke it with `this` = the receiver;
+    /// otherwise create/update an own property on the receiver itself (the spec sets
+    /// on the receiver, not the prototype).
     pub(crate) fn super_set(
         &mut self,
         home_class_id: u32,
@@ -785,15 +803,17 @@ impl<'p> Vm<'p> {
         this: Value,
         v: Value,
     ) -> Result<(), Thrown> {
-        let parent = self
-            .super_parent(home_class_id)
-            .ok_or_else(|| Thrown("TypeError: bad super reference".into()))?;
-        let proto = self.prototype_of(parent).unwrap_or(Value::UNDEFINED);
+        let proto = self.super_base(home_class_id);
+        // MakeSuperPropertyReference: RequireObjectCoercible(GetSuperBase()).
+        self.require_object_coercible(proto)?;
         let setter = self.lookup_accessor(proto, key, true);
         if self.is_callable(setter) {
             self.call_value(setter, this, &[v])?;
         } else {
-            self.set_prop(this, key, v, false)?;
+            // `super.x = v` PutValue sets on the receiver. `super` only appears in
+            // class methods, which are always strict — so a failed [[Set]] (e.g. a
+            // frozen receiver) is a TypeError, not a silent no-op.
+            self.set_prop(this, key, v, true)?;
         }
         Ok(())
     }

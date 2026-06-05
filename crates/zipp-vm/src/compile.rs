@@ -354,6 +354,11 @@ struct Compiler {
     /// Empty at script level, so script-level class methods keep free vars as
     /// globals. Saved/restored around each class to handle nesting.
     class_enclosing: Vec<EnclosingFn>,
+    /// True while compiling the methods of a DERIVED class (`class X extends …`):
+    /// gates `super(...)` (a base class's constructor calling `super()` is an early
+    /// SyntaxError). `super.x` property access is allowed in ANY class method, so it
+    /// uses the per-method home-class id instead. Saved/restored around each class.
+    class_derived: bool,
     /// Global slots bound by a top-level `const` (immutable): assignment to one
     /// is a runtime TypeError.
     const_globals: HashSet<u32>,
@@ -371,6 +376,7 @@ impl Compiler {
             eval_mode: false,
             in_strict: false,
             class_enclosing: Vec::new(),
+            class_derived: false,
             const_globals: HashSet::new(),
         }
     }
@@ -606,6 +612,7 @@ impl Compiler {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = true;
         fc.super_class = super_class;
+        fc.derived_class = fc.cx.class_derived;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
         fc.reserve_arguments(); // class methods/ctors bind `arguments`
@@ -700,6 +707,10 @@ impl Compiler {
         // arrows already capture), so propagating the enclosing method's compile-time
         // home-class id is sufficient.
         fc.super_class = super_class;
+        // An arrow inherits the enclosing method's derived-ness (so `super(...)` in an
+        // arrow inside a derived constructor is allowed). `cx.class_derived` still
+        // reflects the enclosing class while its method bodies (and their arrows) compile.
+        fc.derived_class = fc.cx.class_derived;
         fc.in_async = a.r#async;
         fc.bind_params(&a.params)?;
         if a.expression {
@@ -843,9 +854,13 @@ struct FnCompiler<'a> {
     /// whether the body actually referenced `arguments` (gates building it).
     arguments_reg: Option<Reg>,
     uses_arguments: bool,
-    /// When compiling a class method/constructor whose class `extends P`, the
-    /// class_id of `P` — so `super(…)` / `super.m(…)` resolve to its members.
+    /// When compiling a class method/constructor, THIS class's class_id — the home
+    /// for `super.x`/`super.m()`, which resolve at runtime via the home prototype's
+    /// [[Prototype]] (so they work in base classes too, reaching %Object.prototype%).
     super_class: Option<u32>,
+    /// True only inside a DERIVED class's methods — gates `super(...)` (calling it in
+    /// a base class constructor is an early SyntaxError). `super.x` is not gated.
+    derived_class: bool,
     /// When set, `this` resolves to this register instead of reg 0. Used while
     /// evaluating static field initializers inline at class-definition time,
     /// where `this` must be the class value (not the enclosing `this`) — without
@@ -967,6 +982,7 @@ impl<'a> FnCompiler<'a> {
             arguments_reg: None,
             uses_arguments: false,
             super_class: None,
+            derived_class: false,
             this_override: None,
             pattern_block_local: false,
             in_generator: false,
@@ -1954,13 +1970,17 @@ impl<'a> FnCompiler<'a> {
         let saved_enclosing = std::mem::take(&mut self.cx.class_enclosing);
         let chain = self.child_enclosing();
         self.cx.class_enclosing = chain;
-        // `super` resolves its target at RUNTIME via this class's own
-        // `ClassData.parent` (set by MakeClass from the evaluated `extends`
-        // expression). So methods of a derived class carry THIS class's id as
-        // their super context — which lets `extends <any expression>` (mixins,
-        // conditionals, built-ins, class expressions) work, not just
-        // `extends <identifier-of-an-earlier-class>`.
-        let super_class_id = class.super_class.as_ref().map(|_| class_id);
+        // `super.x` resolves its target at RUNTIME via this class's prototype's
+        // [[Prototype]] (the parent's prototype for a derived class, %Object.prototype%
+        // for a base class). EVERY class method carries THIS class's id as its super
+        // (home-class) context — so `super.x`/`super.m()` work in base classes too;
+        // `super(...)` is separately gated on `class_derived` below. Carrying the
+        // class id (not the parent) also lets `extends <any expression>` (mixins,
+        // conditionals, built-ins, class expressions) work.
+        let super_class_id = Some(class_id);
+        // Gate `super(...)`: only a derived class's constructor may call it.
+        let saved_derived = self.cx.class_derived;
+        self.cx.class_derived = class.super_class.is_some();
         let mut ctor_fn: Option<&ox::Function> = None;
         // Each method's value-Function start byte → its MethodDefinition span, so
         // `Function.prototype.toString` can recover the exact `m() {}` / `get x()
@@ -2289,6 +2309,7 @@ impl<'a> FnCompiler<'a> {
             source: self.cx.src_slice(class.span.start, class.span.end),
         };
         self.cx.class_enclosing = saved_enclosing;
+        self.cx.class_derived = saved_derived;
         Ok((class_id, static_fields, computed_defs, computed_fields_ordered, static_block_fns))
     }
 
@@ -4883,6 +4904,9 @@ impl<'a> FnCompiler<'a> {
             // here (before the generic branches) because `super` is not a value
             // and would fail `expr(callee)`.
             if matches!(&c.callee, ox::Expression::Super(_)) {
+                if !self.derived_class {
+                    return Err("`super(...)` is only valid in a derived class constructor".into());
+                }
                 let pid = self
                     .super_class
                     .ok_or("`super(...)` is only valid in a derived class constructor")?;
@@ -4924,6 +4948,9 @@ impl<'a> FnCompiler<'a> {
 
         // `super(args)` — run the superclass constructor on the current `this`.
         if matches!(&c.callee, ox::Expression::Super(_)) {
+            if !self.derived_class {
+                return Err("`super(...)` is only valid in a derived class constructor".into());
+            }
             let pid = self
                 .super_class
                 .ok_or("`super(...)` is only valid in a derived class constructor")?;
