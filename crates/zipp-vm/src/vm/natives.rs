@@ -196,6 +196,10 @@ impl<'p> Vm<'p> {
                 // `Symbol.prototype[Symbol.toPrimitive](hint)` → the Symbol itself.
                 self.this_symbol_value(this, "[Symbol.toPrimitive]")?
             }
+            FN_HAS_INSTANCE => {
+                // `Function.prototype[Symbol.hasInstance](V)` → OrdinaryHasInstance.
+                Value::bool(self.ordinary_has_instance(this, a0)?)
+            }
             DATE_TO_PRIMITIVE => {
                 // `Date.prototype[Symbol.toPrimitive](hint)`: O must be an Object.
                 // hint "string"/"default" → OrdinaryToPrimitive(O, "string"),

@@ -306,6 +306,20 @@ impl<'p> Vm<'p> {
         let obj_proto = self.obj_proto;
         let arr_proto = self.arr_proto;
         let fn_proto = self.fn_proto;
+        // Function.prototype[Symbol.hasInstance]: OrdinaryHasInstance as a method,
+        // with the spec-mandated { writable:false, enumerable:false,
+        // configurable:false } — the only non-configurable @@-method on a builtin.
+        let fn_has_instance = Value::heap(self.heap.alloc(HeapObj::Native(FN_HAS_INSTANCE)));
+        let non_config_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        if let HeapObj::Object(p) = self.heap.get_mut(fn_proto) {
+            p.define("@@hasInstance", fn_has_instance, non_config_attr);
+        }
         let object_ctor = build(
             self,
             &[

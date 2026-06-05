@@ -1362,7 +1362,15 @@ impl<'p> Vm<'p> {
                         // fall through to the prototype-chain check below.)
                         if c.is_heap() {
                             let hi = self.get_prop(c, "@@hasInstance")?;
-                            if self.is_callable(hi) {
+                            // The built-in Function.prototype[@@hasInstance] is
+                            // OrdinaryHasInstance, already implemented by the kind
+                            // dispatch below (which also handles classes / built-in
+                            // constructors); skip it so only a USER-overridden
+                            // @@hasInstance intercepts here.
+                            let is_builtin = hi.is_heap()
+                                && matches!(self.heap.get(hi.heap_index()),
+                                    HeapObj::Native(n) if *n == native::FN_HAS_INSTANCE);
+                            if self.is_callable(hi) && !is_builtin {
                                 let res = self.call_value(hi, c, &[v])?;
                                 let b = self.truthy(res);
                                 self.set(base, dst, Value::bool(b));

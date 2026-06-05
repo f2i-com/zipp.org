@@ -661,6 +661,15 @@ impl<'p> Vm<'p> {
     /// `v instanceof F` for a constructor FUNCTION `F`: true iff `F.prototype` is
     /// somewhere in `v`'s prototype chain.
     pub(crate) fn instanceof_via_proto(&mut self, v: Value, ctor: Value) -> bool {
+        // A bound function's instanceof uses the [[BoundTargetFunction]]'s
+        // prototype (OrdinaryHasInstance step 2) — unwrap the bind chain.
+        let mut ctor = ctor;
+        for _ in 0..1000 {
+            match ctor.is_heap().then(|| self.heap.get(ctor.heap_index())) {
+                Some(HeapObj::Bound { target, .. }) => ctor = *target,
+                _ => break,
+            }
+        }
         let target = match self.prototype_of(ctor) {
             Some(p) => p,
             None => return false,
@@ -676,6 +685,60 @@ impl<'p> Vm<'p> {
             cur = self.object_get_prototype_of(cur);
         }
         false
+    }
+
+    /// OrdinaryHasInstance(C, O) — the algorithm behind both the default
+    /// `Function.prototype[Symbol.hasInstance]` method and the `instanceof`
+    /// operator's non-overridden path. A bound function resolves to its target; a
+    /// throwing `prototype` getter / non-object prototype propagates per spec
+    /// (unlike the operator's cached-prototype fast path).
+    pub(crate) fn ordinary_has_instance(&mut self, c: Value, v: Value) -> Result<bool, Thrown> {
+        if !self.is_callable(c) {
+            return Ok(false);
+        }
+        // A bound function uses its [[BoundTargetFunction]] (recursively).
+        if let Some(HeapObj::Bound { target, .. }) =
+            c.is_heap().then(|| self.heap.get(c.heap_index()))
+        {
+            let t = *target;
+            return self.ordinary_has_instance(t, v);
+        }
+        if !self.is_object_value(v) {
+            return Ok(false);
+        }
+        // C.prototype: a non-object DATA reassignment (`f.prototype = undefined`)
+        // is recorded in fn_props because the lazy prototype cache only holds
+        // object prototypes (get_prop returns that cache), so read such an override
+        // directly. An accessor (`defineProperty` get) or an object prototype still
+        // goes through get_prop — so a throwing prototype getter propagates.
+        let data_override = if c.is_heap() {
+            self.fn_props.get(&c.heap_index()).and_then(|m| {
+                m.pos("prototype")
+                    .and_then(|i| (!m.attrs[i].accessor).then(|| m.vals[i]))
+            })
+        } else {
+            None
+        };
+        let p = match data_override {
+            Some(v) => v,
+            None => self.get_prop(c, "prototype")?,
+        };
+        if !self.is_object_value(p) {
+            return Err(Thrown(
+                "TypeError: Function has non-object prototype in instanceof check".into(),
+            ));
+        }
+        let mut cur = self.object_get_prototype_of(v);
+        for _ in 0..10_000 {
+            if !cur.is_heap() {
+                return Ok(false);
+            }
+            if cur == p {
+                return Ok(true);
+            }
+            cur = self.object_get_prototype_of(cur);
+        }
+        Ok(false)
     }
 
     /// True iff `v` is an object whose class chain includes the class at heap
