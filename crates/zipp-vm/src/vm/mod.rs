@@ -239,6 +239,12 @@ pub struct Vm<'p> {
     /// gates on it — making get/has-own/descriptor all agree the property is gone.
     /// Empty in normal programs; cleared for a name when it's re-defined.
     deleted_globals: std::collections::HashSet<String>,
+    /// Heap indices of arrays whose `length` was made non-writable via
+    /// `Object.defineProperty(arr, "length", { writable: false })`. An array's
+    /// length lives in the dense Vec with no per-array attribute state, so the
+    /// (rare) non-writable flag is recorded here — read by the length descriptor,
+    /// `arr.length = n`, and the push/pop/shift/unshift mutators.
+    array_length_nonwritable: std::collections::HashSet<u32>,
     /// Heap indices of derived-class instances whose `super(...)` has run during
     /// construction (set by the SuperCtor ops, read+cleared in `construct`). A
     /// derived constructor that returns `undefined` without `super()` having run

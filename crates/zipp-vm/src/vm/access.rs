@@ -406,6 +406,12 @@ impl<'p> Vm<'p> {
             if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
                 return Err(Thrown("RangeError: Invalid array length".into()));
             }
+            // A `defineProperty`'d non-writable `length` rejects assignment (sloppy
+            // no-op / strict TypeError) — the ToNumber/RangeError coercion above
+            // still runs first, per OrdinarySet.
+            if self.array_length_nonwritable.contains(&idx) {
+                return self.reject_write("length", strict);
+            }
             if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
                 return Err(Thrown(
                     "RangeError: array length exceeds the engine's dense-array limit".into(),

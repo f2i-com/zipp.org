@@ -97,6 +97,7 @@ impl<'p> Vm<'p> {
             ta_tracking: std::collections::HashSet::new(),
             deleted_callable_intrinsics: std::collections::HashSet::new(),
             deleted_globals: std::collections::HashSet::new(),
+            array_length_nonwritable: std::collections::HashSet::new(),
             super_called: std::collections::HashSet::new(),
             obj_proto: 0,
             fn_proto: 0,

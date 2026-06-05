@@ -777,7 +777,8 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => {
                 if key == "length" {
                     let len = len_value(items.len());
-                    return self.make_data_descriptor(len, true, false, false);
+                    let writable = !self.array_length_nonwritable.contains(&idx);
+                    return self.make_data_descriptor(len, writable, false, false);
                 }
                 let dense_len = items.len();
                 // A special index override (defineProperty'd attrs/accessor) OR a
@@ -1505,12 +1506,36 @@ impl<'p> Vm<'p> {
                 }
             }
             if key == "length" {
-                // `length` is a non-configurable, non-enumerable, WRITABLE data
-                // property (ArraySetLength, 15.4.5.1). Reject making it configurable
-                // or enumerable, or turning it into an accessor.
-                let (value, get, set, _d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
+                // `length` is a non-configurable, non-enumerable data property
+                // (ArraySetLength, 15.4.5.1) — writable by default. Reject making it
+                // configurable or enumerable, or turning it into an accessor.
+                let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
                 if get.is_some() || set.is_some() || d_cf == Some(true) || d_en == Some(true) {
                     return Err(Thrown("TypeError: Cannot redefine property: length".into()));
+                }
+                let cur_writable = !self.array_length_nonwritable.contains(&idx);
+                let cur_len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
+                // A non-configurable, NON-writable `length`: it can't be made writable
+                // again, and its value can only be "redefined" to the SAME length.
+                if !cur_writable {
+                    if d_wr == Some(true) {
+                        return Err(Thrown("TypeError: Cannot redefine property: length".into()));
+                    }
+                    if let Some(v) = value {
+                        let n = self.to_number_coerce(v)?;
+                        if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
+                            return Err(Thrown("RangeError: Invalid array length".into()));
+                        }
+                        if n as usize != cur_len {
+                            return Err(Thrown(
+                                "TypeError: Cannot redefine property: length".into(),
+                            ));
+                        }
+                    }
+                    return Ok(());
                 }
                 if let Some(v) = value {
                     let n = self.to_number_coerce(v)?;
@@ -1551,6 +1576,11 @@ impl<'p> Vm<'p> {
                         items.resize(new_len, Value::UNDEFINED);
                     }
                     self.heap.bump_version(idx);
+                }
+                // Record a newly non-writable length (writable was true above) so
+                // future writes / mutators / the descriptor honour it.
+                if d_wr == Some(false) {
+                    self.array_length_nonwritable.insert(idx);
                 }
                 return Ok(());
             }
