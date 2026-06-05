@@ -143,6 +143,19 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // A String wrapper's `length` and in-range char indices are non-configurable
+        // exotic own props — `delete` fails (false). A named own prop (`s.foo`) falls
+        // through to the generic deletion below.
+        if matches!(self.heap.get(idx), HeapObj::Boxed { kind: 0, .. }) {
+            let blocked = key == "length"
+                || self
+                    .string_exotic_chars(obj)
+                    .and_then(|(_, len)| canonical_index_str(key).map(|i| i < len))
+                    .unwrap_or(false);
+            if blocked {
+                return Value::bool(false);
+            }
+        }
         // A TypedArray's in-bounds integer index is a non-configurable exotic own
         // property: `delete ta[0]` fails (false). An out-of-range / non-index key
         // falls through to the named-property (arr_props) deletion below.
@@ -319,6 +332,20 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
+        // A String wrapper (`new String("ab")`) is a String exotic: `length` and its
+        // in-range char indices are non-writable, non-configurable own data props, so
+        // assigning them is a sloppy no-op / a strict TypeError. Other keys
+        // (`s.foo = 1`) fall through to the ordinary named-property path below.
+        if key != "__proto__" && matches!(self.heap.get(idx), HeapObj::Boxed { kind: 0, .. }) {
+            let blocked = key == "length"
+                || self
+                    .string_exotic_chars(obj)
+                    .and_then(|(_, len)| canonical_index_str(key).map(|i| i < len))
+                    .unwrap_or(false);
+            if blocked {
+                return self.reject_write(key, strict);
+            }
+        }
         // `o.__proto__ = v` invokes the inherited Object.prototype.__proto__
         // setter: an object/null value runs [[SetPrototypeOf]] (the setter throws a
         // TypeError if it is rejected — a non-extensible target, a cycle, or the

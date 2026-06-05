@@ -257,6 +257,15 @@ pub(crate) fn spec_key_order(keys: &[String]) -> Vec<usize> {
     ints.into_iter().map(|(_, i)| i).chain(rest).collect()
 }
 
+/// A canonical non-negative integer property key as a usize index — "0", "1",
+/// "10" but NOT "00", "01", "-1", "1.5", "" or " 1" (no leading zeros / sign /
+/// fraction / whitespace). Mirrors the array-index canonicality used by
+/// `spec_key_order`. Used to index strings/arrays by a string key (`s["0"]`).
+pub(crate) fn canonical_index_str(k: &str) -> Option<usize> {
+    let i: usize = k.parse().ok()?;
+    (i.to_string() == k).then_some(i)
+}
+
 pub(crate) fn array_index(key: Value) -> Option<usize> {
     if key.is_int() {
         let i = key.as_int();

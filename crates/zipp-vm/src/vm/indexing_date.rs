@@ -65,11 +65,25 @@ impl<'p> Vm<'p> {
         }
         // A boxed String indexes its wrapped string (chars / length); a boxed
         // Number/Boolean has no index, so computed access goes through the prototype.
-        if let HeapObj::Boxed { kind, value } = self.heap.get(obj.heap_index()) {
-            let (k, v) = (*kind, *value);
+        if let HeapObj::Boxed { kind, .. } = self.heap.get(obj.heap_index()) {
+            let k = *kind;
             if k == 0 {
-                return self.get_index(v, key);
+                // A String wrapper is a String exotic: an in-range char index
+                // (numeric Value or canonical numeric-string) reads the wrapped
+                // string; any other key (an assigned/defineProperty'd own prop in
+                // arr_props, `length`, or a method) resolves on the WRAPPER so own
+                // properties aren't lost to the primitive.
+                let ks = self.key_of(key);
+                if let Some((sval, len)) = self.string_exotic_chars(obj) {
+                    if let Some(i) = array_index(key).or_else(|| canonical_index_str(&ks)) {
+                        if i < len {
+                            return self.get_index(sval, Value::int(i as i32));
+                        }
+                    }
+                }
+                return self.get_prop(obj, &ks);
             }
+            // A boxed Number/Boolean has no index — go through the prototype.
             let key_s = self.key_of(key);
             return self.get_prop(obj, &key_s);
         }
@@ -158,9 +172,15 @@ impl<'p> Vm<'p> {
                 Ok(map.get(&k).unwrap_or(Value::UNDEFINED))
             }
             HeapObj::Str(s) => {
-                // Numeric key (incl. an integral double — a JIT region produces
-                // f64 indices, and a deopted string index must agree): char at i.
-                if let Some(i) = array_index(key) {
+                // A numeric Value key (the hot path — incl. an integral double, since
+                // a JIT region produces f64 indices and a deopted string index must
+                // agree), OR a canonical numeric-STRING key (`"abc"["0"]`). The
+                // numeric form is checked FIRST so `s[i]` never pays the string parse.
+                let i_opt = match array_index(key) {
+                    Some(i) => Some(i),
+                    None => canonical_index_str(&self.key_of(key)),
+                };
+                if let Some(i) = i_opt {
                     // A single ASCII char is interned at heap index == its byte
                     // (see Heap::new), so return that slot DIRECTLY — no temporary
                     // 1-char String + re-intern per access (that alloc dominated
@@ -181,7 +201,7 @@ impl<'p> Vm<'p> {
                         None => return Ok(Value::UNDEFINED),
                     }
                 }
-                // Non-numeric key: `s["length"]`, else resolve via String.prototype
+                // Non-index key: `s["length"]`, else resolve via String.prototype
                 // (a computed method name / `@@iterator`), mirroring dot access.
                 let char_len = s.char_len;
                 let k = self.key_of(key);

@@ -1209,6 +1209,24 @@ impl<'p> Vm<'p> {
                 .unwrap_or(false),
             // A class's own (static) properties live in `ClassData.statics`.
             HeapObj::Class(c) => c.statics.pos(key).map_or(false, |i| c.statics.attrs[i].enumerable),
+            // A String wrapper's char indices are own ENUMERABLE props; `length` is
+            // non-enumerable; an assigned own prop lives in the arr_props side table.
+            HeapObj::Boxed { kind: 0, .. } => {
+                if key == "length" {
+                    false
+                } else if self
+                    .string_exotic_chars(obj)
+                    .and_then(|(_, len)| canonical_index_str(key).map(|i| i < len))
+                    .unwrap_or(false)
+                {
+                    true
+                } else {
+                    self.arr_props
+                        .get(&obj.heap_index())
+                        .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
+                        .unwrap_or(false)
+                }
+            }
             _ => false,
         }
     }
