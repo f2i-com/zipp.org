@@ -304,6 +304,18 @@ impl<'p> Vm<'p> {
                 ));
             }
         }
+        // A NEW index (past the current length) on a non-extensible array adds an own
+        // property → rejected (sloppy no-op / strict TypeError). An in-range index is
+        // already present and stays writable. (Checked before the &mut borrow below.)
+        if let Some(i) = array_index(key) {
+            let present = matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
+            if !present
+                && matches!(self.heap.get(idx), HeapObj::Array(_))
+                && self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
+            {
+                return self.reject_write(&self.key_of(key), strict);
+            }
+        }
         match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 // Numeric key (incl. an integral double — the JIT region produces

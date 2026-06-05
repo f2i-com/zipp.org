@@ -507,6 +507,14 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                // A NEW own property on a non-extensible function is rejected (the
+                // extensibility flag lives in the arr_props side table). The intrinsic
+                // name/length/prototype already exist, so they are not "new".
+                let present = matches!(key, "name" | "length" | "prototype")
+                    || self.fn_props.get(&idx).map_or(false, |m| m.pos(key).is_some());
+                if !present && self.arr_props.get(&idx).map_or(false, |m| !m.extensible) {
+                    return self.reject_write(key, strict);
+                }
                 self.fn_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             }
             return Ok(());
@@ -543,6 +551,14 @@ impl<'p> Vm<'p> {
                         self.heap.bump_version(idx);
                         return Ok(());
                     }
+                    // A NEW index (past the current length) on a non-extensible array
+                    // adds an own property → rejected (sloppy no-op / strict TypeError).
+                    // An in-range index is already present and stays writable.
+                    let present =
+                        matches!(self.heap.get(idx), HeapObj::Array(items) if n < items.len());
+                    if !present && self.arr_props.get(&idx).map_or(false, |m| !m.extensible) {
+                        return self.reject_write(key, strict);
+                    }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         if n >= items.len() {
                             items.resize(n + 1, Value::UNDEFINED);
@@ -552,6 +568,14 @@ impl<'p> Vm<'p> {
                     self.heap.bump_version(idx);
                     return Ok(());
                 }
+            }
+            // A NEW named own prop on a non-extensible array is rejected.
+            if self
+                .arr_props
+                .get(&idx)
+                .map_or(false, |m| !m.extensible && m.pos(key).is_none())
+            {
+                return self.reject_write(key, strict);
             }
             let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             if added {
@@ -571,6 +595,15 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(());
                 }
+            }
+            // A NEW named own prop on a non-extensible TypedArray is rejected (its
+            // integer indices are exotic and handled above, so this is named-only).
+            if self
+                .arr_props
+                .get(&idx)
+                .map_or(false, |m| !m.extensible && m.pos(key).is_none())
+            {
+                return self.reject_write(key, strict);
             }
             let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
             if added {
