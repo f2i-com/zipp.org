@@ -866,6 +866,18 @@ impl<'p> Vm<'p> {
         {
             return self.array_like_search(Value::heap(idx), name, args);
         }
+        // push/pop/shift/unshift end with Set(O,"length",…,true); on a FROZEN array
+        // `length` is non-writable, so they throw a TypeError — even when no element
+        // changes (pop/shift on an empty array, push/unshift with no args still set
+        // `length`). (A SEALED-but-not-frozen array keeps `length` writable, so it is
+        // not gated here; its add/delete failures are a separate concern.)
+        if matches!(name, "push" | "pop" | "shift" | "unshift")
+            && self.arr_props.get(&idx).map_or(false, |m| m.is_frozen())
+        {
+            return Err(Thrown(
+                "TypeError: Cannot assign to read only property 'length' of object '[object Array]'".into(),
+            ));
+        }
         match name {
             "push" => {
                 let mut last = Value::UNDEFINED;

@@ -2161,7 +2161,19 @@ impl<'p> Vm<'p> {
                         // per-element array idiom. Append directly, skipping the
                         // try_builtin_method → dispatch_builtin_method → array_method
                         // layering (and the args-gather), then return the new length.
-                        if argc == 1 && key == "push" && recv.is_heap() {
+                        // A FROZEN array must throw (length non-writable) — skip the
+                        // fast path so it routes through array_method's frozen guard.
+                        // The arr_props side table is empty for an ordinary array, so
+                        // the guard is a no-op lookup in the common build-a-list case.
+                        if argc == 1
+                            && key == "push"
+                            && recv.is_heap()
+                            && !(!self.arr_props.is_empty()
+                                && self
+                                    .arr_props
+                                    .get(&recv.heap_index())
+                                    .map_or(false, |m| m.is_frozen()))
+                        {
                             let v = self.get(base, arg_base);
                             let len = if let HeapObj::Array(items) =
                                 self.heap.get_mut(recv.heap_index())
