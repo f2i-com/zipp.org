@@ -1486,14 +1486,19 @@ impl<'p> Vm<'p> {
             }
             _ => 3, // Array named prop + exotic objects -> arr_props side table
         };
-        // A callable's/class's `name`/`length`/`prototype` are synthesized; accept
-        // the call but don't shadow them (full redefinition isn't modelled).
-        if target != 0 && matches!(key, "name" | "length" | "prototype") {
+        // A callable's/class's `prototype` is synthesized; accept the redefinition
+        // but don't shadow it (full `prototype` redefinition isn't modelled). `name`
+        // and `length` ARE redefinable: they fall through and are stored as explicit
+        // own props (fn_props for a function, class statics), seeding `existing` from
+        // the synthesized intrinsic below so a value-only redefine keeps the
+        // {writable:false, enumerable:false, configurable:true} attrs and counts as a
+        // redefinition (not a brand-new property the extensible check could block).
+        if target != 0 && key == "prototype" {
             return Ok(());
         }
         let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
         // The existing descriptor lives wherever `target` writes (below).
-        let existing = match target {
+        let mut existing = match target {
             0 => match self.heap.get(idx) {
                 HeapObj::Object(m) => m.pos(key).map(|i| (m.attrs[i], m.vals[i])),
                 _ => None,
@@ -1505,6 +1510,27 @@ impl<'p> Vm<'p> {
             3 => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
             _ => self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
+        // A first `name`/`length` redefine on a callable/class: seed `existing` from
+        // the synthesized intrinsic (a configurable data property) so the merge
+        // treats it as a redefinition that preserves writable:false/enumerable:false.
+        if existing.is_none()
+            && (target == 1 || target == 2)
+            && matches!(key, "name" | "length")
+            && self.callable_has_intrinsic(obj, key)
+        {
+            if let Some(v) = self.callable_intrinsic_value(obj, key) {
+                existing = Some((
+                    PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    },
+                    v,
+                ));
+            }
+        }
         let extensible = match self.heap.get(idx) {
             HeapObj::Object(m) => m.extensible,
             _ => true,
@@ -1528,6 +1554,13 @@ impl<'p> Vm<'p> {
             _ => {
                 self.fn_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
             }
+        }
+        // A redefined callable/class `name`/`length` now lives as an explicit own
+        // prop; suppress the synthesized intrinsic so it neither double-counts in
+        // own-key enumeration nor reappears after a later `delete`.
+        if (target == 1 || target == 2) && matches!(key, "name" | "length") {
+            self.deleted_callable_intrinsics
+                .insert((idx, if key == "name" { 0 } else { 1 }));
         }
         self.heap.bump_version(idx);
         Ok(())
@@ -1831,14 +1864,55 @@ impl<'p> Vm<'p> {
                 }
                 // A bound function F: name is "bound " + target.name, and length is
                 // max(0, target.length - boundArgsCount) when the target has a
-                // numeric length (BoundFunctionCreate / SetFunctionLength+Name).
+                // numeric length (BoundFunctionCreate / SetFunctionLength+Name). Read
+                // the target's EFFECTIVE name/length so a `defineProperty`-redefined
+                // value flows through to the bound function.
                 let nbound = args.len() as i32;
                 let (tname, tlen) =
-                    self.callable_name_length(*target).unwrap_or((String::new(), 0));
+                    self.effective_name_length(*target).unwrap_or((String::new(), 0));
                 Some((format!("bound {tname}"), (tlen - nbound).max(0)))
             }
             _ => None,
         }
+    }
+
+    /// A callable's EFFECTIVE name/length: its synthesized intrinsic overlaid with
+    /// any value redefined via `Object.defineProperty(fn, "name"|"length", …)`
+    /// (stored in fn_props for a function, statics for a class). Used by `bind` so a
+    /// bound function's name/length derive from the target's CURRENT values, not the
+    /// frozen intrinsic. A non-string redefined `name` yields "" (per SetFunctionName,
+    /// which only adopts a String target name); a non-finite/non-numeric `length`
+    /// yields 0.
+    pub(crate) fn effective_name_length(&self, obj: Value) -> Option<(String, i32)> {
+        let (mut name, mut len) = self.callable_name_length(obj)?;
+        if obj.is_heap() {
+            let idx = obj.heap_index();
+            let name_ovr = match self.heap.get(idx) {
+                HeapObj::Class(c) => c.statics.pos("name").map(|i| c.statics.vals[i]),
+                _ => self.fn_props.get(&idx).and_then(|m| m.pos("name").map(|i| m.vals[i])),
+            };
+            let len_ovr = match self.heap.get(idx) {
+                HeapObj::Class(c) => c.statics.pos("length").map(|i| c.statics.vals[i]),
+                _ => self.fn_props.get(&idx).and_then(|m| m.pos("length").map(|i| m.vals[i])),
+            };
+            if let Some(v) = name_ovr {
+                name = if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
+                    self.display(v)
+                } else {
+                    String::new()
+                };
+            }
+            if let Some(v) = len_ovr {
+                len = if v.is_int() {
+                    v.as_int() as i32
+                } else if v.is_double() && v.as_f64().is_finite() {
+                    v.as_f64() as i32
+                } else {
+                    0
+                };
+            }
+        }
+        Some((name, len))
     }
 
     /// SetFunctionName for an object-literal accessor / computed member whose name
