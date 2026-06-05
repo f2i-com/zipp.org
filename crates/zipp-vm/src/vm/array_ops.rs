@@ -455,6 +455,241 @@ impl<'p> Vm<'p> {
         Ok(Some(this))
     }
 
+    // ── generic (array-like) mutators: the abstract Get/Set/HasProperty/
+    // DeletePropertyOrThrow + ToLength(length)/Set(length) protocol, so
+    // `Array.prototype.<m>.call({0:…, length:n}, …)` mutates a plain object. Real
+    // arrays use the dense fast paths in `array_method`; these run only for a
+    // non-array `this`. ──
+
+    /// ToLength(Get(O, "length")) — clamped to [0, 2^53-1].
+    fn al_len(&mut self, this: Value) -> Result<i64, Thrown> {
+        let lv = self.get_prop(this, "length")?;
+        let lenf = self.to_number_coerce(lv)?;
+        Ok(if lenf.is_nan() || lenf <= 0.0 {
+            0
+        } else {
+            lenf.floor().min(9_007_199_254_740_991.0) as i64
+        })
+    }
+    /// Set(O, "length", n, true).
+    fn al_set_len(&mut self, this: Value, n: i64) -> Result<(), Thrown> {
+        self.set_prop(this, "length", Value::num(n as f64), true)
+    }
+    fn al_has(&self, this: Value, i: i64) -> bool {
+        self.has_property(this, Value::num(i as f64))
+    }
+    fn al_get(&mut self, this: Value, i: i64) -> Result<Value, Thrown> {
+        self.get_index(this, Value::num(i as f64))
+    }
+    fn al_set(&mut self, this: Value, i: i64, v: Value) -> Result<(), Thrown> {
+        self.set_index(this, Value::num(i as f64), v, true)
+    }
+    /// DeletePropertyOrThrow(O, i).
+    fn al_del(&mut self, this: Value, i: i64) -> Result<(), Thrown> {
+        let r = self.delete_property(this, &i.to_string())?;
+        if !self.truthy(r) {
+            return Err(Thrown(format!(
+                "TypeError: Cannot delete property '{i}' of an array-like object"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn array_like_mutate(
+        &mut self,
+        this: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
+        const MAX_SAFE: i64 = 9_007_199_254_740_991;
+        let _gc = self.gc_lock_guard();
+        let len = self.al_len(this)?;
+        let r = match name {
+            "push" => {
+                let argc = args.len() as i64;
+                if len + argc > MAX_SAFE {
+                    return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
+                }
+                let mut n = len;
+                for &item in args {
+                    self.al_set(this, n, item)?;
+                    n += 1;
+                }
+                self.al_set_len(this, n)?;
+                Value::num(n as f64)
+            }
+            "pop" => {
+                if len == 0 {
+                    self.al_set_len(this, 0)?;
+                    Value::UNDEFINED
+                } else {
+                    let i = len - 1;
+                    let el = self.al_get(this, i)?;
+                    self.al_del(this, i)?;
+                    self.al_set_len(this, i)?;
+                    el
+                }
+            }
+            "shift" => {
+                if len == 0 {
+                    self.al_set_len(this, 0)?;
+                    Value::UNDEFINED
+                } else {
+                    let first = self.al_get(this, 0)?;
+                    let mut k = 1;
+                    while k < len {
+                        if self.al_has(this, k) {
+                            let v = self.al_get(this, k)?;
+                            self.al_set(this, k - 1, v)?;
+                        } else {
+                            self.al_del(this, k - 1)?;
+                        }
+                        k += 1;
+                    }
+                    self.al_del(this, len - 1)?;
+                    self.al_set_len(this, len - 1)?;
+                    first
+                }
+            }
+            "unshift" => {
+                let argc = args.len() as i64;
+                if argc > 0 {
+                    if len + argc > MAX_SAFE {
+                        return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
+                    }
+                    let mut k = len;
+                    while k > 0 {
+                        let from = k - 1;
+                        let to = k + argc - 1;
+                        if self.al_has(this, from) {
+                            let v = self.al_get(this, from)?;
+                            self.al_set(this, to, v)?;
+                        } else {
+                            self.al_del(this, to)?;
+                        }
+                        k -= 1;
+                    }
+                    let mut j = 0i64;
+                    for &item in args {
+                        self.al_set(this, j, item)?;
+                        j += 1;
+                    }
+                }
+                let newlen = len + argc;
+                self.al_set_len(this, newlen)?;
+                Value::num(newlen as f64)
+            }
+            "reverse" => {
+                let middle = len / 2;
+                let mut lower = 0;
+                while lower != middle {
+                    let upper = len - lower - 1;
+                    let lower_exists = self.al_has(this, lower);
+                    let lower_val =
+                        if lower_exists { self.al_get(this, lower)? } else { Value::UNDEFINED };
+                    let upper_exists = self.al_has(this, upper);
+                    let upper_val =
+                        if upper_exists { self.al_get(this, upper)? } else { Value::UNDEFINED };
+                    match (lower_exists, upper_exists) {
+                        (true, true) => {
+                            self.al_set(this, lower, upper_val)?;
+                            self.al_set(this, upper, lower_val)?;
+                        }
+                        (false, true) => {
+                            self.al_set(this, lower, upper_val)?;
+                            self.al_del(this, upper)?;
+                        }
+                        (true, false) => {
+                            self.al_del(this, lower)?;
+                            self.al_set(this, upper, lower_val)?;
+                        }
+                        (false, false) => {}
+                    }
+                    lower += 1;
+                }
+                this
+            }
+            "splice" => {
+                let relative_start =
+                    self.to_integer_or_zero(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                let actual_start = if relative_start < 0 {
+                    len.saturating_add(relative_start).max(0)
+                } else {
+                    relative_start.min(len)
+                };
+                let (insert_count, actual_delete) = if args.is_empty() {
+                    (0i64, 0i64)
+                } else if args.len() == 1 {
+                    (0, len - actual_start)
+                } else {
+                    let dc = self.to_integer_or_zero(args[1])?;
+                    (args.len() as i64 - 2, dc.max(0).min(len - actual_start))
+                };
+                if len - actual_delete + insert_count > MAX_SAFE {
+                    return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
+                }
+                // Build the deleted array (absent indices become undefined — zipp
+                // arrays are dense — so its length stays `actual_delete`).
+                let mut deleted: Vec<Value> = Vec::with_capacity(actual_delete.max(0) as usize);
+                let mut k = 0;
+                while k < actual_delete {
+                    let from = actual_start + k;
+                    deleted.push(if self.al_has(this, from) {
+                        self.al_get(this, from)?
+                    } else {
+                        Value::UNDEFINED
+                    });
+                    k += 1;
+                }
+                let a = Value::heap(self.heap.alloc(HeapObj::Array(deleted)));
+                // Shift the tail to make room for the inserted items.
+                if insert_count < actual_delete {
+                    let mut k = actual_start;
+                    while k < len - actual_delete {
+                        let from = k + actual_delete;
+                        let to = k + insert_count;
+                        if self.al_has(this, from) {
+                            let v = self.al_get(this, from)?;
+                            self.al_set(this, to, v)?;
+                        } else {
+                            self.al_del(this, to)?;
+                        }
+                        k += 1;
+                    }
+                    let mut k = len;
+                    while k > len - actual_delete + insert_count {
+                        self.al_del(this, k - 1)?;
+                        k -= 1;
+                    }
+                } else if insert_count > actual_delete {
+                    let mut k = len - actual_delete;
+                    while k > actual_start {
+                        let from = k + actual_delete - 1;
+                        let to = k + insert_count - 1;
+                        if self.al_has(this, from) {
+                            let v = self.al_get(this, from)?;
+                            self.al_set(this, to, v)?;
+                        } else {
+                            self.al_del(this, to)?;
+                        }
+                        k -= 1;
+                    }
+                }
+                // Insert the new items (args[2..]).
+                let items: &[Value] = if args.len() > 2 { &args[2..] } else { &[] };
+                let mut k = actual_start;
+                for &item in items {
+                    self.al_set(this, k, item)?;
+                    k += 1;
+                }
+                self.al_set_len(this, len - actual_delete + insert_count)?;
+                a
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(r))
+    }
+
     pub(crate) fn array_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
         // Suspend GC for the whole method: callback-driven arms (map/filter/
         // reduce/sort/…) hold un-rooted working sets across interpreter re-entry,
@@ -485,6 +720,14 @@ impl<'p> Vm<'p> {
             }
             if name == "fill" {
                 return self.array_like_fill(Value::heap(idx), args);
+            }
+            // The in-place mutators are generic over an array-like object: they
+            // operate via the abstract ToLength(Get(O,"length")) + Get/Set/
+            // HasProperty/DeletePropertyOrThrow + Set(O,"length",…) protocol, so a
+            // plain `{0:…, length:n}` receiver is mutated correctly (real arrays use
+            // the dense fast paths in the match below).
+            if matches!(name, "pop" | "push" | "shift" | "unshift" | "reverse" | "splice") {
+                return self.array_like_mutate(Value::heap(idx), name, args);
             }
             // Read-only methods that treat a hole as undefined snapshot to a dense
             // temp array and run against that.

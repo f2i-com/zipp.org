@@ -901,7 +901,12 @@ impl<'p> Vm<'p> {
                 if this.is_heap() && matches!(self.heap.get(this.heap_index()), HeapObj::Array(_)) {
                     self.array_method(this.heap_index(), "push", args)?.unwrap_or(Value::UNDEFINED)
                 } else {
-                    Value::UNDEFINED
+                    // Generic over an array-like `this`
+                    // (`Array.prototype.push.call({length, 0:…}, …)`): ToObject then
+                    // the abstract Get/Set/ToLength protocol.
+                    self.require_object_coercible(this)?;
+                    let obj = self.to_object(this)?;
+                    self.array_like_mutate(obj, "push", args)?.unwrap_or(Value::UNDEFINED)
                 }
             }
             // More Object statics as values.
