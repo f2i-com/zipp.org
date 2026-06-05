@@ -99,7 +99,9 @@ impl<'p> Vm<'p> {
                         }
                         Ok(Value::bool(true))
                     }
-                    None => Ok(self.delete_prop(target, key)),
+                    // No deleteProperty trap: forward to the target's [[Delete]] —
+                    // re-enter the proxy-aware path so a Proxy target's own trap fires.
+                    None => self.delete_property(target, key),
                 };
             }
         }

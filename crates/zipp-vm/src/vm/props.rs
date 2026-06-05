@@ -80,10 +80,11 @@ impl<'p> Vm<'p> {
                 Ok(Some(true))
             }
             None => {
-                if target.is_heap() {
-                    self.proto_of.insert(target.heap_index(), proto);
-                }
-                Ok(Some(true))
+                // No setPrototypeOf trap: forward to the target's [[SetPrototypeOf]]
+                // — OrdinarySetPrototypeOf re-enters the proxy path for a Proxy target
+                // (firing its own trap) and applies the cyclic-chain / non-extensible
+                // checks for an ordinary target.
+                Ok(Some(self.ordinary_set_prototype_of(target, proto)?))
             }
         }
     }

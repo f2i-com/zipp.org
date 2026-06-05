@@ -824,6 +824,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         FN_CALL => ("call", 1),
         FN_APPLY => ("apply", 2),
         FN_BIND => ("bind", 1),
+        PROXY_REVOCABLE => ("revocable", 2),
         ARR_IS_ARRAY => ("isArray", 1),
         ARR_FROM => ("from", 1),
         ARR_OF => ("of", 0),
