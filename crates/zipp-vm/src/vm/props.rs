@@ -1027,6 +1027,53 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// OrdinarySetPrototypeOf (+ the Proxy `setPrototypeOf` trap). Returns whether
+    /// the change succeeded (per spec, a boolean — the caller throws if a strict/
+    /// reflective entry point requires it). Shared by `Object.setPrototypeOf`,
+    /// `Reflect.setPrototypeOf`, and the `Object.prototype.__proto__` setter, so the
+    /// failure conditions are enforced uniformly: a same-proto change is a no-op
+    /// success; the immutable-prototype exotic %Object.prototype% rejects any real
+    /// change; a non-extensible target rejects a real change; and a new prototype
+    /// chain that loops back to the target (a cycle) is rejected.
+    pub(crate) fn ordinary_set_prototype_of(&mut self, o: Value, proto: Value) -> Result<bool, Thrown> {
+        // A Proxy routes through its [[SetPrototypeOf]] trap.
+        if let Some(b) = self.proxy_set_prototype_of(o, proto)? {
+            return Ok(b);
+        }
+        let cur = self.object_get_prototype_of(o);
+        if cur == proto {
+            return Ok(true); // SameValue: no-op success (even if non-extensible)
+        }
+        // %Object.prototype% is an immutable-prototype exotic — any real change fails.
+        if o.is_heap() && o.heap_index() == self.obj_proto {
+            return Ok(false);
+        }
+        let extensible = match self.heap.get(o.heap_index()) {
+            HeapObj::Object(m) => m.extensible,
+            _ => true,
+        };
+        if !extensible {
+            return Ok(false);
+        }
+        let mut p = proto;
+        while p.is_heap() {
+            if p.heap_index() == o.heap_index() {
+                return Ok(false); // cycle
+            }
+            // A Proxy's [[GetPrototypeOf]] may be exotic — stop the static walk here.
+            if self.proxy_parts(p.heap_index()).is_some() {
+                break;
+            }
+            let next = self.object_get_prototype_of(p);
+            if !next.is_heap() {
+                break;
+            }
+            p = next;
+        }
+        self.proto_of.insert(o.heap_index(), proto);
+        Ok(true)
+    }
+
     /// FALLIBLE [[GetPrototypeOf]] for the PUBLIC reflective entry points
     /// (`Object.getPrototypeOf`, `Reflect.getPrototypeOf`, the `__proto__`
     /// getter). Identical to `object_get_prototype_of` for ordinary objects, but

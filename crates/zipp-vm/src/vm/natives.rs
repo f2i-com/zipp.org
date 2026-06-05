@@ -897,18 +897,13 @@ impl<'p> Vm<'p> {
                         "TypeError: Object prototype may only be an Object or null".into(),
                     ));
                 }
-                match self.proxy_set_prototype_of(o, proto)? {
-                    Some(true) => {}
-                    Some(false) => {
-                        return Err(Thrown(
-                            "TypeError: Object.setPrototypeOf 'setPrototypeOf' trap returned falsish".into(),
-                        ))
-                    }
-                    None => {
-                        if o.is_heap() {
-                            self.proto_of.insert(o.heap_index(), proto);
-                        }
-                    }
+                // Object.setPrototypeOf returns O, but throws if [[SetPrototypeOf]]
+                // rejects the change (non-extensible / cycle / immutable prototype /
+                // a Proxy trap returning falsish).
+                if !self.ordinary_set_prototype_of(o, proto)? {
+                    return Err(Thrown(
+                        "TypeError: Object.setPrototypeOf failed (target is non-extensible, the change is cyclic, or it has an immutable prototype)".into(),
+                    ));
                 }
                 o
             }
@@ -1325,42 +1320,7 @@ impl<'p> Vm<'p> {
                         "TypeError: Reflect.setPrototypeOf prototype must be an object or null".into(),
                     ));
                 }
-                match self.proxy_set_prototype_of(a0, a1)? {
-                    Some(b) => Value::bool(b),
-                    None => {
-                        // [[SetPrototypeOf]] guards: a same-proto change is a no-op
-                        // success; a non-extensible target rejects a real change; a
-                        // proto chain that loops back to the target is rejected.
-                        let cur = self.object_get_prototype_of(a0);
-                        if cur == a1 {
-                            return Ok(Value::bool(true));
-                        }
-                        let extensible = match self.heap.get(a0.heap_index()) {
-                            HeapObj::Object(m) => m.extensible,
-                            _ => true,
-                        };
-                        if !extensible {
-                            return Ok(Value::bool(false));
-                        }
-                        let mut p = a1;
-                        while p.is_heap() {
-                            if p.heap_index() == a0.heap_index() {
-                                return Ok(Value::bool(false)); // cycle
-                            }
-                            // A Proxy's [[GetPrototypeOf]] may be exotic — stop here.
-                            if self.proxy_parts(p.heap_index()).is_some() {
-                                break;
-                            }
-                            let next = self.object_get_prototype_of(p);
-                            if !next.is_heap() {
-                                break;
-                            }
-                            p = next;
-                        }
-                        self.proto_of.insert(a0.heap_index(), a1);
-                        Value::bool(true)
-                    }
-                }
+                Value::bool(self.ordinary_set_prototype_of(a0, a1)?)
             }
             REFLECT_DEFINE => {
                 if !self.is_object_value(a0) {
@@ -1680,11 +1640,24 @@ impl<'p> Vm<'p> {
                 self.require_object_coercible(this)?; // ToObject(this)
                 self.lookup_accessor(this, &key, id == OBJPROTO_LOOKUP_SETTER)
             }
-            OBJPROTO_PROTO_GET => self.get_prototype_of_checked(this)?,
+            OBJPROTO_PROTO_GET => {
+                // `get __proto__`: RequireObjectCoercible(this) before ToObject.
+                self.require_object_coercible(this)?;
+                self.get_prototype_of_checked(this)?
+            }
             OBJPROTO_PROTO_SET => {
-                // Only an object or null changes the prototype; primitives are ignored.
-                if this.is_heap() && (self.is_object_value(a0) || a0 == Value::NULL) {
-                    self.proto_of.insert(this.heap_index(), a0);
+                // `set __proto__`: RequireObjectCoercible(this) first; a non-object/
+                // non-null value, or a non-object receiver, is a silent no-op;
+                // otherwise [[SetPrototypeOf]] runs and a rejected change throws (the
+                // shared guards: non-extensible / cycle / immutable prototype / a
+                // Proxy trap returning falsish).
+                self.require_object_coercible(this)?;
+                if (self.is_object_value(a0) || a0 == Value::NULL) && self.is_object_value(this)
+                    && !self.ordinary_set_prototype_of(this, a0)?
+                {
+                    return Err(Thrown(
+                        "TypeError: cannot set prototype (target is non-extensible, the change is cyclic, or it has an immutable prototype)".into(),
+                    ));
                 }
                 Value::UNDEFINED
             }

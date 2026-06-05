@@ -297,12 +297,18 @@ impl<'p> Vm<'p> {
         }
         let idx = obj.heap_index();
         // `o.__proto__ = v` invokes the inherited Object.prototype.__proto__
-        // setter: set [[Prototype]] when v is an object or null, else a silent
-        // no-op (a primitive value). Mirrors Object.setPrototypeOf; the getter
-        // side already works via the inherited accessor.
+        // setter: an object/null value runs [[SetPrototypeOf]] (the setter throws a
+        // TypeError if it is rejected — a non-extensible target, a cycle, or the
+        // immutable %Object.prototype% — regardless of the assignment's strictness,
+        // since the throw originates inside the accessor); a primitive value is a
+        // silent no-op. Shared with Object.setPrototypeOf / Reflect.setPrototypeOf.
         if key == "__proto__" {
-            if self.is_object_value(val) || val == Value::NULL {
-                self.proto_of.insert(idx, val);
+            if (self.is_object_value(val) || val == Value::NULL)
+                && !self.ordinary_set_prototype_of(obj, val)?
+            {
+                return Err(Thrown(
+                    "TypeError: cannot set prototype (target is non-extensible, the change is cyclic, or it has an immutable prototype)".into(),
+                ));
             }
             return Ok(());
         }
