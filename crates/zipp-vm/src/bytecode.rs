@@ -346,6 +346,12 @@ pub enum Instr {
     GetIndex { dst: Reg, obj: Reg, key: Reg },
     /// `obj[key] = val` — computed member write.
     SetIndex { obj: Reg, key: Reg, val: Reg },
+    /// `dst = ToPropertyKey(src)` for a read-modify-write of `obj[src]` (`o[k] += v`,
+    /// `o[k]++`): coerce the computed key to a property key ONCE (invoking its
+    /// `toString`/`valueOf`/@@toPrimitive) so the load and the store reuse it. `obj`
+    /// is RequireObjectCoercible-checked FIRST — a null/undefined base throws a
+    /// TypeError BEFORE the key's coercion runs (matching `obj[k]`'s evaluation order).
+    ToPropKey { dst: Reg, obj: Reg, src: Reg },
     /// Define an accessor property in an object literal: `{ get key(){…} }` or
     /// `{ set key(v){…} }`. `func` is the getter/setter function; `is_setter`
     /// picks the half. Merges with an existing accessor for the same key (so a

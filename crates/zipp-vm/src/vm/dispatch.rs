@@ -1867,6 +1867,23 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    Instr::ToPropKey { dst, obj, src } => {
+                        // RequireObjectCoercible(base) precedes ToPropertyKey: a
+                        // null/undefined base throws BEFORE the key's toString runs
+                        // (mirrors get_index). Coercing once here makes the later
+                        // GetIndex/SetIndex coercion a no-op (single key evaluation).
+                        let o = self.get(base, obj);
+                        if o.is_nullish() {
+                            return Err(Thrown(format!(
+                                "TypeError: cannot read property of {}",
+                                self.display(o)
+                            )));
+                        }
+                        let k = self.get(base, src);
+                        let pk = self.coerce_index_key(k)?;
+                        self.set(base, dst, pk);
+                        ip += 1;
+                    }
                     Instr::SetIndex { obj, key, val } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);

@@ -3911,11 +3911,15 @@ impl<'a> FnCompiler<'a> {
             ox::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
                 let obj = self.expr(&m.object)?;
                 let key = self.expr(&m.expression)?;
+                // `o[k]++` reads then writes `o[k]` — coerce the key ToPropertyKey
+                // ONCE and reuse it (its toString/valueOf must not run twice).
+                let keyk = self.temp();
+                self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
                 let cur = self.temp();
-                self.emit(Instr::GetIndex { dst: cur, obj, key });
+                self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
                 let nw = self.temp();
                 self.emit(Instr::AddInt { dst: nw, a: cur, imm: delta });
-                self.emit(Instr::SetIndex { obj, key, val: nw });
+                self.emit(Instr::SetIndex { obj, key: keyk, val: nw });
                 self.emit(Instr::Move { dst, src: if u.prefix { nw } else { cur } });
                 return Ok(dst);
             }
@@ -4505,29 +4509,37 @@ impl<'a> FnCompiler<'a> {
                 let obj = self.expr(&m.object)?; // evaluate receiver + key once
                 let key = self.expr(&m.expression)?;
                 if is_logical {
-                    self.emit(Instr::GetIndex { dst, obj, key });
+                    // A read-modify-write reuses the SAME property key for the load
+                    // and the store: coerce ToPropertyKey ONCE (its toString/valueOf
+                    // must not run twice).
+                    let keyk = self.temp();
+                    self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
+                    self.emit(Instr::GetIndex { dst, obj, key: keyk });
                     let j = self.emit_logical_skip(a.operator, dst);
                     let v = self.expr_into(&a.right, dst)?;
                     if v != dst {
                         self.emit(Instr::Move { dst, src: v });
                     }
-                    self.emit(Instr::SetIndex { obj, key, val: dst });
+                    self.emit(Instr::SetIndex { obj, key: keyk, val: dst });
                     let end = self.here();
                     self.patch_jump(j, end);
                 } else if matches!(a.operator, Op::Assign) {
+                    // A plain store coerces the key once (the single SetIndex).
                     let val = self.expr_into(&a.right, dst)?;
                     if val != dst {
                         self.emit(Instr::Move { dst, src: val });
                     }
                     self.emit(Instr::SetIndex { obj, key, val: dst });
                 } else {
+                    let keyk = self.temp();
+                    self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
                     let cur = self.temp();
-                    self.emit(Instr::GetIndex { dst: cur, obj, key });
+                    self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
                     let rhs = self.expr(&a.right)?;
                     let instr = compound_assign_instr(a.operator, dst, cur, rhs)
                         .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                     self.emit(instr);
-                    self.emit(Instr::SetIndex { obj, key, val: dst });
+                    self.emit(Instr::SetIndex { obj, key: keyk, val: dst });
                 }
                 return Ok(dst);
             }
