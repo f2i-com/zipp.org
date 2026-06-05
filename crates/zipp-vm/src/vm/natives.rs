@@ -623,24 +623,53 @@ impl<'p> Vm<'p> {
             }
             REGEXP_SYM_MATCHALL => {
                 // RegExp.prototype[Symbol.matchAll](string): an iterator over all
-                // matches. Eagerly computed (no user-overridable exec).
-                if !this.is_heap() {
+                // matches. The matcher is built via SpeciesConstructor(R, %RegExp%) +
+                // Construct(C, «R, flags») (so a custom constructor / @@species is
+                // observed), and its lastIndex copies R's via ToLength(Get(R,
+                // "lastIndex")). Eagerly computed over the (real-RegExp) clone.
+                if !self.is_object_value(this) {
                     return Err(Thrown(
                         "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object".into(),
                     ));
                 }
+                // A custom @@species Construct re-enters the interpreter; hold the
+                // un-rooted match Values across it by suspending GC.
+                let _gc = self.gc_lock_guard();
                 let s = self.to_js_string(a0)?;
-                let s_val = self.alloc_str(s.clone());
                 let flags_v = self.get_prop(this, "flags")?;
                 let flags = self.to_js_string(flags_v)?;
                 let global = flags.contains('g');
-                // Clone the regex so iteration doesn't disturb the receiver.
-                let matcher = self.build_regexp(this, flags_v)?;
+                // C = SpeciesConstructor(R, %RegExp%).
+                let default_ctor = Value::heap(self.regexp_ctor);
+                let c = {
+                    let ctor = self.get_prop(this, "constructor")?;
+                    if ctor == Value::UNDEFINED {
+                        default_ctor
+                    } else if !self.is_object_value(ctor) {
+                        return Err(Thrown(
+                            "TypeError: RegExp.prototype[Symbol.matchAll]: constructor is not an object".into(),
+                        ));
+                    } else {
+                        let sp = self.get_prop(ctor, "@@species")?;
+                        if sp == Value::UNDEFINED || sp == Value::NULL {
+                            default_ctor
+                        } else if self.is_constructor(sp) {
+                            sp
+                        } else {
+                            return Err(Thrown(
+                                "TypeError: RegExp.prototype[Symbol.matchAll]: @@species is not a constructor".into(),
+                            ));
+                        }
+                    }
+                };
+                // matcher = Construct(C, «R, flags»).
+                let matcher = self.construct(c, &[this, flags_v])?;
                 let matcher_idx = matcher.heap_index();
-                let li = self.get_prop(this, "lastIndex")?;
-                let li = self.to_number(li)?;
-                let li = if li.is_finite() && li > 0.0 { li as usize } else { 0 };
+                // lastIndex = ToLength(Get(R, "lastIndex")); Set(matcher, lastIndex).
+                let li_v = self.get_prop(this, "lastIndex")?;
+                let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
                 self.set_regexp_last_index(matcher_idx, li);
+                let s_val = self.alloc_str(s.clone());
                 let mut items: Vec<Value> = Vec::new();
                 let mut guard = 0u32;
                 loop {
