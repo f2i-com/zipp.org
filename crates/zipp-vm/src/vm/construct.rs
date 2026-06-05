@@ -559,6 +559,14 @@ impl<'p> Vm<'p> {
                 return Ok(Value::heap(prom));
             }
         }
+        // A user function with no [[Construct]] (generator, async, arrow, or a
+        // concise method) — `new` on it is a TypeError. Gated to Func/Closure so
+        // built-in Native ctors, classes, and bound functions are untouched.
+        if matches!(self.heap.get(cv.heap_index()), HeapObj::Func(_) | HeapObj::Closure { .. })
+            && !self.is_constructor(cv)
+        {
+            return Err(Thrown("TypeError: function is not a constructor".into()));
+        }
         // Constructor FUNCTION (`new F()`, the pre-class OOP idiom): make an object
         // whose [[Prototype]] is `F.prototype` (so its methods + `constructor`
         // resolve), run `F` with `this` = that object, and use F's return value if

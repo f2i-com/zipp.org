@@ -251,7 +251,18 @@ impl<'p> Vm<'p> {
             return false;
         }
         match self.heap.get(v.heap_index()) {
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Class(_) => true,
+            // A class is always a constructor. A plain function/closure is too, but a
+            // generator / async / arrow / concise-method function has no [[Construct]].
+            HeapObj::Class(_) => true,
+            HeapObj::Func(_) | HeapObj::Closure { .. } => {
+                match self.heap.as_callable(v.heap_index()) {
+                    Some((fid, _)) => {
+                        let fp = self.func(fid as usize);
+                        !(fp.is_generator || fp.is_async || fp.non_constructable)
+                    }
+                    None => true,
+                }
+            }
             // The built-in constructor globals (Object/Array/Map/…) are constructors.
             HeapObj::Object(m) => m.is_ctor,
             // A bound function exposes [[Construct]] iff its target does.

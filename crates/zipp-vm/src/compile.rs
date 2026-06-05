@@ -563,6 +563,7 @@ impl Compiler {
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator,
             is_async,
+            non_constructable: false, // a plain function/expression IS constructable
             is_strict,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -678,6 +679,11 @@ impl Compiler {
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator,
             is_async,
+            // A class method/getter/setter is non-constructable. The class
+            // CONSTRUCTOR is also compiled here, but it is reached only via the
+            // HeapObj::Class [[Construct]] path (never as a raw Func), so this flag
+            // is never consulted for it — safe to set uniformly.
+            non_constructable: true,
             is_strict: true,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -753,6 +759,7 @@ impl Compiler {
             arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
             is_generator: false,
             is_async: a.r#async,
+            non_constructable: true, // arrow functions have no [[Construct]]
             is_strict,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -815,6 +822,7 @@ fn placeholder(name: &str) -> FuncProto {
         arguments_reg: None,
         is_generator: false,
         is_async: false,
+        non_constructable: false,
         is_strict: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
@@ -3704,6 +3712,7 @@ impl<'a> FnCompiler<'a> {
                         let fid = self.cx.functions.len() - 1;
                         self.cx.functions[fid].source =
                             self.cx.src_slice(p.span.start, p.span.end);
+                        self.cx.functions[fid].non_constructable = true; // accessor = method
                         let is_setter = matches!(p.kind, ox::PropertyKind::Set);
                         self.emit(Instr::DefineAccessor { obj: dst, key, func, is_setter });
                         // SetFunctionName: a getter/setter is named "get k"/"set k"
@@ -3753,6 +3762,7 @@ impl<'a> FnCompiler<'a> {
                             let fid = self.cx.functions.len() - 1;
                             self.cx.functions[fid].source =
                                 self.cx.src_slice(p.span.start, p.span.end);
+                            self.cx.functions[fid].non_constructable = true; // concise method
                         }
                         self.emit(Instr::SetProp { obj: dst, name, val: v });
                     }
