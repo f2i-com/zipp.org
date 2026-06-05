@@ -2325,6 +2325,10 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn if_stmt(&mut self, i: &ox::IfStatement) -> R<()> {
+        // The statement's completion V starts as undefined (a not-taken / empty
+        // branch yields undefined, not the prior statement's value). No-op outside
+        // eval mode.
+        self.reset_loop_completion();
         let cond = self.expr(&i.test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 }); // patched
@@ -2501,6 +2505,9 @@ impl<'a> FnCompiler<'a> {
 
     /// `try { … } catch (e) { … }` (no finalizer).
     fn try_catch_only(&mut self, t: &ox::TryStatement) -> R<()> {
+        // The statement's completion V starts at undefined (an empty try/catch
+        // yields undefined, not the prior statement's value).
+        self.reset_loop_completion();
         let push_at = self.here();
         // catch_reg/target patched once known.
         self.emit(Instr::PushHandler { catch_target: 0, catch_reg: 0 });
@@ -2533,6 +2540,11 @@ impl<'a> FnCompiler<'a> {
         t: &ox::TryStatement,
         finalizer: &ox::BlockStatement,
     ) -> R<()> {
+        // The statement's completion V starts at undefined (an empty try/finally
+        // yields undefined). The try/catch body value is then preserved through a
+        // normally-completing finally (the finally body's own value is not reset
+        // here, matching "if F is normal, set F to B").
+        self.reset_loop_completion();
         // Two persistent registers carry the completion record (kind + value)
         // from each exit path into the shared finally block. Allocated for the
         // whole construct; reclaimed after `EndFinally`.
@@ -2672,6 +2684,9 @@ impl<'a> FnCompiler<'a> {
     /// (collected in a non-loop frame) jumps to the end.
     fn switch_stmt(&mut self, s: &ox::SwitchStatement) -> R<()> {
         self.push_scope();
+        // CaseBlockEvaluation starts the completion V at undefined (a no-match / all-
+        // empty switch yields undefined, not the prior statement's value).
+        self.reset_loop_completion();
         let disc = self.expr(&s.discriminant)?;
 
         // Pass 1: comparison jumps (strict `===`, like JS). `default` is recorded
