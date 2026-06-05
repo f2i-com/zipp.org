@@ -723,6 +723,24 @@ impl<'p> Vm<'p> {
                 }
                 argv.push(Value::num(byte_to_char(s, st) as f64));
                 argv.push(self.alloc_str(s.to_string()));
+                // RegExp.prototype[@@replace] step 14.k.iv: when the regex has named
+                // capture groups, a `groups` object (OrdinaryObjectCreate(null)) is
+                // the FINAL replacer argument. (Mirrors the exec/array path above.)
+                let named: Vec<(String, Option<std::ops::Range<usize>>)> =
+                    m.named_groups().map(|(n, r)| (n.to_string(), r)).collect();
+                if !named.is_empty() {
+                    let mut gm = ObjMap::new();
+                    for (name, r) in &named {
+                        let v = match r {
+                            Some(r) => self.alloc_str(s[r.clone()].to_string()),
+                            None => Value::UNDEFINED,
+                        };
+                        gm.set(name, v);
+                    }
+                    let gidx = self.heap.alloc(HeapObj::Object(gm));
+                    self.proto_of.insert(gidx, Value::NULL);
+                    argv.push(Value::heap(gidx));
+                }
                 let r = self.call_value(repl, Value::UNDEFINED, &argv)?;
                 let rs = self.to_js_string(r)?;
                 out.push_str(&rs);
