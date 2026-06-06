@@ -509,6 +509,15 @@ impl Compiler {
         }
         if !is_script {
             fc.reserve_arguments(); // non-arrow functions bind `arguments`
+            // A nested arrow that reads `arguments` captures THIS function's
+            // arguments object lexically: materialize it (uses_arguments) and box
+            // its register into a cell so the arrow grabs the live cell as an upvalue.
+            if capture::nested_uses_arguments(body) {
+                fc.uses_arguments = true;
+                let r = fc.arguments_reg.unwrap();
+                fc.emit(Instr::MakeCell { reg: r });
+                fc.cell_regs.insert(r);
+            }
         }
 
         // Apply default parameter values (`function f(x = expr)`) before the body:
@@ -618,6 +627,14 @@ impl Compiler {
         fc.in_generator = is_generator;
         fc.in_async = is_async;
         fc.reserve_arguments(); // class methods/ctors bind `arguments`
+        // A nested arrow reading `arguments` captures this method's arguments
+        // object lexically — materialize + box it (see compile_function_body).
+        if capture::nested_uses_arguments(body) {
+            fc.uses_arguments = true;
+            let r = fc.arguments_reg.unwrap();
+            fc.emit(Instr::MakeCell { reg: r });
+            fc.cell_regs.insert(r);
+        }
         if let Some(pa) = params_ast {
             fc.bind_params(pa)?;
         }

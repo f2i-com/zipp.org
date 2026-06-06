@@ -50,6 +50,18 @@ pub fn captured_locals(params: &[String], body: &[ox::Statement]) -> HashSet<Str
     bound.intersection(&nested_free).cloned().collect()
 }
 
+/// True when a nested ARROW (transitively, with no intervening ordinary function
+/// — ordinary functions bind their own `arguments`, see `fn_node_free`) references
+/// `arguments`. The nearest enclosing ordinary function must then materialize and
+/// box its `arguments` object so the arrow can capture it lexically as an upvalue.
+pub fn nested_uses_arguments(body: &[ox::Statement]) -> bool {
+    let mut nested_free = HashSet::new();
+    for s in body {
+        collect_nested_free(s, &mut nested_free);
+    }
+    nested_free.contains("arguments")
+}
+
 // ── bound-name collection (this scope only; does NOT descend into nested fns) ──
 
 fn collect_bound_in_body(body: &[ox::Statement], out: &mut HashSet<String>) {
@@ -391,7 +403,11 @@ fn fn_node_free(
     body: Option<&ox::FunctionBody>,
     out: &mut HashSet<String>,
 ) {
-    let param_names = param_names(params);
+    let mut param_names = param_names(params);
+    // An ordinary function BINDS its own `arguments` (and `this`), so a reference
+    // to `arguments` inside it is NOT free — it must not leak out as a capture of
+    // the enclosing scope. (Arrows, handled by `arrow_free`, do not bind it.)
+    param_names.push("arguments".to_string());
     let stmts: &[ox::Statement] = match body {
         Some(b) => &b.statements,
         None => &[],
