@@ -502,7 +502,9 @@ impl<'p> Vm<'p> {
                             "RangeError: array length exceeds the engine's dense-array limit".into(),
                         ));
                     }
-                    vec![Value::UNDEFINED; n as usize]
+                    // `new Array(n)` / `Array(n)` creates n HOLES (absent elements),
+                    // not n present `undefined`s.
+                    vec![Value::HOLE; n as usize]
                 } else {
                     args.to_vec()
                 };

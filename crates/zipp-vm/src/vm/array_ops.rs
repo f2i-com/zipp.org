@@ -1056,7 +1056,11 @@ impl<'p> Vm<'p> {
                 let abs = if i < 0 { i + len as i64 } else { i };
                 let v = if abs >= 0 && (abs as usize) < len {
                     match self.heap.get(idx) {
-                        HeapObj::Array(items) => items[abs as usize],
+                        // A hole reads as undefined (never leak the sentinel).
+                        HeapObj::Array(items) => {
+                            let el = items[abs as usize];
+                            if el.is_hole() { Value::UNDEFINED } else { el }
+                        }
                         _ => Value::UNDEFINED,
                     }
                 } else {

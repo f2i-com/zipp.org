@@ -418,7 +418,9 @@ impl<'p> Vm<'p> {
                 ));
             }
             if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                items.resize(n as usize, Value::UNDEFINED);
+                // Extending past the current length adds HOLES (absent elements),
+                // not present `undefined`s; truncating just drops the tail.
+                items.resize(n as usize, Value::HOLE);
             }
             self.heap.bump_version(idx);
             return Ok(());

@@ -250,6 +250,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::UNDEFINED);
                         ip += 1;
                     }
+                    Instr::LoadHole { dst } => {
+                        // The HOLE sentinel for an elided array-literal element; the
+                        // following NewArray/ArrayAppend copies it into the array.
+                        self.set(base, dst, Value::HOLE);
+                        ip += 1;
+                    }
                     Instr::LoadNull { dst } => {
                         self.set(base, dst, Value::NULL);
                         ip += 1;
@@ -1100,7 +1106,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
                         let arr = if argc == 1 && self.get(base, arg_base).is_number() {
-                            // `Array(n)` → n empty slots (undefined).
+                            // `Array(n)` → n HOLES (absent elements), not n undefineds.
                             let n = self.get(base, arg_base).as_f64();
                             if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
                                 return Err(Thrown("RangeError: Invalid array length".into()));
@@ -1110,7 +1116,7 @@ impl<'p> Vm<'p> {
                                     "RangeError: array length exceeds the engine's dense-array limit".into(),
                                 ));
                             }
-                            vec![Value::UNDEFINED; n as usize]
+                            vec![Value::HOLE; n as usize]
                         } else {
                             (0..argc).map(|i| self.get(base, arg_base + i)).collect()
                         };

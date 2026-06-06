@@ -3636,8 +3636,9 @@ impl<'a> FnCompiler<'a> {
                 let save = self.next_reg;
                 match el {
                     ox::ArrayExpressionElement::Elision(_) => {
+                        // An elided element is a HOLE, not a present `undefined`.
                         let v = self.temp();
-                        self.emit(Instr::LoadUndefined { dst: v });
+                        self.emit(Instr::LoadHole { dst: v });
                         self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: false });
                     }
                     ox::ArrayExpressionElement::SpreadElement(s) => {
@@ -3667,7 +3668,8 @@ impl<'a> FnCompiler<'a> {
             let slot = base + i as Reg;
             match el {
                 ox::ArrayExpressionElement::Elision(_) => {
-                    self.emit(Instr::LoadUndefined { dst: slot });
+                    // An elided element is a HOLE, not a present `undefined`.
+                    self.emit(Instr::LoadHole { dst: slot });
                 }
                 ox::ArrayExpressionElement::SpreadElement(_) => unreachable!("handled above"),
                 other => {

@@ -27,6 +27,10 @@ pub enum Instr {
     LoadInt { dst: Reg, val: i32 },
     /// `dst = undefined`
     LoadUndefined { dst: Reg },
+    /// `dst = <array hole>` — the internal HOLE sentinel, used only to fill an
+    /// elided array-literal element (`[1,,3]`) before NewArray/ArrayAppend copies
+    /// it into the array. Must never be observed outside that copy.
+    LoadHole { dst: Reg },
     /// `dst = null`
     LoadNull { dst: Reg },
     /// `dst = true|false`
