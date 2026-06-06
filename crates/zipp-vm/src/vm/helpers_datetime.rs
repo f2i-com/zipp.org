@@ -368,6 +368,13 @@ pub(crate) fn iso_date_in_range(y: i64, m: i64, d: i64) -> bool {
     (y, m, d) >= (-271821, 4, 19) && (y, m, d) <= (275760, 9, 13)
 }
 
+/// Whether `(y, m)` is a representable `Temporal.PlainYearMonth` — within the
+/// year-month-granular range `[-271821-04, +275760-09]` (ISOYearMonthWithinLimits);
+/// any day/time inside the boundary month is in range.
+pub(crate) fn iso_year_month_in_range(y: i64, m: i64) -> bool {
+    (y, m) >= (-271821, 4) && (y, m) <= (275760, 9)
+}
+
 pub(crate) fn parse_month_code(s: &str) -> Option<i64> {
     // MonthCode grammar: "M" followed by EXACTLY two ASCII digits (so "M1"/"M005"
     // are malformed). A trailing "L" marks a lunisolar leap month, which the ISO

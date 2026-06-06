@@ -2128,7 +2128,7 @@ impl<'p> Vm<'p> {
     // ── Temporal.PlainYearMonth ──
 
     pub(crate) fn make_plain_year_month(&mut self, y: i64, m: i64, ref_day: i64) -> Result<Value, Thrown> {
-        if !(1..=12).contains(&m) || !(-271821..=275760).contains(&y) {
+        if !(1..=12).contains(&m) || !iso_year_month_in_range(y, m) {
             return Err(Thrown("RangeError: invalid year-month value".into()));
         }
         let idx = self.heap.alloc(HeapObj::Temporal { kind: 5, fields: vec![y, m, ref_day] });
@@ -2165,8 +2165,14 @@ impl<'p> Vm<'p> {
                 if !temporal_string_ok(&s, true, true) {
                     return Err(Thrown(format!("RangeError: invalid year-month string '{s}'")));
                 }
-                return parse_iso_year_month(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid year-month string '{s}'")));
+                let (y, m, rd) = parse_iso_year_month(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid year-month string '{s}'")))?;
+                if !iso_year_month_in_range(y, m) {
+                    return Err(Thrown(format!(
+                        "RangeError: year-month '{s}' is outside the representable range"
+                    )));
+                }
+                return Ok((y, m, rd));
             }
             if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
@@ -2187,6 +2193,11 @@ impl<'p> Vm<'p> {
                     }
                 } else {
                     m = m.clamp(1, 12);
+                }
+                if !iso_year_month_in_range(y, m) {
+                    return Err(Thrown(
+                        "RangeError: year-month is outside the representable range".into(),
+                    ));
                 }
                 return Ok((y, m, 1));
             }
