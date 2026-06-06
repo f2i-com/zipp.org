@@ -87,8 +87,14 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(idx) {
                 let s = self.heap.str_cow(idx).unwrap().into_owned();
-                return parse_iso_duration(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid duration string '{s}'")));
+                let f = parse_iso_duration(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid duration string '{s}'")))?;
+                // A parsed duration must also be in range (e.g. a days/seconds value
+                // whose total exceeds 2^53 seconds is a RangeError).
+                if !is_valid_duration(&f.map(|x| x as f64)) {
+                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+                }
+                return Ok(f);
             }
             if self.is_object_value(v) {
                 let mut ff = [0f64; 10];
