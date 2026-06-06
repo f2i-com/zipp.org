@@ -2408,6 +2408,7 @@ impl<'p> Vm<'p> {
                     Value::num((iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1) as f64)
                 }
                 "weekOfYear" => Value::num(iso_week_of_year(y, m, d) as f64),
+                "yearOfWeek" => Value::num(iso_year_of_week(y, m, d) as f64),
                 "daysInMonth" => Value::num(days_in_month(y, m) as f64),
                 "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
                 "daysInWeek" => Value::num(7.0),
@@ -2452,6 +2453,7 @@ impl<'p> Vm<'p> {
                     Value::num((iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1) as f64)
                 }
                 "weekOfYear" => Value::num(iso_week_of_year(y, m, d) as f64),
+                "yearOfWeek" => Value::num(iso_year_of_week(y, m, d) as f64),
                 "daysInMonth" => Value::num(days_in_month(y, m) as f64),
                 "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
                 "daysInWeek" => Value::num(7.0),
@@ -2522,6 +2524,7 @@ impl<'p> Vm<'p> {
                     Value::num((iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1) as f64)
                 }
                 "weekOfYear" => Value::num(iso_week_of_year(y, m, d) as f64),
+                "yearOfWeek" => Value::num(iso_year_of_week(y, m, d) as f64),
                 "daysInMonth" => Value::num(days_in_month(y, m) as f64),
                 "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
                 "daysInWeek" => Value::num(7.0),

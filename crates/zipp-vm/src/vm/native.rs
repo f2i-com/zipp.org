@@ -503,12 +503,12 @@ pub const TEMPORAL_GETTER_FIELDS: &[&str] = &[
     "inLeapYear", "monthCode", "calendarId", "hour", "minute", "second", "millisecond",
     "microsecond", "nanosecond", "epochMilliseconds", "epochNanoseconds", "epochSeconds",
     "epochMicroseconds", "era", "eraYear", "timeZoneId", "offset", "offsetNanoseconds",
-    "hoursInDay",
+    "hoursInDay", "yearOfWeek",
 ];
 pub const TEMP_G_ZONEDDATETIME: &[&str] = &[
     "calendarId", "timeZoneId", "year", "month", "monthCode", "day", "hour", "minute",
     "second", "millisecond", "microsecond", "nanosecond", "epochSeconds", "epochMilliseconds",
-    "epochMicroseconds", "epochNanoseconds", "dayOfWeek", "dayOfYear", "weekOfYear",
+    "epochMicroseconds", "epochNanoseconds", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek",
     "hoursInDay", "daysInWeek", "daysInMonth", "daysInYear", "monthsInYear", "inLeapYear",
     "offset", "offsetNanoseconds", "era", "eraYear",
 ];
@@ -518,7 +518,7 @@ pub const TEMP_G_DURATION: &[&str] = &[
     "microseconds", "nanoseconds", "sign", "blank",
 ];
 pub const TEMP_G_PLAINDATE: &[&str] = &[
-    "year", "month", "day", "dayOfWeek", "dayOfYear", "weekOfYear", "daysInMonth",
+    "year", "month", "day", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek", "daysInMonth",
     "daysInYear", "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId",
     "era", "eraYear",
 ];
@@ -526,7 +526,7 @@ pub const TEMP_G_PLAINTIME: &[&str] =
     &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
 pub const TEMP_G_PLAINDATETIME: &[&str] = &[
     "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
-    "nanosecond", "dayOfWeek", "dayOfYear", "weekOfYear", "daysInMonth", "daysInYear",
+    "nanosecond", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek", "daysInMonth", "daysInYear",
     "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId", "era", "eraYear",
 ];
 pub const TEMP_G_INSTANT: &[&str] =

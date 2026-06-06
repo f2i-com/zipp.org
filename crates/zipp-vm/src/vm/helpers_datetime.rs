@@ -64,6 +64,28 @@ pub(crate) fn iso_week_of_year(y: i64, m: i64, d: i64) -> i64 {
     week
 }
 
+/// ISO-8601 week-numbering year — the calendar year that owns the week
+/// `iso_week_of_year` reports. It is `y - 1` for early-January dates that
+/// belong to the previous year's last week, `y + 1` for late-December dates
+/// pulled into next year's week 1, and `y` otherwise. Branches mirror
+/// `iso_week_of_year` exactly so the pair stays consistent.
+pub(crate) fn iso_year_of_week(y: i64, m: i64, d: i64) -> i64 {
+    let doy = iso_to_epoch_days(y, m, d) - iso_to_epoch_days(y, 1, 1) + 1;
+    let dow = iso_day_of_week(y, m, d);
+    let week = (doy - dow + 10) / 7;
+    if week < 1 {
+        return y - 1;
+    }
+    if week == 53 {
+        let jan1 = iso_day_of_week(y, 1, 1);
+        let has53 = jan1 == 4 || (is_leap_year(y) && jan1 == 3);
+        if !has53 {
+            return y + 1;
+        }
+    }
+    y
+}
+
 /// Nanoseconds-since-midnight for a [h,mi,s,ms,us,ns] time.
 pub(crate) fn time_to_ns(f: &[i64; 6]) -> i128 {
     (f[0] as i128) * 3_600_000_000_000
