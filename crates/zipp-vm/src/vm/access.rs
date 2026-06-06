@@ -349,18 +349,19 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
-        // A String wrapper (`new String("ab")`) is a String exotic: `length` and its
-        // in-range char indices are non-writable, non-configurable own data props, so
-        // assigning them is a sloppy no-op / a strict TypeError. Other keys
-        // (`s.foo = 1`) fall through to the ordinary named-property path below.
-        if key != "__proto__" && matches!(self.heap.get(idx), HeapObj::Boxed { kind: 0, .. }) {
-            let blocked = key == "length"
-                || self
-                    .string_exotic_chars(obj)
-                    .and_then(|(_, len)| canonical_index_str(key).map(|i| i < len))
-                    .unwrap_or(false);
-            if blocked {
-                return self.reject_write(key, strict);
+        // A String exotic — a `new String("ab")` wrapper OR a raw primitive string
+        // value used as a receiver (`Array.prototype.shift.call("abc")` after
+        // ToObject) — has `length` and its in-range char indices as non-writable,
+        // non-configurable own data props, so assigning them is a sloppy no-op / a
+        // strict TypeError. Other keys (`s.foo = 1`) fall through to the ordinary
+        // named-property path below.
+        if key != "__proto__" {
+            if let Some((_, slen)) = self.string_exotic_chars(obj) {
+                let blocked =
+                    key == "length" || canonical_index_str(key).map(|i| i < slen).unwrap_or(false);
+                if blocked {
+                    return self.reject_write(key, strict);
+                }
             }
         }
         // `o.__proto__ = v` invokes the inherited Object.prototype.__proto__
