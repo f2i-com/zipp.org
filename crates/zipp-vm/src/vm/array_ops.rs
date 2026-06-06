@@ -360,6 +360,27 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// A snapshot that resolves every index through the `[[Get]]` protocol, so a hole
+    /// reads its PROTOTYPE-inherited value (or `undefined` when truly absent) exactly as
+    /// `fromValue = Get(O, from)` requires. The change-by-copy methods (toReversed /
+    /// toSorted / toSpliced / with) build a dense result this way, so a hole over a
+    /// `Array.prototype[k]` is not silently dropped to `undefined`. The fast path inside
+    /// `array_iter_get` keeps a dense, side-table-free array at plain-snapshot speed; the
+    /// length is read once up front (per LengthOfArrayLike) so a getter that mutates the
+    /// array mid-read still yields exactly `len` elements.
+    pub(crate) fn array_snapshot_get(&mut self, idx: u32) -> Result<Vec<Value>, Thrown> {
+        let len = match self.heap.get(idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => return Ok(Vec::new()),
+        };
+        let this = Value::heap(idx);
+        let mut out = Vec::with_capacity(len);
+        for k in 0..len {
+            out.push(self.array_iter_get(this, k)?.unwrap_or(Value::UNDEFINED));
+        }
+        Ok(out)
+    }
+
     /// Live per-index read for the DENSE callback arms (a real array known to have no
     /// side table at dispatch): a present (non-hole, in-range) element is returned
     /// directly — no per-element side-table lookup, so the hot path stays at snapshot
@@ -1588,7 +1609,7 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                let mut snapshot = self.array_snapshot(idx);
+                let mut snapshot = self.array_snapshot_get(idx)?;
                 if self.is_callable(cmp) {
                     self.comparator_sort(&mut snapshot, cmp)?;
                 } else {
@@ -1610,7 +1631,7 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(snapshot)))))
             }
             "toReversed" => {
-                let mut snapshot = self.array_snapshot(idx);
+                let mut snapshot = self.array_snapshot_get(idx)?;
                 snapshot.reverse();
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(snapshot)))))
             }
@@ -1695,21 +1716,35 @@ impl<'p> Vm<'p> {
             "with" => {
                 // with(index, value): a COPY with one index replaced. The index is
                 // relative (negative from the end) and NOT clamped — an out-of-range
-                // index throws a RangeError.
-                let mut out = self.array_snapshot(idx);
-                let len = out.len() as i64;
+                // index throws a RangeError. Per spec the replaced index is set to
+                // `value` WITHOUT a [[Get]]; every OTHER index is read via Get (so an
+                // inherited `Array.prototype[k]` at a hole is visited, but the replaced
+                // slot's getter is NOT invoked).
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                } as i64;
                 let n = self.to_number_coerce(arg0)?;
                 let rel = if n.is_nan() { 0 } else { n.trunc() as i64 };
                 let actual = if rel >= 0 { rel } else { len + rel };
                 if actual < 0 || actual >= len {
                     return Err(Thrown("RangeError: Invalid index".into()));
                 }
-                out[actual as usize] = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let value = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let this = Value::heap(idx);
+                let mut out = Vec::with_capacity(len as usize);
+                for k in 0..len as usize {
+                    if k as i64 == actual {
+                        out.push(value);
+                    } else {
+                        out.push(self.array_iter_get(this, k)?.unwrap_or(Value::UNDEFINED));
+                    }
+                }
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
             }
             "toSpliced" => {
                 // Like splice() but returns the modified COPY; receiver unchanged.
-                let mut out = self.array_snapshot(idx);
+                let mut out = self.array_snapshot_get(idx)?;
                 let len = out.len();
                 let s = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
                 let start = if s < 0 { (len as i64 + s).max(0) as usize } else { (s as usize).min(len) };

@@ -155,7 +155,13 @@ impl<'p> Vm<'p> {
                             return Ok(items[i]);
                         }
                     }
-                    // Out of range OR a hole → absent (reads as undefined).
+                    // Out of range OR a hole → not an own element; [[Get]] continues up
+                    // the prototype chain, so an index inherited from `Array.prototype[k]`
+                    // (or a prototype accessor) is visited rather than read as undefined.
+                    let k = self.key_of(key);
+                    if self.arr_proto != 0 {
+                        return self.get_member(Value::heap(self.arr_proto), &k, obj);
+                    }
                     return Ok(Value::UNDEFINED);
                 }
                 // Non-int key on an array: "length", else resolve via the prototype

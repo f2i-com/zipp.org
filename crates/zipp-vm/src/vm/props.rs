@@ -2614,8 +2614,17 @@ impl<'p> Vm<'p> {
                 } else if let Some(i) = key.parse::<u32>().ok().filter(|i| i.to_string() == key) {
                     // Element access via a canonical numeric STRING key (`arr["0"]`,
                     // object-pattern destructuring `{0: x} = arr`): GetProp must read
-                    // the element, like GetIndex.
-                    Ok(items.get(i as usize).copied().unwrap_or(Value::UNDEFINED))
+                    // the element, like GetIndex. A present own element wins; a hole or
+                    // out-of-range index is not own, so [[Get]] continues to the
+                    // prototype (an inherited `Array.prototype[i]` is visited, and the
+                    // internal HOLE sentinel never leaks).
+                    match items.get(i as usize) {
+                        Some(v) if !v.is_hole() => Ok(*v),
+                        _ if self.arr_proto != 0 => {
+                            self.get_member(Value::heap(self.arr_proto), key, receiver)
+                        }
+                        _ => Ok(Value::UNDEFINED),
+                    }
                 } else if key == "raw" {
                     // A tagged-template strings array's `.raw` (side table).
                     Ok(self.template_raws.get(&obj.heap_index()).copied().unwrap_or(Value::UNDEFINED))
