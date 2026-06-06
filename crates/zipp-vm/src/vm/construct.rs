@@ -721,6 +721,19 @@ impl<'p> Vm<'p> {
             }
             return Ok(true);
         }
+        if pidx == self.arr_proto && self.arr_proto != 0 {
+            // `class A extends Array`: build a fresh array via the existing ctor dispatch
+            // (the p==arr_proto path, incl. the single-number `new Array(n)` length form)
+            // and clone it into the instance. Array is exotic (length) but a plain
+            // Vec<Value> with no back-references, so the clone is safe.
+            let tv = self.construct(cval, args)?;
+            let cloned = self.heap.get(tv.heap_index()).clone();
+            *self.heap.get_mut(oidx) = cloned;
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
         if pidx == self.map_proto && self.map_proto != 0 {
             // Brand first so the `set` adder operates on a real Map, then add entries
             // via the adder resolved off the instance (honouring a subclass override).

@@ -2012,6 +2012,16 @@ impl<'p> Vm<'p> {
     /// Look up `key` on a built-in prototype object (`arr_proto`/`str_proto`),
     /// returning the method value (or undefined). Lets primitive array/string
     /// values expose their methods as first-class values.
+    /// The effective prototype for an Array's method/inherited-index resolution: a
+    /// `class extends Array` instance records its own (subclass) prototype in proto_of
+    /// (which chains to %Array.prototype%); a plain array has no entry → %Array.prototype%.
+    pub(crate) fn array_eff_proto(&self, idx: u32) -> u32 {
+        self.proto_of
+            .get(&idx)
+            .and_then(|p| p.is_heap().then(|| p.heap_index()))
+            .unwrap_or(self.arr_proto)
+    }
+
     pub(crate) fn proto_member(&self, proto: u32, key: &str) -> Value {
         // Walk the full prototype chain via `proto_of`. Most type prototypes chain
         // directly to Object.prototype, but a TypedArray instance's prototype chain
@@ -2711,19 +2721,29 @@ impl<'p> Vm<'p> {
                     // out-of-range index is not own, so [[Get]] continues to the
                     // prototype (an inherited `Array.prototype[i]` is visited, and the
                     // internal HOLE sentinel never leaks).
-                    match items.get(i as usize) {
-                        Some(v) if !v.is_hole() => Ok(*v),
-                        _ if self.arr_proto != 0 => {
-                            self.get_member(Value::heap(self.arr_proto), key, receiver)
+                    let present = matches!(items.get(i as usize), Some(v) if !v.is_hole());
+                    let own = items.get(i as usize).copied();
+                    if present {
+                        Ok(own.unwrap())
+                    } else {
+                        // Not an own element → [[Get]] continues up the prototype chain.
+                        // A subclass-of-Array instance records its own prototype in
+                        // proto_of (chains to Array.prototype); else the default arr_proto.
+                        let eff = self.array_eff_proto(obj.heap_index());
+                        if eff != 0 {
+                            self.get_member(Value::heap(eff), key, receiver)
+                        } else {
+                            Ok(Value::UNDEFINED)
                         }
-                        _ => Ok(Value::UNDEFINED),
                     }
                 } else if key == "raw" {
                     // A tagged-template strings array's `.raw` (side table).
                     Ok(self.template_raws.get(&obj.heap_index()).copied().unwrap_or(Value::UNDEFINED))
                 } else {
-                    // A method as a VALUE (`arr.map`, `arr.slice`, …) → Array.prototype.
-                    Ok(self.proto_member(self.arr_proto, key))
+                    // A method as a VALUE (`arr.map`, `arr.slice`, …) → Array.prototype,
+                    // or the subclass prototype for a `class extends Array` instance.
+                    let eff = self.array_eff_proto(obj.heap_index());
+                    Ok(self.proto_member(eff, key))
                 }
             }
             HeapObj::Str(s) => {
