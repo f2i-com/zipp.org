@@ -342,7 +342,8 @@ pub(crate) fn parse_offset_ns(s: &str) -> Option<i128> {
 /// Parse an ISO instant string ("…Z" or "…±HH:MM") → epoch nanoseconds (UTC).
 pub(crate) fn instant_str_to_ns(s: &str) -> Option<i128> {
     let s = s.trim();
-    let tpos = s.find(['T', 't'])?;
+    // DateTimeSeparator is `T` | `t` | <space>.
+    let tpos = s.find(['T', 't', ' '])?;
     let after_t = &s[tpos + 1..];
     // Locate the offset/Z that ends the time part.
     let (dt_part, off): (&str, Option<&str>) = if let Some(z) = after_t.find(['Z', 'z']) {
@@ -998,7 +999,8 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
     if !rem.is_empty() {
         if rem.starts_with('[') {
             // calendar/time-zone annotations — accepted (not deeply validated)
-        } else if rem.starts_with(['T', 't']) {
+        } else if rem.starts_with(['T', 't', ' ']) {
+            // DateTimeSeparator is `T` | `t` | <space>; a valid time must follow.
             if parse_iso_time(&rem[1..]).is_none() {
                 return None;
             }

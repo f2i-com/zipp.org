@@ -2824,6 +2824,7 @@ fn calendar_id_from_string(s: &str) -> Option<String> {
         || parse_iso_date(s).is_some()
         || parse_iso_year_month(s).is_some()
         || parse_iso_month_day(s).is_some()
+        || parse_temporal_time(s).is_some()
     {
         return Some("iso8601".to_string());
     }
@@ -2962,6 +2963,36 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
         }
         let off = sign * (hh * 3600 + mm * 60 + ss) * 1_000_000_000;
         return Some((t.to_string(), off));
+    }
+    // A bracket-less full ISO datetime string carries its own zone: "...Z" → UTC,
+    // "...±HH:MM"/"...±HHMM" (minute precision) → that offset zone, normalized via
+    // format_offset. A sub-minute offset or a bare datetime (no offset/Z) is NOT a
+    // time-zone identifier. (Bracketed forms returned at the `[` branch above; bare
+    // offset ids hit the `+`/`-` branch above.)
+    if let Some(sep) = t.find(['T', 't', ' ']) {
+        if parse_iso_date(&t[..sep]).is_some() {
+            let tp = &t[sep + 1..];
+            if let Some(z) = tp.find(['Z', 'z']) {
+                return parse_iso_time(&tp[..z]).map(|_| ("UTC".to_string(), 0));
+            }
+            if let Some(o) = tp.find(['+', '-']) {
+                let (time_str, off_str) = (&tp[..o], &tp[o..]);
+                let after = &off_str[1..];
+                // Minute precision only: a second ':' (=seconds) or a fraction is a
+                // sub-minute offset, which is not a valid identifier.
+                let minute_prec = after.matches(':').count() <= 1
+                    && !after.contains('.')
+                    && !after.contains(',')
+                    && after.bytes().all(|c| c.is_ascii_digit() || c == b':');
+                if parse_iso_time(time_str).is_some() && minute_prec {
+                    if let Some(off) = parse_offset_ns(off_str) {
+                        let off = off as i64;
+                        return Some((format_offset(off), off));
+                    }
+                }
+            }
+            return None;
+        }
     }
     // A named zone like "America/New_York" or "Europe/London": accept the id.
     if t.contains('/') || t.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
