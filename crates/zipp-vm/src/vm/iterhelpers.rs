@@ -526,7 +526,10 @@ impl<'p> Vm<'p> {
     /// take()/drop() count: ToIntegerOrInfinity, clamped non-negative (NaN→0,
     /// +∞ → "all"); a negative or -∞ value is a RangeError.
     fn iter_limit_arg(&mut self, v: Value) -> Result<i64, Thrown> {
-        let n = self.to_number(v)?;
+        // ToIntegerOrInfinity(limit): a coercing ToNumber so an object limit's
+        // valueOf/@@toPrimitive runs (and a throwing one propagates); a Symbol/BigInt
+        // is a TypeError. NaN -> 0, negative -> RangeError, infinite -> the max.
+        let n = self.to_number_coerce(v)?;
         if n.is_nan() {
             return Ok(0);
         }
@@ -579,7 +582,13 @@ impl<'p> Vm<'p> {
         match self.call_value(cb, Value::UNDEFINED, args) {
             Ok(v) => Ok(v),
             Err(e) => {
+                // IfAbruptCloseIterator returns the ORIGINAL completion: the callback's
+                // thrown value wins even if the source's return() also throws. Since the
+                // thrown VALUE lives in `pending_throw` (which the return() call would
+                // overwrite), save and restore it around the close.
+                let saved = self.pending_throw;
                 let _ = self.iterator_close(src);
+                self.pending_throw = saved;
                 Err(e)
             }
         }
