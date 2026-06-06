@@ -118,7 +118,9 @@ impl<'p> Vm<'p> {
         // ToIntegerOrInfinity(ToNumber(arg)): coerce (valueOf/string), truncate;
         // NaN -> 0. Absent arg behaves as `undefined` -> NaN -> 0.
         let mut int_arg = |vm: &mut Self, i: usize| -> Result<f64, Thrown> {
-            let raw = vm.to_number_coerce(args.get(i).copied().unwrap_or(Value::UNDEFINED))?;
+            // ToIntegerOrInfinity goes through ToNumber, so a BigInt/Symbol digits
+            // argument is a TypeError (not silently coerced).
+            let raw = vm.to_number_strict(args.get(i).copied().unwrap_or(Value::UNDEFINED))?;
             Ok(if raw.is_nan() { 0.0 } else { raw.trunc() })
         };
         match name {

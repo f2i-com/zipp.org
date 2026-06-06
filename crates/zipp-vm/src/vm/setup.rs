@@ -412,6 +412,12 @@ impl<'p> Vm<'p> {
             ],
             Some(str_proto),
         );
+        // The global parseInt/parseFloat function objects, allocated up front so that
+        // `Number.parseInt === parseInt` and `Number.parseFloat === parseFloat` (the
+        // spec requires the SAME object, not just same behaviour). Reused for the bare
+        // globals below.
+        let parse_int_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_INT));
+        let parse_float_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_FLOAT));
         // `Number`: the numeric constants (non-writable/enumerable/configurable per
         // spec) + Number.prototype. `Number(x)` / `Number.isInteger(x)` etc. are
         // call-site lowered (GlobalFn), so only the value-level shape is built here.
@@ -436,12 +442,13 @@ impl<'p> Vm<'p> {
                 ("isNaN", NUM_IS_NAN),
                 ("isFinite", NUM_IS_FINITE),
                 ("isSafeInteger", NUM_IS_SAFE_INTEGER),
-                ("parseInt", GLOBAL_PARSE_INT),
-                ("parseFloat", GLOBAL_PARSE_FLOAT),
             ] {
                 let nv = Value::heap(self.heap.alloc(HeapObj::Native(id)));
                 m.define(name, nv, method_attr);
             }
+            // Number.parseInt/parseFloat are the very same objects as the globals.
+            m.define("parseInt", Value::heap(parse_int_fn), method_attr);
+            m.define("parseFloat", Value::heap(parse_float_fn), method_attr);
             m.define("prototype", Value::heap(num_proto), proto_attr);
             m.is_ctor = true; // Number is a constructor (typeof "function").
             self.heap.alloc(HeapObj::Object(m))
@@ -1888,8 +1895,7 @@ impl<'p> Vm<'p> {
             }
         }
         // Bare global functions as first-class values (the call form is GlobalFn).
-        let parse_int_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_INT));
-        let parse_float_fn = self.heap.alloc(HeapObj::Native(GLOBAL_PARSE_FLOAT));
+        // parse_int_fn/parse_float_fn were allocated up front (shared with Number.*).
         let is_nan_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_NAN));
         let is_finite_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_FINITE));
         let eval_fn = self.heap.alloc(HeapObj::Native(GLOBAL_EVAL));
