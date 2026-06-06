@@ -716,8 +716,15 @@ impl<'p> Vm<'p> {
         // correct to share. Detected by the parent being a TypedArray constructor.
         if cval.is_heap() && self.ta_ctors.iter().any(|&c| c != 0 && c == cval.heap_index()) {
             let tv = self.construct(cval, args)?;
-            let cloned = self.heap.get(tv.heap_index()).clone();
+            let tvi = tv.heap_index();
+            let cloned = self.heap.get(tvi).clone();
             *self.heap.get_mut(oidx) = cloned;
+            // Carry over the length-tracking flag (a `new T(rab[, offset])` view with
+            // no explicit length follows the resizable buffer): it lives in a side
+            // set keyed by heap index, which the clone above does NOT move.
+            if self.ta_tracking.contains(&tvi) {
+                self.ta_tracking.insert(oidx);
+            }
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
