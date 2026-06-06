@@ -768,12 +768,12 @@ impl<'p> Vm<'p> {
                 }
                 let inc = self.read_rounding_increment(opts)?;
                 let mode = self.read_rounding_mode(opts, "trunc")?;
-                // until: this → other; since: other → this.
-                let (d1, d2) = if name == "until" {
-                    ((y, m, d), other)
-                } else {
-                    (other, (y, m, d))
-                };
+                // since = negate(until): always compute the forward (this → other)
+                // difference with a sign-negated rounding mode, then negate the result.
+                // (Swapping operands for `since` would anchor the day-of-month borrow on
+                // the wrong date.)
+                let (d1, d2) = ((y, m, d), other);
+                let eff = if name == "since" { negate_mode(&mode) } else { mode.clone() };
                 let mut f = [0i64; 10];
                 // The day field rounds to the increment; a calendar smallestUnit
                 // (year/month/week) rounds the fractional remainder against the
@@ -782,10 +782,13 @@ impl<'p> Vm<'p> {
                 if si == 3 {
                     let diff = difference_iso_date(d1, d2, &largest);
                     f[..4].copy_from_slice(&diff);
-                    f[3] = round_increment(f[3] as i128, inc, &mode) as i64;
+                    f[3] = round_increment(f[3] as i128, inc, &eff) as i64;
                 } else {
-                    let r = self.round_relative_date_diff(d1, d2, &smallest, &largest, inc, &mode)?;
+                    let r = self.round_relative_date_diff(d1, d2, &smallest, &largest, inc, &eff)?;
                     f[..4].copy_from_slice(&r);
+                }
+                if name == "since" {
+                    f.iter_mut().for_each(|x| *x = -*x);
                 }
                 Ok(Some(self.make_duration(f)))
             }
@@ -1375,26 +1378,29 @@ impl<'p> Vm<'p> {
                         ));
                     }
                 }
-                // until: this → other; since: other → this.
-                let (dt1, dt2) = if name == "until" { (f, o) } else { (o, f) };
+                // since = negate(until): forward (this → other) difference with a
+                // sign-negated rounding mode, then negate the result.
+                let (dt1, dt2) = (f, o);
+                let eff = if name == "since" { negate_mode(&mode) } else { mode.clone() };
                 let df = difference_datetime(dt1, dt2, &largest);
                 // With no calendar units (largestUnit ≤ day) the difference is an
                 // exact nanosecond span: round it and re-balance. Calendar-unit
-                // largestUnits keep the raw difference (full rounding deferred).
-                if rank(&largest) >= rank("day") {
+                // largestUnits round the fractional remainder against the anchor.
+                let mut out = if rank(&largest) >= rank("day") {
                     let total_ns = (df[3] as i128) * DAY_NS
                         + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
                     let inc_ns = unit_ns(&smallest) * inc;
-                    let rounded = round_increment(total_ns, inc_ns, &mode);
-                    Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                    let rounded = round_increment(total_ns, inc_ns, &eff);
+                    balance_duration_ns(rounded, &largest)
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
-                    // Calendar-unit largest + smallest: round against the anchor
-                    // calendar (time-of-day included via epoch nanoseconds).
-                    let r = round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &mode)?;
-                    Ok(Some(self.make_duration(r)))
+                    round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
                 } else {
-                    Ok(Some(self.make_duration(df)))
+                    df
+                };
+                if name == "since" {
+                    out.iter_mut().for_each(|x| *x = -*x);
                 }
+                Ok(Some(self.make_duration(out)))
             }
             "round" => {
                 let (su, inc, mode) = self.read_round_options(
@@ -1689,22 +1695,26 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let f = self.zdt_local(idx);
-                let (dt1, dt2) = if name == "until" { (f, of) } else { (of, f) };
+                // since = negate(until): forward (this → other) difference with a
+                // sign-negated rounding mode, then negate the result.
+                let (dt1, dt2) = (f, of);
+                let eff = if name == "since" { negate_mode(&mode) } else { mode.clone() };
                 let df = difference_datetime(dt1, dt2, &largest);
-                if rank(&largest) >= rank("day") {
+                let mut out = if rank(&largest) >= rank("day") {
                     let total_ns = (df[3] as i128) * DAY_NS
                         + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
                     let inc_ns = unit_ns(&smallest) * inc;
-                    let rounded = round_increment(total_ns, inc_ns, &mode);
-                    Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                    let rounded = round_increment(total_ns, inc_ns, &eff);
+                    balance_duration_ns(rounded, &largest)
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
-                    // Calendar-unit largest + smallest: round against the anchor
-                    // calendar (time-of-day included via epoch nanoseconds).
-                    let r = round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &mode)?;
-                    Ok(Some(self.make_duration(r)))
+                    round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
                 } else {
-                    Ok(Some(self.make_duration(df)))
+                    df
+                };
+                if name == "since" {
+                    out.iter_mut().for_each(|x| *x = -*x);
                 }
+                Ok(Some(self.make_duration(out)))
             }
             "round" => {
                 let opts = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -2892,6 +2902,20 @@ fn calendar_id_from_string(s: &str) -> Option<String> {
         return Some("iso8601".to_string());
     }
     None
+}
+
+/// The rounding mode for the negated frame, used to implement `since` as
+/// `negate(until)`: ceil/floor and halfCeil/halfFloor swap (they are direction-
+/// sensitive); trunc/expand/halfTrunc/halfExpand/halfEven are sign-symmetric.
+fn negate_mode(m: &str) -> String {
+    match m {
+        "ceil" => "floor",
+        "floor" => "ceil",
+        "halfCeil" => "halfFloor",
+        "halfFloor" => "halfCeil",
+        other => other,
+    }
+    .to_string()
 }
 
 /// Whether `s` is a well-formed UTC-offset string for a Temporal property-bag
