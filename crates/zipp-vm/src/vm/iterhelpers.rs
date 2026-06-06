@@ -551,6 +551,17 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// GetIteratorDirect's `next` read for a consuming helper (toArray/forEach/some/…):
+    /// read `iter.next` ONCE (propagating a throwing getter) so the loop steps via the
+    /// cached method. A generator uses the internal step path (UNDEFINED).
+    fn iter_direct_next(&mut self, iter: Value) -> Result<Value, Thrown> {
+        if iter.is_heap() && !matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. }) {
+            self.get_prop(iter, "next")
+        } else {
+            Ok(Value::UNDEFINED)
+        }
+    }
+
     /// Step a single-source helper: use the cached `next` (GetIteratorDirect) when set,
     /// else the generic step path (a generator source).
     fn ih_step(&mut self, source: Value, next: Value) -> Result<Option<Value>, Thrown> {
@@ -610,15 +621,17 @@ impl<'p> Vm<'p> {
                 self.make_iter_helper(this, 3, Value::UNDEFINED, n)
             }
             ITER_TOARRAY => {
+                let next = self.iter_direct_next(this)?;
                 let mut out = Vec::new();
-                while let Some(v) = self.iterator_step(this)? {
+                while let Some(v) = self.ih_step(this, next)? {
                     out.push(v);
                 }
                 Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
             }
             ITER_FOREACH => {
+                let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;
-                while let Some(v) = self.iterator_step(this)? {
+                while let Some(v) = self.ih_step(this, next)? {
                     // A throwing callback IteratorCloses the source (its error wins).
                     self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     i += 1;
@@ -626,8 +639,9 @@ impl<'p> Vm<'p> {
                 Ok(Value::UNDEFINED)
             }
             ITER_SOME => {
+                let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;
-                while let Some(v) = self.iterator_step(this)? {
+                while let Some(v) = self.ih_step(this, next)? {
                     let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if self.truthy(r) {
                         // Early return ALSO closes the iterator (IteratorClose).
@@ -639,8 +653,9 @@ impl<'p> Vm<'p> {
                 Ok(Value::bool(false))
             }
             ITER_EVERY => {
+                let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;
-                while let Some(v) = self.iterator_step(this)? {
+                while let Some(v) = self.ih_step(this, next)? {
                     let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if !self.truthy(r) {
                         self.iterator_close(this)?;
@@ -651,8 +666,9 @@ impl<'p> Vm<'p> {
                 Ok(Value::bool(true))
             }
             ITER_FIND => {
+                let next = self.iter_direct_next(this)?;
                 let mut i = 0i64;
-                while let Some(v) = self.iterator_step(this)? {
+                while let Some(v) = self.ih_step(this, next)? {
                     let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if self.truthy(r) {
                         self.iterator_close(this)?;
@@ -667,11 +683,12 @@ impl<'p> Vm<'p> {
                     let _ = self.iterator_close(this);
                     return Err(Thrown("TypeError: reduce reducer is not a function".into()));
                 }
+                let next = self.iter_direct_next(this)?;
                 let has_init = args.len() >= 2;
                 let mut acc = if has_init { args[1] } else { Value::UNDEFINED };
                 let mut i = 0i64;
                 if !has_init {
-                    match self.iterator_step(this)? {
+                    match self.ih_step(this, next)? {
                         Some(v) => {
                             acc = v;
                             i = 1;
@@ -683,7 +700,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                while let Some(v) = self.iterator_step(this)? {
+                while let Some(v) = self.ih_step(this, next)? {
                     acc = self.iter_call_close(a0, this, &[acc, v, Value::num(i as f64)])?;
                     i += 1;
                 }
