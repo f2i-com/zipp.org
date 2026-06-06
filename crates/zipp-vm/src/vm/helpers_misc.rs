@@ -487,17 +487,28 @@ pub(crate) enum BigOp {
 /// `None` ⇒ not a valid BigInt literal (→ SyntaxError at the call site).
 pub(crate) fn parse_bigint_str(s: &str) -> Option<i128> {
     let s = s.trim();
-    let (neg, body) = match s.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    let (neg, body, signed) = match s.strip_prefix('-') {
+        Some(r) => (true, r, true),
+        None => match s.strip_prefix('+') {
+            Some(r) => (false, r, true),
+            None => (false, s, false),
+        },
     };
-    let v: i128 = if let Some(h) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-        i128::from_str_radix(h, 16).ok()?
-    } else if let Some(o) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
-        i128::from_str_radix(o, 8).ok()?
-    } else if let Some(b) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
-        i128::from_str_radix(b, 2).ok()?
+    // A NonDecimalIntegerLiteral (0x/0o/0b) must NOT carry a sign — only a decimal
+    // StrIntegerLiteral may. The digit run must be non-empty and contain only valid
+    // radix digits (from_str_radix would otherwise accept an embedded sign).
+    let non_decimal = [("0x", 16u32), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)]
+        .iter()
+        .find_map(|(p, r)| body.strip_prefix(p).map(|d| (*r, d)));
+    let v: i128 = if let Some((radix, digits)) = non_decimal {
+        if signed || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        i128::from_str_radix(digits, radix).ok()?
     } else {
+        if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
         body.parse::<i128>().ok()?
     };
     Some(if neg { -v } else { v })

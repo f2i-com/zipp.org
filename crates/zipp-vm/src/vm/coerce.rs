@@ -793,8 +793,15 @@ impl<'p> Vm<'p> {
     /// `new Int8Array(buf, -1)` throws rather than silently clamping to 0 (a bare
     /// `as usize` cast saturates a negative float to 0).
     pub(crate) fn to_index(&mut self, v: Value) -> Result<usize, Thrown> {
-        let n = self.to_integer_or_zero(v)?;
-        if n < 0 || (n as i128) > (1i128 << 53) - 1 {
+        // ToIndex = ToIntegerOrInfinity(value) clamped to 0..=2^53-1. The integer
+        // conversion goes through ToNumber, so a BigInt or Symbol is a TypeError
+        // (not silently coerced); `undefined` is 0 and NaN truncates to 0.
+        if v == Value::UNDEFINED {
+            return Ok(0);
+        }
+        let num = self.to_number_strict(v)?;
+        let n = if num.is_nan() { 0.0 } else { num.trunc() };
+        if n < 0.0 || n > ((1i128 << 53) - 1) as f64 {
             return Err(Thrown("RangeError: index is out of range".into()));
         }
         Ok(n as usize)
