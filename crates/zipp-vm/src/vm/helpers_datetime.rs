@@ -342,23 +342,44 @@ pub(crate) fn parse_offset_ns(s: &str) -> Option<i128> {
 /// Parse an ISO instant string ("…Z" or "…±HH:MM") → epoch nanoseconds (UTC).
 pub(crate) fn instant_str_to_ns(s: &str) -> Option<i128> {
     let s = s.trim();
-    // DateTimeSeparator is `T` | `t` | <space>.
-    let tpos = s.find(['T', 't', ' '])?;
-    let after_t = &s[tpos + 1..];
-    // Locate the offset/Z that ends the time part.
-    let (dt_part, off): (&str, Option<&str>) = if let Some(z) = after_t.find(['Z', 'z']) {
-        (&s[..tpos + 1 + z], Some("Z"))
-    } else if let Some(rel) = after_t.find('+') {
-        (&s[..tpos + 1 + rel], Some(&after_t[rel..]))
-    } else if let Some(rel) = after_t.find('-') {
-        (&s[..tpos + 1 + rel], Some(&after_t[rel..]))
-    } else {
-        return None; // an Instant string must carry a UTC designator
+    // Drop a trailing [...] annotation block (its validity is enforced upstream by
+    // temporal_string_ok); the remaining "main" must be DateTime + (Z | numeric UTC
+    // offset) with NOTHING after the designator.
+    let main = match s.find('[') {
+        Some(i) => &s[..i],
+        None => s,
     };
+    // DateTimeSeparator is `T` | `t` | <space>.
+    let tpos = main.find(['T', 't', ' '])?;
+    let after_t = &main[tpos + 1..];
+    // The designator runs from the first Z/+/- to the end of `main` (so trailing junk
+    // is part of `off` and rejected below). An Instant string must carry a designator.
+    let off = if let Some(z) = after_t.find(['Z', 'z']) {
+        &after_t[z..]
+    } else if let Some(rel) = after_t.find(['+', '-']) {
+        &after_t[rel..]
+    } else {
+        return None;
+    };
+    // The time portion between the separator and the designator must be non-empty
+    // (rejects "…T" with no time), and the designator must be exactly "Z"/"z" or a
+    // well-formed UTC offset with no trailing characters.
+    let time_part = &after_t[..after_t.len() - off.len()];
+    if time_part.is_empty() {
+        return None;
+    }
+    let off_ns = if off == "Z" || off == "z" {
+        0
+    } else if super::temporal::valid_offset_string(off) {
+        parse_offset_ns(off)?
+    } else {
+        return None;
+    };
+    let dt_part = &main[..tpos + 1 + time_part.len()];
     let dt = parse_iso_datetime(dt_part)?;
-    let mut ns = (iso_to_epoch_days(dt[0], dt[1], dt[2]) as i128) * DAY_NS
-        + time_to_ns(&[dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]]);
-    ns -= parse_offset_ns(off?)?;
+    let ns = (iso_to_epoch_days(dt[0], dt[1], dt[2]) as i128) * DAY_NS
+        + time_to_ns(&[dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]])
+        - off_ns;
     Some(ns)
 }
 

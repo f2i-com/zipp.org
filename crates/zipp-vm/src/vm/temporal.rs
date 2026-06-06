@@ -1257,6 +1257,18 @@ impl<'p> Vm<'p> {
                 ])?))
             }
             "toZonedDateTime" => {
+                // Validate the options bag and the disambiguation enum (this method
+                // reads only options.disambiguation per spec) before building.
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if opts != Value::UNDEFINED && !self.is_object_value(opts) {
+                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                }
+                self.opt_string(
+                    opts,
+                    "disambiguation",
+                    "compatible",
+                    &["compatible", "earlier", "later", "reject"],
+                )?;
                 let (id, offset) = self.parse_tz_arg(a0)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
@@ -1770,7 +1782,9 @@ impl<'p> Vm<'p> {
         if item.is_heap() {
             if let Some(ns) = self.zdt_epoch_ns(item.heap_index()) {
                 let off = self.zdt_offset_ns(item.heap_index());
-                let _ = self.read_overflow(options)?;
+                // The disambiguation/offset/overflow options are validated even for a
+                // ZonedDateTime instance (the result is still a copy).
+                let _ = self.read_zdt_options(options)?;
                 return Ok(self.make_zoned_date_time_raw(ns, off, item.heap_index()));
             }
             if matches!(self.heap.get(item.heap_index()), HeapObj::Object(_)) {
@@ -2176,8 +2190,14 @@ impl<'p> Vm<'p> {
         if !temporal_string_ok(s, false, false) {
             return Err(Thrown(format!("RangeError: invalid instant string '{s}'")));
         }
-        instant_str_to_ns(s)
-            .ok_or_else(|| Thrown(format!("RangeError: invalid instant string '{s}'")))
+        let ns = instant_str_to_ns(s)
+            .ok_or_else(|| Thrown(format!("RangeError: invalid instant string '{s}'")))?;
+        // IsValidEpochNanoseconds: compare/equals/since/until reach the ns directly
+        // (only make_instant via from() range-checks otherwise).
+        if ns.abs() > NS_MAX_INSTANT {
+            return Err(Thrown(format!("RangeError: instant '{s}' is outside the supported range")));
+        }
+        Ok(ns)
     }
 
     pub(crate) fn instant_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
@@ -2879,7 +2899,7 @@ fn calendar_id_from_string(s: &str) -> Option<String> {
 /// minute / second components with a CONSISTENT separator style (all `:` or all
 /// none), and an optional 1-9 digit sub-minute fraction. (Rejects "00:00" — no
 /// sign, "+0" — short hour, "-000:00" — long hour, "+00:0000" — inconsistent.)
-fn valid_offset_string(s: &str) -> bool {
+pub(crate) fn valid_offset_string(s: &str) -> bool {
     let b = s.as_bytes();
     let n = b.len();
     let two = |i: usize| -> Option<u32> {
