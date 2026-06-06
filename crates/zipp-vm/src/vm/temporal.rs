@@ -1714,6 +1714,7 @@ impl<'p> Vm<'p> {
                 // ToTemporalTimeZoneIdentifier: a string is parsed, a wrong type
                 // (null/boolean/number/bigint/symbol) is a TypeError — not coerced.
                 let (id, offset) = self.parse_tz_arg(tzv)?;
+                self.validate_bag_offset_field(item)?;
                 let reject = self.read_zdt_options(options)?;
                 let f = self.to_plain_date_time_overflow(item, reject)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
@@ -1829,10 +1830,31 @@ impl<'p> Vm<'p> {
                 let tz = self.get_prop(rel, "timeZone")?;
                 if tz != Value::UNDEFINED {
                     self.parse_tz_arg(tz)?;
+                    self.validate_bag_offset_field(rel)?;
                 }
             }
         }
         self.to_plain_date_time(rel)
+    }
+
+    /// Validate a ZonedDateTime-like property bag's `offset` field: if present it
+    /// must be a well-formed UTC-offset string (`±HH:MM…`). (The offset-vs-time-zone
+    /// agreement check needs a tz database and is not done here.)
+    pub(crate) fn validate_bag_offset_field(&mut self, bag: Value) -> Result<(), Thrown> {
+        let offv = self.get_prop(bag, "offset")?;
+        if offv != Value::UNDEFINED {
+            // The offset must be a String or an object (which ToString-s); a
+            // primitive non-string (null/boolean/number/bigint/symbol) is a TypeError.
+            let is_string = offv.is_heap() && self.heap.is_str_like(offv.heap_index());
+            if !is_string && !self.is_object_value(offv) {
+                return Err(Thrown("TypeError: offset must be a string".into()));
+            }
+            let offs = self.to_js_string(offv)?;
+            if !valid_offset_string(&offs) {
+                return Err(Thrown(format!("RangeError: invalid offset string \"{offs}\"")));
+            }
+        }
+        Ok(())
     }
 
     /// `Temporal.Duration.compare(one, two, { relativeTo })`. With a relativeTo
@@ -2691,6 +2713,67 @@ fn calendar_id_from_string(s: &str) -> Option<String> {
         return Some("iso8601".to_string());
     }
     None
+}
+
+/// Whether `s` is a well-formed UTC-offset string for a Temporal property-bag
+/// `offset` field: a required sign, a 2-digit hour 00-23, then optional
+/// minute / second components with a CONSISTENT separator style (all `:` or all
+/// none), and an optional 1-9 digit sub-minute fraction. (Rejects "00:00" — no
+/// sign, "+0" — short hour, "-000:00" — long hour, "+00:0000" — inconsistent.)
+fn valid_offset_string(s: &str) -> bool {
+    let b = s.as_bytes();
+    let n = b.len();
+    let two = |i: usize| -> Option<u32> {
+        if i + 2 <= n && b[i].is_ascii_digit() && b[i + 1].is_ascii_digit() {
+            Some((b[i] - b'0') as u32 * 10 + (b[i + 1] - b'0') as u32)
+        } else {
+            None
+        }
+    };
+    if n == 0 || (b[0] != b'+' && b[0] != b'-') {
+        return false;
+    }
+    // Hour: exactly two digits, 00-23.
+    match two(1) {
+        Some(h) if h <= 23 => {}
+        _ => return false,
+    }
+    let mut i = 3;
+    if i == n {
+        return true;
+    }
+    let extended = b[i] == b':';
+    // Minutes.
+    if extended {
+        i += 1;
+    }
+    match two(i) {
+        Some(m) if m <= 59 => i += 2,
+        _ => return false,
+    }
+    if i == n {
+        return true;
+    }
+    // Seconds — the separator style must match the minutes'.
+    if extended {
+        if i >= n || b[i] != b':' {
+            return false;
+        }
+        i += 1;
+    }
+    match two(i) {
+        Some(sec) if sec <= 59 => i += 2,
+        _ => return false,
+    }
+    if i == n {
+        return true;
+    }
+    // Optional 1-9 digit sub-second fraction terminating the string.
+    if b[i] == b'.' || b[i] == b',' {
+        let frac = &b[i + 1..];
+        return !frac.is_empty() && frac.len() <= 9 && frac.iter().all(|c| c.is_ascii_digit());
+    }
+    false
 }
 
 /// Parse a Temporal time-zone argument into a (normalized id, offset-ns) pair.
