@@ -393,10 +393,11 @@ impl Vm<'_> {
                 }
                 m_idx!(*proto);
             }
-            HeapObj::IterHelper { source, arg, inner, .. } => {
+            HeapObj::IterHelper { source, arg, inner, next, .. } => {
                 m_val!(*source);
                 m_val!(*arg);
                 m_val!(*inner);
+                m_val!(*next);
             }
             HeapObj::Class(c) => {
                 for (_, v) in c

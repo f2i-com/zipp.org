@@ -64,6 +64,16 @@ impl<'p> Vm<'p> {
             return Ok(Some(val));
         }
         let next = self.get_prop(iter, "next")?;
+        self.iterator_step_with(iter, next)
+    }
+
+    /// IteratorStep using a PRE-FETCHED `next` method (GetIteratorDirect cached it), so
+    /// `iter.next` is not re-read each step. `Ok(None)` at end.
+    pub(crate) fn iterator_step_with(
+        &mut self,
+        iter: Value,
+        next: Value,
+    ) -> Result<Option<Value>, Thrown> {
         let res = self.call_value(next, iter, &[])?;
         if !self.is_object_value(res) {
             return Err(Thrown("TypeError: iterator.next() returned a non-object".into()));
@@ -121,7 +131,7 @@ impl<'p> Vm<'p> {
             pairs.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![item, method]))));
         }
         let src = Value::heap(self.heap.alloc(HeapObj::Array(pairs)));
-        Ok(self.make_iter_helper(src, 6, Value::UNDEFINED, 0))
+        self.make_iter_helper(src, 6, Value::UNDEFINED, 0)
     }
 
     /// `Iterator.zip(iterables, options)` (keyed=false) / `Iterator.zipKeyed`
@@ -256,7 +266,7 @@ impl<'p> Vm<'p> {
         } else {
             Value::UNDEFINED
         };
-        let h = self.make_iter_helper(source, 7, arg, mode as i64);
+        let h = self.make_iter_helper(source, 7, arg, mode as i64)?;
         self.ih_set_inner(h.heap_index(), inner);
         Ok(h)
     }
@@ -462,7 +472,19 @@ impl<'p> Vm<'p> {
         Ok(self.iter_result(out, false))
     }
 
-    fn make_iter_helper(&mut self, source: Value, kind: u8, arg: Value, n: i64) -> Value {
+    fn make_iter_helper(&mut self, source: Value, kind: u8, arg: Value, n: i64) -> Result<Value, Thrown> {
+        // GetIteratorDirect(source): read `next` ONCE now (a getter fires once, and a
+        // throwing `next` getter propagates here at creation). Single-source helpers
+        // (kinds 0..=5) then step via this cached method; a generator uses the internal
+        // step path, and zip/concat (6/7) hold an Array of sub-iterators.
+        let next = if kind <= 5
+            && source.is_heap()
+            && !matches!(self.heap.get(source.heap_index()), HeapObj::Generator { .. })
+        {
+            self.get_prop(source, "next")?
+        } else {
+            Value::UNDEFINED
+        };
         let idx = self.heap.alloc(HeapObj::IterHelper {
             source,
             kind,
@@ -471,11 +493,12 @@ impl<'p> Vm<'p> {
             idx: 0,
             done: false,
             inner: Value::UNDEFINED,
+            next,
         });
         if self.iterator_helper_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.iterator_helper_proto));
         }
-        Value::heap(idx)
+        Ok(Value::heap(idx))
     }
 
     // Field mutators for an IterHelper (kept tiny to dodge borrow conflicts).
@@ -528,6 +551,16 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Step a single-source helper: use the cached `next` (GetIteratorDirect) when set,
+    /// else the generic step path (a generator source).
+    fn ih_step(&mut self, source: Value, next: Value) -> Result<Option<Value>, Thrown> {
+        if next != Value::UNDEFINED {
+            self.iterator_step_with(source, next)
+        } else {
+            self.iterator_step(source)
+        }
+    }
+
     /// Call a helper callback (`this` = undefined); on an abrupt completion,
     /// IteratorClose the source iterator `src` before propagating (the callback's error
     /// wins over any close error), per the helpers' IfAbruptCloseIterator.
@@ -565,16 +598,16 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: the callback argument is not a function".into()));
         }
         match id {
-            ITER_MAP => Ok(self.make_iter_helper(this, 0, a0, 0)),
-            ITER_FILTER => Ok(self.make_iter_helper(this, 1, a0, 0)),
-            ITER_FLATMAP => Ok(self.make_iter_helper(this, 4, a0, 0)),
+            ITER_MAP => self.make_iter_helper(this, 0, a0, 0),
+            ITER_FILTER => self.make_iter_helper(this, 1, a0, 0),
+            ITER_FLATMAP => self.make_iter_helper(this, 4, a0, 0),
             ITER_TAKE => {
                 let n = self.iter_limit_or_close(a0, this)?;
-                Ok(self.make_iter_helper(this, 2, Value::UNDEFINED, n))
+                self.make_iter_helper(this, 2, Value::UNDEFINED, n)
             }
             ITER_DROP => {
                 let n = self.iter_limit_or_close(a0, this)?;
-                Ok(self.make_iter_helper(this, 3, Value::UNDEFINED, n))
+                self.make_iter_helper(this, 3, Value::UNDEFINED, n)
             }
             ITER_TOARRAY => {
                 let mut out = Vec::new();
@@ -663,9 +696,9 @@ impl<'p> Vm<'p> {
     /// Lazy `.next()` for an Iterator Helper (the `%IteratorHelperPrototype%.next`).
     pub(crate) fn iter_helper_next(&mut self, idx: u32) -> Result<Value, Thrown> {
         loop {
-            let (source, kind, arg, n, cidx, done, inner) = match self.heap.get(idx) {
-                HeapObj::IterHelper { source, kind, arg, n, idx, done, inner } => {
-                    (*source, *kind, *arg, *n, *idx, *done, *inner)
+            let (source, kind, arg, n, cidx, done, inner, next) = match self.heap.get(idx) {
+                HeapObj::IterHelper { source, kind, arg, n, idx, done, inner, next } => {
+                    (*source, *kind, *arg, *n, *idx, *done, *inner, *next)
                 }
                 _ => {
                     return Err(Thrown(
@@ -679,14 +712,15 @@ impl<'p> Vm<'p> {
             match kind {
                 0 => {
                     // map
-                    match self.iterator_step(source)? {
+                    match self.ih_step(source, next)? {
                         None => {
                             self.ih_set_done(idx);
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
                         Some(v) => {
+                            // A throwing mapper IteratorCloses the source.
                             let mapped =
-                                self.call_value(arg, Value::UNDEFINED, &[v, Value::num(cidx as f64)])?;
+                                self.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])?;
                             self.ih_inc_idx(idx);
                             return Ok(self.iter_result(mapped, false));
                         }
@@ -694,14 +728,14 @@ impl<'p> Vm<'p> {
                 }
                 1 => {
                     // filter
-                    match self.iterator_step(source)? {
+                    match self.ih_step(source, next)? {
                         None => {
                             self.ih_set_done(idx);
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
                         Some(v) => {
                             let keep =
-                                self.call_value(arg, Value::UNDEFINED, &[v, Value::num(cidx as f64)])?;
+                                self.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])?;
                             self.ih_inc_idx(idx);
                             if self.truthy(keep) {
                                 return Ok(self.iter_result(v, false));
@@ -713,11 +747,13 @@ impl<'p> Vm<'p> {
                 2 => {
                     // take
                     if n <= 0 {
+                        // Reaching the limit closes the source (IteratorClose).
                         self.ih_set_done(idx);
+                        self.iterator_close(source)?;
                         return Ok(self.iter_result(Value::UNDEFINED, true));
                     }
                     self.ih_set_n(idx, n - 1);
-                    match self.iterator_step(source)? {
+                    match self.ih_step(source, next)? {
                         None => {
                             self.ih_set_done(idx);
                             return Ok(self.iter_result(Value::UNDEFINED, true));
@@ -729,7 +765,7 @@ impl<'p> Vm<'p> {
                     // drop
                     let mut nn = n;
                     while nn > 0 {
-                        match self.iterator_step(source)? {
+                        match self.ih_step(source, next)? {
                             None => {
                                 self.ih_set_done(idx);
                                 return Ok(self.iter_result(Value::UNDEFINED, true));
@@ -738,7 +774,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     self.ih_set_n(idx, 0);
-                    match self.iterator_step(source)? {
+                    match self.ih_step(source, next)? {
                         None => {
                             self.ih_set_done(idx);
                             return Ok(self.iter_result(Value::UNDEFINED, true));
@@ -757,14 +793,14 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
-                    match self.iterator_step(source)? {
+                    match self.ih_step(source, next)? {
                         None => {
                             self.ih_set_done(idx);
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
                         Some(v) => {
                             let mapped =
-                                self.call_value(arg, Value::UNDEFINED, &[v, Value::num(cidx as f64)])?;
+                                self.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])?;
                             self.ih_inc_idx(idx);
                             let it = self.get_iterator_flattenable(mapped)?;
                             self.ih_set_inner(idx, it);
@@ -826,6 +862,6 @@ impl<'p> Vm<'p> {
         // A string yields its code-point iterator; otherwise get the iterable's
         // iterator (or use it directly if it is one).
         let it = self.get_iterator_flattenable(o)?;
-        Ok(self.make_iter_helper(it, 5, Value::UNDEFINED, 0))
+        self.make_iter_helper(it, 5, Value::UNDEFINED, 0)
     }
 }

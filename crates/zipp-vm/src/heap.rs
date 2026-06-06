@@ -474,6 +474,11 @@ pub enum HeapObj {
         idx: i64,
         done: bool,
         inner: Value,
+        /// The source's `next` method, read ONCE at creation (GetIteratorDirect), so
+        /// stepping calls the cached method rather than re-reading `source.next` each
+        /// time. `UNDEFINED` when the source needs the generic step path (a generator,
+        /// or a multi-source zip/concat helper).
+        next: Value,
     },
     /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
     /// `ctor` is the func id that runs instance field initializers then the user
