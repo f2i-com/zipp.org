@@ -742,10 +742,19 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)))
             }
             "with" => {
+                self.reject_temporal_like(a0)?;
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                let ny = self.opt_int_field(a0, "year")?.unwrap_or(y);
-                let mut nm = self.opt_int_field(a0, "month")?.unwrap_or(m);
-                let mut nd = self.opt_int_field(a0, "day")?.unwrap_or(d);
+                let yf = self.opt_int_field(a0, "year")?;
+                let mf = self.read_month_field(a0)?;
+                let df = self.opt_int_field(a0, "day")?;
+                if yf.is_none() && mf.is_none() && df.is_none() {
+                    return Err(Thrown(
+                        "TypeError: with() requires at least one recognized property".into(),
+                    ));
+                }
+                let ny = yf.unwrap_or(y);
+                let mut nm = mf.unwrap_or(m);
+                let mut nd = df.unwrap_or(d);
                 if !reject {
                     nm = nm.clamp(1, 12);
                     nd = nd.clamp(1, days_in_month(ny, nm));
@@ -884,6 +893,29 @@ impl<'p> Vm<'p> {
         Ok(n.trunc() as i64)
     }
 
+    /// Guard a `.with()` argument: it must be a plain property bag — not a primitive,
+    /// not a Temporal object (the brand check runs BEFORE any property Get, so a
+    /// throwing calendar/timeZone getter on a Temporal arg is never invoked), and not
+    /// an object carrying a `calendar` or `timeZone` property.
+    pub(crate) fn reject_temporal_like(&mut self, arg: Value) -> Result<(), Thrown> {
+        if !self.is_object_value(arg) {
+            return Err(Thrown("TypeError: with() requires a property-bag object".into()));
+        }
+        if arg.is_heap() {
+            if let HeapObj::Temporal { .. } = self.heap.get(arg.heap_index()) {
+                return Err(Thrown("TypeError: with() does not accept a Temporal object".into()));
+            }
+        }
+        if self.get_prop(arg, "calendar")? != Value::UNDEFINED
+            || self.get_prop(arg, "timeZone")? != Value::UNDEFINED
+        {
+            return Err(Thrown(
+                "TypeError: with() argument must not have a calendar or timeZone property".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn opt_int_field(&mut self, obj: Value, key: &str) -> Result<Option<i64>, Thrown> {
         let v = self.get_prop(obj, key)?;
         if v == Value::UNDEFINED {
@@ -1015,6 +1047,7 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool(f == o)))
             }
             "with" => {
+                self.reject_temporal_like(a0)?;
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let names =
                     ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
@@ -1299,6 +1332,7 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)))
             }
             "with" => {
+                self.reject_temporal_like(a0)?;
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let names = [
                     "year", "month", "day", "hour", "minute", "second", "millisecond",
@@ -1771,18 +1805,23 @@ impl<'p> Vm<'p> {
                 // Merge date/time fields from the bag over the current local
                 // wall-clock; the zone (and thus offset) is unchanged.
                 let bag = args.first().copied().unwrap_or(Value::UNDEFINED);
-                if !self.is_object_value(bag) {
-                    return Err(Thrown("TypeError: ZonedDateTime.with requires an object".into()));
-                }
+                self.reject_temporal_like(bag)?;
                 let mut f = self.zdt_local(idx);
                 let names = [
                     "year", "month", "day", "hour", "minute", "second", "millisecond",
                     "microsecond", "nanosecond",
                 ];
+                let mut any = false;
                 for (i, nm) in names.iter().enumerate() {
                     if let Some(x) = self.opt_int_field(bag, nm)? {
                         f[i] = x;
+                        any = true;
                     }
+                }
+                if !any && self.get_prop(bag, "offset")? == Value::UNDEFINED {
+                    return Err(Thrown(
+                        "TypeError: with() requires at least one recognized property".into(),
+                    ));
                 }
                 // Validate the resolution options (disambiguation/offset/overflow).
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -2501,9 +2540,17 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool((y, m) == (o.0, o.1))))
             }
             "with" => {
+                self.reject_temporal_like(a0)?;
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                let ny = self.opt_int_field(a0, "year")?.unwrap_or(y);
-                let mut nm = self.read_month_field(a0)?.unwrap_or(m);
+                let yf = self.opt_int_field(a0, "year")?;
+                let mf = self.read_month_field(a0)?;
+                if yf.is_none() && mf.is_none() {
+                    return Err(Thrown(
+                        "TypeError: with() requires at least one recognized property".into(),
+                    ));
+                }
+                let ny = yf.unwrap_or(y);
+                let mut nm = mf.unwrap_or(m);
                 if !reject {
                     nm = nm.clamp(1, 12);
                 }
@@ -2702,9 +2749,18 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool((ry, m, d) == o)))
             }
             "with" => {
+                self.reject_temporal_like(a0)?;
                 let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                let mut nm = self.read_month_field(a0)?.unwrap_or(m);
-                let mut nd = self.opt_int_field(a0, "day")?.unwrap_or(d);
+                let yf = self.opt_int_field(a0, "year")?;
+                let mf = self.read_month_field(a0)?;
+                let df = self.opt_int_field(a0, "day")?;
+                if yf.is_none() && mf.is_none() && df.is_none() {
+                    return Err(Thrown(
+                        "TypeError: with() requires at least one recognized property".into(),
+                    ));
+                }
+                let mut nm = mf.unwrap_or(m);
+                let mut nd = df.unwrap_or(d);
                 if !reject {
                     nm = nm.clamp(1, 12);
                     nd = nd.clamp(1, days_in_month(ry, nm));
