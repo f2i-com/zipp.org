@@ -1456,17 +1456,48 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                let mut snapshot = self.array_snapshot(idx);
+                // Collect the PRESENT (non-hole) elements; holes are absent indices
+                // (SortIndexedProperties skips them) and re-appear as holes at the end,
+                // with the length preserved.
+                let (mut snapshot, total_len) = match self.heap.get(idx) {
+                    HeapObj::Array(items) => {
+                        let total = items.len();
+                        (items.iter().copied().filter(|v| !v.is_hole()).collect::<Vec<_>>(), total)
+                    }
+                    _ => (Vec::new(), 0),
+                };
                 if self.is_callable(cmp) {
                     // Comparator sort: stable O(n log n) bottom-up merge sort,
                     // re-entering the VM for each comparison.
                     self.comparator_sort(&mut snapshot, cmp)?;
                 } else {
-                    // Default sort: by string coercion (JS spec default).
-                    snapshot.sort_by(|a, b| self.display(*a).cmp(&self.display(*b)));
+                    // Default sort (no comparator): SortCompare coerces each element
+                    // with ToString (invoking a user toString/valueOf — a Symbol is a
+                    // TypeError) and compares by code units; `undefined` elements sort
+                    // to the end. Keys are precomputed because ToString may run JS,
+                    // which can't happen inside the sort comparator.
+                    let mut keyed: Vec<(Option<String>, Value)> =
+                        Vec::with_capacity(snapshot.len());
+                    for v in std::mem::take(&mut snapshot) {
+                        let key = if v == Value::UNDEFINED {
+                            None // undefined sorts last
+                        } else {
+                            Some(self.to_js_string(v)?)
+                        };
+                        keyed.push((key, v));
+                    }
+                    keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
+                        (Some(a), Some(b)) => a.cmp(b),
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                    });
+                    snapshot = keyed.into_iter().map(|(_, v)| v).collect();
                 }
                 if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    *items = snapshot;
+                    items.clear();
+                    items.append(&mut snapshot);
+                    items.resize(total_len, Value::HOLE); // holes re-appended at the end
                 }
                 Ok(Some(Value::heap(idx)))
             }
@@ -1561,7 +1592,20 @@ impl<'p> Vm<'p> {
                 if self.is_callable(cmp) {
                     self.comparator_sort(&mut snapshot, cmp)?;
                 } else {
-                    snapshot.sort_by(|a, b| self.display(*a).cmp(&self.display(*b)));
+                    // Default SortCompare: ToString each element (undefined last).
+                    let mut keyed: Vec<(Option<String>, Value)> =
+                        Vec::with_capacity(snapshot.len());
+                    for v in std::mem::take(&mut snapshot) {
+                        let key = if v == Value::UNDEFINED { None } else { Some(self.to_js_string(v)?) };
+                        keyed.push((key, v));
+                    }
+                    keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
+                        (Some(a), Some(b)) => a.cmp(b),
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                    });
+                    snapshot = keyed.into_iter().map(|(_, v)| v).collect();
                 }
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(snapshot)))))
             }
