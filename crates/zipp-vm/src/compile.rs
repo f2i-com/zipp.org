@@ -3108,14 +3108,19 @@ impl<'a> FnCompiler<'a> {
             }
             E::TemplateLiteral(t) => {
                 // Desugar `q0${e0}q1${e1}...qN` to string concatenation
-                // q0 + e0 + q1 + e1 + ... + qN. q0 is loaded as a string, so every
-                // `+` is a (rope) string concat that coerces each ${e} to a string.
+                // q0 + ToString(e0) + q1 + ToString(e1) + ... + qN. Each `${e}` is
+                // ToString'd (string hint) FIRST — NOT left to `+`, whose default
+                // hint tries `valueOf` before `toString` (wrong for e.g. a Temporal
+                // value, whose `valueOf` throws). After ToStr both operands are
+                // strings, so each `+` is a pure (rope) concat.
                 let q0 = t.quasis[0].value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
                 let idx = self.add_string_const(q0);
                 self.emit(Instr::LoadConst { dst, idx });
                 for (i, e) in t.expressions.iter().enumerate() {
                     let r = self.expr(e)?;
-                    self.emit(Instr::Add { dst, a: dst, b: r });
+                    let rs = self.temp();
+                    self.emit(Instr::ToStr { dst: rs, a: r });
+                    self.emit(Instr::Add { dst, a: dst, b: rs });
                     if let Some(qe) = t.quasis.get(i + 1) {
                         let q = qe.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
                         if !q.is_empty() {

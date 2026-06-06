@@ -331,6 +331,15 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    // ToString(a) with the STRING hint (toString before valueOf),
+                    // for template-literal substitutions.
+                    Instr::ToStr { dst, a } => {
+                        let av = self.get(base, a);
+                        let s = self.to_js_string(av)?;
+                        let r = self.alloc_str(s);
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::Sub { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);

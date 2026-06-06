@@ -108,6 +108,12 @@ pub enum Instr {
     LooseNe { dst: Reg, a: Reg, b: Reg },
 
     Not { dst: Reg, a: Reg },
+    /// `dst = ToString(a)` — the string-hint coercion (ToPrimitive with the string
+    /// hint: `@@toPrimitive("string")` / `toString` / `valueOf`). Used for template-
+    /// literal substitutions, which `ToString` each `${…}` rather than going through
+    /// `+` (whose default hint tries `valueOf` first — wrong for e.g. a Temporal
+    /// value, whose `valueOf` throws but whose `toString` works).
+    ToStr { dst: Reg, a: Reg },
     /// `dst = typeof a` (a JS type-name string).
     TypeOf { dst: Reg, a: Reg },
     /// `dst = Array.isArray(a)` — true iff `a` is a heap array.
