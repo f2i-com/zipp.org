@@ -1409,9 +1409,8 @@ impl<'p> Vm<'p> {
         if tzarg == Value::UNDEFINED {
             return Err(Thrown("TypeError: Temporal.ZonedDateTime requires a time zone".into()));
         }
-        let tzstr = self.to_js_string(tzarg)?;
-        let (id, offset_ns) = parse_time_zone(&tzstr)
-            .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{tzstr}\"")))?;
+        // ToTemporalTimeZoneIdentifier: a wrong-type time zone is a TypeError.
+        let (id, offset_ns) = self.parse_tz_arg(tzarg)?;
         let hi = (ns >> 64) as i64;
         let lo = ns as i64;
         let idx = self.heap.alloc(HeapObj::Temporal { kind: 7, fields: vec![hi, lo, offset_ns] });
@@ -1505,10 +1504,9 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool(eq)))
             }
             "withTimeZone" => {
-                // Same instant, different zone.
-                let tzstr = self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-                let (id, offset) = parse_time_zone(&tzstr)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{tzstr}\"")))?;
+                // Same instant, different zone. A wrong-type zone is a TypeError.
+                let (id, offset) =
+                    self.parse_tz_arg(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 let ns = self.zdt_epoch_ns(idx).unwrap_or(0);
                 Ok(Some(self.alloc_zdt(ns, offset, id)))
             }
@@ -1702,9 +1700,9 @@ impl<'p> Vm<'p> {
                         "TypeError: Temporal.ZonedDateTime.from requires a timeZone property".into(),
                     ));
                 }
-                let tzstr = self.to_js_string(tzv)?;
-                let (id, offset) = parse_time_zone(&tzstr)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{tzstr}\"")))?;
+                // ToTemporalTimeZoneIdentifier: a string is parsed, a wrong type
+                // (null/boolean/number/bigint/symbol) is a TypeError — not coerced.
+                let (id, offset) = self.parse_tz_arg(tzv)?;
                 let reject = self.read_zdt_options(options)?;
                 let f = self.to_plain_date_time_overflow(item, reject)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
