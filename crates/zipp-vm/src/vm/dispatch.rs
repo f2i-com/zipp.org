@@ -1864,7 +1864,29 @@ impl<'p> Vm<'p> {
                             cells.push(cell);
                         }
                         let v = Value::heap(
-                            self.heap.alloc(HeapObj::Closure { func: func_id, upvalues: cells }),
+                            self.heap.alloc(HeapObj::Closure { func: func_id, upvalues: cells, this_val: Value::UNDEFINED }),
+                        );
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::MakeArrow { dst, func_id, this_reg } => {
+                        // Like MakeClosure, but the resulting closure also captures the
+                        // defining frame's effective `this` (register `this_reg` =
+                        // `this_override.unwrap_or(0)` at the definition site — usually
+                        // reg 0, but the class value inside a static field initializer)
+                        // so a later call binds it lexically (FuncProto::lexical_this).
+                        let sources = &self.func(func_id as usize).upvalues;
+                        let mut cells = Vec::with_capacity(sources.len());
+                        for src in sources {
+                            let cell = match *src {
+                                UpvalSource::ParentLocal(reg) => self.get(base, reg).heap_index(),
+                                UpvalSource::ParentUpval(idx) => self.closure_upvalue(cur_closure, idx),
+                            };
+                            cells.push(cell);
+                        }
+                        let this_val = self.get(base, this_reg);
+                        let v = Value::heap(
+                            self.heap.alloc(HeapObj::Closure { func: func_id, upvalues: cells, this_val }),
                         );
                         self.set(base, dst, v);
                         ip += 1;
@@ -2919,7 +2941,7 @@ impl<'p> Vm<'p> {
             Value::heap(self.heap.alloc(HeapObj::Func(fid)))
         } else {
             let cells = self.capture_upvalue_cells(&sources, base, cur_closure);
-            Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: cells }))
+            Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: cells, this_val: Value::UNDEFINED }))
         }
     }
 
@@ -2960,9 +2982,14 @@ impl<'p> Vm<'p> {
         let callee_regs = (proto.reg_count as usize).max(1);
         let callee_params = proto.param_count as usize;
         let is_strict = proto.is_strict;
-        // OrdinaryCallBindThis: a sloppy callee invoked with a nullish `this`
-        // (e.g. a bare `f()`) binds the global object instead.
-        let this_val = if !is_strict && this_val.is_nullish() && self.global_this != 0 {
+        let lexical_this = proto.lexical_this;
+        // An arrow binds the `this` it captured lexically (ignoring the supplied
+        // one) and skips OrdinaryCallBindThis. Otherwise OrdinaryCallBindThis:
+        // a sloppy callee invoked with a nullish `this` (e.g. a bare `f()`) binds
+        // the global object instead.
+        let this_val = if lexical_this && closure != NO_CLOSURE {
+            self.rebind_arrow_this(func_id, closure, this_val)
+        } else if !is_strict && this_val.is_nullish() && self.global_this != 0 {
             Value::heap(self.global_this)
         } else {
             this_val

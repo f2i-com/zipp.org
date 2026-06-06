@@ -248,6 +248,12 @@ impl<'p> Vm<'p> {
     #[allow(dead_code)]
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_self_call_impl(&mut self, func_id: u32, args: *const u64, argc: usize) -> u64 {
+        // An arrow needs its lexically-captured `this` bound at reg 0; this fast
+        // path sets reg 0 = UNDEFINED, so deopt arrows to the interpreter (which
+        // rebinds correctly). Recursive arrows that read `this` are rare.
+        if self.func(func_id as usize).lexical_this {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
         // Depth guard: deopt (not crash) past the native recursion budget; the
         // interpreter path then enforces MAX_FRAMES / throws RangeError.
         if self.jit_recurse_depth >= JIT_SELF_RECURSE_MAX {
@@ -370,6 +376,11 @@ impl<'p> Vm<'p> {
         args: *const u64,
         argc: usize,
     ) -> u64 {
+        // Arrows need their lexical `this` at reg 0 (this path sets UNDEFINED) —
+        // deopt them to the interpreter, which rebinds correctly.
+        if self.func(func_id as usize).lexical_this {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
         let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let params = proto.param_count as usize;
@@ -539,6 +550,34 @@ impl<'p> Vm<'p> {
     /// callbacks* use native recursion. Ordinary JS recursion (a function
     /// calling itself) does NOT — it stays on the frame stack. The frame cap
     /// still bounds total depth.
+    /// For an arrow callee (`lexical_this` proto), return the `this` it captured
+    /// lexically — which replaces any `this` the caller supplied and suppresses
+    /// OrdinaryCallBindThis. Returns `this` unchanged for non-arrows. `closure`
+    /// is the callee's `Closure` heap index (arrows are always closures) or
+    /// `NO_CLOSURE`.
+    pub(crate) fn rebind_arrow_this(&self, func_id: u32, closure: u32, this: Value) -> Value {
+        if closure != NO_CLOSURE && self.func(func_id as usize).lexical_this {
+            if let HeapObj::Closure { this_val, .. } = self.heap.get(closure) {
+                return *this_val;
+            }
+        }
+        this
+    }
+
+    /// If `callee` is an arrow function value, its lexically-captured `this`; else
+    /// `None`. Used by call paths that hold the callee Value rather than its
+    /// `(func_id, closure)` pair.
+    pub(crate) fn arrow_captured_this(&self, callee: Value) -> Option<Value> {
+        if callee.is_heap() {
+            if let HeapObj::Closure { func, this_val, .. } = self.heap.get(callee.heap_index()) {
+                if self.func(*func as usize).lexical_this {
+                    return Some(*this_val);
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         // A callable Proxy: `apply` trap (or call the target).
         if callee.is_heap() {
@@ -629,10 +668,14 @@ impl<'p> Vm<'p> {
             let p = self.func(func_id as usize);
             (p.is_generator, p.is_async, p.is_strict)
         };
-        // OrdinaryCallBindThis: a sloppy (non-strict) function called with a
-        // nullish `this` binds the global object instead. Strict functions —
-        // and built-ins, which never reach here — receive `this` as passed.
-        let this = if !is_strict && this.is_nullish() && self.global_this != 0 {
+        // An arrow ignores the supplied `this` and uses the one it captured
+        // lexically (and skips OrdinaryCallBindThis). Otherwise OrdinaryCallBindThis:
+        // a sloppy (non-strict) function called with a nullish `this` binds the
+        // global object instead. Strict functions — and built-ins, which never
+        // reach here — receive `this` as passed.
+        let this = if closure != NO_CLOSURE && self.func(func_id as usize).lexical_this {
+            self.rebind_arrow_this(func_id, closure, this)
+        } else if !is_strict && this.is_nullish() && self.global_this != 0 {
             Value::heap(self.global_this)
         } else {
             this
@@ -801,7 +844,9 @@ impl<'p> Vm<'p> {
         for mut f in eval_prog.functions {
             for ins in f.code.iter_mut() {
                 match ins {
-                    Instr::MakeFunc { func_id, .. } | Instr::MakeClosure { func_id, .. } => {
+                    Instr::MakeFunc { func_id, .. }
+                    | Instr::MakeClosure { func_id, .. }
+                    | Instr::MakeArrow { func_id, .. } => {
                         *func_id += base_func;
                     }
                     Instr::LoadGlobal { idx, .. }

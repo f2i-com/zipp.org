@@ -303,10 +303,11 @@ impl Vm<'_> {
                 m_idx!(*left);
                 m_idx!(*right);
             }
-            HeapObj::Closure { upvalues, .. } => {
+            HeapObj::Closure { upvalues, this_val, .. } => {
                 for &u in upvalues {
                     m_idx!(u);
                 }
+                m_val!(*this_val);
             }
             HeapObj::Cell(v) => m_val!(*v),
             HeapObj::Bound { target, this, args } => {

@@ -327,8 +327,10 @@ pub enum HeapObj {
     Func(u32),
     /// A closure: a function id plus captured upvalue cells (indices of `Cell`
     /// heap objects). Captured variables are boxed into cells so mutation is
-    /// shared between the closure and its defining scope.
-    Closure { func: u32, upvalues: Vec<u32> },
+    /// shared between the closure and its defining scope. `this_val` is the
+    /// lexically-captured `this` for an ARROW function (its proto has
+    /// `lexical_this`); it is `UNDEFINED` and unused for ordinary closures.
+    Closure { func: u32, upvalues: Vec<u32>, this_val: Value },
     /// A boxed mutable variable cell (an upvalue's storage).
     Cell(Value),
     /// A bound function (`fn.bind(thisArg, ...boundArgs)`): calling it invokes
@@ -768,7 +770,7 @@ impl Heap {
     pub fn as_callable(&self, idx: u32) -> Option<(u32, &[u32])> {
         match self.get(idx) {
             HeapObj::Func(id) => Some((*id, &[])),
-            HeapObj::Closure { func, upvalues } => Some((*func, upvalues.as_slice())),
+            HeapObj::Closure { func, upvalues, .. } => Some((*func, upvalues.as_slice())),
             _ => None,
         }
     }

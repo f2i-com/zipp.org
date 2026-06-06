@@ -824,7 +824,7 @@ impl<'p> Vm<'p> {
         if ups.is_empty() {
             Value::heap(self.heap.alloc(HeapObj::Func(fid)))
         } else {
-            Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: ups.to_vec() }))
+            Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: ups.to_vec(), this_val: Value::UNDEFINED }))
         }
     }
 

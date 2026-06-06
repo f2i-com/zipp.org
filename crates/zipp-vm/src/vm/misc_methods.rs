@@ -283,7 +283,9 @@ impl<'p> Vm<'p> {
         args: &[Value],
         this_val: Value,
     ) -> Result<Value, Thrown> {
-        self.regs[win] = this_val; // reg 0 = this (thisArg)
+        // An arrow callback ignores the supplied thisArg and uses its lexical `this`.
+        let this_val = self.arrow_captured_this(cb).unwrap_or(this_val);
+        self.regs[win] = this_val; // reg 0 = this (thisArg, or arrow's lexical this)
         let n = args.len().min(param_count);
         for i in 0..n {
             self.regs[win + 1 + i] = args[i];

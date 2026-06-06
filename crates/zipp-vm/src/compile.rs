@@ -564,6 +564,7 @@ impl Compiler {
             is_generator,
             is_async,
             non_constructable: false, // a plain function/expression IS constructable
+            lexical_this: false,
             is_strict,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -684,6 +685,7 @@ impl Compiler {
             // HeapObj::Class [[Construct]] path (never as a raw Func), so this flag
             // is never consulted for it — safe to set uniformly.
             non_constructable: true,
+            lexical_this: false, // a concise method gets its own `this`, not lexical
             is_strict: true,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -760,6 +762,7 @@ impl Compiler {
             is_generator: false,
             is_async: a.r#async,
             non_constructable: true, // arrow functions have no [[Construct]]
+            lexical_this: true, // arrows capture `this` lexically (see FuncProto)
             is_strict,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -823,6 +826,7 @@ fn placeholder(name: &str) -> FuncProto {
         is_generator: false,
         is_async: false,
         non_constructable: false,
+        lexical_this: false,
         is_strict: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
@@ -1359,8 +1363,8 @@ impl<'a> FnCompiler<'a> {
     fn compile_named_init(&mut self, dst: Reg, init: &ox::Expression, name: &str) -> R<Reg> {
         match init {
             ox::Expression::ArrowFunctionExpression(a) => {
-                let (id, has_up) = self.compile_arrow(a, name)?;
-                self.emit_make_callable(dst, id, has_up);
+                let (id, _has_up) = self.compile_arrow(a, name)?;
+                self.emit_make_arrow(dst, id);
                 Ok(dst)
             }
             ox::Expression::FunctionExpression(f) if f.id.is_none() => {
@@ -2388,6 +2392,16 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// Emit creation of an ARROW value. Always `MakeArrow` (even with no
+    /// upvalues) so the resulting closure carries the lexically-captured `this`
+    /// of the defining frame — `MakeFunc` has no slot for it. The captured `this`
+    /// is read from the effective-`this` register at the definition site
+    /// (`this_override` when inside a static field initializer, else reg 0).
+    fn emit_make_arrow(&mut self, dst: Reg, id: u32) {
+        let this_reg = self.this_override.unwrap_or(0);
+        self.emit(Instr::MakeArrow { dst, func_id: id, this_reg });
+    }
+
     fn if_stmt(&mut self, i: &ox::IfStatement) -> R<()> {
         // The statement's completion V starts as undefined (a not-taken / empty
         // branch yields undefined, not the prior statement's value). No-op outside
@@ -3356,8 +3370,8 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             E::ArrowFunctionExpression(a) => {
-                let (id, has_up) = self.compile_arrow(a, "")?;
-                self.emit_make_callable(dst, id, has_up);
+                let (id, _has_up) = self.compile_arrow(a, "")?;
+                self.emit_make_arrow(dst, id);
                 Ok(dst)
             }
             E::ClassExpression(c) => self.class_expr(c, dst, None),

@@ -310,6 +310,13 @@ pub enum Instr {
     /// one of the current frame's own upvalues (for nested-of-nested capture).
     MakeClosure { dst: Reg, func_id: u32 },
 
+    /// Like `MakeClosure`, but for an ARROW function: the closure also captures
+    /// the defining frame's effective `this` from register `this_reg` (the
+    /// `this_override.unwrap_or(0)` at the definition site) into the closure, so
+    /// a later call binds it lexically (see `FuncProto::lexical_this`). Always
+    /// used for arrows (even with no upvalues) since `MakeFunc` has no `this` slot.
+    MakeArrow { dst: Reg, func_id: u32, this_reg: Reg },
+
     /// Box the value currently in `reg` into a fresh heap Cell and write the
     /// cell reference back into `reg`. Emitted for a captured local/param so
     /// later reads/writes go through the shared cell.
@@ -519,6 +526,13 @@ pub struct FuncProto {
     /// above; this covers the remaining cases. Plain function declarations/
     /// expressions are constructable (false).
     pub non_constructable: bool,
+    /// True for an arrow function: it captures `this` (and `super`/`arguments`/
+    /// `new.target`) LEXICALLY from its defining scope rather than receiving its
+    /// own. The arrow value is always a `Closure` carrying the captured `this`;
+    /// at every call entry reg 0 is rebound to that captured value, ignoring any
+    /// `this` supplied by the caller (`.call`/`.apply`/`bind`/a method receiver/
+    /// an array-method thisArg). Also suppresses OrdinaryCallBindThis.
+    pub lexical_this: bool,
     /// True when this function runs in strict mode (own `"use strict"` directive,
     /// a strict enclosing scope, a class body, or module code). Strict functions
     /// receive `this` exactly as passed; sloppy functions called with a nullish

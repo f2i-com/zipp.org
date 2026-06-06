@@ -426,6 +426,8 @@ impl<'p> Vm<'p> {
     /// to its first `await` (or to completion / a throw). Returns the activation's
     /// result Promise — the value an `async` call evaluates to.
     pub(crate) fn alloc_async(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
+        // An async arrow captures `this` lexically (call sites pass UNDEFINED/recv).
+        let this = self.rebind_arrow_this(func_id, closure, this);
         let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
