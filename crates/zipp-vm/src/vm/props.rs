@@ -2286,7 +2286,17 @@ impl<'p> Vm<'p> {
             }
             return Ok(v);
         }
-        Ok(self.proto_member(proto, key))
+        // A SUBCLASS instance (`class X extends Map/Set/Promise/Date/…`) is the builtin
+        // variant re-branded with its own prototype recorded in `proto_of` (which chains
+        // to the builtin's prototype), so resolve through it — subclass methods AND the
+        // inherited builtin methods both resolve. A plain builtin instance has no
+        // `proto_of` entry → the builtin's default prototype.
+        let eff = self
+            .proto_of
+            .get(&obj.heap_index())
+            .and_then(|p| p.is_heap().then(|| p.heap_index()))
+            .unwrap_or(proto);
+        Ok(self.proto_member(eff, key))
     }
 
     /// Property GET with an explicit `receiver` — the original object a lookup

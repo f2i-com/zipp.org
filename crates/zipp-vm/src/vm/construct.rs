@@ -680,6 +680,50 @@ impl<'p> Vm<'p> {
         Ok(obj)
     }
 
+    /// `super(...)` to a built-in EXOTIC parent (`class X extends Set/Map/…`): re-brand
+    /// the plain-Object instance `obj` with the builtin's internal representation so its
+    /// prototype methods operate and `instanceof` the builtin holds. The instance's own
+    /// (subclass) prototype is captured first and re-recorded in `proto_of` (so subclass
+    /// methods/fields still resolve — exotic get_member walks proto_of when present), and
+    /// later field initializers write named props into the exotic `arr_props` side table.
+    /// Returns `true` when `cval` was a recognised builtin exotic ctor (and obj branded).
+    pub(crate) fn brand_builtin_subclass(
+        &mut self,
+        cval: Value,
+        obj: Value,
+        args: &[Value],
+    ) -> Result<bool, Thrown> {
+        let oidx = obj.heap_index();
+        // Only re-brand a class instance that is still a plain Object (not already a
+        // builtin variant from a deeper super() in the chain).
+        if !matches!(self.heap.get(oidx), HeapObj::Object(_)) {
+            return Ok(false);
+        }
+        let pidx = match self.prototype_of(cval) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            _ => return Ok(false),
+        };
+        // Capture the subclass prototype before re-branding loses the map.class link.
+        let sub_proto = self.object_get_prototype_of(obj);
+        if pidx == self.set_proto && self.set_proto != 0 {
+            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            let mut items: Vec<Value> = Vec::new();
+            if !a0.is_nullish() {
+                for e in self.iterate_to_vec(a0)? {
+                    if !items.iter().any(|v| self.same_value_zero(*v, e)) {
+                        items.push(e);
+                    }
+                }
+            }
+            *self.heap.get_mut(oidx) = HeapObj::Set(items);
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Build the callable for a class constructor: a plain `Func`, or a `Closure`
     /// over the cells the ctor captured (at class-definition time) when it closes
     /// over an enclosing-function local.
@@ -866,6 +910,13 @@ impl<'p> Vm<'p> {
             // chain already reaches the error prototype (so name/toString/
             // instanceof resolve), so nothing else is needed here.
             _ => {
+                // `super(...)` to a BUILT-IN EXOTIC parent (`class X extends Set/…`):
+                // brand the plain-Object instance with the builtin's internal
+                // representation so its methods work and it is a real instanceof. The
+                // instance keeps its own (subclass) prototype, recorded in proto_of.
+                if self.brand_builtin_subclass(cval, obj, args)? {
+                    return Ok(());
+                }
                 if let Some(k) = self.error_ctors.iter().position(|&c| c == cval.heap_index()) {
                     let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
                     if let Some(m) = msg.filter(|m| *m != Value::UNDEFINED) {

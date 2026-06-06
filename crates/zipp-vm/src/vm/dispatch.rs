@@ -1462,7 +1462,15 @@ impl<'p> Vm<'p> {
                             0
                         };
                         let r = match kind {
-                            1 => v.is_heap() && self.instance_of_class(v, c.heap_index()),
+                            // A class instance: the fast map.class-lineage check, then
+                            // the spec prototype-chain check (which also covers a
+                            // subclass-of-builtin instance re-branded to the builtin
+                            // variant, whose map.class link is gone).
+                            1 => {
+                                v.is_heap()
+                                    && (self.instance_of_class(v, c.heap_index())
+                                        || self.instanceof_via_proto(v, c))
+                            }
                             2 => self.instanceof_via_proto(v, c),
                             // RHS is neither callable nor has @@hasInstance: TypeError
                             // (`x instanceof {}`, `x instanceof 5`, `x instanceof null`).
