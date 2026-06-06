@@ -519,7 +519,7 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-                if !temporal_string_ok(&s, true) {
+                if !temporal_string_ok(&s, true, true) {
                     return Err(Thrown(format!("RangeError: invalid date string '{s}'")));
                 }
                 return parse_iso_date(&s)
@@ -890,7 +890,7 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-                if !temporal_string_ok(&s, true) {
+                if !temporal_string_ok(&s, true, false) {
                     return Err(Thrown(format!("RangeError: invalid time string '{s}'")));
                 }
                 return parse_temporal_time(&s)
@@ -1067,7 +1067,7 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-                if !temporal_string_ok(&s, true) {
+                if !temporal_string_ok(&s, true, true) {
                     return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
                 }
                 return parse_iso_datetime(&s)
@@ -1696,7 +1696,7 @@ impl<'p> Vm<'p> {
         }
         let s = self.to_js_string(item)?;
         let _ = self.read_zdt_options(options)?;
-        if !temporal_string_ok(&s, false) {
+        if !temporal_string_ok(&s, false, true) {
             return Err(Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")));
         }
         let (f, offset, id) = parse_zdt_string(&s)
@@ -2013,7 +2013,7 @@ impl<'p> Vm<'p> {
     }
 
     fn parse_instant_string(&mut self, s: &str) -> Result<i128, Thrown> {
-        if !temporal_string_ok(s, false) {
+        if !temporal_string_ok(s, false, false) {
             return Err(Thrown(format!("RangeError: invalid instant string '{s}'")));
         }
         instant_str_to_ns(s)
@@ -2146,7 +2146,7 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-                if !temporal_string_ok(&s, true) {
+                if !temporal_string_ok(&s, true, true) {
                     return Err(Thrown(format!("RangeError: invalid year-month string '{s}'")));
                 }
                 return parse_iso_year_month(&s)
@@ -2362,7 +2362,7 @@ impl<'p> Vm<'p> {
             }
             if self.heap.is_str_like(v.heap_index()) {
                 let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-                if !temporal_string_ok(&s, true) {
+                if !temporal_string_ok(&s, true, true) {
                     return Err(Thrown(format!("RangeError: invalid month-day string '{s}'")));
                 }
                 return parse_iso_month_day(&s)
@@ -2553,7 +2553,12 @@ fn annotations_valid(ann: &str) -> bool {
 /// Validate a Temporal ISO string for a given parser context: the annotation
 /// suffix must be well-formed, and (for the wall-clock "Plain" types) the string
 /// must not carry a `Z`/`z` UTC designator (a numeric offset is still allowed).
-fn temporal_string_ok(s: &str, reject_utc_designator: bool) -> bool {
+/// `require_iso_calendar` (for the calendar-BEARING types — PlainDate/DateTime/
+/// YearMonth/MonthDay/ZonedDateTime/Duration-relativeTo) additionally requires the
+/// FIRST `[u-ca=…]` calendar annotation, if present, to be the supported "iso8601"
+/// (so "…[u-ca=notacal]" / a date-like calendar name is a RangeError). The
+/// calendar-LESS types (Instant, PlainTime) ignore the calendar entirely.
+fn temporal_string_ok(s: &str, reject_utc_designator: bool, require_iso_calendar: bool) -> bool {
     let s = s.trim();
     let (main, ann) = match s.find('[') {
         Some(i) => (&s[..i], &s[i..]),
@@ -2561,6 +2566,17 @@ fn temporal_string_ok(s: &str, reject_utc_designator: bool) -> bool {
     };
     if !ann.is_empty() && !annotations_valid(ann) {
         return false;
+    }
+    // The first calendar annotation is the resolved calendar; later `[u-ca=…]` are
+    // ignored. This ISO-only engine accepts only "iso8601".
+    if require_iso_calendar {
+        if let Some(p) = ann.find("u-ca=") {
+            let val = &ann[p + 5..];
+            match val.find(']') {
+                Some(end) if val[..end].eq_ignore_ascii_case("iso8601") => {}
+                _ => return false,
+            }
+        }
     }
     if reject_utc_designator && main.bytes().any(|b| b == b'Z' || b == b'z') {
         return false;
