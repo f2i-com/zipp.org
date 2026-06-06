@@ -955,7 +955,12 @@ impl<'p> Vm<'p> {
         // methods through the generic HasProperty/Get protocol (which calls
         // get_index → array_index_override → the getter). Arrays without a side
         // table keep the fast snapshot path (zero perf impact on the common case).
-        if self.arr_props.contains_key(&idx)
+        // A side table (defineProperty'd index accessor) OR a HOLE (a deleted/absent
+        // element) makes the dense placeholder unreliable: the callback methods must
+        // skip absent indices via HasProperty (and observe mid-iteration mutation),
+        // so route them through the live protocol. A hole-free, side-table-free array
+        // (the common case) keeps the fast snapshot path — zero perf impact.
+        if (self.arr_props.contains_key(&idx) || self.array_has_holes(idx))
             && matches!(
                 name,
                 "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
@@ -964,9 +969,9 @@ impl<'p> Vm<'p> {
             return self.array_like_iterate(Value::heap(idx), name, args);
         }
         // Likewise route the SEARCH methods off the dense fast path when the array
-        // carries a side table (a defineProperty'd index accessor must have its
-        // getter invoked, not the dense undefined placeholder read).
-        if self.arr_props.contains_key(&idx)
+        // carries a side table (a defineProperty'd index accessor must have its getter
+        // invoked) OR has holes (indexOf/lastIndexOf skip holes via HasProperty).
+        if (self.arr_props.contains_key(&idx) || self.array_has_holes(idx))
             && matches!(name, "indexOf" | "lastIndexOf" | "includes")
         {
             return self.array_like_search(Value::heap(idx), name, args);

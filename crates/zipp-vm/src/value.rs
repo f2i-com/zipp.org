@@ -70,6 +70,15 @@ impl Value {
     /// ever escapes a guard it degrades to undefined-ish rather than a wild NaN.
     /// `is_undefined()`/`is_nullish()` use exact bit compares, so this is distinct.
     pub const UNINITIALIZED: Value = Value(TAG_UNDEFINED | 1);
+    /// An INTERNAL-ONLY sentinel for an array HOLE — an absent element of a sparse
+    /// array (`[1,,3]`, a deleted index, a length-extended tail). Distinct from
+    /// `undefined` so `HasProperty`/iteration can tell an absent index from a
+    /// present `undefined` one. Like UNINITIALIZED it shares the UNDEFINED tag with
+    /// a payload bit, so a stray escape degrades to undefined-ish; but it must NEVER
+    /// reach user code — every read of an array slot maps a hole to `undefined` (or
+    /// a prototype lookup). `is_undefined()` uses an exact bit compare, so a hole is
+    /// not `undefined`.
+    pub const HOLE: Value = Value(TAG_UNDEFINED | 2);
     pub const NULL: Value = Value(TAG_NULL);
     pub const TRUE: Value = Value(TAG_BOOL | 1);
     pub const FALSE: Value = Value(TAG_BOOL);
@@ -159,6 +168,12 @@ impl Value {
     #[inline(always)]
     pub fn is_uninitialized(self) -> bool {
         self.0 == Value::UNINITIALIZED.0
+    }
+
+    /// The internal array-hole sentinel (see `HOLE`).
+    #[inline(always)]
+    pub fn is_hole(self) -> bool {
+        self.0 == Value::HOLE.0
     }
 
     #[inline(always)]

@@ -67,17 +67,32 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Array(items) => {
                 let len = items.len();
-                if let Some(i) = array_index(key) {
-                    return i < len;
+                // A canonical integer index: a numeric Value, or a canonical numeric
+                // string ("0", not "01"/"-1").
+                let int_index = array_index(key).or_else(|| {
+                    let k = self.key_of(key);
+                    match k.parse::<u32>() {
+                        Ok(n) if n != u32::MAX && n.to_string() == k => Some(n as usize),
+                        _ => None,
+                    }
+                });
+                if let Some(i) = int_index {
+                    if i >= len {
+                        return false;
+                    }
+                    // An in-range slot is present iff it is not a hole.
+                    if !items[i].is_hole() {
+                        return true;
+                    }
+                    // A hole is absent unless overridden (a defineProperty'd index in
+                    // arr_props) or inherited from the prototype chain.
+                    let k = self.key_of(key);
+                    if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                        return true;
+                    }
+                    return self.arr_proto != 0 && self.has_property(Value::heap(self.arr_proto), key);
                 }
                 let k = self.key_of(key);
-                // A canonical numeric-string index ("0", not "01"/"-1") is an
-                // array index too.
-                if let Ok(n) = k.parse::<u32>() {
-                    if n != u32::MAX && n.to_string() == k {
-                        return (n as usize) < len;
-                    }
-                }
                 if k == "length" {
                     return true;
                 }

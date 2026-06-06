@@ -42,9 +42,24 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn array_snapshot(&self, idx: u32) -> Vec<Value> {
         match self.heap.get(idx) {
-            HeapObj::Array(items) => items.clone(),
+            // A hole reads as `undefined` for every snapshot consumer (join, slice,
+            // concat, spread, sort, JSON, …) — the internal HOLE sentinel must never
+            // leak to user code. Hole-SENSITIVE methods (the callback/search/find
+            // family) take the live HasProperty+Get path instead, not this snapshot.
+            HeapObj::Array(items) => {
+                items.iter().map(|&v| if v.is_hole() { Value::UNDEFINED } else { v }).collect()
+            }
             _ => Vec::new(),
         }
+    }
+
+    /// Whether a real array currently holds any HOLE (an absent element). Used to
+    /// route the hole-sensitive callback/search methods off the dense-snapshot fast
+    /// path onto the live HasProperty+Get protocol; a hole-free array keeps the fast
+    /// path. O(n), but only consulted by methods that are already O(n) (and whose
+    /// per-element JS callback dominates).
+    pub(crate) fn array_has_holes(&self, idx: u32) -> bool {
+        matches!(self.heap.get(idx), HeapObj::Array(items) if items.iter().any(|v| v.is_hole()))
     }
 
     /// IsArray(v) (ES 7.2.2): true for an Array exotic, recursing through Proxy

@@ -151,10 +151,11 @@ impl<'p> Vm<'p> {
                         return Ok(v);
                     }
                     if let HeapObj::Array(items) = self.heap.get(aidx) {
-                        if i < items.len() {
+                        if i < items.len() && !items[i].is_hole() {
                             return Ok(items[i]);
                         }
                     }
+                    // Out of range OR a hole → absent (reads as undefined).
                     return Ok(Value::UNDEFINED);
                 }
                 // Non-int key on an array: "length", else resolve via the prototype

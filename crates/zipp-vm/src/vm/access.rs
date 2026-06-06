@@ -204,7 +204,7 @@ impl<'p> Vm<'p> {
                     }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         if i < items.len() {
-                            items[i] = Value::UNDEFINED;
+                            items[i] = Value::HOLE;
                         }
                     }
                     self.heap.bump_version(idx);
@@ -217,7 +217,7 @@ impl<'p> Vm<'p> {
             HeapObj::Array(items) => {
                 if let Ok(i) = key.parse::<usize>() {
                     if i < items.len() {
-                        items[i] = Value::UNDEFINED;
+                        items[i] = Value::HOLE;
                     }
                     false // array slot stays (a hole); no version bump needed
                 } else {

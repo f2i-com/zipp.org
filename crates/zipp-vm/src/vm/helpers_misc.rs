@@ -125,9 +125,17 @@ pub(crate) extern "win64" fn jit_get_index(
     }
     match vm.heap.get(arr.heap_index()) {
         HeapObj::Array(items) => match array_index(key) {
-            // In range → the element; out of range / negative / non-integral →
-            // undefined (matches JS and the interpreter's get_index).
-            Some(i) if i < items.len() => items[i].bits(),
+            // In range and present → the element. A HOLE must NOT be returned (it is
+            // an internal sentinel): deopt so the interpreter's get_index applies the
+            // absent-index / prototype semantics. Out of range / negative /
+            // non-integral → undefined (matches JS and the interpreter).
+            Some(i) if i < items.len() => {
+                if items[i].is_hole() {
+                    crate::codegen::SELF_CALL_DEOPT
+                } else {
+                    items[i].bits()
+                }
+            }
             _ => Value::UNDEFINED.bits(),
         },
         // Flat ASCII string `s[i]`: mirror the interpreter's get_index Str path

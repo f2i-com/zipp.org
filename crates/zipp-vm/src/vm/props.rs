@@ -383,7 +383,15 @@ impl<'p> Vm<'p> {
             };
             let mut ks: Vec<String> = Vec::new();
             for i in 0..len {
-                if self.array_index_override(idx, i).map_or(true, |(a, _)| a.enumerable) {
+                let overridden = self.array_index_override(idx, i);
+                // A hole (an absent element) with no defineProperty'd override is not
+                // an own property — skip it.
+                if overridden.is_none()
+                    && matches!(self.heap.get(idx), HeapObj::Array(items) if items[i].is_hole())
+                {
+                    continue;
+                }
+                if overridden.map_or(true, |(a, _)| a.enumerable) {
                     ks.push(i.to_string());
                 }
             }
@@ -790,7 +798,8 @@ impl<'p> Vm<'p> {
                     ovr
                 } else {
                     match key.parse::<usize>() {
-                        Ok(i) if i.to_string() == key && i < dense_len => {
+                        // A hole has no own property descriptor (falls to undefined).
+                        Ok(i) if i.to_string() == key && i < dense_len && !items[i].is_hole() => {
                             let v = items[i];
                             return self.make_data_descriptor(v, true, true, true);
                         }
@@ -889,7 +898,10 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(items) => {
                     let dense_len = items.len();
                     for i in 0..dense_len {
-                        keys.push(i.to_string());
+                        // A hole is an absent element — not a reflectable own key.
+                        if !items[i].is_hole() {
+                            keys.push(i.to_string());
+                        }
                     }
                     keys.push("length".to_string());
                     if let Some(m) = self.arr_props.get(&idx) {
