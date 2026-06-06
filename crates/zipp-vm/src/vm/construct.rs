@@ -773,6 +773,34 @@ impl<'p> Vm<'p> {
             }
             return Ok(true);
         }
+        // Temporal value types (immutable kind+fields, no back-references): the parent
+        // ctor is one of the 8 Temporal constructors. Build a fresh instance through the
+        // existing ctor dispatch, then clone its representation into the instance —
+        // `construct` reuses all the per-kind arg parsing/validation. A ZonedDateTime
+        // also carries its time-zone in the `zdt_tz` side table.
+        let ci = cval.heap_index();
+        let is_temporal_ctor = ci != 0
+            && (ci == self.duration_ctor
+                || ci == self.plaindate_ctor
+                || ci == self.plaintime_ctor
+                || ci == self.plaindatetime_ctor
+                || ci == self.instant_ctor
+                || ci == self.plainyearmonth_ctor
+                || ci == self.plainmonthday_ctor
+                || ci == self.zoneddatetime_ctor);
+        if is_temporal_ctor {
+            let tv = self.construct(cval, args)?;
+            let tvi = tv.heap_index();
+            let cloned = self.heap.get(tvi).clone();
+            *self.heap.get_mut(oidx) = cloned;
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            if let Some(tz) = self.zdt_tz.get(&tvi).copied() {
+                self.zdt_tz.insert(oidx, tz);
+            }
+            return Ok(true);
+        }
         Ok(false)
     }
 
