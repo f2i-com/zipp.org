@@ -425,6 +425,36 @@ impl<'p> Vm<'p> {
         if !self.is_object_value(options) {
             return Err(Thrown("TypeError: options must be an object or undefined".into()));
         }
+        // ToSecondsStringPrecision reads options in spec order — fractionalSecondDigits,
+        // then roundingMode, then smallestUnit — casting each (the observable
+        // get/.toString sequence the order-of-operations tests assert) before applying
+        // precedence. smallestUnit, when present, wins over fractionalSecondDigits, but
+        // fsd's read+cast+validation still occurs first.
+        let fsd_v = self.get_prop(options, "fractionalSecondDigits")?;
+        let fsd_result: (i128, i32, bool) = if fsd_v == Value::UNDEFINED {
+            (1, -1, false)
+        } else if !fsd_v.is_number() {
+            // A string/null/boolean/bigint/object is ToString'd and must be "auto"
+            // (a Symbol throws TypeError inside to_js_string).
+            if self.to_js_string(fsd_v)? == "auto" {
+                (1, -1, false)
+            } else {
+                return Err(Thrown(
+                    "RangeError: fractionalSecondDigits must be 'auto' or 0..9".into(),
+                ));
+            }
+        } else {
+            // A genuine Number is floored into 0..9 (GetStringOrNumberOption).
+            let n = self.to_number(fsd_v)?;
+            if n.is_nan() {
+                return Err(Thrown("RangeError: fractionalSecondDigits is NaN".into()));
+            }
+            let n = n.floor() as i64;
+            if !(0..=9).contains(&n) {
+                return Err(Thrown("RangeError: fractionalSecondDigits out of range".into()));
+            }
+            (10i128.pow(9 - n as u32), n as i32, false)
+        };
         let mode = self.opt_string(
             options,
             "roundingMode",
@@ -451,30 +481,7 @@ impl<'p> Vm<'p> {
             };
             return Ok((unit, digits, omit, mode));
         }
-        let fsd_v = self.get_prop(options, "fractionalSecondDigits")?;
-        if fsd_v == Value::UNDEFINED {
-            return Ok((1, -1, false, mode));
-        }
-        // GetStringOrNumberOption dispatches on the RAW type, not coercibility: a
-        // genuine Number is floored into 0..9; anything else (string/null/boolean/
-        // bigint/object) is ToString'd and must equal exactly "auto" (a Symbol
-        // ToString throws TypeError inside to_js_string).
-        if !fsd_v.is_number() {
-            if self.to_js_string(fsd_v)? == "auto" {
-                return Ok((1, -1, false, mode));
-            }
-            return Err(Thrown("RangeError: fractionalSecondDigits must be 'auto' or 0..9".into()));
-        }
-        let n = self.to_number(fsd_v)?;
-        if n.is_nan() {
-            return Err(Thrown("RangeError: fractionalSecondDigits is NaN".into()));
-        }
-        let n = n.floor() as i64;
-        if !(0..=9).contains(&n) {
-            return Err(Thrown("RangeError: fractionalSecondDigits out of range".into()));
-        }
-        let unit = 10i128.pow(9 - n as u32);
-        Ok((unit, n as i32, false, mode))
+        Ok((fsd_result.0, fsd_result.1, fsd_result.2, mode))
     }
 
     /// The calendar annotation suffix for a toString() per the `calendarName`
@@ -583,8 +590,9 @@ impl<'p> Vm<'p> {
         d2: (i64, i64, i64),
         smallest: &str,
         largest: &str,
+        inc: i128,
         mode: &str,
-    ) -> [i64; 4] {
+    ) -> Result<[i64; 4], Thrown> {
         let rank =
             |u: &str| ["year", "month", "week", "day"].iter().position(|&x| x == u).unwrap_or(3);
         let si = rank(smallest);
@@ -592,28 +600,40 @@ impl<'p> Vm<'p> {
         let e2 = iso_to_epoch_days(d2.0, d2.1, d2.2);
         let sign = (e2 > e1) as i64 - (e2 < e1) as i64;
         if sign == 0 {
-            return [0, 0, 0, 0];
+            return Ok([0, 0, 0, 0]);
         }
-        // Whole count of the smallest unit from d1 to d2.
+        // Whole count of the smallest unit from d1 to d2, aligned to the increment
+        // (NudgeToCalendarUnit): r1 is the toward-zero multiple of inc, r2 the next.
         let count = difference_iso_date(d1, d2, smallest)[si];
         let mk = |k: i64| -> [i64; 10] {
             let mut dur = [0i64; 10];
             dur[si] = k;
             dur
         };
-        let lower = self.date_add(d1.0, d1.1, d1.2, &mk(count), 1);
+        let r1 = round_increment(count as i128, inc, "trunc") as i64;
+        let r2 = r1 + inc as i64 * sign;
+        let lower = self.date_add(d1.0, d1.1, d1.2, &mk(r1), 1);
         let ld = iso_to_epoch_days(lower.0, lower.1, lower.2);
+        // The r2 endpoint is a CalendarDateAdd(constrain) that must lie within the
+        // ISO date limits — a huge increment can push it past the range (RangeError).
+        let upper = self.date_add(d1.0, d1.1, d1.2, &mk(r2), 1);
+        if !iso_date_in_range(upper.0, upper.1, upper.2) {
+            return Err(Thrown(
+                "RangeError: rounded date is outside the valid ISO range".into(),
+            ));
+        }
         let rounded = if ld == e2 {
-            count
+            r1
         } else {
-            let upper = self.date_add(d1.0, d1.1, d1.2, &mk(count + sign), 1);
             let ud = iso_to_epoch_days(upper.0, upper.1, upper.2);
             let denom = (ud - ld) as f64;
             let progress = if denom != 0.0 { (e2 - ld) as f64 / denom } else { 0.0 };
-            round_fraction(count, sign, progress, mode)
+            // Round the increment-quotient (r1/inc), preserving its parity for
+            // halfEven, then scale back. At inc==1 this is round_fraction(count, …).
+            round_fraction(r1 / inc as i64, sign, progress, mode) * inc as i64
         };
         // Balance up to largestUnit (only months can fold into years).
-        match si {
+        Ok(match si {
             1 if rank(largest) == 0 => {
                 let end = self.date_add(d1.0, d1.1, d1.2, &mk(rounded), 1);
                 difference_iso_date(d1, end, "year")
@@ -621,7 +641,7 @@ impl<'p> Vm<'p> {
             0 => [rounded, 0, 0, 0],
             1 => [0, rounded, 0, 0],
             _ => [0, 0, rounded, 0],
-        }
+        })
     }
 
     /// `date ± duration` (date units constrain day; time units fold to whole days).
@@ -767,7 +787,7 @@ impl<'p> Vm<'p> {
                     f[..4].copy_from_slice(&diff);
                     f[3] = round_increment(f[3] as i128, inc, &mode) as i64;
                 } else {
-                    let r = self.round_relative_date_diff(d1, d2, &smallest, &largest, &mode);
+                    let r = self.round_relative_date_diff(d1, d2, &smallest, &largest, inc, &mode)?;
                     f[..4].copy_from_slice(&r);
                 }
                 Ok(Some(self.make_duration(f)))
@@ -1361,7 +1381,7 @@ impl<'p> Vm<'p> {
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
                     // Calendar-unit largest + smallest: round against the anchor
                     // calendar (time-of-day included via epoch nanoseconds).
-                    let r = round_relative_datetime_diff(dt1, dt2, &smallest, &largest, &mode);
+                    let r = round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &mode)?;
                     Ok(Some(self.make_duration(r)))
                 } else {
                     Ok(Some(self.make_duration(df)))
@@ -1671,7 +1691,7 @@ impl<'p> Vm<'p> {
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
                     // Calendar-unit largest + smallest: round against the anchor
                     // calendar (time-of-day included via epoch nanoseconds).
-                    let r = round_relative_datetime_diff(dt1, dt2, &smallest, &largest, &mode);
+                    let r = round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &mode)?;
                     Ok(Some(self.make_duration(r)))
                 } else {
                     Ok(Some(self.make_duration(df)))
@@ -1889,6 +1909,32 @@ impl<'p> Vm<'p> {
                     self.validate_bag_offset_field(rel)?;
                 }
             }
+        }
+        // A plain STRING relativeTo (ToRelativeTemporalObject) uses a LOOSER grammar
+        // than PlainDateTime parsing: a `Z` UTC designator is allowed WHEN a time-zone
+        // annotation is present, and a bare date may carry a `[tz]` annotation. Strip
+        // the annotation, validate it (Z not blanket-rejected), enforce the
+        // Z-requires-tz-annotation rule, then field-parse the annotation-stripped main.
+        if rel.is_heap() && self.heap.is_str_like(rel.heap_index()) {
+            let s = self.heap.str_cow(rel.heap_index()).unwrap().into_owned();
+            let st = s.trim();
+            let (main, ann) = match st.find('[') {
+                Some(i) => (&st[..i], &st[i..]),
+                None => (st, ""),
+            };
+            if !temporal_string_ok(st, false, true) {
+                return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
+            }
+            // A time-zone annotation is any `[...]` block whose body (after an optional
+            // leading `!`) has no `=` (so [UTC]/[-07:00]/[!UTC] count; [u-ca=…] does not).
+            let has_tz_ann = ann
+                .split(['[', ']'])
+                .any(|b| !b.is_empty() && !b.trim_start_matches('!').contains('='));
+            if main.bytes().any(|b| b == b'Z' || b == b'z') && !has_tz_ann {
+                return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
+            }
+            return parse_iso_datetime(main)
+                .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
         }
         self.to_plain_date_time(rel)
     }
@@ -3052,30 +3098,42 @@ fn round_relative_datetime_diff(
     dt2: [i64; 9],
     smallest: &str,
     largest: &str,
+    inc: i128,
     mode: &str,
-) -> [i64; 10] {
+) -> Result<[i64; 10], Thrown> {
     let si = ["year", "month", "week"].iter().position(|&x| x == smallest).unwrap_or(2);
     let ns1 = dt_epoch_ns(dt1);
     let ns2 = dt_epoch_ns(dt2);
     let sign = (ns2 > ns1) as i64 - (ns2 < ns1) as i64;
     if sign == 0 {
-        return [0; 10];
+        return Ok([0; 10]);
     }
+    // Align the count to the increment (NudgeToCalendarUnit): r1 is the toward-zero
+    // multiple of inc, r2 the next one.
     let count = difference_datetime(dt1, dt2, smallest)[si];
     let mk = |k: i64| -> [i64; 10] {
         let mut d = [0i64; 10];
         d[si] = k;
         d
     };
-    let lower = dt_add_dur(dt1, mk(count));
+    let r1 = round_increment(count as i128, inc, "trunc") as i64;
+    let r2 = r1 + inc as i64 * sign;
+    let lower = dt_add_dur(dt1, mk(r1));
     let ld = dt_epoch_ns(lower);
+    // The r2 endpoint is a CalendarDateAdd(constrain) that must lie within the ISO
+    // date limits — a huge increment can push it past the range (RangeError).
+    let upper = dt_add_dur(dt1, mk(r2));
+    if !iso_date_in_range(upper[0], upper[1], upper[2]) {
+        return Err(Thrown(
+            "RangeError: rounded date is outside the valid ISO range".into(),
+        ));
+    }
     let rounded = if ld == ns2 {
-        count
+        r1
     } else {
-        let upper = dt_add_dur(dt1, mk(count + sign));
         let ud = dt_epoch_ns(upper);
         let progress = if ud != ld { (ns2 - ld) as f64 / (ud - ld) as f64 } else { 0.0 };
-        round_fraction(count, sign, progress, mode)
+        round_fraction(r1 / inc as i64, sign, progress, mode) * inc as i64
     };
     let mut f = [0i64; 10];
     if si == 1 && largest == "year" {
@@ -3085,7 +3143,7 @@ fn round_relative_datetime_diff(
     } else {
         f[si] = rounded;
     }
-    f
+    Ok(f)
 }
 
 /// `Duration.total(unit)` relative to a start date-time: the (possibly fractional)
