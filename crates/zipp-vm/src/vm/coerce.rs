@@ -573,6 +573,9 @@ impl<'p> Vm<'p> {
         if let Some(o) = self.str_relational(va, vb) {
             return Ok(o.is_lt());
         }
+        if let Some(ord) = self.bigint_relational(va, vb)? {
+            return Ok(matches!(ord, Some(std::cmp::Ordering::Less)));
+        }
         Ok(self.to_number(va)? < self.to_number(vb)?)
     }
     #[inline]
@@ -587,7 +590,48 @@ impl<'p> Vm<'p> {
         if let Some(o) = self.str_relational(va, vb) {
             return Ok(o.is_le());
         }
+        if let Some(ord) = self.bigint_relational(va, vb)? {
+            return Ok(matches!(
+                ord,
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ));
+        }
         Ok(self.to_number(va)? <= self.to_number(vb)?)
+    }
+
+    /// Abstract relational comparison when at least one operand is a BigInt. A
+    /// BigInt must be compared by its exact mathematical value — `to_number` would
+    /// round it to an f64 (so `10000000000000000000n` and `9999999999999999999n`
+    /// wrongly compare equal). Returns `Ok(None)` when neither operand is a BigInt
+    /// (the caller falls back to numeric comparison), `Ok(Some(None))` when the
+    /// pair is unordered (the other side is NaN), else `Ok(Some(Some(ordering)))`.
+    fn bigint_relational(
+        &self,
+        va: Value,
+        vb: Value,
+    ) -> Result<Option<Option<std::cmp::Ordering>>, Thrown> {
+        let ab = self.bigint_i128(va);
+        let bb = self.bigint_i128(vb);
+        if ab.is_none() && bb.is_none() {
+            return Ok(None);
+        }
+        let ord = match (ab, bb) {
+            (Some(x), Some(y)) => Some(x.cmp(&y)),
+            (Some(x), None) => cmp_i128_f64(x, self.to_number(vb)?),
+            (None, Some(y)) => cmp_i128_f64(y, self.to_number(va)?).map(|o| o.reverse()),
+            (None, None) => unreachable!(),
+        };
+        Ok(Some(ord))
+    }
+
+    /// The i128 value of a BigInt heap object, if `v` is one.
+    fn bigint_i128(&self, v: Value) -> Option<i128> {
+        if v.is_heap() {
+            if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
+                return Some(*n);
+            }
+        }
+        None
     }
 
     /// JS relational comparison of two STRING operands is lexicographic (by code
@@ -1291,5 +1335,65 @@ impl<'p> Vm<'p> {
             return self.alloc_str(s);
         }
         v
+    }
+}
+
+/// Exact ordering of an i128 (a BigInt) against an f64, comparing mathematical
+/// values without rounding the integer. `None` means unordered (the f64 is NaN).
+fn cmp_i128_f64(x: i128, y: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if y.is_nan() {
+        return None;
+    }
+    if y == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if y == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    // 2^127 — any finite f64 at or beyond this magnitude is outside i128's range.
+    const TWO_127: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if y >= TWO_127 {
+        return Some(Ordering::Less);
+    }
+    if y < -TWO_127 {
+        return Some(Ordering::Greater);
+    }
+    // y is finite and in (-2^127, 2^127): floor(y) is an integer-valued f64 that
+    // converts to i128 exactly. Compare the integer parts, then break a tie by the
+    // fractional part of y.
+    let yf = y.floor();
+    let yi = yf as i128;
+    Some(match x.cmp(&yi) {
+        Ordering::Equal if y > yf => Ordering::Less, // x == floor(y) < y
+        ord => ord,
+    })
+}
+
+#[cfg(test)]
+mod cmp_i128_f64_tests {
+    use super::cmp_i128_f64;
+    use std::cmp::Ordering::*;
+
+    #[test]
+    fn exact_against_numbers() {
+        assert_eq!(cmp_i128_f64(2, 1.5), Some(Greater));
+        assert_eq!(cmp_i128_f64(1, 1.5), Some(Less));
+        assert_eq!(cmp_i128_f64(5, 5.0), Some(Equal));
+        assert_eq!(cmp_i128_f64(-2, -1.5), Some(Less));
+        assert_eq!(cmp_i128_f64(-1, -1.5), Some(Greater));
+        // Beyond 2^53 the f64 can't hold the integer exactly, but the compare must.
+        assert_eq!(cmp_i128_f64(9_007_199_254_740_993, 9_007_199_254_740_992.0), Some(Greater));
+        assert_eq!(cmp_i128_f64(10_000_000_000_000_001, 1e16), Some(Greater));
+        // NaN / infinities.
+        assert_eq!(cmp_i128_f64(1, f64::NAN), None);
+        assert_eq!(cmp_i128_f64(i128::MAX, f64::INFINITY), Some(Less));
+        assert_eq!(cmp_i128_f64(i128::MIN, f64::NEG_INFINITY), Some(Greater));
+        // A large in-range f64 (1e30 < 2^127) still compares exactly.
+        assert_eq!(cmp_i128_f64(i128::MAX, 1e30), Some(Greater));
+        assert_eq!(cmp_i128_f64(i128::MIN, -1e30), Some(Less));
+        // Magnitudes beyond 2^127 saturate the comparison.
+        assert_eq!(cmp_i128_f64(i128::MAX, 1e40), Some(Less));
+        assert_eq!(cmp_i128_f64(i128::MIN, -1e40), Some(Greater));
     }
 }
