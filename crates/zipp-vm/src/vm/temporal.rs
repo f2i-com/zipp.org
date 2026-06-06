@@ -602,15 +602,18 @@ impl<'p> Vm<'p> {
         if sign == 0 {
             return Ok([0, 0, 0, 0]);
         }
-        // Whole count of the smallest unit from d1 to d2, aligned to the increment
-        // (NudgeToCalendarUnit): r1 is the toward-zero multiple of inc, r2 the next.
-        let count = difference_iso_date(d1, d2, smallest)[si];
+        // Decompose at largestUnit to KEEP the units above smallestUnit; only the
+        // smallestUnit component is rounded (the sub-smallest remainder becomes the
+        // fraction toward the next increment — NudgeToCalendarUnit).
+        let base = difference_iso_date(d1, d2, largest);
+        let sval = base[si];
         let mk = |k: i64| -> [i64; 10] {
             let mut dur = [0i64; 10];
+            dur[..si].copy_from_slice(&base[..si]);
             dur[si] = k;
             dur
         };
-        let r1 = round_increment(count as i128, inc, "trunc") as i64;
+        let r1 = round_increment(sval as i128, inc, "trunc") as i64;
         let r2 = r1 + inc as i64 * sign;
         let lower = self.date_add(d1.0, d1.1, d1.2, &mk(r1), 1);
         let ld = iso_to_epoch_days(lower.0, lower.1, lower.2);
@@ -622,26 +625,20 @@ impl<'p> Vm<'p> {
                 "RangeError: rounded date is outside the valid ISO range".into(),
             ));
         }
-        let rounded = if ld == e2 {
+        let picked = if ld == e2 {
             r1
         } else {
             let ud = iso_to_epoch_days(upper.0, upper.1, upper.2);
             let denom = (ud - ld) as f64;
             let progress = if denom != 0.0 { (e2 - ld) as f64 / denom } else { 0.0 };
             // Round the increment-quotient (r1/inc), preserving its parity for
-            // halfEven, then scale back. At inc==1 this is round_fraction(count, …).
+            // halfEven, then scale back. At inc==1 this is round_fraction(sval, …).
             round_fraction(r1 / inc as i64, sign, progress, mode) * inc as i64
         };
-        // Balance up to largestUnit (only months can fold into years).
-        Ok(match si {
-            1 if rank(largest) == 0 => {
-                let end = self.date_add(d1.0, d1.1, d1.2, &mk(rounded), 1);
-                difference_iso_date(d1, end, "year")
-            }
-            0 => [rounded, 0, 0, 0],
-            1 => [0, rounded, 0, 0],
-            _ => [0, 0, rounded, 0],
-        })
+        // Re-balance the kept-larger-units + rounded-smallest endpoint to largestUnit
+        // (folds an overflowing smallest unit up, e.g. 12 months → 1 year).
+        let end = self.date_add(d1.0, d1.1, d1.2, &mk(picked), 1);
+        Ok(difference_iso_date(d1, end, largest))
     }
 
     /// `date ± duration` (date units constrain day; time units fold to whole days).
@@ -3108,15 +3105,18 @@ fn round_relative_datetime_diff(
     if sign == 0 {
         return Ok([0; 10]);
     }
-    // Align the count to the increment (NudgeToCalendarUnit): r1 is the toward-zero
-    // multiple of inc, r2 the next one.
-    let count = difference_datetime(dt1, dt2, smallest)[si];
+    // Decompose at largestUnit to KEEP the units above smallestUnit; only the
+    // smallestUnit component is rounded (the sub-smallest remainder, including the
+    // time-of-day, becomes the epoch-ns fraction toward the next increment).
+    let base = difference_datetime(dt1, dt2, largest);
+    let sval = base[si];
     let mk = |k: i64| -> [i64; 10] {
         let mut d = [0i64; 10];
+        d[..si].copy_from_slice(&base[..si]);
         d[si] = k;
         d
     };
-    let r1 = round_increment(count as i128, inc, "trunc") as i64;
+    let r1 = round_increment(sval as i128, inc, "trunc") as i64;
     let r2 = r1 + inc as i64 * sign;
     let lower = dt_add_dur(dt1, mk(r1));
     let ld = dt_epoch_ns(lower);
@@ -3128,21 +3128,18 @@ fn round_relative_datetime_diff(
             "RangeError: rounded date is outside the valid ISO range".into(),
         ));
     }
-    let rounded = if ld == ns2 {
+    let picked = if ld == ns2 {
         r1
     } else {
         let ud = dt_epoch_ns(upper);
         let progress = if ud != ld { (ns2 - ld) as f64 / (ud - ld) as f64 } else { 0.0 };
         round_fraction(r1 / inc as i64, sign, progress, mode) * inc as i64
     };
+    // Re-balance the kept-larger + rounded-smallest endpoint to largestUnit.
+    let end = dt_add_dur(dt1, mk(picked));
+    let d = difference_iso_date((dt1[0], dt1[1], dt1[2]), (end[0], end[1], end[2]), largest);
     let mut f = [0i64; 10];
-    if si == 1 && largest == "year" {
-        let end = dt_add_dur(dt1, mk(rounded));
-        let d = difference_iso_date((dt1[0], dt1[1], dt1[2]), (end[0], end[1], end[2]), "year");
-        f[..4].copy_from_slice(&d);
-    } else {
-        f[si] = rounded;
-    }
+    f[..4].copy_from_slice(&d);
     Ok(f)
 }
 
