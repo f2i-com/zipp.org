@@ -801,6 +801,23 @@ impl<'p> Vm<'p> {
     }
 
     /// Read an optional integer field from an options/with object (None if absent).
+    /// ToIntegerWithTruncation for a Temporal *constructor* field: ToNumber, reject a
+    /// non-finite value (NaN / ±Infinity) with a RangeError — the spec rejects these
+    /// before any component range check — then truncate toward zero. (The property-bag
+    /// `from({...})` path uses `opt_int_field`, which already finite-checks.)
+    pub(crate) fn temporal_ctor_int(&mut self, v: Value) -> Result<i64, Thrown> {
+        // `to_number_coerce` (not the non-`&mut` `to_number`) so an object field runs
+        // the observable ToPrimitive (valueOf/@@toPrimitive) in spec order, and a
+        // Symbol/BigInt is rejected with a TypeError.
+        let n = self.to_number_coerce(v)?;
+        if !n.is_finite() {
+            return Err(Thrown(
+                "RangeError: Temporal field must be a finite number".into(),
+            ));
+        }
+        Ok(n.trunc() as i64)
+    }
+
     pub(crate) fn opt_int_field(&mut self, obj: Value, key: &str) -> Result<Option<i64>, Thrown> {
         let v = self.get_prop(obj, key)?;
         if v == Value::UNDEFINED {

@@ -389,9 +389,9 @@ impl<'p> Vm<'p> {
             return self.build_duration(args);
         }
         if ci == self.plaindate_ctor && ci != 0 {
-            let y = self.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))? as i64;
-            let m = self.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))? as i64;
-            let d = self.to_number(args.get(2).copied().unwrap_or(Value::UNDEFINED))? as i64;
+            let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+            let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+            let d = self.temporal_ctor_int(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             return self.make_plain_date(y, m, d);
         }
         if ci == self.plaintime_ctor && ci != 0 {
@@ -399,7 +399,7 @@ impl<'p> Vm<'p> {
             for (i, slot) in f.iter_mut().enumerate() {
                 let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
                 if v != Value::UNDEFINED {
-                    *slot = self.to_number(v)? as i64;
+                    *slot = self.temporal_ctor_int(v)?;
                 }
             }
             return self.make_plain_time(f);
@@ -410,7 +410,7 @@ impl<'p> Vm<'p> {
             for (i, slot) in f.iter_mut().enumerate() {
                 let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
                 if v != Value::UNDEFINED {
-                    *slot = self.to_number(v)? as i64;
+                    *slot = self.temporal_ctor_int(v)?;
                 }
             }
             return self.make_plain_date_time(f);
@@ -421,20 +421,20 @@ impl<'p> Vm<'p> {
         }
         if ci == self.plainyearmonth_ctor && ci != 0 {
             // (year, month, calendar?, referenceISODay=1)
-            let y = self.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))? as i64;
-            let m = self.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))? as i64;
+            let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+            let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
             let rd = match args.get(3).copied() {
-                Some(v) if v != Value::UNDEFINED => self.to_number(v)? as i64,
+                Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1,
             };
             return self.make_plain_year_month(y, m, rd);
         }
         if ci == self.plainmonthday_ctor && ci != 0 {
             // (month, day, calendar?, referenceISOYear=1972)
-            let m = self.to_number(args.first().copied().unwrap_or(Value::UNDEFINED))? as i64;
-            let d = self.to_number(args.get(1).copied().unwrap_or(Value::UNDEFINED))? as i64;
+            let m = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+            let d = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
             let ry = match args.get(3).copied() {
-                Some(v) if v != Value::UNDEFINED => self.to_number(v)? as i64,
+                Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1972,
             };
             return self.make_plain_month_day(m, d, ry);
