@@ -4961,6 +4961,20 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
             }
+            // `super.m(...args)` — a StaticMemberExpression whose object is `super`
+            // (which is not a value, so it must be handled before the generic
+            // StaticMember case evaluates the object).
+            if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+                if matches!(&m.object, ox::Expression::Super(_)) {
+                    let pid = self
+                        .super_class
+                        .ok_or("`super.method(...)` is only valid in a derived class")?;
+                    let name = self.string_name(m.property.name.as_str());
+                    let args_arr = self.build_spread_args(&c.arguments)?;
+                    self.emit(Instr::SuperMethodSpread { dst, home_class_id: pid, name, args: args_arr });
+                    return Ok(dst);
+                }
+            }
             // Method call `obj.m(...)` — evaluate the receiver first so `this`
             // binds correctly, then build args, then CallMethodSpread.
             if let ox::Expression::StaticMemberExpression(m) = &c.callee {

@@ -1046,6 +1046,24 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    Instr::SuperMethodSpread { dst, home_class_id, name, args } => {
+                        // `super.name(...args)` — like SuperMethod but the arguments come
+                        // from a spread array; `this` = the current receiver.
+                        let key: &'p str =
+                            &self.func(func_id as usize).string_constants[name as usize];
+                        let proto = self.super_base(home_class_id);
+                        self.require_object_coercible(proto)?;
+                        let this = self.get(base, 0);
+                        let m = self.get_member(proto, key, this)?;
+                        if !self.is_callable(m) {
+                            return Err(Thrown(format!("TypeError: super.{key} is not a function")));
+                        }
+                        let args_v = self.get(base, args);
+                        let arg_vec = self.array_snapshot(args_v.heap_index());
+                        let r = self.call_value(m, this, &arg_vec)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::SuperGet { dst, home_class_id, name } => {
                         // `super.name` read: resolve on the super base (the home
                         // object's [[Prototype]]) with `this` = the current receiver

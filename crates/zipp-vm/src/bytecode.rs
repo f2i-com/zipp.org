@@ -249,6 +249,9 @@ pub enum Instr {
     /// elements of `args` (`this` = obj). The computed-key analogue of
     /// `CallMethodSpread` (binds `this`, unlike `CallSpread` on the GET result).
     CallMethodComputedSpread { dst: Reg, obj: Reg, key: Reg, args: Reg },
+    /// `dst = super.name(...args_array)` — super method call spreading the elements
+    /// of `args` (`this` = the current receiver). The spread analogue of SuperMethod.
+    SuperMethodSpread { dst: Reg, home_class_id: u32, name: u32, args: Reg },
     /// `dst = new callee(...args_array)` — construct `callee` spreading the
     /// elements of the array in `args` as the arguments.
     NewSpread { dst: Reg, callee: Reg, args: Reg },
