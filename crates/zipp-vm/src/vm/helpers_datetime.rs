@@ -454,15 +454,30 @@ pub(crate) fn parse_month_code(s: &str) -> Option<i64> {
     // MonthCode grammar: "M" followed by EXACTLY two ASCII digits (so "M1"/"M005"
     // are malformed). A trailing "L" marks a lunisolar leap month, which the ISO
     // 8601 calendar does not have — reject it. The two-digit value must be 1..=12.
+    match parse_month_code_syntax(s) {
+        Some((n, false)) if (1..=12).contains(&n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Parse a monthCode for *syntax* only, separating well-formedness from
+/// ISO-calendar validity. Returns `Some((month, is_leap))` for any well-formed
+/// code ("M" + exactly two ASCII digits + optional trailing "L"), or `None` if
+/// the string is malformed. The caller decides whether the (month, leap) pair is
+/// valid for its calendar — for ISO that means `1..=12` and `!is_leap`. This
+/// split lets `with()` defer a calendar-invalid-but-well-formed code (e.g.
+/// "M08L", "M13") past the point where the options bag is read, per spec.
+pub(crate) fn parse_month_code_syntax(s: &str) -> Option<(i64, bool)> {
     let body = s.strip_prefix('M')?;
-    if body.ends_with('L') {
+    let (digits, is_leap) = match body.strip_suffix('L') {
+        Some(d) => (d, true),
+        None => (body, false),
+    };
+    if digits.len() != 2 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    if body.len() != 2 || !body.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let n = body.parse::<i64>().ok()?;
-    (1..=12).contains(&n).then_some(n)
+    let n = digits.parse::<i64>().ok()?;
+    Some((n, is_leap))
 }
 
 /// Parse "YYYY-MM" (or a fuller ISO date) → (year, month, referenceISODay).

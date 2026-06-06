@@ -2298,8 +2298,9 @@ impl<'p> Vm<'p> {
             PLAINYEARMONTH_COMPARE => {
                 let a = self.to_plain_year_month(a0)?;
                 let b = self.to_plain_year_month(a1)?;
-                let ka = a.0 * 12 + a.1;
-                let kb = b.0 * 12 + b.1;
+                // Compare the full ISO reference date (year, month, then reference day).
+                let ka = (a.0, a.1, a.2);
+                let kb = (b.0, b.1, b.2);
                 Value::num(if ka < kb { -1.0 } else if ka > kb { 1.0 } else { 0.0 })
             }
             _ if (PMD_M_BASE..PMD_M_BASE + PLAINMONTHDAY_METHODS.len() as u16).contains(&id) => {

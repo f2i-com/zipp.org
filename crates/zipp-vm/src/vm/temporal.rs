@@ -713,8 +713,10 @@ impl<'p> Vm<'p> {
                 let other = self.to_plain_date(a0)?;
                 Ok(Some(Value::bool((y, m, d) == other)))
             }
-            "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(y, m, d)?)),
-            "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(m, d, y)?)),
+            // The ISO reference is canonical: day 1 for a year-month, year 1972 for a
+            // month-day — NOT the source date's day/year.
+            "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(y, m, 1)?)),
+            "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(m, d, 1972)?)),
             "toPlainDateTime" => {
                 // Combine this date with a time (ToTemporalTime; default midnight).
                 let t = if a0 == Value::UNDEFINED { [0i64; 6] } else { self.to_plain_time(a0)? };
@@ -743,21 +745,37 @@ impl<'p> Vm<'p> {
             }
             "with" => {
                 self.reject_temporal_like(a0)?;
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                let yf = self.opt_int_field(a0, "year")?;
-                let mf = self.read_month_field(a0)?;
+                // Field reads (observable getters) happen in alphabetical key order
+                // (day, month, monthCode, year), all BEFORE reading the options bag.
                 let df = self.opt_int_field(a0, "day")?;
+                let mf = self.read_month_field_raw(a0)?;
+                let yf = self.opt_int_field(a0, "year")?;
                 if yf.is_none() && mf.is_none() && df.is_none() {
                     return Err(Thrown(
                         "TypeError: with() requires at least one recognized property".into(),
                     ));
                 }
                 let ny = yf.unwrap_or(y);
-                let mut nm = mf.unwrap_or(m);
+                let month_valid = mf.map(|(_, v)| v).unwrap_or(true);
+                let mut nm = mf.map(|(mm, _)| mm).unwrap_or(m);
                 let mut nd = df.unwrap_or(d);
+                // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
+                // rejected during field preparation, BEFORE the options bag is read.
+                if nm < 1 || nd < 1 {
+                    return Err(Thrown("RangeError: invalid date fields".into()));
+                }
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                // A well-formed-but-calendar-invalid monthCode ("M08L", "M13") is
+                // rejected only after the options bag has been read.
+                if !month_valid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
+                }
                 if !reject {
-                    nm = nm.clamp(1, 12);
-                    nd = nd.clamp(1, days_in_month(ny, nm));
+                    // "constrain" clamps only the UPPER bound.
+                    nm = nm.min(12);
+                    nd = nd.min(days_in_month(ny, nm));
                 }
                 Ok(Some(self.make_plain_date(ny, nm, nd)?))
             }
@@ -1048,20 +1066,27 @@ impl<'p> Vm<'p> {
             }
             "with" => {
                 self.reject_temporal_like(a0)?;
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let names =
                     ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
                 let maxes = [23, 59, 59, 999, 999, 999];
-                let mut nf = f;
+                // Read all the time fields (observable getters) BEFORE the options bag.
+                let mut raw: [Option<i64>; 6] = [None; 6];
                 let mut any = false;
                 for (i, nm) in names.iter().enumerate() {
                     if let Some(x) = self.opt_int_field(a0, nm)? {
-                        nf[i] = if reject { x } else { x.clamp(0, maxes[i]) };
+                        raw[i] = Some(x);
                         any = true;
                     }
                 }
                 if !any {
                     return Err(Thrown("TypeError: with() requires a partial time object".into()));
+                }
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let mut nf = f;
+                for (i, slot) in raw.iter().enumerate() {
+                    if let Some(x) = *slot {
+                        nf[i] = if reject { x } else { x.clamp(0, maxes[i]) };
+                    }
                 }
                 Ok(Some(self.make_plain_time(nf)?))
             }
@@ -1294,8 +1319,8 @@ impl<'p> Vm<'p> {
             }
             "toPlainDate" => Ok(Some(self.make_plain_date(date[0], date[1], date[2])?)),
             "toPlainTime" => Ok(Some(self.make_plain_time(time)?)),
-            "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(date[0], date[1], date[2])?)),
-            "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(date[1], date[2], date[0])?)),
+            "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(date[0], date[1], 1)?)),
+            "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(date[1], date[2], 1972)?)),
             "withCalendar" => {
                 self.validate_calendar_value(a0)?;
                 Ok(Some(self.make_plain_date_time(f)?))
@@ -1333,25 +1358,66 @@ impl<'p> Vm<'p> {
             }
             "with" => {
                 self.reject_temporal_like(a0)?;
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                let names = [
-                    "year", "month", "day", "hour", "minute", "second", "millisecond",
-                    "microsecond", "nanosecond",
+                // Read all fields (observable getters) in alphabetical key order, BEFORE
+                // the options bag — each pair is (key, index into the [y,mo,d,h,mi,s,ms,
+                // us,ns] field array). The `month` slot goes through read_month_field_raw
+                // so monthCode is honoured, month/monthCode agreement is enforced, and a
+                // calendar-invalid code is deferred (month_valid=false) until after the
+                // options bag is read.
+                let order: [(&str, usize); 9] = [
+                    ("day", 2),
+                    ("hour", 3),
+                    ("microsecond", 7),
+                    ("millisecond", 6),
+                    ("minute", 4),
+                    ("month", 1),
+                    ("nanosecond", 8),
+                    ("second", 5),
+                    ("year", 0),
                 ];
-                let mut nf = f;
+                let mut raw: [Option<i64>; 9] = [None; 9];
+                let mut month_valid = true;
                 let mut any = false;
-                for (i, nm) in names.iter().enumerate() {
-                    if let Some(x) = self.opt_int_field(a0, nm)? {
-                        nf[i] = x;
+                for (key, slot) in order {
+                    let v = if key == "month" {
+                        self.read_month_field_raw(a0)?.map(|(mm, valid)| {
+                            month_valid = valid;
+                            mm
+                        })
+                    } else {
+                        self.opt_int_field(a0, key)?
+                    };
+                    if let Some(x) = v {
+                        raw[slot] = Some(x);
                         any = true;
                     }
                 }
                 if !any {
                     return Err(Thrown("TypeError: with() requires a partial object".into()));
                 }
+                let mut nf = f;
+                for (i, slot) in raw.iter().enumerate() {
+                    if let Some(x) = *slot {
+                        nf[i] = x;
+                    }
+                }
+                // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
+                // rejected during field preparation, BEFORE the options bag is read.
+                if nf[1] < 1 || nf[2] < 1 {
+                    return Err(Thrown("RangeError: invalid date fields".into()));
+                }
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                // A well-formed-but-calendar-invalid monthCode ("M08L", "M13") is
+                // rejected only after the options bag has been read.
+                if !month_valid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
+                }
                 if !reject {
-                    nf[1] = nf[1].clamp(1, 12);
-                    nf[2] = nf[2].clamp(1, days_in_month(nf[0], nf[1]));
+                    // "constrain" clamps only the UPPER bound.
+                    nf[1] = nf[1].min(12);
+                    nf[2] = nf[2].min(days_in_month(nf[0], nf[1]));
                     let maxes = [23, 59, 59, 999, 999, 999];
                     for (i, &mx) in maxes.iter().enumerate() {
                         nf[3 + i] = nf[3 + i].clamp(0, mx);
@@ -1811,9 +1877,21 @@ impl<'p> Vm<'p> {
                     "year", "month", "day", "hour", "minute", "second", "millisecond",
                     "microsecond", "nanosecond",
                 ];
+                let mut month_valid = true;
                 let mut any = false;
                 for (i, nm) in names.iter().enumerate() {
-                    if let Some(x) = self.opt_int_field(bag, nm)? {
+                    // The month slot goes through read_month_field_raw so monthCode is
+                    // honoured, month/monthCode agreement is enforced, and a calendar-
+                    // invalid code is deferred until after the options bag is read.
+                    let v = if i == 1 {
+                        self.read_month_field_raw(bag)?.map(|(mm, valid)| {
+                            month_valid = valid;
+                            mm
+                        })
+                    } else {
+                        self.opt_int_field(bag, nm)?
+                    };
+                    if let Some(x) = v {
                         f[i] = x;
                         any = true;
                     }
@@ -1823,9 +1901,21 @@ impl<'p> Vm<'p> {
                         "TypeError: with() requires at least one recognized property".into(),
                     ));
                 }
+                // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
+                // rejected during field preparation, BEFORE the options bag is read.
+                if f[1] < 1 || f[2] < 1 {
+                    return Err(Thrown("RangeError: invalid date fields".into()));
+                }
                 // Validate the resolution options (disambiguation/offset/overflow).
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 self.read_zdt_options(options)?;
+                // A well-formed-but-calendar-invalid monthCode ("M08L", "M13") is
+                // rejected only after the options bag has been read.
+                if !month_valid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
+                }
                 let off = self.zdt_offset_ns(idx);
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
@@ -2159,8 +2249,9 @@ impl<'p> Vm<'p> {
             }
         }
         format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{}[{}]",
-            f[0], f[1], f[2], f[3], f[4], f[5], frac, offset, tz
+            "{}T{:02}:{:02}:{:02}{}{}[{}]",
+            iso_date_string(f[0], f[1], f[2]),
+            f[3], f[4], f[5], frac, offset, tz
         )
     }
 
@@ -2421,31 +2512,54 @@ impl<'p> Vm<'p> {
 
     /// Read month from an object: monthCode ("M06") takes precedence over `month`.
     pub(crate) fn read_month_field(&mut self, obj: Value) -> Result<Option<i64>, Thrown> {
+        // Eager form for the non-`with` paths (from/construction): a calendar-invalid
+        // monthCode is rejected immediately, matching the historical behaviour.
+        match self.read_month_field_raw(obj)? {
+            Some((m, true)) => Ok(Some(m)),
+            Some((_, false)) => {
+                Err(Thrown("RangeError: monthCode is not valid for the ISO 8601 calendar".into()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Read the `month`/`monthCode` fields, returning `(month, calendar_valid)`.
+    /// `calendar_valid` is false only for a *well-formed* monthCode that is invalid
+    /// for ISO (a leap month, or a month outside 1..=12) — a numeric `month` is always
+    /// reported valid (its upper bound is constrained/rejected later; its lower bound
+    /// is a field-prep floor enforced by the caller). Malformed monthCode syntax and a
+    /// month/monthCode disagreement still throw eagerly here (field-prep errors). The
+    /// `with()` handlers defer the `calendar_valid == false` rejection until after the
+    /// options bag is read, per spec; [[read_month_field]] rejects it immediately.
+    pub(crate) fn read_month_field_raw(
+        &mut self,
+        obj: Value,
+    ) -> Result<Option<(i64, bool)>, Thrown> {
         // Read both `month` and `monthCode` (alphabetical field order puts `month`
-        // first). An invalid monthCode is a RangeError (not a silently-absent field);
-        // when both are present they must agree.
+        // first). When both are present they must agree.
         let month_opt = self.opt_int_field(obj, "month")?;
         let mc = self.get_prop(obj, "monthCode")?;
         if mc != Value::UNDEFINED {
             // monthCode is converted with ToPrimitive(string) then RequireString:
             // an object whose `toString`/`@@toPrimitive` yields a string is fine, but
             // a value that resolves to a non-string (number/bigint/boolean/symbol) is
-            // a TypeError. A well-formed-but-invalid string is a RangeError below.
+            // a TypeError. Malformed syntax is a (field-prep) RangeError below.
             let prim = self.to_primitive_string(mc)?;
             if !(prim.is_heap() && self.heap.is_str_like(prim.heap_index())) {
                 return Err(Thrown("TypeError: monthCode must be a string".into()));
             }
             let s = self.heap.str_cow(prim.heap_index()).unwrap().into_owned();
-            let code_month = parse_month_code(&s)
+            let (code_month, is_leap) = parse_month_code_syntax(&s)
                 .ok_or_else(|| Thrown(format!("RangeError: invalid monthCode '{s}'")))?;
             if let Some(m) = month_opt {
                 if m != code_month {
                     return Err(Thrown("RangeError: month and monthCode must agree".into()));
                 }
             }
-            return Ok(Some(code_month));
+            let calendar_valid = !is_leap && (1..=12).contains(&code_month);
+            return Ok(Some((code_month, calendar_valid)));
         }
-        Ok(month_opt)
+        Ok(month_opt.map(|m| (m, true)))
     }
 
     /// Validate a property-bag `calendar` field for the ISO-only engine: absent,
@@ -2515,7 +2629,7 @@ impl<'p> Vm<'p> {
         name: &str,
         args: &[Value],
     ) -> Result<Option<Value>, Thrown> {
-        let (y, m, _ref) = match self.pym_fields(idx) {
+        let (y, m, rd) = match self.pym_fields(idx) {
             Some(t) => t,
             None => return Ok(None),
         };
@@ -2528,7 +2642,7 @@ impl<'p> Vm<'p> {
                 let s = if suf.is_empty() {
                     year_month_string(y, m)
                 } else {
-                    format!("{}{}", iso_date_string(y, m, _ref), suf)
+                    format!("{}{}", iso_date_string(y, m, rd), suf)
                 };
                 Ok(Some(self.alloc_str(s)))
             }
@@ -2536,23 +2650,40 @@ impl<'p> Vm<'p> {
                 Err(Thrown("TypeError: Called Temporal.PlainYearMonth.prototype.valueOf".into()))
             }
             "equals" => {
+                // ISO PlainYearMonth equality includes the reference ISO day.
                 let o = self.to_plain_year_month(a0)?;
-                Ok(Some(Value::bool((y, m) == (o.0, o.1))))
+                Ok(Some(Value::bool((y, m, rd) == (o.0, o.1, o.2))))
             }
             "with" => {
                 self.reject_temporal_like(a0)?;
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                // Field reads (observable getters) happen in alphabetical key order
+                // (month, monthCode, year), all BEFORE reading the options bag.
+                let mf = self.read_month_field_raw(a0)?;
                 let yf = self.opt_int_field(a0, "year")?;
-                let mf = self.read_month_field(a0)?;
                 if yf.is_none() && mf.is_none() {
                     return Err(Thrown(
                         "TypeError: with() requires at least one recognized property".into(),
                     ));
                 }
                 let ny = yf.unwrap_or(y);
-                let mut nm = mf.unwrap_or(m);
+                let month_valid = mf.map(|(_, v)| v).unwrap_or(true);
+                let mut nm = mf.map(|(mm, _)| mm).unwrap_or(m);
+                // month uses ToPositiveIntegerWithTruncation: a value below 1 is rejected
+                // during field preparation, BEFORE the options bag is read.
+                if nm < 1 {
+                    return Err(Thrown("RangeError: invalid date fields".into()));
+                }
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                // A well-formed-but-calendar-invalid monthCode ("M08L", "M13") is
+                // rejected only after the options bag has been read.
+                if !month_valid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
+                }
                 if !reject {
-                    nm = nm.clamp(1, 12);
+                    // "constrain" clamps only the upper bound.
+                    nm = nm.min(12);
                 }
                 Ok(Some(self.make_plain_year_month(ny, nm, 1)?))
             }
@@ -2634,7 +2765,7 @@ impl<'p> Vm<'p> {
                 let mut o = ObjMap::new();
                 o.set("isoYear", Value::num(y as f64));
                 o.set("isoMonth", Value::num(m as f64));
-                o.set("isoDay", Value::num(_ref as f64));
+                o.set("isoDay", Value::num(rd as f64));
                 o.set("calendar", cal);
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(o)))))
             }
@@ -2750,20 +2881,44 @@ impl<'p> Vm<'p> {
             }
             "with" => {
                 self.reject_temporal_like(a0)?;
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-                let yf = self.opt_int_field(a0, "year")?;
-                let mf = self.read_month_field(a0)?;
+                // Field reads (observable getters) happen in alphabetical key order
+                // (day, month, monthCode, year), all BEFORE reading the options bag.
                 let df = self.opt_int_field(a0, "day")?;
+                let mf = self.read_month_field_raw(a0)?;
+                let yf = self.opt_int_field(a0, "year")?;
                 if yf.is_none() && mf.is_none() && df.is_none() {
                     return Err(Thrown(
                         "TypeError: with() requires at least one recognized property".into(),
                     ));
                 }
-                let mut nm = mf.unwrap_or(m);
+                let month_valid = mf.map(|(_, v)| v).unwrap_or(true);
+                let mut nm = mf.map(|(mm, _)| mm).unwrap_or(m);
                 let mut nd = df.unwrap_or(d);
-                if !reject {
-                    nm = nm.clamp(1, 12);
-                    nd = nd.clamp(1, days_in_month(ry, nm));
+                // month/day use ToPositiveIntegerWithTruncation: a value below 1 is
+                // rejected during field preparation, BEFORE the options bag is read.
+                if nm < 1 || nd < 1 {
+                    return Err(Thrown("RangeError: invalid date fields".into()));
+                }
+                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                // A well-formed-but-calendar-invalid monthCode ("M08L", "M13") is
+                // rejected only after the options bag has been read.
+                if !month_valid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
+                }
+                // The (optional) `year` field is used ONLY to apply the overflow option
+                // to the day (e.g. whether Feb 29 fits) — it is never range-checked. The
+                // result keeps the instance's canonical ISO reference year.
+                let eff_year = yf.unwrap_or(ry);
+                if reject {
+                    if !(1..=12).contains(&nm) || nd > days_in_month(eff_year, nm) {
+                        return Err(Thrown("RangeError: month-day out of range".into()));
+                    }
+                } else {
+                    // "constrain" clamps only the upper bound.
+                    nm = nm.min(12);
+                    nd = nd.min(days_in_month(eff_year, nm));
                 }
                 Ok(Some(self.make_plain_month_day(nm, nd, ry)?))
             }
