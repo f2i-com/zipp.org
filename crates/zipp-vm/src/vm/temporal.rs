@@ -2617,6 +2617,27 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
         let rb = t[lb..].find(']').map(|r| lb + r)?;
         let inner = &t[lb + 1..rb];
         let inner = inner.strip_prefix('!').unwrap_or(inner);
+        // A non-empty prefix before the annotation means the whole string is a
+        // "<datetime|offset>[tz]" form — the prefix is NOT decorative and must be a
+        // valid ISO datetime/offset. Validate it (e.g. reject
+        // "-000000-10-31T17:45+00:00[UTC]" for its negative-zero extended year),
+        // not just the bracket content. A pure UTC offset (only digits/`:`/`.`/`,`
+        // after the sign) is checked directly; anything else must parse as a full
+        // zoned-datetime string (which validates the date via the hardened parser).
+        let prefix = t[..lb].trim();
+        if !prefix.is_empty() {
+            let pure_offset = prefix.strip_prefix(['+', '-']).is_some_and(|r| {
+                !r.is_empty()
+                    && r.chars().all(|c| c.is_ascii_digit() || matches!(c, ':' | '.' | ','))
+            });
+            if pure_offset {
+                if parse_offset_ns(prefix).is_none() {
+                    return None;
+                }
+            } else if parse_zdt_string(t).is_none() {
+                return None;
+            }
+        }
         return parse_time_zone(inner);
     }
     if t.eq_ignore_ascii_case("UTC") {
