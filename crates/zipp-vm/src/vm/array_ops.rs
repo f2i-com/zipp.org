@@ -421,7 +421,9 @@ impl<'p> Vm<'p> {
                 // it happens BEFORE any element is visited. (forEach/some/every/
                 // reduce create no array, and filter creates length 0, so only map
                 // validates here.)
-                if lenf.is_finite() && lenf.floor() > 4_294_967_295.0 {
+                // ArrayCreate(len) requires len <= 2^32-1; a larger finite length OR a
+                // non-finite one (Infinity, via ToLength → 2^53-1) is a RangeError.
+                if lenf > 4_294_967_295.0 {
                     return Err(Thrown("RangeError: Invalid array length".into()));
                 }
                 let mut out = vec![Value::UNDEFINED; len];
@@ -967,8 +969,33 @@ impl<'p> Vm<'p> {
                 if matches!(name, "with" | "toReversed" | "toSorted" | "toSpliced") {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
                     let n = self.to_number_coerce(lv)?;
-                    let len = if n.is_finite() && n > 0.0 { n.floor() } else { 0.0 };
-                    if len > 4_294_967_295.0 {
+                    // ArrayCreate(len) requires len <= 2^32-1; a larger finite length OR
+                    // a non-finite one (Infinity, via ToLength → 2^53-1) is a RangeError.
+                    if n > 4_294_967_295.0 {
+                        return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                }
+                // slice does ArraySpeciesCreate(O, count); the result `count` must be
+                // <= 2^32-1, validated (RangeError) BEFORE any element is read.
+                if name == "slice" {
+                    let lv = self.get_prop(Value::heap(idx), "length")?;
+                    let lenf = self.to_number_coerce(lv)?;
+                    // ToLength(lenf) → clamp to [0, 2^53-1].
+                    let len = if lenf.is_nan() || lenf <= 0.0 {
+                        0.0
+                    } else {
+                        lenf.trunc().min(9_007_199_254_740_991.0)
+                    };
+                    // relativeStart/relativeEnd = ToIntegerOrInfinity(arg) (Infinity-aware).
+                    let toii = |raw: f64| if raw.is_nan() { 0.0 } else { raw.trunc() };
+                    let s_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let rel_start = toii(self.to_number_coerce(s_arg)?);
+                    let k = if rel_start < 0.0 { (len + rel_start).max(0.0) } else { rel_start.min(len) };
+                    let e_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                    let rel_end =
+                        if e_arg == Value::UNDEFINED { len } else { toii(self.to_number_coerce(e_arg)?) };
+                    let fin = if rel_end < 0.0 { (len + rel_end).max(0.0) } else { rel_end.min(len) };
+                    if (fin - k).max(0.0) > 4_294_967_295.0 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
                 }
