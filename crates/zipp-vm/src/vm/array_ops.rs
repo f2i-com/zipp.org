@@ -1097,6 +1097,18 @@ impl<'p> Vm<'p> {
                 "TypeError: Cannot assign to read only property 'length' of object '[object Array]'".into(),
             ));
         }
+        // pop/shift read an element via the spec Get. When that element is a HOLE in
+        // the array's own storage, Get defers to the prototype chain — a prototype
+        // accessor there can run arbitrary code (e.g. freeze the array mid-operation),
+        // which the fast Vec path would miss. Route such cases to the abstract path.
+        if name == "pop" || name == "shift" {
+            if let HeapObj::Array(items) = self.heap.get(idx) {
+                let probe = if name == "pop" { items.len().checked_sub(1) } else { Some(0) };
+                if probe.map_or(false, |p| items.get(p).is_some_and(|v| v.is_hole())) {
+                    return self.array_like_mutate(Value::heap(idx), name, args);
+                }
+            }
+        }
         match name {
             "push" => {
                 let mut last = Value::UNDEFINED;
