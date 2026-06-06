@@ -516,6 +516,31 @@ impl<'p> Vm<'p> {
         Ok(n as i64)
     }
 
+    /// `iter_limit_arg` but IteratorClose(`src`) on an abrupt completion (the take/drop
+    /// limit is validated AFTER GetIteratorDirect, so a bad limit closes the source).
+    fn iter_limit_or_close(&mut self, v: Value, src: Value) -> Result<i64, Thrown> {
+        match self.iter_limit_arg(v) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                let _ = self.iterator_close(src);
+                Err(e)
+            }
+        }
+    }
+
+    /// Call a helper callback (`this` = undefined); on an abrupt completion,
+    /// IteratorClose the source iterator `src` before propagating (the callback's error
+    /// wins over any close error), per the helpers' IfAbruptCloseIterator.
+    fn iter_call_close(&mut self, cb: Value, src: Value, args: &[Value]) -> Result<Value, Thrown> {
+        match self.call_value(cb, Value::UNDEFINED, args) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let _ = self.iterator_close(src);
+                Err(e)
+            }
+        }
+    }
+
     /// Dispatch an `Iterator.prototype` helper. `this` is the source iterator.
     pub(crate) fn iter_helper_method(
         &mut self,
@@ -532,7 +557,11 @@ impl<'p> Vm<'p> {
             id,
             ITER_MAP | ITER_FILTER | ITER_FLATMAP | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND
         );
+        // GetIteratorDirect(O) precedes the argument checks, so a callback that is not
+        // callable (or, for take/drop, a limit that fails ToNumber / is out of range)
+        // must IteratorClose the underlying iterator before throwing.
         if needs_fn && !self.is_callable(a0) {
+            let _ = self.iterator_close(this);
             return Err(Thrown("TypeError: the callback argument is not a function".into()));
         }
         match id {
@@ -540,11 +569,11 @@ impl<'p> Vm<'p> {
             ITER_FILTER => Ok(self.make_iter_helper(this, 1, a0, 0)),
             ITER_FLATMAP => Ok(self.make_iter_helper(this, 4, a0, 0)),
             ITER_TAKE => {
-                let n = self.iter_limit_arg(a0)?;
+                let n = self.iter_limit_or_close(a0, this)?;
                 Ok(self.make_iter_helper(this, 2, Value::UNDEFINED, n))
             }
             ITER_DROP => {
-                let n = self.iter_limit_arg(a0)?;
+                let n = self.iter_limit_or_close(a0, this)?;
                 Ok(self.make_iter_helper(this, 3, Value::UNDEFINED, n))
             }
             ITER_TOARRAY => {
@@ -557,7 +586,8 @@ impl<'p> Vm<'p> {
             ITER_FOREACH => {
                 let mut i = 0i64;
                 while let Some(v) = self.iterator_step(this)? {
-                    self.call_value(a0, Value::UNDEFINED, &[v, Value::num(i as f64)])?;
+                    // A throwing callback IteratorCloses the source (its error wins).
+                    self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     i += 1;
                 }
                 Ok(Value::UNDEFINED)
@@ -565,8 +595,10 @@ impl<'p> Vm<'p> {
             ITER_SOME => {
                 let mut i = 0i64;
                 while let Some(v) = self.iterator_step(this)? {
-                    let r = self.call_value(a0, Value::UNDEFINED, &[v, Value::num(i as f64)])?;
+                    let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if self.truthy(r) {
+                        // Early return ALSO closes the iterator (IteratorClose).
+                        self.iterator_close(this)?;
                         return Ok(Value::bool(true));
                     }
                     i += 1;
@@ -576,8 +608,9 @@ impl<'p> Vm<'p> {
             ITER_EVERY => {
                 let mut i = 0i64;
                 while let Some(v) = self.iterator_step(this)? {
-                    let r = self.call_value(a0, Value::UNDEFINED, &[v, Value::num(i as f64)])?;
+                    let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if !self.truthy(r) {
+                        self.iterator_close(this)?;
                         return Ok(Value::bool(false));
                     }
                     i += 1;
@@ -587,8 +620,9 @@ impl<'p> Vm<'p> {
             ITER_FIND => {
                 let mut i = 0i64;
                 while let Some(v) = self.iterator_step(this)? {
-                    let r = self.call_value(a0, Value::UNDEFINED, &[v, Value::num(i as f64)])?;
+                    let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
                     if self.truthy(r) {
+                        self.iterator_close(this)?;
                         return Ok(v);
                     }
                     i += 1;
@@ -597,6 +631,7 @@ impl<'p> Vm<'p> {
             }
             ITER_REDUCE => {
                 if !self.is_callable(a0) {
+                    let _ = self.iterator_close(this);
                     return Err(Thrown("TypeError: reduce reducer is not a function".into()));
                 }
                 let has_init = args.len() >= 2;
@@ -616,7 +651,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 while let Some(v) = self.iterator_step(this)? {
-                    acc = self.call_value(a0, Value::UNDEFINED, &[acc, v, Value::num(i as f64)])?;
+                    acc = self.iter_call_close(a0, this, &[acc, v, Value::num(i as f64)])?;
                     i += 1;
                 }
                 Ok(acc)
