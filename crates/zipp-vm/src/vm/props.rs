@@ -2022,6 +2022,46 @@ impl<'p> Vm<'p> {
             .unwrap_or(self.arr_proto)
     }
 
+    /// Like `proto_member`, but ACCESSOR-AWARE: when the property found on the
+    /// chain is a getter (e.g. a user `Object.defineProperty(TA.prototype,
+    /// "constructor", {get})`), it is invoked with `receiver`. Used by the
+    /// TypedArray/DataView instance get path so a user-installed accessor on a
+    /// type prototype is honoured (SpeciesConstructor reads `this.constructor`).
+    /// Mirrors `proto_member`'s walk, including the Object.prototype fallback.
+    pub(crate) fn proto_member_get(
+        &mut self,
+        proto: u32,
+        key: &str,
+        receiver: Value,
+    ) -> Result<Value, Thrown> {
+        let mut cur = proto;
+        let mut guard = 0u32;
+        while cur != 0 && guard < 64 {
+            guard += 1;
+            if let Some((attr, raw)) = self.own_member(cur, key) {
+                return if attr.accessor {
+                    if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, receiver, &[]) }
+                } else {
+                    Ok(raw)
+                };
+            }
+            match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => cur = p.heap_index(),
+                _ => break,
+            }
+        }
+        if self.obj_proto != 0 && proto != self.obj_proto {
+            if let Some((attr, raw)) = self.own_member(self.obj_proto, key) {
+                return if attr.accessor {
+                    if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, receiver, &[]) }
+                } else {
+                    Ok(raw)
+                };
+            }
+        }
+        Ok(Value::UNDEFINED)
+    }
+
     pub(crate) fn proto_member(&self, proto: u32, key: &str) -> Value {
         // Walk the full prototype chain via `proto_of`. Most type prototypes chain
         // directly to Object.prototype, but a TypedArray instance's prototype chain
@@ -2463,7 +2503,9 @@ impl<'p> Vm<'p> {
                 "BYTES_PER_ELEMENT" => Value::num(size as f64),
                 "buffer" => Value::heap(buffer),
                 "@@toStringTag" => self.alloc_str(native::TA_KINDS[kind as usize].0.to_string()),
-                _ => self.proto_member(self.ta_protos[kind as usize], key),
+                // Accessor-aware so a user getter on the type prototype fires with
+                // the TA instance as receiver (SpeciesConstructor's this.constructor).
+                _ => return self.proto_member_get(self.ta_protos[kind as usize], key, obj),
             });
         }
         if let HeapObj::ArrayBuffer { data, .. } = self.heap.get(obj.heap_index()) {
