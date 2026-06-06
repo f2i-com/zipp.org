@@ -709,6 +709,20 @@ impl<'p> Vm<'p> {
         };
         // Capture the subclass prototype before re-branding loses the map.class link.
         let sub_proto = self.object_get_prototype_of(obj);
+        // `class T extends Uint8Array` (or any TypedArray kind): build a real typed
+        // array through the builtin ctor (handling every arg form — length, array,
+        // (buffer, byteOffset, length) on a fixed/resizable buffer) and move it into
+        // the instance. The TA references a freshly-constructed ArrayBuffer, which is
+        // correct to share. Detected by the parent being a TypedArray constructor.
+        if cval.is_heap() && self.ta_ctors.iter().any(|&c| c != 0 && c == cval.heap_index()) {
+            let tv = self.construct(cval, args)?;
+            let cloned = self.heap.get(tv.heap_index()).clone();
+            *self.heap.get_mut(oidx) = cloned;
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
         if pidx == self.set_proto && self.set_proto != 0 {
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             let mut items: Vec<Value> = Vec::new();
