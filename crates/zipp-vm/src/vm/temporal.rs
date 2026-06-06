@@ -606,7 +606,10 @@ impl<'p> Vm<'p> {
         // smallestUnit component is rounded (the sub-smallest remainder becomes the
         // fraction toward the next increment — NudgeToCalendarUnit).
         let base = difference_iso_date(d1, d2, largest);
-        let sval = base[si];
+        // smallestUnit = week: difference_iso_date dumps the sub-month remainder into
+        // DAYS (weeks = 0 when largestUnit > week), so derive the whole-week count from
+        // the full sub-week day span instead of the (zeroed) week field.
+        let sval = if si == 2 { (base[2] * 7 + base[3]) / 7 } else { base[si] };
         let mk = |k: i64| -> [i64; 10] {
             let mut dur = [0i64; 10];
             dur[..si].copy_from_slice(&base[..si]);
@@ -635,8 +638,12 @@ impl<'p> Vm<'p> {
             // halfEven, then scale back. At inc==1 this is round_fraction(sval, …).
             round_fraction(r1 / inc as i64, sign, progress, mode) * inc as i64
         };
-        // Re-balance the kept-larger-units + rounded-smallest endpoint to largestUnit
-        // (folds an overflowing smallest unit up, e.g. 12 months → 1 year).
+        // Weeks never fold into a larger calendar unit, so keep years/months + the
+        // rounded weeks + 0 days. Year/month results re-balance to largestUnit (which
+        // folds an overflowing smallest unit up, e.g. 12 months → 1 year).
+        if si == 2 {
+            return Ok([base[0], base[1], picked, 0]);
+        }
         let end = self.date_add(d1.0, d1.1, d1.2, &mk(picked), 1);
         Ok(difference_iso_date(d1, end, largest))
     }
@@ -2027,10 +2034,10 @@ impl<'p> Vm<'p> {
         Ok(order(tot(&fa), tot(&fb)))
     }
 
-    /// `Duration.round` with a relativeTo anchor: add the duration to the anchor,
-    /// round the span to smallestUnit (calendar-aware for week/month/year via the
-    /// anchor's variable unit lengths), then re-express from the anchor in
-    /// largestUnit. Date-oriented; a sub-day remainder is rounded as nanoseconds.
+    /// `Duration.round` with a relativeTo anchor: round the span `start →
+    /// start+duration` exactly like `PlainDateTime.prototype.until`, so the
+    /// calendar-unit nudging, the day/time remainder rounding (time-of-day included
+    /// via epoch nanoseconds), and the re-balance to largestUnit are all shared.
     pub(crate) fn round_duration_relative(
         &mut self,
         f: [i64; 10],
@@ -2041,60 +2048,24 @@ impl<'p> Vm<'p> {
         mode: &str,
     ) -> Result<[i64; 10], Thrown> {
         let end = dt_add_dur(start, f);
-        let sd = (start[0], start[1], start[2]);
-        let sed = iso_to_epoch_days(sd.0, sd.1, sd.2);
-        let eed = iso_to_epoch_days(end[0], end[1], end[2]);
-        let sign: i64 = if eed >= sed { 1 } else { -1 };
-        let total_ns = dt_epoch_ns(end) - dt_epoch_ns(start);
-
-        // Express the span start→(date at epoch `e`) in largestUnit as [y,m,w,d].
-        let express = |e: i64| -> [i64; 4] {
-            let (ey, em, edd) = epoch_days_to_iso(e);
-            difference_iso_date(sd, (ey, em, edd), largest)
-        };
-        // Round `whole` units of `unit_kind` (0=month,1=year) to the increment,
-        // using the anchor's actual unit length for the fractional part.
-        let mut round_calendar = |whole: i64, year: bool| -> i64 {
-            let step = |n: i64| -> [i64; 10] {
-                if year { [n, 0, 0, 0, 0, 0, 0, 0, 0, 0] } else { [0, n, 0, 0, 0, 0, 0, 0, 0, 0] }
-            };
-            let ml = dt_add_dur(start, step(whole));
-            let ml1 = dt_add_dur(start, step(whole + sign));
-            let mle = iso_to_epoch_days(ml[0], ml[1], ml[2]);
-            let ml1e = iso_to_epoch_days(ml1[0], ml1[1], ml1[2]);
-            let denom = (ml1e - mle).unsigned_abs().max(1) as i128;
-            let num = (eed - mle) as i128;
-            let scaled = whole as i128 * denom + num;
-            (round_increment(scaled, inc * denom, mode) / denom) as i64
-        };
-
-        if ["year", "month", "week", "day"].contains(&smallest) {
-            let rounded_end = match smallest {
-                "day" => sed + round_increment((eed - sed) as i128, inc, mode) as i64,
-                "week" => sed + (round_increment((eed - sed) as i128, 7 * inc, mode) / 7) as i64 * 7,
-                "month" => {
-                    let bal = difference_iso_date(sd, (end[0], end[1], end[2]), "month");
-                    let rm = round_calendar(bal[0] * 12 + bal[1], false);
-                    let re = dt_add_dur(start, [0, rm, 0, 0, 0, 0, 0, 0, 0, 0]);
-                    iso_to_epoch_days(re[0], re[1], re[2])
-                }
-                _ => {
-                    let bal = difference_iso_date(sd, (end[0], end[1], end[2]), "year");
-                    let ry = round_calendar(bal[0], true);
-                    let re = dt_add_dur(start, [ry, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-                    iso_to_epoch_days(re[0], re[1], re[2])
-                }
-            };
-            let b = express(rounded_end);
-            Ok([b[0], b[1], b[2], b[3], 0, 0, 0, 0, 0, 0])
+        let order = [
+            "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
+            "microsecond", "nanosecond",
+        ];
+        let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(9);
+        if rank(largest) >= rank("day") {
+            // A day-or-time largestUnit is a pure nanosecond span: round it, balance.
+            let total_ns = dt_epoch_ns(end) - dt_epoch_ns(start);
+            let rounded = round_increment(total_ns, unit_ns(smallest) * inc, mode);
+            Ok(balance_duration_ns(rounded, largest))
+        } else if matches!(smallest, "year" | "month" | "week") {
+            // Calendar largestUnit + calendar smallestUnit → NudgeToCalendarUnit.
+            round_relative_datetime_diff(start, end, smallest, largest, inc, mode)
         } else {
-            // Time smallestUnit (or the nanosecond default → pure balancing).
-            let inc_ns = unit_ns(smallest) * inc;
-            let rounded_ns = round_increment(total_ns, inc_ns, mode);
-            let days = rounded_ns.div_euclid(DAY_NS);
-            let t = ns_to_time(rounded_ns.rem_euclid(DAY_NS));
-            let b = express(sed + days as i64);
-            Ok([b[0], b[1], b[2], b[3], t[0], t[1], t[2], t[3], t[4], t[5]])
+            // Calendar largestUnit + day/time smallestUnit → round the day+time
+            // remainder and roll an overflowing day up into the calendar units.
+            let df = difference_datetime(start, end, largest);
+            Ok(round_datetime_diff_daytime(start, df, smallest, largest, inc, mode))
         }
     }
 
@@ -3191,7 +3162,9 @@ fn round_relative_datetime_diff(
     // smallestUnit component is rounded (the sub-smallest remainder, including the
     // time-of-day, becomes the epoch-ns fraction toward the next increment).
     let base = difference_datetime(dt1, dt2, largest);
-    let sval = base[si];
+    // smallestUnit = week: difference dumps the sub-month remainder into days, so
+    // derive the whole-week count from the full sub-week day span.
+    let sval = if si == 2 { (base[2] * 7 + base[3]) / 7 } else { base[si] };
     let mk = |k: i64| -> [i64; 10] {
         let mut d = [0i64; 10];
         d[..si].copy_from_slice(&base[..si]);
@@ -3217,6 +3190,10 @@ fn round_relative_datetime_diff(
         let progress = if ud != ld { (ns2 - ld) as f64 / (ud - ld) as f64 } else { 0.0 };
         round_fraction(r1 / inc as i64, sign, progress, mode) * inc as i64
     };
+    // Weeks never fold into a larger calendar unit: keep years/months + rounded weeks.
+    if si == 2 {
+        return Ok([base[0], base[1], picked, 0, 0, 0, 0, 0, 0, 0]);
+    }
     // Re-balance the kept-larger + rounded-smallest endpoint to largestUnit.
     let end = dt_add_dur(dt1, mk(picked));
     let d = difference_iso_date((dt1[0], dt1[1], dt1[2]), (end[0], end[1], end[2]), largest);
