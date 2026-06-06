@@ -704,6 +704,9 @@ impl<'p> Vm<'p> {
             "until" | "since" => {
                 let other = self.to_plain_date(a0)?;
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if opts != Value::UNDEFINED && !self.is_object_value(opts) {
+                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                }
                 let date_units = &[
                     "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
                 ];
@@ -1259,6 +1262,9 @@ impl<'p> Vm<'p> {
             "until" | "since" => {
                 let o = self.to_plain_date_time(a0)?;
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if opts != Value::UNDEFINED && !self.is_object_value(opts) {
+                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                }
                 let all_units = &[
                     "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
                     "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
@@ -2194,13 +2200,15 @@ impl<'p> Vm<'p> {
         let month_opt = self.opt_int_field(obj, "month")?;
         let mc = self.get_prop(obj, "monthCode")?;
         if mc != Value::UNDEFINED {
-            // monthCode must be a String value — a number / bigint / boolean / object
-            // that merely ToString-s is a TypeError; a malformed string is a
-            // RangeError below.
-            if !(mc.is_heap() && self.heap.is_str_like(mc.heap_index())) {
+            // monthCode is converted with ToPrimitive(string) then RequireString:
+            // an object whose `toString`/`@@toPrimitive` yields a string is fine, but
+            // a value that resolves to a non-string (number/bigint/boolean/symbol) is
+            // a TypeError. A well-formed-but-invalid string is a RangeError below.
+            let prim = self.to_primitive_string(mc)?;
+            if !(prim.is_heap() && self.heap.is_str_like(prim.heap_index())) {
                 return Err(Thrown("TypeError: monthCode must be a string".into()));
             }
-            let s = self.heap.str_cow(mc.heap_index()).unwrap().into_owned();
+            let s = self.heap.str_cow(prim.heap_index()).unwrap().into_owned();
             let code_month = parse_month_code(&s)
                 .ok_or_else(|| Thrown(format!("RangeError: invalid monthCode '{s}'")))?;
             if let Some(m) = month_opt {
@@ -2303,6 +2311,9 @@ impl<'p> Vm<'p> {
             "until" | "since" => {
                 let o = self.to_plain_year_month(a0)?;
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                if opts != Value::UNDEFINED && !self.is_object_value(opts) {
+                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                }
                 let ym_units = &["auto", "year", "years", "month", "months"];
                 // smallestUnit default "month"; largestUnit default "auto" → "year".
                 let smallest =

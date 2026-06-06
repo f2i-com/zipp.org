@@ -186,12 +186,17 @@ impl<'p> Vm<'p> {
         arg: Value,
         allowed: &[&str],
     ) -> Result<(String, i128, String), Thrown> {
-        // A bare string argument is shorthand for { smallestUnit: <string> }.
+        // A bare string argument is shorthand for { smallestUnit: <string> }; any
+        // other non-object (a number/boolean/etc.) is a TypeError, not options.
         let (su_string, options) =
             if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
                 (Some(arg), Value::UNDEFINED)
             } else if arg == Value::UNDEFINED {
                 return Err(Thrown("TypeError: round() requires an options argument".into()));
+            } else if !self.is_object_value(arg) {
+                return Err(Thrown(
+                    "TypeError: round() options must be an object or a string".into(),
+                ));
             } else {
                 (None, arg)
             };
