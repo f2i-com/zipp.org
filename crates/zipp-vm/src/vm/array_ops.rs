@@ -489,6 +489,28 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::bool(true)))
             }
+            "find" | "findIndex" | "findLast" | "findLastIndex" => {
+                // The find family visits EVERY index with Get (no HasProperty skip), so a
+                // throwing index getter on an array-like propagates and an absent index is
+                // undefined. find/findIndex go forward; findLast/findLastIndex backward.
+                let backward = name == "findLast" || name == "findLastIndex";
+                let order: Vec<usize> =
+                    if backward { (0..len).rev().collect() } else { (0..len).collect() };
+                for k in order {
+                    let val = self.array_iter_get(this, k)?.unwrap_or(Value::UNDEFINED);
+                    let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
+                    if self.truthy(r) {
+                        return Ok(Some(match name {
+                            "find" | "findLast" => val,
+                            _ => idxv(k),
+                        }));
+                    }
+                }
+                Ok(Some(match name {
+                    "find" | "findLast" => Value::UNDEFINED,
+                    _ => Value::num(-1.0),
+                }))
+            }
             "reduce" | "reduceRight" => {
                 let right = name == "reduceRight";
                 let order: Vec<usize> =
@@ -973,6 +995,12 @@ impl<'p> Vm<'p> {
             // and propagates a throwing getter (a dense snapshot would do none of these).
             if matches!(name, "indexOf" | "lastIndexOf" | "includes") {
                 return self.array_like_search(Value::heap(idx), name, args);
+            }
+            // The find family iterates via the generic Get protocol (every index visited,
+            // accessor getters invoked, a throwing getter propagated) rather than
+            // materialising a dense snapshot that swallows those side effects.
+            if matches!(name, "find" | "findIndex" | "findLast" | "findLastIndex") {
+                return self.array_like_iterate(Value::heap(idx), name, args);
             }
             // Read-only methods that treat a hole as undefined snapshot to a dense
             // temp array and run against that.
@@ -1586,9 +1614,12 @@ impl<'p> Vm<'p> {
                 }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let receiver = Value::heap(idx);
-                let snapshot = self.array_snapshot(idx);
-                for i in (0..snapshot.len()).rev() {
-                    let v = snapshot[i];
+                // `len` is captured once; each element is read LIVE (a callback may mutate
+                // the array). findLast/findLastIndex visit EVERY index (no HasProperty
+                // skip), so an absent/hole index is the inherited value or undefined.
+                let len = self.array_snapshot(idx).len();
+                for i in (0..len).rev() {
+                    let v = self.array_dense_or_proto_get(idx, i)?.unwrap_or(Value::UNDEFINED);
                     let r = self.call_value(cb, this_arg, &[v, Value::int(i as i32), receiver])?;
                     if self.truthy(r) {
                         return Ok(Some(if name == "findLast" {
