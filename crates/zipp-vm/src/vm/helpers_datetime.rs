@@ -142,6 +142,7 @@ pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
     // Minutes: optional, after an optional ':' separator. A ':' must be followed
     // by two digits.
     let mut had_min = false;
+    let mut min_colon = false;
     {
         let mut j = i;
         let colon = b.get(j) == Some(&':');
@@ -152,6 +153,7 @@ pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
             mi = v;
             i = j + 2;
             had_min = true;
+            min_colon = colon;
         } else if colon {
             return None;
         }
@@ -159,6 +161,8 @@ pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
     // Seconds (only meaningful when minutes were present), then an optional
     // fractional part — fractions are ONLY allowed after seconds, never after a
     // bare hour or minute (those make the string invalid).
+    let mut had_sec = false;
+    let mut sec_colon = false;
     if had_min {
         let mut j = i;
         let colon = b.get(j) == Some(&':');
@@ -168,6 +172,8 @@ pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
         if let Some(v) = take2(j) {
             sec = v;
             i = j + 2;
+            had_sec = true;
+            sec_colon = colon;
             if b.get(i) == Some(&'.') || b.get(i) == Some(&',') {
                 i += 1;
                 let start = i;
@@ -190,10 +196,24 @@ pub(crate) fn parse_iso_time(s: &str) -> Option<[i64; 6]> {
             return None;
         }
     }
-    // Anything left must begin a UTC offset / designator / annotation block —
-    // a stray '.' or ',' here is a fractional hour/minute and is invalid.
-    if let Some(&c) = b.get(i) {
-        if !matches!(c, '+' | '-' | 'Z' | 'z' | '[' | ' ') {
+    // The hour:minute and minute:second separators must be consistent — both ':'
+    // (extended) or both absent (basic). Reject "0000:00" / "00:0000".
+    if had_sec && min_colon != sec_colon {
+        return None;
+    }
+    // The remaining suffix must be empty, OR a fully well-formed designator —
+    // "Z"/"z" or a valid UTC offset — optionally followed by a "[...]" annotation
+    // block (validated upstream). A stray '.'/',' or trailing junk is invalid.
+    if i < n {
+        let suffix: String = b[i..].iter().collect();
+        let head = match suffix.find('[') {
+            Some(p) => &suffix[..p],
+            None => suffix.as_str(),
+        };
+        if !(head.is_empty()
+            || head.eq_ignore_ascii_case("z")
+            || super::temporal::valid_offset_string(head))
+        {
             return None;
         }
     }
@@ -287,7 +307,9 @@ pub(crate) fn parse_iso_datetime(s: &str) -> Option<[i64; 9]> {
     let (y, mo, d) = parse_iso_date(date_s)?;
     let t = match time_s {
         Some(ts) if !ts.is_empty() => parse_iso_time(ts)?,
-        _ => [0; 6],
+        // A present `T`/space separator requires a valid time (reject "2020-01-01T").
+        Some(_) => return None,
+        None => [0; 6],
     };
     Some([y, mo, d, t[0], t[1], t[2], t[3], t[4], t[5]])
 }
@@ -1012,17 +1034,24 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
     }
     let y = sign * yv;
     let after = &rest[ylen..];
+    let had_ym_sep = after.starts_with('-');
     let after = after.strip_prefix('-').unwrap_or(after);
     if after.len() < 2 {
         return None;
     }
     let m = after[..2].parse::<i64>().ok()?;
     let after = &after[2..];
+    let had_md_sep = after.starts_with('-');
     let after = after.strip_prefix('-').unwrap_or(after);
     if after.len() < 2 {
         return None;
     }
     let d = after[..2].parse::<i64>().ok()?;
+    // The year-month and month-day separators must match — both '-' (extended) or
+    // both absent (basic). Reject mixed forms "2020-0101" / "202001-01".
+    if had_ym_sep != had_md_sep {
+        return None;
+    }
     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
         return None;
     }
