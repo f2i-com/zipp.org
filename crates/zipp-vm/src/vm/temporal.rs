@@ -348,7 +348,7 @@ impl<'p> Vm<'p> {
     // ── Temporal.PlainDate ──
 
     pub(crate) fn make_plain_date(&mut self, y: i64, m: i64, d: i64) -> Result<Value, Thrown> {
-        if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) || !(-271821..=275760).contains(&y) {
+        if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) || !iso_date_in_range(y, m, d) {
             return Err(Thrown("RangeError: invalid ISO date".into()));
         }
         let idx = self.heap.alloc(HeapObj::Temporal { kind: 1, fields: vec![y, m, d] });
@@ -522,8 +522,14 @@ impl<'p> Vm<'p> {
                 if !temporal_string_ok(&s, true, true) {
                     return Err(Thrown(format!("RangeError: invalid date string '{s}'")));
                 }
-                return parse_iso_date(&s)
-                    .ok_or_else(|| Thrown(format!("RangeError: invalid date string '{s}'")));
+                let (y, m, d) = parse_iso_date(&s)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid date string '{s}'")))?;
+                if !iso_date_in_range(y, m, d) {
+                    return Err(Thrown(format!(
+                        "RangeError: date '{s}' is outside the representable range"
+                    )));
+                }
+                return Ok((y, m, d));
             }
             if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
@@ -541,6 +547,9 @@ impl<'p> Vm<'p> {
                 } else {
                     m = m.clamp(1, 12);
                     d = d.clamp(1, days_in_month(y, m));
+                }
+                if !iso_date_in_range(y, m, d) {
+                    return Err(Thrown("RangeError: date is outside the representable range".into()));
                 }
                 return Ok((y, m, d));
             }

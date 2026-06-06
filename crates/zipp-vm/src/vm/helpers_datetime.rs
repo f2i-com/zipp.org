@@ -349,6 +349,14 @@ pub(crate) fn year_month_string(y: i64, m: i64) -> String {
 }
 
 /// Parse a month code like "M06" (ISO calendars have no leap months) → 1..=12.
+/// Whether `(y, m, d)` is a representable `Temporal.PlainDate` — within the
+/// day-granular range `[-271821-04-19, +275760-09-13]`. (ISODateWithinLimits checks
+/// the date at noon, so the bound is at day granularity; `PlainDateTime`/`Instant`
+/// use a finer, nanosecond-precise epoch bound instead.)
+pub(crate) fn iso_date_in_range(y: i64, m: i64, d: i64) -> bool {
+    (y, m, d) >= (-271821, 4, 19) && (y, m, d) <= (275760, 9, 13)
+}
+
 pub(crate) fn parse_month_code(s: &str) -> Option<i64> {
     // MonthCode grammar: "M" followed by EXACTLY two ASCII digits (so "M1"/"M005"
     // are malformed). A trailing "L" marks a lunisolar leap month, which the ISO
