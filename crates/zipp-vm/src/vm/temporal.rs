@@ -225,7 +225,9 @@ impl<'p> Vm<'p> {
                 }
                 let total_ns = (f[3] as i128) * DAY_NS
                     + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
-                Ok(Some(Value::num(total_ns as f64 / unit_ns(&unit) as f64)))
+                // Correctly-rounded single division of the exact rational (casting
+                // total_ns to f64 first would double-round past 2^53).
+                Ok(Some(Value::num(rational_to_f64(total_ns, unit_ns(&unit)))))
             }
             "round" => {
                 let (su_v, options) = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
@@ -263,7 +265,10 @@ impl<'p> Vm<'p> {
                         Some(s)
                     }
                 };
-                if su.is_none() && lu.is_none() {
+                // At least one of smallestUnit/largestUnit must be PROVIDED — an
+                // explicit largestUnit "auto" counts (it resolves `lu` to None but is
+                // not absent), so test the raw option values, not the resolved `lu`.
+                if su_v == Value::UNDEFINED && lu_v == Value::UNDEFINED {
                     return Err(Thrown(
                         "RangeError: at least one of smallestUnit or largestUnit is required".into(),
                     ));
@@ -3472,25 +3477,22 @@ fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> f64 {
             let lower_ns = dt_epoch_ns(dt_add_dur(start, units(whole)));
             let upper_ns = dt_epoch_ns(dt_add_dur(start, units(whole + sign)));
             if upper_ns != lower_ns {
-                whole as f64
-                    + sign as f64 * (end_ns - lower_ns) as f64 / (upper_ns - lower_ns) as f64
+                // whole + sign·(end-lower)/(upper-lower) as one correctly-rounded
+                // rational, so the final addition can't round the wrong way.
+                let span = upper_ns - lower_ns;
+                rational_to_f64(whole as i128 * span + sign as i128 * (end_ns - lower_ns), span)
             } else {
                 whole as f64
             }
         }
         "week" => {
-            // Keep the integer week count exact (i128 → f64) and route only the small
-            // sub-week remainder through f64, avoiding the 1-ULP loss of one division.
-            let un = 7 * DAY_NS;
-            let whole = diff / un;
-            whole as f64 + (diff - whole * un) as f64 / un as f64
+            // One correctly-rounded division of the exact total (the naive
+            // whole+remainder split is still 1 ULP off in some cases).
+            rational_to_f64(diff, 7 * DAY_NS)
         }
         _ => {
-            // Same exact-integer split for a fixed-length unit (day/hour/…/ns), so the
-            // large numerator's f64 conversion doesn't drop a ULP.
-            let un = unit_ns(unit);
-            let whole = diff / un;
-            whole as f64 + (diff - whole * un) as f64 / un as f64
+            // Same for a fixed-length unit (day/hour/…/ns).
+            rational_to_f64(diff, unit_ns(unit))
         }
     }
 }

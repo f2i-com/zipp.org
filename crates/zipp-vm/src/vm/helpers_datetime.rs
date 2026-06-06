@@ -1008,6 +1008,67 @@ pub(crate) fn round_increment_as_if_positive(value: i128, inc: i128, mode: &str)
     round_increment(value, inc, m)
 }
 
+/// The f64 nearest to `num / den` (`den != 0`), rounded to nearest with ties to
+/// even — i.e. the SINGLE correctly-rounded double of the exact rational, as
+/// `Temporal.Duration.prototype.total` requires. Casting the i128 numerator to
+/// f64 first (`num as f64 / den as f64`) double-rounds and can be 1 ULP off once
+/// the numerator exceeds 2^53; this divides exactly. Implemented by long division
+/// to a 54-bit quotient (53-bit mantissa + one guard bit) carrying a sticky bit,
+/// then a single round-half-even. The operands here keep every intermediate well
+/// inside u128 (numerator < 2^84, denominator < 2^48 ⇒ scaled width ≤ ~105 bits).
+pub(crate) fn rational_to_f64(num: i128, den: i128) -> f64 {
+    if num == 0 {
+        return 0.0;
+    }
+    let neg = (num < 0) ^ (den < 0);
+    let a = num.unsigned_abs();
+    let b = den.unsigned_abs();
+    // floor(a * 2^shift / b) plus a sticky flag for the truncated remainder; the
+    // quotient q represents q * 2^-shift ≈ a/b.
+    let scaled_div = |shift: i32| -> (u128, bool) {
+        if shift >= 0 {
+            let n = a << (shift as u32);
+            (n / b, n % b != 0)
+        } else {
+            let d = b << ((-shift) as u32);
+            (a / d, a % d != 0)
+        }
+    };
+    let bit_len = |x: u128| 128 - x.leading_zeros() as i32;
+    // Aim for a 54-bit quotient (the bit estimate is within ±1 of the truth).
+    let mut shift = 54 - (bit_len(a) - bit_len(b));
+    let (mut q, mut sticky) = scaled_div(shift);
+    while q >= (1u128 << 54) {
+        sticky |= (q & 1) != 0;
+        q >>= 1;
+        shift -= 1;
+    }
+    while q < (1u128 << 53) {
+        shift += 1;
+        let (q2, s2) = scaled_div(shift);
+        q = q2;
+        sticky = s2;
+    }
+    // q is 54 bits; bit 0 is the round bit, the value is q * 2^-shift.
+    let round_bit = q & 1;
+    let mut mant = q >> 1; // 53-bit mantissa in [2^52, 2^53)
+    let mut exp = 1 - shift; // value ≈ mant * 2^exp
+    if round_bit == 1 && (sticky || (mant & 1) == 1) {
+        mant += 1;
+        if mant == (1u128 << 53) {
+            mant >>= 1; // carry: 2^53 → 2^52
+            exp += 1;
+        }
+    }
+    // mant < 2^53 and 2^exp is a power of two, so the product is exact.
+    let val = (mant as f64) * 2f64.powi(exp);
+    if neg {
+        -val
+    } else {
+        val
+    }
+}
+
 /// Round a value lying at fractional position `progress` (0..1) between `lower`
 /// and `lower+sign` to one of the two, per a Temporal roundingMode. `lower` is
 /// the toward-zero neighbour; `progress==0` means the value is exactly `lower`.
@@ -1293,5 +1354,55 @@ pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
         }
     }
     Some(f)
+}
+
+#[cfg(test)]
+mod rational_to_f64_tests {
+    use super::rational_to_f64;
+
+    #[test]
+    fn matches_hardware_division_in_exact_range() {
+        // For operands below 2^53 both casts are exact and IEEE-754 division is
+        // already correctly rounded, so it is a trustworthy oracle. A small LCG
+        // gives deterministic coverage of the rounding/tie logic.
+        let mut s: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (s >> 11) as i128 // 53 random-ish bits
+        };
+        for _ in 0..200_000 {
+            let a = (next() % ((1i128 << 52) - 1)) + 1;
+            let b = (next() % ((1i128 << 52) - 1)) + 1;
+            let oracle = a as f64 / b as f64;
+            assert_eq!(rational_to_f64(a, b), oracle, "a={a} b={b}");
+            // Sign must be respected exactly.
+            assert_eq!(rational_to_f64(-a, b), -oracle, "neg a={a} b={b}");
+            assert_eq!(rational_to_f64(a, -b), -oracle, "neg b a={a} b={b}");
+        }
+    }
+
+    #[test]
+    fn exact_large_integers_are_exact() {
+        // q * b / b == q with no rounding, for q exactly representable.
+        for &q in &[0i128, 1, 2, 1_000_000, (1i128 << 53) - 1, 1i128 << 53] {
+            for &b in &[1i128, 3, 1_000_000_000, 3_600_000_000_000] {
+                assert_eq!(rational_to_f64(q * b, b), q as f64, "q={q} b={b}");
+            }
+        }
+    }
+
+    #[test]
+    fn matches_test262_precision_cases() {
+        // The exact rationals from the failing Duration.total precision tests; the
+        // expected values are the single correctly-rounded doubles.
+        // 4000 h + 1 ns, in hours.
+        assert_eq!(rational_to_f64(14_400_000_000_000_001, 3_600_000_000_000), 4000.000_000_000_000_5);
+        // (2^51 s + 200 ms) totalled in seconds → the .2 fraction vanishes at that
+        // magnitude (ULP is 0.5, so it rounds down to even).
+        let ns = (1i128 << 51) * 1_000_000_000 + 200_000_000;
+        assert_eq!(rational_to_f64(ns, 1_000_000_000), 2_251_799_813_685_248.0);
+        // A large numerator that the naive double-cast drops a ULP on.
+        assert_eq!(rational_to_f64(28_171_865_665_040_770, 3_600_000_000_000), 7825.518_240_289_103);
+    }
 }
 
