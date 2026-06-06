@@ -2720,7 +2720,11 @@ impl<'p> Vm<'p> {
                             }
                             cur = pc.parent;
                         }
-                        _ => break,
+                        // A non-Class parent (a built-in constructor or a plain
+                        // function) is the subclass constructor's [[Prototype]]:
+                        // delegate the static read up its prototype chain (so
+                        // `class X extends Temporal.Y {}` inherits `Y.from` etc.).
+                        _ => return self.get_member(Value::heap(pidx), key, obj),
                     }
                 }
                 // A class is a function: keys not found as a static fall back to
