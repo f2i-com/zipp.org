@@ -1436,6 +1436,11 @@ impl<'p> Vm<'p> {
             }
             "forEach" => {
                 let cb = a0;
+                if !self.is_callable(cb) {
+                    return Err(Thrown(
+                        "TypeError: Map.prototype.forEach callback is not a function".into(),
+                    ));
+                }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 // Walk the LIVE entries by index so a key the callback `set`s during
                 // iteration is visited (sec-map.prototype.foreach).
@@ -1750,6 +1755,11 @@ impl<'p> Vm<'p> {
             }
             "forEach" => {
                 let cb = a0;
+                if !self.is_callable(cb) {
+                    return Err(Thrown(
+                        "TypeError: Set.prototype.forEach callback is not a function".into(),
+                    ));
+                }
                 let this_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 // Iterate the LIVE backing store by index (not a frozen clone) so a
                 // value the callback `add`s during iteration is still visited
