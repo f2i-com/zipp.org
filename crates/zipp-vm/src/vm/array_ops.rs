@@ -8,21 +8,6 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
-    /// The live value at dense index `i` of array `idx`, or `None` when `i` is past
-    /// the array's CURRENT length (e.g. a callback shortened it mid-iteration). The
-    /// callback methods' per-element tails read through this so they observe
-    /// in-place element mutations and a shortened length — the spec re-does
-    /// `Get(O, k)` / `HasProperty(O, k)` live each iteration rather than reading a
-    /// once-taken snapshot. (The JIT/native kernels only inline call-free numeric
-    /// callbacks, which cannot mutate the receiver, so the leading run is unaffected
-    /// and stays a snapshot read.)
-    pub(crate) fn array_live_get(&self, idx: u32, i: usize) -> Option<Value> {
-        match self.heap.get(idx) {
-            HeapObj::Array(items) if i < items.len() => Some(items[i]),
-            _ => None,
-        }
-    }
-
     /// Shared driver for `map`/`filter`/`forEach` (callback args = [element,
     /// index]). Uses the native callback fast path when the callback is a
     /// compiled non-capturing function: a single reused register window, a direct
@@ -200,7 +185,7 @@ impl<'p> Vm<'p> {
             // array): a present index uses its current value; an index now past the
             // live length is absent — `map` keeps a placeholder so its result length
             // stays the original, `filter`/`forEach` skip it (HasProperty is false).
-            let v = match self.array_live_get(idx, i) {
+            let v = match self.array_dense_or_proto_get(idx, i)? {
                 Some(v) => v,
                 None => {
                     if matches!(mode, EachMode::Map) {
@@ -345,10 +330,59 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Live read of index `k` for the iteration protocol: `Some(value)` if the
+    /// index is PRESENT (HasProperty), `None` if absent (a hole / out of range).
+    /// Re-reads the receiver each call so a mutation during a callback (a deleted
+    /// index, a shrunk length, a changed element) is observed. The common case — a
+    /// real array with no side table — reads the dense slot directly (no get_index/
+    /// has_property dispatch), keeping the iterator methods at dense-snapshot speed;
+    /// an array-like object, or an array with accessor/override indices, falls back
+    /// to the general HasProperty + Get protocol (invoking inherited/accessor getters).
+    pub(crate) fn array_iter_get(&mut self, this: Value, k: usize) -> Result<Option<Value>, Thrown> {
+        // Fast path: only a PRESENT (non-hole, in-range) own element of a real array
+        // with no side table. A hole or out-of-range index is NOT resolved here — it
+        // falls through to the general HasProperty+Get protocol below, which walks the
+        // prototype chain (a prototype-inherited index at a hole must still be visited).
+        if this.is_heap() && !self.arr_props.contains_key(&this.heap_index()) {
+            if let HeapObj::Array(items) = self.heap.get(this.heap_index()) {
+                if let Some(v) = items.get(k) {
+                    if !v.is_hole() {
+                        return Ok(Some(*v));
+                    }
+                }
+            }
+        }
+        let kv = Value::num(k as f64);
+        if self.has_property(this, kv) {
+            Ok(Some(self.get_index(this, kv)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Live per-index read for the DENSE callback arms (a real array known to have no
+    /// side table at dispatch): a present (non-hole, in-range) element is returned
+    /// directly — no per-element side-table lookup, so the hot path stays at snapshot
+    /// speed — while a hole or out-of-range index defers to the proto-aware
+    /// `array_iter_get` (which visits a prototype-inherited index). Re-reads the heap
+    /// each call, so a callback's mid-iteration mutation (delete / length change) is
+    /// observed.
+    pub(crate) fn array_dense_or_proto_get(&mut self, idx: u32, i: usize) -> Result<Option<Value>, Thrown> {
+        if let HeapObj::Array(items) = self.heap.get(idx) {
+            if let Some(v) = items.get(i) {
+                if !v.is_hole() {
+                    return Ok(Some(*v));
+                }
+            }
+        }
+        self.array_iter_get(Value::heap(idx), i)
+    }
+
     /// The hole-skipping iteration methods (forEach/map/filter/some/every/reduce/
-    /// reduceRight) run against an array-like *object* by visiting only indices
-    /// where HasProperty is true — unlike the dense-snapshot fast path, this
-    /// honours absent indices (own or inherited holes), per the spec.
+    /// reduceRight) run against an array-like *object* OR a real array by visiting
+    /// only indices where HasProperty is true (via `array_iter_get`) — unlike the
+    /// dense-snapshot path, this honours absent indices (own or inherited holes) and
+    /// observes mid-iteration mutation, per the spec.
     pub(crate) fn array_like_iterate(
         &mut self,
         this: Value,
@@ -375,8 +409,7 @@ impl<'p> Vm<'p> {
         match name {
             "forEach" => {
                 for k in 0..len {
-                    if self.has_property(this, idxv(k)) {
-                        let val = self.get_index(this, idxv(k))?;
+                    if let Some(val) = self.array_iter_get(this, k)? {
                         self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                     }
                 }
@@ -393,8 +426,7 @@ impl<'p> Vm<'p> {
                 }
                 let mut out = vec![Value::UNDEFINED; len];
                 for k in 0..len {
-                    if self.has_property(this, idxv(k)) {
-                        let val = self.get_index(this, idxv(k))?;
+                    if let Some(val) = self.array_iter_get(this, k)? {
                         out[k] = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                     }
                 }
@@ -403,8 +435,7 @@ impl<'p> Vm<'p> {
             "filter" => {
                 let mut out = Vec::new();
                 for k in 0..len {
-                    if self.has_property(this, idxv(k)) {
-                        let val = self.get_index(this, idxv(k))?;
+                    if let Some(val) = self.array_iter_get(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                         if self.truthy(r) {
                             out.push(val);
@@ -415,8 +446,7 @@ impl<'p> Vm<'p> {
             }
             "some" => {
                 for k in 0..len {
-                    if self.has_property(this, idxv(k)) {
-                        let val = self.get_index(this, idxv(k))?;
+                    if let Some(val) = self.array_iter_get(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                         if self.truthy(r) {
                             return Ok(Some(Value::bool(true)));
@@ -427,8 +457,7 @@ impl<'p> Vm<'p> {
             }
             "every" => {
                 for k in 0..len {
-                    if self.has_property(this, idxv(k)) {
-                        let val = self.get_index(this, idxv(k))?;
+                    if let Some(val) = self.array_iter_get(this, k)? {
                         let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                         if !self.truthy(r) {
                             return Ok(Some(Value::bool(false)));
@@ -444,10 +473,10 @@ impl<'p> Vm<'p> {
                 let mut acc = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let mut started = args.len() >= 2;
                 for k in order {
-                    if !self.has_property(this, idxv(k)) {
-                        continue;
-                    }
-                    let val = self.get_index(this, idxv(k))?;
+                    let val = match self.array_iter_get(this, k)? {
+                        Some(v) => v,
+                        None => continue,
+                    };
                     if !started {
                         acc = val;
                         started = true;
@@ -955,11 +984,13 @@ impl<'p> Vm<'p> {
         // methods through the generic HasProperty/Get protocol (which calls
         // get_index → array_index_override → the getter). Arrays without a side
         // table keep the fast snapshot path (zero perf impact on the common case).
-        // A side table (defineProperty'd index accessor) OR a HOLE (a deleted/absent
-        // element) makes the dense placeholder unreliable: the callback methods must
-        // skip absent indices via HasProperty (and observe mid-iteration mutation),
-        // so route them through the live protocol. A hole-free, side-table-free array
-        // (the common case) keeps the fast snapshot path — zero perf impact.
+        // A side table (defineProperty'd index accessor) OR a HOLE makes the dense
+        // placeholder unreliable: route the callback methods to the live HasProperty+
+        // Get protocol (skips absent indices, invokes accessor getters). A hole-free,
+        // side-table-free array keeps the fast dense path below — whose general
+        // (non-native) JS-callback branch reads each element live, so a callback's
+        // mid-iteration mutation is still observed; only the non-mutating native
+        // numeric kernel snapshots.
         if (self.arr_props.contains_key(&idx) || self.array_has_holes(idx))
             && matches!(
                 name,
@@ -1245,7 +1276,7 @@ impl<'p> Vm<'p> {
                 // not HasProperty-skip), while `some`/`every` skip it.
                 let len = self.array_snapshot(idx).len();
                 for i in 0..len {
-                    let v = match self.array_live_get(idx, i) {
+                    let v = match self.array_dense_or_proto_get(idx, i)? {
                         Some(v) => v,
                         None => {
                             if name == "some" || name == "every" {
@@ -1368,7 +1399,7 @@ impl<'p> Vm<'p> {
                 for i in start..snapshot.len() {
                     // Live read; skip an index now past the live length (the callback
                     // shortened the array) — reduce HasProperty-skips absent indices.
-                    let v = match self.array_live_get(idx, i) {
+                    let v = match self.array_dense_or_proto_get(idx, i)? {
                         Some(v) => v,
                         None => continue,
                     };
@@ -1434,7 +1465,7 @@ impl<'p> Vm<'p> {
                     i -= 1;
                     // Live read; skip an index now past the live length (a callback
                     // shortened the array) — reduceRight HasProperty-skips absent ones.
-                    let v = match self.array_live_get(idx, i) {
+                    let v = match self.array_dense_or_proto_get(idx, i)? {
                         Some(v) => v,
                         None => continue,
                     };
