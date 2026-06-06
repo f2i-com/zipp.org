@@ -721,6 +721,58 @@ impl<'p> Vm<'p> {
             }
             return Ok(true);
         }
+        if pidx == self.map_proto && self.map_proto != 0 {
+            // Brand first so the `set` adder operates on a real Map, then add entries
+            // via the adder resolved off the instance (honouring a subclass override).
+            *self.heap.get_mut(oidx) = HeapObj::Map { keys: Vec::new(), vals: Vec::new() };
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !a0.is_nullish() {
+                let adder = self.get_member(obj, "set", obj)?;
+                if !self.is_callable(adder) {
+                    return Err(Thrown("TypeError: Map.prototype.set is not callable".into()));
+                }
+                for e in self.iterate_to_vec(a0)? {
+                    let k = self.get_index(e, Value::int(0))?;
+                    let v = self.get_index(e, Value::int(1))?;
+                    self.call_value(adder, obj, &[k, v])?;
+                }
+            }
+            return Ok(true);
+        }
+        if pidx == self.promise_proto && self.promise_proto != 0 {
+            // `class P extends Promise`: brand the instance AS the promise (its heap
+            // index IS the promise), bind resolve/reject to it, and run the executor —
+            // so NewPromiseCapability(P) (construct -> super(executor)) yields a branded P.
+            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !self.is_callable(a0) {
+                return Err(Thrown(format!(
+                    "TypeError: Promise resolver {} is not a function",
+                    self.display(a0)
+                )));
+            }
+            *self.heap.get_mut(oidx) = HeapObj::Promise {
+                state: PromiseState::Pending,
+                result: Value::UNDEFINED,
+                fulfill: Vec::new(),
+                reject: Vec::new(),
+                handled: false,
+            };
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            let res =
+                Value::heap(self.heap.alloc(HeapObj::BoundResolver { promise: oidx, is_reject: false }));
+            let rej =
+                Value::heap(self.heap.alloc(HeapObj::BoundResolver { promise: oidx, is_reject: true }));
+            if self.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
+                let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                self.reject(oidx, reason);
+            }
+            return Ok(true);
+        }
         Ok(false)
     }
 
