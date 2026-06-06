@@ -189,16 +189,17 @@ impl<'p> Vm<'p> {
                 Err(Thrown("TypeError: Called Temporal.Duration.prototype.valueOf".into()))
             }
             "total" => {
-                // arg: a unit string, or { unit, relativeTo }.
-                let unit_v = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
-                    a0
-                } else if a0 == Value::UNDEFINED {
+                // arg: a unit string, or { unit, relativeTo }. GetTemporalRelativeToOption
+                // is read BEFORE the unit (spec order).
+                if a0 == Value::UNDEFINED {
                     return Err(Thrown("TypeError: total() requires an options argument".into()));
-                } else if !self.is_object_value(a0) {
+                }
+                let is_string = a0.is_heap() && self.heap.is_str_like(a0.heap_index());
+                if !is_string && !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: total() argument must be a string or object".into()));
-                } else {
-                    self.get_prop(a0, "unit")?
-                };
+                }
+                let rel = if is_string { Value::UNDEFINED } else { self.get_prop(a0, "relativeTo")? };
+                let unit_v = if is_string { a0 } else { self.get_prop(a0, "unit")? };
                 if unit_v == Value::UNDEFINED {
                     return Err(Thrown("RangeError: unit is required".into()));
                 }
@@ -209,11 +210,6 @@ impl<'p> Vm<'p> {
                 // Years/months/weeks (in the value or as the requested unit) need a
                 // calendar: use the `relativeTo` option's date-time as the anchor.
                 if f[0] != 0 || f[1] != 0 || f[2] != 0 || matches!(unit.as_str(), "year" | "month" | "week") {
-                    let rel = if a0.is_heap() && !self.heap.is_str_like(a0.heap_index()) {
-                        self.get_prop(a0, "relativeTo")?
-                    } else {
-                        Value::UNDEFINED
-                    };
                     if rel == Value::UNDEFINED {
                         return Err(Thrown(
                             "RangeError: a relativeTo option is required for years, months, or weeks"
@@ -230,28 +226,23 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::num(rational_to_f64(total_ns, unit_ns(&unit)))))
             }
             "round" => {
-                let (su_v, options) = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
-                    (a0, Value::UNDEFINED)
+                // round(roundTo): a bare string is shorthand for { smallestUnit }.
+                let (su_string, options) = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
+                    (Some(normalize_unit(&self.to_js_string(a0)?, "")), Value::UNDEFINED)
                 } else if a0 == Value::UNDEFINED {
                     return Err(Thrown("TypeError: round() requires an options argument".into()));
                 } else if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: round() argument must be a string or object".into()));
                 } else {
-                    (self.get_prop(a0, "smallestUnit")?, a0)
+                    (None, a0)
                 };
+                // GetTemporalDurationRoundingSettings reads the options in this exact
+                // order — largestUnit, relativeTo, roundingIncrement, roundingMode,
+                // smallestUnit — and only then resolves defaults + runs validation.
                 let lu_v = if options == Value::UNDEFINED {
                     Value::UNDEFINED
                 } else {
                     self.get_prop(options, "largestUnit")?
-                };
-                let su = if su_v == Value::UNDEFINED {
-                    None
-                } else {
-                    let s = normalize_unit(&self.to_js_string(su_v)?, "");
-                    if !DURATION_UNITS.contains(&s.as_str()) {
-                        return Err(Thrown(format!("RangeError: invalid smallestUnit: {s}")));
-                    }
-                    Some(s)
                 };
                 let lu = if lu_v == Value::UNDEFINED {
                     None
@@ -265,20 +256,50 @@ impl<'p> Vm<'p> {
                         Some(s)
                     }
                 };
-                // At least one of smallestUnit/largestUnit must be PROVIDED — an
-                // explicit largestUnit "auto" counts (it resolves `lu` to None but is
-                // not absent), so test the raw option values, not the resolved `lu`.
-                if su_v == Value::UNDEFINED && lu_v == Value::UNDEFINED {
-                    return Err(Thrown(
-                        "RangeError: at least one of smallestUnit or largestUnit is required".into(),
-                    ));
-                }
+                // A relativeTo anchor enables calendar-unit rounding/balancing.
+                let rel = if options == Value::UNDEFINED {
+                    Value::UNDEFINED
+                } else {
+                    self.get_prop(options, "relativeTo")?
+                };
                 let inc = self.read_rounding_increment(options)?;
                 let mode = if options == Value::UNDEFINED {
                     "halfExpand".to_string()
                 } else {
                     self.read_rounding_mode(options, "halfExpand")?
                 };
+                let su = match su_string {
+                    Some(s) => {
+                        if !DURATION_UNITS.contains(&s.as_str()) {
+                            return Err(Thrown(format!("RangeError: invalid smallestUnit: {s}")));
+                        }
+                        Some(s)
+                    }
+                    None => {
+                        let su_v = if options == Value::UNDEFINED {
+                            Value::UNDEFINED
+                        } else {
+                            self.get_prop(options, "smallestUnit")?
+                        };
+                        if su_v == Value::UNDEFINED {
+                            None
+                        } else {
+                            let s = normalize_unit(&self.to_js_string(su_v)?, "");
+                            if !DURATION_UNITS.contains(&s.as_str()) {
+                                return Err(Thrown(format!("RangeError: invalid smallestUnit: {s}")));
+                            }
+                            Some(s)
+                        }
+                    }
+                };
+                // At least one of smallestUnit/largestUnit must be PROVIDED — an
+                // explicit largestUnit "auto" counts (it resolves `lu` to None but is
+                // not absent), so test the resolved smallestUnit / raw largestUnit.
+                if su.is_none() && lu_v == Value::UNDEFINED {
+                    return Err(Thrown(
+                        "RangeError: at least one of smallestUnit or largestUnit is required".into(),
+                    ));
+                }
                 let smallest = su.unwrap_or_else(|| "nanosecond".to_string());
                 // largestUnit "auto" → the larger of smallestUnit and the duration's
                 // own largest non-zero unit.
@@ -301,12 +322,6 @@ impl<'p> Vm<'p> {
                         "RangeError: smallestUnit must not be larger than largestUnit".into(),
                     ));
                 }
-                // A relativeTo anchor enables calendar-unit rounding/balancing.
-                let rel = if options == Value::UNDEFINED {
-                    Value::UNDEFINED
-                } else {
-                    self.get_prop(options, "relativeTo")?
-                };
                 // ValidateTemporalRoundingIncrement applies on BOTH paths (the
                 // relativeTo branch used to skip it): a time-unit increment must divide
                 // its next unit, and a calendar/day smallestUnit being balanced to a
