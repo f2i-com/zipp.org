@@ -444,7 +444,11 @@ impl<'p> Vm<'p> {
     /// Read a ZonedDateTime resolution options bag, returning `(offset option,
     /// overflow-is-reject)`. The offset option (default "reject") governs how a bag/
     /// string `offset` that disagrees with the time zone is resolved.
-    pub(crate) fn read_zdt_options(&mut self, options: Value) -> Result<(String, bool), Thrown> {
+    pub(crate) fn read_zdt_options(
+        &mut self,
+        options: Value,
+        offset_default: &str,
+    ) -> Result<(String, bool), Thrown> {
         if options != Value::UNDEFINED && !self.is_object_value(options) {
             return Err(Thrown("TypeError: options must be an object or undefined".into()));
         }
@@ -454,8 +458,13 @@ impl<'p> Vm<'p> {
             "compatible",
             &["compatible", "earlier", "later", "reject"],
         )?;
-        let off =
-            self.opt_string(options, "offset", "reject", &["prefer", "use", "ignore", "reject"])?;
+        // `from` defaults the offset option to "reject"; `with` defaults to "prefer".
+        let off = self.opt_string(
+            options,
+            "offset",
+            offset_default,
+            &["prefer", "use", "ignore", "reject"],
+        )?;
         let reject = self.read_overflow(options)?;
         Ok((off, reject))
     }
@@ -1938,7 +1947,11 @@ impl<'p> Vm<'p> {
                         any = true;
                     }
                 }
-                if !any && self.get_prop(bag, "offset")? == Value::UNDEFINED {
+                // Read and validate the bag's `offset` field (a bad string is a
+                // RangeError, a non-string a TypeError); its presence also satisfies the
+                // "at least one recognized property" requirement.
+                let bag_off = self.validate_bag_offset_field(bag)?;
+                if !any && bag_off.is_none() {
                     return Err(Thrown(
                         "TypeError: with() requires at least one recognized property".into(),
                     ));
@@ -1948,9 +1961,10 @@ impl<'p> Vm<'p> {
                 if f[1] < 1 || f[2] < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
-                // Validate the resolution options (disambiguation/offset/overflow).
+                // Validate the resolution options. ZonedDateTime.with defaults the offset
+                // option to "prefer" (unlike `from`, which defaults to "reject").
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                self.read_zdt_options(options)?;
+                let (off_opt, reject) = self.read_zdt_options(options, "prefer")?;
                 // A well-formed-but-calendar-invalid monthCode ("M08L", "M13") is
                 // rejected only after the options bag has been read.
                 if !month_valid {
@@ -1958,11 +1972,55 @@ impl<'p> Vm<'p> {
                         "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
                     ));
                 }
-                let off = self.zdt_offset_ns(idx);
+                // InterpretTemporalDateTimeFields: apply overflow to the upper bounds of
+                // the merged date/time fields ("reject" throws, "constrain" clamps).
+                let maxes = [23, 59, 59, 999, 999, 999];
+                if reject {
+                    if !(1..=12).contains(&f[1]) || f[2] > days_in_month(f[0], f[1]) {
+                        return Err(Thrown("RangeError: invalid date fields".into()));
+                    }
+                    for (i, &mx) in maxes.iter().enumerate() {
+                        if f[3 + i] < 0 || f[3 + i] > mx {
+                            return Err(Thrown("RangeError: time field out of range".into()));
+                        }
+                    }
+                } else {
+                    f[1] = f[1].min(12);
+                    f[2] = f[2].min(days_in_month(f[0], f[1]));
+                    for (i, &mx) in maxes.iter().enumerate() {
+                        f[3 + i] = f[3 + i].clamp(0, mx);
+                    }
+                }
+                // Offset agreement (InterpretISODateTimeOffset): the merged offset is the
+                // bag's (when given) else the receiver's, which for zipp's fixed-offset
+                // zones equals the zone offset. "use" keeps the merged offset; "ignore"/
+                // "prefer" use the zone offset; "reject" requires the two to match.
+                let zone_off = self.zdt_offset_ns(idx);
+                let merged_off = bag_off.unwrap_or(zone_off);
+                let eff = match off_opt.as_str() {
+                    "use" => merged_off,
+                    "ignore" | "prefer" => zone_off,
+                    _ => {
+                        if merged_off == zone_off {
+                            zone_off
+                        } else {
+                            return Err(Thrown(
+                                "RangeError: the offset does not match the time zone".into(),
+                            ));
+                        }
+                    }
+                };
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
+                // The resulting instant must be representable (the ±nsMaxInstant bound).
+                let instant = local - eff as i128;
+                if instant.abs() > NS_MAX_INSTANT {
+                    return Err(Thrown(
+                        "RangeError: ZonedDateTime outside the supported range".into(),
+                    ));
+                }
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
+                Ok(Some(self.alloc_zdt(instant, zone_off, id)))
             }
             _ => Ok(None),
         }
@@ -1994,7 +2052,7 @@ impl<'p> Vm<'p> {
                 let off = self.zdt_offset_ns(item.heap_index());
                 // The disambiguation/offset/overflow options are validated even for a
                 // ZonedDateTime instance (the result is still a copy).
-                let _ = self.read_zdt_options(options)?;
+                let _ = self.read_zdt_options(options, "reject")?;
                 return Ok(self.make_zoned_date_time_raw(ns, off, item.heap_index()));
             }
             if matches!(self.heap.get(item.heap_index()), HeapObj::Object(_)) {
@@ -2012,7 +2070,7 @@ impl<'p> Vm<'p> {
                 // (null/boolean/number/bigint/symbol) is a TypeError — not coerced.
                 let (id, offset) = self.parse_tz_arg(tzv)?;
                 let bag_off = self.validate_bag_offset_field(item)?;
-                let (off_opt, reject) = self.read_zdt_options(options)?;
+                let (off_opt, reject) = self.read_zdt_options(options, "reject")?;
                 let f = self.to_plain_date_time_overflow(item, reject)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
@@ -2056,7 +2114,7 @@ impl<'p> Vm<'p> {
         }
         let (f, str_offset, id, zone_offset, behaviour) = parse_zdt_string(&s)
             .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
-        let (off_opt, _reject) = self.read_zdt_options(options)?;
+        let (off_opt, _reject) = self.read_zdt_options(options, "reject")?;
         let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
             + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
         // Offset agreement (InterpretISODateTimeOffset): a `Z` designator (EXACT) fixes
