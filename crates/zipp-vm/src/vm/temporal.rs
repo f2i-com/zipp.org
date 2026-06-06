@@ -358,7 +358,11 @@ impl<'p> Vm<'p> {
                     + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
                 let inc_ns = unit_ns(&smallest) * inc;
                 let rounded = round_increment(total_ns, inc_ns, &mode);
-                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                let balanced = balance_duration_ns(rounded, &largest);
+                if !is_valid_duration(&std::array::from_fn(|i| balanced[i] as f64)) {
+                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+                }
+                Ok(Some(self.make_duration(balanced)))
             }
             "add" | "subtract" => {
                 let other = self.to_duration(a0)?;
@@ -378,7 +382,13 @@ impl<'p> Vm<'p> {
                 let day_units =
                     ["day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
                 let largest = day_units[existing(&f).min(existing(&other)) as usize];
-                Ok(Some(self.make_duration(balance_duration_ns(total_ns, largest))))
+                let balanced = balance_duration_ns(total_ns, largest);
+                // BalanceDuration → the result must be a valid Duration (its total
+                // time, in seconds, below 2^53); else RangeError.
+                if !is_valid_duration(&std::array::from_fn(|i| balanced[i] as f64)) {
+                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+                }
+                Ok(Some(self.make_duration(balanced)))
             }
             _ => Ok(None),
         }
@@ -2197,8 +2207,15 @@ impl<'p> Vm<'p> {
             self.get_prop(opts, "relativeTo")?
         };
         let order = |a: i128, b: i128| if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 };
-        if rel != Value::UNDEFINED {
-            let start = self.relative_to_dt(rel)?;
+        // GetTemporalRelativeToOption parses/validates the relativeTo (throwing on an
+        // invalid string) BEFORE the identical-slots short-circuit below.
+        let start = if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
+        // Two durations with identical internal slots compare equal (+0) — even with
+        // calendar units and no relativeTo (the relativeTo requirement is skipped).
+        if fa == fb {
+            return Ok(0.0);
+        }
+        if let Some(start) = start {
             let e1 = dt_epoch_ns(dt_add_dur(start, fa));
             let e2 = dt_epoch_ns(dt_add_dur(start, fb));
             return Ok(order(e1, e2));
