@@ -117,6 +117,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Generator { .. }
                 | HeapObj::AsyncGenerator(_)
                 | HeapObj::Date(_)
+                | HeapObj::Temporal { .. }
                 | HeapObj::Promise { .. }
                 | HeapObj::WeakMap { .. }
                 | HeapObj::WeakSet(_)

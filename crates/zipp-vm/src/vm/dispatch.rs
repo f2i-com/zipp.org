@@ -1342,6 +1342,25 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, result);
                         ip += 1;
                     }
+                    Instr::CallMethodComputedSpread { dst, obj, key, args } => {
+                        // `obj[key](...args)` — bind `this` = obj (unlike CallSpread on
+                        // the GET result). Builtin method first, else resolve off the
+                        // receiver via the computed key and call with `this = recv`.
+                        let recv = self.get(base, obj);
+                        let k = self.get(base, key);
+                        let kstr = self.display(k);
+                        let args_v = self.get(base, args);
+                        let arg_vec = self.array_snapshot(args_v.heap_index());
+                        let result = match self.dispatch_builtin_method(recv, &kstr, &arg_vec)? {
+                            Some(r) => r,
+                            None => {
+                                let method = self.get_index(recv, k)?;
+                                self.call_value(method, recv, &arg_vec)?
+                            }
+                        };
+                        self.set(base, dst, result);
+                        ip += 1;
+                    }
                     Instr::MathOp { dst, op, arg_base, argc } => {
                         let r = self.eval_math(op, base, arg_base, argc)?;
                         self.set(base, dst, Value::num(r));

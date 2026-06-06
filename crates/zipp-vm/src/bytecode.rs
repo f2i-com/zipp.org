@@ -245,6 +245,10 @@ pub enum Instr {
     /// the array in `args` (`this` = obj). Handles builtin methods (e.g.
     /// `arr.push(...xs)`) and user methods alike.
     CallMethodSpread { dst: Reg, obj: Reg, name: u32, args: Reg },
+    /// `dst = obj[key](...args_array)` — computed-member method call spreading the
+    /// elements of `args` (`this` = obj). The computed-key analogue of
+    /// `CallMethodSpread` (binds `this`, unlike `CallSpread` on the GET result).
+    CallMethodComputedSpread { dst: Reg, obj: Reg, key: Reg, args: Reg },
     /// `dst = new callee(...args_array)` — construct `callee` spreading the
     /// elements of the array in `args` as the arguments.
     NewSpread { dst: Reg, callee: Reg, args: Reg },

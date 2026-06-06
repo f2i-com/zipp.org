@@ -4973,6 +4973,18 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::CallMethodSpread { dst, obj, name, args: args_arr });
                 return Ok(dst);
             }
+            // Computed method call `obj[key](...)` — bind `this` = obj (a plain
+            // CallSpread on the GET result would lose the receiver).
+            if let ox::Expression::ComputedMemberExpression(m) = &c.callee {
+                let obj = self.expr(&m.object)?;
+                if m.optional {
+                    self.emit_optional_check(obj);
+                }
+                let key = self.expr(&m.expression)?;
+                let args_arr = self.build_spread_args(&c.arguments)?;
+                self.emit(Instr::CallMethodComputedSpread { dst, obj, key, args: args_arr });
+                return Ok(dst);
+            }
             let callee = self.expr(&c.callee)?;
             let args_arr = self.build_spread_args(&c.arguments)?;
             self.emit(Instr::CallSpread { dst, callee, args: args_arr });
