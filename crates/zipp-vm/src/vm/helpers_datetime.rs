@@ -238,6 +238,17 @@ pub(crate) fn parse_temporal_time(s: &str) -> Option<[i64; 6]> {
     if ambiguous_with_date(main) {
         return None;
     }
+    // A bare DATE carrying a UTC designator / numeric offset but NO time
+    // ("2022-09-15Z", "2022-09-15+00:00", "2022-09-15-02:30") is not a valid
+    // PlainTime string — the date "YYYY-MM-DD" is followed by Z/±offset, not a time.
+    if main.len() >= 10 {
+        let (date_candidate, rest) = main.split_at(10);
+        if parse_iso_date(date_candidate).is_some()
+            && matches!(rest.chars().next(), Some('Z' | 'z' | '+' | '-'))
+        {
+            return None;
+        }
+    }
     parse_iso_time(main)
 }
 
