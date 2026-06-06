@@ -302,6 +302,26 @@ impl<'p> Vm<'p> {
                 } else {
                     self.get_prop(options, "relativeTo")?
                 };
+                // ValidateTemporalRoundingIncrement applies on BOTH paths (the
+                // relativeTo branch used to skip it): a time-unit increment must divide
+                // its next unit, and a calendar/day smallestUnit being balanced to a
+                // coarser largestUnit forbids an increment greater than 1.
+                if let Some(max) = max_increment(&smallest) {
+                    if inc >= max || max % inc != 0 {
+                        return Err(Thrown(
+                            "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                        ));
+                    }
+                }
+                if matches!(smallest.as_str(), "year" | "month" | "week" | "day")
+                    && urank(&smallest) > urank(&largest)
+                    && inc != 1
+                {
+                    return Err(Thrown(
+                        "RangeError: roundingIncrement must be 1 when balancing a calendar unit"
+                            .into(),
+                    ));
+                }
                 if rel != Value::UNDEFINED {
                     let start = self.relative_to_dt(rel)?;
                     let r = self.round_duration_relative(f, start, &smallest, &largest, inc, &mode)?;
@@ -313,13 +333,6 @@ impl<'p> Vm<'p> {
                     return Err(Thrown(
                         "RangeError: a relativeTo option is required for years, months, or weeks".into(),
                     ));
-                }
-                if let Some(max) = max_increment(&smallest) {
-                    if inc >= max || max % inc != 0 {
-                        return Err(Thrown(
-                            "RangeError: roundingIncrement must evenly divide the next unit".into(),
-                        ));
-                    }
                 }
                 let total_ns = (f[3] as i128) * DAY_NS
                     + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
@@ -2809,7 +2822,19 @@ fn annotations_valid(ann: &str) -> bool {
                 return false; // critical unknown key annotation
             }
         } else {
-            tz_count += 1; // [Area/Location] time-zone annotation
+            // [Area/Location] or [±HH:MM] offset time-zone annotation. An offset-form
+            // annotation must be minute precision (±HH, ±HH:MM, ±HHMM) — a sub-minute
+            // one ([-07:00:01] / [-070001] / [-07:00:00.1]) is invalid.
+            if let Some(off) = body.strip_prefix(['+', '-']) {
+                let sub_minute = off.contains('.')
+                    || off.contains(',')
+                    || off.matches(':').count() >= 2
+                    || (!off.contains(':') && off.bytes().filter(|c| c.is_ascii_digit()).count() > 4);
+                if sub_minute {
+                    return false;
+                }
+            }
+            tz_count += 1;
         }
     }
     tz_count <= 1 && !(cal_count > 1 && cal_critical)
@@ -3211,33 +3236,49 @@ fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> f64 {
     match unit {
         "year" | "month" => {
             let sign = if diff < 0 { -1i64 } else { 1 };
-            let step: [i64; 10] = if unit == "year" {
-                [sign, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-            } else {
-                [0, sign, 0, 0, 0, 0, 0, 0, 0, 0]
+            let units = |k: i64| -> [i64; 10] {
+                let mut d = [0i64; 10];
+                if unit == "year" {
+                    d[0] = k;
+                } else {
+                    d[1] = k;
+                }
+                d
             };
+            // Whole signed units, ALWAYS re-added from the anchor (chaining would let
+            // day-of-month clamping accumulate and corrupt the unit length).
             let mut whole = 0i64;
-            let mut cur = start;
             for _ in 0..2_000_000 {
-                let next = dt_add_dur(cur, step);
-                let nn = dt_epoch_ns(next);
-                if (sign > 0 && nn > end_ns) || (sign < 0 && nn < end_ns) {
+                let cand = dt_epoch_ns(dt_add_dur(start, units(whole + sign)));
+                if (sign > 0 && cand > end_ns) || (sign < 0 && cand < end_ns) {
                     break;
                 }
-                cur = next;
                 whole += sign;
             }
-            let cur_ns = dt_epoch_ns(cur);
-            let next_ns = dt_epoch_ns(dt_add_dur(cur, step));
-            let frac = if next_ns != cur_ns {
-                (end_ns - cur_ns) as f64 / (next_ns - cur_ns) as f64
+            // The fraction is the signed progress over the anchor-based unit length.
+            let lower_ns = dt_epoch_ns(dt_add_dur(start, units(whole)));
+            let upper_ns = dt_epoch_ns(dt_add_dur(start, units(whole + sign)));
+            if upper_ns != lower_ns {
+                whole as f64
+                    + sign as f64 * (end_ns - lower_ns) as f64 / (upper_ns - lower_ns) as f64
             } else {
-                0.0
-            };
-            whole as f64 + frac
+                whole as f64
+            }
         }
-        "week" => diff as f64 / (7.0 * DAY_NS as f64),
-        _ => diff as f64 / unit_ns(unit) as f64,
+        "week" => {
+            // Keep the integer week count exact (i128 → f64) and route only the small
+            // sub-week remainder through f64, avoiding the 1-ULP loss of one division.
+            let un = 7 * DAY_NS;
+            let whole = diff / un;
+            whole as f64 + (diff - whole * un) as f64 / un as f64
+        }
+        _ => {
+            // Same exact-integer split for a fixed-length unit (day/hour/…/ns), so the
+            // large numerator's f64 conversion doesn't drop a ULP.
+            let un = unit_ns(unit);
+            let whole = diff / un;
+            whole as f64 + (diff - whole * un) as f64 / un as f64
+        }
     }
 }
 

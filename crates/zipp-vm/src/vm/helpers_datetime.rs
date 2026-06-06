@@ -340,25 +340,34 @@ pub(crate) fn parse_offset_ns(s: &str) -> Option<i128> {
     if matches!(s, "Z" | "z") {
         return Some(0);
     }
-    // A sub-second offset fraction may have at most 9 digits.
-    if let Some(dot) = s.find('.') {
-        if s[dot + 1..].chars().take_while(|c| c.is_ascii_digit()).count() > 9 {
-            return None;
-        }
-    }
     let sign: i128 = match s.as_bytes().first() {
         Some(b'+') => 1,
         Some(b'-') => -1,
         _ => return None,
     };
+    // Split the integer part (±HH[:]MM[:]SS) from an optional sub-second fraction.
     let body = &s[1..];
-    let digits: String = body.chars().filter(|c| c.is_ascii_digit()).collect();
+    let (int_part, frac) = match body.split_once(['.', ',']) {
+        Some((a, b)) => (a, b),
+        None => (body, ""),
+    };
+    let digits: String = int_part.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() < 2 {
         return None;
     }
     let h: i128 = digits[..2].parse().ok()?;
     let mi: i128 = if digits.len() >= 4 { digits[2..4].parse().ok()? } else { 0 };
-    Some(sign * (h * 3_600_000_000_000 + mi * 60_000_000_000))
+    let sec: i128 = if digits.len() >= 6 { digits[4..6].parse().ok()? } else { 0 };
+    let frac_digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if frac_digits.len() > 9 {
+        return None;
+    }
+    let frac_ns: i128 = if frac_digits.is_empty() {
+        0
+    } else {
+        frac_digits.parse::<i128>().ok()? * 10i128.pow(9 - frac_digits.len() as u32)
+    };
+    Some(sign * (h * 3_600_000_000_000 + mi * 60_000_000_000 + sec * 1_000_000_000 + frac_ns))
 }
 
 /// Parse an ISO instant string ("…Z" or "…±HH:MM") → epoch nanoseconds (UTC).
