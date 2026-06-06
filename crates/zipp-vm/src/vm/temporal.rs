@@ -789,8 +789,9 @@ impl<'p> Vm<'p> {
         if !n.is_finite() {
             return Err(Thrown("RangeError: roundingIncrement out of range".into()));
         }
+        // ToTemporalRoundingIncrement: truncate(increment) must be in [1, 10^9].
         let n = n.trunc();
-        if n < 1.0 {
+        if n < 1.0 || n > 1_000_000_000.0 {
             return Err(Thrown("RangeError: roundingIncrement out of range".into()));
         }
         Ok(n as i128)
