@@ -901,8 +901,10 @@ impl<'p> Vm<'p> {
                     ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
                 let maxes = [23, 59, 59, 999, 999, 999];
                 let mut f = [0i64; 6];
+                let mut any = false;
                 for (i, nm) in names.iter().enumerate() {
                     if let Some(x) = self.opt_int_field(v, nm)? {
+                        any = true;
                         if reject {
                             if x < 0 || x > maxes[i] {
                                 return Err(Thrown(format!("RangeError: {nm} out of range")));
@@ -912,6 +914,14 @@ impl<'p> Vm<'p> {
                             f[i] = x.clamp(0, maxes[i]);
                         }
                     }
+                }
+                // ToTemporalTimeRecord: a property bag with NO recognized time field
+                // (hour/minute/second/ms/us/ns) is not a valid PlainTime-like — a
+                // TypeError, not a silent default to 00:00:00.
+                if !any {
+                    return Err(Thrown(
+                        "TypeError: object has no recognized Temporal.PlainTime fields".into(),
+                    ));
                 }
                 return Ok(f);
             }
