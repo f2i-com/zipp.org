@@ -392,6 +392,7 @@ impl<'p> Vm<'p> {
             let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
             let d = self.temporal_ctor_int(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+            self.validate_calendar_value(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
             return self.make_plain_date(y, m, d);
         }
         if ci == self.plaintime_ctor && ci != 0 {
@@ -413,6 +414,7 @@ impl<'p> Vm<'p> {
                     *slot = self.temporal_ctor_int(v)?;
                 }
             }
+            self.validate_calendar_value(args.get(9).copied().unwrap_or(Value::UNDEFINED))?;
             return self.make_plain_date_time(f);
         }
         if ci == self.instant_ctor && ci != 0 {
@@ -423,6 +425,7 @@ impl<'p> Vm<'p> {
             // (year, month, calendar?, referenceISODay=1)
             let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+            self.validate_calendar_value(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let rd = match args.get(3).copied() {
                 Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1,
@@ -433,6 +436,7 @@ impl<'p> Vm<'p> {
             // (month, day, calendar?, referenceISOYear=1972)
             let m = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let d = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+            self.validate_calendar_value(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let ry = match args.get(3).copied() {
                 Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1972,
@@ -440,6 +444,7 @@ impl<'p> Vm<'p> {
             return self.make_plain_month_day(m, d, ry);
         }
         if ci == self.zoneddatetime_ctor && ci != 0 {
+            self.validate_calendar_value(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             return self.make_zoned_date_time(args);
         }
         // Intl.<service> constructors.

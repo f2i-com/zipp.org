@@ -669,10 +669,7 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.make_plain_date_time([y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]])?))
             }
             "withCalendar" => {
-                let cal = self.to_js_string(a0)?;
-                if !cal.eq_ignore_ascii_case("iso8601") {
-                    return Err(Thrown(format!("RangeError: unsupported calendar \"{cal}\"")));
-                }
+                self.validate_calendar_value(a0)?;
                 Ok(Some(self.make_plain_date(y, m, d)?))
             }
             "toZonedDateTime" => {
@@ -1188,10 +1185,7 @@ impl<'p> Vm<'p> {
             "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(date[0], date[1], date[2])?)),
             "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(date[1], date[2], date[0])?)),
             "withCalendar" => {
-                let cal = self.to_js_string(a0)?;
-                if !cal.eq_ignore_ascii_case("iso8601") {
-                    return Err(Thrown(format!("RangeError: unsupported calendar \"{cal}\"")));
-                }
+                self.validate_calendar_value(a0)?;
                 Ok(Some(self.make_plain_date_time(f)?))
             }
             "withPlainDate" => {
@@ -1519,11 +1513,9 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_zdt(ns, offset, id)))
             }
             "withCalendar" => {
-                // ISO 8601 only — accept "iso8601", reject other calendars.
-                let cal = self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-                if !cal.eq_ignore_ascii_case("iso8601") {
-                    return Err(Thrown(format!("RangeError: unsupported calendar \"{cal}\"")));
-                }
+                // ISO 8601 only — accept "iso8601"/undefined/a calendar-bearing
+                // Temporal, reject a wrong type (TypeError) or other calendar (RangeError).
+                self.validate_calendar_value(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 let (ns, off) = (self.zdt_epoch_ns(idx).unwrap_or(0), self.zdt_offset_ns(idx));
                 Ok(Some(self.make_zoned_date_time_raw(ns, off, idx)))
             }
@@ -2238,6 +2230,15 @@ impl<'p> Vm<'p> {
     /// annotation / bare ISO string), is accepted; anything else is a RangeError.
     pub(crate) fn validate_iso_calendar_field(&mut self, obj: Value) -> Result<(), Thrown> {
         let cv = self.get_prop(obj, "calendar")?;
+        self.validate_calendar_value(cv)
+    }
+
+    /// Validate a Temporal calendar VALUE — a positional constructor calendar arg or
+    /// a property-bag `calendar` field. `undefined` (→ default iso8601), a
+    /// calendar-bearing Temporal instance, or a string resolving to "iso8601" is
+    /// accepted; a wrong type (null/boolean/number/bigint/symbol/non-calendar object)
+    /// is a TypeError, an unknown / empty / malformed calendar string a RangeError.
+    pub(crate) fn validate_calendar_value(&mut self, cv: Value) -> Result<(), Thrown> {
         if cv == Value::UNDEFINED {
             return Ok(());
         }
