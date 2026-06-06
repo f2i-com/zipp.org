@@ -1632,6 +1632,18 @@ impl<'p> Vm<'p> {
                 Value::heap(self.heap.alloc(HeapObj::Object(m)))
             }
             ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
+            ITER_DISPOSE => {
+                // %IteratorPrototype% [ @@dispose ](): GetMethod(O, "return"); if present
+                // Call it; return undefined. A non-callable, non-nullish `return` throws.
+                let ret = self.get_prop(this, "return")?;
+                if !ret.is_nullish() {
+                    if !self.is_callable(ret) {
+                        return Err(Thrown("TypeError: iterator return is not a function".into()));
+                    }
+                    self.call_value(ret, this, &[])?;
+                }
+                Value::UNDEFINED
+            }
             // ES2025 Iterator Helpers (%Iterator.prototype%).
             ITER_MAP | ITER_FILTER | ITER_TAKE | ITER_DROP | ITER_FLATMAP | ITER_REDUCE
             | ITER_TOARRAY | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND => {

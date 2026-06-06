@@ -182,6 +182,9 @@ pub const ITER_ZIP: u16 = 619;
 /// `Iterator.zipKeyed(iterables, options)` — like zip but `iterables` is an
 /// object of named iterables and the result yields keyed objects.
 pub const ITER_ZIPKEYED: u16 = 682;
+/// `%Iterator.prototype% [ @@dispose ]()` — calls the iterator's `return` (if any)
+/// and returns undefined (explicit resource management).
+pub const ITER_DISPOSE: u16 = 683;
 // The test262 `$262` host object.
 pub const DOLLAR262_DETACH: u16 = 620;
 pub const DOLLAR262_GC: u16 = 621;
@@ -910,6 +913,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         ITER_CONCAT => ("concat", 0),
         ITER_ZIP => ("zip", 1),
         ITER_ZIPKEYED => ("zipKeyed", 1),
+        ITER_DISPOSE => ("[Symbol.dispose]", 0),
         OBJPROTO_DEFINE_GETTER => ("__defineGetter__", 2),
         OBJPROTO_DEFINE_SETTER => ("__defineSetter__", 2),
         OBJPROTO_LOOKUP_GETTER => ("__lookupGetter__", 1),
