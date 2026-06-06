@@ -935,6 +935,32 @@ impl<'p> Vm<'p> {
                     .enumerate()
                     .map(|(i, c)| (i.to_string(), self.alloc_str(c.to_string())))
                     .collect()
+            } else if self.proxy_parts(src.heap_index()).is_some() {
+                // CopyDataProperties over a Proxy source: [[OwnPropertyKeys]] (the
+                // ownKeys trap), then per key [[GetOwnProperty]] (the gopd trap) for
+                // enumerability, then Get — each trap propagates an abrupt completion
+                // (a plain snapshot would swallow it).
+                let keys = self.proxy_own_keys(src)?.unwrap_or_default();
+                let mut pv = Vec::new();
+                for k in keys {
+                    // (Symbol keys are copied elsewhere; here mirror the string path.)
+                    if !(k.is_heap() && self.heap.is_str_like(k.heap_index())) {
+                        continue;
+                    }
+                    let ks = self.display(k);
+                    let enumerable = match self.proxy_gopd(src, &ks)? {
+                        Some(d) if d != Value::UNDEFINED => {
+                            let en = self.get_prop(d, "enumerable")?;
+                            self.truthy(en)
+                        }
+                        _ => false,
+                    };
+                    if enumerable {
+                        let v = self.get_prop(src, &ks)?;
+                        pv.push((ks, v));
+                    }
+                }
+                pv
             } else {
                 // Collect the source's own ENUMERABLE keys, then Get each — so a
                 // getter is invoked and its VALUE is copied (not the accessor

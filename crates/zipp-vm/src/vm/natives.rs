@@ -1697,6 +1697,10 @@ impl<'p> Vm<'p> {
             DOLLAR262_GC => Value::UNDEFINED,
             // Object.prototype Annex-B accessor helpers.
             OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {
+                // Spec order: ToObject(this) [step 1], THEN IsCallable(getter) [step 2],
+                // THEN ToPropertyKey(P) [step 4]. A null/undefined receiver therefore
+                // throws before the getter is type-checked or the key is coerced.
+                self.require_object_coercible(this)?;
                 if !self.is_callable(a1) {
                     return Err(Thrown(
                         "TypeError: Object.prototype.__define[GS]etter__: expecting a function".into(),
