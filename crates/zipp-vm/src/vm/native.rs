@@ -744,11 +744,17 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     ] {
         if (base..base + methods.len() as u16).contains(&id) {
             let m = methods[(id - base) as usize];
-            let len: u8 = match m {
-                "with" | "add" | "subtract" | "until" | "since" | "round" | "equals"
-                | "total" | "withPlainTime" | "withTimeZone" | "withCalendar" | "withPlainDate"
-                | "toZonedDateTime" | "toZonedDateTimeISO" => 1,
-                _ => 0,
+            // `toPlainDate` takes a required `item` arg on PlainMonthDay/PlainYearMonth
+            // (length 1) but no arg on PlainDateTime/ZonedDateTime (length 0).
+            let len: u8 = if m == "toPlainDate" && (base == PYM_M_BASE || base == PMD_M_BASE) {
+                1
+            } else {
+                match m {
+                    "with" | "add" | "subtract" | "until" | "since" | "round" | "equals"
+                    | "total" | "withTimeZone" | "withCalendar" | "withPlainDate"
+                    | "toZonedDateTime" | "toZonedDateTimeISO" => 1,
+                    _ => 0,
+                }
             };
             return Some((m, len));
         }
