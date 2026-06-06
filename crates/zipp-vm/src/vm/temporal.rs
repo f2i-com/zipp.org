@@ -2054,12 +2054,32 @@ impl<'p> Vm<'p> {
         if !temporal_string_ok(&s, false, true) {
             return Err(Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")));
         }
-        let (f, offset, id) = parse_zdt_string(&s)
+        let (f, str_offset, id, zone_offset, behaviour) = parse_zdt_string(&s)
             .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
-        let _ = self.read_zdt_options(options)?;
+        let (off_opt, _reject) = self.read_zdt_options(options)?;
         let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
             + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
-        Ok(self.alloc_zdt(local - offset as i128, offset, id))
+        // Offset agreement (InterpretISODateTimeOffset): a `Z` designator (EXACT) fixes
+        // the instant as UTC and is never reconciled; no explicit offset (WALL) uses the
+        // zone; an explicit offset (OPTION) that differs from the zone's is reconciled
+        // per the `offset` option (reject=default → RangeError; use → the string offset
+        // sets the instant; ignore/prefer → the zone offset).
+        let eff = if behaviour == 1 {
+            str_offset
+        } else if str_offset == zone_offset {
+            zone_offset
+        } else {
+            match off_opt.as_str() {
+                "use" => str_offset,
+                "ignore" | "prefer" => zone_offset,
+                _ => {
+                    return Err(Thrown(
+                        "RangeError: the offset does not match the time zone".into(),
+                    ))
+                }
+            }
+        };
+        Ok(self.alloc_zdt(local - eff as i128, zone_offset, id))
     }
 
     /// Allocate a ZonedDateTime from epoch ns, offset, and an (owned) tz id.
@@ -2184,6 +2204,21 @@ impl<'p> Vm<'p> {
                 .any(|b| !b.is_empty() && !b.trim_start_matches('!').contains('='));
             if main.bytes().any(|b| b == b'Z' || b == b'z') && !has_tz_ann {
                 return Err(Thrown(format!("RangeError: invalid datetime string '{s}'")));
+            }
+            // With a time-zone annotation the relativeTo is ZonedDateTime-like. Per
+            // ToRelativeTemporalObject (offset:"reject") only an EXPLICIT offset that
+            // disagrees with the zone is a RangeError; a `Z` designator (EXACT) is the
+            // exact UTC instant and is accepted, and no offset (WALL) uses the zone. The
+            // wall-clock fields are the anchor.
+            if has_tz_ann {
+                let (f, str_offset, _id, zone_offset, behaviour) = parse_zdt_string(st)
+                    .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")))?;
+                if behaviour == 2 && str_offset != zone_offset {
+                    return Err(Thrown(format!(
+                        "RangeError: the relativeTo offset does not match the time zone in '{s}'"
+                    )));
+                }
+                return Ok(f);
             }
             return parse_iso_datetime(main)
                 .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
@@ -3581,7 +3616,13 @@ fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> f64 {
 /// numeric offset / `Z` is OPTIONAL — when absent the offset comes from the zone
 /// (so `1970-01-01T00:00[UTC]` and `2020-01-01[+09:00]` parse). The time part is
 /// optional (date-only -> midnight). Basic-format offsets (`-0800`) are accepted.
-fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String)> {
+/// Parse a ZonedDateTime/relativeTo string. Returns the wall-clock fields, the
+/// instant offset (ns), the zone id, the zone's offset (ns), and the *offset
+/// behaviour*: `0` = WALL (no explicit offset → use the zone), `1` = EXACT (a `Z`
+/// designator → the instant is UTC, the offset is not reconciled), `2` = OPTION
+/// (an explicit `±HH:MM` offset → reconcile against the zone per the `offset`
+/// option). The behaviour drives ToTemporalZonedDateTime's InterpretISODateTimeOffset.
+fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String, i64, i8)> {
     let lb = s.find('[')?;
     let rb = s[lb..].find(']').map(|r| lb + r)?;
     let mut tz = s[lb + 1..rb].to_string();
@@ -3601,21 +3642,23 @@ fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String)> {
     // In the time part, locate an explicit `Z` or numeric offset (else use the
     // zone's offset). The time itself never contains `+`/`-`, so the first one
     // begins the offset.
-    let (time_str, offset_ns) = match time_part {
-        None => ("", tz_offset),
+    let (time_str, offset_ns, behaviour) = match time_part {
+        None => ("", tz_offset, 0i8),
         Some(t) => {
             if let Some(zpos) = t.find(['Z', 'z']) {
-                (&t[..zpos], 0i64)
+                (&t[..zpos], 0i64, 1i8)
             } else if let Some(opos) = t.find(['+', '-']) {
-                (&t[..opos], parse_offset_ns(&t[opos..])? as i64)
+                (&t[..opos], parse_offset_ns(&t[opos..])? as i64, 2i8)
             } else {
-                (t, tz_offset)
+                (t, tz_offset, 0i8)
             }
         }
     };
     let time = if time_str.is_empty() { [0i64; 6] } else { parse_iso_time(time_str)? };
     let f = [date.0, date.1, date.2, time[0], time[1], time[2], time[3], time[4], time[5]];
-    Some((f, offset_ns, tz_id))
+    // Return the zone's offset alongside the (possibly explicit) string offset so the
+    // caller can reconcile a mismatch per the `offset` option / offset behaviour.
+    Some((f, offset_ns, tz_id, tz_offset, behaviour))
 }
 
 /// Format a UTC offset (nanoseconds) as `±HH:MM` (or `±HH:MM:SS` when needed).
