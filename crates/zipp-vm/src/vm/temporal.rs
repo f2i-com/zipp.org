@@ -441,7 +441,10 @@ impl<'p> Vm<'p> {
     /// RangeError; a non-object, non-undefined `options` is a TypeError). The
     /// single-offset model can't act on disambiguation/offset, but their values
     /// must still be in range. Returns the overflow `reject` flag.
-    pub(crate) fn read_zdt_options(&mut self, options: Value) -> Result<bool, Thrown> {
+    /// Read a ZonedDateTime resolution options bag, returning `(offset option,
+    /// overflow-is-reject)`. The offset option (default "reject") governs how a bag/
+    /// string `offset` that disagrees with the time zone is resolved.
+    pub(crate) fn read_zdt_options(&mut self, options: Value) -> Result<(String, bool), Thrown> {
         if options != Value::UNDEFINED && !self.is_object_value(options) {
             return Err(Thrown("TypeError: options must be an object or undefined".into()));
         }
@@ -451,8 +454,10 @@ impl<'p> Vm<'p> {
             "compatible",
             &["compatible", "earlier", "later", "reject"],
         )?;
-        self.opt_string(options, "offset", "reject", &["prefer", "use", "ignore", "reject"])?;
-        self.read_overflow(options)
+        let off =
+            self.opt_string(options, "offset", "reject", &["prefer", "use", "ignore", "reject"])?;
+        let reject = self.read_overflow(options)?;
+        Ok((off, reject))
     }
 
     /// Resolve a toString() options bag (fractionalSecondDigits / smallestUnit /
@@ -2006,12 +2011,31 @@ impl<'p> Vm<'p> {
                 // ToTemporalTimeZoneIdentifier: a string is parsed, a wrong type
                 // (null/boolean/number/bigint/symbol) is a TypeError — not coerced.
                 let (id, offset) = self.parse_tz_arg(tzv)?;
-                self.validate_bag_offset_field(item)?;
-                let reject = self.read_zdt_options(options)?;
+                let bag_off = self.validate_bag_offset_field(item)?;
+                let (off_opt, reject) = self.read_zdt_options(options)?;
                 let f = self.to_plain_date_time_overflow(item, reject)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
-                return Ok(self.alloc_zdt(local - offset as i128, offset, id));
+                // Offset agreement: a bag `offset` is reconciled with the zone's offset
+                // per the `offset` option. zipp's zones carry a single fixed offset, so:
+                // reject → must equal it (else RangeError); use → use the bag offset for
+                // the instant; ignore/prefer → use the zone offset.
+                let eff = match bag_off {
+                    None => offset,
+                    Some(b) => match off_opt.as_str() {
+                        "use" => b,
+                        "ignore" | "prefer" => offset,
+                        _ => {
+                            if b != offset {
+                                return Err(Thrown(
+                                    "RangeError: offset does not match the time zone".into(),
+                                ));
+                            }
+                            offset
+                        }
+                    },
+                };
+                return Ok(self.alloc_zdt(local - eff as i128, offset, id));
             }
         }
         // An Object was handled above; only a String is parseable. Any other value —
@@ -2170,21 +2194,26 @@ impl<'p> Vm<'p> {
     /// Validate a ZonedDateTime-like property bag's `offset` field: if present it
     /// must be a well-formed UTC-offset string (`±HH:MM…`). (The offset-vs-time-zone
     /// agreement check needs a tz database and is not done here.)
-    pub(crate) fn validate_bag_offset_field(&mut self, bag: Value) -> Result<(), Thrown> {
+    /// Validate a ZonedDateTime-like bag's `offset` field and return its value in
+    /// nanoseconds (`None` if absent). The offset must be a well-formed UTC-offset
+    /// string; whether it must AGREE with the time zone is decided by the caller via
+    /// the `offset` option.
+    pub(crate) fn validate_bag_offset_field(&mut self, bag: Value) -> Result<Option<i64>, Thrown> {
         let offv = self.get_prop(bag, "offset")?;
-        if offv != Value::UNDEFINED {
-            // The offset must be a String or an object (which ToString-s); a
-            // primitive non-string (null/boolean/number/bigint/symbol) is a TypeError.
-            let is_string = offv.is_heap() && self.heap.is_str_like(offv.heap_index());
-            if !is_string && !self.is_object_value(offv) {
-                return Err(Thrown("TypeError: offset must be a string".into()));
-            }
-            let offs = self.to_js_string(offv)?;
-            if !valid_offset_string(&offs) {
-                return Err(Thrown(format!("RangeError: invalid offset string \"{offs}\"")));
-            }
+        if offv == Value::UNDEFINED {
+            return Ok(None);
         }
-        Ok(())
+        // The offset must be a String or an object (which ToString-s); a primitive
+        // non-string (null/boolean/number/bigint/symbol) is a TypeError.
+        let is_string = offv.is_heap() && self.heap.is_str_like(offv.heap_index());
+        if !is_string && !self.is_object_value(offv) {
+            return Err(Thrown("TypeError: offset must be a string".into()));
+        }
+        let offs = self.to_js_string(offv)?;
+        if !valid_offset_string(&offs) {
+            return Err(Thrown(format!("RangeError: invalid offset string \"{offs}\"")));
+        }
+        Ok(parse_offset_ns(&offs).map(|n| n as i64))
     }
 
     /// `Temporal.Duration.compare(one, two, { relativeTo })`. With a relativeTo
