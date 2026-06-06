@@ -187,14 +187,27 @@ impl<'p> Vm<'p> {
         allowed: &[&str],
     ) -> Result<(String, i128, String), Thrown> {
         // A bare string argument is shorthand for { smallestUnit: <string> }.
-        let (smallest_v, options) =
+        let (su_string, options) =
             if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
-                (arg, Value::UNDEFINED)
+                (Some(arg), Value::UNDEFINED)
             } else if arg == Value::UNDEFINED {
                 return Err(Thrown("TypeError: round() requires an options argument".into()));
             } else {
-                (self.get_prop(arg, "smallestUnit")?, arg)
+                (None, arg)
             };
+        // Spec order: read + coerce ALL options BEFORE any algorithmic validation —
+        // roundingIncrement, then roundingMode, then smallestUnit (the observable
+        // get/valueOf/toString sequence the order-of-operations tests assert).
+        let inc = self.read_rounding_increment(options)?;
+        let mode = if options == Value::UNDEFINED {
+            "halfExpand".to_string()
+        } else {
+            self.read_rounding_mode(options, "halfExpand")?
+        };
+        let smallest_v = match su_string {
+            Some(s) => s,
+            None => self.get_prop(options, "smallestUnit")?,
+        };
         if smallest_v == Value::UNDEFINED {
             return Err(Thrown("RangeError: smallestUnit is required".into()));
         }
@@ -202,12 +215,7 @@ impl<'p> Vm<'p> {
         if !allowed.contains(&su.as_str()) {
             return Err(Thrown(format!("RangeError: invalid smallestUnit: {su}")));
         }
-        let inc = self.read_rounding_increment(options)?;
-        let mode = if options == Value::UNDEFINED {
-            "halfExpand".to_string()
-        } else {
-            self.read_rounding_mode(options, "halfExpand")?
-        };
+        // Algorithmic validation comes last: the increment must evenly divide its unit.
         if let Some(max) = max_increment(&su) {
             if inc >= max || max % inc != 0 {
                 return Err(Thrown(
