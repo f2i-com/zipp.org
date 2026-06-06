@@ -1791,10 +1791,6 @@ impl<'p> Vm<'p> {
             | "isSubsetOf" | "isSupersetOf" | "isDisjointFrom" => {
                 // Calls user has()/keys() (Set-like arg), so suspend GC for the scope.
                 let _gc = self.gc_lock_guard();
-                let this_items = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.clone(),
-                    _ => Vec::new(),
-                };
                 // GetSetRecord (read size / has / keys in spec order) WITHOUT yet
                 // calling keys(): a real Set uses its elements directly; a Set-like
                 // ({size, has, keys}) keeps its has/keys methods so the size-favoured
@@ -1845,6 +1841,14 @@ impl<'p> Vm<'p> {
                         (None, int_size, has, keys)
                     }
                 };
+                // Snapshot `this`'s elements AFTER GetSetRecord: the `size`/`has`/`keys`
+                // getters of a Set-like argument may have mutated this Set (the spec
+                // copies O.[[SetData]] at this point, so any element added by the getters
+                // is included — see union/difference/symmetricDifference mutation tests).
+                let this_items = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.clone(),
+                    _ => Vec::new(),
+                };
                 let mem = |hay: &[Value], v: Value, vm: &Self| hay.iter().any(|x| vm.same_value_zero(*x, v));
                 let this_size = this_items.len() as i64;
                 let result = match name {
@@ -1859,11 +1863,22 @@ impl<'p> Vm<'p> {
                         Value::heap(self.heap.alloc(HeapObj::Set(r)))
                     }
                     "symmetricDifference" => {
+                        // resultSetData = copy of O (after GetSetRecord). For each key
+                        // the spec decides remove-vs-keep by SetDataHas(O.[[SetData]], key)
+                        // — the LIVE receiver, which the keys() iterator may have mutated —
+                        // not by the result. (See symmetricDifference set-like-class-mutation.)
                         let okeys = self.set_rec_keys(&other_real, other_keys, a0)?;
-                        let mut r: Vec<Value> =
-                            this_items.iter().copied().filter(|&v| !mem(&okeys, v, self)).collect();
+                        let o_live = match self.heap.get(idx) {
+                            HeapObj::Set(items) => items.clone(),
+                            _ => Vec::new(),
+                        };
+                        let mut r = this_items.clone();
                         for v in okeys {
-                            if !mem(&this_items, v, self) && !mem(&r, v, self) {
+                            if mem(&o_live, v, self) {
+                                // In O → remove it from the result if present.
+                                r.retain(|&x| !self.same_value_zero(x, v));
+                            } else if !mem(&r, v, self) {
+                                // Not in O → add it to the result if absent.
                                 r.push(v);
                             }
                         }
@@ -1909,8 +1924,18 @@ impl<'p> Vm<'p> {
                         if this_size > other_size {
                             Value::bool(false)
                         } else {
+                            // Iterate `this` LIVE: the argument's has() may delete a
+                            // not-yet-visited element, so re-read the Set's length and
+                            // current element each step (the spec re-reads thisSize and
+                            // skips emptied slots — see isSubsetOf set-like-class-mutation).
                             let mut ok = true;
-                            for &e in &this_items {
+                            let mut index = 0usize;
+                            loop {
+                                let e = match self.heap.get(idx) {
+                                    HeapObj::Set(items) if index < items.len() => items[index],
+                                    _ => break,
+                                };
+                                index += 1;
                                 if !self.set_rec_has(&other_real, other_has, a0, e)? {
                                     ok = false;
                                     break;
@@ -1922,11 +1947,33 @@ impl<'p> Vm<'p> {
                     "isSupersetOf" => {
                         if this_size < other_size {
                             Value::bool(false)
-                        } else {
+                        } else if let Some(items) = &other_real {
+                            let items = items.clone();
                             let mut ok = true;
-                            for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                            for v in items {
                                 if !mem(&this_items, v, self) {
                                     ok = false;
+                                    break;
+                                }
+                            }
+                            Value::bool(ok)
+                        } else {
+                            // Set-like: step keys() LAZILY and IteratorClose on an early
+                            // break, so the iterator's return() is invoked exactly once
+                            // when we stop short (see isSupersetOf set-like-iter-return /
+                            // set-like-class-order).
+                            let kiter = self.call_value(other_keys, a0, &[])?;
+                            if !self.is_object_value(kiter) {
+                                return Err(Thrown(
+                                    "TypeError: Set-like keys() did not return an object".into(),
+                                ));
+                            }
+                            let next = self.get_prop(kiter, "next")?;
+                            let mut ok = true;
+                            while let Some(v) = self.iterator_step_with(kiter, next)? {
+                                if !mem(&this_items, v, self) {
+                                    ok = false;
+                                    self.iterator_close(kiter)?;
                                     break;
                                 }
                             }
@@ -1937,16 +1984,41 @@ impl<'p> Vm<'p> {
                         // isDisjointFrom
                         let mut disjoint = true;
                         if this_size <= other_size {
-                            for &e in &this_items {
+                            // Iterate `this` LIVE (has() may delete not-yet-visited
+                            // elements — see isDisjointFrom set-like-class-mutation).
+                            let mut index = 0usize;
+                            loop {
+                                let e = match self.heap.get(idx) {
+                                    HeapObj::Set(items) if index < items.len() => items[index],
+                                    _ => break,
+                                };
+                                index += 1;
                                 if self.set_rec_has(&other_real, other_has, a0, e)? {
                                     disjoint = false;
                                     break;
                                 }
                             }
-                        } else {
-                            for v in self.set_rec_keys(&other_real, other_keys, a0)? {
+                        } else if let Some(items) = &other_real {
+                            let items = items.clone();
+                            for v in items {
                                 if mem(&this_items, v, self) {
                                     disjoint = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Set-like: step keys() lazily, IteratorClose on early break.
+                            let kiter = self.call_value(other_keys, a0, &[])?;
+                            if !self.is_object_value(kiter) {
+                                return Err(Thrown(
+                                    "TypeError: Set-like keys() did not return an object".into(),
+                                ));
+                            }
+                            let next = self.get_prop(kiter, "next")?;
+                            while let Some(v) = self.iterator_step_with(kiter, next)? {
+                                if mem(&this_items, v, self) {
+                                    disjoint = false;
+                                    self.iterator_close(kiter)?;
                                     break;
                                 }
                             }
