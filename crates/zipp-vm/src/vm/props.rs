@@ -478,13 +478,49 @@ impl<'p> Vm<'p> {
             }
             return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
         }
+        // A plain Object: EnumerableOwnPropertyNames — snapshot the ordered own string
+        // keys ([[OwnPropertyKeys]]) ONCE, then per key re-read the LIVE descriptor (so
+        // a key a prior getter deleted or made non-enumerable is skipped) and, for
+        // values/entries, read the value via Get (an accessor's getter runs and its
+        // mutations are observed; a thrown getter propagates). Object.keys reads no
+        // value, so it never triggers a getter.
+        if obj.is_heap() {
+            if let HeapObj::Object(m) = self.heap.get(obj.heap_index()) {
+                let names: Vec<String> = spec_key_order(&m.keys)
+                    .into_iter()
+                    .map(|i| m.keys[i].clone())
+                    .filter(|k| !is_hidden_key(k))
+                    .collect();
+                let mut out: Vec<Value> = Vec::with_capacity(names.len());
+                for k in names {
+                    let enumerable = match self.heap.get(obj.heap_index()) {
+                        HeapObj::Object(m) => m.pos(&k).map_or(false, |i| m.attrs[i].enumerable),
+                        _ => false,
+                    };
+                    if !enumerable {
+                        continue;
+                    }
+                    match what {
+                        EnumWhat::Keys => {
+                            let kv = self.alloc_str(k);
+                            out.push(kv);
+                        }
+                        EnumWhat::Values => {
+                            let v = self.get_member(obj, &k, obj)?;
+                            out.push(v);
+                        }
+                        EnumWhat::Entries => {
+                            let v = self.get_member(obj, &k, obj)?;
+                            let kv = self.alloc_str(k);
+                            out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))));
+                        }
+                    }
+                }
+                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            }
+        }
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
-                HeapObj::Object(m) => spec_key_order(&m.keys)
-                    .into_iter()
-                    .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
-                    .map(|i| (m.keys[i].clone(), m.vals[i]))
-                    .collect(),
                 HeapObj::Array(items) => {
                     let mut v: Vec<(String, Value)> =
                         items.iter().enumerate().map(|(i, x)| (i.to_string(), *x)).collect();
