@@ -869,8 +869,9 @@ impl<'p> Vm<'p> {
                     continue;
                 }
                 _ => {
-                    // 5 = passthrough wrapper (Iterator.from of a foreign iterator)
-                    match self.iterator_step(source)? {
+                    // 5 = passthrough wrapper (Iterator.from of a foreign iterator):
+                    // step via the cached next (GetIteratorDirect read it once).
+                    match self.ih_step(source, next)? {
                         None => {
                             self.ih_set_done(idx);
                             return Ok(self.iter_result(Value::UNDEFINED, true));
@@ -888,6 +889,24 @@ impl<'p> Vm<'p> {
         // A string yields its code-point iterator; otherwise get the iterable's
         // iterator (or use it directly if it is one).
         let it = self.get_iterator_flattenable(o)?;
+        // If the iterator ALREADY inherits %Iterator.prototype% (OrdinaryHasInstance
+        // (%Iterator%, it) — e.g. a generator or a built-in iterator), return it
+        // unwrapped; only a foreign iterator gets the WrapForValidIterator wrapper.
+        // Walk via object_get_prototype_of so a Generator's gen_proto link is followed
+        // (generator instances resolve their [[Prototype]] specially, not via proto_of).
+        if it.is_heap() && self.iterator_proto_root != 0 {
+            let mut cur = it;
+            for _ in 0..64 {
+                let p = self.object_get_prototype_of(cur);
+                if !p.is_heap() {
+                    break;
+                }
+                if p.heap_index() == self.iterator_proto_root {
+                    return Ok(it);
+                }
+                cur = p;
+            }
+        }
         self.make_iter_helper(it, 5, Value::UNDEFINED, 0)
     }
 }

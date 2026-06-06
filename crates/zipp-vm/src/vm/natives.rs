@@ -1673,6 +1673,20 @@ impl<'p> Vm<'p> {
                         }
                         _ => (0, Value::UNDEFINED, Value::UNDEFINED, true),
                     };
+                    // kind 5 = the WrapForValidIterator (Iterator.from): its return()
+                    // DELEGATES — GetMethod(iterator, "return") and, if present, returns
+                    // that method's result verbatim; otherwise CreateIterResultObject(
+                    // undefined, true). (It does not close-and-return-done like a helper.)
+                    if kind == 5 {
+                        let ret = self.get_prop(source, "return")?;
+                        if ret.is_nullish() {
+                            return Ok(self.iter_result(Value::UNDEFINED, true));
+                        }
+                        if !self.is_callable(ret) {
+                            return Err(Thrown("TypeError: iterator return is not a function".into()));
+                        }
+                        return self.call_value(ret, source, &[]);
+                    }
                     // Mark done first (a re-entrant return is then a no-op), then
                     // close the underlying iterator — `inner` for concat (its
                     // `source` is the pair-array), else `source`. Skip if already
