@@ -185,6 +185,7 @@ impl<'p> Vm<'p> {
         &mut self,
         arg: Value,
         allowed: &[&str],
+        validate_increment: bool,
     ) -> Result<(String, i128, String), Thrown> {
         // A bare string argument is shorthand for { smallestUnit: <string> }; any
         // other non-object (a number/boolean/etc.) is a TypeError, not options.
@@ -220,12 +221,24 @@ impl<'p> Vm<'p> {
         if !allowed.contains(&su.as_str()) {
             return Err(Thrown(format!("RangeError: invalid smallestUnit: {su}")));
         }
-        // Algorithmic validation comes last: the increment must evenly divide its unit.
-        if let Some(max) = max_increment(&su) {
-            if inc >= max || max % inc != 0 {
-                return Err(Thrown(
-                    "RangeError: roundingIncrement must evenly divide the next unit".into(),
-                ));
+        // Algorithmic validation comes last: the increment must evenly divide its
+        // unit. Instant.round validates against the solar day instead (its own
+        // guard downstream), so it opts out with validate_increment = false.
+        if validate_increment {
+            if su == "day" {
+                // "day" rounds against a 1-day dividend (inclusive), so only an
+                // increment of exactly 1 is valid.
+                if inc != 1 {
+                    return Err(Thrown(
+                        "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                    ));
+                }
+            } else if let Some(max) = max_increment(&su) {
+                if inc >= max || max % inc != 0 {
+                    return Err(Thrown(
+                        "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                    ));
+                }
             }
         }
         Ok((su, inc, mode))

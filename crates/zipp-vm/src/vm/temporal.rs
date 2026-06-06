@@ -1021,6 +1021,7 @@ impl<'p> Vm<'p> {
                 let (su, inc, mode) = self.read_round_options(
                     a0,
                     &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"],
+                    true,
                 )?;
                 let ns = time_to_ns(&f);
                 let inc_ns = unit_ns(&su) * inc;
@@ -1336,6 +1337,15 @@ impl<'p> Vm<'p> {
                 }
                 let inc = self.read_rounding_increment(opts)?;
                 let mode = self.read_rounding_mode(opts, "trunc")?;
+                // A time-unit increment must evenly divide its next-highest unit
+                // (day/week/month/year carry no per-unit bound here).
+                if let Some(max) = max_increment(&smallest) {
+                    if inc >= max || max % inc != 0 {
+                        return Err(Thrown(
+                            "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                        ));
+                    }
+                }
                 // until: this → other; since: other → this.
                 let (dt1, dt2) = if name == "until" { (f, o) } else { (o, f) };
                 let df = difference_datetime(dt1, dt2, &largest);
@@ -1364,6 +1374,7 @@ impl<'p> Vm<'p> {
                         "day", "hour", "minute", "second", "millisecond", "microsecond",
                         "nanosecond",
                     ],
+                    true,
                 )?;
                 let time_ns = time_to_ns(&time);
                 let inc_ns = unit_ns(&su) * inc;
@@ -1533,11 +1544,16 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.make_zoned_date_time_raw(new_ns, self.zdt_offset_ns(idx), idx)))
             }
             "equals" => {
-                let other = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let eq = other.is_heap()
-                    && self.zdt_epoch_ns(other.heap_index()) == self.zdt_epoch_ns(idx)
-                    && self.zdt_epoch_ns(idx).is_some()
-                    && self.zdt_tz_id(idx) == self.zdt_tz_id(other.heap_index());
+                // ToTemporalZonedDateTime casts the argument (string / property bag /
+                // ZonedDateTime). Two ZonedDateTimes are equal iff their epoch-ns
+                // match AND their time zones match (offset zones compared canonically,
+                // so +00/+0000/+00:00 are equal) AND their calendars match (always
+                // iso8601 here).
+                let other_v = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let other = self.zoned_date_time_from(other_v, Value::UNDEFINED)?;
+                let oi = other.heap_index();
+                let eq = self.zdt_epoch_ns(idx) == self.zdt_epoch_ns(oi)
+                    && self.tz_canon(idx) == self.tz_canon(oi);
                 Ok(Some(Value::bool(eq)))
             }
             "withTimeZone" => {
@@ -1634,6 +1650,15 @@ impl<'p> Vm<'p> {
                 }
                 let inc = self.read_rounding_increment(opts)?;
                 let mode = self.read_rounding_mode(opts, "trunc")?;
+                // A time-unit increment must evenly divide its next-highest unit
+                // (day/week/month/year carry no per-unit bound here).
+                if let Some(max) = max_increment(&smallest) {
+                    if inc >= max || max % inc != 0 {
+                        return Err(Thrown(
+                            "RangeError: roundingIncrement must evenly divide the next unit".into(),
+                        ));
+                    }
+                }
                 let f = self.zdt_local(idx);
                 let (dt1, dt2) = if name == "until" { (f, of) } else { (of, f) };
                 let df = difference_datetime(dt1, dt2, &largest);
@@ -1660,6 +1685,7 @@ impl<'p> Vm<'p> {
                         "day", "hour", "minute", "second", "millisecond", "microsecond",
                         "nanosecond",
                     ],
+                    true,
                 )?;
                 let f = self.zdt_local(idx);
                 let time_ns = time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
@@ -2003,6 +2029,18 @@ impl<'p> Vm<'p> {
             .and_then(|v| self.heap.str_cow(v.heap_index()).map(|s| s.into_owned()))
     }
 
+    /// A canonical time-zone key for equality: an offset zone collapses to its
+    /// formatted offset (so "+00"/"+0000"/"+00:00" all match), a named zone keeps
+    /// its id. Calendars are always iso8601 here, so no calendar term is needed.
+    fn tz_canon(&self, idx: u32) -> String {
+        let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
+        if id.starts_with(['+', '-']) {
+            format_offset(self.zdt_offset_ns(idx))
+        } else {
+            id
+        }
+    }
+
     /// ISO string for a ZonedDateTime: `YYYY-MM-DDTHH:MM:SS<offset>[<tzid>]`.
     pub(crate) fn zdt_to_string(&self, idx: u32) -> String {
         let f = self.zdt_local(idx);
@@ -2173,6 +2211,7 @@ impl<'p> Vm<'p> {
                 let (su, inc, mode) = self.read_round_options(
                     a0,
                     &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"],
+                    false,
                 )?;
                 let inc_ns = unit_ns(&su) * inc;
                 // Instant rounding increments must evenly divide a 24-hour day.
@@ -2228,14 +2267,17 @@ impl<'p> Vm<'p> {
                 if !temporal_string_ok(&s, true, true) {
                     return Err(Thrown(format!("RangeError: invalid year-month string '{s}'")));
                 }
-                let (y, m, rd) = parse_iso_year_month(&s)
+                let (y, m, _) = parse_iso_year_month(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid year-month string '{s}'")))?;
                 if !iso_year_month_in_range(y, m) {
                     return Err(Thrown(format!(
                         "RangeError: year-month '{s}' is outside the representable range"
                     )));
                 }
-                return Ok((y, m, rd));
+                // ISO yearMonthFromFields sets [[ISODay]] = 1: the day parsed from the
+                // string is validated above but dropped (the 4-arg constructor's
+                // explicit referenceISODay is a separate path and keeps its value).
+                return Ok((y, m, 1));
             }
             if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
@@ -2893,10 +2935,28 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
     let b = t.as_bytes();
     if b[0] == b'+' || b[0] == b'-' {
         let sign: i64 = if b[0] == b'-' { -1 } else { 1 };
-        let parts: Vec<&str> = t[1..].split(':').collect();
-        let hh: i64 = parts.first()?.parse().ok()?;
-        let mm: i64 = parts.get(1).map_or(Some(0), |p| p.parse().ok())?;
-        let ss: i64 = parts.get(2).map_or(Some(0), |p| p.parse().ok())?;
+        let body = &t[1..];
+        // Both colon-separated (±HH, ±HH:MM, ±HH:MM:SS) and colon-less (±HH,
+        // ±HHMM, ±HHMMSS) offset forms are valid time-zone identifiers. A
+        // sub-minute/fractional offset is NOT a valid identifier (rejected).
+        let (hh, mm, ss) = if body.contains(':') {
+            let parts: Vec<&str> = body.split(':').collect();
+            if parts.len() > 3 {
+                return None;
+            }
+            let hh: i64 = parts.first()?.parse().ok()?;
+            let mm: i64 = parts.get(1).map_or(Some(0), |p| p.parse().ok())?;
+            let ss: i64 = parts.get(2).map_or(Some(0), |p| p.parse().ok())?;
+            (hh, mm, ss)
+        } else {
+            if !body.bytes().all(|c| c.is_ascii_digit()) || !matches!(body.len(), 2 | 4 | 6) {
+                return None;
+            }
+            let hh: i64 = body[0..2].parse().ok()?;
+            let mm: i64 = if body.len() >= 4 { body[2..4].parse().ok()? } else { 0 };
+            let ss: i64 = if body.len() >= 6 { body[4..6].parse().ok()? } else { 0 };
+            (hh, mm, ss)
+        };
         if hh > 23 || mm > 59 || ss > 59 {
             return None;
         }
