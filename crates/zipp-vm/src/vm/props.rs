@@ -1063,6 +1063,53 @@ impl<'p> Vm<'p> {
         Value::UNDEFINED
     }
 
+    /// `__lookupGetter__`/`__lookupSetter__`'s chain walk using the SPEC abstract
+    /// operations: each step is `[[GetOwnProperty]](key)` then `[[GetPrototypeOf]]()`,
+    /// both Proxy-trap-aware and throwing — so a trap that raises an abrupt completion
+    /// propagates (unlike `lookup_accessor`, which returns Value and skips Proxy nodes).
+    pub(crate) fn lookup_accessor_checked(
+        &mut self,
+        this: Value,
+        key: &str,
+        want_setter: bool,
+    ) -> Result<Value, Thrown> {
+        let mut cur = this;
+        for _ in 0..10_000 {
+            if !cur.is_heap() {
+                break;
+            }
+            if self.proxy_parts(cur.heap_index()).is_some() {
+                // [[GetOwnProperty]] via the getOwnPropertyDescriptor trap (may throw).
+                if let Some(desc) = self.proxy_gopd(cur, key)? {
+                    if desc != Value::UNDEFINED {
+                        // An accessor descriptor carries get/set; a data descriptor → undefined.
+                        let is_accessor = self.has_property_str(desc, "get")
+                            || self.has_property_str(desc, "set");
+                        if is_accessor {
+                            let which = if want_setter { "set" } else { "get" };
+                            return self.get_prop(desc, which);
+                        }
+                        return Ok(Value::UNDEFINED);
+                    }
+                }
+            } else if let HeapObj::Object(m) = self.heap.get(cur.heap_index()) {
+                if let Some(i) = m.pos(key) {
+                    let attr = m.attrs[i];
+                    if attr.accessor {
+                        return Ok(if want_setter { attr.setter } else { m.vals[i] });
+                    }
+                    return Ok(Value::UNDEFINED);
+                }
+            }
+            // [[GetPrototypeOf]] via the getPrototypeOf trap (may throw).
+            cur = self.get_prototype_of_checked(cur)?;
+            if cur == Value::NULL {
+                break;
+            }
+        }
+        Ok(Value::UNDEFINED)
+    }
+
     /// If `idx` is a generator / async / async-generator FUNCTION, the matching
     /// dynamic-function intrinsic prototype (%GeneratorFunction.prototype% etc.) —
     /// its [[Prototype]] and the target for its method/`.constructor` lookups.

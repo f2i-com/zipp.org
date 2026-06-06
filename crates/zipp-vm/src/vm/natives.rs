@@ -1712,13 +1712,17 @@ impl<'p> Vm<'p> {
                 Value::UNDEFINED
             }
             OBJPROTO_LOOKUP_GETTER | OBJPROTO_LOOKUP_SETTER => {
+                // ToObject(this) is step 1 — BEFORE ToPropertyKey(P) — so a non-coercible
+                // receiver throws without ever coercing the key.
+                self.require_object_coercible(this)?;
                 let key = self.to_property_key(a0)?;
-                self.require_object_coercible(this)?; // ToObject(this)
                 // A private name (`#x`) is not reflectable: report no accessor.
                 if is_private_key(&key) {
                     Value::UNDEFINED
                 } else {
-                    self.lookup_accessor(this, &key, id == OBJPROTO_LOOKUP_SETTER)
+                    // The chain walk uses Proxy-trap-aware [[GetOwnProperty]] /
+                    // [[GetPrototypeOf]] so a throwing trap propagates.
+                    self.lookup_accessor_checked(this, &key, id == OBJPROTO_LOOKUP_SETTER)?
                 }
             }
             OBJPROTO_PROTO_GET => {
