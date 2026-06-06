@@ -208,16 +208,27 @@ impl<'p> Vm<'p> {
                     return Err(Thrown(format!("RangeError: invalid unit: {unit}")));
                 }
                 // Years/months/weeks (in the value or as the requested unit) need a
-                // calendar: use the `relativeTo` option's date-time as the anchor.
-                if f[0] != 0 || f[1] != 0 || f[2] != 0 || matches!(unit.as_str(), "year" | "month" | "week") {
-                    if rel == Value::UNDEFINED {
-                        return Err(Thrown(
-                            "RangeError: a relativeTo option is required for years, months, or weeks"
-                                .into(),
-                        ));
+                // calendar anchor; any other unit uses the time span directly.
+                let needs_cal = f[0] != 0
+                    || f[1] != 0
+                    || f[2] != 0
+                    || matches!(unit.as_str(), "year" | "month" | "week");
+                // ToRelativeTemporalObject: a provided relativeTo is resolved (and its
+                // target instant validated) even for a time unit — total({unit:"ns"})
+                // against a ZonedDateTime at the limit still throws on overflow.
+                let anchor =
+                    if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
+                if needs_cal && anchor.is_none() {
+                    return Err(Thrown(
+                        "RangeError: a relativeTo option is required for years, months, or weeks"
+                            .into(),
+                    ));
+                }
+                if let Some((start, zoned)) = anchor {
+                    check_relative_target(start, f, zoned)?;
+                    if needs_cal {
+                        return Ok(Some(Value::num(duration_total_relative(f, start, &unit))));
                     }
-                    let start = self.relative_to_dt(rel)?;
-                    return Ok(Some(Value::num(duration_total_relative(f, start, &unit))));
                 }
                 let total_ns = (f[3] as i128) * DAY_NS
                     + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
@@ -343,7 +354,8 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if rel != Value::UNDEFINED {
-                    let start = self.relative_to_dt(rel)?;
+                    let (start, zoned) = self.relative_to_dt(rel)?;
+                    check_relative_target(start, f, zoned)?;
                     let r = self.round_duration_relative(f, start, &smallest, &largest, inc, &mode)?;
                     return Ok(Some(self.make_duration(r)));
                 }
@@ -2223,10 +2235,15 @@ impl<'p> Vm<'p> {
     /// Parse a `relativeTo` option into a date-time [y,mo,d,h,…] anchor (a
     /// ZonedDateTime uses its local wall-clock; otherwise PlainDate/PlainDateTime/
     /// string/object coercion).
-    pub(crate) fn relative_to_dt(&mut self, rel: Value) -> Result<[i64; 9], Thrown> {
+    /// Resolve a `relativeTo` option to its anchor wall-clock fields plus a flag for
+    /// whether it is ZonedDateTime-like (a ZDT instance, a `[tz]`-annotated string, or
+    /// a bag carrying a `timeZone`). The flag selects the tighter ±nsMaxInstant epoch
+    /// bound (vs the PlainDateTime ±(nsMaxInstant+nsPerDay) bound) for range checks.
+    pub(crate) fn relative_to_dt(&mut self, rel: Value) -> Result<([i64; 9], bool), Thrown> {
+        let mut is_zoned = false;
         if rel.is_heap() {
             if matches!(self.heap.get(rel.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
-                return Ok(self.zdt_local(rel.heap_index()));
+                return Ok((self.zdt_local(rel.heap_index()), true));
             }
             // A property bag carrying a `timeZone` is a ZonedDateTime-like: the
             // time zone is validated (a non-string/non-object is a TypeError, an
@@ -2237,6 +2254,7 @@ impl<'p> Vm<'p> {
                 if tz != Value::UNDEFINED {
                     self.parse_tz_arg(tz)?;
                     self.validate_bag_offset_field(rel)?;
+                    is_zoned = true;
                 }
             }
         }
@@ -2276,12 +2294,13 @@ impl<'p> Vm<'p> {
                         "RangeError: the relativeTo offset does not match the time zone in '{s}'"
                     )));
                 }
-                return Ok(f);
+                return Ok((f, true));
             }
-            return parse_iso_datetime(main)
-                .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
+            let f = parse_iso_datetime(main)
+                .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")))?;
+            return Ok((f, false));
         }
-        self.to_plain_date_time(rel)
+        Ok((self.to_plain_date_time(rel)?, is_zoned))
     }
 
     /// Validate a ZonedDateTime-like property bag's `offset` field: if present it
@@ -2331,13 +2350,17 @@ impl<'p> Vm<'p> {
         let order = |a: i128, b: i128| if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 };
         // GetTemporalRelativeToOption parses/validates the relativeTo (throwing on an
         // invalid string) BEFORE the identical-slots short-circuit below.
-        let start = if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
+        let start =
+            if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
         // Two durations with identical internal slots compare equal (+0) — even with
         // calendar units and no relativeTo (the relativeTo requirement is skipped).
         if fa == fb {
             return Ok(0.0);
         }
-        if let Some(start) = start {
+        if let Some((start, zoned)) = start {
+            // Both anchored end-points must be representable.
+            check_relative_target(start, fa, zoned)?;
+            check_relative_target(start, fb, zoned)?;
             let e1 = dt_epoch_ns(dt_add_dur(start, fa));
             let e2 = dt_epoch_ns(dt_add_dur(start, fb));
             return Ok(order(e1, e2));
@@ -3507,6 +3530,30 @@ fn dt_add_dur(start: [i64; 9], f: [i64; 10]) -> [i64; 9] {
 fn dt_epoch_ns(dt: [i64; 9]) -> i128 {
     (iso_to_epoch_days(dt[0], dt[1], dt[2]) as i128) * DAY_NS
         + time_to_ns(&[dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]])
+}
+
+/// Range-check the instant after adding duration `f` to a `relativeTo` anchor (the
+/// target of Duration.prototype.total / round). The result must be representable:
+/// a ZonedDateTime anchor uses the tight inclusive ±nsMaxInstant epoch bound (and
+/// its own start is checked too — a string/bag ZDT anchor is not constructor-checked);
+/// a Plain anchor uses ISODateTimeWithinLimits on the target only (its start is a
+/// valid PlainDate/PlainDateTime by parse, possibly at the day-granular min boundary
+/// that the nanosecond datetime bound would wrongly reject).
+fn check_relative_target(start: [i64; 9], f: [i64; 10], is_zoned: bool) -> Result<(), Thrown> {
+    let end = dt_add_dur(start, f);
+    let ok = if is_zoned {
+        // ZonedDateTime: the tight inclusive epoch bound (IsValidEpochNanoseconds).
+        dt_epoch_ns(start).abs() <= NS_MAX_INSTANT && dt_epoch_ns(end).abs() <= NS_MAX_INSTANT
+    } else {
+        // Plain: the inclusive datetime bound (±(nsMaxInstant + nsPerDay)). Inclusive so
+        // the day-granular min/max date anchors (e.g. -271821-04-19T00:00:00, exactly at
+        // the boundary) are accepted, while genuine overflows still fail.
+        dt_epoch_ns(end).abs() <= NS_MAX_INSTANT + DAY_NS
+    };
+    if !ok {
+        return Err(Thrown("RangeError: Temporal result is outside the representable range".into()));
+    }
+    Ok(())
 }
 
 /// `nsMaxInstant` — the inclusive epoch-nanosecond bound of `Temporal.Instant`
