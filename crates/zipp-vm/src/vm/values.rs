@@ -492,6 +492,20 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// thisBigIntValue(v): the i128 of a BigInt primitive OR a boxed BigInt wrapper
+    /// (`Object(1n)`, a Boxed of kind 4); `None` otherwise. Backs
+    /// BigInt.prototype.{toString,valueOf}, which accept the wrapper object.
+    pub(crate) fn this_bigint_value(&self, v: Value) -> Option<i128> {
+        if v.is_heap() {
+            match self.heap.get(v.heap_index()) {
+                HeapObj::BigInt(n) => return Some(*n),
+                HeapObj::Boxed { kind: 4, value } => return self.bigint_value(*value),
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// `ToBigInt(v)` (used by `BigInt(x)`, asIntN/asUintN, and `==`). A non-integer
     /// number → RangeError; symbol/null/undefined/object → TypeError; a bad numeric
     /// string → SyntaxError.
@@ -502,18 +516,12 @@ impl<'p> Vm<'p> {
         if v.is_bool() {
             return Ok(if v.as_bool() { 1 } else { 0 });
         }
-        if v.is_int() {
-            return Ok(v.as_int() as i128);
-        }
-        if v.is_double() {
-            let d = v.as_f64();
-            if !d.is_finite() || d.fract() != 0.0 {
-                return Err(Thrown(
-                    "RangeError: The number is not a safe integer and cannot be converted to a BigInt"
-                        .into(),
-                ));
-            }
-            return Ok(d as i128);
+        // ToBigInt of a Number is a TypeError — a Number is only accepted by the
+        // BigInt() constructor's NumberToBigInt step (see `bigint_from`). This covers
+        // a boxed Number and an object whose ToPrimitive yields a Number (via the
+        // object branch below), not just a bare numeric literal.
+        if v.is_number() {
+            return Err(Thrown("TypeError: Cannot convert a Number to a BigInt".into()));
         }
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
@@ -533,6 +541,29 @@ impl<'p> Vm<'p> {
             return self.to_bigint(prim);
         }
         Err(Thrown("TypeError: Cannot convert this value to a BigInt".into()))
+    }
+
+    /// The `BigInt(value)` constructor coercion (NOT the abstract ToBigInt): the
+    /// value is taken through ToPrimitive(number); an integral Number is accepted
+    /// via NumberToBigInt (a non-integral Number is a RangeError), and any other
+    /// primitive falls through to the strict ToBigInt (Boolean/String/BigInt).
+    pub(crate) fn bigint_from(&mut self, v: Value) -> Result<i128, Thrown> {
+        let prim = if self.is_object_value(v) {
+            self.to_primitive_number(v)?
+        } else {
+            v
+        };
+        if prim.is_number() {
+            let d = prim.as_f64();
+            if !d.is_finite() || d.fract() != 0.0 {
+                return Err(Thrown(
+                    "RangeError: The number is not a safe integer and cannot be converted to a BigInt"
+                        .into(),
+                ));
+            }
+            return Ok(d as i128);
+        }
+        self.to_bigint(prim)
     }
 
     /// Build a RegExp from a pattern value + flags value (`/x/g`, `new RegExp(p,f)`).

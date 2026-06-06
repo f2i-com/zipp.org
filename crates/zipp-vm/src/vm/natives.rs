@@ -348,7 +348,7 @@ impl<'p> Vm<'p> {
                 }
             }
             BIGINT_TO_STRING => {
-                let n = match self.bigint_value(this) {
+                let n = match self.this_bigint_value(this) {
                     Some(n) => n,
                     None => {
                         return Err(Thrown(
@@ -356,19 +356,23 @@ impl<'p> Vm<'p> {
                         ))
                     }
                 };
-                let radix = if a0 == Value::UNDEFINED { 10 } else { self.to_number(a0)? as i64 };
+                // radix = ToIntegerOrInfinity(arg): ToNumber first, so a BigInt or
+                // Symbol radix is a TypeError (the lenient `to_number` would accept a
+                // BigInt). The this-value's brand check above still comes first.
+                let radix = if a0 == Value::UNDEFINED { 10 } else { self.to_number_strict(a0)? as i64 };
                 if !(2..=36).contains(&radix) {
                     return Err(Thrown("RangeError: toString() radix must be between 2 and 36".into()));
                 }
                 self.alloc_str(bigint_to_radix(n, radix as u32))
             }
             BIGINT_VALUE_OF => {
-                if self.bigint_value(this).is_some() {
-                    this
-                } else {
-                    return Err(Thrown(
-                        "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt".into(),
-                    ));
+                match self.this_bigint_value(this) {
+                    Some(n) => self.make_bigint(n),
+                    None => {
+                        return Err(Thrown(
+                            "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt".into(),
+                        ))
+                    }
                 }
             }
             BIGINT_AS_INTN | BIGINT_AS_UINTN => {

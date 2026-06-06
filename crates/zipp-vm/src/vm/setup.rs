@@ -903,8 +903,13 @@ impl<'p> Vm<'p> {
             m.define("length", Value::num(1.0), fn_attr);
             let bigint_ctor = self.heap.alloc(HeapObj::Object(m));
             self.bigint_ctor = bigint_ctor;
+            // BigInt.prototype[@@toStringTag] === "BigInt" (a non-writable,
+            // non-enumerable, configurable own data property), so Object.prototype
+            // .toString.call(1n) is "[object BigInt]".
+            let tag_v = self.alloc_str("BigInt".to_string());
             if let HeapObj::Object(p) = self.heap.get_mut(bigint_proto) {
                 p.define("constructor", Value::heap(bigint_ctor), method_attr);
+                p.define("@@toStringTag", tag_v, fn_attr);
             }
         }
         // `RegExp` (constructable; `new RegExp`/`/x/` literals lower to NewRegExp).

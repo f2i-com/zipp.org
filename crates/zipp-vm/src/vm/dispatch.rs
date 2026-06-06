@@ -1923,7 +1923,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::BigIntFrom { dst, arg } => {
                         let a = self.get(base, arg);
-                        let n = self.to_bigint(a)?;
+                        let n = self.bigint_from(a)?;
                         let v = self.make_bigint(n);
                         self.set(base, dst, v);
                         ip += 1;
