@@ -2187,7 +2187,9 @@ impl<'p> Vm<'p> {
                         "TypeError: PlainYearMonth-like requires year and month".into(),
                     ));
                 }
-                let y = self.to_number(yv)? as i64;
+                // ToIntegerWithTruncation: reject a non-finite (NaN/±Infinity) year
+                // and run the observable ToPrimitive (not the non-`&mut` to_number).
+                let y = self.temporal_ctor_int(yv)?;
                 let mut m = m.unwrap();
                 if reject {
                     if !(1..=12).contains(&m) {
@@ -2419,14 +2421,18 @@ impl<'p> Vm<'p> {
             if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
                 let m = self.read_month_field(v)?;
-                let dv = self.get_prop(v, "day")?;
-                if m.is_none() || dv == Value::UNDEFINED {
+                let d_opt = self.opt_int_field(v, "day")?;
+                // The reference `year` field is read (and finite-checked, rejecting
+                // ±Infinity/NaN) even though this ISO engine always stores 1972 as
+                // the reference ISO year.
+                let _year = self.opt_int_field(v, "year")?;
+                if m.is_none() || d_opt.is_none() {
                     return Err(Thrown(
                         "TypeError: PlainMonthDay-like requires month and day".into(),
                     ));
                 }
                 let mut m = m.unwrap();
-                let mut d = self.to_number(dv)? as i64;
+                let mut d = d_opt.unwrap();
                 if reject {
                     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
                         return Err(Thrown("RangeError: month-day out of range".into()));
