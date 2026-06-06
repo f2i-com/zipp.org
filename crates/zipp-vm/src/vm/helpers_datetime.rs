@@ -466,6 +466,13 @@ pub(crate) fn parse_iso_year_month(s: &str) -> Option<(i64, i64, i64)> {
     if !(1..=12).contains(&m) {
         return None;
     }
+    // Only a bare year-month reaches this fallback (a fuller date/time form is caught
+    // by parse_iso_date earlier); anything after MM other than a "[…]" annotation
+    // (e.g. an offset, fractional time, or trailing junk) makes the string invalid.
+    let rem = &after[2..];
+    if !rem.is_empty() && !rem.starts_with('[') {
+        return None;
+    }
     Some((y, m, 1))
 }
 
@@ -489,6 +496,12 @@ pub(crate) fn parse_iso_month_day(s: &str) -> Option<(i64, i64, i64)> {
     }
     let d = after[..2].parse::<i64>().ok()?;
     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
+        return None;
+    }
+    // Only a bare month-day reaches this fallback; anything after DD other than a
+    // "[…]" annotation makes the string invalid (offset / fractional / junk).
+    let rem = &after[2..];
+    if !rem.is_empty() && !rem.starts_with('[') {
         return None;
     }
     Some((1972, m, d))
