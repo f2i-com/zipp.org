@@ -1791,17 +1791,21 @@ impl<'p> Vm<'p> {
                     "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
                     "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
                 ];
-                let smallest = normalize_unit(
-                    &self.opt_string(opts, "smallestUnit", "nanosecond", all_units)?,
-                    "nanosecond",
-                );
-                let largest_raw =
-                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", all_units)?, "auto");
                 let order = [
                     "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
                     "microsecond", "nanosecond",
                 ];
                 let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(9);
+                // GetDifferenceSettings order: largestUnit, roundingIncrement, roundingMode,
+                // smallestUnit — resolve "auto" + validate only after all four are read.
+                let largest_raw =
+                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", all_units)?, "auto");
+                let inc = self.read_rounding_increment(opts)?;
+                let mode = self.read_rounding_mode(opts, "trunc")?;
+                let smallest = normalize_unit(
+                    &self.opt_string(opts, "smallestUnit", "nanosecond", all_units)?,
+                    "nanosecond",
+                );
                 let largest = if largest_raw == "auto" {
                     if rank(&smallest) < rank("hour") { smallest.clone() } else { "hour".to_string() }
                 } else {
@@ -1812,8 +1816,6 @@ impl<'p> Vm<'p> {
                         "RangeError: smallestUnit is larger than largestUnit".into(),
                     ));
                 }
-                let inc = self.read_rounding_increment(opts)?;
-                let mode = self.read_rounding_mode(opts, "trunc")?;
                 // A time-unit increment must evenly divide its next-highest unit
                 // (day/week/month/year carry no per-unit bound here).
                 if let Some(max) = max_increment(&smallest) {
@@ -2356,7 +2358,7 @@ impl<'p> Vm<'p> {
                     let (_, off) = self.parse_tz_arg(tz_v)?;
                     (off, format_offset(off))
                 };
-                let rounded = round_increment(ns, unit, &mode);
+                let rounded = round_increment_as_if_positive(ns, unit, &mode);
                 let local = rounded + offset as i128;
                 let t = ns_to_time(local.rem_euclid(DAY_NS));
                 let (y, mo, d) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
@@ -2416,7 +2418,7 @@ impl<'p> Vm<'p> {
                         "RangeError: roundingIncrement does not divide evenly into a day".into(),
                     ));
                 }
-                let rounded = round_increment(ns, inc_ns, &mode);
+                let rounded = round_increment_as_if_positive(ns, inc_ns, &mode);
                 Ok(Some(self.make_instant(rounded)?))
             }
             _ => Ok(None),

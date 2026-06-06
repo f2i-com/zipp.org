@@ -782,6 +782,10 @@ impl<'p> Vm<'p> {
                     // A class value renders as its whole `class … { … }` source.
                     HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
                     HeapObj::Native(_) | HeapObj::Bound { .. } => None,
+                    // A constructor global (Array, Date, Temporal.Instant, …) is stored
+                    // as an is_ctor Object — it is callable and `typeof` "function", so it
+                    // renders in the `[native code]` form rather than throwing.
+                    HeapObj::Object(m) if m.is_ctor => None,
                     // A callable Proxy (its target is callable) is a function for
                     // toString purposes — render the `[native code]` form, not throw.
                     HeapObj::Proxy { target, revoked, .. }

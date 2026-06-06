@@ -990,6 +990,24 @@ pub(crate) fn round_increment(value: i128, inc: i128, mode: &str) -> i128 {
     }
 }
 
+/// RoundNumberToIncrementAsIfPositive: round `value` to a multiple of `inc`,
+/// applying the rounding mode as if `value` were positive — so `trunc` behaves
+/// like `floor` and `expand` like `ceil` regardless of sign ("rounding down is
+/// toward the Big Bang, not the epoch"). Used when rounding an ABSOLUTE point on
+/// the timeline (Temporal.Instant round/toString), as opposed to rounding a
+/// duration (which uses the sign-relative `round_increment`). Implemented by
+/// remapping the sign-relative modes to their absolute ceil/floor equivalents.
+pub(crate) fn round_increment_as_if_positive(value: i128, inc: i128, mode: &str) -> i128 {
+    let m = match mode {
+        "expand" => "ceil",
+        "trunc" => "floor",
+        "halfExpand" => "halfCeil",
+        "halfTrunc" => "halfFloor",
+        other => other,
+    };
+    round_increment(value, inc, m)
+}
+
 /// Round a value lying at fractional position `progress` (0..1) between `lower`
 /// and `lower+sign` to one of the two, per a Temporal roundingMode. `lower` is
 /// the toward-zero neighbour; `progress==0` means the value is exactly `lower`.

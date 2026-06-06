@@ -266,7 +266,12 @@ impl<'p> Vm<'p> {
             "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
         ];
         let small_allowed = &largest_allowed[1..]; // same minus "auto"
+        // GetDifferenceSettings reads the options in this exact order: largestUnit,
+        // roundingIncrement, roundingMode, then smallestUnit — and only AFTER all four
+        // are read does it resolve an "auto" largestUnit and run the range validations.
         let lu_raw = self.opt_string(options, "largestUnit", "auto", &largest_allowed)?;
+        let inc = self.read_rounding_increment(options)?;
+        let mode = self.read_rounding_mode(options, "trunc")?;
         let su = normalize_unit(
             &self.opt_string(options, "smallestUnit", "nanosecond", small_allowed)?,
             "nanosecond",
@@ -279,8 +284,6 @@ impl<'p> Vm<'p> {
         } else {
             normalize_unit(&lu_raw, default_largest)
         };
-        let inc = self.read_rounding_increment(options)?;
-        let mode = self.read_rounding_mode(options, "trunc")?;
         if rank(&lu) > rank(&su) {
             return Err(Thrown(
                 "RangeError: largestUnit must not be smaller than smallestUnit".into(),
