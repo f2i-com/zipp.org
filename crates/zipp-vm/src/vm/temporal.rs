@@ -227,7 +227,7 @@ impl<'p> Vm<'p> {
                 if let Some((start, zoned)) = anchor {
                     check_relative_target(start, f, zoned)?;
                     if needs_cal {
-                        return Ok(Some(Value::num(duration_total_relative(f, start, &unit))));
+                        return Ok(Some(Value::num(duration_total_relative(f, start, &unit)?)));
                     }
                 }
                 let total_ns = (f[3] as i128) * DAY_NS
@@ -3665,7 +3665,7 @@ fn round_relative_datetime_diff(
 
 /// `Duration.total(unit)` relative to a start date-time: the (possibly fractional)
 /// total of the duration measured in `unit`, computed via the calendar at `start`.
-fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> f64 {
+fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> Result<f64, Thrown> {
     let end_ns = dt_epoch_ns(dt_add_dur(start, f));
     let start_ns = dt_epoch_ns(start);
     let diff = end_ns - start_ns;
@@ -3691,26 +3691,40 @@ fn duration_total_relative(f: [i64; 10], start: [i64; 9], unit: &str) -> f64 {
                 }
                 whole += sign;
             }
+            // NudgeToCalendarUnit brackets the duration between `whole` and `whole+sign`
+            // calendar units from the anchor (both via CalendarDateAdd). The FAR bracket
+            // (past the duration's end) is the one that can exceed the date range; it
+            // must be representable (inclusive ±(nsMaxInstant+nsPerDay), so the
+            // day-granular min/max date boundary itself is still accepted).
+            let far = dt_add_dur(start, units(whole + sign));
+            if dt_epoch_ns(far).abs() > NS_MAX_INSTANT + DAY_NS {
+                return Err(Thrown(
+                    "RangeError: Temporal result is outside the representable range".into(),
+                ));
+            }
             // The fraction is the signed progress over the anchor-based unit length.
             let lower_ns = dt_epoch_ns(dt_add_dur(start, units(whole)));
-            let upper_ns = dt_epoch_ns(dt_add_dur(start, units(whole + sign)));
+            let upper_ns = dt_epoch_ns(far);
             if upper_ns != lower_ns {
                 // whole + sign·(end-lower)/(upper-lower) as one correctly-rounded
                 // rational, so the final addition can't round the wrong way.
                 let span = upper_ns - lower_ns;
-                rational_to_f64(whole as i128 * span + sign as i128 * (end_ns - lower_ns), span)
+                Ok(rational_to_f64(
+                    whole as i128 * span + sign as i128 * (end_ns - lower_ns),
+                    span,
+                ))
             } else {
-                whole as f64
+                Ok(whole as f64)
             }
         }
         "week" => {
             // One correctly-rounded division of the exact total (the naive
             // whole+remainder split is still 1 ULP off in some cases).
-            rational_to_f64(diff, 7 * DAY_NS)
+            Ok(rational_to_f64(diff, 7 * DAY_NS))
         }
         _ => {
             // Same for a fixed-length unit (day/hour/…/ns).
-            rational_to_f64(diff, unit_ns(unit))
+            Ok(rational_to_f64(diff, unit_ns(unit)))
         }
     }
 }
