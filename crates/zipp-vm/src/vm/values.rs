@@ -77,15 +77,14 @@ impl<'p> Vm<'p> {
                     }
                 });
                 if let Some(i) = int_index {
-                    if i >= len {
-                        return false;
-                    }
                     // An in-range slot is present iff it is not a hole.
-                    if !items[i].is_hole() {
+                    if i < len && !items[i].is_hole() {
                         return true;
                     }
-                    // A hole is absent unless overridden (a defineProperty'd index in
-                    // arr_props) or inherited from the prototype chain.
+                    // A hole OR an out-of-range index is not an own element, but it may
+                    // be overridden (a defineProperty'd index in arr_props) or inherited
+                    // from the prototype chain — [[HasProperty]] must keep walking (an
+                    // out-of-range `i` was previously reported absent without this check).
                     let k = self.key_of(key);
                     if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
                         return true;

@@ -1631,9 +1631,21 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(snapshot)))))
             }
             "toReversed" => {
-                let mut snapshot = self.array_snapshot_get(idx)?;
-                snapshot.reverse();
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(snapshot)))))
+                // Read in SPEC order: out[k] = Get(O, len-k-1). A snapshot-then-reverse
+                // would read indices ascending, but a getter's side effect (e.g. it
+                // shrinks the array) makes the read order observable, so the descending
+                // `from` sequence must be honoured.
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => 0,
+                };
+                let this = Value::heap(idx);
+                let mut out = Vec::with_capacity(len);
+                for k in 0..len {
+                    let from = len - k - 1;
+                    out.push(self.array_iter_get(this, from)?.unwrap_or(Value::UNDEFINED));
+                }
+                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
             }
             "splice" => {
                 // splice(start, deleteCount?, ...items): mutate in place, return
