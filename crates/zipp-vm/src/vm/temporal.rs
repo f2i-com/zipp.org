@@ -455,8 +455,11 @@ impl<'p> Vm<'p> {
         if fsd_v == Value::UNDEFINED {
             return Ok((1, -1, false, mode));
         }
-        // A string value must be exactly "auto"; otherwise it is a Number 0..9.
-        if fsd_v.is_heap() && self.heap.is_str_like(fsd_v.heap_index()) {
+        // GetStringOrNumberOption dispatches on the RAW type, not coercibility: a
+        // genuine Number is floored into 0..9; anything else (string/null/boolean/
+        // bigint/object) is ToString'd and must equal exactly "auto" (a Symbol
+        // ToString throws TypeError inside to_js_string).
+        if !fsd_v.is_number() {
             if self.to_js_string(fsd_v)? == "auto" {
                 return Ok((1, -1, false, mode));
             }
@@ -466,7 +469,7 @@ impl<'p> Vm<'p> {
         if n.is_nan() {
             return Err(Thrown("RangeError: fractionalSecondDigits is NaN".into()));
         }
-        let n = n.trunc() as i64;
+        let n = n.floor() as i64;
         if !(0..=9).contains(&n) {
             return Err(Thrown("RangeError: fractionalSecondDigits out of range".into()));
         }
@@ -551,8 +554,14 @@ impl<'p> Vm<'p> {
                         return Err(Thrown("RangeError: invalid date fields".into()));
                     }
                 } else {
-                    m = m.clamp(1, 12);
-                    d = d.clamp(1, days_in_month(y, m));
+                    // "constrain" clamps only the UPPER bound; a month/day below 1 is
+                    // a hard floor that always rejects (RegulateISODate is reached only
+                    // after the fields are validated >= 1).
+                    if m < 1 || d < 1 {
+                        return Err(Thrown("RangeError: invalid date fields".into()));
+                    }
+                    m = m.min(12);
+                    d = d.min(days_in_month(y, m));
                 }
                 if !iso_date_in_range(y, m, d) {
                     return Err(Thrown("RangeError: date is outside the representable range".into()));
@@ -1080,6 +1089,22 @@ impl<'p> Vm<'p> {
         self.to_plain_date_time_overflow(v, false)
     }
 
+    /// Like `to_plain_date_time` but enforces ISODateTimeWithinLimits on the
+    /// result — required by compare/equals/since/until, whose argument must be a
+    /// representable PlainDateTime. The constructor/from() bound this via
+    /// `make_plain_date_time`; these methods reach the parsed fields directly.
+    /// NOT used by the `relativeTo` path, where a bare date string is a
+    /// day-granular PlainDate (so the minimum -271821-04-19 midnight stays valid).
+    pub(crate) fn to_plain_date_time_limited(&mut self, v: Value) -> Result<[i64; 9], Thrown> {
+        let f = self.to_plain_date_time(v)?;
+        if !iso_datetime_ns_in_range(f) {
+            return Err(Thrown(
+                "RangeError: date-time is outside the representable range".into(),
+            ));
+        }
+        Ok(f)
+    }
+
     pub(crate) fn to_plain_date_time_overflow(
         &mut self,
         v: Value,
@@ -1139,8 +1164,13 @@ impl<'p> Vm<'p> {
                         }
                     }
                 } else {
-                    f[1] = f[1].clamp(1, 12);
-                    f[2] = f[2].clamp(1, days_in_month(f[0], f[1]));
+                    // "constrain" clamps only the upper bound; month/day below 1 is a
+                    // hard floor that rejects (time fields legitimately clamp up from 0).
+                    if f[1] < 1 || f[2] < 1 {
+                        return Err(Thrown("RangeError: invalid date fields".into()));
+                    }
+                    f[1] = f[1].min(12);
+                    f[2] = f[2].min(days_in_month(f[0], f[1]));
                     for (i, &mx) in maxes.iter().enumerate() {
                         f[3 + i] = f[3 + i].clamp(0, mx);
                     }
@@ -1184,7 +1214,7 @@ impl<'p> Vm<'p> {
                 Err(Thrown("TypeError: Called Temporal.PlainDateTime.prototype.valueOf".into()))
             }
             "equals" => {
-                let o = self.to_plain_date_time(a0)?;
+                let o = self.to_plain_date_time_limited(a0)?;
                 Ok(Some(Value::bool(f == o)))
             }
             "toPlainDate" => Ok(Some(self.make_plain_date(date[0], date[1], date[2])?)),
@@ -1271,7 +1301,7 @@ impl<'p> Vm<'p> {
                 ])?))
             }
             "until" | "since" => {
-                let o = self.to_plain_date_time(a0)?;
+                let o = self.to_plain_date_time_limited(a0)?;
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
                     return Err(Thrown("TypeError: options must be an object or undefined".into()));
@@ -2225,7 +2255,11 @@ impl<'p> Vm<'p> {
                         return Err(Thrown("RangeError: month out of range".into()));
                     }
                 } else {
-                    m = m.clamp(1, 12);
+                    // "constrain" clamps only the upper bound; month < 1 always rejects.
+                    if m < 1 {
+                        return Err(Thrown("RangeError: month out of range".into()));
+                    }
+                    m = m.min(12);
                 }
                 if !iso_year_month_in_range(y, m) {
                     return Err(Thrown(
@@ -2309,6 +2343,23 @@ impl<'p> Vm<'p> {
         // A non-string primitive (null/boolean/number) is a TypeError, not a
         // bad calendar string.
         Err(Thrown("TypeError: value is not a valid calendar".into()))
+    }
+
+    /// A Temporal *constructor*'s calendar argument must be a bare calendar
+    /// IDENTIFIER ("iso8601", ASCII-case-insensitive) — NOT a full ISO date /
+    /// annotated string. (Those are only accepted by `withCalendar` and the
+    /// property-bag `calendar` field, which keep using `validate_calendar_value`.)
+    /// Non-string cases are identical to the general validator.
+    pub(crate) fn validate_calendar_identifier(&mut self, cv: Value) -> Result<(), Thrown> {
+        if cv.is_heap() && self.heap.is_str_like(cv.heap_index()) {
+            let s = self.heap.str_cow(cv.heap_index()).unwrap().into_owned();
+            return if s.trim().eq_ignore_ascii_case("iso8601") {
+                Ok(())
+            } else {
+                Err(Thrown(format!("RangeError: \"{s}\" is not a valid calendar identifier")))
+            };
+        }
+        self.validate_calendar_value(cv)
     }
 
     pub(crate) fn plain_year_month_method(
@@ -2499,8 +2550,12 @@ impl<'p> Vm<'p> {
                         return Err(Thrown("RangeError: month-day out of range".into()));
                     }
                 } else {
-                    m = m.clamp(1, 12);
-                    d = d.clamp(1, days_in_month(1972, m));
+                    // "constrain" clamps only the upper bound; month/day below 1 rejects.
+                    if m < 1 || d < 1 {
+                        return Err(Thrown("RangeError: month-day out of range".into()));
+                    }
+                    m = m.min(12);
+                    d = d.min(days_in_month(1972, m));
                 }
                 return Ok((1972, m, d));
             }

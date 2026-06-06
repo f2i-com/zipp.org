@@ -2226,8 +2226,8 @@ impl<'p> Vm<'p> {
                 self.make_plain_date_time(f)?
             }
             PLAINDATETIME_COMPARE => {
-                let a = self.to_plain_date_time(a0)?;
-                let b = self.to_plain_date_time(a1)?;
+                let a = self.to_plain_date_time_limited(a0)?;
+                let b = self.to_plain_date_time_limited(a1)?;
                 let an = iso_to_epoch_days(a[0], a[1], a[2]) as i128 * 86_400_000_000_000
                     + time_to_ns(&[a[3], a[4], a[5], a[6], a[7], a[8]]);
                 let bn = iso_to_epoch_days(b[0], b[1], b[2]) as i128 * 86_400_000_000_000
