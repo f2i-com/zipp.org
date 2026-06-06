@@ -2357,16 +2357,20 @@ impl<'p> Vm<'p> {
                 let _ = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign = if name == "add" { 1 } else { -1 };
                 let op_sign = sign * Self::duration_sign(&dur);
-                // Spec AddDurationToYearMonth: the intermediate ISO date (Day = 1) must
-                // be within the day-granular ISO date limits, so every op on the
-                // minimum -271821-04 (Day 1 < 19) throws. A negative duration with
-                // sub-month units (weeks/days/time) additionally materialises the
-                // end-of-month reference date, which for the maximum +275760-09 is
-                // Day 30 > 13 → out of range; pure year/month ops never do.
-                let has_subday = dur[2..].iter().any(|&x| x != 0);
-                if !iso_date_in_range(y, m, 1)
-                    || (op_sign < 0 && has_subday && !iso_date_in_range(y, m, days_in_month(y, m)))
-                {
+                // A PlainYearMonth carries no day, so any unit smaller than a month
+                // (weeks/days/time) is unrepresentable: ToDateDurationRecordWithoutTime
+                // rejects a nonzero sub-month remainder → RangeError, regardless of
+                // sign, overflow option, or whether the result would land in range.
+                // (This subsumes the old end-of-month overflow check for the maximum.)
+                if dur[2..].iter().any(|&x| x != 0) {
+                    return Err(Thrown(
+                        "RangeError: PlainYearMonth.prototype.add/subtract does not accept units smaller than months".into(),
+                    ));
+                }
+                // The intermediate ISO date (Day = 1) must still be within the
+                // day-granular ISO limits, so every op on the minimum -271821-04
+                // (whose Day 1 = -271821-04-01 < the min ISO date -271821-04-19) throws.
+                if !iso_date_in_range(y, m, 1) {
                     return Err(Thrown(
                         "RangeError: PlainYearMonth is outside the valid ISO date range".into(),
                     ));
