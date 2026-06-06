@@ -1984,6 +1984,15 @@ impl<'p> Vm<'p> {
                 return Ok(self.alloc_zdt(local - offset as i128, offset, id));
             }
         }
+        // An Object was handled above; only a String is parseable. Any other value —
+        // a non-string primitive (number/bigint/boolean/null/undefined) or a non-string
+        // heap value (Symbol) — is a TypeError per ToTemporalZonedDateTime, NOT a failed
+        // string parse (RangeError). This also precedes reading the options bag.
+        if !(item.is_heap() && self.heap.is_str_like(item.heap_index())) {
+            return Err(Thrown(
+                "TypeError: ZonedDateTime.from argument must be an object or string".into(),
+            ));
+        }
         let s = self.to_js_string(item)?;
         let _ = self.read_zdt_options(options)?;
         if !temporal_string_ok(&s, false, true) {

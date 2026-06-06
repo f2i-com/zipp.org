@@ -397,13 +397,15 @@ impl<'p> Vm<'p> {
                     Instr::ToNum { dst, a } => {
                         let va = self.get(base, a);
                         // `+x`: numbers pass through (keep Int tag); `+bigint` throws
-                        // (unary plus is not defined on BigInt); else ToNumber.
+                        // (unary plus is not defined on BigInt); else ToNumber STRICT —
+                        // a BigInt reached via ToPrimitive (a boxed `Object(1n)`, or an
+                        // object whose valueOf returns a BigInt) is also a TypeError.
                         let r = if va.is_number() {
                             va
                         } else if self.bigint_value(va).is_some() {
                             return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
                         } else {
-                            Value::num(self.to_number_coerce(va)?)
+                            Value::num(self.to_number_strict(va)?)
                         };
                         self.set(base, dst, r);
                         ip += 1;
