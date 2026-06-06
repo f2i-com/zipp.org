@@ -3736,6 +3736,16 @@ impl<'a> FnCompiler<'a> {
                         let ke = p.key.as_expression().ok_or("unsupported computed object key")?;
                         let key = self.expr(ke)?;
                         let v = self.expr(&p.value)?;
+                        // A computed concise method `{ [expr](){} }` (incl. `*`/`async`):
+                        // its toString is the whole `[expr](){}` — the value-Function span
+                        // omits the computed key + modifiers, so patch it with the
+                        // ObjectProperty span (mirrors the static-key method branch below).
+                        if p.method {
+                            let fid = self.cx.functions.len() - 1;
+                            self.cx.functions[fid].source =
+                                self.cx.src_slice(p.span.start, p.span.end);
+                            self.cx.functions[fid].non_constructable = true;
+                        }
                         // SetFunctionName: an anonymous function/arrow/class value
                         // takes the (runtime) computed key as its name — a Symbol key
                         // becomes "[description]".
