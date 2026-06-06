@@ -605,6 +605,8 @@ impl<'p> Vm<'p> {
             if proto.is_heap() {
                 self.proto_of.insert(obj.heap_index(), proto);
             }
+            // `new.target` for the constructor body (the next frame entered).
+            self.pending_new_target = new_target;
             let ret = self.call_value(cv, obj, args)?;
             // A constructor that returns ANY object (TypedArray/Map/Date/… too, not
             // just a plain object/array) replaces the new instance with it.
@@ -637,6 +639,8 @@ impl<'p> Vm<'p> {
             // returns an object/array replaces the instance.
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
+                // `new.target` for the class constructor body (the next frame entered).
+                self.pending_new_target = new_target;
                 let result = self.call_value(f, obj, args);
                 // Capture + clear the super() signal BEFORE propagating any throw,
                 // so a constructor that threw never leaves a stale entry (the heap
@@ -668,7 +672,7 @@ impl<'p> Vm<'p> {
             // No own constructor: run the parent's ctor (implicit `super(...args)`)
             // then this class's field initializers.
             if let Some(pidx) = parent {
-                self.run_class_ctor(Value::heap(pidx), obj, args)?;
+                self.run_class_ctor(Value::heap(pidx), obj, args, new_target)?;
             }
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
@@ -991,7 +995,7 @@ impl<'p> Vm<'p> {
     /// Run a class's constructor contribution on an existing instance `obj` —
     /// for `super(...)` and the implicit-super chain. An explicit ctor runs its
     /// own `super`; an implicit one runs the parent chain then its fields.
-    pub(crate) fn run_class_ctor(&mut self, cval: Value, obj: Value, args: &[Value]) -> Result<(), Thrown> {
+    pub(crate) fn run_class_ctor(&mut self, cval: Value, obj: Value, args: &[Value], new_target: Value) -> Result<(), Thrown> {
         if !cval.is_heap() {
             return Ok(());
         }
@@ -1036,14 +1040,17 @@ impl<'p> Vm<'p> {
         if has_explicit {
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
+                // `new.target` propagates unchanged through super() to the parent ctor.
+                self.pending_new_target = new_target;
                 self.call_value(f, obj, args)?;
             }
         } else {
             if let Some(pidx) = parent {
-                self.run_class_ctor(Value::heap(pidx), obj, args)?;
+                self.run_class_ctor(Value::heap(pidx), obj, args, new_target)?;
             }
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
+                self.pending_new_target = new_target;
                 self.call_value(f, obj, &[])?;
             }
         }

@@ -362,6 +362,11 @@ struct Compiler {
     /// Global slots bound by a top-level `const` (immutable): assignment to one
     /// is a runtime TypeError.
     const_globals: HashSet<u32>,
+    /// True while compiling code where `new.target` is syntactically allowed —
+    /// inside an ordinary function/method/constructor/class-field body, and
+    /// inherited by nested arrows. False at the top level of a script or eval (a
+    /// `new.target` there is an early SyntaxError). Saved/restored per function.
+    new_target_ok: bool,
 }
 
 impl Compiler {
@@ -375,6 +380,7 @@ impl Compiler {
             source,
             eval_mode: false,
             in_strict: false,
+            new_target_ok: false,
             class_enclosing: Vec::new(),
             class_derived: false,
             const_globals: HashSet::new(),
@@ -486,6 +492,10 @@ impl Compiler {
         // body so nested functions/arrows inherit it; restore the parent's after.
         let parent_strict = self.in_strict;
         let is_strict = parent_strict || has_use_strict(directives);
+        // `new.target` is allowed inside an ordinary function, not at script/eval
+        // top level; nested arrows inherit this. Restored at the end.
+        let parent_nt = self.new_target_ok;
+        self.new_target_ok = !is_script;
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = is_strict;
         fc.is_script = is_script;
@@ -552,6 +562,7 @@ impl Compiler {
             fc.stmt(s)?;
         }
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
+        fc.cx.new_target_ok = parent_nt;
         // An eval script returns its accumulated completion value; everything else
         // returns undefined.
         if let Some(cr) = fc.completion_reg {
@@ -620,6 +631,9 @@ impl Compiler {
         // resolves to an upvalue (not a global). `MakeClass` builds the per-method
         // closures at runtime. Empty at script level → free vars stay globals.
         let enclosing = self.class_enclosing.clone();
+        // `new.target` is allowed in a class method/ctor/field-init body.
+        let parent_nt = self.new_target_ok;
+        self.new_target_ok = true;
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = true;
         fc.super_class = super_class;
@@ -685,6 +699,7 @@ impl Compiler {
             fc.stmt(s)?;
         }
         fc.cx.in_strict = parent_strict; // restore after the (strict) class body
+        fc.cx.new_target_ok = parent_nt;
         fc.emit(Instr::ReturnUndefined);
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         Ok(FuncProto {
@@ -3428,6 +3443,19 @@ impl<'a> FnCompiler<'a> {
                     let _ = self.expr(e)?;
                 }
                 self.emit(Instr::LoadUndefined { dst }); // empty sequence (unreachable)
+                Ok(dst)
+            }
+            E::MetaProperty(mp) if mp.meta.name == "new" && mp.property.name == "target" => {
+                // `new.target` is an early SyntaxError outside a function/class body
+                // (e.g. at the top level of a script or an indirect eval), including
+                // inside an arrow that has no enclosing ordinary function.
+                if !self.cx.new_target_ok {
+                    return Err("SyntaxError: new.target expression is not allowed here".into());
+                }
+                // The current activation's new.target (undefined unless entered via
+                // new/Reflect.construct/super). Arrows inherit it lexically from their
+                // enclosing function via the frame they run in.
+                self.emit(Instr::LoadNewTarget { dst });
                 Ok(dst)
             }
             _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),

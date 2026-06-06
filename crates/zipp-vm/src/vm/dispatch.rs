@@ -250,6 +250,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::UNDEFINED);
                         ip += 1;
                     }
+                    Instr::LoadNewTarget { dst } => {
+                        let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
+                        self.set(base, dst, nt);
+                        ip += 1;
+                    }
                     Instr::LoadHole { dst } => {
                         // The HOLE sentinel for an elided array-literal element; the
                         // following NewArray/ArrayAppend copies it into the array.
@@ -1002,7 +1007,9 @@ impl<'p> Vm<'p> {
                         for i in 0..argc {
                             args.push(self.get(base, arg_base + i));
                         }
-                        self.run_class_ctor(parent, this, &args)?;
+                        // `super(...)` keeps the derived activation's new.target.
+                        let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
+                        self.run_class_ctor(parent, this, &args, nt)?;
                         if this.is_heap() {
                             self.super_called.insert(this.heap_index());
                         }
@@ -1014,7 +1021,8 @@ impl<'p> Vm<'p> {
                         let this = self.get(base, 0);
                         let args_v = self.get(base, args);
                         let arg_vec = self.array_snapshot(args_v.heap_index());
-                        self.run_class_ctor(parent, this, &arg_vec)?;
+                        let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
+                        self.run_class_ctor(parent, this, &arg_vec, nt)?;
                         if this.is_heap() {
                             self.super_called.insert(this.heap_index());
                         }
@@ -3030,7 +3038,8 @@ impl<'p> Vm<'p> {
 
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new() });
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target });
         Ok(())
     }
 

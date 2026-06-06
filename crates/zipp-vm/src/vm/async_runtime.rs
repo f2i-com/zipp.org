@@ -52,6 +52,7 @@ impl<'p> Vm<'p> {
             ret_dst: 0,
             closure,
             handlers: Vec::new(),
+            new_target: Value::UNDEFINED,
         });
         let outcome = self.run_loop(stop);
         if let Some((_v, genstart_ip)) = self.pending_yield.take() {
@@ -164,6 +165,7 @@ impl<'p> Vm<'p> {
                     ret_dst: 0,
                     closure,
                     handlers: Vec::new(),
+                    new_target: Value::UNDEFINED,
                 });
                 let outcome = self.run_loop(stop);
                 if let Some((y, yield_ip)) = self.pending_yield.take() {
@@ -499,6 +501,7 @@ impl<'p> Vm<'p> {
             ret_dst: 0,
             closure,
             handlers: Vec::new(),
+            new_target: Value::UNDEFINED,
         });
         let outcome = self.run_loop(stop);
         let (state, regs) = if let Some((_v, genstart_ip)) = self.pending_yield.take() {
@@ -656,6 +659,7 @@ impl<'p> Vm<'p> {
             ret_dst: 0,
             closure,
             handlers: saved_handlers,
+            new_target: Value::UNDEFINED,
         });
         // Resume after the suspending op, delivering the sent/awaited value. The
         // op at `resume_ip` is a Yield (resumed by `.next(v)`) or Await (resumed
@@ -1244,6 +1248,7 @@ impl<'p> Vm<'p> {
             ret_dst: 0,
             closure,
             handlers: saved_handlers,
+            new_target: Value::UNDEFINED,
         });
         // Position the resume point and deliver the awaited value / rejection.
         let outcome = if resume_ip == usize::MAX {

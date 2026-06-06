@@ -77,6 +77,11 @@ struct Frame {
     /// thrown error bubbling up from a builtin call) unwinds to the innermost
     /// handler here, else propagates to the caller frame.
     handlers: Vec<Handler>,
+    /// The `new.target` value for this activation: the constructor when entered
+    /// via `new` / `Reflect.construct` / `super(...)`, else `undefined` (a plain
+    /// call, `.call`/`.apply`, a method, a tagged template, …). Read by the
+    /// `LoadNewTarget` op; consumed from `pending_new_target` at frame setup.
+    new_target: Value,
 }
 
 /// Which array higher-order method `array_each` is driving (callback args are
@@ -180,6 +185,11 @@ pub struct Vm<'p> {
     /// exact thrown object/string/number, and survives propagation across
     /// nested `run_loop` invocations (builtin callbacks) until caught.
     pending_throw: Option<Value>,
+    /// One-shot `new.target` for the NEXT frame entered: `construct` /
+    /// `Reflect.construct` / `super(...)` set it to the constructor right before
+    /// invoking the body; the frame-setup path consumes it into `Frame::new_target`
+    /// and resets it to `undefined`, so ordinary calls observe `new.target` undefined.
+    pending_new_target: Value,
     /// Set by a `Yield` op to hand a generator's yielded value (+ the yield's
     /// bytecode ip, for the resume point) back to `generator_method`, which
     /// `.take()`s it to distinguish a suspension from a normal return.
