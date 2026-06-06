@@ -1695,6 +1695,10 @@ impl<'p> Vm<'p> {
                 return Ok(self.make_zoned_date_time_raw(ns, off, item.heap_index()));
             }
             if matches!(self.heap.get(item.heap_index()), HeapObj::Object(_)) {
+                // The calendar field is resolved (and validated) before the timeZone
+                // requirement, so an invalid calendar is a RangeError even when the
+                // timeZone is absent.
+                self.validate_iso_calendar_field(item)?;
                 let tzv = self.get_prop(item, "timeZone")?;
                 if tzv == Value::UNDEFINED {
                     return Err(Thrown(
