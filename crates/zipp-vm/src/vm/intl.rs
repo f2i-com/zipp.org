@@ -266,14 +266,19 @@ impl<'p> Vm<'p> {
             "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
         ];
         let small_allowed = &largest_allowed[1..]; // same minus "auto"
-        let lu = normalize_unit(
-            &self.opt_string(options, "largestUnit", "auto", &largest_allowed)?,
-            default_largest,
-        );
+        let lu_raw = self.opt_string(options, "largestUnit", "auto", &largest_allowed)?;
         let su = normalize_unit(
             &self.opt_string(options, "smallestUnit", "nanosecond", small_allowed)?,
             "nanosecond",
         );
+        // An "auto"/absent largestUnit resolves to LargerOfTwoTemporalUnits(default,
+        // smallestUnit) — the lower rank — so e.g. smallestUnit "hour" yields
+        // largestUnit "hour" instead of wrongly defaulting to the (smaller) default.
+        let lu = if normalize_unit(&lu_raw, "auto") == "auto" {
+            if rank(default_largest) <= rank(&su) { default_largest.to_string() } else { su.clone() }
+        } else {
+            normalize_unit(&lu_raw, default_largest)
+        };
         let inc = self.read_rounding_increment(options)?;
         let mode = self.read_rounding_mode(options, "trunc")?;
         if rank(&lu) > rank(&su) {
