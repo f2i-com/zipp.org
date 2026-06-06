@@ -1003,12 +1003,13 @@ impl<'p> Vm<'p> {
                 return self.array_like_iterate(Value::heap(idx), name, args);
             }
             // Read-only methods that treat a hole as undefined snapshot to a dense
-            // temp array and run against that.
+            // temp array and run against that. (concat is NOT here: it must check
+            // IsConcatSpreadable on the receiver itself — a non-array array-like is
+            // appended WHOLE, not spread — so it runs on the object directly below.)
             if matches!(
                 name,
-                "find" | "findIndex" | "findLast" | "findLastIndex"
-                    | "join" | "toString" | "slice" | "at"
-                    | "concat" | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
+                "join" | "toString" | "slice" | "at"
+                    | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
                     | "toSpliced" | "entries" | "keys" | "values" | "toLocaleString"
             ) {
                 // with/toReversed/toSorted/toSpliced build a result of the source

@@ -923,7 +923,12 @@ impl<'p> Vm<'p> {
                 if this.is_heap() {
                     self.array_method(this.heap_index(), "join", args)?.unwrap_or(Value::UNDEFINED)
                 } else {
-                    Value::UNDEFINED
+                    // Generic over a primitive `this`: ToObject (null/undefined throw),
+                    // then join the boxed array-like (a Boolean/Number wrapper has
+                    // length 0, so the result is "").
+                    self.require_object_coercible(this)?;
+                    let obj = self.to_object(this)?;
+                    self.array_method(obj.heap_index(), "join", args)?.unwrap_or(Value::UNDEFINED)
                 }
             }
             ARR_PUSH => {
