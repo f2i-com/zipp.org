@@ -851,10 +851,11 @@ impl<'p> Vm<'p> {
     /// before any component range check — then truncate toward zero. (The property-bag
     /// `from({...})` path uses `opt_int_field`, which already finite-checks.)
     pub(crate) fn temporal_ctor_int(&mut self, v: Value) -> Result<i64, Thrown> {
-        // `to_number_coerce` (not the non-`&mut` `to_number`) so an object field runs
-        // the observable ToPrimitive (valueOf/@@toPrimitive) in spec order, and a
-        // Symbol/BigInt is rejected with a TypeError.
-        let n = self.to_number_coerce(v)?;
+        // `to_number_strict` runs the observable ToPrimitive (valueOf/@@toPrimitive)
+        // on an object field in spec order, then — like ToNumber — rejects a Symbol OR
+        // a BigInt with a TypeError (the lenient `to_number`/`to_number_coerce` coerce
+        // a BigInt for relational compares, which is wrong for a constructor field).
+        let n = self.to_number_strict(v)?;
         if !n.is_finite() {
             return Err(Thrown(
                 "RangeError: Temporal field must be a finite number".into(),

@@ -406,11 +406,12 @@ impl<'p> Vm<'p> {
             return self.make_plain_time(f);
         }
         if ci == self.plaindatetime_ctor && ci != 0 {
-            // year/month/day required (omitted → 0 → RangeError); time fields default 0.
+            // year/month/day are required: an undefined coerces to NaN → RangeError.
+            // The time fields (i >= 3) default to 0 when undefined.
             let mut f = [0i64; 9];
             for (i, slot) in f.iter_mut().enumerate() {
                 let v = args.get(i).copied().unwrap_or(Value::UNDEFINED);
-                if v != Value::UNDEFINED {
+                if i < 3 || v != Value::UNDEFINED {
                     *slot = self.temporal_ctor_int(v)?;
                 }
             }
