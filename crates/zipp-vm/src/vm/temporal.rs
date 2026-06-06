@@ -1395,7 +1395,7 @@ impl<'p> Vm<'p> {
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
                     round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
                 } else {
-                    df
+                    round_datetime_diff_daytime(dt1, df, &smallest, &largest, inc, &eff)
                 };
                 if name == "since" {
                     out.iter_mut().for_each(|x| *x = -*x);
@@ -1648,7 +1648,15 @@ impl<'p> Vm<'p> {
                 let off = self.zdt_offset_ns(idx);
                 let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
+                let result_ns = local - off as i128;
+                // IsValidEpochNanoseconds: the result must lie within the supported
+                // instant range (matches the ZonedDateTime/Instant constructors).
+                if result_ns.abs() > NS_MAX_INSTANT {
+                    return Err(Thrown(
+                        "RangeError: ZonedDateTime result is outside the supported range".into(),
+                    ));
+                }
+                Ok(Some(self.alloc_zdt(result_ns, off, id)))
             }
             "until" | "since" => {
                 // Difference of two ZonedDateTimes (fixed-offset): the difference of
@@ -1709,7 +1717,7 @@ impl<'p> Vm<'p> {
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
                     round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
                 } else {
-                    df
+                    round_datetime_diff_daytime(dt1, df, &smallest, &largest, inc, &eff)
                 };
                 if name == "since" {
                     out.iter_mut().for_each(|x| *x = -*x);
@@ -3128,6 +3136,35 @@ pub(crate) const NS_MAX_INSTANT: i128 = 8_640_000_000_000_000_000_000;
 pub(crate) fn iso_datetime_ns_in_range(f: [i64; 9]) -> bool {
     let ns = dt_epoch_ns(f);
     ns > -NS_MAX_INSTANT - DAY_NS && ns < NS_MAX_INSTANT + DAY_NS
+}
+
+/// Round a date-time difference `df` whose smallestUnit is a DAY-or-time unit while
+/// largestUnit is a calendar unit (year/month/week): round the day+time remainder to
+/// the smallestUnit increment, then re-balance to `largest` so a rounded-up day rolls
+/// into the calendar units. The `rounded == time_ns` short-circuit keeps the
+/// nanosecond-default case (and difference_datetime's day-borrow) byte-identical.
+fn round_datetime_diff_daytime(
+    dt1: [i64; 9],
+    df: [i64; 10],
+    smallest: &str,
+    largest: &str,
+    inc: i128,
+    mode: &str,
+) -> [i64; 10] {
+    let time_ns = (df[3] as i128) * DAY_NS
+        + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
+    let rounded = round_increment(time_ns, unit_ns(smallest) * inc, mode);
+    if rounded == time_ns {
+        return df;
+    }
+    // Reconstruct the rounded endpoint (anchor at the kept year/month/week units, then
+    // add the rounded day+time span) and re-decompose at largestUnit.
+    let anchor = dt_add_dur(dt1, [df[0], df[1], df[2], 0, 0, 0, 0, 0, 0, 0]);
+    let total = dt_epoch_ns(anchor) + rounded;
+    let (ey, em, ed) = epoch_days_to_iso(total.div_euclid(DAY_NS) as i64);
+    let t = ns_to_time(total.rem_euclid(DAY_NS));
+    let end = [ey, em, ed, t[0], t[1], t[2], t[3], t[4], t[5]];
+    difference_datetime(dt1, end, largest)
 }
 
 /// Round the date-time difference dt1→dt2 to a calendar `smallest` unit
