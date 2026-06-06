@@ -350,8 +350,16 @@ pub(crate) fn year_month_string(y: i64, m: i64) -> String {
 
 /// Parse a month code like "M06" (ISO calendars have no leap months) → 1..=12.
 pub(crate) fn parse_month_code(s: &str) -> Option<i64> {
+    // MonthCode grammar: "M" followed by EXACTLY two ASCII digits (so "M1"/"M005"
+    // are malformed). A trailing "L" marks a lunisolar leap month, which the ISO
+    // 8601 calendar does not have — reject it. The two-digit value must be 1..=12.
     let body = s.strip_prefix('M')?;
-    let body = body.strip_suffix('L').unwrap_or(body);
+    if body.ends_with('L') {
+        return None;
+    }
+    if body.len() != 2 || !body.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     let n = body.parse::<i64>().ok()?;
     (1..=12).contains(&n).then_some(n)
 }

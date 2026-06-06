@@ -2188,12 +2188,29 @@ impl<'p> Vm<'p> {
 
     /// Read month from an object: monthCode ("M06") takes precedence over `month`.
     pub(crate) fn read_month_field(&mut self, obj: Value) -> Result<Option<i64>, Thrown> {
+        // Read both `month` and `monthCode` (alphabetical field order puts `month`
+        // first). An invalid monthCode is a RangeError (not a silently-absent field);
+        // when both are present they must agree.
+        let month_opt = self.opt_int_field(obj, "month")?;
         let mc = self.get_prop(obj, "monthCode")?;
         if mc != Value::UNDEFINED {
-            let s = self.to_js_string(mc)?;
-            return Ok(parse_month_code(&s));
+            // monthCode must be a String value — a number / bigint / boolean / object
+            // that merely ToString-s is a TypeError; a malformed string is a
+            // RangeError below.
+            if !(mc.is_heap() && self.heap.is_str_like(mc.heap_index())) {
+                return Err(Thrown("TypeError: monthCode must be a string".into()));
+            }
+            let s = self.heap.str_cow(mc.heap_index()).unwrap().into_owned();
+            let code_month = parse_month_code(&s)
+                .ok_or_else(|| Thrown(format!("RangeError: invalid monthCode '{s}'")))?;
+            if let Some(m) = month_opt {
+                if m != code_month {
+                    return Err(Thrown("RangeError: month and monthCode must agree".into()));
+                }
+            }
+            return Ok(Some(code_month));
         }
-        self.opt_int_field(obj, "month")
+        Ok(month_opt)
     }
 
     /// Validate a property-bag `calendar` field for the ISO-only engine: absent,
