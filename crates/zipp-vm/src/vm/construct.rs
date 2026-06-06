@@ -308,10 +308,31 @@ impl<'p> Vm<'p> {
         self.construct_with_newtarget(cv, args, cv)
     }
 
+    /// OrdinaryCreateFromConstructor's prototype selection: when `new_target`
+    /// differs from the base constructor `cval` (a `Reflect.construct(c, args,
+    /// newTarget)` or a derived-class `super()`), the instance's [[Prototype]] is
+    /// `Get(new_target, "prototype")` when that is an object, else `default`. For
+    /// the common `new C()` case (`new_target == cval`) the default — `cval`'s own
+    /// prototype — is used unchanged (no extra Get on the hot path).
+    pub(crate) fn newtarget_proto(
+        &mut self,
+        new_target: Value,
+        cval: Value,
+        default: Value,
+    ) -> Result<Value, Thrown> {
+        if new_target.is_heap() && new_target != cval {
+            let p = self.get_prop(new_target, "prototype")?;
+            if self.is_object_value(p) {
+                return Ok(p);
+            }
+        }
+        Ok(default)
+    }
+
     /// [[Construct]](argumentsList, newTarget). `new_target` is threaded to a Proxy
-    /// `construct` trap (its 3rd argument) and through a trap-less Proxy's forward to
-    /// the target; the ordinary Func/Class paths build the instance from `cv` (using
-    /// `new_target` for the instance's [[Prototype]] is a separate, larger fix).
+    /// `construct` trap (its 3rd argument), through a trap-less Proxy's forward to
+    /// the target, and into the instance's [[Prototype]] via OrdinaryCreateFrom
+    /// Constructor (see `newtarget_proto`) for the Func/Class paths.
     pub(crate) fn construct_with_newtarget(
         &mut self,
         cv: Value,
@@ -600,7 +621,10 @@ impl<'p> Vm<'p> {
             self.heap.get(cv.heap_index()),
             HeapObj::Func(_) | HeapObj::Closure { .. }
         ) {
-            let proto = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
+            // The instance's [[Prototype]] is newTarget.prototype (OrdinaryCreate
+            // FromConstructor); for the common `new F()` case this is F.prototype.
+            let default = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
+            let proto = self.newtarget_proto(new_target, cv, default)?;
             let obj = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
             if proto.is_heap() {
                 self.proto_of.insert(obj.heap_index(), proto);
@@ -623,7 +647,11 @@ impl<'p> Vm<'p> {
         };
         if let Some((target, bargs)) = bound_parts {
             let combined: Vec<Value> = bargs.into_iter().chain(args.iter().copied()).collect();
-            return self.construct(target, &combined);
+            // Bound [[Construct]]: substitute the target for newTarget only when
+            // newTarget is the bound function itself; otherwise keep the caller's
+            // newTarget so OrdinaryCreateFromConstructor uses its prototype.
+            let nt = if new_target == cv { target } else { new_target };
+            return self.construct_with_newtarget(target, &combined, nt);
         }
         let (ctor, ctor_ups, has_explicit, parent) = match self.heap.get(cv.heap_index()) {
             HeapObj::Class(c) => (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent),
@@ -634,6 +662,16 @@ impl<'p> Vm<'p> {
         let mut map = ObjMap::new();
         map.class = Some(cv.heap_index());
         let obj = Value::heap(self.heap.alloc(HeapObj::Object(map)));
+        // OrdinaryCreateFromConstructor: a `Reflect.construct(Class, args, NT)` (or
+        // any newTarget other than the class) gives the instance NT.prototype as its
+        // [[Prototype]], overriding the class-derived default (proto_of is consulted
+        // first by object_get_prototype_of / instanceof). `new Class()` is unchanged.
+        if new_target.is_heap() && new_target != cv {
+            let p = self.get_prop(new_target, "prototype")?;
+            if self.is_object_value(p) {
+                self.proto_of.insert(obj.heap_index(), p);
+            }
+        }
         if has_explicit {
             // The explicit constructor runs its own `super(...)`; a ctor that
             // returns an object/array replaces the instance.
