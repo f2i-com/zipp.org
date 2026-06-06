@@ -2352,11 +2352,25 @@ impl<'p> Vm<'p> {
             }
             "add" | "subtract" => {
                 let dur = self.to_duration(a0)?;
-                // The result is always a valid year-month, but the overflow option
-                // is still validated (constrain/reject/RangeError on bad values).
+                // The overflow option is still validated (constrain/reject/RangeError
+                // on bad values) and read before the algorithmic range check below.
                 let _ = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign = if name == "add" { 1 } else { -1 };
                 let op_sign = sign * Self::duration_sign(&dur);
+                // Spec AddDurationToYearMonth: the intermediate ISO date (Day = 1) must
+                // be within the day-granular ISO date limits, so every op on the
+                // minimum -271821-04 (Day 1 < 19) throws. A negative duration with
+                // sub-month units (weeks/days/time) additionally materialises the
+                // end-of-month reference date, which for the maximum +275760-09 is
+                // Day 30 > 13 → out of range; pure year/month ops never do.
+                let has_subday = dur[2..].iter().any(|&x| x != 0);
+                if !iso_date_in_range(y, m, 1)
+                    || (op_sign < 0 && has_subday && !iso_date_in_range(y, m, days_in_month(y, m)))
+                {
+                    return Err(Thrown(
+                        "RangeError: PlainYearMonth is outside the valid ISO date range".into(),
+                    ));
+                }
                 // Reference day per spec: start of month for non-negative ops, end of
                 // month for negative — so day/week units don't spill into a wrong month.
                 let ref_day = if op_sign < 0 { days_in_month(y, m) } else { 1 };
