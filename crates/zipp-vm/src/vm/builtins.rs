@@ -210,6 +210,10 @@ impl<'p> Vm<'p> {
         if this.is_null() {
             return Ok("Null".to_string());
         }
+        // A callable object that isn't one of the explicit function heap variants —
+        // notably a built-in constructor global (Array/Map/Temporal.PlainDate/…),
+        // which zipp stores as an `is_ctor` HeapObj::Object — is still "Function".
+        let callable = this.is_heap() && self.is_callable(this);
         let builtin = if this.is_heap() {
             match self.heap.get(this.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "String",
@@ -233,6 +237,7 @@ impl<'p> Vm<'p> {
                 _ if self.bool_proto != 0 && this.heap_index() == self.bool_proto => "Boolean",
                 _ if self.arr_proto != 0 && this.heap_index() == self.arr_proto => "Array",
                 _ if self.error_name(this.heap_index()).is_some() => "Error",
+                _ if callable => "Function",
                 _ => "Object",
             }
         } else if this.is_number() {
