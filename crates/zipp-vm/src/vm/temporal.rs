@@ -1791,6 +1791,11 @@ impl<'p> Vm<'p> {
                 let oz = self.zoned_date_time_from(other, Value::UNDEFINED)?;
                 let of = self.zdt_local(oz.heap_index());
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                // GetOptionsObject: a defined non-object options bag is a TypeError
+                // (a primitive must not be read for properties / silently ignored).
+                if opts != Value::UNDEFINED && !self.is_object_value(opts) {
+                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                }
                 let all_units = &[
                     "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
                     "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
@@ -1994,12 +1999,15 @@ impl<'p> Vm<'p> {
             ));
         }
         let s = self.to_js_string(item)?;
-        let _ = self.read_zdt_options(options)?;
+        // The string is parsed/validated (RangeError on a bad string) BEFORE the
+        // options bag is read — so `from("bad-string", primitiveOptions)` is a
+        // RangeError, not the options TypeError.
         if !temporal_string_ok(&s, false, true) {
             return Err(Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")));
         }
         let (f, offset, id) = parse_zdt_string(&s)
             .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
+        let _ = self.read_zdt_options(options)?;
         let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
             + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
         Ok(self.alloc_zdt(local - offset as i128, offset, id))
