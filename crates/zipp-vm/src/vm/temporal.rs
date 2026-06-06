@@ -1048,6 +1048,7 @@ impl<'p> Vm<'p> {
             || !(0..1000).contains(&f[6])
             || !(0..1000).contains(&f[7])
             || !(0..1000).contains(&f[8])
+            || !iso_datetime_ns_in_range(f)
         {
             return Err(Thrown("RangeError: invalid PlainDateTime value".into()));
         }
@@ -2751,6 +2752,21 @@ fn dt_add_dur(start: [i64; 9], f: [i64; 10]) -> [i64; 9] {
 fn dt_epoch_ns(dt: [i64; 9]) -> i128 {
     (iso_to_epoch_days(dt[0], dt[1], dt[2]) as i128) * DAY_NS
         + time_to_ns(&[dt[3], dt[4], dt[5], dt[6], dt[7], dt[8]])
+}
+
+/// `nsMaxInstant` — the inclusive epoch-nanosecond bound of `Temporal.Instant`
+/// (±8.64 × 10^21, i.e. ±10^8 days).
+pub(crate) const NS_MAX_INSTANT: i128 = 8_640_000_000_000_000_000_000;
+
+/// ISODateTimeWithinLimits: whether the date-time `f` is a representable
+/// `Temporal.PlainDateTime` — its epoch-ns must lie strictly within `nsMaxInstant`
+/// plus a one-day (`nsPerDay`) margin on each side. (Unlike `PlainDate`'s
+/// day-granular bound, this is nanosecond-precise: `-271821-04-19T00:00:00.000000000`
+/// is out of range but `…000000001` is in range.) Caller must have already
+/// validated the field ranges so `dt_epoch_ns` cannot overflow.
+pub(crate) fn iso_datetime_ns_in_range(f: [i64; 9]) -> bool {
+    let ns = dt_epoch_ns(f);
+    ns > -NS_MAX_INSTANT - DAY_NS && ns < NS_MAX_INSTANT + DAY_NS
 }
 
 /// Round the date-time difference dt1→dt2 to a calendar `smallest` unit
