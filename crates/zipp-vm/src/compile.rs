@@ -362,6 +362,12 @@ struct Compiler {
     /// Global slots bound by a top-level `const` (immutable): assignment to one
     /// is a runtime TypeError.
     const_globals: HashSet<u32>,
+    /// Global slots bound by a top-level `let`/`const` (lexical) declaration. Such a
+    /// binding is in its TDZ — the slot is UNINITIALIZED — until its declaration runs,
+    /// so an assignment to it before then is a ReferenceError even in sloppy mode
+    /// (where an *undeclared* name would instead create a global). Registered by a
+    /// hoisting pre-pass so a forward reference (`for([x] of …){} let x;`) is known.
+    lexical_globals: HashSet<u32>,
     /// True while compiling code where `new.target` is syntactically allowed —
     /// inside an ordinary function/method/constructor/class-field body, and
     /// inherited by nested arrows. False at the top level of a script or eval (a
@@ -384,6 +390,7 @@ impl Compiler {
             class_enclosing: Vec::new(),
             class_derived: false,
             const_globals: HashSet::new(),
+            lexical_globals: HashSet::new(),
         }
     }
 
@@ -553,6 +560,26 @@ impl Compiler {
                         fc.cx.global_slot(id.name.as_str());
                     } else {
                         fc.declare_local(id.name.as_str());
+                    }
+                }
+            }
+        }
+
+        // Hoist top-level lexical (`let`/`const`) names into `lexical_globals` so an
+        // assignment to one BEFORE its declaration runs (its TDZ) is a ReferenceError
+        // even in sloppy mode — `for ([x] of [[]]) {} let x;`. Only DIRECT top-level
+        // declarations bind to globals (block-scoped lexicals don't leak), so a
+        // VariableDeclaration nested in a block is not registered.
+        if is_script {
+            for s in body {
+                if let ox::Statement::VariableDeclaration(d) = s {
+                    if d.kind.is_lexical() {
+                        for decl in &d.declarations {
+                            if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
+                                let slot = fc.cx.global_slot(id.name.as_str()) as u32;
+                                fc.cx.lexical_globals.insert(slot);
+                            }
+                        }
                     }
                 }
             }
@@ -4211,8 +4238,10 @@ impl<'a> FnCompiler<'a> {
             Binding::Upvalue(idx) => self.emit(Instr::UpvalSet { idx: *idx, src }),
             Binding::Global(idx) => {
                 // In strict mode, assigning to an unresolvable (never-declared) global
-                // is a ReferenceError, not a silent global creation.
-                if self.cx.in_strict {
+                // is a ReferenceError, not a silent global creation. A top-level
+                // lexical (`let`) binding is likewise checked even in sloppy mode: a
+                // store while it is still in its TDZ (UNINITIALIZED) is a ReferenceError.
+                if self.cx.in_strict || self.cx.lexical_globals.contains(idx) {
                     self.emit(Instr::StoreGlobalStrict { idx: *idx, src });
                 } else {
                     self.emit(Instr::StoreGlobal { idx: *idx, src });
