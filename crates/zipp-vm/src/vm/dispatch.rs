@@ -2174,6 +2174,26 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
 
+                    // Direct eval from strict code: the evaluated string inherits
+                    // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
+                    // a non-string argument is returned unchanged (spec 19.2.1).
+                    Instr::DirectEval { dst, arg } => {
+                        let a0 = self.get(base, arg);
+                        let is_str = a0.is_heap()
+                            && matches!(
+                                self.heap.get(a0.heap_index()),
+                                HeapObj::Str(_) | HeapObj::Cons { .. }
+                            );
+                        let r = if is_str {
+                            let code = self.display(a0);
+                            self.do_eval(&code, true)?
+                        } else {
+                            a0
+                        };
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
                         // A callable Proxy: route through call_value (apply trap).

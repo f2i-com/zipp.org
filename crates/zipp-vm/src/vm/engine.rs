@@ -795,7 +795,7 @@ impl<'p> Vm<'p> {
     /// never reaches this (calling `eval` previously threw ReferenceError), so it
     /// cannot regress non-eval programs. Classes inside eval are supported via the
     /// `eval_classes` runtime class table (class-id operands re-indexed like funcs).
-    pub(crate) fn do_eval(&mut self, code: &str) -> Result<Value, Thrown> {
+    pub(crate) fn do_eval(&mut self, code: &str, force_strict: bool) -> Result<Value, Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -806,7 +806,7 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
         // 2. Compile in eval mode (top-level returns its completion value).
-        let eval_prog = match crate::compile::compile_eval(&ret.program, code) {
+        let eval_prog = match crate::compile::compile_eval(&ret.program, code, force_strict) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };

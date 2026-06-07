@@ -307,9 +307,10 @@ pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
 /// evaluated expression statement) — what `eval("1 + 1")` must yield. The VM
 /// installs the resulting functions into its runtime function table and remaps
 /// the program's independently-numbered global slots onto the live globals.
-pub fn compile_eval(prog: &ox::Program, source: &str) -> R<Program> {
+pub fn compile_eval(prog: &ox::Program, source: &str, force_strict: bool) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
+    c.force_strict = force_strict;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
@@ -342,6 +343,10 @@ struct Compiler {
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
     eval_mode: bool,
+    /// Force strict mode for the whole compilation, regardless of a `"use strict"`
+    /// directive — set for a DIRECT eval invoked from strict-mode code (the
+    /// evaluated string inherits the caller's strictness).
+    force_strict: bool,
     /// Strictness of the lexical scope currently being compiled. Set on entry to
     /// a function/arrow body (inherited from the enclosing scope, OR'd with the
     /// body's own `"use strict"` directive), forced `true` inside class bodies,
@@ -385,6 +390,7 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             source,
             eval_mode: false,
+            force_strict: false,
             in_strict: false,
             new_target_ok: false,
             class_enclosing: Vec::new(),
@@ -415,8 +421,9 @@ impl Compiler {
 
     fn compile(&mut self, prog: &ox::Program) -> R<()> {
         // Module code is always strict; a script is sloppy unless its directive
-        // prologue says `"use strict"` (folded in by `compile_function_body`).
-        self.in_strict = prog.source_type.is_module();
+        // prologue says `"use strict"` (folded in by `compile_function_body`). A
+        // direct eval from strict code forces strict for the whole eval program.
+        self.in_strict = prog.source_type.is_module() || self.force_strict;
         // Reserve function id 0 for the top-level script body; fill it last so
         // nested function ids are stable as we discover them.
         self.functions.push(placeholder("<script>"));
@@ -5184,6 +5191,29 @@ impl<'a> FnCompiler<'a> {
         if let ox::Expression::Identifier(id) = &c.callee {
             if let Some(kind) = error_ctor(&id.name) {
                 return self.build_error(kind, &c.arguments, dst);
+            }
+        }
+        // Direct `eval(code)` from STRICT-mode code: the evaluated string inherits
+        // strict mode (a direct eval shares the caller's strictness). Only fires for
+        // the unshadowed global `eval` — an enclosing user binding named `eval`
+        // (legal only in sloppy code, hence reachable here as an upvalue/local) is
+        // an ordinary call. Sloppy direct eval and indirect eval are untouched: they
+        // still route through the generic `Call` → `GLOBAL_EVAL` native (sloppy).
+        if let ox::Expression::Identifier(id) = &c.callee {
+            if id.name == "eval"
+                && self.cx.in_strict
+                && matches!(self.resolve("eval"), Binding::Global(_))
+            {
+                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                let arg = if argc == 0 {
+                    let r = self.temp();
+                    self.emit(Instr::LoadUndefined { dst: r });
+                    r
+                } else {
+                    arg_base
+                };
+                self.emit(Instr::DirectEval { dst, arg });
+                return Ok(dst);
             }
         }
         // `Symbol(desc?)` → a fresh Symbol primitive (MakeSymbol op). `Symbol` is

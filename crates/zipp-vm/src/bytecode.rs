@@ -420,6 +420,12 @@ pub enum Instr {
     /// `[arg_base, arg_base+argc)`. Result lands in `dst`.
     Call { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
 
+    /// `dst = eval(arg)` — a DIRECT eval call (the callee is the unshadowed global
+    /// `eval` identifier) emitted only from STRICT-mode code, so the evaluated
+    /// string inherits strict mode (early errors fire). Indirect/sloppy eval still
+    /// goes through the ordinary `Call` → `GLOBAL_EVAL` native path.
+    DirectEval { dst: Reg, arg: Reg },
+
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
     CallMethod { dst: Reg, obj: Reg, name: u32, arg_base: Reg, argc: u16 },
