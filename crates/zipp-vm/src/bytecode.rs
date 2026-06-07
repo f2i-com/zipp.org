@@ -563,6 +563,12 @@ pub struct FuncProto {
     /// `this` supplied by the caller (`.call`/`.apply`/`bind`/a method receiver/
     /// an array-method thisArg). Also suppresses OrdinaryCallBindThis.
     pub lexical_this: bool,
+    /// True for a STATIC class element body — a static method/getter/setter or a
+    /// `static { … }` block (and an arrow lexically inside one). `super.x` /
+    /// `super[x]` there resolves against the class's [[Prototype]] (the PARENT
+    /// CLASS) rather than the class prototype's [[Prototype]]. Threaded like the
+    /// super home-class id through nested arrows; false everywhere else.
+    pub super_static: bool,
     /// True when this function runs in strict mode (own `"use strict"` directive,
     /// a strict enclosing scope, a class body, or module code). Strict functions
     /// receive `this` exactly as passed; sloppy functions called with a nullish

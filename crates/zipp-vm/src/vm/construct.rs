@@ -1013,11 +1013,22 @@ impl<'p> Vm<'p> {
     /// class it is `%Object.prototype%` (so `super.toString()` etc. resolve). Returns
     /// UNDEFINED if unresolvable. (Unlike `super_parent`, this does not require a
     /// parent class, so `super.x` works in base-class methods.)
-    pub(crate) fn super_base(&mut self, home_class_id: u32) -> Value {
+    pub(crate) fn super_base(&mut self, home_class_id: u32, is_static: bool) -> Value {
         let home = match self.class_values.get(home_class_id as usize).copied().flatten() {
             Some(c) => c,
             None => return Value::UNDEFINED,
         };
+        // A STATIC element's HomeObject is the class value itself, so its super base
+        // is GetPrototypeOf(class) — the PARENT CLASS for `class C extends B` (or
+        // %Function.prototype% for a base class) — letting `super.x` reach inherited
+        // STATIC members. An instance element's HomeObject is the class prototype.
+        if is_static {
+            return match self.super_parent(home_class_id) {
+                Some(parent) => parent,
+                None if self.fn_proto != 0 => Value::heap(self.fn_proto),
+                None => Value::UNDEFINED,
+            };
+        }
         let home_proto = match self.prototype_of(home) {
             Some(p) => p,
             None => return Value::UNDEFINED,
@@ -1035,8 +1046,9 @@ impl<'p> Vm<'p> {
         key: &str,
         this: Value,
         v: Value,
+        is_static: bool,
     ) -> Result<(), Thrown> {
-        let proto = self.super_base(home_class_id);
+        let proto = self.super_base(home_class_id, is_static);
         // MakeSuperPropertyReference: RequireObjectCoercible(GetSuperBase()).
         self.require_object_coercible(proto)?;
         let setter = self.lookup_accessor(proto, key, true);

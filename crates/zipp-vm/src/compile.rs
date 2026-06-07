@@ -677,6 +677,7 @@ impl Compiler {
             is_async,
             non_constructable: false, // a plain function/expression IS constructable
             lexical_this: false,
+            super_static: false, // a plain function is not a static class element
             is_strict,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -702,6 +703,7 @@ impl Compiler {
         computed_inits: &[Option<&ox::Expression>],
         body: &[ox::Statement],
         super_class: Option<u32>,
+        super_static: bool,
         is_generator: bool,
         is_async: bool,
     ) -> R<FuncProto> {
@@ -730,6 +732,7 @@ impl Compiler {
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = true;
         fc.super_class = super_class;
+        fc.super_static = super_static;
         fc.derived_class = fc.cx.class_derived;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
@@ -811,6 +814,7 @@ impl Compiler {
             // is never consulted for it — safe to set uniformly.
             non_constructable: true,
             lexical_this: false, // a concise method gets its own `this`, not lexical
+            super_static, // true for static methods/getters/setters/blocks
             is_strict: true,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -829,6 +833,7 @@ impl Compiler {
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
         super_class: Option<u32>,
+        super_static: bool,
     ) -> R<FuncProto> {
         let parent_strict = self.in_strict;
         let is_strict = parent_strict || has_use_strict(&a.body.directives);
@@ -840,6 +845,9 @@ impl Compiler {
         // arrows already capture), so propagating the enclosing method's compile-time
         // home-class id is sufficient.
         fc.super_class = super_class;
+        // An arrow inherits the enclosing method's static-ness (so `super.x` in an
+        // arrow inside a static method resolves against the parent CLASS).
+        fc.super_static = super_static;
         // An arrow inherits the enclosing method's derived-ness (so `super(...)` in an
         // arrow inside a derived constructor is allowed). `cx.class_derived` still
         // reflects the enclosing class while its method bodies (and their arrows) compile.
@@ -888,6 +896,7 @@ impl Compiler {
             is_async: a.r#async,
             non_constructable: true, // arrow functions have no [[Construct]]
             lexical_this: true, // arrows capture `this` lexically (see FuncProto)
+            super_static, // inherited from the enclosing method/block
             is_strict,
             constants: fc.constants,
             string_constants: fc.string_constants,
@@ -952,6 +961,7 @@ fn placeholder(name: &str) -> FuncProto {
         is_async: false,
         non_constructable: false,
         lexical_this: false,
+        super_static: false,
         is_strict: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
@@ -995,6 +1005,11 @@ struct FnCompiler<'a> {
     /// for `super.x`/`super.m()`, which resolve at runtime via the home prototype's
     /// [[Prototype]] (so they work in base classes too, reaching %Object.prototype%).
     super_class: Option<u32>,
+    /// True when compiling a STATIC class element (static method/getter/setter or
+    /// `static { … }` block, and arrows lexically inside one). Selects the static
+    /// super base (the class's [[Prototype]] = parent class) at runtime. Baked into
+    /// the emitted function's `FuncProto::super_static`.
+    super_static: bool,
     /// True only inside a DERIVED class's methods — gates `super(...)` (calling it in
     /// a base class constructor is an early SyntaxError). `super.x` is not gated.
     derived_class: bool,
@@ -1124,6 +1139,7 @@ impl<'a> FnCompiler<'a> {
             arguments_reg: None,
             uses_arguments: false,
             super_class: None,
+            super_static: false,
             derived_class: false,
             this_override: None,
             pattern_block_local: false,
@@ -2101,10 +2117,15 @@ impl<'a> FnCompiler<'a> {
         for (fname, finit) in &static_fields {
             let save = self.next_reg;
             // A static field initializer evaluates with `this` = the class, and (like
-            // all class-body code) in STRICT mode.
+            // all class-body code) in STRICT mode. `super.x` inside it (typically via
+            // an arrow) resolves against the class's [[Prototype]] (the parent class),
+            // so thread the home class id + static-ness like a static method body.
             self.this_override = Some(cls);
             let prev_strict = self.cx.in_strict;
             self.cx.in_strict = true;
+            let (prev_sc, prev_ss) = (self.super_class, self.super_static);
+            self.super_class = Some(class_id);
+            self.super_static = true;
             let v = match finit {
                 Some(e) => self.expr(e)?,
                 None => {
@@ -2113,6 +2134,8 @@ impl<'a> FnCompiler<'a> {
                     t
                 }
             };
+            self.super_class = prev_sc;
+            self.super_static = prev_ss;
             self.cx.in_strict = prev_strict;
             self.this_override = None;
             let name_idx = self.string_name(fname);
@@ -2135,9 +2158,13 @@ impl<'a> FnCompiler<'a> {
             if *is_static {
                 // …but the value initializer evaluates with `this` = the class, in
                 // STRICT mode (the computed KEY above used the enclosing context).
+                // `super.x` resolves against the parent class (as for static fields).
                 self.this_override = Some(cls);
                 let prev_strict = self.cx.in_strict;
                 self.cx.in_strict = true;
+                let (prev_sc, prev_ss) = (self.super_class, self.super_static);
+                self.super_class = Some(class_id);
+                self.super_static = true;
                 let vr = match init {
                     Some(e) => self.expr(e)?,
                     None => {
@@ -2146,6 +2173,8 @@ impl<'a> FnCompiler<'a> {
                         t
                     }
                 };
+                self.super_class = prev_sc;
+                self.super_static = prev_ss;
                 self.cx.in_strict = prev_strict;
                 self.this_override = None;
                 self.emit(Instr::SetIndex { obj: cls, key: kr, val: vr });
@@ -2350,6 +2379,7 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 body,
                 super_class_id,
+                false, // instance method: super resolves via the prototype chain
                 func.generator,
                 func.r#async,
             )?;
@@ -2373,6 +2403,7 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 body,
                 super_class_id,
+                false, // instance getter: super resolves via the prototype chain
                 false, // getters are never generators
                 false, // getters are never async
             )?;
@@ -2396,6 +2427,7 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 body,
                 super_class_id,
+                false, // instance setter: super resolves via the prototype chain
                 false, // setters are never generators
                 false, // setters are never async
             )?;
@@ -2418,7 +2450,8 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 &[],
                 body,
-                None, // statics: `super` would refer to the parent class, not handled
+                super_class_id,
+                true, // static method: `super.x` resolves via the class's [[Prototype]] (parent class)
                 func.generator,
                 func.r#async,
             )?;
@@ -2441,7 +2474,8 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 &[],
                 body,
-                None, // statics: no `super`
+                super_class_id,
+                true, // static getter: `super.x` resolves via the class's [[Prototype]]
                 false,
                 false,
             )?;
@@ -2463,7 +2497,8 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 &[],
                 body,
-                None, // statics: no `super`
+                super_class_id,
+                true, // static setter: `super.x` resolves via the class's [[Prototype]]
                 false,
                 false,
             )?;
@@ -2494,6 +2529,7 @@ impl<'a> FnCompiler<'a> {
                 &instance_computed_inits,
                 body,
                 super_class_id,
+                false, // a constructor's super is the instance prototype chain
                 false, // a constructor is never a generator
                 false, // a constructor is never async
             )?;
@@ -2522,7 +2558,8 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 &[],
                 body,
-                if matches!(*kind, 3 | 4 | 5) { None } else { super_class_id }, // statics get no super
+                super_class_id,
+                matches!(*kind, 3 | 4 | 5), // static computed members get the parent-class super base
                 func.generator,
                 func.r#async,
             )?;
@@ -2546,7 +2583,8 @@ impl<'a> FnCompiler<'a> {
                 &[],
                 &[],
                 body,
-                None, // static context: `super` is the parent class (as for static methods, not modelled)
+                super_class_id,
+                true, // a static block's `super.x` resolves via the class's [[Prototype]]
                 false,
                 false,
             )?;
@@ -2638,7 +2676,7 @@ impl<'a> FnCompiler<'a> {
         let captured = capture::captured_locals(&names, &a.body.statements);
         let enclosing = self.child_enclosing();
         let mut proto =
-            self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class)?;
+            self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class, self.super_static)?;
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
         let has_upvalues = !proto.upvalues.is_empty();

@@ -1090,7 +1090,7 @@ impl<'p> Vm<'p> {
                         // property get + call (and like SuperMethodComputed). This
                         // reaches inherited methods, accessors, and base-class super
                         // (→ %Object.prototype%), not just own parent-class methods.
-                        let proto = self.super_base(home_class_id);
+                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -1111,7 +1111,7 @@ impl<'p> Vm<'p> {
                         // from a spread array; `this` = the current receiver.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
-                        let proto = self.super_base(home_class_id);
+                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
                         let m = self.get_member(proto, key, this)?;
@@ -1131,7 +1131,7 @@ impl<'p> Vm<'p> {
                         // %Object.prototype%.
                         let key =
                             self.func(func_id as usize).string_constants[name as usize].clone();
-                        let proto = self.super_base(home_class_id);
+                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -1142,7 +1142,7 @@ impl<'p> Vm<'p> {
                     Instr::SuperGetComputed { dst, home_class_id, key } => {
                         let kv = self.get(base, key);
                         let ks = self.to_property_key(kv)?;
-                        let proto = self.super_base(home_class_id);
+                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -1153,7 +1153,7 @@ impl<'p> Vm<'p> {
                     Instr::SuperMethodComputed { dst, home_class_id, key, arg_base, argc } => {
                         let kv = self.get(base, key);
                         let ks = self.to_property_key(kv)?;
-                        let proto = self.super_base(home_class_id);
+                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -1171,7 +1171,8 @@ impl<'p> Vm<'p> {
                             self.func(func_id as usize).string_constants[name as usize].clone();
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
-                        self.super_set(home_class_id, &key, this, v)?;
+                        let is_static = self.func(func_id as usize).super_static;
+                        self.super_set(home_class_id, &key, this, v, is_static)?;
                         ip += 1;
                     }
                     Instr::SuperSetComputed { home_class_id, key, val } => {
@@ -1179,7 +1180,8 @@ impl<'p> Vm<'p> {
                         let ks = self.to_property_key(kv)?;
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
-                        self.super_set(home_class_id, &ks, this, v)?;
+                        let is_static = self.func(func_id as usize).super_static;
+                        self.super_set(home_class_id, &ks, this, v, is_static)?;
                         ip += 1;
                     }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
