@@ -2100,8 +2100,11 @@ impl<'a> FnCompiler<'a> {
         // (in the enclosing scope) right after the class is created.
         for (fname, finit) in &static_fields {
             let save = self.next_reg;
-            // A static field initializer evaluates with `this` = the class.
+            // A static field initializer evaluates with `this` = the class, and (like
+            // all class-body code) in STRICT mode.
             self.this_override = Some(cls);
+            let prev_strict = self.cx.in_strict;
+            self.cx.in_strict = true;
             let v = match finit {
                 Some(e) => self.expr(e)?,
                 None => {
@@ -2110,6 +2113,7 @@ impl<'a> FnCompiler<'a> {
                     t
                 }
             };
+            self.cx.in_strict = prev_strict;
             self.this_override = None;
             let name_idx = self.string_name(fname);
             self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
@@ -2129,8 +2133,11 @@ impl<'a> FnCompiler<'a> {
             let save = self.next_reg;
             let kr = self.expr(key)?; // key evaluates with the enclosing `this`
             if *is_static {
-                // …but the value initializer evaluates with `this` = the class.
+                // …but the value initializer evaluates with `this` = the class, in
+                // STRICT mode (the computed KEY above used the enclosing context).
                 self.this_override = Some(cls);
+                let prev_strict = self.cx.in_strict;
+                self.cx.in_strict = true;
                 let vr = match init {
                     Some(e) => self.expr(e)?,
                     None => {
@@ -2139,6 +2146,7 @@ impl<'a> FnCompiler<'a> {
                         t
                     }
                 };
+                self.cx.in_strict = prev_strict;
                 self.this_override = None;
                 self.emit(Instr::SetIndex { obj: cls, key: kr, val: vr });
             } else {
