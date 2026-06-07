@@ -1082,6 +1082,22 @@ impl<'p> Vm<'p> {
                     m.define("BYTES_PER_ELEMENT", Value::num(size as f64), proto_attr);
                 }
             }
+            // Uint8Array (kind 1) base64/hex proposal — hex subset: `toHex` /
+            // `setFromHex` on the prototype, `fromHex` static on the constructor.
+            {
+                let u8_proto = self.ta_protos[1];
+                let u8_ctor = self.ta_ctors[1];
+                let to_hex = Value::heap(self.heap.alloc(HeapObj::Native(U8_TO_HEX)));
+                let set_from_hex = Value::heap(self.heap.alloc(HeapObj::Native(U8_SET_FROM_HEX)));
+                let from_hex = Value::heap(self.heap.alloc(HeapObj::Native(U8_FROM_HEX)));
+                if let HeapObj::Object(m) = self.heap.get_mut(u8_proto) {
+                    m.define("toHex", to_hex, method_attr);
+                    m.define("setFromHex", set_from_hex, method_attr);
+                }
+                if let HeapObj::Object(m) = self.heap.get_mut(u8_ctor) {
+                    m.define("fromHex", from_hex, method_attr);
+                }
+            }
             let arraybuffer_proto = build(
                 self,
                 &[

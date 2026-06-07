@@ -196,6 +196,10 @@ pub const PROMISE_ALLSETTLEDKEYED: u16 = 877;
 // Annex B legacy string escapes (B.2.1).
 pub const GLOBAL_ESCAPE: u16 = 878;
 pub const GLOBAL_UNESCAPE: u16 = 879;
+// Uint8Array base64/hex proposal — hex subset.
+pub const U8_TO_HEX: u16 = 880;
+pub const U8_SET_FROM_HEX: u16 = 881;
+pub const U8_FROM_HEX: u16 = 882;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -945,6 +949,9 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_DECODE_URI_COMPONENT => ("decodeURIComponent", 1),
         GLOBAL_ESCAPE => ("escape", 1),
         GLOBAL_UNESCAPE => ("unescape", 1),
+        U8_TO_HEX => ("toHex", 0),
+        U8_SET_FROM_HEX => ("setFromHex", 1),
+        U8_FROM_HEX => ("fromHex", 1),
         FN_HAS_INSTANCE => ("[Symbol.hasInstance]", 1),
         FN_THROW_TYPE_ERROR => ("", 0),
         GLOBAL_IS_NAN => ("isNaN", 1),

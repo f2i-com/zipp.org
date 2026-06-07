@@ -2026,6 +2026,83 @@ impl<'p> Vm<'p> {
                 let r = unescape_str(&s);
                 self.alloc_str(r)
             }
+            U8_TO_HEX => {
+                let idx = self.u8_brand(this)?;
+                let bytes = self
+                    .u8_bytes(idx)
+                    .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
+                let mut s = String::with_capacity(bytes.len() * 2);
+                for b in bytes {
+                    let h = hex_lower(b);
+                    s.push(h[0] as char);
+                    s.push(h[1] as char);
+                }
+                self.alloc_str(s)
+            }
+            U8_SET_FROM_HEX => {
+                let idx = self.u8_brand(this)?;
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_string_value(arg) {
+                    return Err(Thrown(
+                        "TypeError: Uint8Array.prototype.setFromHex argument must be a string".into(),
+                    ));
+                }
+                // Writing into a TypedArray backed by an immutable ArrayBuffer is a
+                // TypeError (checked before any decode/write, so contents are never
+                // mutated — even for an empty input).
+                if let HeapObj::TypedArray { buffer, .. } = self.heap.get(idx) {
+                    let buffer = *buffer;
+                    if self.immutable_buffers.contains(&buffer) {
+                        return Err(Thrown(
+                            "TypeError: Cannot setFromHex into a TypedArray backed by an immutable ArrayBuffer".into(),
+                        ));
+                    }
+                }
+                let s = self.to_js_string(arg)?;
+                let max = self
+                    .ta_effective_len(idx)
+                    .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
+                let (read, bytes, err) = from_hex(&s, max);
+                let written = bytes.len();
+                self.u8_write(idx, &bytes);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                // The { read, written } result (an ordinary object).
+                let mut m = crate::heap::ObjMap::new();
+                let attr = crate::heap::PropAttr {
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                m.define("read", Value::num(read as f64), attr);
+                m.define("written", Value::num(written as f64), attr);
+                let obj = self.heap.alloc(HeapObj::Object(m));
+                if self.obj_proto != 0 {
+                    self.proto_of.insert(obj, Value::heap(self.obj_proto));
+                }
+                Value::heap(obj)
+            }
+            U8_FROM_HEX => {
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_string_value(arg) {
+                    return Err(Thrown(
+                        "TypeError: Uint8Array.fromHex argument must be a string".into(),
+                    ));
+                }
+                let s = self.to_js_string(arg)?;
+                let (_, bytes, err) = from_hex(&s, usize::MAX);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                let buf = self.alloc_array_buffer(bytes.len());
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
+                    data.copy_from_slice(&bytes);
+                }
+                self.alloc_typed_array(buf, 1, 0, bytes.len())
+            }
             GLOBAL_IS_NAN => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan()),
             GLOBAL_IS_FINITE => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite()),
             GLOBAL_EVAL => {
@@ -3008,6 +3085,44 @@ fn hex_val(b: u8) -> Result<u8, ()> {
 /// replaced by the percent-encoded uppercase hex of its UTF-8 bytes. Rust `str`
 /// holds only Unicode scalar values, so the lone-surrogate URIError branch is
 /// unreachable here.
+/// A byte → its two lowercase hex ASCII digits.
+fn hex_lower(b: u8) -> [u8; 2] {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    [D[(b >> 4) as usize], D[(b & 0xf) as usize]]
+}
+
+/// FromHex(string, maxLength) (Uint8Array base64/hex proposal): decode hex into
+/// at most `maxLength` bytes. Returns (chars read, decoded bytes, optional
+/// SyntaxError). An odd-length string decodes NOTHING; an illegal hexit pair
+/// decodes the valid prefix then errors; reaching `maxLength` stops without error.
+fn from_hex(s: &str, max_len: usize) -> (usize, Vec<u8>, Option<Thrown>) {
+    let chars: Vec<char> = s.chars().collect();
+    let length = chars.len();
+    let err = || Some(Thrown("SyntaxError: invalid hexadecimal string".into()));
+    if length % 2 != 0 {
+        return (0, Vec::new(), err());
+    }
+    let hexv = |c: char| -> Option<u8> {
+        if c.is_ascii() {
+            hex_val(c as u8).ok()
+        } else {
+            None
+        }
+    };
+    let mut bytes = Vec::new();
+    let mut read = 0;
+    while read < length && bytes.len() < max_len {
+        match (hexv(chars[read]), hexv(chars[read + 1])) {
+            (Some(h), Some(l)) => {
+                bytes.push((h << 4) | l);
+                read += 2;
+            }
+            _ => return (read, bytes, err()),
+        }
+    }
+    (read, bytes, None)
+}
+
 /// `escape(string)` (Annex B B.2.1.1): keep `A-Za-z0-9@*_+-./`, encode any
 /// other UTF-16 code unit as `%XX` (unit < 256) or `%uXXXX`. Iterates code
 /// units (not chars) so an astral char yields its two surrogate `%uXXXX`s.

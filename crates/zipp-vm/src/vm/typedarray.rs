@@ -73,6 +73,60 @@ impl<'p> Vm<'p> {
         Value::heap(idx)
     }
 
+    /// True if `v` is a (primitive) String value.
+    pub(crate) fn is_string_value(&self, v: Value) -> bool {
+        v.is_heap()
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            )
+    }
+
+    /// Validate a `Uint8Array` receiver (the base64/hex methods are Uint8Array-only,
+    /// even via `.call`), returning its heap index.
+    pub(crate) fn u8_brand(&self, this: Value) -> Result<u32, Thrown> {
+        if this.is_heap() {
+            if let HeapObj::TypedArray { kind: 1, .. } = self.heap.get(this.heap_index()) {
+                return Ok(this.heap_index());
+            }
+        }
+        Err(Thrown("TypeError: method requires a Uint8Array receiver".into()))
+    }
+
+    /// The live bytes of a Uint8Array view (`None` if its buffer is detached or
+    /// out of bounds).
+    pub(crate) fn u8_bytes(&self, idx: u32) -> Option<Vec<u8>> {
+        let len = self.ta_effective_len(idx)?;
+        let (buffer, off) = match self.heap.get(idx) {
+            HeapObj::TypedArray { buffer, byte_offset, .. } => (*buffer, *byte_offset),
+            _ => return None,
+        };
+        match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                Some(data[off..off + len].to_vec())
+            }
+            _ => None,
+        }
+    }
+
+    /// Write `bytes` into a Uint8Array view starting at element 0 (bytes beyond the
+    /// view are ignored; the caller bounds the slice to the view length).
+    pub(crate) fn u8_write(&mut self, idx: u32, bytes: &[u8]) {
+        let (buffer, off) = match self.heap.get(idx) {
+            HeapObj::TypedArray { buffer, byte_offset, .. } => (*buffer, *byte_offset),
+            _ => return,
+        };
+        if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buffer) {
+            if !*detached {
+                for (i, &b) in bytes.iter().enumerate() {
+                    if off + i < data.len() {
+                        data[off + i] = b;
+                    }
+                }
+            }
+        }
+    }
+
     /// Read element `i` of a TypedArray as a Value (number, or BigInt for the
     /// 64-bit BigInt kinds). Out-of-bounds → undefined.
     pub(crate) fn ta_element_get(&mut self, ta_idx: u32, i: usize) -> Value {
