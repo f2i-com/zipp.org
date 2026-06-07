@@ -3067,6 +3067,15 @@ impl<'a> FnCompiler<'a> {
         }
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
+        // Close-on-throw (sync for-of only): if the element binding or the body
+        // throws, the iterator must be closed before the error propagates. The
+        // thrown value lands in `exc_reg`; a catch block after the loop closes the
+        // iterator and re-throws. (for-await iterates asynchronously — left as-is.)
+        let exc_reg = if f.r#await {
+            None
+        } else {
+            Some(self.declare_local("<forof.exc>"))
+        };
 
         // The loop binding: a destructuring pattern's leaves, an assignment to an
         // existing target, or a single (possibly cell-boxed) declared variable.
@@ -3114,6 +3123,21 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
             j
         };
+        // Enter the loop body's break/continue scope, then install the per-iteration
+        // close-on-throw handler. The scope's `handler_depth` floor is recorded
+        // BEFORE the push so a `break`/`continue` (handler_depth > floor) unwinds
+        // through it (popping the handler) on its way to the break/continue target.
+        // The handler is OUTSIDE the IterNext/done-check above, so a throwing
+        // `next()` (or normal exhaustion) does NOT close the iterator (per spec).
+        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
+        let close_push = if let Some(er) = exc_reg {
+            let at = self.here();
+            self.emit(Instr::PushHandler { catch_target: 0, catch_reg: er });
+            self.handler_depth += 1;
+            Some(at)
+        } else {
+            None
+        };
         if let Some(p) = pattern {
             self.extract_pattern(p, elem)?;
         } else if let Some(tgt) = assign_tgt {
@@ -3126,17 +3150,33 @@ impl<'a> FnCompiler<'a> {
         }
         self.next_reg = save; // reclaim done + elem temps
 
-        self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
         self.stmt(&f.body)?;
+        // Normal iteration completion: pop the close-on-throw handler before looping.
+        if close_push.is_some() {
+            self.emit(Instr::PopHandler);
+            self.handler_depth -= 1;
+        }
         let ctx = self.loop_ctx.pop().unwrap();
         for c in ctx.continue_jumps {
             self.patch_jump(c, top); // continue → re-run IterNext (advance + test)
         }
         self.emit(Instr::Jump { target: top });
+        // Close-on-throw catch block: reached only when a throw unwinds out of the
+        // element binding or body (the handler is already popped by the unwind).
+        // Close the iterator quietly (error context — the original error wins) and
+        // re-throw it. `return` out of the body discards the catch handler (it is
+        // not a finally), so it does not close here — a remaining gap.
+        if let (Some(at), Some(er)) = (close_push, exc_reg) {
+            let catch_target = self.here();
+            self.emit(Instr::IterCloseQuiet { iter: iter_reg });
+            self.emit(Instr::Throw { src: er });
+            if let Instr::PushHandler { catch_target: ct, .. } = &mut self.code[at as usize] {
+                *ct = catch_target;
+            }
+        }
         // A `break` out of the loop closes the (not-yet-exhausted) iterator via a
         // block reached only from break jumps; the normal `done` exit skips it
-        // (the iterator already signalled completion). (`return`/`throw` out of the
-        // body don't yet close — a remaining gap.)
+        // (the iterator already signalled completion).
         let end = if ctx.break_jumps.is_empty() {
             let e = self.here();
             self.patch_jump(jdone, e);

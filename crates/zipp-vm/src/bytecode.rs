@@ -184,6 +184,11 @@ pub enum Instr {
     /// IteratorClose: invoke `iter`'s `return()` (if present) — emitted on the
     /// abrupt `break` exit of a `for-of` so a not-yet-exhausted iterator is closed.
     IterClose { iter: Reg },
+    /// IteratorClose in an ERROR context: invoke `iter`'s `return()` (if present)
+    /// but SWALLOW any error it throws and skip the result-is-object check, so a
+    /// throw/return out of a `for-of` body closes the iterator while preserving the
+    /// original abrupt completion (the spec's `Completion(...)` discard of the close result).
+    IterCloseQuiet { iter: Reg },
     /// Resolve `src`'s ASYNC iterator into `dst`: `src[@@asyncIterator]()` if
     /// present, else `src[@@iterator]()` (a sync iterable used by `for await`),
     /// else pass `src` through (async generators / built-ins iterate directly).

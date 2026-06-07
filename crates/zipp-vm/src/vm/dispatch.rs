@@ -2719,6 +2719,13 @@ impl<'p> Vm<'p> {
                         self.iterator_close(it)?;
                         ip += 1;
                     }
+                    Instr::IterCloseQuiet { iter } => {
+                        // Error-context close: a throwing/non-object return() is
+                        // ignored so the original abrupt completion is preserved.
+                        let it = self.get(base, iter);
+                        let _ = self.iterator_close(it);
+                        ip += 1;
+                    }
                     Instr::IterNext { value_dst, done_dst, iter, idx } => {
                         let it = self.get(base, iter);
                         if !it.is_heap() {
