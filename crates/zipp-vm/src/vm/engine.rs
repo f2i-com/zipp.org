@@ -333,6 +333,7 @@ impl<'p> Vm<'p> {
                 closure: NO_CLOSURE,
                 handlers: Vec::new(),
                 new_target: Value::UNDEFINED,
+                callee: Value::UNDEFINED,
             });
             let stop = self.frames.len() - 1;
             match self.run_loop(stop) {
@@ -451,6 +452,7 @@ impl<'p> Vm<'p> {
             closure: NO_CLOSURE,
             handlers: Vec::new(),
             new_target: Value::UNDEFINED,
+            callee: Value::UNDEFINED,
         });
         let stop = self.frames.len() - 1;
         let r = self.run_loop(stop);
@@ -532,7 +534,7 @@ impl<'p> Vm<'p> {
         // only the top frame so the reservation math is relative to a known base.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.reserve_jit_regs();
-        self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED });
+        self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
         // Everything allocated so far (interned strings, all built-ins, hoisted
         // top-level functions) is pinned: the GC never collects below this floor.
         self.set_gc_floor();
@@ -745,7 +747,7 @@ impl<'p> Vm<'p> {
 
         let stop_depth = self.frames.len();
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target });
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
         self.run_loop(stop_depth)
     }
 

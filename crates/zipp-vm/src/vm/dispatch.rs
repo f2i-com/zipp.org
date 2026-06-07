@@ -256,13 +256,18 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::LoadCallee { dst } => {
-                        // The function value of the running frame — its Closure object
-                        // if it has captures, else a function object for its func id.
-                        let (clo, fid) = {
+                        // The function value of the running frame. Prefer the actual
+                        // callee the caller invoked (so a named function expression's
+                        // own name === the outer reference); fall back to the Closure
+                        // object, or a fresh Func for a plain function whose caller is
+                        // unknown (generator/async resume, top-level).
+                        let (callee, clo, fid) = {
                             let fr = self.frames.last().unwrap();
-                            (fr.closure, fr.func)
+                            (fr.callee, fr.closure, fr.func)
                         };
-                        let v = if clo != NO_CLOSURE {
+                        let v = if !callee.is_undefined() {
+                            callee
+                        } else if clo != NO_CLOSURE {
                             Value::heap(clo)
                         } else {
                             Value::heap(self.heap.alloc(HeapObj::Func(fid)))
@@ -2355,6 +2360,7 @@ impl<'p> Vm<'p> {
                             argc,
                             dst,
                             ip + 1,
+                            callee_v,
                         )?;
                         break;
                     }
@@ -2488,7 +2494,8 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1)?;
+                        let callee_v = if closure != NO_CLOSURE { Value::heap(closure) } else { Value::UNDEFINED };
+                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, callee_v)?;
                         break;
                     }
 
@@ -2548,7 +2555,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1)?;
+                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, method)?;
                         break;
                     }
 
@@ -3138,6 +3145,7 @@ impl<'p> Vm<'p> {
         argc: u16,
         dst: u16,
         caller_ip_next: usize,
+        callee_val: Value,
     ) -> Result<(), Thrown> {
         if self.frames.len() >= MAX_FRAMES {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
@@ -3198,7 +3206,7 @@ impl<'p> Vm<'p> {
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target });
+        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
         Ok(())
     }
 

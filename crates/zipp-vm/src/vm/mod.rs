@@ -77,6 +77,13 @@ struct Frame {
     /// thrown error bubbling up from a builtin call) unwinds to the innermost
     /// handler here, else propagates to the caller frame.
     handlers: Vec<Handler>,
+    /// The function VALUE being invoked in this activation (the object the caller
+    /// actually called), or `UNDEFINED` when unknown/irrelevant (top-level script,
+    /// eval, generator/async resume). `LoadCallee` returns it so a named function
+    /// expression's own name has the SAME identity as the outer reference (rather
+    /// than a freshly-allocated `Func`); falls back to the closure/fresh-Func when
+    /// `UNDEFINED`.
+    callee: Value,
     /// The `new.target` value for this activation: the constructor when entered
     /// via `new` / `Reflect.construct` / `super(...)`, else `undefined` (a plain
     /// call, `.call`/`.apply`, a method, a tagged template, …). Read by the
