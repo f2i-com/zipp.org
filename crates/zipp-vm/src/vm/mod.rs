@@ -389,6 +389,12 @@ pub struct Vm<'p> {
     /// A module is evaluated at most once, so re-importing the same path returns the
     /// SAME namespace object (identity). Values are GC roots (modules persist).
     module_cache: std::collections::HashMap<std::path::PathBuf, Value>,
+    /// Module Namespace exotic objects: namespace heap index → its (export name →
+    /// global slot) map. Each module's exported bindings live in PER-MODULE fresh
+    /// global slots (see run_eval_program module mode), so a namespace's [[Get]]
+    /// reads the LIVE binding without colliding with another module's same-named
+    /// export. [[Set]] is a no-op. Pruned on GC sweep.
+    module_namespaces: std::collections::HashMap<u32, std::collections::HashMap<String, u32>>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).

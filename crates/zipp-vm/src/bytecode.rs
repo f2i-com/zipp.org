@@ -855,6 +855,12 @@ pub struct Program {
     /// True if the module depends on another module (`import …`, `export … from`,
     /// `export *`) — the loader cannot link those yet, so the import rejects.
     pub module_has_imports: bool,
+    /// Compile-time global slots DECLARED by a module's top level (var/let/const/
+    /// function/class + the synthetic `*default*`). When loading a module these are
+    /// remapped to PER-MODULE FRESH slots (not the realm's shared by-name slots) so
+    /// two modules' same-named exports don't collide; free/builtin references stay
+    /// realm-shared. Empty for ordinary scripts / eval.
+    pub module_decl_globals: Vec<u32>,
 }
 
 /// A compiled class: the constructor func id (runs field inits + user ctor body),

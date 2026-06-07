@@ -220,21 +220,28 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
-    pub(crate) fn build_module_namespace(&mut self, exports: &[(String, String)]) -> Value {
+    /// Build a Module Namespace exotic object from the module's exports, where each
+    /// entry pairs the exported name with the LIVE per-module global slot holding the
+    /// binding. The ObjMap stores a SNAPSHOT value (for key order, descriptors, and
+    /// reflection); the namespace's slot map registered in `module_namespaces` is what
+    /// the live `[[Get]]` (get_member) reads, so re-assignments inside the module are
+    /// observed through `ns.x` (live bindings).
+    pub(crate) fn build_module_namespace(&mut self, exports: &[(String, u32)]) -> Value {
         let _gc = self.gc_lock_guard(); // hold the alloc'd values across allocations
         // Resolve each export's value (first export of a name wins), then sort the
         // names (the spec orders namespace keys via Array.prototype.sort default).
-        let mut pairs: Vec<(String, Value)> = Vec::new();
+        let mut pairs: Vec<(String, Value, u32)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for (exported, local) in exports {
+        for (exported, slot) in exports {
             if !seen.insert(exported.clone()) {
                 continue;
             }
-            let val = match self.eval_global_slot(local) {
-                Ok(slot) => self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED),
-                Err(_) => Value::UNDEFINED,
-            };
-            pairs.push((exported.clone(), val));
+            let val = self
+                .globals
+                .get(*slot as usize)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
+            pairs.push((exported.clone(), val, *slot));
         }
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         let tag = self.alloc_str("Module".to_string());
@@ -246,8 +253,10 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
-        for (name, val) in pairs {
+        let mut slot_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for (name, val, slot) in pairs {
             m.define(&name, val, data_attr);
+            slot_map.insert(name, slot);
         }
         m.define(
             "@@toStringTag",
@@ -263,6 +272,7 @@ impl<'p> Vm<'p> {
         m.extensible = false;
         let idx = self.heap.alloc(HeapObj::Object(m));
         self.proto_of.insert(idx, Value::NULL);
+        self.module_namespaces.insert(idx, slot_map);
         Value::heap(idx)
     }
 

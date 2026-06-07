@@ -148,6 +148,7 @@ impl<'p> Vm<'p> {
             error_data: std::collections::HashSet::new(),
             module_base_dir: None,
             module_cache: std::collections::HashMap::new(),
+            module_namespaces: std::collections::HashMap::new(),
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),
@@ -854,7 +855,7 @@ impl<'p> Vm<'p> {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
-        self.run_eval_program(eval_prog, this_override)
+        self.run_eval_program(eval_prog, this_override, false).map(|(v, _)| v)
     }
 
     /// Parse + load a MODULE file for a dynamic `import()`: compile it as a module
@@ -862,7 +863,7 @@ impl<'p> Vm<'p> {
     /// return its (exported name, local name) pairs. The caller reads each local's
     /// top-level (eval-global) binding afterward to build the namespace. A parse or
     /// compile error, or a throw during evaluation, propagates as `Err`.
-    pub(crate) fn load_module(&mut self, code: &str) -> Result<Vec<(String, String)>, Thrown> {
+    pub(crate) fn load_module(&mut self, code: &str) -> Result<Vec<(String, u32)>, Thrown> {
         let allocator = oxc_allocator::Allocator::default();
         let ret =
             oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::mjs()).parse();
@@ -881,8 +882,19 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: module dependencies are not supported".into()));
         }
         let exports = prog.module_exports.clone();
-        self.run_eval_program(prog, None)?;
-        Ok(exports)
+        let names = prog.global_names.clone();
+        // Run the module in its OWN environment: its declared globals are remapped
+        // to fresh per-module slots (module=true), so its exports don't collide with
+        // another module's same-named bindings. `gmap[i]` is the live slot for
+        // compile-time global slot `i`.
+        let (_completion, gmap) = self.run_eval_program(prog, None, true)?;
+        let mut out: Vec<(String, u32)> = Vec::with_capacity(exports.len());
+        for (exported, local) in exports {
+            if let Some(i) = names.iter().position(|n| *n == local) {
+                out.push((exported, gmap[i]));
+            }
+        }
+        Ok(out)
     }
 
     /// Install a compiled eval/module Program into the live realm (remap its global
@@ -893,16 +905,39 @@ impl<'p> Vm<'p> {
         &mut self,
         eval_prog: crate::bytecode::Program,
         this_override: Option<Value>,
-    ) -> Result<Value, Thrown> {
+        module: bool,
+    ) -> Result<(Value, Vec<u32>), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // Runtime base ids: eval functions and classes are appended past the
         // compile-time tables (parallel to global slots).
         let base_func = (self.main_func_count + self.eval_funcs.len()) as u32;
         let base_class = (self.main_class_count + self.eval_classes.len()) as u32;
         // 3. Remap the eval program's own global-slot numbering onto live slots.
+        //    For a MODULE, each slot it DECLARES (var/let/const/function/class +
+        //    `*default*`) draws a FRESH per-module slot so two modules' same-named
+        //    exports don't collide — the foundation for correct live bindings. A
+        //    free reference (builtin or import) still resolves realm-shared by name.
+        let decl: std::collections::HashSet<u32> = if module {
+            eval_prog.module_decl_globals.iter().copied().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
         let mut gmap: Vec<u32> = Vec::with_capacity(eval_prog.global_names.len());
-        for name in &eval_prog.global_names {
-            gmap.push(self.eval_global_slot(name)?);
+        for (i, name) in eval_prog.global_names.iter().enumerate() {
+            if module && decl.contains(&(i as u32)) {
+                if self.eval_global_next >= cap {
+                    return Err(Thrown(
+                        "EvalError: too many distinct globals introduced by eval".into(),
+                    ));
+                }
+                let s = self.eval_global_next;
+                self.eval_global_next += 1;
+                self.globals[s as usize] = Value::UNINITIALIZED;
+                gmap.push(s);
+            } else {
+                gmap.push(self.eval_global_slot(name)?);
+            }
         }
         // 4. Install eval classes: re-index their member func ids (which point into
         //    the eval functions installed below) by base_func, leak each ClassDef,
@@ -998,6 +1033,7 @@ impl<'p> Vm<'p> {
                 Value::UNDEFINED
             }
         });
-        self.call_value(script, this, &[])
+        let completion = self.call_value(script, this, &[])?;
+        Ok((completion, gmap))
     }
 }

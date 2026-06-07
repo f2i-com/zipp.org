@@ -2556,6 +2556,19 @@ impl<'p> Vm<'p> {
                     None => self.get_member(target, key, receiver),
                 };
             }
+            // Module Namespace exotic [[Get]]: an exported name reads its LIVE
+            // per-module slot (so a re-assignment inside the module is observed),
+            // not the snapshot in the ObjMap. Non-export keys (e.g. @@toStringTag)
+            // fall through to the ordinary lookup below.
+            if let Some(slot_map) = self.module_namespaces.get(&obj.heap_index()) {
+                if let Some(&slot) = slot_map.get(key) {
+                    return Ok(self
+                        .globals
+                        .get(slot as usize)
+                        .copied()
+                        .unwrap_or(Value::UNDEFINED));
+                }
+            }
         }
         if !obj.is_heap() {
             // Reading a property of null/undefined throws a TypeError (matches

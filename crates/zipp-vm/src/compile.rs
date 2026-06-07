@@ -293,6 +293,7 @@ pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
     }
+    let module_decl_globals = c.collect_module_decl_globals();
     Ok(Program {
         functions: c.functions,
         global_count: c.globals.len() as u32,
@@ -301,6 +302,7 @@ pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
         hoisted_globals: c.hoisted_globals,
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
+        module_decl_globals,
     })
 }
 
@@ -323,6 +325,7 @@ pub fn compile_eval(
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
     }
+    let module_decl_globals = c.collect_module_decl_globals();
     Ok(Program {
         functions: c.functions,
         global_count: c.globals.len() as u32,
@@ -331,6 +334,7 @@ pub fn compile_eval(
         hoisted_globals: c.hoisted_globals,
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
+        module_decl_globals,
     })
 }
 
@@ -430,6 +434,29 @@ impl Compiler {
             module_exports: Vec::new(),
             module_has_imports: false,
         }
+    }
+
+    /// Global slots a module's top level DECLARES (var/let/const/function/class +
+    /// the synthetic `*default*`) — remapped to per-module fresh slots by the
+    /// loader. Meaningful only for module compiles; harmless (unused) for scripts.
+    fn collect_module_decl_globals(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self.decl_globals.iter().copied().collect();
+        v.extend(self.lexical_globals.iter().copied());
+        v.extend(self.const_globals.iter().copied());
+        v.extend(self.hoisted_globals.iter().copied());
+        if let Some(i) = self.globals.iter().position(|n| n == "*default*") {
+            v.push(i as u32);
+        }
+        // An INLINE `export const x` / `export function f` is an
+        // ExportNamedDeclaration, so the bare-declaration hoisting pre-passes above
+        // never registered its slot. Add every exported LOCAL's slot directly so a
+        // module's exports always get fresh per-module slots (isolation).
+        for (_, local) in &self.module_exports {
+            if let Some(i) = self.globals.iter().position(|n| n == local) {
+                v.push(i as u32);
+            }
+        }
+        v
     }
 
     /// Slice the program source by a function node's byte span, for
