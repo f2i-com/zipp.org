@@ -630,6 +630,57 @@ impl Compiler {
             }
         }
 
+        // Annex B B.3.3: in a SLOPPY (non-script) function body, a `function`
+        // declared inside a block also gets a function-scoped `var` binding,
+        // initialized to undefined here and assigned the function value when the
+        // block declaration executes (see func_decl). Names that would be an early
+        // error (a formal parameter, or a lexical `let`/`const`/`class` in scope —
+        // top-level OR an enclosing block/for-head/catch param) are skipped, as is
+        // a top-level function name (already var-scoped).
+        if !is_script && !fc.cx.in_strict {
+            let mut blockers = std::collections::HashSet::new();
+            for p in params {
+                blockers.insert(p.clone());
+            }
+            for s in body {
+                match s {
+                    ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                        for decl in &d.declarations {
+                            capture::collect_pattern_names(&decl.id, &mut blockers);
+                        }
+                    }
+                    ox::Statement::ClassDeclaration(c) => {
+                        if let Some(id) = &c.id {
+                            blockers.insert(id.name.to_string());
+                        }
+                    }
+                    ox::Statement::FunctionDeclaration(f) => {
+                        if let Some(id) = &f.id {
+                            blockers.insert(id.name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut b33 = std::collections::HashSet::new();
+            for s in body {
+                collect_b33_block_fns(s, false, &blockers, &mut b33);
+            }
+            for name in &b33 {
+                // CreateMutableBinding + InitializeBinding(undefined) at entry.
+                let reg = fc.declare_local(name);
+                if fc.cell_regs.contains(&reg) {
+                    let t = fc.temp();
+                    fc.emit(Instr::LoadUndefined { dst: t });
+                    fc.emit(Instr::CellSet { cell: reg, src: t });
+                    fc.next_reg -= 1;
+                } else {
+                    fc.emit(Instr::LoadUndefined { dst: reg });
+                }
+            }
+            fc.b33_names = b33;
+        }
+
         // Hoist top-level lexical (`let`/`const`) names into `lexical_globals` so an
         // assignment to one BEFORE its declaration runs (its TDZ) is a ReferenceError
         // even in sloppy mode — `for ([x] of [[]]) {} let x;`. Only DIRECT top-level
@@ -1074,6 +1125,11 @@ struct FnCompiler<'a> {
     /// the with body (depth ≥ floor) is not shadowed. Empty except inside a
     /// `with` body, so non-`with` code compiles identically (zero regression).
     with_stack: Vec<WithScope>,
+    /// Annex B B.3.3: names of functions declared inside BLOCKS of this (sloppy,
+    /// non-script) function body that also get a function-scoped `var` binding,
+    /// synced to the function value when the block declaration executes. Excludes
+    /// names with a lexical conflict (which would be an early error → B.3.3 skipped).
+    b33_names: std::collections::HashSet<String>,
     /// Active optional-chain short-circuit targets: a stack (chains can nest),
     /// each entry collecting the ip of every `?.` nullish-bail jump in that chain.
     /// On exit the chain patches them to a "load undefined" block.
@@ -1176,6 +1232,7 @@ impl<'a> FnCompiler<'a> {
             upvalues: Rc::new(RefCell::new(Vec::new())),
             enclosing,
             with_stack: Vec::new(),
+            b33_names: std::collections::HashSet::new(),
         };
         // Register 0 is reserved for `this` in every function (undefined for
         // plain calls, the receiver for method calls). Parameters follow at
@@ -2085,12 +2142,41 @@ impl<'a> FnCompiler<'a> {
             // plain function object. The name's binding may be a plain register or
             // a cell (when a sibling/inner function captures this function name).
             self.cx.functions.push(proto);
+            // Annex B B.3.3: a block function with a function-scoped `var` binding
+            // (in `b33_names`) assigns the var the function value when this
+            // declaration executes. `s0reg` is that binding's register in the
+            // function's base scope; the block-local shadows it inside the block.
+            let s0reg = match name.as_deref() {
+                Some(n) if self.b33_names.contains(n) => self
+                    .scopes
+                    .first()
+                    .and_then(|s| s.iter().find(|(nm, _)| nm == n).map(|(_, r)| *r)),
+                _ => None,
+            };
             match binding {
-                Some(Binding::Local(reg)) => self.emit_make_callable(reg, id, has_upvalues),
+                Some(Binding::Local(reg)) => {
+                    self.emit_make_callable(reg, id, has_upvalues);
+                    if let Some(s0) = s0reg {
+                        if s0 != reg {
+                            if self.cell_regs.contains(&s0) {
+                                self.emit(Instr::CellSet { cell: s0, src: reg });
+                            } else {
+                                self.emit(Instr::Move { dst: s0, src: reg });
+                            }
+                        }
+                    }
+                }
                 Some(Binding::LocalCell(cell)) => {
                     let tmp = self.temp();
                     self.emit_make_callable(tmp, id, has_upvalues);
                     self.emit(Instr::CellSet { cell, src: tmp });
+                    if let Some(s0) = s0reg {
+                        if self.cell_regs.contains(&s0) {
+                            self.emit(Instr::CellSet { cell: s0, src: tmp });
+                        } else {
+                            self.emit(Instr::Move { dst: s0, src: tmp });
+                        }
+                    }
                     self.next_reg -= 1;
                 }
                 _ => {}
@@ -6445,6 +6531,146 @@ fn hoisted_var_names(body: &[ox::Statement]) -> Vec<String> {
         collect_hoisted_vars(s, &mut set);
     }
     set.into_iter().collect()
+}
+
+/// Add a block's DIRECT lexical declaration names (top-level `let`/`const`/
+/// `class` of the block) to `out` — the names that block Annex B B.3.3 for a
+/// same-block function declaration.
+fn add_block_lexicals(s: &ox::Statement, out: &mut std::collections::HashSet<String>) {
+    use ox::Statement as S;
+    match s {
+        S::VariableDeclaration(d) if d.kind.is_lexical() => {
+            for decl in &d.declarations {
+                capture::collect_pattern_names(&decl.id, out);
+            }
+        }
+        S::ClassDeclaration(c) => {
+            if let Some(id) = &c.id {
+                out.insert(id.name.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Annex B B.3.3: collect names of `function` declarations inside BLOCKS (not at
+/// the top level of the function body) that are eligible for a function-scoped
+/// `var` binding. `blockers` is the set of lexical names in scope (params,
+/// top-level lexicals, plus the lexical declarations of every enclosing block /
+/// for-head / catch param): a function whose name is blocked would be an early
+/// error under B.3.3 and so is SKIPPED (left block-local).
+fn collect_b33_block_fns(
+    s: &ox::Statement,
+    nested: bool,
+    blockers: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use ox::Statement as S;
+    let for_left_lex = |d: &ox::VariableDeclaration, bk: &mut std::collections::HashSet<String>| {
+        if d.kind.is_lexical() {
+            for decl in &d.declarations {
+                capture::collect_pattern_names(&decl.id, bk);
+            }
+        }
+    };
+    match s {
+        S::FunctionDeclaration(f) => {
+            if nested {
+                if let Some(id) = &f.id {
+                    let n = id.name.as_str();
+                    if !blockers.contains(n) {
+                        out.insert(n.to_string());
+                    }
+                }
+            }
+        }
+        S::BlockStatement(b) => {
+            let mut bk = blockers.clone();
+            for st in &b.body {
+                add_block_lexicals(st, &mut bk);
+            }
+            for st in &b.body {
+                collect_b33_block_fns(st, true, &bk, out);
+            }
+        }
+        S::ForStatement(f) => {
+            let mut bk = blockers.clone();
+            if let Some(ox::ForStatementInit::VariableDeclaration(d)) = &f.init {
+                for_left_lex(d, &mut bk);
+            }
+            collect_b33_block_fns(&f.body, true, &bk, out);
+        }
+        S::ForOfStatement(f) => {
+            let mut bk = blockers.clone();
+            if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                for_left_lex(d, &mut bk);
+            }
+            collect_b33_block_fns(&f.body, true, &bk, out);
+        }
+        S::ForInStatement(f) => {
+            let mut bk = blockers.clone();
+            if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                for_left_lex(d, &mut bk);
+            }
+            collect_b33_block_fns(&f.body, true, &bk, out);
+        }
+        S::WhileStatement(w) => collect_b33_block_fns(&w.body, true, blockers, out),
+        S::DoWhileStatement(d) => collect_b33_block_fns(&d.body, true, blockers, out),
+        S::IfStatement(i) => {
+            collect_b33_block_fns(&i.consequent, true, blockers, out);
+            if let Some(a) = &i.alternate {
+                collect_b33_block_fns(a, true, blockers, out);
+            }
+        }
+        S::SwitchStatement(sw) => {
+            // All cases share one block scope: their lexicals block every case.
+            let mut bk = blockers.clone();
+            for c in &sw.cases {
+                for st in &c.consequent {
+                    add_block_lexicals(st, &mut bk);
+                }
+            }
+            for c in &sw.cases {
+                for st in &c.consequent {
+                    collect_b33_block_fns(st, true, &bk, out);
+                }
+            }
+        }
+        S::TryStatement(t) => {
+            {
+                let mut bk = blockers.clone();
+                for st in &t.block.body {
+                    add_block_lexicals(st, &mut bk);
+                }
+                for st in &t.block.body {
+                    collect_b33_block_fns(st, true, &bk, out);
+                }
+            }
+            if let Some(h) = &t.handler {
+                let mut bk = blockers.clone();
+                if let Some(p) = &h.param {
+                    capture::collect_pattern_names(&p.pattern, &mut bk);
+                }
+                for st in &h.body.body {
+                    add_block_lexicals(st, &mut bk);
+                }
+                for st in &h.body.body {
+                    collect_b33_block_fns(st, true, &bk, out);
+                }
+            }
+            if let Some(fin) = &t.finalizer {
+                let mut bk = blockers.clone();
+                for st in &fin.body {
+                    add_block_lexicals(st, &mut bk);
+                }
+                for st in &fin.body {
+                    collect_b33_block_fns(st, true, &bk, out);
+                }
+            }
+        }
+        S::LabeledStatement(l) => collect_b33_block_fns(&l.body, nested, blockers, out),
+        _ => {}
+    }
 }
 
 fn collect_hoisted_vars(s: &ox::Statement, out: &mut std::collections::HashSet<String>) {
