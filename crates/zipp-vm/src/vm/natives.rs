@@ -2295,8 +2295,10 @@ impl<'p> Vm<'p> {
                 }
                 self.alloc_typed_array(buf, 1, 0, bytes.len())
             }
-            GLOBAL_IS_NAN => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan()),
-            GLOBAL_IS_FINITE => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite()),
+            // ? ToNumber(x): coerce objects (@@toPrimitive/valueOf/toString) and
+            // propagate abrupt completions (throwing valueOf, Symbol → TypeError).
+            GLOBAL_IS_NAN => Value::bool(self.to_number_coerce(a0)?.is_nan()),
+            GLOBAL_IS_FINITE => Value::bool(self.to_number_coerce(a0)?.is_finite()),
             GLOBAL_EVAL => {
                 // eval(x): if x is not a String, return it unchanged (spec 19.2.1).
                 let is_str = a0.is_heap()

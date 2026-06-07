@@ -1540,13 +1540,13 @@ impl<'p> Vm<'p> {
                                 Value::num(parse_int(&s, radix))
                             }
                             G::ParseFloat => Value::num(parse_float(&self.display(a0))),
-                            // isNaN/isFinite coerce and never throw for the values
-                            // in this subset; treat any coercion failure as NaN.
-                            G::IsNaN => {
-                                Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan())
-                            }
+                            // isNaN/isFinite are `Number::isNaN/isFinite(? ToNumber(x))`:
+                            // ToNumber coerces objects (@@toPrimitive/valueOf/toString)
+                            // and propagates abrupt completions (a throwing valueOf, a
+                            // Symbol arg → TypeError), so route through to_number_coerce.
+                            G::IsNaN => Value::bool(self.to_number_coerce(a0)?.is_nan()),
                             G::IsFinite => {
-                                Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite())
+                                Value::bool(self.to_number_coerce(a0)?.is_finite())
                             }
                         };
                         self.set(base, dst, v);
