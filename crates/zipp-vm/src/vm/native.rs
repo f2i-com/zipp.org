@@ -987,6 +987,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         DISPOSABLE_DISPOSE => ("dispose", 0),
         DISPOSABLE_DISPOSE_ASYNC => ("disposeAsync", 0),
         DISPOSABLE_MOVE => ("move", 0),
+        DISPOSABLE_DISPOSED_GET => ("get disposed", 0),
         GEN_NEXT => ("next", 1),
         GEN_RETURN => ("return", 1),
         GEN_THROW => ("throw", 1),
