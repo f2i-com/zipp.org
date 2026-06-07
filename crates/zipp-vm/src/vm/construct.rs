@@ -1329,8 +1329,11 @@ impl<'p> Vm<'p> {
                 // is "class constructor cannot be invoked without 'new'".
                 HeapObj::Class(_) => true,
                 // A built-in constructor object (String/Number/Array/…) is callable
-                // (typeof is "function") — it can be passed as a callback.
-                HeapObj::Object(m) => m.is_ctor,
+                // (typeof is "function"); so is %Function.prototype% itself (a
+                // built-in function that accepts any args and returns undefined).
+                HeapObj::Object(m) => {
+                    m.is_ctor || (self.fn_proto != 0 && v.heap_index() == self.fn_proto)
+                }
                 _ => false,
             }
     }

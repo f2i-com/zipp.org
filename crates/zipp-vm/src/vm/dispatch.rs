@@ -1555,6 +1555,9 @@ impl<'p> Vm<'p> {
                         }
                         // A class uses its `extends` chain; a constructor FUNCTION
                         // checks whether `F.prototype` is in `v`'s prototype chain.
+                        // Any other CALLABLE right operand (%Function.prototype%, a
+                        // native function, …) still uses OrdinaryHasInstance.
+                        let c_callable = c.is_heap() && self.is_callable(c);
                         let kind = if c.is_heap() {
                             match self.heap.get(c.heap_index()) {
                                 HeapObj::Class(_) => 1u8,
@@ -1562,6 +1565,7 @@ impl<'p> Vm<'p> {
                                 // Built-in constructor globals (Map/Set/Date/WeakMap/…)
                                 // are objects but constructable: use prototype-chain check.
                                 HeapObj::Object(m) if m.is_ctor => 2,
+                                _ if c_callable => 3,
                                 _ => 0,
                             }
                         } else {
@@ -1578,6 +1582,10 @@ impl<'p> Vm<'p> {
                                         || self.instanceof_via_proto(v, c))
                             }
                             2 => self.instanceof_via_proto(v, c),
+                            // A plain callable RHS: spec OrdinaryHasInstance — reads
+                            // `C.prototype` via [[Get]] (a getter runs; a non-object
+                            // prototype throws), returns false for a primitive LHS.
+                            3 => self.ordinary_has_instance(c, v)?,
                             // RHS is neither callable nor has @@hasInstance: TypeError
                             // (`x instanceof {}`, `x instanceof 5`, `x instanceof null`).
                             _ => {
