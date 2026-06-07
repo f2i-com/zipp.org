@@ -1708,6 +1708,8 @@ impl<'p> Vm<'p> {
                 .map(|(i, &(name, _, _))| (name, native::MATH_METHOD_BASE + i as u16))
                 .collect();
             methods.push(("random", MATH_RANDOM));
+            methods.push(("sumPrecise", MATH_SUM_PRECISE));
+            methods.push(("f16round", MATH_F16ROUND));
             let idx = build(self, &methods, None);
             let consts: &[(&str, f64)] = &[
                 ("E", std::f64::consts::E),

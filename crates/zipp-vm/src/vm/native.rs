@@ -189,6 +189,8 @@ pub const ITER_DISPOSE: u16 = 683;
 pub const DOLLAR262_DETACH: u16 = 620;
 pub const DOLLAR262_GC: u16 = 621;
 pub const DOLLAR262_CREATE_REALM: u16 = 873;
+pub const MATH_SUM_PRECISE: u16 = 874;
+pub const MATH_F16ROUND: u16 = 875;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -880,6 +882,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         JSON_RAW_JSON => ("rawJSON", 1),
         JSON_IS_RAW_JSON => ("isRawJSON", 1),
         MATH_RANDOM => ("random", 0),
+        MATH_SUM_PRECISE => ("sumPrecise", 1),
+        MATH_F16ROUND => ("f16round", 1),
         WM_GET => ("get", 1),
         WM_SET => ("set", 2),
         WM_GET_OR_INSERT => ("getOrInsert", 2),

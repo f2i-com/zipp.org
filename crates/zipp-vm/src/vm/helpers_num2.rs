@@ -60,6 +60,141 @@ pub(crate) fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
     }
 }
 
+/// `Math.f16round(x)`: round `x` to the nearest IEEE-754 binary16 (half) value
+/// (round-ties-to-even), returned as an f64. NaN/±0/±Infinity pass through;
+/// magnitudes at/above the round-to-infinity threshold (65520) become ±Infinity.
+pub(crate) fn f16_round(x: f64) -> f64 {
+    if !x.is_finite() {
+        return x; // NaN, ±Infinity
+    }
+    if x == 0.0 {
+        return x; // preserves ±0
+    }
+    let neg = x.is_sign_negative();
+    let a = x.abs();
+    // Largest finite half is 65504; the round-to-nearest-even tie point to infinity
+    // is 65520 (midpoint between 65504 and 2^16).
+    if a >= 65520.0 {
+        return if neg { f64::NEG_INFINITY } else { f64::INFINITY };
+    }
+    // Determine the binade exponent e with 2^e <= a < 2^(e+1) (robust to log2 noise).
+    let mut e = a.log2().floor() as i32;
+    while (e as f64).exp2() > a {
+        e -= 1;
+    }
+    while ((e + 1) as f64).exp2() <= a {
+        e += 1;
+    }
+    // Half has a 10-bit fraction → ulp = 2^(e-10) for normals; subnormals (e < -14)
+    // share the fixed ulp 2^-24.
+    let ulp_exp = if e < -14 { -24 } else { e - 10 };
+    let ulp = (ulp_exp as f64).exp2();
+    let rounded = (a / ulp).round_ties_even() * ulp;
+    if neg {
+        -rounded
+    } else {
+        rounded
+    }
+}
+
+/// `Math.sumPrecise(numbers)`: the correctly-rounded sum of the finite f64s, via
+/// Shewchuk's non-overlapping-partials algorithm. NaN if any input is NaN or if
+/// both +∞ and −∞ appear; otherwise the lone infinity if present. The empty sum
+/// (and an all-`-0` sum) is −0.
+pub(crate) fn sum_precise(nums: &[f64]) -> f64 {
+    let mut has_pos_inf = false;
+    let mut has_neg_inf = false;
+    let mut all_neg_zero = true;
+    for &x in nums {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x.is_infinite() {
+            if x > 0.0 {
+                has_pos_inf = true;
+            } else {
+                has_neg_inf = true;
+            }
+        }
+        // A value that is not negative zero makes the (possible) zero result +0.
+        if !(x == 0.0 && x.is_sign_negative()) {
+            all_neg_zero = false;
+        }
+    }
+    if has_pos_inf && has_neg_inf {
+        return f64::NAN;
+    }
+    if has_pos_inf {
+        return f64::INFINITY;
+    }
+    if has_neg_inf {
+        return f64::NEG_INFINITY;
+    }
+    let mut partials: Vec<f64> = Vec::new();
+    for &xi in nums {
+        let mut x = xi;
+        let mut i = 0usize;
+        for j in 0..partials.len() {
+            let mut y = partials[j];
+            if x.abs() < y.abs() {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let hi = x + y;
+            // If combining would overflow to ±∞ while both are finite, keep `y` as a
+            // separate partial and carry `x` unchanged — so large same-sign values
+            // that later cancel (1e308 + 1e308 + … − 1e308 − 1e308) don't spuriously
+            // produce ∞/NaN.
+            if hi.is_infinite() && x.is_finite() {
+                partials[i] = y;
+                i += 1;
+                continue;
+            }
+            let lo = y - (hi - x);
+            if lo != 0.0 {
+                partials[i] = lo;
+                i += 1;
+            }
+            x = hi;
+        }
+        partials.truncate(i);
+        partials.push(x);
+    }
+    let n = partials.len();
+    if n == 0 {
+        return if all_neg_zero { -0.0 } else { 0.0 };
+    }
+    // Correctly-rounded final summation (round-half-to-even), mirroring CPython's
+    // msum tail: add the (non-overlapping, increasing) partials from the largest
+    // down until the low part is non-zero, then resolve a halfway tie to even.
+    let mut hi = partials[n - 1];
+    let mut lo = 0.0;
+    let mut i = n - 1;
+    while i > 0 {
+        i -= 1;
+        let x = hi;
+        let y = partials[i];
+        hi = x + y;
+        lo = y - (hi - x);
+        if lo != 0.0 {
+            break;
+        }
+    }
+    if i > 0
+        && ((lo < 0.0 && partials[i - 1] < 0.0) || (lo > 0.0 && partials[i - 1] > 0.0))
+    {
+        let y = lo * 2.0;
+        let x = hi + y;
+        if y == x - hi {
+            hi = x;
+        }
+    }
+    if hi == 0.0 && all_neg_zero {
+        -0.0
+    } else {
+        hi
+    }
+}
+
 /// `Number.isInteger`: a number with no fractional part (no coercion).
 pub(crate) fn num_is_integer(v: Value) -> bool {
     if v.is_int() {

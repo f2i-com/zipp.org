@@ -1677,6 +1677,45 @@ impl<'p> Vm<'p> {
                 let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
                 Value::num((r >> 11) as f64 / (1u64 << 53) as f64)
             }
+            // `Math.sumPrecise(iterable)`: correctly-rounded sum. Every element must
+            // already BE a Number (no coercion) — else a TypeError (the iterator is
+            // closed). Spec 2024 proposal.
+            MATH_SUM_PRECISE => {
+                let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                // Iterate STEP-BY-STEP (the iterable may be infinite) and validate
+                // each element is a Number with NO coercion; on a non-number, close
+                // the iterator and throw a TypeError.
+                let iter = self.get_iterator_direct(a0)?;
+                let next = self.get_prop(iter, "next")?;
+                let mut nums: Vec<f64> = Vec::new();
+                loop {
+                    let res = self.call_value(next, iter, &[])?;
+                    if !self.is_object_value(res) {
+                        return Err(Thrown(
+                            "TypeError: Math.sumPrecise: iterator result is not an object".into(),
+                        ));
+                    }
+                    let done = self.get_prop(res, "done")?;
+                    if self.truthy(done) {
+                        break;
+                    }
+                    let v = self.get_prop(res, "value")?;
+                    if !(v.is_int() || v.is_double()) {
+                        let _ = self.iterator_close(iter);
+                        return Err(Thrown(
+                            "TypeError: Math.sumPrecise: each element must be a Number".into(),
+                        ));
+                    }
+                    nums.push(v.as_f64());
+                }
+                Value::num(super::helpers_num2::sum_precise(&nums))
+            }
+            // `Math.f16round(x)`: round ToNumber(x) to the nearest binary16 value.
+            MATH_F16ROUND => {
+                let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let x = self.to_number_coerce(a0)?;
+                Value::num(super::helpers_num2::f16_round(x))
+            }
             // WeakMap/WeakSet methods (brand-checked + object-key validated inside).
             WM_GET => self.weakmap_method(this, "get", args)?,
             WM_SET => self.weakmap_method(this, "set", args)?,
