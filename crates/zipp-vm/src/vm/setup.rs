@@ -1091,13 +1091,17 @@ impl<'p> Vm<'p> {
                 let set_from_hex = Value::heap(self.heap.alloc(HeapObj::Native(U8_SET_FROM_HEX)));
                 let from_hex = Value::heap(self.heap.alloc(HeapObj::Native(U8_FROM_HEX)));
                 let to_base64 = Value::heap(self.heap.alloc(HeapObj::Native(U8_TO_BASE64)));
+                let set_from_base64 = Value::heap(self.heap.alloc(HeapObj::Native(U8_SET_FROM_BASE64)));
+                let from_base64 = Value::heap(self.heap.alloc(HeapObj::Native(U8_FROM_BASE64)));
                 if let HeapObj::Object(m) = self.heap.get_mut(u8_proto) {
                     m.define("toHex", to_hex, method_attr);
                     m.define("setFromHex", set_from_hex, method_attr);
                     m.define("toBase64", to_base64, method_attr);
+                    m.define("setFromBase64", set_from_base64, method_attr);
                 }
                 if let HeapObj::Object(m) = self.heap.get_mut(u8_ctor) {
                     m.define("fromHex", from_hex, method_attr);
+                    m.define("fromBase64", from_base64, method_attr);
                 }
             }
             let arraybuffer_proto = build(

@@ -2061,6 +2061,72 @@ impl<'p> Vm<'p> {
                 let s = to_base64(&bytes, url, omit);
                 self.alloc_str(s)
             }
+            U8_FROM_BASE64 => {
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_string_value(arg) {
+                    return Err(Thrown(
+                        "TypeError: Uint8Array.fromBase64 argument must be a string".into(),
+                    ));
+                }
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (url, lch) = self.read_b64_decode_opts(opts)?;
+                let s = self.to_js_string(arg)?;
+                let (_, b, err) = from_base64(&s, url, lch, usize::MAX);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                let buf = self.alloc_array_buffer(b.len());
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buf) {
+                    data.copy_from_slice(&b);
+                }
+                self.alloc_typed_array(buf, 1, 0, b.len())
+            }
+            U8_SET_FROM_BASE64 => {
+                let idx = self.u8_brand(this)?;
+                let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if !self.is_string_value(arg) {
+                    return Err(Thrown(
+                        "TypeError: Uint8Array.prototype.setFromBase64 argument must be a string".into(),
+                    ));
+                }
+                // Writing into an immutable-backed view is a TypeError — verified
+                // BEFORE reading the options object (its getters must not run).
+                if let HeapObj::TypedArray { buffer, .. } = self.heap.get(idx) {
+                    let buffer = *buffer;
+                    if self.immutable_buffers.contains(&buffer) {
+                        return Err(Thrown(
+                            "TypeError: Cannot setFromBase64 into a TypedArray backed by an immutable ArrayBuffer".into(),
+                        ));
+                    }
+                }
+                let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let (url, lch) = self.read_b64_decode_opts(opts)?;
+                let s = self.to_js_string(arg)?;
+                let max = self
+                    .ta_effective_len(idx)
+                    .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
+                let (read, b, err) = from_base64(&s, url, lch, max);
+                let written = b.len();
+                self.u8_write(idx, &b);
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                let mut m = crate::heap::ObjMap::new();
+                let attr = crate::heap::PropAttr {
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                m.define("read", Value::num(read as f64), attr);
+                m.define("written", Value::num(written as f64), attr);
+                let obj = self.heap.alloc(HeapObj::Object(m));
+                if self.obj_proto != 0 {
+                    self.proto_of.insert(obj, Value::heap(self.obj_proto));
+                }
+                Value::heap(obj)
+            }
             U8_TO_HEX => {
                 let idx = self.u8_brand(this)?;
                 let bytes = self
@@ -3156,6 +3222,172 @@ fn from_hex(s: &str, max_len: usize) -> (usize, Vec<u8>, Option<Thrown>) {
         }
     }
     (read, bytes, None)
+}
+
+/// ASCII whitespace skipped between base64 characters: tab, LF, FF, CR, space.
+fn is_b64_ws(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\x0C' | '\r' | ' ')
+}
+
+/// A base64 character → its 6-bit value, honouring the alphabet (`url` ⇒ `-_`).
+fn b64_val(c: char, url: bool) -> Option<u8> {
+    match c {
+        'A'..='Z' => Some(c as u8 - b'A'),
+        'a'..='z' => Some(c as u8 - b'a' + 26),
+        '0'..='9' => Some(c as u8 - b'0' + 52),
+        '+' if !url => Some(62),
+        '/' if !url => Some(63),
+        '-' if url => Some(62),
+        '_' if url => Some(63),
+        _ => None,
+    }
+}
+
+/// Decode a base64 chunk of 2/3/4 sextets into 1/2/3 bytes. When
+/// `throw_on_extra` (strict mode), the unused trailing bits of a 2- or
+/// 3-sextet final chunk must be zero (else `None`).
+fn decode_chunk(chunk: &[u8], throw_on_extra: bool) -> Option<Vec<u8>> {
+    match chunk.len() {
+        2 => {
+            if throw_on_extra && (chunk[1] & 0x0f) != 0 {
+                return None;
+            }
+            Some(vec![(chunk[0] << 2) | (chunk[1] >> 4)])
+        }
+        3 => {
+            if throw_on_extra && (chunk[2] & 0x03) != 0 {
+                return None;
+            }
+            Some(vec![
+                (chunk[0] << 2) | (chunk[1] >> 4),
+                ((chunk[1] & 0x0f) << 4) | (chunk[2] >> 2),
+            ])
+        }
+        4 => Some(vec![
+            (chunk[0] << 2) | (chunk[1] >> 4),
+            ((chunk[1] & 0x0f) << 4) | (chunk[2] >> 2),
+            ((chunk[2] & 0x03) << 6) | chunk[3],
+        ]),
+        _ => None,
+    }
+}
+
+/// FromBase64(string, alphabet, lastChunkHandling, maxLength) (Uint8Array
+/// base64/hex proposal). `lch`: 0=loose, 1=strict, 2=stop-before-partial.
+/// Returns (chars read, decoded bytes (≤ maxLength), optional SyntaxError).
+/// Chunks are atomic: a chunk whose full output would exceed `max_len` is not
+/// decoded (the decode stops before it, without error).
+fn from_base64(s: &str, url: bool, lch: u8, max_len: usize) -> (usize, Vec<u8>, Option<Thrown>) {
+    let chars: Vec<char> = s.chars().collect();
+    let length = chars.len();
+    let synerr = || Some(Thrown("SyntaxError: invalid base64 string".into()));
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut chunk: Vec<u8> = Vec::new();
+    let mut read = 0usize; // committed position (after the last full chunk)
+    let mut index = 0usize;
+    if max_len == 0 {
+        return (0, bytes, None); // no room — read nothing (trailing garbage ignored)
+    }
+    loop {
+        while index < length && is_b64_ws(chars[index]) {
+            index += 1;
+        }
+        if index == length {
+            if chunk.is_empty() {
+                return (length, bytes, None);
+            }
+            // Partial chunk at end (no padding).
+            match lch {
+                2 => return (read, bytes, None), // stop-before-partial
+                1 => return (read, bytes, synerr()), // strict
+                _ => {
+                    // loose
+                    if chunk.len() == 1 {
+                        return (read, bytes, synerr());
+                    }
+                    let nb = chunk.len() - 1;
+                    if bytes.len() + nb > max_len {
+                        return (read, bytes, None);
+                    }
+                    match decode_chunk(&chunk, false) {
+                        Some(d) => {
+                            bytes.extend(d);
+                            return (length, bytes, None);
+                        }
+                        None => return (read, bytes, synerr()),
+                    }
+                }
+            }
+        }
+        let c = chars[index];
+        if c == '=' {
+            // Padding: the pending chunk must be 2 or 3 sextets.
+            if chunk.len() < 2 {
+                return (read, bytes, synerr());
+            }
+            let need_eq = 4 - chunk.len(); // 2 sextets→"==", 3 sextets→"="
+            let mut got = 0;
+            let mut j = index;
+            while got < need_eq {
+                while j < length && is_b64_ws(chars[j]) {
+                    j += 1;
+                }
+                if j < length && chars[j] == '=' {
+                    got += 1;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if got < need_eq {
+                // Incomplete padding: stop-before-partial stops here; else error.
+                if lch == 2 {
+                    return (read, bytes, None);
+                }
+                return (read, bytes, synerr());
+            }
+            // Only whitespace may follow the padding.
+            let mut k = j;
+            while k < length && is_b64_ws(chars[k]) {
+                k += 1;
+            }
+            if k != length {
+                return (read, bytes, synerr());
+            }
+            let nb = chunk.len() - 1;
+            if bytes.len() + nb > max_len {
+                return (read, bytes, None);
+            }
+            match decode_chunk(&chunk, lch == 1) {
+                Some(d) => {
+                    bytes.extend(d);
+                    return (length, bytes, None);
+                }
+                None => return (read, bytes, synerr()),
+            }
+        }
+        match b64_val(c, url) {
+            Some(v) => {
+                chunk.push(v);
+                index += 1;
+                if chunk.len() == 4 {
+                    if bytes.len() + 3 > max_len {
+                        return (read, bytes, None);
+                    }
+                    if let Some(d) = decode_chunk(&chunk, false) {
+                        bytes.extend(d);
+                    }
+                    chunk.clear();
+                    read = index;
+                    // Output full: stop here, ignoring any trailing characters.
+                    if bytes.len() == max_len {
+                        return (read, bytes, None);
+                    }
+                }
+            }
+            None => return (read, bytes, synerr()),
+        }
+    }
 }
 
 /// Encode bytes as base64 (Uint8Array.prototype.toBase64). `url` selects the

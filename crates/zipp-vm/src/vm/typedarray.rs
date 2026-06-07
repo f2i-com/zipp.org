@@ -82,6 +82,54 @@ impl<'p> Vm<'p> {
             )
     }
 
+    /// Read the base64-DECODE options object (fromBase64/setFromBase64): returns
+    /// (base64url?, lastChunkHandling) where lch is 0=loose, 1=strict,
+    /// 2=stop-before-partial. `alphabet` is Get first, then `lastChunkHandling`
+    /// (the observable order); each must be undefined or an exact allowed string
+    /// (no ToString coercion), else TypeError.
+    pub(crate) fn read_b64_decode_opts(&mut self, opts: Value) -> Result<(bool, u8), Thrown> {
+        if opts == Value::UNDEFINED {
+            return Ok((false, 0));
+        }
+        if !self.is_object_value(opts) {
+            return Err(Thrown("TypeError: base64 options must be an object".into()));
+        }
+        let a = self.get_prop(opts, "alphabet")?;
+        let url = if a == Value::UNDEFINED {
+            false
+        } else if self.is_string_value(a) {
+            match self.to_js_string(a)?.as_str() {
+                "base64" => false,
+                "base64url" => true,
+                _ => {
+                    return Err(Thrown(
+                        "TypeError: base64 alphabet must be \"base64\" or \"base64url\"".into(),
+                    ))
+                }
+            }
+        } else {
+            return Err(Thrown("TypeError: base64 alphabet must be a string".into()));
+        };
+        let l = self.get_prop(opts, "lastChunkHandling")?;
+        let lch = if l == Value::UNDEFINED {
+            0u8
+        } else if self.is_string_value(l) {
+            match self.to_js_string(l)?.as_str() {
+                "loose" => 0,
+                "strict" => 1,
+                "stop-before-partial" => 2,
+                _ => {
+                    return Err(Thrown(
+                        "TypeError: lastChunkHandling must be \"loose\", \"strict\", or \"stop-before-partial\"".into(),
+                    ))
+                }
+            }
+        } else {
+            return Err(Thrown("TypeError: lastChunkHandling must be a string".into()));
+        };
+        Ok((url, lch))
+    }
+
     /// Validate a `Uint8Array` receiver (the base64/hex methods are Uint8Array-only,
     /// even via `.call`), returning its heap index.
     pub(crate) fn u8_brand(&self, this: Value) -> Result<u32, Thrown> {
