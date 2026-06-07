@@ -3353,6 +3353,15 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             E::Identifier(id) => {
+                // A strict-mode reserved word may not appear as an identifier
+                // reference (property keys / member names are different AST nodes,
+                // so `obj.public` / `{public:1}` are unaffected).
+                if self.cx.in_strict && is_strict_reserved_word(id.name.as_str()) {
+                    return Err(format!(
+                        "SyntaxError: '{}' is a reserved word in strict mode",
+                        id.name
+                    ));
+                }
                 // Special global value identifiers that are not user bindings.
                 match id.name.as_str() {
                     "undefined" => {
@@ -6115,14 +6124,24 @@ fn strict_name_err(strict: bool, name: &str) -> R<()> {
     Ok(())
 }
 
-/// The ECMAScript FutureReservedWords that are reserved ONLY in strict mode — they
-/// may not be used as a binding name or assignment target there. (`let`, `static`,
-/// and `yield` are contextual keywords handled by the parser, so they're excluded
-/// here.) These ARE valid identifiers in sloppy mode.
+/// The ECMAScript identifiers reserved ONLY in strict mode — they may not be used
+/// as a binding name, assignment target, or identifier reference there. The six
+/// FutureReservedWords plus the contextual keywords `let`/`static`/`yield` (these
+/// reach a binding/reference position as plain identifiers only where they are NOT
+/// the declaration keyword / class modifier / YieldExpression). All are valid
+/// identifiers in sloppy mode.
 fn is_strict_reserved_word(name: &str) -> bool {
     matches!(
         name,
-        "implements" | "interface" | "package" | "private" | "protected" | "public"
+        "implements"
+            | "interface"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "let"
+            | "static"
+            | "yield"
     )
 }
 
