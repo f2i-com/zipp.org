@@ -83,6 +83,14 @@ fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
                 out.insert(id.name.to_string());
             }
         }
+        // A class declaration is a lexical binding like `let`/`const`: a nested
+        // closure that captures it must see it boxed (so a forward-materialised
+        // function can hold its cell).
+        S::ClassDeclaration(c) => {
+            if let Some(id) = &c.id {
+                out.insert(id.name.to_string());
+            }
+        }
         // Recurse into nested *statements* (blocks, loops, if) but NOT into
         // nested function bodies — those introduce their own scope.
         S::BlockStatement(b) => collect_bound_in_body(&b.body, out),

@@ -2026,9 +2026,22 @@ impl<'p> Vm<'p> {
                         self.set(base, reg, Value::heap(cell));
                         ip += 1;
                     }
+                    Instr::MakeCellTdz { reg } => {
+                        // A captured lexical pre-created at entry: the cell starts in
+                        // its TDZ (UNINITIALIZED) until the textual declaration runs.
+                        let cell = self.heap.alloc(HeapObj::Cell(Value::UNINITIALIZED));
+                        self.set(base, reg, Value::heap(cell));
+                        ip += 1;
+                    }
                     Instr::CellGet { dst, cell } => {
                         let cell_idx = self.get(base, cell).heap_index();
                         let v = self.heap.cell_get(cell_idx);
+                        if v.is_uninitialized() {
+                            return Err(Thrown(
+                                "ReferenceError: cannot access a lexical binding before initialization"
+                                    .to_string(),
+                            ));
+                        }
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2041,6 +2054,12 @@ impl<'p> Vm<'p> {
                     Instr::UpvalGet { dst, idx } => {
                         let cell = self.closure_upvalue(cur_closure, idx);
                         let v = self.heap.cell_get(cell);
+                        if v.is_uninitialized() {
+                            return Err(Thrown(
+                                "ReferenceError: cannot access a lexical binding before initialization"
+                                    .to_string(),
+                            ));
+                        }
                         self.set(base, dst, v);
                         ip += 1;
                     }

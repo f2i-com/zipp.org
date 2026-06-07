@@ -360,6 +360,12 @@ pub enum Instr {
     /// cell reference back into `reg`. Emitted for a captured local/param so
     /// later reads/writes go through the shared cell.
     MakeCell { reg: Reg },
+    /// Like `MakeCell` but the fresh Cell holds the UNINITIALIZED (TDZ) sentinel
+    /// regardless of `reg`'s value. Emitted at function entry for a captured
+    /// lexical (`let`/`const`/`class`) that a forward-referenced function may
+    /// capture: a `CellGet`/`UpvalGet` before the binding's textual declaration
+    /// runs (its TDZ) then throws a ReferenceError instead of reading undefined.
+    MakeCellTdz { reg: Reg },
     /// `dst = *<cell in reg>` — read a captured local's cell.
     CellGet { dst: Reg, cell: Reg },
     /// `*<cell in reg> = src` — write a captured local's cell.

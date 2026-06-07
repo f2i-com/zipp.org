@@ -720,7 +720,70 @@ impl Compiler {
             }
         }
 
+        // Pre-create cells for captured function-body-level lexical (`let`/`const`/
+        // `class`) bindings so a function materialised at entry (a forward
+        // reference) can capture them. Only DIRECT top-level lexicals are
+        // function-body-scoped (block-nested ones are block-local), so this scans
+        // the body's own statements, not recursively. The textual declaration
+        // REUSES the cell (var_decl / class_decl). Pre-creating an (undefined) cell
+        // does not weaken TDZ — zipp does not runtime-enforce a function-body
+        // lexical's TDZ today, and only CAPTURED names are touched.
+        if !is_script {
+            let mut lex = std::collections::HashSet::new();
+            for s in body {
+                match s {
+                    ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                        for decl in &d.declarations {
+                            capture::collect_pattern_names(&decl.id, &mut lex);
+                        }
+                    }
+                    ox::Statement::ClassDeclaration(c) => {
+                        if let Some(id) = &c.id {
+                            lex.insert(id.name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for name in &lex {
+                if fc.captured.contains(name) && !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                    // Box a TDZ cell: a read before the textual declaration runs
+                    // (e.g. via a forward-materialised function) throws a
+                    // ReferenceError rather than reading undefined.
+                    let r = fc.alloc_reg();
+                    fc.scopes[0].push((name.clone(), r));
+                    fc.emit(Instr::MakeCellTdz { reg: r });
+                    fc.cell_regs.insert(r);
+                    fc.entry_lexicals.insert(name.clone());
+                    // `const`-ness is recorded by the textual declaration (which
+                    // reuses this reg), so an assignment after it still TypeErrors.
+                }
+            }
+        }
+
+        // Materialise top-level function declarations at entry so a forward call or
+        // reference (`f(); function f(){}`, `var g = f; function f(){}`) resolves to
+        // the live function object rather than an undefined hoist slot. Sibling
+        // functions, captured vars, and captured lexicals are all bound above, so
+        // each function's captures resolve. They are skipped in the statement loop
+        // below (a function declaration has no textual side effects). Script-level
+        // functions are materialised at VM startup, so this applies to nested
+        // function bodies only.
+        if !is_script {
+            for s in body {
+                if let ox::Statement::FunctionDeclaration(f) = s {
+                    fc.func_decl(f)?;
+                }
+            }
+        }
+
         for s in body {
+            // Top-level function declarations were materialised at entry above.
+            if !is_script {
+                if let ox::Statement::FunctionDeclaration(_) = s {
+                    continue;
+                }
+            }
             fc.stmt(s)?;
         }
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
@@ -1149,6 +1212,12 @@ struct FnCompiler<'a> {
     /// synced to the function value when the block declaration executes. Excludes
     /// names with a lexical conflict (which would be an early error → B.3.3 skipped).
     b33_names: std::collections::HashSet<String>,
+    /// Function-body-level lexical (`let`/`const`/`class`) names that were
+    /// pre-created as cells at entry because a nested function captures them, so a
+    /// function materialised at entry (forward reference) can bind their cell. The
+    /// textual declaration REUSES this cell instead of allocating a fresh binding.
+    /// Empty unless a body has a captured forward-referenced lexical.
+    entry_lexicals: std::collections::HashSet<String>,
     /// Active optional-chain short-circuit targets: a stack (chains can nest),
     /// each entry collecting the ip of every `?.` nullish-bail jump in that chain.
     /// On exit the chain patches them to a "load undefined" block.
@@ -1252,6 +1321,7 @@ impl<'a> FnCompiler<'a> {
             enclosing,
             with_stack: Vec::new(),
             b33_names: std::collections::HashSet::new(),
+            entry_lexicals: std::collections::HashSet::new(),
         };
         // Register 0 is reserved for `this` in every function (undefined for
         // plain calls, the receiver for method calls). Parameters follow at
@@ -1827,7 +1897,19 @@ impl<'a> FnCompiler<'a> {
             // Allocate the local FIRST so `let x = x`-style self-reference and
             // ordinary declarations land in a stable register. declare_local
             // boxes the register into a cell if a nested function captures it.
-            let reg = self.declare_local(name);
+            // A captured function-body-level lexical pre-created as a cell at entry
+            // (so a forward-referenced function could capture it) is REUSED here
+            // rather than shadowed, so the closure and this declaration share one
+            // cell; otherwise a fresh binding is allocated.
+            let reg = if self.scopes.len() == 1 && self.entry_lexicals.contains(name) {
+                self.scopes[0]
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, r)| *r)
+                    .unwrap_or_else(|| self.declare_local(name))
+            } else {
+                self.declare_local(name)
+            };
             if is_const {
                 self.const_regs.insert(reg);
             }
@@ -1845,11 +1927,18 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::Move { dst: reg, src: v });
                     }
                 }
-            } else if !is_cell {
+            } else if is_cell {
+                // A bare `let x;` initializes the binding to undefined, exiting its
+                // TDZ. A reused entry-precreated cell starts UNINITIALIZED, so this
+                // is where it becomes legal to read; an ordinary captured cell is
+                // already undefined, so this is a harmless re-set.
+                let t = self.temp();
+                self.emit(Instr::LoadUndefined { dst: t });
+                self.emit(Instr::CellSet { cell: reg, src: t });
+                self.next_reg -= 1;
+            } else {
                 self.emit(Instr::LoadUndefined { dst: reg });
             }
-            // A captured local with no initializer keeps the cell's default
-            // (undefined), set when MakeCell boxed the freshly-undefined reg.
         }
         Ok(())
     }
@@ -1863,6 +1952,11 @@ impl<'a> FnCompiler<'a> {
             P::BindingIdentifier(id) => {
                 if self.is_script && !self.pattern_block_local {
                     self.cx.global_slot(&id.name);
+                } else if self.scopes.len() == 1 && self.entry_lexicals.contains(id.name.as_str())
+                {
+                    // Pre-created as a cell at entry (a captured forward-referenced
+                    // lexical); reuse it so extraction and the capturing closure
+                    // share one cell rather than shadowing with a fresh binding.
                 } else {
                     self.declare_local(&id.name);
                 }
