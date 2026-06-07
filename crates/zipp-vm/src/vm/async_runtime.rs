@@ -1047,9 +1047,10 @@ impl<'p> Vm<'p> {
             }
         }
         // Keyed combinators (allKeyed/allSettledKeyed) operate over an OBJECT's own
-        // enumerable string keys: validate it's an object, snapshot the keys, and
-        // iterate the corresponding VALUES (reusing the array-iteration path below);
-        // the keys are stored on the Combinator to build the keyed result on settle.
+        // enumerable keys (incl. Symbols): validate it's an object, snapshot the
+        // keys, and iterate the corresponding VALUES (reusing the array-iteration
+        // path below); the keys are stored on the Combinator (Symbols as their
+        // "@@…" form) to build the keyed result on settle.
         let mut comb_keys: Vec<String> = Vec::new();
         let iterable = if matches!(kind, CombKind::AllKeyed | CombKind::AllSettledKeyed) {
             if !self.is_object_value(iterable) {
@@ -1059,7 +1060,12 @@ impl<'p> Vm<'p> {
                 self.reject(result, e);
                 return Ok(Value::heap(result));
             }
-            let karr = match self.object_enum_own(iterable, EnumWhat::Keys) {
+            // OwnPropertyKeys (incl. Symbols), filtered to enumerable own props —
+            // per PerformPromiseAllKeyed step "For each key of ? OwnPropertyKeys,
+            // if desc.[[Enumerable]]". A Symbol key round-trips via its internal
+            // "@@…" key string (key_of), so `map.set` in combinator_finish carries
+            // it back as a real Symbol on the keyed result object.
+            let karr = match self.object_own_keys(iterable) {
                 Ok(a) => a,
                 Err(Thrown(msg)) => {
                     self.reject_with_thrown(result, &msg);
@@ -1069,7 +1075,10 @@ impl<'p> Vm<'p> {
             let kvals = self.array_snapshot(karr.heap_index());
             let mut vals = Vec::with_capacity(kvals.len());
             for kv in kvals {
-                let ks = self.display(kv);
+                let ks = self.key_of(kv);
+                if !self.own_is_enumerable(iterable, &ks) {
+                    continue;
+                }
                 let v = match self.get_member(iterable, &ks, iterable) {
                     Ok(v) => v,
                     Err(Thrown(msg)) => {
