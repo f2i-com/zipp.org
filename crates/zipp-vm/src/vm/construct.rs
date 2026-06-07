@@ -1364,12 +1364,14 @@ impl<'p> Vm<'p> {
             HeapObj::Cons { len, .. } => {
                 key == "length" || key.parse::<usize>().map_or(false, |i| i < *len)
             }
-            // A class value: own statics (data + `static get`/`set`) + name/length.
+            // A class value: own statics (data + `static get`/`set`) + name/length
+            // + the synthesized `prototype` (a class always has one).
             HeapObj::Class(c) => {
                 c.statics.pos(key).is_some()
                     || c.static_getters.iter().any(|(n, _)| n == key)
                     || c.static_setters.iter().any(|(n, _)| n == key)
                     || self.callable_has_intrinsic(obj, key)
+                    || (key == "prototype" && self.callable_has_prototype(obj))
             }
             // Functions/closures + the native resolve/reject + combinator element
             // functions: assigned own props (`fn.x`) + the synthesized name/length.
@@ -1381,6 +1383,7 @@ impl<'p> Vm<'p> {
             | HeapObj::CombinatorResolver { .. } => {
                 self.fn_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
                     || self.callable_has_intrinsic(obj, key)
+                    || (key == "prototype" && self.callable_has_prototype(obj))
             }
             // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*, …)
             // keep their named own props in the arr_props side table; a boxed String

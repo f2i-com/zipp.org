@@ -774,6 +774,7 @@ impl<'p> Vm<'p> {
         // ordinary constructor function. (Only synthesized when no explicit own
         // `prototype` was assigned — the generic match below handles that case.)
         if key == "prototype"
+            && self.callable_has_prototype(obj)
             && !matches!(self.heap.get(idx), HeapObj::Object(m) if m.pos("prototype").is_some())
         {
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
@@ -992,6 +993,13 @@ impl<'p> Vm<'p> {
                     if has_name {
                         keys.push("name".to_string());
                     }
+                    // `prototype` (own, non-enumerable) follows name/length, before
+                    // the static elements declared in the class body.
+                    if self.callable_has_prototype(obj)
+                        && c.statics.pos("prototype").is_none()
+                    {
+                        keys.push("prototype".to_string());
+                    }
                     keys.extend(c.statics.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
                     for (n, _) in &c.static_getters {
                         if !is_hidden_key(n) && !keys.iter().any(|k| k == n) {
@@ -1015,6 +1023,13 @@ impl<'p> Vm<'p> {
                     }
                     if has_name {
                         keys.push("name".to_string());
+                    }
+                    // An ordinary function / generator owns `prototype` (after
+                    // name/length), unless it was reassigned into the fn_props bag.
+                    if self.callable_has_prototype(obj)
+                        && self.fn_props.get(&idx).map_or(true, |m| m.pos("prototype").is_none())
+                    {
+                        keys.push("prototype".to_string());
                     }
                     if let Some(m) = self.fn_props.get(&idx) {
                         keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
@@ -2393,6 +2408,36 @@ impl<'p> Vm<'p> {
             return false;
         }
         self.callable_name_length(obj).is_some()
+    }
+
+    /// Whether a callable owns a `prototype` data property. Per spec only some
+    /// callables do: a `class`, an ordinary `function` declaration/expression,
+    /// and any generator (sync OR async) function. Arrow functions, concise
+    /// methods/accessors, and plain `async function`s have NO `prototype`. Bound
+    /// and built-in/native functions also have none here. Mirrors the cases for
+    /// which `prototype_of` would synthesize one, so the `prototype` own-property
+    /// reporting (descriptor / hasOwnProperty / `in` / ownKeys) stays consistent.
+    pub(crate) fn callable_has_prototype(&self, obj: Value) -> bool {
+        if !obj.is_heap() {
+            return false;
+        }
+        match self.heap.get(obj.heap_index()) {
+            HeapObj::Class(_) => true,
+            HeapObj::Func(id) => self.func_has_prototype(*id),
+            HeapObj::Closure { func, .. } => self.func_has_prototype(*func),
+            _ => false,
+        }
+    }
+
+    fn func_has_prototype(&self, id: u32) -> bool {
+        let f = self.func(id as usize);
+        // Generator and async-generator functions/methods always own `prototype`.
+        if f.is_generator {
+            return true;
+        }
+        // Arrows (lexical_this), concise methods/accessors (non_constructable),
+        // and plain async functions do not.
+        !(f.lexical_this || f.non_constructable || f.is_async)
     }
 
     /// The current value of a callable's `name`/`length` own property (allocating

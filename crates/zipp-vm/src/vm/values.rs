@@ -134,6 +134,10 @@ impl<'p> Vm<'p> {
             // properties of the class value and are inherited up the chain.
             HeapObj::Class(_) => {
                 let k = self.key_of(key);
+                // A class always owns `prototype`.
+                if k == "prototype" && self.callable_has_prototype(obj) {
+                    return true;
+                }
                 let mut cur = Some(idx);
                 while let Some(cidx) = cur {
                     match self.heap.get(cidx) {
@@ -167,6 +171,11 @@ impl<'p> Vm<'p> {
                     HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
                 ) && self.fn_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
                 {
+                    return true;
+                }
+                // A function's synthesized `prototype` own property (ordinary
+                // functions + generators; not arrows/methods/async/bound/native).
+                if k == "prototype" && self.callable_has_prototype(obj) {
                     return true;
                 }
                 // A boxed String wrapper exposes the wrapped string's chars +
