@@ -804,6 +804,7 @@ impl<'p> Vm<'p> {
         code: &str,
         force_strict: bool,
         force_new_target_ok: bool,
+        this_override: Option<Value>,
     ) -> Result<Value, Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // 1. Parse.
@@ -914,11 +915,15 @@ impl<'p> Vm<'p> {
         // 7. Run the eval script function (global id `base_func`) to completion in
         //    global scope (`this` = globalThis), returning its completion value.
         let script = Value::heap(self.heap.alloc(HeapObj::Func(base_func)));
-        let this = if self.global_this != 0 {
-            Value::heap(self.global_this)
-        } else {
-            Value::UNDEFINED
-        };
+        // A DIRECT eval inherits the caller's `this` (e.g. inside a class field
+        // initializer / method); an indirect eval runs in global scope (globalThis).
+        let this = this_override.unwrap_or_else(|| {
+            if self.global_this != 0 {
+                Value::heap(self.global_this)
+            } else {
+                Value::UNDEFINED
+            }
+        });
         self.call_value(script, this, &[])
     }
 }

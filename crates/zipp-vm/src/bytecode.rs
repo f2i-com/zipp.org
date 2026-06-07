@@ -437,7 +437,7 @@ pub enum Instr {
     /// caller's new.target validity (true inside a function/method/field initializer)
     /// so the eval may contain `new.target`. Indirect/sloppy eval still goes through
     /// the ordinary `Call` → `GLOBAL_EVAL` native path.
-    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool },
+    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg },
 
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.

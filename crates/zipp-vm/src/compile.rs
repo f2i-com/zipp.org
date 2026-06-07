@@ -5490,7 +5490,10 @@ impl<'a> FnCompiler<'a> {
                 } else {
                     arg_base
                 };
-                self.emit(Instr::DirectEval { dst, arg, new_target_ok: self.cx.new_target_ok });
+                // The effective `this` to inherit: a static field initializer holds
+                // it in `this_override`, otherwise it is reg 0.
+                let this_reg = self.this_override.unwrap_or(0);
+                self.emit(Instr::DirectEval { dst, arg, new_target_ok: self.cx.new_target_ok, this_reg });
                 return Ok(dst);
             }
         }

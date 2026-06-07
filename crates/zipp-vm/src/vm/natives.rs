@@ -1860,7 +1860,7 @@ impl<'p> Vm<'p> {
                     a0
                 } else {
                     let code = self.display(a0);
-                    return self.do_eval(&code, false, false);
+                    return self.do_eval(&code, false, false, None);
                 }
             }
             // String static methods.
