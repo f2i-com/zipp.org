@@ -1079,8 +1079,14 @@ impl<'p> Vm<'p> {
                     Instr::PushFieldKey { class, key } => {
                         let cv = self.get(base, class);
                         let kv = self.get(base, key);
+                        // ToPropertyKey at class-DEFINITION time (spec: a ClassElement-
+                        // Name is evaluated once when the class is defined). Running the
+                        // key's toString/@@toPrimitive now means a throwing or
+                        // non-callable @@toPrimitive surfaces at definition (not at the
+                        // first `new`), and the resolved key is reused per instance.
+                        let k = self.coerce_index_key(kv)?;
                         if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
-                            c.computed_field_keys.push(kv);
+                            c.computed_field_keys.push(k);
                         }
                         ip += 1;
                     }
