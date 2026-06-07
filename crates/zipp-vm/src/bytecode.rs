@@ -420,6 +420,10 @@ pub enum Instr {
     GetProp { dst: Reg, obj: Reg, name: u32 },
     /// `obj.<string_constants[name]> = val` — static property write.
     SetProp { obj: Reg, name: u32, val: Reg },
+    /// Define an own writable/enumerable/configurable data property directly on a
+    /// fresh object — CreateDataProperty, NOT [[Set]]: used for object-literal data
+    /// properties, which must ignore any inherited accessor / non-writable property.
+    InitDataProp { obj: Reg, name: u32, val: Reg },
     /// `dst = delete obj.<string_constants[name]>` — remove an own property;
     /// `dst` is the boolean result (true unless the property is non-deletable).
     /// In strict mode a false result throws a TypeError instead.

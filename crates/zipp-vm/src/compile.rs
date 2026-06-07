@@ -4162,7 +4162,14 @@ impl<'a> FnCompiler<'a> {
                                 self.cx.src_slice(p.span.start, p.span.end);
                             self.cx.functions[fid].non_constructable = true; // concise method
                         }
-                        self.emit(Instr::SetProp { obj: dst, name, val: v });
+                        // `{ __proto__: v }` (colon form) sets the prototype — a real
+                        // [[Set]]/proto-setter; every other key is CreateDataProperty,
+                        // which must ignore an inherited accessor / non-writable prop.
+                        if key == "__proto__" && !p.method {
+                            self.emit(Instr::SetProp { obj: dst, name, val: v });
+                        } else {
+                            self.emit(Instr::InitDataProp { obj: dst, name, val: v });
+                        }
                     }
                 }
                 ox::ObjectPropertyKind::SpreadProperty(s) => {

@@ -2173,6 +2173,24 @@ impl<'p> Vm<'p> {
                         self.set_prop(o, &key, v, strict)?;
                         ip += 1;
                     }
+                    Instr::InitDataProp { obj, name, val } => {
+                        // CreateDataProperty on a fresh object-literal object: a plain
+                        // own w/e/c data property, ignoring the prototype chain.
+                        let o = self.get(base, obj);
+                        let v = self.get(base, val);
+                        let key: &'p str =
+                            &self.func(func_id as usize).string_constants[name as usize];
+                        if o.is_heap() {
+                            let oi = o.heap_index();
+                            if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                                m.define(key, v, crate::heap::PropAttr::data());
+                            } else {
+                                let k = key.to_string();
+                                self.set_prop(o, &k, v, false)?;
+                            }
+                        }
+                        ip += 1;
+                    }
                     Instr::DeleteProp { dst, obj, name, strict } => {
                         let o = self.get(base, obj);
                         // `delete obj.x` does ToObject(base) — null/undefined throw a

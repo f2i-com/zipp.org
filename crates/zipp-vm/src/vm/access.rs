@@ -18,8 +18,11 @@ enum ProtoSet {
     /// `false` = trap returned falsish → no-op/throw).
     Proxy(bool),
     /// No accessor or proxy governs the write — write an own data property on the
-    /// receiver (shadowing any inherited data property).
+    /// receiver (shadowing any inherited WRITABLE data property).
     DataWrite,
+    /// An inherited NON-WRITABLE data property — the write is rejected (a sloppy
+    /// no-op / strict TypeError); it does NOT create a shadowing own property.
+    NonWritable,
 }
 
 impl<'p> Vm<'p> {
@@ -500,6 +503,7 @@ impl<'p> Vm<'p> {
                 ProtoSet::GetterOnly => return self.reject_write(key, strict),
                 ProtoSet::Proxy(true) => return Ok(()), // chain proxy's set trap handled it
                 ProtoSet::Proxy(false) => return self.reject_write(key, strict),
+                ProtoSet::NonWritable => return self.reject_write(key, strict),
                 ProtoSet::DataWrite => {} // no inherited accessor/proxy ⇒ own-data write
             }
         }
@@ -761,7 +765,13 @@ impl<'p> Vm<'p> {
                             ProtoSet::GetterOnly
                         });
                     }
-                    return Ok(ProtoSet::DataWrite); // inherited data property → own-data shadow
+                    // An inherited WRITABLE data property is shadowed by an own
+                    // write; a NON-WRITABLE one rejects the write (OrdinarySet).
+                    return Ok(if a.writable {
+                        ProtoSet::DataWrite
+                    } else {
+                        ProtoSet::NonWritable
+                    });
                 }
             }
             cur = self.object_get_prototype_of(cur);
