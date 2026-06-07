@@ -1214,6 +1214,21 @@ impl<'p> Vm<'p> {
         if idx == self.obj_proto {
             return Value::NULL; // Object.prototype's [[Prototype]] is null
         }
+        // A class value's [[Prototype]] is its PARENT CLASS (`class C extends B` →
+        // B), or %Function.prototype% for a base class — so `getPrototypeOf(C)===B`,
+        // `getPrototypeOf(class{})===Function.prototype`, and `C instanceof Function`
+        // all hold (the chain reaches %Function.prototype% then %Object.prototype%).
+        let class_parent = match self.heap.get(idx) {
+            HeapObj::Class(c) => Some(c.parent),
+            _ => None,
+        };
+        if let Some(parent) = class_parent {
+            return match parent {
+                Some(p) => Value::heap(p),
+                None if self.fn_proto != 0 => Value::heap(self.fn_proto),
+                None => Value::NULL,
+            };
+        }
         // Built-in instance types delegate to their respective prototype (so
         // `Object.getPrototypeOf(new Map()) === Map.prototype` and `m instanceof Map`).
         let builtin_proto = match self.heap.get(idx) {
