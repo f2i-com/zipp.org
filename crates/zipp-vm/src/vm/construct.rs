@@ -1512,6 +1512,24 @@ impl<'p> Vm<'p> {
     /// Resolve an iterable's iterator: a plain object with a `@@iterator` method
     /// (a custom iterable) yields `obj[@@iterator]()`; everything else (arrays,
     /// strings, Map/Set, generators) iterates directly and passes through.
+    /// GetIterator that ALWAYS returns a real iterator OBJECT by invoking
+    /// `v[@@iterator]()` — unlike `get_iterator`, which fast-paths arrays/strings/
+    /// Map/Set to the raw value (driven positionally by `IterNext`). `yield*`
+    /// delegation needs a genuine iterator so it can call `.next`/`.throw`/`.return`
+    /// on it (an Array Iterator has `.next` but no `.throw`/`.return`, exactly as the
+    /// spec requires).
+    pub(crate) fn get_iterator_direct(&mut self, v: Value) -> Result<Value, Thrown> {
+        let m = self.get_prop(v, "@@iterator")?;
+        if !self.is_callable(m) {
+            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+        }
+        let it = self.call_value(m, v, &[])?;
+        if !self.is_object_value(it) {
+            return Err(Thrown("TypeError: iterator is not an object".into()));
+        }
+        Ok(it)
+    }
+
     pub(crate) fn get_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {

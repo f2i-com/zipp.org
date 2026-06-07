@@ -165,6 +165,20 @@ pub enum Instr {
     /// `dst = yield val` — suspend the current generator, handing `val` out as
     /// the yielded value. On resume the value passed to `.next(v)` lands in `dst`.
     Yield { dst: Reg, val: Reg },
+    /// `yield*` suspension point: yield `val` like `Yield`, but on resume DELIVER
+    /// the resume MODE (0 = next, 1 = throw, 2 = return) into `mode_dst` and the
+    /// resume value into `val_dst` — instead of `Yield`'s in-body throw/return
+    /// injection — so the `yield*` loop can forward it to the inner iterator's
+    /// next/throw/return. Only emitted for a SYNC `yield*` (see `IterDelegate`).
+    YieldDelegate { mode_dst: Reg, val_dst: Reg, val: Reg },
+    /// One step of `yield*` delegation: drive `iter` per the resume `mode` (0 next /
+    /// 1 throw / 2 return) with argument `sent`, applying the spec's missing-method
+    /// rules (throw with no `throw` → IteratorClose + TypeError; return with no
+    /// `return` → the generator returns `sent`). Writes the result value to
+    /// `value_dst` and two booleans: `done_dst` true ⇒ the `yield*` expression
+    /// completes with `value_dst`; `ret_dst` true ⇒ the generator must RETURN
+    /// `value_dst`. Both false ⇒ yield `value_dst` (via `YieldDelegate`).
+    IterDelegate { value_dst: Reg, done_dst: Reg, ret_dst: Reg, iter: Reg, mode: Reg, sent: Reg },
     /// Generator body entry marker — emitted for a (sync) generator right after the
     /// parameter prologue (defaults + destructuring). FunctionDeclarationInstantiation
     /// runs eagerly at call time (so a destructuring throw or default side-effect
@@ -502,6 +516,10 @@ pub enum Instr {
     /// method (a custom iterable) call it (this = src) → the iterator object; else
     /// pass `src` through (arrays/strings/Map/Set/generators iterate directly).
     GetIterator { dst: Reg, src: Reg },
+    /// Like `GetIterator` but ALWAYS returns a real iterator OBJECT (invokes
+    /// `src[@@iterator]()`, never the raw positional fast-path) — for `yield*`
+    /// delegation, which calls `.next`/`.throw`/`.return` on the iterator.
+    GetIteratorObj { dst: Reg, src: Reg },
     /// Normalize `src` for array destructuring (`let [a,b] = src`): a generator or
     /// custom iterable is drained (LAZILY, ≤ `count` elements — `u32::MAX` when the
     /// pattern has a `...rest`) into a fresh array; arrays/strings/Map/Set (and

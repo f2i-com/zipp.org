@@ -2649,6 +2649,12 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, it);
                         ip += 1;
                     }
+                    Instr::GetIteratorObj { dst, src } => {
+                        let s = self.get(base, src);
+                        let it = self.get_iterator_direct(s)?;
+                        self.set(base, dst, it);
+                        ip += 1;
+                    }
                     Instr::GetAsyncIterator { dst, src } => {
                         let s = self.get(base, src);
                         let it = self.get_async_iterator(s)?;
@@ -2731,6 +2737,28 @@ impl<'p> Vm<'p> {
                         self.pending_yield_handlers = f.handlers;
                         self.pending_yield = Some((v, ip));
                         return Ok(v);
+                    }
+                    Instr::YieldDelegate { val, .. } => {
+                        // A `yield*` suspension: yield `val` exactly like `Yield`. The
+                        // resume MODE + value are delivered into mode_dst/val_dst by
+                        // gen_resume (it detects the resume op is a YieldDelegate), so
+                        // here we only suspend.
+                        let v = self.get(base, val);
+                        let f = self.frames.pop().unwrap();
+                        self.pending_yield_handlers = f.handlers;
+                        self.pending_yield = Some((v, ip));
+                        return Ok(v);
+                    }
+                    Instr::IterDelegate { value_dst, done_dst, ret_dst, iter, mode, sent } => {
+                        let iter_v = self.get(base, iter);
+                        let mode_code = self.get(base, mode).as_int();
+                        let sent_v = self.get(base, sent);
+                        let (val, done_b, ret_b) =
+                            self.iter_delegate_step(iter_v, mode_code, sent_v)?;
+                        self.set(base, value_dst, val);
+                        self.set(base, done_dst, Value::bool(done_b));
+                        self.set(base, ret_dst, Value::bool(ret_b));
+                        ip += 1;
                     }
                     Instr::GenStart => {
                         // Body-entry marker reached during the eager call-time run of

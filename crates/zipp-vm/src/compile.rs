@@ -5259,32 +5259,83 @@ impl<'a> FnCompiler<'a> {
             return Err("`yield` is only valid inside a generator (function*)".into());
         }
         if y.delegate {
-            // `yield* expr`: lazily delegate to the iterable, yielding each of its
-            // elements (drives any iterable via IterNext — generator, array,
-            // string, Map, Set). Sent values aren't forwarded and the delegate's
-            // own return value is approximated as undefined (both rare).
             let arg = y.argument.as_ref().ok_or("yield* requires an operand")?;
+            if self.in_async {
+                // ASYNC `yield*` (async generator): drive the operand via IterNext,
+                // yielding each element. Sent values / return-value / throw-return
+                // delegation are approximated (the async delegation protocol is a
+                // separate path). Left UNCHANGED — adding sync GetIterator here
+                // regresses the async-gen yield* throw/return tests.
+                let save = self.next_reg;
+                let iter = self.alloc_reg();
+                let v = self.expr_into(arg, iter)?;
+                if v != iter {
+                    self.emit(Instr::Move { dst: iter, src: v });
+                }
+                let idx = self.alloc_reg();
+                self.emit(Instr::LoadInt { dst: idx, val: 0 });
+                let elem = self.alloc_reg();
+                let done = self.alloc_reg();
+                let sink = self.alloc_reg(); // discards the value sent to next()
+                let top = self.here();
+                self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter, idx });
+                let jdone = self.here();
+                self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+                self.emit(Instr::Yield { dst: sink, val: elem });
+                self.emit(Instr::Jump { target: top });
+                let end = self.here();
+                self.patch_jump(jdone, end);
+                self.next_reg = save;
+                self.emit(Instr::LoadUndefined { dst });
+                return Ok(dst);
+            }
+            // SYNC `yield*` — the full delegation protocol (spec 14.4.14 step 5):
+            // GetIterator, then a loop that drives the inner iterator per the OUTER
+            // generator's resume mode (next/throw/return), forwarding sent values,
+            // `gen.throw()`, and `gen.return()`. `IterDelegate` performs one step
+            // (incl. the missing-method rules) and classifies the outcome;
+            // `YieldDelegate` yields and on resume delivers (mode, value).
             let save = self.next_reg;
             let iter = self.alloc_reg();
             let v = self.expr_into(arg, iter)?;
             if v != iter {
                 self.emit(Instr::Move { dst: iter, src: v });
             }
-            let idx = self.alloc_reg();
-            self.emit(Instr::LoadInt { dst: idx, val: 0 });
-            let elem = self.alloc_reg();
+            self.emit(Instr::GetIteratorObj { dst: iter, src: iter });
+            let mode = self.alloc_reg();
+            self.emit(Instr::LoadInt { dst: mode, val: 0 }); // start as a `next`
+            let sent = self.alloc_reg();
+            self.emit(Instr::LoadUndefined { dst: sent });
+            let value = self.alloc_reg();
             let done = self.alloc_reg();
-            let sink = self.alloc_reg(); // discards the value sent to next()
+            let ret = self.alloc_reg();
             let top = self.here();
-            self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter, idx });
+            self.emit(Instr::IterDelegate {
+                value_dst: value,
+                done_dst: done,
+                ret_dst: ret,
+                iter,
+                mode,
+                sent,
+            });
+            let jret = self.here();
+            self.emit(Instr::JumpIfTrue { cond: ret, target: 0 }); // → generator return
             let jdone = self.here();
-            self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
-            self.emit(Instr::Yield { dst: sink, val: elem });
+            self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // → yield* completes
+            // Neither: yield the value; on resume (mode,sent) are delivered, loop.
+            self.emit(Instr::YieldDelegate { mode_dst: mode, val_dst: sent, val: value });
             self.emit(Instr::Jump { target: top });
-            let end = self.here();
-            self.patch_jump(jdone, end);
+            // ret: the inner iterator's return (or a missing one) ends the generator.
+            let ret_label = self.here();
+            self.patch_jump(jret, ret_label);
+            self.emit(Instr::Return { src: value });
+            // done: the `yield*` expression evaluates to the inner's final value.
+            let done_label = self.here();
+            self.patch_jump(jdone, done_label);
+            if dst != value {
+                self.emit(Instr::Move { dst, src: value });
+            }
             self.next_reg = save;
-            self.emit(Instr::LoadUndefined { dst });
             return Ok(dst);
         }
         // Evaluate the yielded value (undefined for a bare `yield`); on resume

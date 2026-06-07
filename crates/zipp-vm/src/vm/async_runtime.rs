@@ -187,7 +187,30 @@ impl<'p> Vm<'p> {
             handlers: saved_handlers,
             new_target: Value::UNDEFINED,
         });
-        let outcome = match input {
+        // A `yield*` suspension point (YieldDelegate) consumes ALL three resume
+        // modes by DELIVERING (mode-code, value) into the loop's registers — the
+        // loop then forwards next/throw/return to the inner iterator. This must NOT
+        // inject a body throw/finally (that's a plain Yield's behaviour).
+        let resumes_delegate = matches!(
+            self.func(fid as usize).code.get(resume_ip),
+            Some(Instr::YieldDelegate { .. })
+        );
+        let outcome = if resumes_delegate {
+            if let Instr::YieldDelegate { mode_dst, val_dst, .. } =
+                self.func(fid as usize).code[resume_ip]
+            {
+                let (m, v) = match input {
+                    GenResumeMode::Next(v) => (0, v),
+                    GenResumeMode::Throw(v) => (1, v),
+                    GenResumeMode::Return(v) => (2, v),
+                };
+                self.regs[new_base + mode_dst as usize] = Value::int(m);
+                self.regs[new_base + val_dst as usize] = v;
+            }
+            self.frames[stop].ip = resume_ip + 1;
+            self.run_loop(stop)
+        } else {
+            match input {
             GenResumeMode::Next(v) => {
                 // First next() runs from ip 0 (legacy proto with no marker); a later
                 // one resumes just past the Yield/GenStart, delivering the sent value
@@ -242,6 +265,7 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(Some(self.iter_result(v, true)));
                 }
+            }
             }
         };
         if let Some((y, yield_ip)) = self.pending_yield.take() {

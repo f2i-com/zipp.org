@@ -86,6 +86,72 @@ impl<'p> Vm<'p> {
         Ok(Some(val))
     }
 
+    /// One step of SYNC `yield*` delegation (spec 14.4.14 step 5). Drives `iter`
+    /// per the outer generator's resume `mode` (0 = next, 1 = throw, 2 = return)
+    /// with argument `sent`, applying the missing-method rules. Returns
+    /// `(value, done, ret)`: `done` ⇒ the `yield*` expression completes with
+    /// `value`; `ret` ⇒ the generator must RETURN `value`; both false ⇒ yield
+    /// `value` and keep delegating.
+    pub(crate) fn iter_delegate_step(
+        &mut self,
+        iter: Value,
+        mode: i32,
+        sent: Value,
+    ) -> Result<(Value, bool, bool), Thrown> {
+        // Read result.value/result.done after validating `result` is an object.
+        let unpack = |vm: &mut Self, result: Value| -> Result<(Value, bool), Thrown> {
+            if !vm.is_object_value(result) {
+                return Err(Thrown(
+                    "TypeError: iterator result is not an object".into(),
+                ));
+            }
+            let d = vm.get_prop(result, "done")?;
+            let done = vm.truthy(d);
+            let value = vm.get_prop(result, "value")?;
+            Ok((value, done))
+        };
+        match mode {
+            // next: result = iter.next(sent) → done completes the yield* expression.
+            0 => {
+                let next = self.get_prop(iter, "next")?;
+                let result = self.call_value(next, iter, &[sent])?;
+                let (value, done) = unpack(self, result)?;
+                Ok((value, done, false))
+            }
+            // throw: forward to iter.throw(sent); a missing `throw` closes the
+            // iterator and is a TypeError (the inner can't handle the throw).
+            1 => {
+                let throw_m = self.get_prop(iter, "throw")?;
+                if throw_m.is_nullish() {
+                    let _ = self.iterator_close(iter);
+                    return Err(Thrown(
+                        "TypeError: The iterator does not provide a 'throw' method".into(),
+                    ));
+                }
+                if !self.is_callable(throw_m) {
+                    return Err(Thrown("TypeError: iterator 'throw' is not a function".into()));
+                }
+                let result = self.call_value(throw_m, iter, &[sent])?;
+                let (value, done) = unpack(self, result)?;
+                Ok((value, done, false))
+            }
+            // return: forward to iter.return(sent); a missing `return` ends the
+            // generator with `sent`; otherwise a done result ends it with the value.
+            _ => {
+                let ret_m = self.get_prop(iter, "return")?;
+                if ret_m.is_nullish() {
+                    return Ok((sent, false, true));
+                }
+                if !self.is_callable(ret_m) {
+                    return Err(Thrown("TypeError: iterator 'return' is not a function".into()));
+                }
+                let result = self.call_value(ret_m, iter, &[sent])?;
+                let (value, done) = unpack(self, result)?;
+                Ok((value, false, done))
+            }
+        }
+    }
+
     /// GetIteratorFlattenable: obtain a steppable iterator from any iterable
     /// (arrays/strings/Map/Set via @@iterator) or an object that is itself an
     /// iterator (has a callable `.next`).
