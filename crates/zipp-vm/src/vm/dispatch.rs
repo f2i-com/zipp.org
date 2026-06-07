@@ -1501,6 +1501,15 @@ impl<'p> Vm<'p> {
                     Instr::HasProp { dst, key, obj, brand } => {
                         let k = self.get(base, key);
                         let o = self.get(base, obj);
+                        // The `in` operator (and `#x in`) require an Object right
+                        // operand — a primitive RHS is a TypeError (checked before
+                        // ToPropertyKey on the key, per spec order).
+                        if !self.is_object_value(o) {
+                            let kd = self.display(k);
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot use 'in' operator to search for '{kd}' in a non-object"
+                            )));
+                        }
                         // ToPropertyKey: an object key is ToString-coerced (toString/
                         // valueOf), not rendered "[object Object]".
                         let k = self.coerce_index_key(k)?;
