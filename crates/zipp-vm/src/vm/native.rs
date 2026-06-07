@@ -188,6 +188,7 @@ pub const ITER_DISPOSE: u16 = 683;
 // The test262 `$262` host object.
 pub const DOLLAR262_DETACH: u16 = 620;
 pub const DOLLAR262_GC: u16 = 621;
+pub const DOLLAR262_CREATE_REALM: u16 = 873;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

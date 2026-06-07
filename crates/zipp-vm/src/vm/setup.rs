@@ -1913,10 +1913,12 @@ impl<'p> Vm<'p> {
         // The test262 `$262` host object: { global, detachArrayBuffer, gc }.
         let d262_detach = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_DETACH)));
         let d262_gc = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_GC)));
+        let d262_create_realm = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_CREATE_REALM)));
         let mut d262 = ObjMap::new();
         d262.define("global", Value::heap(global_this), method_attr);
         d262.define("detachArrayBuffer", d262_detach, method_attr);
         d262.define("gc", d262_gc, method_attr);
+        d262.define("createRealm", d262_create_realm, method_attr);
         self.dollar262 = self.heap.alloc(HeapObj::Object(d262));
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).

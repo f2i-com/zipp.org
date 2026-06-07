@@ -51,6 +51,60 @@ impl<'p> Vm<'p> {
     /// Invoke a native (built-in) function by id with `this` and `args`. Backs
     /// first-class builtin values (`Object.defineProperty`, `Array.isArray`,
     /// `Object.prototype.hasOwnProperty`, `Function.prototype.call`, …).
+    /// `$262.createRealm()` — a minimal new realm. Returns `{ global }` where
+    /// `global` exposes a DISTINCT constructor object (with its own distinct
+    /// `prototype`) for each intrinsic, plus fresh namespace objects. The realm
+    /// constructors are recognised as constructors (`is_ctor`) so they serve as a
+    /// foreign `newTarget` for `Reflect.construct`/`super` (the dominant
+    /// cross-realm test shape); they are not yet independently functional.
+    pub(crate) fn create_realm(&mut self) -> Value {
+        let ne = PropAttr { writable: false, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
+        let proto_attr = PropAttr { writable: false, enumerable: false, configurable: false, accessor: false, setter: Value::UNDEFINED };
+        let data = PropAttr::data();
+        // Build a fresh constructor object with its own fresh `.prototype`.
+        let mut make_ctor = |vm: &mut Self, name: &str| -> Value {
+            let proto_idx = vm.heap.alloc(HeapObj::Object(ObjMap::new()));
+            let name_v = vm.alloc_str(name.to_string());
+            let mut cmap = ObjMap::new();
+            cmap.is_ctor = true;
+            cmap.define("prototype", Value::heap(proto_idx), proto_attr);
+            cmap.define("name", name_v, ne);
+            cmap.define("length", Value::int(1), ne);
+            let ctor_idx = vm.heap.alloc(HeapObj::Object(cmap));
+            if let HeapObj::Object(pm) = vm.heap.get_mut(proto_idx) {
+                pm.define("constructor", Value::heap(ctor_idx), ne);
+            }
+            Value::heap(ctor_idx)
+        };
+        let mut g = ObjMap::new();
+        const CTORS: &[&str] = &[
+            "Object", "Array", "Function", "String", "Number", "Boolean", "Symbol",
+            "BigInt", "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError",
+            "EvalError", "URIError", "AggregateError", "Map", "Set", "WeakMap", "WeakSet",
+            "WeakRef", "FinalizationRegistry", "RegExp", "Promise", "Date", "Proxy",
+            "ArrayBuffer", "SharedArrayBuffer", "DataView", "Int8Array", "Uint8Array",
+            "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
+            "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+        ];
+        for name in CTORS {
+            let c = make_ctor(self, name);
+            g.define(name, c, data);
+        }
+        // Fresh namespace objects (not constructors).
+        for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl"] {
+            let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+            g.define(ns, o, data);
+        }
+        let g_idx = self.heap.alloc(HeapObj::Object(g));
+        // `globalThis` is the realm's global object itself.
+        if let HeapObj::Object(gm) = self.heap.get_mut(g_idx) {
+            gm.define("globalThis", Value::heap(g_idx), data);
+        }
+        let mut realm = ObjMap::new();
+        realm.define("global", Value::heap(g_idx), data);
+        Value::heap(self.heap.alloc(HeapObj::Object(realm)))
+    }
+
     pub(crate) fn call_native(&mut self, id: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         use native::*;
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -1721,6 +1775,7 @@ impl<'p> Vm<'p> {
                 Value::NULL
             }
             DOLLAR262_GC => Value::UNDEFINED,
+            DOLLAR262_CREATE_REALM => self.create_realm(),
             // Object.prototype Annex-B accessor helpers.
             OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {
                 // Spec order: ToObject(this) [step 1], THEN IsCallable(getter) [step 2],
