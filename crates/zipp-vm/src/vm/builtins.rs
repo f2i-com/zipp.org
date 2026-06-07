@@ -986,17 +986,21 @@ impl<'p> Vm<'p> {
         let bounds_ok = size <= byte_length && pos <= byte_length - size;
         let abs = byte_offset + pos;
         // GetViewValue/SetViewValue step "If IsViewOutOfBounds, throw TypeError":
-        // a detached backing buffer makes the view out of bounds, and this check
+        // the view is out of bounds if its backing buffer is detached OR (on a
+        // resizable buffer that shrank) its byte range no longer fits. This
         // precedes the RangeError bounds check (per spec order — for get, after
-        // ToIndex; for set, after the value conversion done above).
-        let detached = matches!(
-            self.heap.get(buffer),
-            HeapObj::ArrayBuffer { detached: true, .. }
-        );
+        // ToIndex; for set, after the value conversion done above). A non-resizable
+        // buffer can never shrink, so this only fires for detached/shrunk-resizable.
+        let oob = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } => {
+                *detached || byte_offset + byte_length > data.len()
+            }
+            _ => true,
+        };
         if op == 0 {
-            if detached {
+            if oob {
                 return Err(Thrown(
-                    "TypeError: Cannot perform DataView read on a detached ArrayBuffer".into(),
+                    "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer".into(),
                 ));
             }
             if !bounds_ok {
@@ -1046,15 +1050,18 @@ impl<'p> Vm<'p> {
                 ta_encode(kind, f)
             };
             // SetViewValue converts the VALUE before checking the bounds — so a
-            // throwing valueOf wins over an out-of-range offset. The detached
+            // throwing valueOf wins over an out-of-range offset. The out-of-bounds
             // check (TypeError) comes after the conversion (a valueOf may itself
-            // detach the buffer) and before the RangeError bounds check.
-            if matches!(
-                self.heap.get(buffer),
-                HeapObj::ArrayBuffer { detached: true, .. }
-            ) {
+            // detach/resize the buffer) and before the RangeError bounds check.
+            let oob = match self.heap.get(buffer) {
+                HeapObj::ArrayBuffer { data, detached } => {
+                    *detached || byte_offset + byte_length > data.len()
+                }
+                _ => true,
+            };
+            if oob {
                 return Err(Thrown(
-                    "TypeError: Cannot perform DataView write on a detached ArrayBuffer".into(),
+                    "TypeError: Cannot perform DataView write on a detached or out-of-bounds ArrayBuffer".into(),
                 ));
             }
             if !bounds_ok {
