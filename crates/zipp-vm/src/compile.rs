@@ -1813,27 +1813,33 @@ impl<'a> FnCompiler<'a> {
                 use ox::ExportDefaultDeclarationKind as K;
                 // Bind the default value to a synthetic global "*default*" (not a
                 // valid identifier, so no user collision) and export it as "default".
+                let slot = self.cx.global_slot("*default*") as u32;
+                let tmp = self.temp();
                 match &e.declaration {
-                    K::FunctionDeclaration(_) | K::ClassDeclaration(_) => {
-                        // `export default function/class` — value form deferred; skip
-                        // the default export (named decls are rare in the fixtures).
+                    K::FunctionDeclaration(f) => {
+                        let (id, has_up) = self
+                            .compile_func_expr(f.id.as_ref().map(|i| i.name.to_string()), f)?;
+                        self.emit_make_callable(tmp, id, has_up);
+                    }
+                    K::ClassDeclaration(c) => {
+                        let r = self.class_expr(c, tmp, None)?;
+                        if r != tmp {
+                            self.emit(Instr::Move { dst: tmp, src: r });
+                        }
                     }
                     other => {
-                        let slot = self.cx.global_slot("*default*") as u32;
-                        let tmp = self.temp();
-                        let expr =
-                            other.as_expression().ok_or("unsupported default export")?;
+                        let expr = other.as_expression().ok_or("unsupported default export")?;
                         let v = self.expr_into(expr, tmp)?;
                         if v != tmp {
                             self.emit(Instr::Move { dst: tmp, src: v });
                         }
-                        self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
-                        self.next_reg -= 1;
-                        self.cx
-                            .module_exports
-                            .push(("default".to_string(), "*default*".to_string()));
                     }
                 }
+                self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                self.next_reg -= 1;
+                self.cx
+                    .module_exports
+                    .push(("default".to_string(), "*default*".to_string()));
             }
             S::ExportAllDeclaration(_) => {
                 // `export * from './m'` — needs the other module; not modelled yet.
