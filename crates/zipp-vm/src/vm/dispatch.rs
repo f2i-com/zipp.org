@@ -916,6 +916,21 @@ impl<'p> Vm<'p> {
                                             .into(),
                                     ));
                                 } else {
+                                    // protoParent = Get(superclass, "prototype") — runs
+                                    // an accessor `prototype` (exactly once) and must be
+                                    // an Object or null; anything else (a bound
+                                    // function's absent prototype, a getter returning a
+                                    // primitive, a setter-only `prototype`) is a
+                                    // TypeError per ClassDefinitionEvaluation.
+                                    let proto_parent = self.get_prop(pv, "prototype")?;
+                                    if proto_parent != Value::NULL
+                                        && !self.is_object_value(proto_parent)
+                                    {
+                                        return Err(Thrown(
+                                            "TypeError: Class extends value does not have valid prototype property"
+                                                .into(),
+                                        ));
+                                    }
                                     Some(pv.heap_index())
                                 }
                             }
