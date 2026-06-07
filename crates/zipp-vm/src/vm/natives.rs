@@ -2026,6 +2026,41 @@ impl<'p> Vm<'p> {
                 let r = unescape_str(&s);
                 self.alloc_str(r)
             }
+            U8_TO_BASE64 => {
+                let idx = self.u8_brand(this)?;
+                let opts = args.first().copied().unwrap_or(Value::UNDEFINED);
+                // GetOptionsObject + read alphabet/omitPadding BEFORE the bytes (a
+                // getter on the options object may observably mutate the array).
+                let (url, omit) = if opts == Value::UNDEFINED {
+                    (false, false)
+                } else if self.is_object_value(opts) {
+                    let a = self.get_prop(opts, "alphabet")?;
+                    let url = if a == Value::UNDEFINED {
+                        false
+                    } else if self.is_string_value(a) {
+                        match self.to_js_string(a)?.as_str() {
+                            "base64" => false,
+                            "base64url" => true,
+                            _ => {
+                                return Err(Thrown(
+                                    "TypeError: toBase64 alphabet must be \"base64\" or \"base64url\"".into(),
+                                ))
+                            }
+                        }
+                    } else {
+                        return Err(Thrown("TypeError: toBase64 alphabet must be a string".into()));
+                    };
+                    let op = self.get_prop(opts, "omitPadding")?;
+                    (url, self.truthy(op))
+                } else {
+                    return Err(Thrown("TypeError: toBase64 options must be an object".into()));
+                };
+                let bytes = self
+                    .u8_bytes(idx)
+                    .ok_or_else(|| Thrown("TypeError: Uint8Array buffer is detached".into()))?;
+                let s = to_base64(&bytes, url, omit);
+                self.alloc_str(s)
+            }
             U8_TO_HEX => {
                 let idx = self.u8_brand(this)?;
                 let bytes = self
@@ -3121,6 +3156,48 @@ fn from_hex(s: &str, max_len: usize) -> (usize, Vec<u8>, Option<Thrown>) {
         }
     }
     (read, bytes, None)
+}
+
+/// Encode bytes as base64 (Uint8Array.prototype.toBase64). `url` selects the
+/// base64url alphabet (`-_` for `+/`); `omit_padding` drops trailing `=`.
+fn to_base64(bytes: &[u8], url: bool, omit_padding: bool) -> String {
+    const STD: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let t = if url { URL } else { STD };
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let (b0, b1, b2) = (bytes[i], bytes[i + 1], bytes[i + 2]);
+        out.push(t[(b0 >> 2) as usize] as char);
+        out.push(t[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(t[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(t[(b2 & 0x3f) as usize] as char);
+        i += 3;
+    }
+    match bytes.len() - i {
+        1 => {
+            let b0 = bytes[i];
+            out.push(t[(b0 >> 2) as usize] as char);
+            out.push(t[((b0 & 3) << 4) as usize] as char);
+            if !omit_padding {
+                out.push('=');
+                out.push('=');
+            }
+        }
+        2 => {
+            let (b0, b1) = (bytes[i], bytes[i + 1]);
+            out.push(t[(b0 >> 2) as usize] as char);
+            out.push(t[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+            out.push(t[((b1 & 0xf) << 2) as usize] as char);
+            if !omit_padding {
+                out.push('=');
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// `escape(string)` (Annex B B.2.1.1): keep `A-Za-z0-9@*_+-./`, encode any

@@ -200,6 +200,8 @@ pub const GLOBAL_UNESCAPE: u16 = 879;
 pub const U8_TO_HEX: u16 = 880;
 pub const U8_SET_FROM_HEX: u16 = 881;
 pub const U8_FROM_HEX: u16 = 882;
+// Uint8Array base64/hex proposal — base64 encode (decode = 884/885, follow-up).
+pub const U8_TO_BASE64: u16 = 883;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -952,6 +954,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         U8_TO_HEX => ("toHex", 0),
         U8_SET_FROM_HEX => ("setFromHex", 1),
         U8_FROM_HEX => ("fromHex", 1),
+        U8_TO_BASE64 => ("toBase64", 0),
         FN_HAS_INSTANCE => ("[Symbol.hasInstance]", 1),
         FN_THROW_TYPE_ERROR => ("", 0),
         GLOBAL_IS_NAN => ("isNaN", 1),

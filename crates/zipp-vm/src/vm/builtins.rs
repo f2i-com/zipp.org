@@ -381,8 +381,16 @@ impl<'p> Vm<'p> {
         // ValidateTypedArray: nearly every TypedArray prototype method throws a
         // TypeError when the view is out of bounds — a detached buffer, or (on a
         // resizable buffer that shrank) an offset/length that no longer fits.
-        // subarray is the one exception (it just builds another view).
-        if name != "subarray" && self.ta_effective_len(idx).is_none() {
+        // subarray is the one exception (it just builds another view). The
+        // Uint8Array base64/hex methods are also excluded: they aren't handled
+        // here (they fall through to their prototype Natives) and have their own
+        // spec-ordered checks — e.g. toBase64 reads its options object BEFORE
+        // observing detachedness, so the blanket check must not preempt that.
+        if !matches!(
+            name,
+            "subarray" | "toHex" | "setFromHex" | "toBase64" | "setFromBase64"
+        ) && self.ta_effective_len(idx).is_none()
+        {
             return Err(Thrown(format!(
                 "TypeError: Cannot perform {name} on an out-of-bounds or detached TypedArray"
             )));
