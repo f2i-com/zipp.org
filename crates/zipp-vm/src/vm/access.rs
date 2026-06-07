@@ -232,7 +232,19 @@ impl<'p> Vm<'p> {
                     self.arr_props.get_mut(&idx).map_or(false, |m| m.remove(key))
                 }
             }
-            HeapObj::Class(c) => c.statics.remove(key),
+            HeapObj::Class(c) => {
+                // Static methods/data live in `statics`; static accessors live in
+                // the `static_getters`/`static_setters` side lists. A class's own
+                // members are all configurable, so `delete C.x` must drop the key
+                // from whichever holds it (a get/set pair shares one key).
+                let mut removed = c.statics.remove(key);
+                let gl = c.static_getters.len();
+                c.static_getters.retain(|(n, _)| n != key);
+                let sl = c.static_setters.len();
+                c.static_setters.retain(|(n, _)| n != key);
+                removed |= c.static_getters.len() != gl || c.static_setters.len() != sl;
+                removed
+            }
             // A TypedArray's named/symbol own property lives in arr_props (its
             // integer indices were handled above — they can't be deleted).
             HeapObj::TypedArray { .. } => {

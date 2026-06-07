@@ -589,23 +589,31 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// take()/drop() count: ToIntegerOrInfinity, clamped non-negative (NaN→0,
-    /// +∞ → "all"); a negative or -∞ value is a RangeError.
+    /// take()/drop() count (spec 27.1.4.3/.7): numLimit = ToNumber(limit); a NaN
+    /// numLimit is a RangeError; integerLimit = ToIntegerOrInfinity(numLimit) (so a
+    /// fraction truncates toward zero — `take(-0.5)` → 0, not negative); a negative
+    /// integerLimit (incl. -∞) is a RangeError; +∞ means "all".
     fn iter_limit_arg(&mut self, v: Value) -> Result<i64, Thrown> {
-        // ToIntegerOrInfinity(limit): a coercing ToNumber so an object limit's
-        // valueOf/@@toPrimitive runs (and a throwing one propagates); a Symbol/BigInt
-        // is a TypeError. NaN -> 0, negative -> RangeError, infinite -> the max.
+        // ToNumber so an object limit's valueOf/@@toPrimitive runs (a throwing one
+        // propagates); a Symbol/BigInt is a TypeError.
         let n = self.to_number_coerce(v)?;
         if n.is_nan() {
-            return Ok(0);
-        }
-        if n < 0.0 {
-            return Err(Thrown("RangeError: take/drop limit must be non-negative".into()));
+            return Err(Thrown("RangeError: take/drop limit must not be NaN".into()));
         }
         if n.is_infinite() {
-            return Ok(i64::MAX);
+            return if n < 0.0 {
+                Err(Thrown("RangeError: take/drop limit must be non-negative".into()))
+            } else {
+                Ok(i64::MAX)
+            };
         }
-        Ok(n as i64)
+        // ToIntegerOrInfinity truncates toward zero BEFORE the sign check, so
+        // `-0.5` → -0 (allowed) but `-1` → -1 (RangeError).
+        let int_limit = n.trunc();
+        if int_limit < 0.0 {
+            return Err(Thrown("RangeError: take/drop limit must be non-negative".into()));
+        }
+        Ok(int_limit as i64)
     }
 
     /// `iter_limit_arg` but IteratorClose(`src`) on an abrupt completion (the take/drop
