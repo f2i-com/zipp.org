@@ -1025,6 +1025,39 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(p) = self.heap.get_mut(regexp_proto) {
                 p.define("constructor", Value::heap(regexp_ctor), method_attr);
             }
+            // Annex B legacy RegExp static accessors on the constructor. input/$_
+            // are read-write; the match-info accessors are read-only. A shared
+            // getter/setter brand-checks the %RegExp%-constructor receiver. All are
+            // { enumerable:false, configurable:true }.
+            {
+                let g = Value::heap(self.heap.alloc(HeapObj::Native(REGEXP_LEGACY_GET)));
+                let s = Value::heap(self.heap.alloc(HeapObj::Native(REGEXP_LEGACY_SET)));
+                let rw = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: s,
+                };
+                let ro = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: Value::UNDEFINED,
+                };
+                let read_only = [
+                    "lastMatch", "$&", "lastParen", "$+", "leftContext", "$`", "rightContext",
+                    "$'", "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9",
+                ];
+                if let HeapObj::Object(m) = self.heap.get_mut(regexp_ctor) {
+                    m.define("input", g, rw);
+                    m.define("$_", g, rw);
+                    for k in read_only {
+                        m.define(k, g, ro);
+                    }
+                }
+            }
         }
         // TypedArrays: the %TypedArray% abstract base (its prototype holds the shared
         // methods), the 11 concrete kinds inheriting from it, plus ArrayBuffer and

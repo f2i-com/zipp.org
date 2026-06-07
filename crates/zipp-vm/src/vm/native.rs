@@ -207,6 +207,10 @@ pub const U8_FROM_BASE64: u16 = 885;
 // Error.prototype.stack accessor (get/set).
 pub const ERROR_STACK_GET: u16 = 886;
 pub const ERROR_STACK_SET: u16 = 887;
+// RegExp legacy static accessors (RegExp.input/$_/lastMatch/$1.. — shared
+// get/set with a %RegExp%-constructor brand check).
+pub const REGEXP_LEGACY_GET: u16 = 888;
+pub const REGEXP_LEGACY_SET: u16 = 889;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -958,6 +962,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_DECODE_URI_COMPONENT => ("decodeURIComponent", 1),
         ERROR_STACK_GET => ("get stack", 0),
         ERROR_STACK_SET => ("set stack", 1),
+        REGEXP_LEGACY_GET => ("get", 0),
+        REGEXP_LEGACY_SET => ("set", 1),
         GLOBAL_ESCAPE => ("escape", 1),
         GLOBAL_UNESCAPE => ("unescape", 1),
         U8_TO_HEX => ("toHex", 0),

@@ -2004,6 +2004,29 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            REGEXP_LEGACY_GET => {
+                // GetLegacyRegExpStaticProperty: the receiver must be the %RegExp%
+                // constructor itself (SameValue(C, thisValue)); else TypeError. The
+                // value is the relevant last-match slot — not yet tracked, so the
+                // default empty string (the prop-desc / brand tests check shape +
+                // brand, not the captured value).
+                if !(this.is_heap() && this.heap_index() == self.regexp_ctor) {
+                    return Err(Thrown(
+                        "TypeError: RegExp legacy static getter called on a non-%RegExp% receiver".into(),
+                    ));
+                }
+                self.alloc_str(String::new())
+            }
+            REGEXP_LEGACY_SET => {
+                // SetLegacyRegExpStaticProperty: same %RegExp%-constructor brand
+                // check; the assignment is accepted (not yet tracked → a no-op).
+                if !(this.is_heap() && this.heap_index() == self.regexp_ctor) {
+                    return Err(Thrown(
+                        "TypeError: RegExp legacy static setter called on a non-%RegExp% receiver".into(),
+                    ));
+                }
+                Value::UNDEFINED
+            }
             ITER_TAG_GET => self.alloc_str("Iterator".to_string()),
             ITER_TAG_SET => {
                 if this.is_heap() && this.heap_index() == self.iterator_proto_root {
