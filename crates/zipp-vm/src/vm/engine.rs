@@ -146,6 +146,7 @@ impl<'p> Vm<'p> {
             shared_buffers: std::collections::HashSet::new(),
             immutable_buffers: std::collections::HashSet::new(),
             error_data: std::collections::HashSet::new(),
+            module_base_dir: None,
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),
@@ -510,6 +511,12 @@ impl<'p> Vm<'p> {
     /// Allocate a string on the heap and return its boxed Value.
     pub fn alloc_str(&mut self, s: String) -> Value {
         Value::heap(self.heap.alloc_str(s))
+    }
+
+    /// Set the directory used to resolve a dynamic `import(specifier)` against the
+    /// filesystem (the running script's directory). Without it, `import()` rejects.
+    pub fn set_module_base_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.module_base_dir = dir;
     }
 
     /// Run the top-level function (id 0) to completion.

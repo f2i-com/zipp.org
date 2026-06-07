@@ -2235,28 +2235,56 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ImportCall { dst, spec } => {
                         // import(spec): ToString the specifier, then return a Promise.
-                        // There is no host module loader, so a coercible specifier
-                        // rejects with a TypeError; if ToString throws, the Promise
-                        // rejects with that thrown value (import() never throws sync).
+                        // With a module base dir (a file-run script), resolve the
+                        // specifier against it and evaluate the module: a throw during
+                        // evaluation rejects with that value, a successful load resolves
+                        // (namespace objects are not modelled yet — Ok yields undefined).
+                        // Without a base dir, or when the file is absent, reject with a
+                        // TypeError; if ToString throws, reject with that thrown value.
+                        // import() never throws synchronously. Everything that may GC
+                        // (ToString, module evaluation, make_error) runs BEFORE the
+                        // promise is allocated; the settle value is rooted in `dst`
+                        // across alloc_promise (the iter-169 GC invariant).
                         let spec_val = self.get(base, spec);
-                        // ToString FIRST — a user toString may GC; spec_val is rooted
-                        // in its register and a thrown value is rooted in pending_throw,
-                        // so nothing live is collected. Build the reject reason BEFORE
-                        // allocating the promise (avoids a GC window with an unrooted
-                        // promise), then root the reason in `dst` across alloc_promise.
-                        let coerced = self.to_js_string(spec_val);
-                        let reason = match coerced {
-                            Ok(_) => self.make_error(1, None), // TypeError, no host loader
-                            Err(_) => match self.pending_throw.take() {
-                                Some(v) => v,
-                                None => self.make_error(1, None),
-                            },
+                        let settle: Result<Value, Value> = match self.to_js_string(spec_val) {
+                            Err(_) => Err(self
+                                .pending_throw
+                                .take()
+                                .unwrap_or_else(|| self.make_error(1, None))),
+                            Ok(spec_str) => {
+                                let src = self.module_base_dir.as_ref().and_then(|dir| {
+                                    std::fs::read_to_string(dir.join(&spec_str)).ok()
+                                });
+                                match src {
+                                    // No host loader / unresolved specifier → TypeError.
+                                    None => Err(self.make_error(1, None)),
+                                    // Evaluate the module source in this realm (strict).
+                                    Some(code) => match self.do_eval(&code, true, false, None) {
+                                        Ok(_) => Ok(Value::UNDEFINED),
+                                        Err(_) => Err(self
+                                            .pending_throw
+                                            .take()
+                                            .unwrap_or_else(|| self.make_error(1, None))),
+                                    },
+                                }
+                            }
                         };
-                        self.set(base, dst, reason);
-                        let p = self.alloc_promise();
-                        let r = self.get(base, dst);
-                        self.reject(p, r);
-                        self.set(base, dst, Value::heap(p));
+                        match settle {
+                            Ok(v) => {
+                                self.set(base, dst, v);
+                                let p = self.alloc_promise();
+                                let r = self.get(base, dst);
+                                self.resolve(p, r);
+                                self.set(base, dst, Value::heap(p));
+                            }
+                            Err(e) => {
+                                self.set(base, dst, e);
+                                let p = self.alloc_promise();
+                                let r = self.get(base, dst);
+                                self.reject(p, r);
+                                self.set(base, dst, Value::heap(p));
+                            }
+                        }
                         ip += 1;
                     }
                     Instr::ClassStaticField { class, key, val } => {

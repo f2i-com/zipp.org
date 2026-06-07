@@ -380,6 +380,11 @@ pub struct Vm<'p> {
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep.
     error_data: std::collections::HashSet<u32>,
+    /// Directory the running script was loaded from, used to resolve a dynamic
+    /// `import(specifier)` against the filesystem (relative + bare specifiers).
+    /// `None` when running from a string (eval/embedding) — then `import()` has no
+    /// host loader and rejects.
+    module_base_dir: Option<std::path::PathBuf>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).

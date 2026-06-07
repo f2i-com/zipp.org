@@ -103,7 +103,10 @@ def run_one(args, get_harness, path):
                 return ("SKIP", f"missing-include {inc}", path)
     parts.append(src)
     assembled = "\n".join(parts)
-    fd, tmp = tempfile.mkstemp(suffix=".js")
+    # Create the temp script IN THE TEST'S OWN DIRECTORY so a relative dynamic
+    # `import('./x_FIXTURE.js')` resolves against the fixtures beside the test
+    # (zipp resolves import() relative to the running script's directory).
+    fd, tmp = tempfile.mkstemp(suffix=".js", dir=os.path.dirname(path))
     try:
         os.write(fd, assembled.encode("utf-8"))
         os.close(fd)

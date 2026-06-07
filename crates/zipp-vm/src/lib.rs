@@ -48,6 +48,13 @@ pub struct Outcome {
 /// or unsupported syntax); a runtime uncaught throw is reported via
 /// [`Outcome::error`] alongside any output produced before it.
 pub fn run(src: &str) -> Result<Outcome, String> {
+    run_with_base(src, None)
+}
+
+/// Like [`run`], but `base_dir` is the directory the script was loaded from, used
+/// to resolve a dynamic `import(specifier)` against the filesystem. `None` (the
+/// `run` default) means no host module loader, so `import()` rejects.
+pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, src, SourceType::unambiguous()).parse();
     if !ret.errors.is_empty() {
@@ -65,6 +72,7 @@ pub fn run(src: &str) -> Result<Outcome, String> {
         }
     }
     let mut vm = vm::Vm::new(&program);
+    vm.set_module_base_dir(base_dir);
     match vm.run() {
         Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
         Err(thrown) => Ok(Outcome {
