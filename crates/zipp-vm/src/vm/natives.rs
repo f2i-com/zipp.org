@@ -103,6 +103,8 @@ impl<'p> Vm<'p> {
             // symbols, …): methods become fresh same-id Natives (distinct identity),
             // data/symbol values are shared by value.
             if let Some(&main_ctor) = self.builtin_globals.get(name) {
+                // Route `new other.X()` / `other.X(...)` to the real ctor's logic.
+                self.realm_ctor_main.insert(ctor_idx, main_ctor);
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ctor) {
                     HeapObj::Object(mm) => mm
                         .keys

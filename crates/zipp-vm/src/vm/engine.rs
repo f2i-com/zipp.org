@@ -158,6 +158,7 @@ impl<'p> Vm<'p> {
             shadow_realms: std::collections::HashSet::new(),
             realms: vec![std::collections::HashMap::new()], // realm 0 = main
             obj_realm: std::collections::HashMap::new(),
+            realm_ctor_main: std::collections::HashMap::new(),
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,
@@ -659,6 +660,19 @@ impl<'p> Vm<'p> {
                 return Err(Thrown(
                     "TypeError: Constructor Intl service requires 'new'".into(),
                 ));
+            }
+        }
+        // A realm constructor called as a plain function (`other.Symbol('x')`,
+        // `other.Array(1, 2)`): route to the MAIN ctor's call behaviour, tagging
+        // the result with the realm.
+        if callee.is_heap() {
+            if let Some(&main) = self.realm_ctor_main.get(&callee.heap_index()) {
+                let cr = self.get_function_realm(callee);
+                let r = self.call_value(Value::heap(main), this, args)?;
+                if r.is_heap() && cr != 0 {
+                    self.obj_realm.insert(r.heap_index(), cr);
+                }
+                return Ok(r);
             }
         }
         // A built-in constructor object called as a plain function (passed as a

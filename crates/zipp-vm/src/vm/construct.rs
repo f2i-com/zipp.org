@@ -395,12 +395,31 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
         }
-        // A constructor from a `$262.createRealm()` realm: constructing it yields a
-        // fresh realm-tagged, function-like object (enough to serve as a foreign
-        // newTarget / GetFunctionRealm subject, e.g. `new other.Function()`).
-        // Per-kind functional construction in another realm is future work.
+        // A constructor from a `$262.createRealm()` realm.
         let cr = self.get_function_realm(cv);
         if cr != 0 {
+            // If we know the MAIN-realm constructor it mirrors, build a REAL instance
+            // by delegating to it with `cv` as newTarget (so the instance's
+            // [[Prototype]] is the realm's `X.prototype`), then tag it with the realm.
+            // EXCEPT the Function family: `new other.Function()` must stay a generic
+            // realm object whose `.prototype` is a settable data property (the
+            // proto-from-ctor-realm tests do `nt.prototype = undefined`), which a real
+            // function's synthesized prototype is not yet (see fn.prototype set path).
+            if let Some(&main) = self.realm_ctor_main.get(&cv.heap_index()) {
+                let is_fn_family = main == self.function_ctor
+                    || main == self.gen_fn_ctor
+                    || main == self.async_fn_ctor
+                    || main == self.asyncgen_fn_ctor;
+                if !is_fn_family {
+                    let res = self.construct_with_newtarget(Value::heap(main), args, cv)?;
+                    if res.is_heap() {
+                        self.obj_realm.insert(res.heap_index(), cr);
+                    }
+                    return Ok(res);
+                }
+            }
+            // Otherwise a fresh realm-tagged, function-like object (a valid foreign
+            // newTarget / GetFunctionRealm subject, e.g. `new other.Function()`).
             let proto_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
             let mut m = ObjMap::new();
             m.is_ctor = true;

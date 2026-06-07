@@ -405,6 +405,10 @@ pub struct Vm<'p> {
     /// with a non-object `newTarget.prototype` falls back to realm R's `%C.prototype%`.
     realms: Vec<std::collections::HashMap<u32, u32>>,
     obj_realm: std::collections::HashMap<u32, u32>,
+    /// A realm constructor's heap index → the MAIN-realm constructor it mirrors, so
+    /// `new other.Array()` / `other.Symbol('x')` route to the real construction /
+    /// call behaviour (with the realm's prototype + realm tag).
+    realm_ctor_main: std::collections::HashMap<u32, u32>,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.
