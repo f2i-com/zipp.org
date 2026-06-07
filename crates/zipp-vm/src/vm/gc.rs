@@ -154,6 +154,21 @@ impl Vm<'_> {
         }
         for f in &self.frames {
             root_idx!(f.closure);
+            root_val!(f.new_target);
+            root_val!(f.callee);
+        }
+        // Realm registry ($262.createRealm): keep every realm constructor /
+        // prototype / object reachable so the `obj_realm` and `realms` heap-index
+        // mappings never go stale (a freed-then-reused slot would misattribute a
+        // realm). See [[vm-gc]].
+        for &k in self.obj_realm.keys() {
+            root_idx!(k);
+        }
+        for m in &self.realms {
+            for (&main_p, &realm_p) in m {
+                root_idx!(main_p);
+                root_idx!(realm_p);
+            }
         }
         // Error / TypedArray constructor + prototype tables (mostly < floor, but
         // root them unconditionally to be safe).

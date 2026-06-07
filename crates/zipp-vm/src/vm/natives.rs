@@ -61,41 +61,60 @@ impl<'p> Vm<'p> {
         let ne = PropAttr { writable: false, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
         let proto_attr = PropAttr { writable: false, enumerable: false, configurable: false, accessor: false, setter: Value::UNDEFINED };
         let data = PropAttr::data();
-        // Build a fresh constructor object with its own fresh `.prototype`.
-        let mut make_ctor = |vm: &mut Self, name: &str| -> Value {
-            let proto_idx = vm.heap.alloc(HeapObj::Object(ObjMap::new()));
-            let name_v = vm.alloc_str(name.to_string());
+        // A fresh realm id; realms[r] maps each MAIN-realm intrinsic prototype to
+        // this realm's corresponding prototype (for GetPrototypeFromConstructor's
+        // GetFunctionRealm fallback).
+        let r = self.realms.len() as u32;
+        self.realms.push(std::collections::HashMap::new());
+        // (constructor name, its MAIN-realm prototype heap index — 0 = no mapping)
+        let mut ctors: Vec<(&str, u32)> = vec![
+            ("Object", self.obj_proto), ("Array", self.arr_proto), ("Function", self.fn_proto),
+            ("String", self.str_proto), ("Number", self.num_proto), ("Boolean", self.bool_proto),
+            ("Symbol", self.symbol_proto), ("BigInt", self.bigint_proto),
+            ("Error", self.error_protos[0]), ("TypeError", self.error_protos[1]),
+            ("RangeError", self.error_protos[2]), ("SyntaxError", self.error_protos[3]),
+            ("ReferenceError", self.error_protos[4]), ("EvalError", self.error_protos[5]),
+            ("URIError", self.error_protos[6]), ("AggregateError", self.error_protos[7]),
+            ("Map", self.map_proto), ("Set", self.set_proto), ("WeakMap", self.weakmap_proto),
+            ("WeakSet", self.weakset_proto), ("WeakRef", self.weakref_proto),
+            ("FinalizationRegistry", self.finreg_proto), ("RegExp", self.regexp_proto),
+            ("Promise", self.promise_proto), ("Date", self.date_proto), ("Proxy", 0),
+            ("ArrayBuffer", self.arraybuffer_proto), ("SharedArrayBuffer", self.sab_proto),
+            ("DataView", self.dataview_proto),
+        ];
+        for (k, t) in native::TA_KINDS.iter().enumerate() {
+            ctors.push((t.0, self.ta_protos[k]));
+        }
+        let mut g = ObjMap::new();
+        for (name, main_proto) in ctors {
+            let proto_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            let name_v = self.alloc_str(name.to_string());
             let mut cmap = ObjMap::new();
             cmap.is_ctor = true;
             cmap.define("prototype", Value::heap(proto_idx), proto_attr);
             cmap.define("name", name_v, ne);
             cmap.define("length", Value::int(1), ne);
-            let ctor_idx = vm.heap.alloc(HeapObj::Object(cmap));
-            if let HeapObj::Object(pm) = vm.heap.get_mut(proto_idx) {
+            let ctor_idx = self.heap.alloc(HeapObj::Object(cmap));
+            if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
                 pm.define("constructor", Value::heap(ctor_idx), ne);
             }
-            Value::heap(ctor_idx)
-        };
-        let mut g = ObjMap::new();
-        const CTORS: &[&str] = &[
-            "Object", "Array", "Function", "String", "Number", "Boolean", "Symbol",
-            "BigInt", "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError",
-            "EvalError", "URIError", "AggregateError", "Map", "Set", "WeakMap", "WeakSet",
-            "WeakRef", "FinalizationRegistry", "RegExp", "Promise", "Date", "Proxy",
-            "ArrayBuffer", "SharedArrayBuffer", "DataView", "Int8Array", "Uint8Array",
-            "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
-            "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
-        ];
-        for name in CTORS {
-            let c = make_ctor(self, name);
-            g.define(name, c, data);
+            // Tag both objects with this realm, and map the main proto → realm proto
+            // so GetFunctionRealm's GetPrototypeFromConstructor fallback works.
+            self.obj_realm.insert(ctor_idx, r);
+            self.obj_realm.insert(proto_idx, r);
+            if main_proto != 0 {
+                self.realms[r as usize].insert(main_proto, proto_idx);
+            }
+            g.define(name, Value::heap(ctor_idx), data);
         }
         // Fresh namespace objects (not constructors).
         for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl"] {
-            let o = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
-            g.define(ns, o, data);
+            let o_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            self.obj_realm.insert(o_idx, r);
+            g.define(ns, Value::heap(o_idx), data);
         }
         let g_idx = self.heap.alloc(HeapObj::Object(g));
+        self.obj_realm.insert(g_idx, r);
         // `globalThis` is the realm's global object itself.
         if let HeapObj::Object(gm) = self.heap.get_mut(g_idx) {
             gm.define("globalThis", Value::heap(g_idx), data);
@@ -103,6 +122,15 @@ impl<'p> Vm<'p> {
         let mut realm = ObjMap::new();
         realm.define("global", Value::heap(g_idx), data);
         Value::heap(self.heap.alloc(HeapObj::Object(realm)))
+    }
+
+    /// GetFunctionRealm — the realm id a constructor/object belongs to (0 = main).
+    pub(crate) fn get_function_realm(&self, f: Value) -> u32 {
+        if f.is_heap() {
+            self.obj_realm.get(&f.heap_index()).copied().unwrap_or(0)
+        } else {
+            0
+        }
     }
 
     pub(crate) fn call_native(&mut self, id: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {

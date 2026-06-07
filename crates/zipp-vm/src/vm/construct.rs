@@ -325,24 +325,46 @@ impl<'p> Vm<'p> {
             if self.is_object_value(p) {
                 return Ok(p);
             }
+            // Non-object prototype: GetPrototypeFromConstructor falls back to
+            // GetFunctionRealm(newTarget)'s intrinsic prototype.
+            if default.is_heap() {
+                if let Some(rp) = self.realm_proto_fallback(new_target, default.heap_index()) {
+                    return Ok(Value::heap(rp));
+                }
+            }
         }
         Ok(default)
+    }
+
+    /// For a cross-realm `new_target` whose `prototype` is not an object, the
+    /// realm's copy of `main_proto` (the intrinsic default proto) — else None.
+    pub(crate) fn realm_proto_fallback(&self, new_target: Value, main_proto: u32) -> Option<u32> {
+        let r = self.get_function_realm(new_target) as usize;
+        if r != 0 {
+            return self.realms.get(r).and_then(|m| m.get(&main_proto).copied());
+        }
+        None
     }
 
     /// `Get(new_target, "prototype")` when it is an object and `new_target`
     /// differs from the base constructor — the [[Prototype]] override a built-in
     /// constructor must apply when built via `Reflect.construct(C, args, newTarget)`
-    /// / a derived `super()` / a cross-realm newTarget. `None` for the ordinary
-    /// `new C()` case (use the built-in's default prototype).
+    /// / a derived `super()` / a cross-realm newTarget. For a cross-realm newTarget
+    /// with a non-object prototype, falls back to that realm's `%default_proto%`.
+    /// `None` for the ordinary `new C()` case (use the built-in's default prototype).
     pub(crate) fn newtarget_proto_override(
         &mut self,
         new_target: Value,
         cv: Value,
+        default_proto: u32,
     ) -> Result<Option<Value>, Thrown> {
         if new_target.is_heap() && new_target != cv {
             let p = self.get_prop(new_target, "prototype")?;
             if self.is_object_value(p) {
                 return Ok(Some(p));
+            }
+            if let Some(rp) = self.realm_proto_fallback(new_target, default_proto) {
+                return Ok(Some(Value::heap(rp)));
             }
         }
         Ok(None)
@@ -373,12 +395,27 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
         }
+        // A constructor from a `$262.createRealm()` realm: constructing it yields a
+        // fresh realm-tagged, function-like object (enough to serve as a foreign
+        // newTarget / GetFunctionRealm subject, e.g. `new other.Function()`).
+        // Per-kind functional construction in another realm is future work.
+        let cr = self.get_function_realm(cv);
+        if cr != 0 {
+            let proto_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            let mut m = ObjMap::new();
+            m.is_ctor = true;
+            m.define("prototype", Value::heap(proto_idx), PropAttr::data());
+            let idx = self.heap.alloc(HeapObj::Object(m));
+            self.obj_realm.insert(idx, cr);
+            self.obj_realm.insert(proto_idx, cr);
+            return Ok(Value::heap(idx));
+        }
         // A built-in error constructor used as a VALUE (`var E = TypeError; new E()`,
         // `Reflect.construct(RangeError, [msg])`). Mirrors the compile-lowered
         // `new TypeError(msg)` path. AggregateError takes the message as arg[1].
         if let Some(k) = self.error_ctors.iter().position(|&c| c == cv.heap_index()) {
             let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
-            let over = self.newtarget_proto_override(new_target, cv)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.error_protos[k])?;
             let e = self.make_error(k as u8, msg);
             return Ok(self.set_ctor_proto(e, over));
         }
@@ -547,8 +584,8 @@ impl<'p> Vm<'p> {
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             // OrdinaryCreateFromConstructor: a foreign newTarget (Reflect.construct /
             // cross-realm / derived super) sets the instance's [[Prototype]] to
-            // newTarget.prototype rather than the built-in's default.
-            let over = self.newtarget_proto_override(new_target, cv)?;
+            // newTarget.prototype rather than the built-in's default `p`.
+            let over = self.newtarget_proto_override(new_target, cv, p)?;
             if p == self.arr_proto && self.arr_proto != 0 {
                 let arr = if args.len() == 1 && a0.is_number() {
                     let n = a0.as_f64();

@@ -156,6 +156,8 @@ impl<'p> Vm<'p> {
             shadowrealm_ctor: 0,
             shadowrealm_proto: 0,
             shadow_realms: std::collections::HashSet::new(),
+            realms: vec![std::collections::HashMap::new()], // realm 0 = main
+            obj_realm: std::collections::HashMap::new(),
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,

@@ -397,6 +397,14 @@ pub struct Vm<'p> {
     shadowrealm_ctor: u32,
     shadowrealm_proto: u32,
     shadow_realms: std::collections::HashSet<u32>,
+    /// `$262.createRealm()` realm registry. `realms[r]` maps a MAIN-realm intrinsic
+    /// prototype heap index to realm `r`'s corresponding prototype (realm 0 = the
+    /// main realm, an empty map). `obj_realm` tags a heap index (a realm's
+    /// constructor, its prototype, or an object created in it) with its realm id —
+    /// `GetFunctionRealm`. Used so `Reflect.construct(C, args, newTargetFromRealmR)`
+    /// with a non-object `newTarget.prototype` falls back to realm R's `%C.prototype%`.
+    realms: Vec<std::collections::HashMap<u32, u32>>,
+    obj_realm: std::collections::HashMap<u32, u32>,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.
