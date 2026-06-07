@@ -2989,6 +2989,21 @@ impl<'a> FnCompiler<'a> {
     /// (collected in a non-loop frame) jumps to the end.
     fn switch_stmt(&mut self, s: &ox::SwitchStatement) -> R<()> {
         self.push_scope();
+        // A switch CaseBlock is one block scope. In STRICT mode, Annex B is not
+        // honored, so a function declaration in a case consequent stays block-local
+        // and does not leak past the switch — pre-declare it here. (In sloppy mode the
+        // existing Annex B hoisting to the function/global scope is preserved.)
+        if self.cx.in_strict {
+            for c in &s.cases {
+                for st in &c.consequent {
+                    if let ox::Statement::FunctionDeclaration(f) = st {
+                        if let Some(id) = &f.id {
+                            self.declare_local(id.name.as_str());
+                        }
+                    }
+                }
+            }
+        }
         // CaseBlockEvaluation starts the completion V at undefined (a no-match / all-
         // empty switch yields undefined, not the prior statement's value).
         self.reset_loop_completion();
