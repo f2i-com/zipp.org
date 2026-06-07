@@ -373,6 +373,13 @@ pub struct Vm<'p> {
     /// getter is true, they are never resizable/detachable, and writes through a
     /// TypedArray view throw a TypeError.
     immutable_buffers: std::collections::HashSet<u32>,
+    /// Heap indices of objects that have the [[ErrorData]] internal slot (real
+    /// Error instances — built-in error ctors, internal throws, and
+    /// `class X extends Error` instances). Distinguishes a true error from a
+    /// plain object that merely inherits Error.prototype (which `is_error_instance`
+    /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
+    /// getter. Pruned on GC sweep.
+    error_data: std::collections::HashSet<u32>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).

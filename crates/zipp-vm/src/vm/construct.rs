@@ -139,6 +139,7 @@ impl<'p> Vm<'p> {
         if self.suppressederror_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.suppressederror_proto));
         }
+        self.error_data.insert(idx); // [[ErrorData]] internal slot
         Ok(Value::heap(idx))
     }
 
@@ -1183,6 +1184,8 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
                 if let Some(k) = self.error_ctors.iter().position(|&c| c == cval.heap_index()) {
+                    // `class X extends Error` instance: it has the [[ErrorData]] slot.
+                    self.error_data.insert(obj.heap_index());
                     let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
                     if let Some(m) = msg.filter(|m| *m != Value::UNDEFINED) {
                         let mi = self.to_str_idx(m);

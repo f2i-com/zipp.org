@@ -1375,7 +1375,9 @@ impl<'p> Vm<'p> {
         map.define("message", msg, attr);
         let errs = Value::heap(self.heap.alloc(HeapObj::Array(errors)));
         map.define("errors", errs, attr);
-        Value::heap(self.heap.alloc(HeapObj::Object(map)))
+        let idx = self.heap.alloc(HeapObj::Object(map));
+        self.error_data.insert(idx); // [[ErrorData]] internal slot
+        Value::heap(idx)
     }
 
     /// Resume (or start) a suspended async activation `idx` with `input` — the

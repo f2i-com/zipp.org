@@ -1951,7 +1951,7 @@ impl<'p> Vm<'p> {
                         "TypeError: Error.prototype.stack getter called on a non-object".into(),
                     ));
                 }
-                if this.is_heap() && self.is_error_instance(this.heap_index()) {
+                if this.is_heap() && self.error_data.contains(&this.heap_index()) {
                     self.alloc_str(String::new())
                 } else {
                     Value::UNDEFINED
