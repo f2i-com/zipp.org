@@ -5740,30 +5740,107 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish => {
-                let cur = self.load_with(name, objs, dst);
-                if cur != dst {
-                    self.emit(Instr::Move { dst, src: cur });
-                }
+                // Resolve the reference ONCE (which with-object, if any, holds the
+                // binding), then read and write through that same target — even if
+                // a getter run by the read mutates the object meanwhile.
+                let (found, tgt) = self.emit_with_probe(name, objs);
+                self.emit_with_rmw_read(name, found, tgt, dst);
                 let j = self.emit_logical_skip(a.operator, dst);
                 let v = self.compile_named_init(dst, &a.right, name)?;
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
-                self.store_with(name, objs, dst);
+                self.emit_with_rmw_write(name, found, tgt, dst);
                 let end = self.here();
                 self.patch_jump(j, end);
                 Ok(dst)
             }
             other => {
-                let cur = self.load_with(name, objs, dst); // == dst
+                // Compound `x op= y` in a `with`: PutValue reuses the Reference from
+                // GetValue, so the write targets the same object the read used even
+                // when the getter deletes/replaces the property in between.
+                let (found, tgt) = self.emit_with_probe(name, objs);
+                self.emit_with_rmw_read(name, found, tgt, dst); // current value → dst
                 let rhs = self.expr(&a.right)?;
-                let instr = compound_assign_instr(other, dst, cur, rhs)
+                let instr = compound_assign_instr(other, dst, dst, rhs)
                     .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                 self.emit(instr);
-                self.store_with(name, objs, dst);
+                self.emit_with_rmw_write(name, found, tgt, dst);
                 Ok(dst)
             }
         }
+    }
+
+    /// Emit a runtime `with`-target probe for a read-modify-write of `name`: find
+    /// the innermost with-object that HAS the binding, recording whether one
+    /// matched (`found`, a bool reg) and which it is (`tgt`). The reference is
+    /// resolved ONCE so a later read and write target the SAME object even if a
+    /// getter mutates that object's properties in between (spec: PutValue reuses
+    /// the Reference produced by reference resolution). The two returned registers
+    /// stay live across the caller's read, RHS evaluation, and write.
+    fn emit_with_probe(&mut self, name: &str, objs: &[Reg]) -> (Reg, Reg) {
+        let nidx = self.string_name(name);
+        let found = self.alloc_reg();
+        let tgt = self.alloc_reg();
+        self.emit(Instr::LoadBool { dst: found, val: false });
+        self.emit(Instr::LoadUndefined { dst: tgt });
+        let mut done = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.next_reg -= 1; // reclaim the flag temp
+            self.emit(Instr::LoadBool { dst: found, val: true });
+            self.emit(Instr::Move { dst: tgt, src: obj });
+            let jd = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            done.push(jd);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        let end = self.here();
+        for jd in done {
+            self.patch_jump(jd, end);
+        }
+        (found, tgt)
+    }
+
+    /// Read `name` for a with read-modify-write: `dst = tgt.name` when a with-object
+    /// matched (`found`), else read the static (lexical/global) binding into `dst`.
+    fn emit_with_rmw_read(&mut self, name: &str, found: Reg, tgt: Reg, dst: Reg) {
+        let nidx = self.string_name(name);
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond: found, target: 0 }); // → static read
+        self.emit(Instr::GetProp { dst, obj: tgt, name: nidx });
+        let je = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let stat = self.here();
+        self.patch_jump(jf, stat);
+        let b = self.resolve(name);
+        let r = self.load_binding(&b, dst);
+        if r != dst {
+            self.emit(Instr::Move { dst, src: r });
+        }
+        let end = self.here();
+        self.patch_jump(je, end);
+    }
+
+    /// Write `src` to `name` for a with read-modify-write: `tgt.name = src` when a
+    /// with-object matched (`found`), else store to the static binding.
+    fn emit_with_rmw_write(&mut self, name: &str, found: Reg, tgt: Reg, src: Reg) {
+        let nidx = self.string_name(name);
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond: found, target: 0 }); // → static write
+        self.emit(Instr::SetProp { obj: tgt, name: nidx, val: src });
+        let je = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let stat = self.here();
+        self.patch_jump(jf, stat);
+        let b = self.resolve(name);
+        self.store_binding(&b, src);
+        let end = self.here();
+        self.patch_jump(je, end);
     }
 
     fn yield_expr(&mut self, y: &ox::YieldExpression, dst: Reg) -> R<Reg> {
