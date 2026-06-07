@@ -2308,9 +2308,11 @@ impl<'p> Vm<'p> {
                             }
                         }
                         // A built-in constructor object invoked as a function
-                        // (e.g. an Intl service ctor without `new`).
+                        // (e.g. an Intl service ctor without `new`), or an
+                        // [[IsHTMLDDA]] exotic called directly (→ undefined).
                         if callee_v.is_heap()
-                            && matches!(self.heap.get(callee_v.heap_index()), HeapObj::Object(m) if m.is_ctor)
+                            && (matches!(self.heap.get(callee_v.heap_index()), HeapObj::Object(m) if m.is_ctor)
+                                || self.is_htmldda.contains(&callee_v.heap_index()))
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();

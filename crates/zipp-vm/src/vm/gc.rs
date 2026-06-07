@@ -170,6 +170,11 @@ impl Vm<'_> {
                 root_idx!(realm_p);
             }
         }
+        // Explicit `fn.prototype = obj` overrides keep the assigned object alive.
+        for (&k, &v) in &self.fn_proto_override {
+            root_idx!(k);
+            root_val!(v);
+        }
         // Error / TypedArray constructor + prototype tables (mostly < floor, but
         // root them unconditionally to be safe).
         for &i in self.error_protos.iter().chain(self.error_ctors.iter()) {

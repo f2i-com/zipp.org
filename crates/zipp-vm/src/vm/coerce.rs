@@ -351,6 +351,15 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn loose_eq(&mut self, a: Value, b: Value) -> Result<bool, Thrown> {
+        // An [[IsHTMLDDA]] exotic (`document.all`) loosely equals null/undefined.
+        if !self.is_htmldda.is_empty() {
+            if a.is_heap() && b.is_nullish() && self.is_htmldda.contains(&a.heap_index()) {
+                return Ok(true);
+            }
+            if b.is_heap() && a.is_nullish() && self.is_htmldda.contains(&b.heap_index()) {
+                return Ok(true);
+            }
+        }
         // Object vs primitive (`[1] == 1`, `{} == "[object Object]"`,
         // `Object('x') == 'x'`): ToPrimitive the object side, then retry. Two
         // objects fall through to reference equality; object vs null/undefined is
@@ -715,6 +724,10 @@ impl<'p> Vm<'p> {
         }
         if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
             return *n != 0;
+        }
+        // An [[IsHTMLDDA]] exotic (`document.all`) is falsy.
+        if !self.is_htmldda.is_empty() && self.is_htmldda.contains(&v.heap_index()) {
+            return false;
         }
         true
     }

@@ -409,6 +409,18 @@ pub struct Vm<'p> {
     /// `new other.Array()` / `other.Symbol('x')` route to the real construction /
     /// call behaviour (with the realm's prototype + realm tag).
     realm_ctor_main: std::collections::HashMap<u32, u32>,
+    /// An explicit `fn.prototype = value` assignment, for ANY value — including a
+    /// NON-object (undefined/null/primitive) which the `prototypes` map (heap-only)
+    /// can't hold. Consulted FIRST by the `.prototype` read / `prototype_of` /
+    /// getOwnPropertyDescriptor, so a function whose prototype was set to a
+    /// non-object reports it (and OrdinaryCreateFromConstructor then falls back).
+    fn_proto_override: std::collections::HashMap<u32, Value>,
+    /// Heap indices of `[[IsHTMLDDA]]` exotic objects (`$262.IsHTMLDDA`, the
+    /// `document.all` emulation): `typeof` is "undefined", loose `== null`/`==
+    /// undefined` is true, ToBoolean is false, and calling it returns undefined —
+    /// yet it is otherwise an ordinary object (and `Object.is`/`===` do NOT treat
+    /// it as undefined).
+    is_htmldda: std::collections::HashSet<u32>,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.

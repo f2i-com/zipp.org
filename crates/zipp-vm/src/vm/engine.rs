@@ -159,6 +159,8 @@ impl<'p> Vm<'p> {
             realms: vec![std::collections::HashMap::new()], // realm 0 = main
             obj_realm: std::collections::HashMap::new(),
             realm_ctor_main: std::collections::HashMap::new(),
+            fn_proto_override: std::collections::HashMap::new(),
+            is_htmldda: std::collections::HashSet::new(),
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,
@@ -589,6 +591,10 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+        // An [[IsHTMLDDA]] exotic (`document.all`) is callable and returns undefined.
+        if callee.is_heap() && !self.is_htmldda.is_empty() && self.is_htmldda.contains(&callee.heap_index()) {
+            return Ok(Value::UNDEFINED);
+        }
         // A callable Proxy: `apply` trap (or call the target).
         if callee.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(callee.heap_index()) {

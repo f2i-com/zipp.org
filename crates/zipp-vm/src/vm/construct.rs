@@ -401,22 +401,14 @@ impl<'p> Vm<'p> {
             // If we know the MAIN-realm constructor it mirrors, build a REAL instance
             // by delegating to it with `cv` as newTarget (so the instance's
             // [[Prototype]] is the realm's `X.prototype`), then tag it with the realm.
-            // EXCEPT the Function family: `new other.Function()` must stay a generic
-            // realm object whose `.prototype` is a settable data property (the
-            // proto-from-ctor-realm tests do `nt.prototype = undefined`), which a real
-            // function's synthesized prototype is not yet (see fn.prototype set path).
+            // (`fn.prototype` is now assignable to a non-object, so a real
+            // `new other.Function()` works as a settable-prototype newTarget.)
             if let Some(&main) = self.realm_ctor_main.get(&cv.heap_index()) {
-                let is_fn_family = main == self.function_ctor
-                    || main == self.gen_fn_ctor
-                    || main == self.async_fn_ctor
-                    || main == self.asyncgen_fn_ctor;
-                if !is_fn_family {
-                    let res = self.construct_with_newtarget(Value::heap(main), args, cv)?;
-                    if res.is_heap() {
-                        self.obj_realm.insert(res.heap_index(), cr);
-                    }
-                    return Ok(res);
+                let res = self.construct_with_newtarget(Value::heap(main), args, cv)?;
+                if res.is_heap() {
+                    self.obj_realm.insert(res.heap_index(), cr);
                 }
+                return Ok(res);
             }
             // Otherwise a fresh realm-tagged, function-like object (a valid foreign
             // newTarget / GetFunctionRealm subject, e.g. `new other.Function()`).
@@ -1431,6 +1423,10 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn is_callable(&self, v: Value) -> bool {
+        // An [[IsHTMLDDA]] exotic (`document.all`) is callable (returns undefined).
+        if v.is_heap() && !self.is_htmldda.is_empty() && self.is_htmldda.contains(&v.heap_index()) {
+            return true;
+        }
         v.is_heap()
             && match self.heap.get(v.heap_index()) {
                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {

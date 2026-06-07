@@ -31,6 +31,12 @@ impl<'p> Vm<'p> {
         ) {
             return None;
         }
+        // An explicit `fn.prototype = value` wins. A non-object value means there is
+        // no usable prototype OBJECT (OrdinaryCreateFromConstructor then falls back to
+        // the intrinsic default), so report None.
+        if let Some(&v) = self.fn_proto_override.get(&idx) {
+            return if v.is_heap() && self.is_object_value(v) { Some(v) } else { None };
+        }
         if let Some(&p) = self.prototypes.get(&idx) {
             return Some(Value::heap(p));
         }
@@ -1914,11 +1920,17 @@ impl<'p> Vm<'p> {
         let d262_detach = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_DETACH)));
         let d262_gc = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_GC)));
         let d262_create_realm = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_CREATE_REALM)));
+        // `$262.IsHTMLDDA` — the `document.all` [[IsHTMLDDA]] emulation: an ordinary
+        // object tagged in `is_htmldda` (typeof "undefined", == null/undefined,
+        // falsy, callable→undefined).
+        let d262_htmldda = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+        self.is_htmldda.insert(d262_htmldda);
         let mut d262 = ObjMap::new();
         d262.define("global", Value::heap(global_this), method_attr);
         d262.define("detachArrayBuffer", d262_detach, method_attr);
         d262.define("gc", d262_gc, method_attr);
         d262.define("createRealm", d262_create_realm, method_attr);
+        d262.define("IsHTMLDDA", Value::heap(d262_htmldda), method_attr);
         self.dollar262 = self.heap.alloc(HeapObj::Object(d262));
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).

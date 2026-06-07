@@ -38,6 +38,10 @@ impl<'p> Vm<'p> {
         } else if v.is_null() {
             "object"
         } else if v.is_heap() {
+            // An [[IsHTMLDDA]] exotic (`document.all`): `typeof` is "undefined".
+            if self.is_htmldda.contains(&v.heap_index()) {
+                return "undefined";
+            }
             match self.heap.get(v.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "string",
                 // A class is callable (with `new`), so `typeof C === "function"`.
@@ -553,10 +557,15 @@ impl<'p> Vm<'p> {
                     )));
                 }
             }
-            // Reassigning `fn.prototype = obj` redirects what `new fn()` / the
-            // `.prototype` getter see (the lazily-cached prototype object).
-            if key == "prototype" && val.is_heap() {
-                self.prototypes.insert(idx, val.heap_index());
+            // Reassigning `fn.prototype = value` redirects what `new fn()` / the
+            // `.prototype` getter see. ANY value is honoured (incl. a non-object —
+            // undefined/null/primitive — which the heap-only `prototypes` cache can't
+            // hold), via `fn_proto_override` which the reads consult first.
+            if key == "prototype" {
+                self.fn_proto_override.insert(idx, val);
+                if val.is_heap() {
+                    self.prototypes.insert(idx, val.heap_index());
+                }
             } else {
                 // An existing NON-WRITABLE own data property (e.g. a function `name`
                 // set by NamedEvaluation/SetFunctionName) rejects assignment.

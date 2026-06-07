@@ -777,6 +777,11 @@ impl<'p> Vm<'p> {
             && self.callable_has_prototype(obj)
             && !matches!(self.heap.get(idx), HeapObj::Object(m) if m.pos("prototype").is_some())
         {
+            // An explicit `fn.prototype = value` (incl. a non-object) is reported
+            // verbatim as a writable, non-enumerable, non-configurable data property.
+            if let Some(&v) = self.fn_proto_override.get(&idx) {
+                return self.make_data_descriptor(v, true, false, false);
+            }
             let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
             if let Some(p) = self.prototype_of(obj) {
                 return self.make_data_descriptor(p, !is_class, false, false);
@@ -2559,8 +2564,12 @@ impl<'p> Vm<'p> {
                 return Ok(v);
             }
         }
-        // A function's / class's `.prototype` (a lazily-created, stable object).
+        // A function's / class's `.prototype` (a lazily-created, stable object). An
+        // explicit `fn.prototype = value` (incl. a non-object) is returned verbatim.
         if key == "prototype" {
+            if let Some(&v) = self.fn_proto_override.get(&obj.heap_index()) {
+                return Ok(v);
+            }
             if let Some(p) = self.prototype_of(obj) {
                 return Ok(p);
             }
