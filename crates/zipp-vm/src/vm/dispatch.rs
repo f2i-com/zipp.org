@@ -941,8 +941,14 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ClassAddMember { class, key, func, kind } => {
                         let cv = self.get(base, class);
-                        let k = self.get(base, key);
-                        let kstr = self.display(k);
+                        // ToPropertyKey the computed key the SAME way get_index/set_index
+                        // do (ToPrimitive string-hint, Symbols kept, real ToString for a
+                        // function/object) — `display` produced a debug string (e.g.
+                        // "function" for a function-expression key), so the member was
+                        // stored under a key the access could never recompute.
+                        let kraw = self.get(base, key);
+                        let k = self.coerce_index_key(kraw)?;
+                        let kstr = self.key_of(k);
                         // A STATIC element (method/getter/setter) whose computed key is
                         // "prototype" is a TypeError at class definition (a literal
                         // `static prototype(){}` is an early SyntaxError caught by the
