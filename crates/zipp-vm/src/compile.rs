@@ -2950,12 +2950,24 @@ impl<'a> FnCompiler<'a> {
             self.patch_jump(j, fin_start);
         }
 
-        // Finally body, then resume whatever completion brought us here.
+        // Finally body, then resume whatever completion brought us here. In eval
+        // mode a NORMALLY-completing `finally` discards its own completion value —
+        // the try/catch block's value is the result (`try{39}finally{1}` ⇒ 39) — so
+        // save the accumulated completion across the finally body and restore it.
+        let saved_cmpl = self.completion_reg.map(|cr| {
+            let r = self.alloc_reg();
+            self.emit(Instr::Move { dst: r, src: cr });
+            r
+        });
         self.push_scope();
         for s in &finalizer.body {
             self.stmt(s)?;
         }
         self.pop_scope();
+        if let (Some(cr), Some(r)) = (self.completion_reg, saved_cmpl) {
+            self.emit(Instr::Move { dst: cr, src: r });
+            self.next_reg -= 1; // reclaim the saved-completion temp
+        }
         self.emit(Instr::EndFinally { kind_reg, val_reg });
 
         self.next_reg -= 2; // reclaim kind_reg / val_reg
