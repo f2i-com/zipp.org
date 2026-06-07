@@ -272,8 +272,10 @@ pub(crate) fn array_index(key: Value) -> Option<usize> {
         (i >= 0).then_some(i as usize)
     } else if key.is_double() {
         let d = key.as_f64();
-        // Reject negatives, fractions, and absurdly large indices (≥ 2^32).
-        if d >= 0.0 && d.fract() == 0.0 && d < 4_294_967_296.0 {
+        // A spec array index is a canonical uint32 STRICTLY LESS THAN 2^32-1, so
+        // 4294967295 (2^32-1) and anything ≥ 2^32 are ordinary string properties
+        // (they do not extend `.length` and must not hit the dense-array limit).
+        if d >= 0.0 && d.fract() == 0.0 && d < 4_294_967_295.0 {
             Some(d as usize)
         } else {
             None
