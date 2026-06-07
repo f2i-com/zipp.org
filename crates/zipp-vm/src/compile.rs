@@ -1066,6 +1066,14 @@ struct FnCompiler<'a> {
     upvalues: UpvalList,
     /// Enclosing functions' binding snapshots (outermost → direct parent).
     enclosing: Vec<EnclosingFn>,
+    /// Active `with` scopes (innermost last). Each records the register holding
+    /// the (ToObject'd) with-object and the lexical-scope depth at which the
+    /// `with` was entered: an identifier whose static binding lives in a scope
+    /// SHALLOWER than this `floor` (or is a global/upvalue) can be shadowed by
+    /// the with-object and so resolves dynamically; a binding declared INSIDE
+    /// the with body (depth ≥ floor) is not shadowed. Empty except inside a
+    /// `with` body, so non-`with` code compiles identically (zero regression).
+    with_stack: Vec<WithScope>,
     /// Active optional-chain short-circuit targets: a stack (chains can nest),
     /// each entry collecting the ip of every `?.` nullish-bail jump in that chain.
     /// On exit the chain patches them to a "load undefined" block.
@@ -1096,6 +1104,15 @@ struct LoopCtx {
     /// The `handler_depth` in effect where this loop/switch was entered — the
     /// `floor` a `break`/`continue` targeting it must unwind the handler stack to.
     handler_depth: usize,
+}
+
+/// One active `with` scope (see `FnCompiler::with_stack`).
+struct WithScope {
+    /// Register holding the ToObject'd with-object, kept live across the body
+    /// (allocated as a hidden scope-local so per-statement temp resets preserve it).
+    obj_reg: Reg,
+    /// Lexical-scope depth (`scopes.len()`) at the point the `with` was entered.
+    floor: usize,
 }
 
 impl LoopCtx {
@@ -1158,6 +1175,7 @@ impl<'a> FnCompiler<'a> {
             param_tdz: HashSet::new(),
             upvalues: Rc::new(RefCell::new(Vec::new())),
             enclosing,
+            with_stack: Vec::new(),
         };
         // Register 0 is reserved for `this` in every function (undefined for
         // plain calls, the receiver for method calls). Parameters follow at
@@ -1552,6 +1570,26 @@ impl<'a> FnCompiler<'a> {
             S::ClassDeclaration(c) => self.class_decl(c)?,
             S::EmptyStatement(_) => {}
             S::DebuggerStatement(_) => {} // `debugger;` is a no-op (no attached debugger)
+            S::WithStatement(w) => {
+                // `with` is a SyntaxError in strict mode (early error) — preserve
+                // that so strict negative tests keep passing.
+                if self.cx.in_strict {
+                    return Err("SyntaxError: 'with' statements are not allowed in strict mode".into());
+                }
+                // ToObject(GetValue(object)) becomes the with-environment's binding
+                // object. Held in a hidden scope-local so it survives the whole body
+                // (per-statement temp resets allocate above it).
+                let raw = self.expr(&w.object)?;
+                self.push_scope();
+                let obj_reg = self.declare_local_no_box(" with-object");
+                self.emit(Instr::ToObject { dst: obj_reg, src: raw });
+                let floor = self.scopes.len();
+                self.with_stack.push(WithScope { obj_reg, floor });
+                let r = self.stmt(&w.body);
+                self.with_stack.pop();
+                self.pop_scope();
+                r?;
+            }
             _ => return Err("unsupported statement (not in the zipp-vm v1 subset yet)".into()),
         }
         Ok(())
@@ -3575,6 +3613,12 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::Throw { src: e });
                     return Ok(dst);
                 }
+                // Inside a `with`, a free identifier may resolve to a property of an
+                // active with-object (innermost first), else the static binding.
+                let with_objs = self.with_objs_for(id.name.as_str());
+                if !with_objs.is_empty() {
+                    return Ok(self.load_with(id.name.as_str(), &with_objs, dst));
+                }
                 match self.resolve(id.name.as_str()) {
                     Binding::Local(r) => Ok(r), // already in a register
                     Binding::LocalCell(cell) => {
@@ -4532,6 +4576,22 @@ impl<'a> FnCompiler<'a> {
         };
         // Strict mode: `eval++` / `--arguments` is an early SyntaxError.
         strict_name_err(self.cx.in_strict, &name)?;
+        // Inside a `with`, the updated identifier may be a property of an active
+        // with-object (innermost first): read → increment → write through it.
+        let with_objs = self.with_objs_for(&name);
+        if !with_objs.is_empty() {
+            let cur = self.load_with(&name, &with_objs, dst); // == dst
+            if u.prefix {
+                self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta });
+                self.store_with(&name, &with_objs, cur);
+                return Ok(dst); // dst holds the new value
+            }
+            let tmp = self.temp();
+            self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta });
+            self.store_with(&name, &with_objs, tmp);
+            self.next_reg -= 1; // reclaim tmp
+            return Ok(dst); // dst still holds the old value
+        }
         let binding = self.resolve(&name);
         if let Binding::Local(r) = binding {
             if !self.const_regs.contains(&r) {
@@ -4562,6 +4622,90 @@ impl<'a> FnCompiler<'a> {
             self.store_binding(&binding, tmp);
             self.next_reg -= 1; // reclaim tmp
             Ok(dst) // dst still holds the old value
+        }
+    }
+
+    /// The active `with`-object registers that can shadow `name`, innermost
+    /// first. Empty (the common case) when no `with` is active or the name is
+    /// bound by a declaration INSIDE the innermost applicable `with` body —
+    /// in which case the binding resolves statically with no dynamic probe.
+    fn with_objs_for(&self, name: &str) -> Vec<Reg> {
+        if self.with_stack.is_empty() {
+            return Vec::new();
+        }
+        // Depth of the innermost lexical scope that declares `name` (-1 if the
+        // name is free here → a global/upvalue/unresolved, shadowable by all).
+        let mut depth: isize = -1;
+        for (i, scope) in self.scopes.iter().enumerate() {
+            if scope.iter().any(|(n, _)| n == name) {
+                depth = i as isize;
+            }
+        }
+        // A with entered ABOVE the binding's scope (floor > depth) can shadow it.
+        self.with_stack
+            .iter()
+            .rev()
+            .filter(|w| w.floor as isize > depth)
+            .map(|w| w.obj_reg)
+            .collect()
+    }
+
+    /// Emit a `with`-aware read of `name` into `dst`: probe each with-object
+    /// (innermost first) and read from the first that has the binding; otherwise
+    /// fall back to the static (lexical/global) binding. Returns `dst`.
+    fn load_with(&mut self, name: &str, objs: &[Reg], dst: Reg) -> Reg {
+        let nidx = self.string_name(name);
+        let mut end_jumps = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.next_reg -= 1; // reclaim the flag temp (dead after the branch)
+            self.emit(Instr::GetProp { dst, obj, name: nidx });
+            let je = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            end_jumps.push(je);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        // Fallback: the static binding.
+        let b = self.resolve(name);
+        let r = self.load_binding(&b, dst);
+        if r != dst {
+            self.emit(Instr::Move { dst, src: r });
+        }
+        let end = self.here();
+        for je in end_jumps {
+            self.patch_jump(je, end);
+        }
+        dst
+    }
+
+    /// Emit a `with`-aware write of `src` to `name`: store into the first
+    /// with-object (innermost first) that has the binding; otherwise fall back
+    /// to the static (lexical/global) binding.
+    fn store_with(&mut self, name: &str, objs: &[Reg], src: Reg) {
+        let nidx = self.string_name(name);
+        let mut end_jumps = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.next_reg -= 1;
+            self.emit(Instr::SetProp { obj, name: nidx, val: src });
+            let je = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            end_jumps.push(je);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        let b = self.resolve(name);
+        self.store_binding(&b, src);
+        let end = self.here();
+        for je in end_jumps {
+            self.patch_jump(je, end);
         }
     }
 
@@ -5195,6 +5339,12 @@ impl<'a> FnCompiler<'a> {
         };
         // Strict mode: assignment to `eval`/`arguments` is an early SyntaxError.
         strict_name_err(self.cx.in_strict, &name)?;
+        // Inside a `with`, an assignment target may be a property of an active
+        // with-object (innermost first), else the static binding.
+        let with_objs = self.with_objs_for(&name);
+        if !with_objs.is_empty() {
+            return self.assign_with(a, &name, &with_objs, dst);
+        }
         let binding = self.resolve(&name);
         match a.operator {
             Op::Assign => {
@@ -5270,6 +5420,53 @@ impl<'a> FnCompiler<'a> {
                     .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                 self.emit(instr);
                 self.store_binding(&binding, dst);
+                Ok(dst)
+            }
+        }
+    }
+
+    /// Assignment to a plain identifier inside a `with` body, where `objs`
+    /// (innermost first) may shadow the static binding. Mirrors the identifier
+    /// branch of `assign`, routing the read/write through `load_with`/`store_with`.
+    fn assign_with(
+        &mut self,
+        a: &ox::AssignmentExpression,
+        name: &str,
+        objs: &[Reg],
+        dst: Reg,
+    ) -> R<Reg> {
+        use ox::AssignmentOperator as Op;
+        match a.operator {
+            Op::Assign => {
+                let v = self.compile_named_init(dst, &a.right, name)?;
+                if v != dst {
+                    self.emit(Instr::Move { dst, src: v });
+                }
+                self.store_with(name, objs, dst);
+                Ok(dst)
+            }
+            Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish => {
+                let cur = self.load_with(name, objs, dst);
+                if cur != dst {
+                    self.emit(Instr::Move { dst, src: cur });
+                }
+                let j = self.emit_logical_skip(a.operator, dst);
+                let v = self.compile_named_init(dst, &a.right, name)?;
+                if v != dst {
+                    self.emit(Instr::Move { dst, src: v });
+                }
+                self.store_with(name, objs, dst);
+                let end = self.here();
+                self.patch_jump(j, end);
+                Ok(dst)
+            }
+            other => {
+                let cur = self.load_with(name, objs, dst); // == dst
+                let rhs = self.expr(&a.right)?;
+                let instr = compound_assign_instr(other, dst, cur, rhs)
+                    .ok_or("unsupported assignment operator (zipp-vm v1)")?;
+                self.emit(instr);
+                self.store_with(name, objs, dst);
                 Ok(dst)
             }
         }

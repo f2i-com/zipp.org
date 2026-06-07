@@ -315,6 +315,13 @@ pub enum Instr {
     /// filter that a regular `in` applies, so `#x in obj` sees the private element
     /// while `'#x' in obj` does not.
     HasProp { dst: Reg, key: Reg, obj: Reg, brand: bool },
+    /// `dst = bool` — a `with`-statement binding probe: true iff `obj` has the
+    /// property `name` (own or inherited, [[HasProperty]]) AND it is not blocked
+    /// by `obj[@@unscopables]` (an own/inherited unscopables object whose `name`
+    /// entry is truthy hides the binding). Drives `with`-body identifier
+    /// resolution: a true result routes the read/write to `obj`, false falls
+    /// back to the next with-object or the lexical/global binding.
+    WithHas { dst: Reg, obj: Reg, name: u32 },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },

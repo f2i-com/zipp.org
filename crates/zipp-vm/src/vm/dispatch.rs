@@ -1534,6 +1534,29 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
+                    Instr::WithHas { dst, obj, name } => {
+                        let o = self.get(base, obj);
+                        let key = self.func(func_id as usize)
+                            .string_constants[name as usize]
+                            .clone();
+                        // HasBindingFor a with environment: [[HasProperty]] (own or
+                        // inherited), then the @@unscopables filter — an own/inherited
+                        // `@@unscopables` object whose `key` entry is truthy hides the
+                        // binding (so e.g. `with([]) { values }` reaches the outer
+                        // binding, not Array.prototype.values).
+                        let mut found = self.is_object_value(o) && self.has_property_str(o, &key);
+                        if found {
+                            let unsc = self.get_prop(o, "@@unscopables")?;
+                            if self.is_object_value(unsc) {
+                                let blocked = self.get_prop(unsc, &key)?;
+                                if self.truthy(blocked) {
+                                    found = false;
+                                }
+                            }
+                        }
+                        self.set(base, dst, Value::bool(found));
+                        ip += 1;
+                    }
                     Instr::InstanceOfDyn { dst, val, ctor } => {
                         let v = self.get(base, val);
                         let c = self.get(base, ctor);
