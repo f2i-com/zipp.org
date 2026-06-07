@@ -1293,6 +1293,40 @@ impl<'a> FnCompiler<'a> {
         Binding::Global(slot as u32)
     }
 
+    /// Like `resolve`, but NON-creating: returns `None` for a name that has no
+    /// existing binding (rather than minting a fresh global slot). Used by
+    /// `delete <identifier>` to tell a resolvable binding (→ `false`) from an
+    /// unresolvable name (→ `true`, a no-op) without evaluating or declaring it.
+    /// Does not thread upvalues (no side effects); an enclosing-function local is
+    /// reported as unresolved, which only affects the rare `delete <outer local>`.
+    fn resolve_existing(&self, name: &str) -> Option<Binding> {
+        for scope in self.scopes.iter().rev() {
+            for (n, r) in scope.iter().rev() {
+                if n == name {
+                    return Some(if self.cell_regs.contains(r) {
+                        Binding::LocalCell(*r)
+                    } else {
+                        Binding::Local(*r)
+                    });
+                }
+            }
+        }
+        if let Some((n, r)) = &self.self_name {
+            if n == name {
+                return Some(if self.cell_regs.contains(r) {
+                    Binding::LocalCell(*r)
+                } else {
+                    Binding::Local(*r)
+                });
+            }
+        }
+        self.cx
+            .globals
+            .iter()
+            .position(|g| g == name)
+            .map(|i| Binding::Global(i as u32))
+    }
+
     /// Annex B (B.3.3.3): a block-level function declaration is normally given an
     /// extra function/global-scoped `var` binding, but that extension is SKIPPED
     /// when replacing it with `var <name>` would be an early error — i.e. when
@@ -4191,6 +4225,35 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             ox::Expression::ParenthesizedExpression(p) => self.delete_expr(&p.expression, dst),
+            // `delete <identifier>`: in strict mode an early SyntaxError; in sloppy
+            // mode deleting a resolvable binding (var/let/const/param/function or a
+            // declared global) yields `false` (non-configurable), while an
+            // unresolvable name is a no-op that yields `true` — and must NOT be
+            // evaluated (evaluating an undeclared name would throw ReferenceError).
+            ox::Expression::Identifier(id) => {
+                if self.cx.in_strict {
+                    return Err(
+                        "SyntaxError: Delete of an unqualified identifier in strict mode".into(),
+                    );
+                }
+                // A binding is non-configurable — `delete` yields `false` — when it is
+                // a local (param/`var`/`let`/`const`/function) or a DECLARED global
+                // `var`/`let`/`const`. A builtin, an implicitly-created global
+                // (`x = 1` with no declaration), or an unresolvable name is
+                // configurable / a no-op, so `delete` yields `true`.
+                let non_configurable = match self.resolve_existing(&id.name) {
+                    Some(Binding::Local(_))
+                    | Some(Binding::LocalCell(_))
+                    | Some(Binding::Upvalue(_)) => true,
+                    Some(Binding::Global(slot)) => {
+                        self.cx.hoisted_globals.contains(&slot)
+                            || self.cx.lexical_globals.contains(&slot)
+                    }
+                    None => false,
+                };
+                self.emit(Instr::LoadBool { dst, val: !non_configurable });
+                Ok(dst)
+            }
             other => {
                 let _ = self.expr(other)?;
                 self.emit(Instr::LoadBool { dst, val: true });
