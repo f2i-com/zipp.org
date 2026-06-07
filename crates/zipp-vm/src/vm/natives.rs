@@ -98,6 +98,34 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
                 pm.define("constructor", Value::heap(ctor_idx), ne);
             }
+            // Copy the MAIN ctor's own STATIC props (skip prototype/name/length) so
+            // the realm ctor is functional (`OSymbol.for`, `OArray.from`, well-known
+            // symbols, …): methods become fresh same-id Natives (distinct identity),
+            // data/symbol values are shared by value.
+            if let Some(&main_ctor) = self.builtin_globals.get(name) {
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ctor) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals.iter())
+                        .zip(mm.attrs.iter())
+                        .filter(|((k, _), _)| {
+                            k.as_str() != "prototype" && k.as_str() != "name" && k.as_str() != "length"
+                        })
+                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter);
+                    }
+                    if let HeapObj::Object(cm) = self.heap.get_mut(ctor_idx) {
+                        cm.define(&k, copy, a);
+                    }
+                }
+            }
             // Tag both objects with this realm, and map the main proto → realm proto
             // so GetFunctionRealm's GetPrototypeFromConstructor fallback works.
             self.obj_realm.insert(ctor_idx, r);
@@ -122,6 +150,20 @@ impl<'p> Vm<'p> {
         let mut realm = ObjMap::new();
         realm.define("global", Value::heap(g_idx), data);
         Value::heap(self.heap.alloc(HeapObj::Object(realm)))
+    }
+
+    /// Copy a value into a realm: a built-in method (`HeapObj::Native`) becomes a
+    /// FRESH Native with the same id (distinct identity, identical behaviour — so
+    /// `OSymbol.for !== Symbol.for` while the shared registry still works);
+    /// everything else (well-known symbol values, data) is shared by value.
+    fn realm_copy_value(&mut self, v: Value) -> Value {
+        if v.is_heap() {
+            if let HeapObj::Native(id) = self.heap.get(v.heap_index()) {
+                let id = *id;
+                return Value::heap(self.heap.alloc(HeapObj::Native(id)));
+            }
+        }
+        v
     }
 
     /// GetFunctionRealm — the realm id a constructor/object belongs to (0 = main).
