@@ -194,6 +194,12 @@ pub struct Vm<'p> {
     /// bytecode ip, for the resume point) back to `generator_method`, which
     /// `.take()`s it to distinguish a suspension from a normal return.
     pending_yield: Option<(Value, usize)>,
+    /// Set by the `Yield`/`GenStart` ops to the suspending frame's active `try`
+    /// handlers, so a SYNC generator's `generator_method` can park them in the
+    /// `HeapObj::Generator` and restore them on resume (enabling `gen.throw(e)`
+    /// to land in an enclosing `try`/`catch`). The ASYNC `drive_async_gen`
+    /// consumer ignores this — async-gen suspension semantics are unchanged.
+    pending_yield_handlers: Vec<Handler>,
     /// Set by an `Await` op (the awaited value + the Await's ip + the activation's
     /// live `try` handlers); `drive_async` `.take()`s it to suspend the async
     /// activation, mirroring `pending_yield`. Unlike generators, async activations

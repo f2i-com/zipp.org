@@ -86,6 +86,7 @@ impl<'p> Vm<'p> {
             pending_throw: None,
             pending_new_target: Value::UNDEFINED,
             pending_yield: None,
+            pending_yield_handlers: Vec::new(),
             pending_await: None,
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),

@@ -382,9 +382,10 @@ pub enum HeapObj {
     /// A suspended generator (`function*`). Owns a DETACHED register window (off
     /// the contiguous live `regs` Vec, so the JIT's pinned-capacity invariant
     /// holds while parked); `func`/`closure` re-create the frame on resume, and
-    /// `state` carries the resume ip / completion. v1 does not preserve `try`
-    /// handlers across a yield.
-    Generator { func: u32, closure: u32, state: GenState, regs: Vec<Value> },
+    /// `state` carries the resume ip / completion. `handlers` preserves the
+    /// frame's active `try` handlers across a yield, so `gen.throw(e)` resumes
+    /// into an enclosing `try`/`catch` (and `gen.return(v)` can run `finally`).
+    Generator { func: u32, closure: u32, state: GenState, regs: Vec<Value>, handlers: Vec<Handler> },
     /// An `async function*` activation — see [`AsyncGenState`]. Its `.next()`
     /// returns a Promise; the body may both `yield` and `await`.
     AsyncGenerator(Box<AsyncGenState>),

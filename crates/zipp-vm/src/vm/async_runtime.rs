@@ -65,11 +65,13 @@ impl<'p> Vm<'p> {
         if let Some((_v, genstart_ip)) = self.pending_yield.take() {
             // Suspended at `GenStart`: the post-prologue window is live at the top.
             let back = self.regs.split_off(new_base);
+            let handlers = std::mem::take(&mut self.pending_yield_handlers);
             return Ok(Value::heap(self.heap.alloc(HeapObj::Generator {
                 func: func_id,
                 closure,
                 state: GenState::Suspended(genstart_ip),
                 regs: back,
+                handlers,
             })));
         }
         // No marker was reached — either the prologue threw (propagate at the call
@@ -82,6 +84,7 @@ impl<'p> Vm<'p> {
                 closure,
                 state: GenState::Completed,
                 regs: Vec::new(),
+                handlers: Vec::new(),
             }))),
             Err(t) => Err(t),
         }
@@ -102,108 +105,141 @@ impl<'p> Vm<'p> {
         };
         match name {
             "return" => {
-                // Complete the generator (v1 does not run finally blocks).
-                if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
+                // Complete the generator (v1 does not run finally blocks on return).
+                if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
                     *state = GenState::Completed;
                     regs.clear();
+                    handlers.clear();
                 }
                 Ok(Some(self.iter_result(arg0, true)))
             }
-            "throw" => {
-                if matches!(state, GenState::Completed) {
-                    return Err(Thrown(self.throw_message(arg0)));
-                }
-                // v1: complete the generator and surface the throw at the call
-                // site (no resume into a `try` inside the body).
-                if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
-                    *state = GenState::Completed;
-                    regs.clear();
-                }
-                self.pending_throw = Some(arg0);
-                Err(Thrown(self.throw_message(arg0)))
+            "throw" => match state {
+                // Throwing into a completed generator just re-throws at the call site.
+                GenState::Completed => Err(Thrown(self.throw_message(arg0))),
+                GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
+                // Resume the suspended body, injecting the throw at the yield point so
+                // an enclosing `try`/`catch` (whose handlers we parked) can catch it.
+                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, Resume::Throw(arg0)),
+            },
+            "next" => match state {
+                GenState::Completed => Ok(Some(self.iter_result(Value::UNDEFINED, true))),
+                GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
+                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, Resume::Value(arg0)),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Splice a suspended generator's saved register window back onto the live
+    /// register file, RESTORE its parked `try` handlers, and resume it — either
+    /// delivering a sent value at the yield point (`Resume::Value`, from
+    /// `gen.next(v)`) or throwing a value in there (`Resume::Throw`, from
+    /// `gen.throw(e)`, which unwinds through the body's try/catch/finally). On a
+    /// further yield it re-parks the window + handlers; on completion or an
+    /// uncaught throw it clears them. Returns the iterator-result `{value,done}`.
+    fn gen_resume(
+        &mut self,
+        idx: u32,
+        fid: u32,
+        closure: u32,
+        resume_ip: usize,
+        input: Resume,
+    ) -> Result<Option<Value>, Thrown> {
+        let (saved, saved_handlers) = match self.heap.get_mut(idx) {
+            HeapObj::Generator { state, regs, handlers, .. } => {
+                *state = GenState::Running;
+                (std::mem::take(regs), std::mem::take(handlers))
             }
-            "next" => {
-                let resume_ip = match state {
-                    GenState::Completed => return Ok(Some(self.iter_result(Value::UNDEFINED, true))),
-                    GenState::Running => {
-                        return Err(Thrown("TypeError: generator is already running".into()))
-                    }
-                    GenState::Suspended(ip) => ip,
-                };
-                // Take the saved window out of the heap object and splice it onto
-                // the top of the live register file.
-                let saved = match self.heap.get_mut(idx) {
-                    HeapObj::Generator { state, regs, .. } => {
-                        *state = GenState::Running;
-                        std::mem::take(regs)
-                    }
-                    _ => return Ok(None),
-                };
-                let reg_count = saved.len();
-                let new_base = self.regs.len();
-                if self.regs_would_overflow(new_base + reg_count) {
-                    if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
-                        *state = GenState::Suspended(resume_ip);
-                        *regs = saved;
-                    }
-                    return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
-                }
-                self.regs.extend_from_slice(&saved);
-                if new_base + reg_count > self.regs_hw {
-                    self.regs_hw = new_base + reg_count;
-                }
-                // First next() runs from ip 0; a later one resumes after the Yield,
-                // delivering the sent value into the yield expression's dst.
+            _ => return Ok(None),
+        };
+        let reg_count = saved.len();
+        let new_base = self.regs.len();
+        if self.regs_would_overflow(new_base + reg_count) {
+            if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                *state = GenState::Suspended(resume_ip);
+                *regs = saved;
+                *handlers = saved_handlers;
+            }
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
+        self.regs.extend_from_slice(&saved);
+        if new_base + reg_count > self.regs_hw {
+            self.regs_hw = new_base + reg_count;
+        }
+        let stop = self.frames.len();
+        self.frames.push(Frame {
+            func: fid,
+            base: new_base,
+            ip: 0, // set below per resume kind
+            ret_dst: 0,
+            closure,
+            handlers: saved_handlers,
+            new_target: Value::UNDEFINED,
+        });
+        let outcome = match input {
+            Resume::Value(v) => {
+                // First next() runs from ip 0 (legacy proto with no marker); a later
+                // one resumes just past the Yield/GenStart, delivering the sent value
+                // into a Yield's dst (GenStart delivers nothing).
                 let ip = if resume_ip == usize::MAX {
                     0
                 } else {
-                    if let Instr::Yield { dst, .. } =
-                        self.func(fid as usize).code[resume_ip]
-                    {
-                        self.regs[new_base + dst as usize] = arg0;
+                    if let Instr::Yield { dst, .. } = self.func(fid as usize).code[resume_ip] {
+                        self.regs[new_base + dst as usize] = v;
                     }
                     resume_ip + 1
                 };
-                let stop = self.frames.len();
-                self.frames.push(Frame {
-                    func: fid,
-                    base: new_base,
-                    ip,
-                    ret_dst: 0,
-                    closure,
-                    handlers: Vec::new(),
-                    new_target: Value::UNDEFINED,
-                });
-                let outcome = self.run_loop(stop);
-                if let Some((y, yield_ip)) = self.pending_yield.take() {
-                    // Suspended: the window is still live at [new_base..]; park it.
-                    let back = self.regs.split_off(new_base);
-                    if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
-                        *state = GenState::Suspended(yield_ip);
-                        *regs = back;
+                self.frames[stop].ip = ip;
+                self.run_loop(stop)
+            }
+            Resume::Throw(e) => {
+                // Throw at the suspension point: unwind into the body's handlers.
+                self.pending_throw = Some(e);
+                if self.unwind_to_handler(e, stop) {
+                    self.pending_throw = None;
+                    self.run_loop(stop)
+                } else {
+                    // Uncaught in the body: unwind_to_handler already popped the frame
+                    // and truncated its window. Complete the generator and surface the
+                    // throw at the `gen.throw(e)` call site (value via pending_throw).
+                    if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                        *state = GenState::Completed;
+                        regs.clear();
+                        handlers.clear();
                     }
-                    return Ok(Some(self.iter_result(y, false)));
-                }
-                match outcome {
-                    Ok(ret) => {
-                        // Returned / fell off the end (pop_frame_with already truncated).
-                        if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
-                            *state = GenState::Completed;
-                            regs.clear();
-                        }
-                        Ok(Some(self.iter_result(ret, true)))
-                    }
-                    Err(t) => {
-                        self.regs.truncate(new_base);
-                        if let HeapObj::Generator { state, regs, .. } = self.heap.get_mut(idx) {
-                            *state = GenState::Completed;
-                            regs.clear();
-                        }
-                        Err(t)
-                    }
+                    return Err(Thrown(self.throw_message(e)));
                 }
             }
-            _ => Ok(None),
+        };
+        if let Some((y, yield_ip)) = self.pending_yield.take() {
+            // Re-suspended at another yield: park the window AND the live handlers.
+            let back = self.regs.split_off(new_base);
+            let parked = std::mem::take(&mut self.pending_yield_handlers);
+            if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                *state = GenState::Suspended(yield_ip);
+                *regs = back;
+                *handlers = parked;
+            }
+            return Ok(Some(self.iter_result(y, false)));
+        }
+        match outcome {
+            Ok(ret) => {
+                if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                    *state = GenState::Completed;
+                    regs.clear();
+                    handlers.clear();
+                }
+                Ok(Some(self.iter_result(ret, true)))
+            }
+            Err(t) => {
+                self.regs.truncate(new_base);
+                if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                    *state = GenState::Completed;
+                    regs.clear();
+                    handlers.clear();
+                }
+                Err(t)
+            }
         }
     }
 

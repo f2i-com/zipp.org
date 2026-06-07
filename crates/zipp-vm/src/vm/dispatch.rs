@@ -2724,7 +2724,11 @@ impl<'p> Vm<'p> {
                         // run_loop's stop frame) at a yield, so popping returns to
                         // the resumer. `pending_yield` carries the value + this ip.
                         let v = self.get(base, val);
-                        self.frames.pop();
+                        // Capture this frame's `try` handlers so a SYNC generator can
+                        // park them and `gen.throw(e)`/`gen.return(v)` resume into the
+                        // body's try/catch/finally. (drive_async_gen ignores this.)
+                        let f = self.frames.pop().unwrap();
+                        self.pending_yield_handlers = f.handlers;
                         self.pending_yield = Some((v, ip));
                         return Ok(v);
                     }
@@ -2735,7 +2739,8 @@ impl<'p> Vm<'p> {
                         // `alloc_generator` to park, and record this ip so the first
                         // `.next()` resumes just past it (the resume path delivers no
                         // sent value here because this is not a `Yield`).
-                        self.frames.pop();
+                        let f = self.frames.pop().unwrap();
+                        self.pending_yield_handlers = f.handlers; // empty at GenStart
                         self.pending_yield = Some((Value::UNDEFINED, ip));
                         return Ok(Value::UNDEFINED);
                     }
