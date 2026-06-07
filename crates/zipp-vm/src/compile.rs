@@ -6099,12 +6099,31 @@ fn collect_param_names_ordered(params: &ox::FormalParameters, out: &mut Vec<Stri
 /// name or assignment target in strict-mode code. Returns a `SyntaxError`-prefixed
 /// error (mapped to a thrown SyntaxError by the eval/compile entry points).
 fn strict_name_err(strict: bool, name: &str) -> R<()> {
-    if strict && (name == "eval" || name == "arguments") {
+    if !strict {
+        return Ok(());
+    }
+    if name == "eval" || name == "arguments" {
         return Err(format!(
             "SyntaxError: '{name}' may not be used as a binding name or assignment target in strict mode"
         ));
     }
+    if is_strict_reserved_word(name) {
+        return Err(format!(
+            "SyntaxError: '{name}' is a reserved word in strict mode"
+        ));
+    }
     Ok(())
+}
+
+/// The ECMAScript FutureReservedWords that are reserved ONLY in strict mode — they
+/// may not be used as a binding name or assignment target there. (`let`, `static`,
+/// and `yield` are contextual keywords handled by the parser, so they're excluded
+/// here.) These ARE valid identifiers in sloppy mode.
+fn is_strict_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        "implements" | "interface" | "package" | "private" | "protected" | "public"
+    )
 }
 
 /// Leaf binding names introduced by destructuring parameters (for capture
