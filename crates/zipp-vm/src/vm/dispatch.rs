@@ -311,11 +311,33 @@ impl<'p> Vm<'p> {
                                         .find(|(_, &v)| v == idx)
                                         .map(|(k, _)| k.as_str())
                                 })
-                                .unwrap_or("?");
-                            return Err(Thrown(format!("ReferenceError: {name} is not defined")));
+                                .unwrap_or("?")
+                                .to_string();
+                            // A binding created on the global OBJECT in sloppy code
+                            // (`this.x = v` / `globalThis.x = v`) lives as an own
+                            // property there, not in this slot. The global object's
+                            // own properties ARE global bindings, so a bare read
+                            // resolves to it. Own-only: inherited Object.prototype
+                            // members (`toString`, …) are NOT global bindings, so an
+                            // undeclared name still ReferenceErrors. Slot-only names
+                            // (`global_by_name`) are excluded by checking the ObjMap
+                            // directly, preserving their uninitialized ReferenceError.
+                            let has_own = self.global_this != 0
+                                && matches!(
+                                    self.heap.get(self.global_this),
+                                    HeapObj::Object(m) if m.pos(&name).is_some()
+                                );
+                            if !has_own {
+                                return Err(Thrown(format!("ReferenceError: {name} is not defined")));
+                            }
+                            let gobj = Value::heap(self.global_this);
+                            let val = self.get_prop(gobj, &name)?;
+                            self.set(base, dst, val);
+                            ip += 1;
+                        } else {
+                            self.set(base, dst, v);
+                            ip += 1;
                         }
-                        self.set(base, dst, v);
-                        ip += 1;
                     }
                     Instr::LoadGlobalOrUndefined { dst, idx } => {
                         let v = self.globals[idx as usize];
