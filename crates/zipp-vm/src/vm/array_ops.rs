@@ -1109,6 +1109,13 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // push/unshift Set a NEW index; when a prototype carries integer indices, that
+        // Set may hit a prototype setter (OrdinarySet, handled by set_index via the
+        // abstract al_set path). The fast Vec append below bypasses set_index, so route
+        // to the abstract path then. Gated on the flag, so the common fast path stands.
+        if (name == "push" || name == "unshift") && self.array_proto_has_index {
+            return self.array_like_mutate(Value::heap(idx), name, args);
+        }
         match name {
             "push" => {
                 let mut last = Value::UNDEFINED;

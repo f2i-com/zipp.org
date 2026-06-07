@@ -302,6 +302,23 @@ impl<'p> Vm<'p> {
                 return self.set_prop(obj, &k, val, strict);
             }
         }
+        // OrdinarySet prototype step: assigning an array index that is ABSENT as an
+        // own property (a new index past length, or a hole) must consult the
+        // prototype chain — a prototype setter at that index runs (receiver = the
+        // array) and a non-writable prototype data prop rejects, INSTEAD of silently
+        // creating an own element. Gated on `array_proto_has_index` so the common
+        // case (no integer props on Array/Object.prototype) keeps the fast path.
+        if self.array_proto_has_index {
+            if let Some(i) = array_index(key) {
+                let absent = matches!(
+                    self.heap.get(idx),
+                    HeapObj::Array(items) if i >= items.len() || items[i].is_hole()
+                );
+                if absent && self.array_proto_set_step(obj, i, val, strict)? {
+                    return Ok(());
+                }
+            }
+        }
         // Assigning past the dense-array cap (`a[2**31] = v`) would eagerly grow
         // the Vec to billions of holes and OOM — zipp has no sparse arrays, so
         // throw a RangeError instead. (Checked before the &mut borrow below.)

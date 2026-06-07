@@ -1435,6 +1435,7 @@ impl<'p> Vm<'p> {
         if !obj.is_heap() {
             return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
         }
+        self.note_array_proto_index(obj.heap_index(), key);
         // Proxy defineProperty trap: pass the trap a FromPropertyDescriptor of the
         // attributes (only the specified fields); a falsy result means the define
         // failed (Object.defineProperty throws, Reflect.defineProperty -> false).
@@ -2020,6 +2021,82 @@ impl<'p> Vm<'p> {
             .get(&idx)
             .and_then(|p| p.is_heap().then(|| p.heap_index()))
             .unwrap_or(self.arr_proto)
+    }
+
+    /// Flag that `Array.prototype` / `Object.prototype` now carries an integer
+    /// index, so array index assignment must consult the prototype chain (the
+    /// `array_proto_has_index` perf guard, read by `set_index`).
+    pub(crate) fn note_array_proto_index(&mut self, obj_idx: u32, key: &str) {
+        if (obj_idx == self.arr_proto || obj_idx == self.obj_proto)
+            && canonical_index_str(key).is_some()
+        {
+            self.array_proto_has_index = true;
+        }
+    }
+
+    /// OrdinarySet's prototype step for an array index `i` absent as an own property:
+    /// walk the array's prototype chain (incl. Object.prototype). A prototype own
+    /// ACCESSOR at `i` → invoke its setter with `obj` as receiver, return Ok(true)
+    /// (handled, no own property created). A prototype non-writable own DATA prop at
+    /// `i` → reject (Ok(true)). Otherwise Ok(false) → the caller creates the own data
+    /// property. Only called when `array_proto_has_index` is set.
+    pub(crate) fn array_proto_set_step(
+        &mut self,
+        obj: Value,
+        i: usize,
+        val: Value,
+        strict: bool,
+    ) -> Result<bool, Thrown> {
+        let key = i.to_string();
+        let mut cur = match self.object_get_prototype_of(obj) {
+            p if p.is_heap() => p.heap_index(),
+            _ => return Ok(false),
+        };
+        let mut guard = 0u32;
+        let mut saw_obj_proto = false;
+        while cur != 0 && guard < 64 {
+            guard += 1;
+            saw_obj_proto |= cur == self.obj_proto;
+            if let Some((attr, raw)) = self.own_member(cur, &key) {
+                return self.apply_proto_set(attr, raw, obj, &key, val, strict);
+            }
+            cur = match self.proto_of.get(&cur) {
+                Some(p) if p.is_heap() => p.heap_index(),
+                _ => 0,
+            };
+        }
+        // Type prototypes may not record proto_of -> Object.prototype explicitly.
+        if !saw_obj_proto && self.obj_proto != 0 {
+            if let Some((attr, raw)) = self.own_member(self.obj_proto, &key) {
+                return self.apply_proto_set(attr, raw, obj, &key, val, strict);
+            }
+        }
+        Ok(false)
+    }
+
+    fn apply_proto_set(
+        &mut self,
+        attr: PropAttr,
+        _raw: Value,
+        obj: Value,
+        key: &str,
+        val: Value,
+        strict: bool,
+    ) -> Result<bool, Thrown> {
+        if attr.accessor {
+            // For a SET, the setter is `attr.setter` (the `raw` value is the getter).
+            if attr.setter == Value::UNDEFINED {
+                self.reject_write(key, strict)?;
+            } else {
+                self.call_value(attr.setter, obj, &[val])?;
+            }
+            Ok(true)
+        } else if !attr.writable {
+            self.reject_write(key, strict)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Like `proto_member`, but ACCESSOR-AWARE: when the property found on the

@@ -255,6 +255,12 @@ pub struct Vm<'p> {
     /// (rare) non-writable flag is recorded here — read by the length descriptor,
     /// `arr.length = n`, and the push/pop/shift/unshift mutators.
     array_length_nonwritable: std::collections::HashSet<u32>,
+    /// Set once an integer-indexed own property is defined on `Array.prototype` or
+    /// `Object.prototype` (the prototypes in every plain array's chain). While false
+    /// — the overwhelmingly common case — `a[i] = v` for an absent index takes the
+    /// fast own-write path with NO prototype walk; once true, set_index performs the
+    /// full OrdinarySet (a prototype setter at `i` runs, a non-writable one rejects).
+    array_proto_has_index: bool,
     /// Heap indices of derived-class instances whose `super(...)` has run during
     /// construction (set by the SuperCtor ops, read+cleared in `construct`). A
     /// derived constructor that returns `undefined` without `super()` having run

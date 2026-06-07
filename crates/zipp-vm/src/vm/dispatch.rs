@@ -2268,6 +2268,10 @@ impl<'p> Vm<'p> {
                         if argc == 1
                             && key == "push"
                             && recv.is_heap()
+                            // A prototype carrying integer indices means push's new
+                            // index may resolve to a prototype setter (OrdinarySet) —
+                            // route through array_method's proto-aware path.
+                            && !self.array_proto_has_index
                             && !(!self.arr_props.is_empty()
                                 && self
                                     .arr_props
