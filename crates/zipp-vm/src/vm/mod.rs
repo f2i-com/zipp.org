@@ -385,6 +385,10 @@ pub struct Vm<'p> {
     /// `None` when running from a string (eval/embedding) — then `import()` has no
     /// host loader and rejects.
     module_base_dir: Option<std::path::PathBuf>,
+    /// Dynamic-import namespace cache: resolved module path → its namespace value.
+    /// A module is evaluated at most once, so re-importing the same path returns the
+    /// SAME namespace object (identity). Values are GC roots (modules persist).
+    module_cache: std::collections::HashMap<std::path::PathBuf, Value>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).

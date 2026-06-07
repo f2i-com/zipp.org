@@ -2233,18 +2233,19 @@ impl<'p> Vm<'p> {
                         self.set_index(o, k, v, strict)?;
                         ip += 1;
                     }
-                    Instr::ImportCall { dst, spec } => {
-                        // import(spec): ToString the specifier, then return a Promise.
-                        // With a module base dir (a file-run script), resolve the
-                        // specifier against it and evaluate the module: a throw during
-                        // evaluation rejects with that value, a successful load resolves
-                        // (namespace objects are not modelled yet — Ok yields undefined).
-                        // Without a base dir, or when the file is absent, reject with a
-                        // TypeError; if ToString throws, reject with that thrown value.
-                        // import() never throws synchronously. Everything that may GC
-                        // (ToString, module evaluation, make_error) runs BEFORE the
-                        // promise is allocated; the settle value is rooted in `dst`
-                        // across alloc_promise (the iter-169 GC invariant).
+                    Instr::ImportCall { dst, spec, phase, opts } => {
+                        // import(spec [, opts]) / import.defer / import.source.
+                        // Spec order: ToString(spec); then a non-undefined non-object
+                        // `opts` → TypeError; `import.source` → SyntaxError (source
+                        // phase unavailable for a text module); otherwise resolve the
+                        // specifier against the script's dir, load + evaluate the
+                        // module ONCE (cached by path so re-import yields the SAME
+                        // namespace), and resolve with its (snapshot) namespace. A
+                        // missing file / no base dir → TypeError; a throw during
+                        // ToString or evaluation rejects with that value. import()
+                        // never throws synchronously. Everything that may GC runs
+                        // BEFORE the promise is allocated; the settle value is rooted
+                        // in `dst` across alloc_promise (the iter-169 GC invariant).
                         let spec_val = self.get(base, spec);
                         let settle: Result<Value, Value> = match self.to_js_string(spec_val) {
                             Err(_) => Err(self
@@ -2252,20 +2253,46 @@ impl<'p> Vm<'p> {
                                 .take()
                                 .unwrap_or_else(|| self.make_error(1, None))),
                             Ok(spec_str) => {
-                                let src = self.module_base_dir.as_ref().and_then(|dir| {
-                                    std::fs::read_to_string(dir.join(&spec_str)).ok()
-                                });
-                                match src {
-                                    // No host loader / unresolved specifier → TypeError.
-                                    None => Err(self.make_error(1, None)),
-                                    // Evaluate the module source in this realm (strict).
-                                    Some(code) => match self.do_eval(&code, true, false, None) {
-                                        Ok(_) => Ok(Value::UNDEFINED),
-                                        Err(_) => Err(self
-                                            .pending_throw
-                                            .take()
-                                            .unwrap_or_else(|| self.make_error(1, None))),
-                                    },
+                                let opt_err: Option<Value> = match opts {
+                                    Some(r) => {
+                                        let ov = self.get(base, r);
+                                        if ov == Value::UNDEFINED {
+                                            None
+                                        } else {
+                                            self.validate_import_options(ov).err()
+                                        }
+                                    }
+                                    None => None,
+                                };
+                                if let Some(e) = opt_err {
+                                    Err(e) // bad options / import attributes
+                                } else if phase == 2 {
+                                    Err(self.make_error(3, None)) // SyntaxError: source phase
+                                } else {
+                                    match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
+                                        None => Err(self.make_error(1, None)),
+                                        Some(p) => {
+                                            if let Some(ns) = self.module_cache.get(&p).copied() {
+                                                Ok(ns)
+                                            } else {
+                                                match std::fs::read_to_string(&p) {
+                                                    Err(_) => Err(self.make_error(1, None)),
+                                                    Ok(code) => match self.load_module(&code) {
+                                                        Ok(exports) => {
+                                                            let ns =
+                                                                self.build_module_namespace(&exports);
+                                                            self.module_cache.insert(p, ns);
+                                                            Ok(ns)
+                                                        }
+                                                        Err(_) => Err(self
+                                                            .pending_throw
+                                                            .take()
+                                                            .unwrap_or_else(|| self.make_error(1, None))),
+                                                    },
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         };

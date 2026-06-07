@@ -164,6 +164,108 @@ impl<'p> Vm<'p> {
 
     /// Dispatch a `DisposableStack.prototype` method / `disposed` getter. `op` is
     /// one of the `DISPOSABLE_*` native ids.
+    /// Build a (snapshot) Module Namespace object for a dynamic `import()`: a
+    /// null-prototype, non-extensible object whose own data properties are the
+    /// module's exports (each `{ writable:true, enumerable:true, configurable:false }`,
+    /// keyed by exported name, sorted), plus `@@toStringTag = "Module"`
+    /// ({ writable:false, enumerable:false, configurable:false }). Export VALUES are
+    /// read from the module's top-level (eval-global) bindings — a SNAPSHOT (live
+    /// bindings + the namespace exotic [[Set]]/[[Delete]] are a later phase).
+    /// Validate the (non-undefined) 2nd argument of a dynamic `import(x, options)`
+    /// per EvaluateImportCall: `options` must be an Object, and its `with`/`assert`
+    /// import-attributes (if present) must each be an Object whose own enumerable
+    /// values are all Strings. Returns `Err(reason)` (a value to reject the import
+    /// promise with) on any violation or a throwing getter; `Ok(())` if valid.
+    pub(crate) fn validate_import_options(&mut self, ov: Value) -> Result<(), Value> {
+        let _gc = self.gc_lock_guard();
+        if !self.is_object_value(ov) {
+            return Err(self.make_error(1, None)); // TypeError: options not an object
+        }
+        for key in ["with", "assert"] {
+            let attrs = match self.get_prop(ov, key) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(self.pending_throw.take().unwrap_or_else(|| self.make_error(1, None)))
+                }
+            };
+            if attrs == Value::UNDEFINED {
+                continue;
+            }
+            if !self.is_object_value(attrs) {
+                return Err(self.make_error(1, None)); // TypeError: attributes not an object
+            }
+            let names_v = match self.object_own_property_names(attrs) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(self.pending_throw.take().unwrap_or_else(|| self.make_error(1, None)))
+                }
+            };
+            let names = self.array_snapshot(names_v.heap_index());
+            for nv in names {
+                let ks = self.display(nv);
+                let val = match self.get_prop(attrs, &ks) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(self
+                            .pending_throw
+                            .take()
+                            .unwrap_or_else(|| self.make_error(1, None)))
+                    }
+                };
+                if !(val.is_heap() && self.heap.is_str_like(val.heap_index())) {
+                    return Err(self.make_error(1, None)); // TypeError: attribute value not a string
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn build_module_namespace(&mut self, exports: &[(String, String)]) -> Value {
+        let _gc = self.gc_lock_guard(); // hold the alloc'd values across allocations
+        // Resolve each export's value (first export of a name wins), then sort the
+        // names (the spec orders namespace keys via Array.prototype.sort default).
+        let mut pairs: Vec<(String, Value)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (exported, local) in exports {
+            if !seen.insert(exported.clone()) {
+                continue;
+            }
+            let val = match self.eval_global_slot(local) {
+                Ok(slot) => self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED),
+                Err(_) => Value::UNDEFINED,
+            };
+            pairs.push((exported.clone(), val));
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let tag = self.alloc_str("Module".to_string());
+        let mut m = ObjMap::new();
+        let data_attr = PropAttr {
+            writable: true,
+            enumerable: true,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        for (name, val) in pairs {
+            m.define(&name, val, data_attr);
+        }
+        m.define(
+            "@@toStringTag",
+            tag,
+            PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: false,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
+        );
+        m.extensible = false;
+        let idx = self.heap.alloc(HeapObj::Object(m));
+        self.proto_of.insert(idx, Value::NULL);
+        Value::heap(idx)
+    }
+
     pub(crate) fn disposable_op(&mut self, op: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         use native::*;
         if !(this.is_heap() && self.dispose_stacks.contains_key(&this.heap_index())) {

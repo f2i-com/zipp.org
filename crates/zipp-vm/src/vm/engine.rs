@@ -147,6 +147,7 @@ impl<'p> Vm<'p> {
             immutable_buffers: std::collections::HashSet::new(),
             error_data: std::collections::HashSet::new(),
             module_base_dir: None,
+            module_cache: std::collections::HashMap::new(),
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),
@@ -800,7 +801,7 @@ impl<'p> Vm<'p> {
     /// names (sloppy `x = 1`, `var x`, hoisted fns, or builtins the program never
     /// named) draw a fresh EVAL_POOL slot, seeded UNINITIALIZED so a read before a
     /// write is a ReferenceError (matching sloppy global-scope semantics).
-    fn eval_global_slot(&mut self, name: &str) -> Result<u32, Thrown> {
+    pub(crate) fn eval_global_slot(&mut self, name: &str) -> Result<u32, Thrown> {
         if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
             return Ok(i as u32);
         }
@@ -839,7 +840,6 @@ impl<'p> Vm<'p> {
         force_new_target_ok: bool,
         this_override: Option<Value>,
     ) -> Result<Value, Thrown> {
-        use crate::bytecode::{FuncProto, Instr};
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
         // eval code is a Script (never a module), so `await` is a valid identifier
@@ -854,6 +854,47 @@ impl<'p> Vm<'p> {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
+        self.run_eval_program(eval_prog, this_override)
+    }
+
+    /// Parse + load a MODULE file for a dynamic `import()`: compile it as a module
+    /// (strict; `export`/`import` declarations handled), run it in this realm, and
+    /// return its (exported name, local name) pairs. The caller reads each local's
+    /// top-level (eval-global) binding afterward to build the namespace. A parse or
+    /// compile error, or a throw during evaluation, propagates as `Err`.
+    pub(crate) fn load_module(&mut self, code: &str) -> Result<Vec<(String, String)>, Thrown> {
+        let allocator = oxc_allocator::Allocator::default();
+        let ret =
+            oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::mjs()).parse();
+        if !ret.errors.is_empty() {
+            return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
+        }
+        let prog = match crate::compile::compile_eval(&ret.program, code, true, false) {
+            Ok(p) => p,
+            Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
+        };
+        // A module that depends on another module needs linking (not modelled yet);
+        // reject so the import does not resolve an unlinked namespace. (Err without
+        // setting pending_throw → the caller rejects with a TypeError, a non-Syntax
+        // host resolution error, as the spec's HostResolveImportedModule would.)
+        if prog.module_has_imports {
+            return Err(Thrown("TypeError: module dependencies are not supported".into()));
+        }
+        let exports = prog.module_exports.clone();
+        self.run_eval_program(prog, None)?;
+        Ok(exports)
+    }
+
+    /// Install a compiled eval/module Program into the live realm (remap its global
+    /// slots, function ids, and class ids onto the running tables; hoist `var`s and
+    /// top-level functions) and run its top-level function to completion, returning
+    /// the completion value.
+    fn run_eval_program(
+        &mut self,
+        eval_prog: crate::bytecode::Program,
+        this_override: Option<Value>,
+    ) -> Result<Value, Thrown> {
+        use crate::bytecode::{FuncProto, Instr};
         // Runtime base ids: eval functions and classes are appended past the
         // compile-time tables (parallel to global slots).
         let base_func = (self.main_func_count + self.eval_funcs.len()) as u32;

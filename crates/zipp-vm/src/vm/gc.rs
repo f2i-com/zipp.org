@@ -122,6 +122,9 @@ impl Vm<'_> {
         if let Some(v) = self.pending_throw {
             root_val!(v);
         }
+        for v in self.module_cache.values() {
+            root_val!(*v);
+        }
         if let Some((v, _)) = self.pending_yield {
             root_val!(v);
         }

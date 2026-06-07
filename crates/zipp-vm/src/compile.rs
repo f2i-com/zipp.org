@@ -299,6 +299,8 @@ pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
         classes: c.classes,
         global_names: c.globals,
         hoisted_globals: c.hoisted_globals,
+        module_exports: std::mem::take(&mut c.module_exports),
+        module_has_imports: c.module_has_imports,
     })
 }
 
@@ -327,6 +329,8 @@ pub fn compile_eval(
         classes: c.classes,
         global_names: c.globals,
         hoisted_globals: c.hoisted_globals,
+        module_exports: std::mem::take(&mut c.module_exports),
+        module_has_imports: c.module_has_imports,
     })
 }
 
@@ -392,6 +396,16 @@ struct Compiler {
     /// inherited by nested arrows. False at the top level of a script or eval (a
     /// `new.target` there is an early SyntaxError). Saved/restored per function.
     new_target_ok: bool,
+    /// For a MODULE compile: the (exported name, local name) pairs collected from
+    /// `export` declarations, in source order. The loader reads each local's
+    /// top-level (eval-global) binding after the module runs to build its
+    /// namespace. Empty for scripts/eval (which have no `export`).
+    module_exports: Vec<(String, String)>,
+    /// True if a module has any `import` declaration, a re-export (`export … from`),
+    /// or `export *` — i.e. a dependency on another module. The loader cannot link
+    /// dependencies yet, so such a module rejects the dynamic `import()` rather than
+    /// loading an unlinked (incorrect) namespace.
+    module_has_imports: bool,
 }
 
 impl Compiler {
@@ -413,6 +427,8 @@ impl Compiler {
             const_globals: HashSet::new(),
             lexical_globals: HashSet::new(),
             decl_globals: HashSet::new(),
+            module_exports: Vec::new(),
+            module_has_imports: false,
         }
     }
 
@@ -1738,6 +1754,90 @@ impl<'a> FnCompiler<'a> {
                 self.with_stack.pop();
                 self.pop_scope();
                 r?;
+            }
+            // ── ES module declarations (only reached for SourceType::module, i.e.
+            // a fixture loaded by a dynamic `import()`; a script never parses these).
+            S::ImportDeclaration(_) => {
+                // A module that imports another module needs linking, which the
+                // loader does not do yet — mark it so the dynamic import rejects
+                // rather than resolving an unlinked namespace.
+                self.cx.module_has_imports = true;
+            }
+            S::ExportNamedDeclaration(e) => {
+                // `export {x} from './m'` (re-export) needs the other module — not
+                // modelled yet; mark the module unloadable.
+                if e.source.is_some() {
+                    self.cx.module_has_imports = true;
+                    return Ok(());
+                }
+                // `export var/let/const/function/class …`: compile the inner
+                // declaration normally (its top-level binding becomes a global), then
+                // record each bound name as an export (exported name == local name).
+                if let Some(decl) = &e.declaration {
+                    match decl {
+                        ox::Declaration::VariableDeclaration(d) => {
+                            self.var_decl(d)?;
+                            let mut names = std::collections::HashSet::new();
+                            for dd in &d.declarations {
+                                capture::collect_pattern_names(&dd.id, &mut names);
+                            }
+                            for n in names {
+                                self.cx.module_exports.push((n.clone(), n));
+                            }
+                        }
+                        ox::Declaration::FunctionDeclaration(f) => {
+                            self.func_decl(f)?;
+                            if let Some(id) = &f.id {
+                                let n = id.name.to_string();
+                                self.cx.module_exports.push((n.clone(), n));
+                            }
+                        }
+                        ox::Declaration::ClassDeclaration(c) => {
+                            self.class_decl(c)?;
+                            if let Some(id) = &c.id {
+                                let n = id.name.to_string();
+                                self.cx.module_exports.push((n.clone(), n));
+                            }
+                        }
+                        _ => return Err("unsupported export declaration".into()),
+                    }
+                }
+                // `export { local as exported, … }`.
+                for spec in &e.specifiers {
+                    let local = module_export_name(&spec.local);
+                    let exported = module_export_name(&spec.exported);
+                    self.cx.module_exports.push((exported, local));
+                }
+            }
+            S::ExportDefaultDeclaration(e) => {
+                use ox::ExportDefaultDeclarationKind as K;
+                // Bind the default value to a synthetic global "*default*" (not a
+                // valid identifier, so no user collision) and export it as "default".
+                match &e.declaration {
+                    K::FunctionDeclaration(_) | K::ClassDeclaration(_) => {
+                        // `export default function/class` — value form deferred; skip
+                        // the default export (named decls are rare in the fixtures).
+                    }
+                    other => {
+                        let slot = self.cx.global_slot("*default*") as u32;
+                        let tmp = self.temp();
+                        let expr =
+                            other.as_expression().ok_or("unsupported default export")?;
+                        let v = self.expr_into(expr, tmp)?;
+                        if v != tmp {
+                            self.emit(Instr::Move { dst: tmp, src: v });
+                        }
+                        self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                        self.next_reg -= 1;
+                        self.cx
+                            .module_exports
+                            .push(("default".to_string(), "*default*".to_string()));
+                    }
+                }
+            }
+            S::ExportAllDeclaration(_) => {
+                // `export * from './m'` — needs the other module; not modelled yet.
+                self.cx.module_has_imports = true;
             }
             _ => return Err("unsupported statement (not in the zipp-vm v1 subset yet)".into()),
         }
@@ -4114,12 +4214,20 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             E::ImportExpression(ie) => {
-                // Dynamic `import(specifier)` — evaluate the specifier; ImportCall
-                // ToString's it and returns a (rejecting, no host loader) Promise.
-                // `options` (import attributes) and `phase` (import.defer/source) are
-                // not modelled in this subset and are ignored.
+                // Dynamic `import(specifier [, options])` / `import.defer` /
+                // `import.source`. Evaluate the specifier (and options, if any);
+                // ImportCall does ToString, the options/phase checks, and the load.
                 let spec = self.expr(&ie.source)?;
-                self.emit(Instr::ImportCall { dst, spec });
+                let opts = match &ie.options {
+                    Some(o) => Some(self.expr(o)?),
+                    None => None,
+                };
+                let phase = match ie.phase {
+                    Some(ox::ImportPhase::Source) => 2,
+                    Some(ox::ImportPhase::Defer) => 1,
+                    None => 0,
+                };
+                self.emit(Instr::ImportCall { dst, spec, phase, opts });
                 Ok(dst)
             }
             _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
@@ -6673,6 +6781,16 @@ fn compound_assign_instr(op: ox::AssignmentOperator, dst: Reg, a: Reg, b: Reg) -
         Op::BitwiseAnd => Instr::Bitwise { dst, a, b, op: BitwiseOp::And },
         _ => return None,
     })
+}
+
+/// The string of an `export`/`import` ModuleExportName (`foo`, `foo as bar`,
+/// `"a-b"`), for recording a module's (exported, local) export pairs.
+fn module_export_name(n: &ox::ModuleExportName) -> String {
+    match n {
+        ox::ModuleExportName::IdentifierName(id) => id.name.to_string(),
+        ox::ModuleExportName::IdentifierReference(id) => id.name.to_string(),
+        ox::ModuleExportName::StringLiteral(s) => s.value.to_string(),
+    }
 }
 
 /// A class member's (non-computed) name. Computed `[expr]` and `#private` names

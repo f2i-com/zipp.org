@@ -429,8 +429,11 @@ pub enum Instr {
     /// Promise. With no host module loader, a successfully-coerced specifier rejects
     /// with a TypeError; if the specifier's coercion throws, the Promise rejects
     /// with that thrown value (import() never throws synchronously). options/phase
-    /// (import attributes, `import.defer`/`import.source`) are ignored in this subset.
-    ImportCall { dst: Reg, spec: Reg },
+    /// (import attributes) — `opts` is the evaluated 2nd argument (a non-object,
+    /// non-undefined options rejects with a TypeError). `phase`: 0 = normal
+    /// `import(x)`, 1 = `import.defer(x)`, 2 = `import.source(x)` (source phase is
+    /// not available for a SourceTextModule → rejects with a SyntaxError).
+    ImportCall { dst: Reg, spec: Reg, phase: u8, opts: Option<Reg> },
     /// Define a STATIC class field with a computed key: ToPropertyKey(key) once,
     /// throw a TypeError if it is "prototype" (a static field may not be named
     /// `prototype` — it is a non-configurable own property of the constructor),
@@ -844,6 +847,14 @@ pub struct Program {
     /// the never-declared ReferenceError). Other slots start as the uninitialized
     /// sentinel; a write (StoreGlobal/builtin/function) clears it.
     pub hoisted_globals: Vec<u32>,
+    /// For a MODULE program (a fixture loaded by a dynamic `import()`): the
+    /// (exported name, local name) pairs. The loader reads each local's top-level
+    /// binding after the module runs to build the import's namespace. Empty for
+    /// ordinary scripts / eval.
+    pub module_exports: Vec<(String, String)>,
+    /// True if the module depends on another module (`import …`, `export … from`,
+    /// `export *`) — the loader cannot link those yet, so the import rejects.
+    pub module_has_imports: bool,
 }
 
 /// A compiled class: the constructor func id (runs field inits + user ctor body),
