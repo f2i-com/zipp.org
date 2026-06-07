@@ -499,6 +499,24 @@ impl Compiler {
         // body so nested functions/arrows inherit it; restore the parent's after.
         let parent_strict = self.in_strict;
         let is_strict = parent_strict || has_use_strict(directives);
+        // Strict-mode early errors on the FormalParameterList: a parameter may not
+        // be named `eval`/`arguments`, and names may not repeat (a duplicate is a
+        // SyntaxError in strict mode even for otherwise-simple parameter lists).
+        if is_strict {
+            if let Some(pa) = params_ast {
+                let mut ordered = Vec::new();
+                collect_param_names_ordered(pa, &mut ordered);
+                let mut seen = HashSet::new();
+                for nm in &ordered {
+                    strict_name_err(true, nm)?;
+                    if !seen.insert(nm.as_str()) {
+                        return Err(format!(
+                            "SyntaxError: duplicate parameter name '{nm}' not allowed in strict mode"
+                        ));
+                    }
+                }
+            }
+        }
         // `new.target` is allowed inside an ordinary function, not at script/eval
         // top level; nested arrows inherit this. Restored at the end.
         let parent_nt = self.new_target_ok;
@@ -1479,6 +1497,8 @@ impl<'a> FnCompiler<'a> {
                 ox::BindingPattern::BindingIdentifier(id) => id.name.as_str(),
                 _ => unreachable!("handled above"),
             };
+            // Strict mode: `var eval` / `let arguments` etc. are early SyntaxErrors.
+            strict_name_err(self.cx.in_strict, name)?;
 
             // `var` (function-scoped) and a TRUE top-level `let`/`const` bind to
             // GLOBAL slots, so a nested function resolves them via LoadGlobal (a
@@ -1777,6 +1797,11 @@ impl<'a> FnCompiler<'a> {
 
     fn func_decl(&mut self, f: &ox::Function) -> R<()> {
         let name = f.id.as_ref().map(|i| i.name.to_string());
+        // Strict mode: a function may not be named `eval`/`arguments` (the binding
+        // is strict if the enclosing scope is strict OR the body opens `"use strict"`).
+        if let Some(n) = &name {
+            strict_name_err(self.cx.in_strict || has_use_strict(fn_directives(f)), n)?;
+        }
         let (params, rest, body) = function_parts(f)?;
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&f.params));
@@ -2396,6 +2421,14 @@ impl<'a> FnCompiler<'a> {
     /// name (if any) is not hoisted — the value is produced explicitly by a
     /// `MakeFunc`/`MakeClosure` at the use site.
     fn compile_func_expr(&mut self, name: Option<String>, f: &ox::Function) -> R<(u32, bool)> {
+        // Strict mode: a named function expression may not be named `eval`/`arguments`.
+        // Use the SYNTACTIC name (`f.id`), not the inferred NamedEvaluation name.
+        if let Some(id) = &f.id {
+            strict_name_err(
+                self.cx.in_strict || has_use_strict(fn_directives(f)),
+                id.name.as_str(),
+            )?;
+        }
         let (params, rest, body) = function_parts(f)?;
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&f.params));
@@ -2786,6 +2819,8 @@ impl<'a> FnCompiler<'a> {
         let (e_reg, e_name, pattern) = match &handler.param {
             Some(p) => match &p.pattern {
                 ox::BindingPattern::BindingIdentifier(id) => {
+                    // Strict mode: `catch (eval)` / `catch (arguments)` is an early SyntaxError.
+                    strict_name_err(self.cx.in_strict, id.name.as_str())?;
                     (self.declare_local_no_box(id.name.as_str()), Some(id.name.to_string()), None)
                 }
                 pat => (self.declare_local_no_box("<catch.val>"), None, Some(pat)),
@@ -4157,6 +4192,8 @@ impl<'a> FnCompiler<'a> {
             ox::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
             _ => return Err("update on this target not in zipp-vm v1".into()),
         };
+        // Strict mode: `eval++` / `--arguments` is an early SyntaxError.
+        strict_name_err(self.cx.in_strict, &name)?;
         let binding = self.resolve(&name);
         if let Binding::Local(r) = binding {
             if !self.const_regs.contains(&r) {
@@ -4797,6 +4834,8 @@ impl<'a> FnCompiler<'a> {
             ox::AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
             _ => return Err("assignment to non-identifier not in zipp-vm v1".into()),
         };
+        // Strict mode: assignment to `eval`/`arguments` is an early SyntaxError.
+        strict_name_err(self.cx.in_strict, &name)?;
         let binding = self.resolve(&name);
         match a.operator {
             Op::Assign => {
@@ -5861,6 +5900,52 @@ fn param_slot_names(params: &ox::FormalParameters) -> R<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// All parameter binding identifiers in source order, duplicates preserved
+/// (for strict-mode early-error checks: `eval`/`arguments` and duplicate names).
+fn collect_param_names_ordered(params: &ox::FormalParameters, out: &mut Vec<String>) {
+    fn walk(p: &ox::BindingPattern, out: &mut Vec<String>) {
+        use ox::BindingPattern as P;
+        match p {
+            P::BindingIdentifier(id) => out.push(id.name.to_string()),
+            P::AssignmentPattern(ap) => walk(&ap.left, out),
+            P::ObjectPattern(op) => {
+                for prop in &op.properties {
+                    walk(&prop.value, out);
+                }
+                if let Some(rest) = &op.rest {
+                    walk(&rest.argument, out);
+                }
+            }
+            P::ArrayPattern(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    walk(el, out);
+                }
+                if let Some(rest) = &arr.rest {
+                    walk(&rest.argument, out);
+                }
+            }
+        }
+    }
+    for item in &params.items {
+        walk(&item.pattern, out);
+    }
+    if let Some(r) = &params.rest {
+        walk(&r.rest.argument, out);
+    }
+}
+
+/// Strict-mode early error: `eval` and `arguments` may not be used as a binding
+/// name or assignment target in strict-mode code. Returns a `SyntaxError`-prefixed
+/// error (mapped to a thrown SyntaxError by the eval/compile entry points).
+fn strict_name_err(strict: bool, name: &str) -> R<()> {
+    if strict && (name == "eval" || name == "arguments") {
+        return Err(format!(
+            "SyntaxError: '{name}' may not be used as a binding name or assignment target in strict mode"
+        ));
+    }
+    Ok(())
 }
 
 /// Leaf binding names introduced by destructuring parameters (for capture
