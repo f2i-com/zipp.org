@@ -992,27 +992,46 @@ impl<'p> Vm<'p> {
                     }
                 }
                 HeapObj::Class(c) => {
-                    if has_length {
+                    // Spec order: the constructor's `length`, `name`, then
+                    // `prototype` are created FIRST. A static element named one of
+                    // them overwrites the VALUE but keeps that early position (it was
+                    // already defined), so emit these three first and skip them when
+                    // listing the remaining static elements.
+                    // A static element named length/name (a method, a computed key,
+                    // a generator, OR a get/set accessor) overrides the intrinsic but
+                    // keeps its position — check all three stores.
+                    let static_has = |k: &str| {
+                        c.statics.pos(k).is_some()
+                            || c.static_getters.iter().any(|(n, _)| n == k)
+                            || c.static_setters.iter().any(|(n, _)| n == k)
+                    };
+                    if has_length || static_has("length") {
                         keys.push("length".to_string());
                     }
-                    if has_name {
+                    if has_name || static_has("name") {
                         keys.push("name".to_string());
                     }
-                    // `prototype` (own, non-enumerable) follows name/length, before
-                    // the static elements declared in the class body.
-                    if self.callable_has_prototype(obj)
-                        && c.statics.pos("prototype").is_none()
-                    {
+                    if self.callable_has_prototype(obj) || c.statics.pos("prototype").is_some() {
                         keys.push("prototype".to_string());
                     }
-                    keys.extend(c.statics.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                    let is_intrinsic_key =
+                        |k: &str| matches!(k, "length" | "name" | "prototype");
+                    keys.extend(
+                        c.statics
+                            .keys
+                            .iter()
+                            .filter(|k| !is_hidden_key(k) && !is_intrinsic_key(k))
+                            .cloned(),
+                    );
                     for (n, _) in &c.static_getters {
-                        if !is_hidden_key(n) && !keys.iter().any(|k| k == n) {
+                        if !is_hidden_key(n) && !is_intrinsic_key(n) && !keys.iter().any(|k| k == n)
+                        {
                             keys.push(n.clone());
                         }
                     }
                     for (n, _) in &c.static_setters {
-                        if !is_hidden_key(n) && !keys.iter().any(|k| k == n) {
+                        if !is_hidden_key(n) && !is_intrinsic_key(n) && !keys.iter().any(|k| k == n)
+                        {
                             keys.push(n.clone());
                         }
                     }
