@@ -985,7 +985,20 @@ impl<'p> Vm<'p> {
         };
         let bounds_ok = size <= byte_length && pos <= byte_length - size;
         let abs = byte_offset + pos;
+        // GetViewValue/SetViewValue step "If IsViewOutOfBounds, throw TypeError":
+        // a detached backing buffer makes the view out of bounds, and this check
+        // precedes the RangeError bounds check (per spec order — for get, after
+        // ToIndex; for set, after the value conversion done above).
+        let detached = matches!(
+            self.heap.get(buffer),
+            HeapObj::ArrayBuffer { detached: true, .. }
+        );
         if op == 0 {
+            if detached {
+                return Err(Thrown(
+                    "TypeError: Cannot perform DataView read on a detached ArrayBuffer".into(),
+                ));
+            }
             if !bounds_ok {
                 return Err(Thrown(
                     "RangeError: Offset is outside the bounds of the DataView".into(),
@@ -1033,7 +1046,17 @@ impl<'p> Vm<'p> {
                 ta_encode(kind, f)
             };
             // SetViewValue converts the VALUE before checking the bounds — so a
-            // throwing valueOf wins over an out-of-range offset.
+            // throwing valueOf wins over an out-of-range offset. The detached
+            // check (TypeError) comes after the conversion (a valueOf may itself
+            // detach the buffer) and before the RangeError bounds check.
+            if matches!(
+                self.heap.get(buffer),
+                HeapObj::ArrayBuffer { detached: true, .. }
+            ) {
+                return Err(Thrown(
+                    "TypeError: Cannot perform DataView write on a detached ArrayBuffer".into(),
+                ));
+            }
             if !bounds_ok {
                 return Err(Thrown(
                     "RangeError: Offset is outside the bounds of the DataView".into(),
