@@ -447,26 +447,34 @@ impl<'p> Vm<'p> {
                         use crate::bytecode::BitwiseOp as B;
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        // BigInt bitwise: &/|/^/<</>> on two BigInts; `>>>` is not
-                        // defined for BigInt (TypeError); mixing → TypeError.
-                        if self.bigint_value(va).is_some() || self.bigint_value(vb).is_some() {
-                            let bop = match op {
-                                B::And => BigOp::And,
-                                B::Or => BigOp::Or,
-                                B::Xor => BigOp::Xor,
-                                B::Shl => BigOp::Shl,
-                                B::Shr => BigOp::Shr,
-                                B::Ushr => {
+                        // BigInt bitwise: &/|/^/<</>> on two BigInts (incl. wrapper
+                        // objects, via bigint_binop's ToNumeric); `>>>` is not defined
+                        // for BigInt (TypeError); mixing → TypeError.
+                        match op {
+                            B::Ushr => {
+                                if self.this_bigint_value(va).is_some()
+                                    || self.this_bigint_value(vb).is_some()
+                                {
                                     return Err(Thrown(
                                         "TypeError: BigInts have no unsigned right shift, use >> instead"
                                             .into(),
-                                    ))
+                                    ));
                                 }
-                            };
-                            if let Some(bv) = self.bigint_binop(bop, va, vb)? {
-                                self.set(base, dst, bv);
-                                ip += 1;
-                                continue;
+                            }
+                            _ => {
+                                let bop = match op {
+                                    B::And => BigOp::And,
+                                    B::Or => BigOp::Or,
+                                    B::Xor => BigOp::Xor,
+                                    B::Shl => BigOp::Shl,
+                                    B::Shr => BigOp::Shr,
+                                    B::Ushr => unreachable!(),
+                                };
+                                if let Some(bv) = self.bigint_binop(bop, va, vb)? {
+                                    self.set(base, dst, bv);
+                                    ip += 1;
+                                    continue;
+                                }
                             }
                         }
                         let x = to_int32(self.to_number_coerce(va)?);

@@ -576,11 +576,18 @@ impl<'p> Vm<'p> {
     /// ⇒ both BigInt (result); `Err` ⇒ exactly one BigInt (mixing TypeError) or a
     /// BigInt-specific RangeError (÷0, negative exponent).
     pub(crate) fn bigint_binop(&mut self, op: BigOp, va: Value, vb: Value) -> Result<Option<Value>, Thrown> {
-        let (a, b) = (self.bigint_value(va), self.bigint_value(vb));
-        if a.is_none() && b.is_none() {
+        // A BigInt is "involved" if either operand is a BigInt primitive or a BigInt
+        // wrapper object (`Object(1n)`) — detectable without running user code. If
+        // neither is, this is a Number op (return None → the caller's numeric path).
+        if self.this_bigint_value(va).is_none() && self.this_bigint_value(vb).is_none() {
             return Ok(None);
         }
-        let (a, b) = match (a, b) {
+        // ApplyStringOrNumericBinaryOperator: ToNumeric each operand (ToPrimitive with
+        // the number hint — `Object(1n)`/`{valueOf(){return 1n}}` → the BigInt). Both
+        // must then be BigInt; mixing BigInt with a non-BigInt is a TypeError.
+        let pa = self.to_primitive_number(va)?;
+        let pb = self.to_primitive_number(vb)?;
+        let (a, b) = match (self.bigint_value(pa), self.bigint_value(pb)) {
             (Some(a), Some(b)) => (a, b),
             _ => {
                 return Err(Thrown(
