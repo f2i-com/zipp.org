@@ -1683,7 +1683,21 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::LoadUndefined { dst: tmp });
                     tmp
                 };
-                self.emit(Instr::StoreGlobal { idx: slot, src: v });
+                // `var x = init` inside a `with` whose object has `x`: the
+                // declaration's binding is hoisted (the global slot is already
+                // undefined), but the INITIALIZER is an assignment evaluated in the
+                // with-scope, so it targets the with-object. A bare `var x;` (no
+                // init) performs no assignment, so it never routes here.
+                let with_objs = if decl.init.is_some() {
+                    self.with_objs_for(name)
+                } else {
+                    Vec::new()
+                };
+                if with_objs.is_empty() {
+                    self.emit(Instr::StoreGlobal { idx: slot, src: v });
+                } else {
+                    self.store_with(name, &with_objs, v);
+                }
                 self.next_reg -= 1; // reclaim tmp
                 continue;
             }
@@ -1709,7 +1723,17 @@ impl<'a> FnCompiler<'a> {
                     }
                 };
                 if let Some(init) = &decl.init {
-                    if self.cell_regs.contains(&reg) {
+                    // `var x = init` inside a `with` whose object has `x`: the
+                    // declaration is hoisted (the function-scope slot is already
+                    // undefined), but the initializer assignment targets the
+                    // with-object (falling back to this slot if absent).
+                    let with_objs = self.with_objs_for(name);
+                    if !with_objs.is_empty() {
+                        let tmp = self.temp();
+                        let v = self.compile_named_init(tmp, init, name)?;
+                        self.store_with(name, &with_objs, v);
+                        self.next_reg -= 1;
+                    } else if self.cell_regs.contains(&reg) {
                         let tmp = self.temp();
                         let v = self.compile_named_init(tmp, init, name)?;
                         self.emit(Instr::CellSet { cell: reg, src: v });
