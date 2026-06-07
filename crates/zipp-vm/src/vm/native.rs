@@ -193,6 +193,9 @@ pub const MATH_SUM_PRECISE: u16 = 874;
 pub const MATH_F16ROUND: u16 = 875;
 pub const PROMISE_ALLKEYED: u16 = 876;
 pub const PROMISE_ALLSETTLEDKEYED: u16 = 877;
+// Annex B legacy string escapes (B.2.1).
+pub const GLOBAL_ESCAPE: u16 = 878;
+pub const GLOBAL_UNESCAPE: u16 = 879;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -940,6 +943,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_ENCODE_URI_COMPONENT => ("encodeURIComponent", 1),
         GLOBAL_DECODE_URI => ("decodeURI", 1),
         GLOBAL_DECODE_URI_COMPONENT => ("decodeURIComponent", 1),
+        GLOBAL_ESCAPE => ("escape", 1),
+        GLOBAL_UNESCAPE => ("unescape", 1),
         FN_HAS_INSTANCE => ("[Symbol.hasInstance]", 1),
         FN_THROW_TYPE_ERROR => ("", 0),
         GLOBAL_IS_NAN => ("isNaN", 1),

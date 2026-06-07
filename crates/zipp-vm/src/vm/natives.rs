@@ -2016,6 +2016,16 @@ impl<'p> Vm<'p> {
                     Err(_) => return Err(Thrown("URIError: URI malformed".into())),
                 }
             }
+            GLOBAL_ESCAPE => {
+                let s = self.to_js_string(a0)?;
+                let r = escape_str(&s);
+                self.alloc_str(r)
+            }
+            GLOBAL_UNESCAPE => {
+                let s = self.to_js_string(a0)?;
+                let r = unescape_str(&s);
+                self.alloc_str(r)
+            }
             GLOBAL_IS_NAN => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_nan()),
             GLOBAL_IS_FINITE => Value::bool(self.to_number(a0).unwrap_or(f64::NAN).is_finite()),
             GLOBAL_EVAL => {
@@ -2998,6 +3008,78 @@ fn hex_val(b: u8) -> Result<u8, ()> {
 /// replaced by the percent-encoded uppercase hex of its UTF-8 bytes. Rust `str`
 /// holds only Unicode scalar values, so the lone-surrogate URIError branch is
 /// unreachable here.
+/// `escape(string)` (Annex B B.2.1.1): keep `A-Za-z0-9@*_+-./`, encode any
+/// other UTF-16 code unit as `%XX` (unit < 256) or `%uXXXX`. Iterates code
+/// units (not chars) so an astral char yields its two surrogate `%uXXXX`s.
+fn escape_str(s: &str) -> String {
+    // A-Za-z0-9 and @ * _ + - . /
+    const KEEP: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+    let mut out = String::new();
+    for u in s.encode_utf16() {
+        if u < 0x80 && KEEP.contains(&(u as u8)) {
+            out.push(u as u8 as char);
+        } else if u < 0x100 {
+            let h = hex_upper(u as u8);
+            out.push('%');
+            out.push(h[0] as char);
+            out.push(h[1] as char);
+        } else {
+            let hi = hex_upper((u >> 8) as u8);
+            let lo = hex_upper((u & 0xff) as u8);
+            out.push('%');
+            out.push('u');
+            out.push(hi[0] as char);
+            out.push(hi[1] as char);
+            out.push(lo[0] as char);
+            out.push(lo[1] as char);
+        }
+    }
+    out
+}
+
+/// `unescape(string)` (Annex B B.2.1.2): decode `%uXXXX` (one UTF-16 unit) and
+/// `%XX` (a unit < 256); any other character passes through unchanged. A `%`
+/// not followed by valid hex is literal.
+fn unescape_str(s: &str) -> String {
+    let u: Vec<u16> = s.encode_utf16().collect();
+    let n = u.len();
+    let hexv = |c: u16| -> Option<u16> {
+        match c {
+            0x30..=0x39 => Some(c - 0x30),
+            0x41..=0x46 => Some(c - 0x41 + 10),
+            0x61..=0x66 => Some(c - 0x61 + 10),
+            _ => None,
+        }
+    };
+    let mut out: Vec<u16> = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let c = u[i];
+        if c == b'%' as u16 {
+            if i + 5 < n && u[i + 1] == b'u' as u16 {
+                if let (Some(a), Some(b), Some(d), Some(e)) =
+                    (hexv(u[i + 2]), hexv(u[i + 3]), hexv(u[i + 4]), hexv(u[i + 5]))
+                {
+                    out.push((a << 12) | (b << 8) | (d << 4) | e);
+                    i += 6;
+                    continue;
+                }
+            }
+            if i + 2 < n {
+                if let (Some(a), Some(b)) = (hexv(u[i + 1]), hexv(u[i + 2])) {
+                    out.push((a << 4) | b);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    String::from_utf16_lossy(&out)
+}
+
 fn uri_encode(s: &str, extra: &[u8]) -> Result<String, ()> {
     let mut out = String::with_capacity(s.len());
     let mut buf = [0u8; 4];
