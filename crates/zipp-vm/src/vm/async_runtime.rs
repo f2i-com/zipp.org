@@ -22,6 +22,7 @@ impl<'p> Vm<'p> {
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
+        let arguments_reg = proto.arguments_reg;
         let mut regs = vec![Value::UNDEFINED; reg_count];
         regs[0] = this;
         let n = args.len().min(param_count);
@@ -29,6 +30,12 @@ impl<'p> Vm<'p> {
         if let Some(rr) = rest_reg {
             let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
             regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        // `arguments` (a generator that references it): an array of ALL actual args,
+        // built here at call time like the ordinary frame setup does.
+        if let Some(areg) = arguments_reg {
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+            regs[areg as usize] = arr;
         }
         // FunctionDeclarationInstantiation runs eagerly at CALL time: splice the
         // window onto the live register file and run the parameter prologue
@@ -434,6 +441,7 @@ impl<'p> Vm<'p> {
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
+        let arguments_reg = proto.arguments_reg;
         let mut regs = vec![Value::UNDEFINED; reg_count];
         regs[0] = this;
         let n = args.len().min(param_count);
@@ -441,6 +449,11 @@ impl<'p> Vm<'p> {
         if let Some(rr) = rest_reg {
             let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
             regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        // `arguments` (an async function that references it).
+        if let Some(areg) = arguments_reg {
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+            regs[areg as usize] = arr;
         }
         let result = self.alloc_promise();
         let idx = self.heap.alloc(HeapObj::AsyncState(Box::new(AsyncStateData {
@@ -476,6 +489,7 @@ impl<'p> Vm<'p> {
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
+        let arguments_reg = proto.arguments_reg;
         let mut regs = vec![Value::UNDEFINED; reg_count];
         regs[0] = this;
         let n = args.len().min(param_count);
@@ -483,6 +497,11 @@ impl<'p> Vm<'p> {
         if let Some(rr) = rest_reg {
             let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
             regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+        }
+        // `arguments` (an async generator that references it).
+        if let Some(areg) = arguments_reg {
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+            regs[areg as usize] = arr;
         }
         // Run the parameter prologue up to `GenStart` (see `alloc_generator`).
         let new_base = self.regs.len();
