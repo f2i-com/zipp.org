@@ -1002,6 +1002,16 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         let fv = self.materialize_callable(func, base, cur_closure);
+                        // SetFunctionName from the evaluated key (NamedEvaluation):
+                        // the compile-time proto carried only a "<class>.[computed]"
+                        // placeholder. A Symbol key → "[description]" (or "" when it
+                        // has none); a getter/setter gets the "get "/"set " prefix.
+                        let name_prefix = match kind {
+                            1 | 4 => 1, // getter / static getter
+                            2 | 5 => 2, // setter / static setter
+                            _ => 0,     // (static) method
+                        };
+                        self.set_fn_name_from_key(fv, k, name_prefix);
                         if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
                             if kind == 3 {
                                 // Static method — non-enumerable (like a named one).

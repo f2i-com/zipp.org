@@ -571,7 +571,7 @@ mod helpers_misc;
 mod helpers_datetime;
 mod helpers_numeric;
 mod helpers_json;
-mod helpers_num2;
+pub(crate) mod helpers_num2;
 mod gc;
 
 pub(crate) use helpers_misc::*;

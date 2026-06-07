@@ -6996,11 +6996,11 @@ fn for_left_name(left: &ox::ForStatementLeft) -> R<String> {
 
 /// Render a numeric object key the way JS does (`{0: 'a'}` has key `"0"`).
 fn fmt_key_num(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 1e21 {
-        format!("{}", n as i64)
-    } else {
-        format!("{n}")
-    }
+    // The property key for a numeric literal is ToString(value) — the canonical
+    // ECMAScript Number→String (e.g. 0.0000001 → "1e-7", 1e21 → "1e+21"), the SAME
+    // form the runtime uses for `obj[n]`, so a numeric-keyed member is stored and
+    // read under one key. (Rust's `{}` differs for small/large magnitudes.)
+    crate::vm::helpers_num2::fmt_f64(n)
 }
 
 /// Conservative static check: is this expression definitely a number? Used to
