@@ -681,6 +681,10 @@ impl<'p> Vm<'p> {
             self.rebind_arrow_this(func_id, closure, this)
         } else if !is_strict && this.is_nullish() && self.global_this != 0 {
             Value::heap(self.global_this)
+        } else if !is_strict && !self.is_object_value(this) && self.global_this != 0 {
+            // OrdinaryCallBindThis: a sloppy function boxes a primitive `this`
+            // (number/string/boolean/symbol/bigint) to its wrapper object.
+            self.to_object(this)?
         } else {
             this
         };
