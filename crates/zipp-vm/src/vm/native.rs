@@ -672,6 +672,8 @@ pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
     // Map.prototype upsert proposal (kind 4) — appended here (not in the Map
     // block) so existing entries keep their native ids.
     ("getOrInsert", 4, 2), ("getOrInsertComputed", 4, 2),
+    // Date.prototype.toTemporalInstant (kind 6) — appended (keeps existing ids).
+    ("toTemporalInstant", 6, 0),
 ];
 
 /// `(name, kind)` for a prototype-method native id, if it is one.

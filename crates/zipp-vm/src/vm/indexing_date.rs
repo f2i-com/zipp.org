@@ -451,6 +451,14 @@ impl<'p> Vm<'p> {
         let field = |v: i64| if ms.is_nan() { Value::num(f64::NAN) } else { Value::num(v as f64) };
         let r = match name {
             "getTime" | "valueOf" => Value::num(ms),
+            // `Date.prototype.toTemporalInstant()` → a Temporal.Instant at the date's
+            // epoch nanoseconds (ms × 1e6); an invalid Date is a RangeError.
+            "toTemporalInstant" => {
+                if ms.is_nan() {
+                    return Err(Thrown("RangeError: Invalid time value".into()));
+                }
+                return Ok(Some(self.make_instant((ms as i128) * 1_000_000)?));
+            }
             "getFullYear" | "getUTCFullYear" => field(p.0),
             "getMonth" | "getUTCMonth" => field(p.1),
             "getDate" | "getUTCDate" => field(p.2),
