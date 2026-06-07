@@ -844,6 +844,11 @@ impl<'p> Vm<'p> {
                     m.define("constructor", ctor_v, method_attr);
                 }
             }
+            // Error.isError(arg) (ES2024): a static of the base `Error` constructor.
+            let iserr = Value::heap(self.heap.alloc(HeapObj::Native(ERROR_IS_ERROR)));
+            if let HeapObj::Object(m) = self.heap.get_mut(self.error_ctors[0]) {
+                m.define("isError", iserr, method_attr);
+            }
         }
         // `Symbol`: a callable-but-NOT-constructable function object (typeof
         // "function" via the type_of special case; `new Symbol()` throws because

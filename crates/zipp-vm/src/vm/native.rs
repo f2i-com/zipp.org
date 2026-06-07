@@ -211,6 +211,8 @@ pub const ERROR_STACK_SET: u16 = 887;
 // get/set with a %RegExp%-constructor brand check).
 pub const REGEXP_LEGACY_GET: u16 = 888;
 pub const REGEXP_LEGACY_SET: u16 = 889;
+// Error.isError(arg) (ES2024): true iff arg has the [[ErrorData]] internal slot.
+pub const ERROR_IS_ERROR: u16 = 890;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -949,6 +951,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         OBJPROTO_DEFINE_SETTER => ("__defineSetter__", 2),
         OBJPROTO_LOOKUP_GETTER => ("__lookupGetter__", 1),
         OBJPROTO_LOOKUP_SETTER => ("__lookupSetter__", 1),
+        ERROR_IS_ERROR => ("isError", 1),
         PROTO_TO_LOCALE_STRING => ("toLocaleString", 0),
         NUM_IS_INTEGER => ("isInteger", 1),
         NUM_IS_NAN => ("isNaN", 1),

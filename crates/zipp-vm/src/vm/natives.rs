@@ -1942,6 +1942,12 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            ERROR_IS_ERROR => {
+                // Error.isError(arg) (ES2024): true iff arg is an object carrying
+                // the [[ErrorData]] internal slot (a genuine Error instance — NOT a
+                // fake with Error.prototype but no slot, nor a primitive).
+                Value::bool(a0.is_heap() && self.error_data.contains(&a0.heap_index()))
+            }
             ERROR_STACK_GET => {
                 // get stack: a non-Object receiver throws; an object without
                 // [[ErrorData]] yields undefined; an Error instance yields an
