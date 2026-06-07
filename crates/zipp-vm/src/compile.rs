@@ -1424,10 +1424,11 @@ impl<'a> FnCompiler<'a> {
                             // block-local. At script level they normally hoist to
                             // a global (Annex B) and so are NOT pre-declared here —
                             // UNLESS the name conflicts with an enclosing-block
-                            // lexical binding, which suppresses the extension and
-                            // keeps the function block-local (conflict-skip).
+                            // lexical binding (conflict-skip), OR the code is STRICT
+                            // (Annex B is not honored in strict mode, so the function
+                            // stays block-local and does not leak past the block).
                             let nm = id.name.as_str();
-                            if !self.is_script || self.block_fn_conflicts(nm) {
+                            if !self.is_script || self.cx.in_strict || self.block_fn_conflicts(nm) {
                                 self.declare_local(nm);
                             }
                         }
