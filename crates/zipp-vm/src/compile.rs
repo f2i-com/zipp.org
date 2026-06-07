@@ -373,6 +373,10 @@ struct Compiler {
     /// (where an *undeclared* name would instead create a global). Registered by a
     /// hoisting pre-pass so a forward reference (`for([x] of …){} let x;`) is known.
     lexical_globals: HashSet<u32>,
+    /// Global slots bound by a top-level FUNCTION or CLASS declaration. Like a
+    /// global `var`/`let`/`const`, these are non-configurable bindings, so
+    /// `delete <name>` on one yields `false`.
+    decl_globals: HashSet<u32>,
     /// True while compiling code where `new.target` is syntactically allowed —
     /// inside an ordinary function/method/constructor/class-field body, and
     /// inherited by nested arrows. False at the top level of a script or eval (a
@@ -397,6 +401,7 @@ impl Compiler {
             class_derived: false,
             const_globals: HashSet::new(),
             lexical_globals: HashSet::new(),
+            decl_globals: HashSet::new(),
         }
     }
 
@@ -429,16 +434,19 @@ impl Compiler {
         self.functions.push(placeholder("<script>"));
 
         // Pass 1: hoist top-level function (and class) declaration names to globals.
+        // Record their slots as non-configurable bindings (for `delete <name>`).
         for s in &prog.body {
             match s {
                 ox::Statement::FunctionDeclaration(f) => {
                     if let Some(id) = &f.id {
-                        self.global_slot(id.name.as_str());
+                        let slot = self.global_slot(id.name.as_str()) as u32;
+                        self.decl_globals.insert(slot);
                     }
                 }
                 ox::Statement::ClassDeclaration(c) => {
                     if let Some(id) = &c.id {
-                        self.global_slot(id.name.as_str());
+                        let slot = self.global_slot(id.name.as_str()) as u32;
+                        self.decl_globals.insert(slot);
                     }
                 }
                 _ => {}
@@ -4241,16 +4249,21 @@ impl<'a> FnCompiler<'a> {
                 // `var`/`let`/`const`. A builtin, an implicitly-created global
                 // (`x = 1` with no declaration), or an unresolvable name is
                 // configurable / a no-op, so `delete` yields `true`.
-                let non_configurable = match self.resolve_existing(&id.name) {
-                    Some(Binding::Local(_))
-                    | Some(Binding::LocalCell(_))
-                    | Some(Binding::Upvalue(_)) => true,
-                    Some(Binding::Global(slot)) => {
-                        self.cx.hoisted_globals.contains(&slot)
-                            || self.cx.lexical_globals.contains(&slot)
-                    }
-                    None => false,
-                };
+                // `NaN`/`Infinity`/`undefined` are the only non-configurable builtin
+                // global properties; they're not tracked as compiler globals, so
+                // check them by name (a local of that name still resolves below).
+                let non_configurable = matches!(id.name.as_str(), "NaN" | "Infinity" | "undefined")
+                    || match self.resolve_existing(&id.name) {
+                        Some(Binding::Local(_))
+                        | Some(Binding::LocalCell(_))
+                        | Some(Binding::Upvalue(_)) => true,
+                        Some(Binding::Global(slot)) => {
+                            self.cx.hoisted_globals.contains(&slot)
+                                || self.cx.lexical_globals.contains(&slot)
+                                || self.cx.decl_globals.contains(&slot)
+                        }
+                        None => false,
+                    };
                 self.emit(Instr::LoadBool { dst, val: !non_configurable });
                 Ok(dst)
             }
