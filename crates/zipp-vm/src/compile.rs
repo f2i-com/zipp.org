@@ -6862,7 +6862,13 @@ fn collect_b33_block_fns(
             if let Some(h) = &t.handler {
                 let mut bk = blockers.clone();
                 if let Some(p) = &h.param {
-                    capture::collect_pattern_names(&p.pattern, &mut bk);
+                    // B.3.5: a SIMPLE (BindingIdentifier) catch parameter does NOT
+                    // block the B.3.3 var-binding extension — a `var`/block-function
+                    // of the same name may redeclare it. A DESTRUCTURING catch param
+                    // does block (a matching `var` there is an early error).
+                    if !matches!(&p.pattern, ox::BindingPattern::BindingIdentifier(_)) {
+                        capture::collect_pattern_names(&p.pattern, &mut bk);
+                    }
                 }
                 for st in &h.body.body {
                     add_block_lexicals(st, &mut bk);
