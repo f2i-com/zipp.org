@@ -349,6 +349,15 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
+        // `undefined` / `NaN` / `Infinity` on the global object are non-writable,
+        // non-configurable data properties: assigning them is a sloppy no-op and a
+        // strict TypeError — never a shadowing own property.
+        if self.global_this != 0
+            && idx == self.global_this
+            && matches!(key, "undefined" | "NaN" | "Infinity")
+        {
+            return self.reject_write(key, strict);
+        }
         // A String exotic — a `new String("ab")` wrapper OR a raw primitive string
         // value used as a receiver (`Array.prototype.shift.call("abc")` after
         // ToObject) — has `length` and its in-range char indices as non-writable,
