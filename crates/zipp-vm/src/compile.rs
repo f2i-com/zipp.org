@@ -1998,15 +1998,24 @@ impl<'a> FnCompiler<'a> {
             Cell(Reg, Reg),   // (cell, temp)
             Global(u32, Reg), // (slot, temp)
         }
-        let dest = if self.is_script {
-            let slot = self.cx.global_slot(&n) as u32;
-            Dest::Global(slot, self.temp())
-        } else {
-            let reg = self.declare_local(&n);
-            if self.cell_regs.contains(&reg) {
-                Dest::Cell(reg, self.temp())
-            } else {
-                Dest::Reg(reg)
+        // A class declaration pre-declared block-local (e.g. inside a switch/block,
+        // where it is lexically scoped) binds to that existing innermost local
+        // rather than leaking to a global. `resolve_existing` scans innermost-first,
+        // so it returns the current block's binding (shadowing any outer/global one).
+        let dest = match self.resolve_existing(&n) {
+            Some(Binding::LocalCell(r)) => Dest::Cell(r, self.temp()),
+            Some(Binding::Local(r)) => Dest::Reg(r),
+            _ if self.is_script => {
+                let slot = self.cx.global_slot(&n) as u32;
+                Dest::Global(slot, self.temp())
+            }
+            _ => {
+                let reg = self.declare_local(&n);
+                if self.cell_regs.contains(&reg) {
+                    Dest::Cell(reg, self.temp())
+                } else {
+                    Dest::Reg(reg)
+                }
             }
         };
         let cls = match &dest {
@@ -2989,18 +2998,28 @@ impl<'a> FnCompiler<'a> {
     /// (collected in a non-loop frame) jumps to the end.
     fn switch_stmt(&mut self, s: &ox::SwitchStatement) -> R<()> {
         self.push_scope();
-        // A switch CaseBlock is one block scope. In STRICT mode, Annex B is not
-        // honored, so a function declaration in a case consequent stays block-local
-        // and does not leak past the switch — pre-declare it here. (In sloppy mode the
-        // existing Annex B hoisting to the function/global scope is preserved.)
-        if self.cx.in_strict {
-            for c in &s.cases {
-                for st in &c.consequent {
-                    if let ox::Statement::FunctionDeclaration(f) = st {
+        // A switch CaseBlock is one block scope. Pre-declare its lexically-scoped
+        // declarations as block-local so they don't leak past the switch:
+        //  - class / generator / async(-generator) function declarations are ALWAYS
+        //    lexical (no Annex B), so block-local in both strict and sloppy;
+        //  - an ordinary function declaration is block-local only in strict (sloppy
+        //    keeps the Annex B hoist to the function/global scope).
+        for c in &s.cases {
+            for st in &c.consequent {
+                match st {
+                    ox::Statement::FunctionDeclaration(f) => {
                         if let Some(id) = &f.id {
+                            if self.cx.in_strict || f.generator || f.r#async {
+                                self.declare_local(id.name.as_str());
+                            }
+                        }
+                    }
+                    ox::Statement::ClassDeclaration(cd) => {
+                        if let Some(id) = &cd.id {
                             self.declare_local(id.name.as_str());
                         }
                     }
+                    _ => {}
                 }
             }
         }
