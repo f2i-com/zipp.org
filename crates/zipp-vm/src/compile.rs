@@ -4298,6 +4298,19 @@ impl<'a> FnCompiler<'a> {
                 _ => {}
             }
         }
+        // A destructuring rest parameter (`function f(...[a,b])`): the overflow args
+        // were gathered into the rest array (rest_reg, the synthetic `<rest>` slot);
+        // destructure that array into the pattern's leaves, like a normal pattern param.
+        if let Some(r) = &params.rest {
+            if !matches!(&r.rest.argument, ox::BindingPattern::BindingIdentifier(_)) {
+                if let Some(rr) = self.rest_reg {
+                    self.declare_pattern(&r.rest.argument)?;
+                    let save = self.next_reg;
+                    self.extract_pattern(&r.rest.argument, rr)?;
+                    self.next_reg = save;
+                }
+            }
+        }
         self.param_tdz.clear(); // the body resolves parameters normally
         Ok(())
     }
@@ -5862,6 +5875,15 @@ fn param_pattern_leaves(params: &ox::FormalParameters) -> Vec<String> {
             capture::collect_pattern_names(&item.pattern, &mut set);
         }
     }
+    // A destructuring rest parameter (`...[a,b]`) introduces its leaves too.
+    if let Some(r) = &params.rest {
+        if matches!(
+            &r.rest.argument,
+            ox::BindingPattern::ObjectPattern(_) | ox::BindingPattern::ArrayPattern(_)
+        ) {
+            capture::collect_pattern_names(&r.rest.argument, &mut set);
+        }
+    }
     set.into_iter().collect()
 }
 
@@ -5875,13 +5897,18 @@ fn with_rest(params: &[String], rest: &Option<String>) -> Vec<String> {
     v
 }
 
-/// The rest-parameter name (`function f(...args)` → `Some("args")`), or `None`.
-/// Only a plain identifier rest target is supported (no `...{a,b}`).
+/// The rest-parameter SLOT name (`function f(...args)` → `Some("args")`), or
+/// `None`. A destructuring rest target (`...[a,b]` / `...{x}`) uses a synthetic
+/// slot `"<rest>"` that holds the gathered array; `bind_params` then destructures
+/// it into the pattern's leaves.
 fn rest_name(params: &ox::FormalParameters) -> R<Option<String>> {
     match &params.rest {
         None => Ok(None),
         Some(r) => match &r.rest.argument {
             ox::BindingPattern::BindingIdentifier(id) => Ok(Some(id.name.to_string())),
+            ox::BindingPattern::ObjectPattern(_) | ox::BindingPattern::ArrayPattern(_) => {
+                Ok(Some("<rest>".to_string()))
+            }
             _ => Err("rest-parameter destructuring is not in the zipp-vm subset yet".into()),
         },
     }
