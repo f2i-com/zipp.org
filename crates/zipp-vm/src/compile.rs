@@ -1580,6 +1580,9 @@ impl<'a> FnCompiler<'a> {
                 // object. Held in a hidden scope-local so it survives the whole body
                 // (per-statement temp resets allocate above it).
                 let raw = self.expr(&w.object)?;
+                // ToObject(null)/ToObject(undefined) throw a TypeError (the with
+                // object must be coercible).
+                self.emit(Instr::CheckCoercible { src: raw });
                 self.push_scope();
                 let obj_reg = self.declare_local_no_box(" with-object");
                 self.emit(Instr::ToObject { dst: obj_reg, src: raw });
@@ -3587,22 +3590,34 @@ impl<'a> FnCompiler<'a> {
                     ));
                 }
                 // Special global value identifiers that are not user bindings.
-                match id.name.as_str() {
-                    "undefined" => {
-                        self.emit(Instr::LoadUndefined { dst });
+                // Inside a `with`, an own property of a with-object SHADOWS the
+                // literal (e.g. `with({NaN:'x'}) NaN` === 'x'); the literal is the
+                // fallback when no with-object carries the name.
+                if matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
+                    let lit = |s: &mut Self| match id.name.as_str() {
+                        "undefined" => s.emit(Instr::LoadUndefined { dst }),
+                        "NaN" => {
+                            let idx = s.add_const(Value::num(f64::NAN));
+                            s.emit(Instr::LoadConst { dst, idx });
+                        }
+                        _ => {
+                            let idx = s.add_const(Value::num(f64::INFINITY));
+                            s.emit(Instr::LoadConst { dst, idx });
+                        }
+                    };
+                    let with_objs = self.with_objs_for(id.name.as_str());
+                    if with_objs.is_empty() {
+                        lit(self);
                         return Ok(dst);
                     }
-                    "NaN" => {
-                        let idx = self.add_const(Value::num(f64::NAN));
-                        self.emit(Instr::LoadConst { dst, idx });
-                        return Ok(dst);
+                    let nidx = self.string_name(id.name.as_str());
+                    let end_jumps = self.emit_with_get_chain(nidx, &with_objs, dst);
+                    lit(self);
+                    let end = self.here();
+                    for je in end_jumps {
+                        self.patch_jump(je, end);
                     }
-                    "Infinity" => {
-                        let idx = self.add_const(Value::num(f64::INFINITY));
-                        self.emit(Instr::LoadConst { dst, idx });
-                        return Ok(dst);
-                    }
-                    _ => {}
+                    return Ok(dst);
                 }
                 // A parameter referenced before its own left-to-right
                 // initialization — `(x = x)` (self) or `(x = y, y)` (forward) — is
@@ -4490,6 +4505,13 @@ impl<'a> FnCompiler<'a> {
                         "SyntaxError: Delete of an unqualified identifier in strict mode".into(),
                     );
                 }
+                // Inside a `with`, `delete name` removes the binding from the
+                // innermost with-object that has it (yielding its delete result),
+                // else falls through to the static-binding delete semantics below.
+                let with_objs = self.with_objs_for(id.name.as_str());
+                if !with_objs.is_empty() {
+                    return Ok(self.delete_with(id.name.as_str(), &with_objs, dst));
+                }
                 // A binding is non-configurable — `delete` yields `false` — when it is
                 // a local (param/`var`/`let`/`const`/function) or a DECLARED global
                 // `var`/`let`/`const`. A builtin, an implicitly-created global
@@ -4650,11 +4672,11 @@ impl<'a> FnCompiler<'a> {
             .collect()
     }
 
-    /// Emit a `with`-aware read of `name` into `dst`: probe each with-object
-    /// (innermost first) and read from the first that has the binding; otherwise
-    /// fall back to the static (lexical/global) binding. Returns `dst`.
-    fn load_with(&mut self, name: &str, objs: &[Reg], dst: Reg) -> Reg {
-        let nidx = self.string_name(name);
+    /// Emit the per-with-object probe+read chain for a READ of `nidx`: for each
+    /// object innermost-first, `WithHas` → on hit `GetProp` into `dst` then jump
+    /// past the fallback. Returns the "jump to end" ips for the caller to patch
+    /// AFTER it emits its own fallback (the static binding, or a literal).
+    fn emit_with_get_chain(&mut self, nidx: u32, objs: &[Reg], dst: Reg) -> Vec<u32> {
         let mut end_jumps = Vec::new();
         for &obj in objs {
             let flag = self.temp();
@@ -4669,6 +4691,15 @@ impl<'a> FnCompiler<'a> {
             let nxt = self.here();
             self.patch_jump(jf, nxt);
         }
+        end_jumps
+    }
+
+    /// Emit a `with`-aware read of `name` into `dst`: probe each with-object
+    /// (innermost first) and read from the first that has the binding; otherwise
+    /// fall back to the static (lexical/global) binding. Returns `dst`.
+    fn load_with(&mut self, name: &str, objs: &[Reg], dst: Reg) -> Reg {
+        let nidx = self.string_name(name);
+        let end_jumps = self.emit_with_get_chain(nidx, objs, dst);
         // Fallback: the static binding.
         let b = self.resolve(name);
         let r = self.load_binding(&b, dst);
@@ -4707,6 +4738,46 @@ impl<'a> FnCompiler<'a> {
         for je in end_jumps {
             self.patch_jump(je, end);
         }
+    }
+
+    /// Emit a `with`-aware `delete name` into `dst`: delete from the first
+    /// with-object (innermost first) that has the binding, else fall back to the
+    /// static-binding delete semantics (mirrors `delete_expr`'s identifier arm).
+    fn delete_with(&mut self, name: &str, objs: &[Reg], dst: Reg) -> Reg {
+        let nidx = self.string_name(name);
+        let mut end_jumps = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.next_reg -= 1;
+            self.emit(Instr::DeleteProp { dst, obj, name: nidx, strict: false });
+            let je = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            end_jumps.push(je);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        // Fallback: the static binding's delete result (no with-object had it).
+        let non_configurable = matches!(name, "NaN" | "Infinity" | "undefined")
+            || match self.resolve_existing(name) {
+                Some(Binding::Local(_))
+                | Some(Binding::LocalCell(_))
+                | Some(Binding::Upvalue(_)) => true,
+                Some(Binding::Global(slot)) => {
+                    self.cx.hoisted_globals.contains(&slot)
+                        || self.cx.lexical_globals.contains(&slot)
+                        || self.cx.decl_globals.contains(&slot)
+                }
+                None => false,
+            };
+        self.emit(Instr::LoadBool { dst, val: !non_configurable });
+        let end = self.here();
+        for je in end_jumps {
+            self.patch_jump(je, end);
+        }
+        dst
     }
 
     /// Emit a read of `binding` into `dst`; returns the register holding the
