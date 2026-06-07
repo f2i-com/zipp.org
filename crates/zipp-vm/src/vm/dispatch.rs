@@ -2192,7 +2192,7 @@ impl<'p> Vm<'p> {
                     // Direct eval from strict code: the evaluated string inherits
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
-                    Instr::DirectEval { dst, arg } => {
+                    Instr::DirectEval { dst, arg, new_target_ok } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
@@ -2201,7 +2201,7 @@ impl<'p> Vm<'p> {
                             );
                         let r = if is_str {
                             let code = self.display(a0);
-                            self.do_eval(&code, true)?
+                            self.do_eval(&code, true, new_target_ok)?
                         } else {
                             a0
                         };

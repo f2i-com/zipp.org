@@ -307,10 +307,16 @@ pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
 /// evaluated expression statement) — what `eval("1 + 1")` must yield. The VM
 /// installs the resulting functions into its runtime function table and remaps
 /// the program's independently-numbered global slots onto the live globals.
-pub fn compile_eval(prog: &ox::Program, source: &str, force_strict: bool) -> R<Program> {
+pub fn compile_eval(
+    prog: &ox::Program,
+    source: &str,
+    force_strict: bool,
+    force_new_target_ok: bool,
+) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
     c.force_strict = force_strict;
+    c.force_new_target_ok = force_new_target_ok;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
@@ -347,6 +353,10 @@ struct Compiler {
     /// directive — set for a DIRECT eval invoked from strict-mode code (the
     /// evaluated string inherits the caller's strictness).
     force_strict: bool,
+    /// Allow `new.target` at the eval script top level — set for a DIRECT eval
+    /// invoked from inside a function/method/class-field initializer (the eval
+    /// inherits the caller's new.target validity).
+    force_new_target_ok: bool,
     /// Strictness of the lexical scope currently being compiled. Set on entry to
     /// a function/arrow body (inherited from the enclosing scope, OR'd with the
     /// body's own `"use strict"` directive), forced `true` inside class bodies,
@@ -395,6 +405,7 @@ impl Compiler {
             source,
             eval_mode: false,
             force_strict: false,
+            force_new_target_ok: false,
             in_strict: false,
             new_target_ok: false,
             class_enclosing: Vec::new(),
@@ -535,9 +546,11 @@ impl Compiler {
             }
         }
         // `new.target` is allowed inside an ordinary function, not at script/eval
-        // top level; nested arrows inherit this. Restored at the end.
+        // top level; nested arrows inherit this. Restored at the end. A DIRECT eval
+        // from inside a function/method/field initializer forces it on for the eval
+        // script top level (the eval inherits the caller's new.target validity).
         let parent_nt = self.new_target_ok;
-        self.new_target_ok = !is_script;
+        self.new_target_ok = !is_script || self.force_new_target_ok;
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = is_strict;
         fc.is_script = is_script;
@@ -5390,7 +5403,7 @@ impl<'a> FnCompiler<'a> {
                 } else {
                     arg_base
                 };
-                self.emit(Instr::DirectEval { dst, arg });
+                self.emit(Instr::DirectEval { dst, arg, new_target_ok: self.cx.new_target_ok });
                 return Ok(dst);
             }
         }

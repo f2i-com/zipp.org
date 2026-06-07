@@ -433,9 +433,11 @@ pub enum Instr {
 
     /// `dst = eval(arg)` — a DIRECT eval call (the callee is the unshadowed global
     /// `eval` identifier) emitted only from STRICT-mode code, so the evaluated
-    /// string inherits strict mode (early errors fire). Indirect/sloppy eval still
-    /// goes through the ordinary `Call` → `GLOBAL_EVAL` native path.
-    DirectEval { dst: Reg, arg: Reg },
+    /// string inherits strict mode (early errors fire). `new_target_ok` carries the
+    /// caller's new.target validity (true inside a function/method/field initializer)
+    /// so the eval may contain `new.target`. Indirect/sloppy eval still goes through
+    /// the ordinary `Call` → `GLOBAL_EVAL` native path.
+    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool },
 
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
