@@ -795,6 +795,24 @@ impl<'p> Vm<'p> {
             let err_proto = build(self, &[("toString", ERROR_TO_STRING)], None);
             self.proto_of.insert(err_proto, Value::heap(obj_proto));
             self.error_protos[0] = err_proto;
+            // Error.prototype.stack — an accessor { get, set }, enumerable:false,
+            // configurable:true (inherited by every Error subtype). The getter
+            // yields an implementation-defined string for Error instances (else
+            // undefined); the setter installs an own data property on the receiver.
+            {
+                let g = Value::heap(self.heap.alloc(HeapObj::Native(ERROR_STACK_GET)));
+                let s = Value::heap(self.heap.alloc(HeapObj::Native(ERROR_STACK_SET)));
+                let acc = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: s,
+                };
+                if let HeapObj::Object(m) = self.heap.get_mut(err_proto) {
+                    m.define("stack", g, acc);
+                }
+            }
             // Subtype prototypes chain to Error.prototype.
             for k in 1..8usize {
                 let p = build(self, &[], None);

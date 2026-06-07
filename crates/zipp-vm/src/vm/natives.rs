@@ -1942,6 +1942,68 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            ERROR_STACK_GET => {
+                // get stack: a non-Object receiver throws; an object without
+                // [[ErrorData]] yields undefined; an Error instance yields an
+                // implementation-defined stack string.
+                if !self.is_object_value(this) {
+                    return Err(Thrown(
+                        "TypeError: Error.prototype.stack getter called on a non-object".into(),
+                    ));
+                }
+                if this.is_heap() && self.is_error_instance(this.heap_index()) {
+                    self.alloc_str(String::new())
+                } else {
+                    Value::UNDEFINED
+                }
+            }
+            ERROR_STACK_SET => {
+                // set stack(v): SetterThatIgnoresPrototypeProperties(this,
+                // %Error.prototype%, "stack", v). A non-Object receiver or a
+                // non-String value throws; a write whose receiver IS Error.prototype
+                // is ignored; otherwise create an own data property (no own one yet)
+                // or ordinary-Set the existing own property.
+                if !self.is_object_value(this) {
+                    return Err(Thrown(
+                        "TypeError: Error.prototype.stack setter called on a non-object".into(),
+                    ));
+                }
+                if !self.is_string_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Error.prototype.stack setter requires a string value".into(),
+                    ));
+                }
+                if this.is_heap() && this.heap_index() == self.error_protos[0] {
+                    return Ok(Value::UNDEFINED); // ignore writes on the home object
+                }
+                let own = self.object_get_own_property_descriptor(this, "stack");
+                if own == Value::UNDEFINED {
+                    // CreateDataPropertyOrThrow(this, "stack", v) — bypasses the proto
+                    // chain (an ordinary Set would re-enter this inherited setter).
+                    let attr = crate::heap::PropAttr {
+                        writable: true,
+                        enumerable: true,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    };
+                    let mut dm = crate::heap::ObjMap::new();
+                    dm.define("value", a0, attr);
+                    dm.define("writable", Value::bool(true), attr);
+                    dm.define("enumerable", Value::bool(true), attr);
+                    dm.define("configurable", Value::bool(true), attr);
+                    let desc = self.heap.alloc(HeapObj::Object(dm));
+                    if self.obj_proto != 0 {
+                        self.proto_of.insert(desc, Value::heap(self.obj_proto));
+                    }
+                    self.object_define_property(this, "stack", Value::heap(desc))?;
+                } else {
+                    // An own property exists → ordinary Set (respects writable /
+                    // an own accessor / a Proxy trap), with Throw = true.
+                    self.set_prop(this, "stack", a0, true)?;
+                }
+                Value::UNDEFINED
+            }
             ITER_TAG_GET => self.alloc_str("Iterator".to_string()),
             ITER_TAG_SET => {
                 if this.is_heap() && this.heap_index() == self.iterator_proto_root {
