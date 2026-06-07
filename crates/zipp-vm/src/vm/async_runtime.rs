@@ -7,6 +7,17 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// How a SYNC generator is being resumed (`gen_resume`). Kept separate from the
+/// async `Resume` enum so the async drive paths are entirely unaffected.
+enum GenResumeMode {
+    /// `gen.next(v)` — deliver `v` at the yield point.
+    Next(Value),
+    /// `gen.throw(e)` — throw `e` at the yield point (into try/catch/finally).
+    Throw(Value),
+    /// `gen.return(v)` — return `v`, running any `finally` on the way out.
+    Return(Value),
+}
+
 impl<'p> Vm<'p> {
     /// Calling a `function*` does NOT run its body — it allocates a suspended
     /// Generator whose DETACHED register window holds `this` + the bound args
@@ -104,37 +115,37 @@ impl<'p> Vm<'p> {
             _ => return Ok(None),
         };
         match name {
-            "return" => {
-                // Complete the generator (v1 does not run finally blocks on return).
-                if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
-                    *state = GenState::Completed;
-                    regs.clear();
-                    handlers.clear();
-                }
-                Ok(Some(self.iter_result(arg0, true)))
-            }
+            "return" => match state {
+                // A completed generator just echoes {value, done:true}.
+                GenState::Completed => Ok(Some(self.iter_result(arg0, true))),
+                GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
+                // Resume the suspended body with a RETURN completion so any `finally`
+                // spanning the yield runs (and a `finally { yield }` can re-suspend).
+                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, GenResumeMode::Return(arg0)),
+            },
             "throw" => match state {
                 // Throwing into a completed generator just re-throws at the call site.
                 GenState::Completed => Err(Thrown(self.throw_message(arg0))),
                 GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
                 // Resume the suspended body, injecting the throw at the yield point so
                 // an enclosing `try`/`catch` (whose handlers we parked) can catch it.
-                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, Resume::Throw(arg0)),
+                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, GenResumeMode::Throw(arg0)),
             },
             "next" => match state {
                 GenState::Completed => Ok(Some(self.iter_result(Value::UNDEFINED, true))),
                 GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
-                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, Resume::Value(arg0)),
+                GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, GenResumeMode::Next(arg0)),
             },
             _ => Ok(None),
         }
     }
 
     /// Splice a suspended generator's saved register window back onto the live
-    /// register file, RESTORE its parked `try` handlers, and resume it — either
-    /// delivering a sent value at the yield point (`Resume::Value`, from
-    /// `gen.next(v)`) or throwing a value in there (`Resume::Throw`, from
-    /// `gen.throw(e)`, which unwinds through the body's try/catch/finally). On a
+    /// register file, RESTORE its parked `try` handlers, and resume it with one of
+    /// three completions at the yield point: `Next(v)` delivers a sent value (from
+    /// `gen.next(v)`); `Throw(e)` throws a value in there (`gen.throw(e)`), which
+    /// unwinds through the body's try/catch/finally; `Return(v)` injects a return
+    /// completion (`gen.return(v)`), running any `finally` on the way out. On a
     /// further yield it re-parks the window + handlers; on completion or an
     /// uncaught throw it clears them. Returns the iterator-result `{value,done}`.
     fn gen_resume(
@@ -143,7 +154,7 @@ impl<'p> Vm<'p> {
         fid: u32,
         closure: u32,
         resume_ip: usize,
-        input: Resume,
+        input: GenResumeMode,
     ) -> Result<Option<Value>, Thrown> {
         let (saved, saved_handlers) = match self.heap.get_mut(idx) {
             HeapObj::Generator { state, regs, handlers, .. } => {
@@ -177,7 +188,7 @@ impl<'p> Vm<'p> {
             new_target: Value::UNDEFINED,
         });
         let outcome = match input {
-            Resume::Value(v) => {
+            GenResumeMode::Next(v) => {
                 // First next() runs from ip 0 (legacy proto with no marker); a later
                 // one resumes just past the Yield/GenStart, delivering the sent value
                 // into a Yield's dst (GenStart delivers nothing).
@@ -192,7 +203,7 @@ impl<'p> Vm<'p> {
                 self.frames[stop].ip = ip;
                 self.run_loop(stop)
             }
-            Resume::Throw(e) => {
+            GenResumeMode::Throw(e) => {
                 // Throw at the suspension point: unwind into the body's handlers.
                 self.pending_throw = Some(e);
                 if self.unwind_to_handler(e, stop) {
@@ -208,6 +219,28 @@ impl<'p> Vm<'p> {
                         handlers.clear();
                     }
                     return Err(Thrown(self.throw_message(e)));
+                }
+            }
+            GenResumeMode::Return(v) => {
+                // Return completion at the suspension point: run any `finally` that
+                // spans the yield (route_through_finally, kind 1=return), exactly as
+                // a `return` statement in the body would. EndFinally then completes
+                // the return (or an outer finally), and a `finally { yield }` makes
+                // the generator re-suspend below.
+                if let Some(target) = self.route_through_finally(1, v) {
+                    self.frames[stop].ip = target as usize;
+                    self.run_loop(stop)
+                } else {
+                    // No `finally` pending: discard the spliced window/frame and
+                    // complete the generator with the return value.
+                    self.frames.pop();
+                    self.regs.truncate(new_base);
+                    if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
+                        *state = GenState::Completed;
+                        regs.clear();
+                        handlers.clear();
+                    }
+                    return Ok(Some(self.iter_result(v, true)));
                 }
             }
         };
