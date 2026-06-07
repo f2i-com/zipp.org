@@ -6227,6 +6227,43 @@ impl<'a> FnCompiler<'a> {
             return Ok(dst);
         }
 
+        // Inside a `with`, a bare-identifier call whose callee is found on a
+        // with-object is invoked with `this` = that with-object (innermost first);
+        // otherwise it falls back to an ordinary call (this = undefined). Placed
+        // after the bare-id special-cases (print/Symbol/eval/RegExp/error-ctor) so
+        // their dedicated lowerings remain the fallback for names not on the object.
+        if let ox::Expression::Identifier(id) = &c.callee {
+            let with_objs = self.with_objs_for(id.name.as_str());
+            if !with_objs.is_empty() {
+                let nidx = self.string_name(id.name.as_str());
+                // Args evaluated ONCE into a contiguous block, shared by the
+                // method-call (this = obj) and the fallback Call.
+                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                let flag = self.temp(); // probe result + fallback callee scratch
+                let mut end_jumps = Vec::new();
+                for &obj in &with_objs {
+                    self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+                    let jf = self.here();
+                    self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+                    self.emit(Instr::CallMethod { dst, obj, name: nidx, arg_base, argc });
+                    let je = self.here();
+                    self.emit(Instr::Jump { target: 0 });
+                    end_jumps.push(je);
+                    let nxt = self.here();
+                    self.patch_jump(jf, nxt);
+                }
+                // Fallback: ordinary call with `this` = undefined.
+                let b = self.resolve(id.name.as_str());
+                let callee = self.load_binding(&b, flag);
+                self.emit(Instr::Call { dst, callee, arg_base, argc });
+                let end = self.here();
+                for je in end_jumps {
+                    self.patch_jump(je, end);
+                }
+                return Ok(dst);
+            }
+        }
+
         // General call: evaluate callee, then contiguous args.
         let callee = self.expr(&c.callee)?;
         let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
