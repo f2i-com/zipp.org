@@ -715,6 +715,7 @@ impl Compiler {
         if let Some(pa) = params_ast {
             names.extend(param_pattern_leaves(pa));
         }
+        names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
         let captured = capture::captured_locals(&names, body);
         // Class bodies are always strict, regardless of the enclosing scope.
         let parent_strict = self.in_strict;
@@ -1630,6 +1631,42 @@ impl<'a> FnCompiler<'a> {
                 continue;
             }
 
+            // A `var` inside a function is FUNCTION-scoped, not block-scoped: bind it
+            // in the function's BASE scope (scopes[0]) so it survives past its block
+            // (`{ var x = 1 } x`, `for (var i…){} i`), reusing an existing binding
+            // rather than duplicating. A nested closure over it boxes the slot (the
+            // var name is in the capture set). A bare `var x;` never resets `x`.
+            if !d.kind.is_lexical() {
+                let existing =
+                    self.scopes[0].iter().rev().find(|(n, _)| n == name).map(|(_, r)| *r);
+                let reg = match existing {
+                    Some(r) => r,
+                    None => {
+                        let r = self.alloc_reg();
+                        self.scopes[0].push((name.to_string(), r));
+                        if self.captured.contains(name) {
+                            self.emit(Instr::MakeCell { reg: r });
+                            self.cell_regs.insert(r);
+                        }
+                        r
+                    }
+                };
+                if let Some(init) = &decl.init {
+                    if self.cell_regs.contains(&reg) {
+                        let tmp = self.temp();
+                        let v = self.compile_named_init(tmp, init, name)?;
+                        self.emit(Instr::CellSet { cell: reg, src: v });
+                        self.next_reg -= 1;
+                    } else {
+                        let v = self.compile_named_init(reg, init, name)?;
+                        if v != reg {
+                            self.emit(Instr::Move { dst: reg, src: v });
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Allocate the local FIRST so `let x = x`-style self-reference and
             // ordinary declarations land in a stable register. declare_local
             // boxes the register into a cell if a nested function captures it.
@@ -1911,6 +1948,7 @@ impl<'a> FnCompiler<'a> {
         let (params, rest, body) = function_parts(f)?;
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&f.params));
+        names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
         let captured = capture::captured_locals(&names, body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
@@ -2556,6 +2594,7 @@ impl<'a> FnCompiler<'a> {
         if let Some(sn) = &self_name {
             names.push(sn.clone());
         }
+        names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
         let captured = capture::captured_locals(&names, body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
@@ -2587,6 +2626,7 @@ impl<'a> FnCompiler<'a> {
         let rest = rest_name(&a.params)?;
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&a.params));
+        names.extend(hoisted_var_names(&a.body.statements)); // function-scoped `var`s (capture)
         let captured = capture::captured_locals(&names, &a.body.statements);
         let enclosing = self.child_enclosing();
         let mut proto =
@@ -5927,6 +5967,17 @@ fn error_ctor(name: &str) -> Option<&'static str> {
 /// enclosing function/script scope, stopping at a function boundary. `let`/
 /// `const`/`class` are excluded (they keep TDZ — a forward read throws). These
 /// slots are pre-initialized to `undefined` so var hoisting matches JS.
+/// All `var` binding names declared anywhere in `body` (recursing through blocks/
+/// loops/if/try/switch but not nested functions). These bind in FUNCTION scope, so a
+/// nested closure over one must be in the capture set to box the right register.
+fn hoisted_var_names(body: &[ox::Statement]) -> Vec<String> {
+    let mut set = std::collections::HashSet::new();
+    for s in body {
+        collect_hoisted_vars(s, &mut set);
+    }
+    set.into_iter().collect()
+}
+
 fn collect_hoisted_vars(s: &ox::Statement, out: &mut std::collections::HashSet<String>) {
     use ox::Statement as S;
     match s {
