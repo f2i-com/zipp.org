@@ -425,6 +425,12 @@ pub enum Instr {
     GetIndex { dst: Reg, obj: Reg, key: Reg },
     /// `obj[key] = val` — computed member write.
     SetIndex { obj: Reg, key: Reg, val: Reg },
+    /// Define a STATIC class field with a computed key: ToPropertyKey(key) once,
+    /// throw a TypeError if it is "prototype" (a static field may not be named
+    /// `prototype` — it is a non-configurable own property of the constructor),
+    /// then write the field on the class. Unlike `SetIndex`, the prototype check
+    /// is unconditional (class bodies are strict regardless of the enclosing code).
+    ClassStaticField { class: Reg, key: Reg, val: Reg },
     /// `dst = ToPropertyKey(src)` for a read-modify-write of `obj[src]` (`o[k] += v`,
     /// `o[k]++`): coerce the computed key to a property key ONCE (invoking its
     /// `toString`/`valueOf`/@@toPrimitive) so the load and the store reuse it. `obj`

@@ -2233,6 +2233,23 @@ impl<'p> Vm<'p> {
                         self.set_index(o, k, v, strict)?;
                         ip += 1;
                     }
+                    Instr::ClassStaticField { class, key, val } => {
+                        let cv = self.get(base, class);
+                        let kv = self.get(base, key);
+                        let vv = self.get(base, val);
+                        // ToPropertyKey ONCE (the key expression was already evaluated).
+                        let k = self.coerce_index_key(kv)?;
+                        if self.key_of(k) == "prototype" {
+                            return Err(Thrown(
+                                "TypeError: Classes may not have a static property named 'prototype'"
+                                    .into(),
+                            ));
+                        }
+                        // The resolved key is a string/symbol, so set_index's own
+                        // ToPropertyKey is idempotent (no user code runs twice).
+                        self.set_index(cv, k, vv, true)?;
+                        ip += 1;
+                    }
                     Instr::DefineAccessor { obj, key, func, is_setter } => {
                         let o = self.get(base, obj);
                         let kv = self.get(base, key);

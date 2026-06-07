@@ -2441,7 +2441,9 @@ impl<'a> FnCompiler<'a> {
                 self.super_static = prev_ss;
                 self.cx.in_strict = prev_strict;
                 self.this_override = None;
-                self.emit(Instr::SetIndex { obj: cls, key: kr, val: vr });
+                // A static field may not be named `prototype` (TypeError); the op
+                // ToPropertyKeys the (already-evaluated) key once and checks it.
+                self.emit(Instr::ClassStaticField { class: cls, key: kr, val: vr });
             } else {
                 self.emit(Instr::PushFieldKey { class: cls, key: kr });
             }
@@ -2608,6 +2610,18 @@ impl<'a> FnCompiler<'a> {
                 }
                 ox::ClassElement::PropertyDefinition(p) => {
                     match class_key_name(&p.key) {
+                        // A COMPUTED static key whose literal folds to "prototype" is
+                        // a runtime TypeError (not the named-`static prototype`
+                        // early SyntaxError) — route it through the computed path so
+                        // ClassStaticField performs the check. (An instance
+                        // `['prototype']` field is allowed; this is static-only.)
+                        Ok(name) if p.r#static && p.computed && name == "prototype" => {
+                            let key = p
+                                .key
+                                .as_expression()
+                                .ok_or("unsupported computed class field key")?;
+                            computed_fields_ordered.push((key, p.value.as_ref(), true));
+                        }
                         // Static string key.
                         Ok(name) if p.r#static => static_fields.push((name, p.value.as_ref())),
                         // Instance string key.
