@@ -226,6 +226,12 @@ pub enum CombKind {
     Race,
     /// `Promise.any` — first fulfilment, or an AggregateError if all reject.
     Any,
+    /// `Promise.allKeyed` — like `all`, but over an object's own enumerable keys;
+    /// fulfils with a null-prototype object mapping each key to its value.
+    AllKeyed,
+    /// `Promise.allSettledKeyed` — like `allSettled` over an object's keys; fulfils
+    /// with a null-prototype object mapping each key to its `{status, …}` record.
+    AllSettledKeyed,
 }
 
 /// A registered reaction on a pending promise: when it settles, `callback` runs
@@ -374,7 +380,7 @@ pub enum HeapObj {
     /// custom `this`-constructor's executor-provided functions are observably
     /// invoked. On the native path they are `BoundResolver`s bound to `result`, so
     /// calling them is identical to `self.resolve/reject(result, …)`.
-    Combinator { kind: CombKind, results: Vec<Value>, remaining: u32, result: u32, settled: Vec<bool>, cap_resolve: Value, cap_reject: Value },
+    Combinator { kind: CombKind, results: Vec<Value>, remaining: u32, result: u32, settled: Vec<bool>, cap_resolve: Value, cap_reject: Value, keys: Vec<String> },
     /// A native resolve/reject element for a combinator: performs one combinator
     /// step (`is_reject` selects fulfill vs reject when CALLED directly by a custom
     /// thenable; via the native reaction the kind comes from the reaction list).

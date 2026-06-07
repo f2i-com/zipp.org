@@ -1046,6 +1046,44 @@ impl<'p> Vm<'p> {
                 return Ok(Value::heap(result));
             }
         }
+        // Keyed combinators (allKeyed/allSettledKeyed) operate over an OBJECT's own
+        // enumerable string keys: validate it's an object, snapshot the keys, and
+        // iterate the corresponding VALUES (reusing the array-iteration path below);
+        // the keys are stored on the Combinator to build the keyed result on settle.
+        let mut comb_keys: Vec<String> = Vec::new();
+        let iterable = if matches!(kind, CombKind::AllKeyed | CombKind::AllSettledKeyed) {
+            if !self.is_object_value(iterable) {
+                let e = self.alloc_error_from_message(
+                    "TypeError: Promise.allKeyed argument is not an object",
+                );
+                self.reject(result, e);
+                return Ok(Value::heap(result));
+            }
+            let karr = match self.object_enum_own(iterable, EnumWhat::Keys) {
+                Ok(a) => a,
+                Err(Thrown(msg)) => {
+                    self.reject_with_thrown(result, &msg);
+                    return Ok(Value::heap(result));
+                }
+            };
+            let kvals = self.array_snapshot(karr.heap_index());
+            let mut vals = Vec::with_capacity(kvals.len());
+            for kv in kvals {
+                let ks = self.display(kv);
+                let v = match self.get_member(iterable, &ks, iterable) {
+                    Ok(v) => v,
+                    Err(Thrown(msg)) => {
+                        self.reject_with_thrown(result, &msg);
+                        return Ok(Value::heap(result));
+                    }
+                };
+                comb_keys.push(ks);
+                vals.push(v);
+            }
+            Value::heap(self.heap.alloc(HeapObj::Array(vals)))
+        } else {
+            iterable
+        };
         // GetIterator(iterable): invoke @@iterator to obtain a REAL iterator object
         // (not the array fast-path, which `get_iterator` returns un-stepped) so the
         // lazy step + IteratorClose below work. A non-callable @@iterator / abrupt →
@@ -1082,6 +1120,7 @@ impl<'p> Vm<'p> {
             settled: Vec::new(),
             cap_resolve,
             cap_reject,
+            keys: comb_keys,
         });
         loop {
             // IteratorStep; a throwing next() leaves the iterator done → no close.
@@ -1133,11 +1172,16 @@ impl<'p> Vm<'p> {
             };
             let res_f = match kind {
                 CombKind::Race | CombKind::Any => cap_resolve,
-                CombKind::All | CombKind::AllSettled => element_resolver(self, false),
+                CombKind::All
+                | CombKind::AllSettled
+                | CombKind::AllKeyed
+                | CombKind::AllSettledKeyed => element_resolver(self, false),
             };
             let res_r = match kind {
-                CombKind::All | CombKind::Race => cap_reject,
-                CombKind::Any | CombKind::AllSettled => element_resolver(self, true),
+                CombKind::All | CombKind::Race | CombKind::AllKeyed => cap_reject,
+                CombKind::Any | CombKind::AllSettled | CombKind::AllSettledKeyed => {
+                    element_resolver(self, true)
+                }
             };
             // Invoke(nextPromise, "then", «res_f, res_r») — OBSERVABLE; abrupt →
             // close + reject with the original error.
@@ -1192,8 +1236,8 @@ impl<'p> Vm<'p> {
         if remaining != 0 || ckind == CombKind::Race {
             return;
         }
-        let collected = match self.heap.get(comb) {
-            HeapObj::Combinator { results, .. } => results.clone(),
+        let (collected, comb_keys) = match self.heap.get(comb) {
+            HeapObj::Combinator { results, keys, .. } => (results.clone(), keys.clone()),
             _ => return,
         };
         // Settle THROUGH the result capability (per spec): Any rejects with an
@@ -1204,6 +1248,16 @@ impl<'p> Vm<'p> {
             CombKind::Any => {
                 let e = self.alloc_aggregate_error(collected);
                 let _ = self.call_value(cap_reject, Value::UNDEFINED, &[e]);
+            }
+            CombKind::AllKeyed | CombKind::AllSettledKeyed => {
+                // Build a NULL-prototype object mapping each key to its value/record.
+                let mut map = ObjMap::new();
+                for (k, v) in comb_keys.iter().zip(collected.iter()) {
+                    map.set(k, *v);
+                }
+                let obj = self.heap.alloc(HeapObj::Object(map));
+                self.proto_of.insert(obj, Value::NULL);
+                let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[Value::heap(obj)]);
             }
             _ => {
                 let arr = Value::heap(self.heap.alloc(HeapObj::Array(collected)));
@@ -1250,18 +1304,18 @@ impl<'p> Vm<'p> {
             (CombKind::Race, ReactionKind::Reject) => {
                 let _ = self.call_value(cap_reject, Value::UNDEFINED, &[value]);
             }
-            (CombKind::All, ReactionKind::Reject) => {
+            (CombKind::All | CombKind::AllKeyed, ReactionKind::Reject) => {
                 let _ = self.call_value(cap_reject, Value::UNDEFINED, &[value]);
             }
             (CombKind::Any, ReactionKind::Fulfill) => {
                 let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[value]);
             }
-            (CombKind::All, ReactionKind::Fulfill)
+            (CombKind::All | CombKind::AllKeyed, ReactionKind::Fulfill)
             | (CombKind::Any, ReactionKind::Reject)
-            | (CombKind::AllSettled, _) => {
+            | (CombKind::AllSettled | CombKind::AllSettledKeyed, _) => {
                 // Record the per-input outcome and decrement the outstanding count;
                 // combinator_finish settles the result when it reaches 0.
-                let stored = if ckind == CombKind::AllSettled {
+                let stored = if matches!(ckind, CombKind::AllSettled | CombKind::AllSettledKeyed) {
                     self.make_settled_record(kind, value)
                 } else {
                     value

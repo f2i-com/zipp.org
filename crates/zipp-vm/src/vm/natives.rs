@@ -2106,7 +2106,7 @@ impl<'p> Vm<'p> {
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
             PROMISE_RESOLVE | PROMISE_REJECT | PROMISE_ALL | PROMISE_ALLSETTLED | PROMISE_RACE
-            | PROMISE_ANY => {
+            | PROMISE_ANY | PROMISE_ALLKEYED | PROMISE_ALLSETTLEDKEYED => {
                 // These static methods read `this` as the constructor C (for the
                 // result's NewPromiseCapability); a non-constructor `this` is a
                 // TypeError. (The single-offset model still builds a native Promise.)
@@ -2155,6 +2155,12 @@ impl<'p> Vm<'p> {
                         self.promise_combine(crate::heap::CombKind::AllSettled, a, this)?
                     }
                     PROMISE_RACE => self.promise_combine(crate::heap::CombKind::Race, a, this)?,
+                    PROMISE_ALLKEYED => {
+                        self.promise_combine(crate::heap::CombKind::AllKeyed, a, this)?
+                    }
+                    PROMISE_ALLSETTLEDKEYED => {
+                        self.promise_combine(crate::heap::CombKind::AllSettledKeyed, a, this)?
+                    }
                     _ => self.promise_combine(crate::heap::CombKind::Any, a, this)?, // PROMISE_ANY
                 }
             }

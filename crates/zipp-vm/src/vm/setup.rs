@@ -478,6 +478,8 @@ impl<'p> Vm<'p> {
                 ("reject", PROMISE_REJECT),
                 ("all", PROMISE_ALL),
                 ("allSettled", PROMISE_ALLSETTLED),
+                ("allKeyed", PROMISE_ALLKEYED),
+                ("allSettledKeyed", PROMISE_ALLSETTLEDKEYED),
                 ("race", PROMISE_RACE),
                 ("any", PROMISE_ANY),
                 // withResolvers/try validate `this` is a constructor (via

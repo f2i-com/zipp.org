@@ -191,6 +191,8 @@ pub const DOLLAR262_GC: u16 = 621;
 pub const DOLLAR262_CREATE_REALM: u16 = 873;
 pub const MATH_SUM_PRECISE: u16 = 874;
 pub const MATH_F16ROUND: u16 = 875;
+pub const PROMISE_ALLKEYED: u16 = 876;
+pub const PROMISE_ALLSETTLEDKEYED: u16 = 877;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -848,6 +850,8 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PROMISE_REJECT => ("reject", 1),
         PROMISE_ALL => ("all", 1),
         PROMISE_ALLSETTLED => ("allSettled", 1),
+        PROMISE_ALLKEYED => ("allKeyed", 1),
+        PROMISE_ALLSETTLEDKEYED => ("allSettledKeyed", 1),
         PROMISE_RACE => ("race", 1),
         PROMISE_ANY => ("any", 1),
         OBJ_IS => ("is", 2),
