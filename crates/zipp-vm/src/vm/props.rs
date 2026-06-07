@@ -769,6 +769,18 @@ impl<'p> Vm<'p> {
                 return self.make_data_descriptor(v, false, false, true);
             }
         }
+        // A function's / class's `prototype` is a non-enumerable, non-configurable
+        // own data property. It is non-writable for a class, writable for an
+        // ordinary constructor function. (Only synthesized when no explicit own
+        // `prototype` was assigned — the generic match below handles that case.)
+        if key == "prototype"
+            && !matches!(self.heap.get(idx), HeapObj::Object(m) if m.pos("prototype").is_some())
+        {
+            let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
+            if let Some(p) = self.prototype_of(obj) {
+                return self.make_data_descriptor(p, !is_class, false, false);
+            }
+        }
         // A String exotic (boxed `new String(s)` or a raw string value): an in-range
         // integer index is a character data prop { value, writable:false,
         // enumerable:true, configurable:false }; `length` is a data prop with all
