@@ -2233,6 +2233,32 @@ impl<'p> Vm<'p> {
                         self.set_index(o, k, v, strict)?;
                         ip += 1;
                     }
+                    Instr::ImportCall { dst, spec } => {
+                        // import(spec): ToString the specifier, then return a Promise.
+                        // There is no host module loader, so a coercible specifier
+                        // rejects with a TypeError; if ToString throws, the Promise
+                        // rejects with that thrown value (import() never throws sync).
+                        let spec_val = self.get(base, spec);
+                        // ToString FIRST — a user toString may GC; spec_val is rooted
+                        // in its register and a thrown value is rooted in pending_throw,
+                        // so nothing live is collected. Build the reject reason BEFORE
+                        // allocating the promise (avoids a GC window with an unrooted
+                        // promise), then root the reason in `dst` across alloc_promise.
+                        let coerced = self.to_js_string(spec_val);
+                        let reason = match coerced {
+                            Ok(_) => self.make_error(1, None), // TypeError, no host loader
+                            Err(_) => match self.pending_throw.take() {
+                                Some(v) => v,
+                                None => self.make_error(1, None),
+                            },
+                        };
+                        self.set(base, dst, reason);
+                        let p = self.alloc_promise();
+                        let r = self.get(base, dst);
+                        self.reject(p, r);
+                        self.set(base, dst, Value::heap(p));
+                        ip += 1;
+                    }
                     Instr::ClassStaticField { class, key, val } => {
                         let cv = self.get(base, class);
                         let kv = self.get(base, key);

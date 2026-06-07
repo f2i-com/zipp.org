@@ -4113,6 +4113,15 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadNewTarget { dst });
                 Ok(dst)
             }
+            E::ImportExpression(ie) => {
+                // Dynamic `import(specifier)` — evaluate the specifier; ImportCall
+                // ToString's it and returns a (rejecting, no host loader) Promise.
+                // `options` (import attributes) and `phase` (import.defer/source) are
+                // not modelled in this subset and are ignored.
+                let spec = self.expr(&ie.source)?;
+                self.emit(Instr::ImportCall { dst, spec });
+                Ok(dst)
+            }
             _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
         }
     }

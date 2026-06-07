@@ -425,6 +425,12 @@ pub enum Instr {
     GetIndex { dst: Reg, obj: Reg, key: Reg },
     /// `obj[key] = val` — computed member write.
     SetIndex { obj: Reg, key: Reg, val: Reg },
+    /// `dst = import(spec)` — dynamic import. ToString the specifier and return a
+    /// Promise. With no host module loader, a successfully-coerced specifier rejects
+    /// with a TypeError; if the specifier's coercion throws, the Promise rejects
+    /// with that thrown value (import() never throws synchronously). options/phase
+    /// (import attributes, `import.defer`/`import.source`) are ignored in this subset.
+    ImportCall { dst: Reg, spec: Reg },
     /// Define a STATIC class field with a computed key: ToPropertyKey(key) once,
     /// throw a TypeError if it is "prototype" (a static field may not be named
     /// `prototype` — it is a non-configurable own property of the constructor),
