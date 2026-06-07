@@ -701,6 +701,25 @@ impl Compiler {
             }
         }
 
+        // Pre-declare every captured function-scope `var` so a function or closure
+        // that captures a sibling `var` declared LATER finds its (undefined) cell at
+        // creation time rather than failing to resolve it (`var g=function(){return
+        // v}; var v=5; g()` ⇒ 5). `var_decl` reuses the binding. The register window
+        // starts undefined, so the boxed cell holds undefined until the assignment.
+        // (Lexical `let`/`const` are NOT pre-created — they have a TDZ and are bound
+        // at their textual declaration.)
+        if !is_script {
+            let mut hv = std::collections::HashSet::new();
+            for s in body {
+                collect_hoisted_vars(s, &mut hv);
+            }
+            for name in &hv {
+                if fc.captured.contains(name) && !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                    fc.declare_local(name); // boxes a cell (the register is undefined)
+                }
+            }
+        }
+
         for s in body {
             fc.stmt(s)?;
         }
