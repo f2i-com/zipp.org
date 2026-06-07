@@ -329,6 +329,37 @@ impl<'p> Vm<'p> {
         Ok(default)
     }
 
+    /// `Get(new_target, "prototype")` when it is an object and `new_target`
+    /// differs from the base constructor — the [[Prototype]] override a built-in
+    /// constructor must apply when built via `Reflect.construct(C, args, newTarget)`
+    /// / a derived `super()` / a cross-realm newTarget. `None` for the ordinary
+    /// `new C()` case (use the built-in's default prototype).
+    pub(crate) fn newtarget_proto_override(
+        &mut self,
+        new_target: Value,
+        cv: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        if new_target.is_heap() && new_target != cv {
+            let p = self.get_prop(new_target, "prototype")?;
+            if self.is_object_value(p) {
+                return Ok(Some(p));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Apply a newTarget [[Prototype]] override to a freshly-built built-in
+    /// instance (an Array/Object/Map/Date/Boxed/… created by `Reflect.construct`
+    /// with a foreign newTarget). A no-op when `over` is `None`.
+    pub(crate) fn set_ctor_proto(&mut self, result: Value, over: Option<Value>) -> Value {
+        if let Some(p) = over {
+            if result.is_heap() {
+                self.proto_of.insert(result.heap_index(), p);
+            }
+        }
+        result
+    }
+
     /// [[Construct]](argumentsList, newTarget). `new_target` is threaded to a Proxy
     /// `construct` trap (its 3rd argument), through a trap-less Proxy's forward to
     /// the target, and into the instance's [[Prototype]] via OrdinaryCreateFrom
@@ -347,7 +378,9 @@ impl<'p> Vm<'p> {
         // `new TypeError(msg)` path. AggregateError takes the message as arg[1].
         if let Some(k) = self.error_ctors.iter().position(|&c| c == cv.heap_index()) {
             let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
-            return Ok(self.make_error(k as u8, msg));
+            let over = self.newtarget_proto_override(new_target, cv)?;
+            let e = self.make_error(k as u8, msg);
+            return Ok(self.set_ctor_proto(e, over));
         }
         // ArrayBuffer / DataView / TypedArray constructors used as values.
         let ci = cv.heap_index();
@@ -512,6 +545,10 @@ impl<'p> Vm<'p> {
         };
         if let Some(p) = builtin_proto {
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            // OrdinaryCreateFromConstructor: a foreign newTarget (Reflect.construct /
+            // cross-realm / derived super) sets the instance's [[Prototype]] to
+            // newTarget.prototype rather than the built-in's default.
+            let over = self.newtarget_proto_override(new_target, cv)?;
             if p == self.arr_proto && self.arr_proto != 0 {
                 let arr = if args.len() == 1 && a0.is_number() {
                     let n = a0.as_f64();
@@ -529,26 +566,37 @@ impl<'p> Vm<'p> {
                 } else {
                     args.to_vec()
                 };
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(arr))));
+                let r = Value::heap(self.heap.alloc(HeapObj::Array(arr)));
+                return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.obj_proto && self.obj_proto != 0 {
+                // `Object(value)` with a non-nullish value ignores newTarget and
+                // returns ToObject(value); only `new Object()` / nullish honours it.
+                if over.is_some() && a0.is_nullish() {
+                    let r = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
+                    return Ok(self.set_ctor_proto(r, over));
+                }
                 return self.to_object(a0);
             }
             if p == self.num_proto && self.num_proto != 0 {
                 let n = if args.is_empty() { 0.0 } else { self.to_number(a0)? };
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 1, value: Value::num(n) })));
+                let r = Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 1, value: Value::num(n) }));
+                return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.bool_proto && self.bool_proto != 0 {
                 let b = !args.is_empty() && self.truthy(a0);
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 2, value: Value::bool(b) })));
+                let r = Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 2, value: Value::bool(b) }));
+                return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.str_proto && self.str_proto != 0 {
                 let s = if args.is_empty() { String::new() } else { self.to_js_string(a0)? };
                 let sv = self.alloc_str(s);
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 0, value: sv })));
+                let r = Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 0, value: sv }));
+                return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.regexp_proto && self.regexp_proto != 0 {
-                return self.build_regexp(a0, args.get(1).copied().unwrap_or(Value::UNDEFINED));
+                let r = self.build_regexp(a0, args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.map_proto && self.map_proto != 0 {
                 // Per spec the entries are added via the `set` adder resolved off the
@@ -565,7 +613,7 @@ impl<'p> Vm<'p> {
                         self.call_value(adder, map_v, &[k, v])?;
                     }
                 }
-                return Ok(map_v);
+                return Ok(self.set_ctor_proto(map_v, over));
             }
             if p == self.set_proto && self.set_proto != 0 {
                 let set_v = Value::heap(self.heap.alloc(HeapObj::Set(Vec::new())));
@@ -578,11 +626,12 @@ impl<'p> Vm<'p> {
                         self.call_value(adder, set_v, &[e])?;
                     }
                 }
-                return Ok(set_v);
+                return Ok(self.set_ctor_proto(set_v, over));
             }
             if p == self.date_proto && self.date_proto != 0 {
                 let ms = self.date_new_ms(args)?;
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Date(ms))));
+                let r = Value::heap(self.heap.alloc(HeapObj::Date(ms)));
+                return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.promise_proto && self.promise_proto != 0 {
                 if !self.is_callable(a0) {
@@ -602,7 +651,7 @@ impl<'p> Vm<'p> {
                     let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
                     self.reject(prom, reason);
                 }
-                return Ok(Value::heap(prom));
+                return Ok(self.set_ctor_proto(Value::heap(prom), over));
             }
         }
         // A user function with no [[Construct]] (generator, async, arrow, or a
