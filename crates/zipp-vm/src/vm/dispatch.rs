@@ -308,6 +308,29 @@ impl<'p> Vm<'p> {
                         self.globals[idx as usize] = v;
                         ip += 1;
                     }
+                    Instr::StoreGlobalStrict { idx, src } => {
+                        // Strict assignment to an unresolvable reference (a global slot
+                        // never declared/initialized) is a ReferenceError, not a global
+                        // creation.
+                        if self.globals[idx as usize].is_uninitialized() {
+                            let name = self
+                                .program
+                                .global_names
+                                .get(idx as usize)
+                                .map(|s| s.as_str())
+                                .or_else(|| {
+                                    self.eval_global_map
+                                        .iter()
+                                        .find(|(_, &v)| v == idx)
+                                        .map(|(k, _)| k.as_str())
+                                })
+                                .unwrap_or("?");
+                            return Err(Thrown(format!("ReferenceError: {name} is not defined")));
+                        }
+                        let v = self.get(base, src);
+                        self.globals[idx as usize] = v;
+                        ip += 1;
+                    }
                     Instr::Now { dst, epoch } => {
                         let ms = if epoch {
                             // Date.now(): integer ms since the Unix epoch.

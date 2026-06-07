@@ -4209,7 +4209,15 @@ impl<'a> FnCompiler<'a> {
             }
             Binding::LocalCell(cell) => self.emit(Instr::CellSet { cell: *cell, src }),
             Binding::Upvalue(idx) => self.emit(Instr::UpvalSet { idx: *idx, src }),
-            Binding::Global(idx) => self.emit(Instr::StoreGlobal { idx: *idx, src }),
+            Binding::Global(idx) => {
+                // In strict mode, assigning to an unresolvable (never-declared) global
+                // is a ReferenceError, not a silent global creation.
+                if self.cx.in_strict {
+                    self.emit(Instr::StoreGlobalStrict { idx: *idx, src });
+                } else {
+                    self.emit(Instr::StoreGlobal { idx: *idx, src });
+                }
+            }
         }
     }
 

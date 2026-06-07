@@ -856,7 +856,8 @@ impl<'p> Vm<'p> {
                     }
                     Instr::LoadGlobal { idx, .. }
                     | Instr::LoadGlobalOrUndefined { idx, .. }
-                    | Instr::StoreGlobal { idx, .. } => {
+                    | Instr::StoreGlobal { idx, .. }
+                    | Instr::StoreGlobalStrict { idx, .. } => {
                         *idx = gmap[*idx as usize];
                     }
                     // Class-id operands: the class itself, and every `super`

@@ -52,6 +52,10 @@ pub enum Instr {
     LoadGlobalOrUndefined { dst: Reg, idx: u32 },
     /// `globals[idx] = src`
     StoreGlobal { idx: u32, src: Reg },
+    /// `globals[idx] = src`, but in STRICT mode: assignment to an unresolvable
+    /// reference (a never-declared global slot, still UNINITIALIZED) throws a
+    /// ReferenceError instead of creating the global (sloppy `StoreGlobal` creates).
+    StoreGlobalStrict { idx: u32, src: Reg },
 
     /// A clock read: `performance.now()` (`epoch = false`, fractional ms since
     /// VM start) or `Date.now()` (`epoch = true`, integer ms since the Unix
