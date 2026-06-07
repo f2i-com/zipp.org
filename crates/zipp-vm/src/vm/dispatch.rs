@@ -255,6 +255,21 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, nt);
                         ip += 1;
                     }
+                    Instr::LoadCallee { dst } => {
+                        // The function value of the running frame — its Closure object
+                        // if it has captures, else a function object for its func id.
+                        let (clo, fid) = {
+                            let fr = self.frames.last().unwrap();
+                            (fr.closure, fr.func)
+                        };
+                        let v = if clo != NO_CLOSURE {
+                            Value::heap(clo)
+                        } else {
+                            Value::heap(self.heap.alloc(HeapObj::Func(fid)))
+                        };
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::LoadHole { dst } => {
                         // The HOLE sentinel for an elided array-literal element; the
                         // following NewArray/ArrayAppend copies it into the array.

@@ -30,6 +30,12 @@ pub enum Instr {
     /// `dst = new.target` — the current activation's `new.target` (the constructor
     /// when entered via `new`/`Reflect.construct`/`super(...)`, else `undefined`).
     LoadNewTarget { dst: Reg },
+
+    /// `dst = <the function currently executing>` — materialises the running
+    /// frame's own function value. Used to bind a named function expression's name
+    /// to itself inside its body (`(function f(){ … f … })`), so self-reference and
+    /// nested closures over the name resolve.
+    LoadCallee { dst: Reg },
     /// `dst = <array hole>` — the internal HOLE sentinel, used only to fill an
     /// elided array-literal element (`[1,,3]`) before NewArray/ArrayAppend copies
     /// it into the array. Must never be observed outside that copy.

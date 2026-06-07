@@ -468,6 +468,7 @@ impl Compiler {
         let captured = capture::captured_locals(&[], &prog.body);
         let top = self.compile_function_body(
             None,
+            None, // a script has no self-name binding
             &[],
             None,
             None,
@@ -489,6 +490,7 @@ impl Compiler {
     fn compile_function_body(
         &mut self,
         name: Option<&str>,
+        self_name: Option<&str>,
         params: &[String],
         rest: Option<&str>,
         params_ast: Option<&ox::FormalParameters>,
@@ -559,6 +561,23 @@ impl Compiler {
                 let r = fc.arguments_reg.unwrap();
                 fc.emit(Instr::MakeCell { reg: r });
                 fc.cell_regs.insert(r);
+            }
+        }
+        // A named function expression binds its own name to itself inside the body
+        // (`(function f(){ … f … })`). Reserve a register AFTER the params/rest/
+        // arguments slots (so the call ABI's fixed param layout is untouched), load
+        // the running function value into it (LoadCallee), and — if a nested closure
+        // captures the name — box it into a cell like a captured parameter. Only set
+        // up when the name is actually referenced and not shadowed by a param/local.
+        if let Some(sn) = self_name {
+            if capture::free_vars(params, body).contains(sn) {
+                let r = fc.alloc_reg();
+                fc.emit(Instr::LoadCallee { dst: r });
+                if fc.captured.contains(sn) {
+                    fc.emit(Instr::MakeCell { reg: r });
+                    fc.cell_regs.insert(r);
+                }
+                fc.self_name = Some((sn.to_string(), r));
             }
         }
 
@@ -983,6 +1002,11 @@ struct FnCompiler<'a> {
     /// completion value (last evaluated expression statement). `Return`ed at the
     /// end instead of `undefined`. `None` outside eval mode / in nested functions.
     completion_reg: Option<Reg>,
+    /// A named function expression's own name bound to itself (the running
+    /// function value): `(name, reg)`. Sits OUTSIDE the parameter/var scope, so
+    /// `resolve` consults it only after the scope stack (params/locals shadow it).
+    /// `None` for declarations, arrows, methods, and anonymous expressions.
+    self_name: Option<(String, Reg)>,
     /// This function's own bindings that some nested function captures; these
     /// are boxed into heap cells at declaration so the closure shares the slot.
     captured: HashSet<String>,
@@ -1089,6 +1113,7 @@ impl<'a> FnCompiler<'a> {
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
             handler_depth: 0,
+            self_name: None,
             captured,
             cell_regs: HashSet::new(),
             const_regs: HashSet::new(),
@@ -1147,6 +1172,13 @@ impl<'a> FnCompiler<'a> {
                 if self.cell_regs.contains(reg) {
                     cell_locals.push((name.clone(), *reg));
                 }
+            }
+        }
+        // A named-function-expression self-binding that was boxed (captured by a
+        // nested closure) is also visible to that closure as an upvalue source.
+        if let Some((name, reg)) = &self.self_name {
+            if self.cell_regs.contains(reg) {
+                cell_locals.push((name.clone(), *reg));
             }
         }
         EnclosingFn { cell_locals, upvalues: self.upvalues.clone() }
@@ -1234,6 +1266,17 @@ impl<'a> FnCompiler<'a> {
                         Binding::Local(*r)
                     };
                 }
+            }
+        }
+        // A named function expression's own name: outside the param/var scope, so
+        // checked only after the scope stack (params/locals shadow it).
+        if let Some((n, r)) = &self.self_name {
+            if n == name {
+                return if self.cell_regs.contains(r) {
+                    Binding::LocalCell(*r)
+                } else {
+                    Binding::Local(*r)
+                };
             }
         }
         // A free variable that resolves in an enclosing function is an upvalue.
@@ -1816,6 +1859,7 @@ impl<'a> FnCompiler<'a> {
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
             name.as_deref(),
+            None, // a declaration's name lives in the enclosing scope, not self-bound
             &params,
             rest.as_deref(),
             Some(&f.params),
@@ -2436,13 +2480,22 @@ impl<'a> FnCompiler<'a> {
                 id.name.as_str(),
             )?;
         }
+        // A named function expression's own name is self-bound (resolves to the
+        // function) inside the body — and a nested closure may capture it, so add it
+        // to the capture-analysis name set. Use the SYNTACTIC name (`f.id`), not the
+        // inferred NamedEvaluation name (an anonymous expr has no self-binding).
+        let self_name = f.id.as_ref().map(|i| i.name.to_string());
         let (params, rest, body) = function_parts(f)?;
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&f.params));
+        if let Some(sn) = &self_name {
+            names.push(sn.clone());
+        }
         let captured = capture::captured_locals(&names, body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
             name.as_deref(),
+            self_name.as_deref(),
             &params,
             rest.as_deref(),
             Some(&f.params),
