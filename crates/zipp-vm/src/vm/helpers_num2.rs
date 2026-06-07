@@ -97,6 +97,75 @@ pub(crate) fn f16_round(x: f64) -> f64 {
     }
 }
 
+/// Decode an IEEE-754 binary16 (half) bit pattern to an f64 (exact — every half
+/// value is representable as an f64). Drives `DataView.prototype.getFloat16`.
+pub(crate) fn f16_bits_to_f64(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = (bits >> 10) & 0x1f;
+    let mant = (bits & 0x3ff) as f64;
+    match exp {
+        0 => sign * mant * 2f64.powi(-24),            // subnormal (±0 when mant == 0)
+        0x1f if mant == 0.0 => sign * f64::INFINITY,  // ±Infinity
+        0x1f => f64::NAN,                             // NaN
+        _ => sign * (1.0 + mant / 1024.0) * 2f64.powi((exp as i32) - 15),
+    }
+}
+
+/// Encode an f64 as the nearest IEEE-754 binary16 (half) bit pattern, rounding
+/// ties to even (overflow → ±Infinity, NaN → a canonical quiet NaN). Drives
+/// `DataView.prototype.setFloat16`.
+pub(crate) fn f64_to_f16_bits(f: f64) -> u16 {
+    if f.is_nan() {
+        return 0x7e00;
+    }
+    let sign: u16 = if f.is_sign_negative() { 0x8000 } else { 0 };
+    let a = f.abs();
+    if a.is_infinite() || a >= 65520.0 {
+        return sign | 0x7c00; // ±Infinity (65520 is the round-to-Inf tie point)
+    }
+    if a == 0.0 {
+        return sign;
+    }
+    let bits = a.to_bits();
+    let e = ((bits >> 52) & 0x7ff) as i32 - 1023; // unbiased binary exponent
+    let m = bits & 0x000f_ffff_ffff_ffff; // 52-bit trailing significand
+    if e < -14 {
+        // Subnormal half: round (a / 2^-24) to a nearest even integer mantissa.
+        // a = (2^52 | m) * 2^(e-52); divide by 2^-24 → shift right by (28 - e).
+        let full = (1u64 << 52) | m;
+        let shift = (28 - e) as u32;
+        let rounded = round_shift_u64(full, shift);
+        // `rounded == 1024` naturally becomes the smallest NORMAL (exp 1, mant 0).
+        return sign | (rounded as u16);
+    }
+    // Normal half: round the 52-bit significand to 10 bits (ties to even).
+    let f16_exp = (e + 15) as u16; // 1..=30 here (a < 65520 ⇒ no exp-15 overflow)
+    let rounded_mant = round_shift_u64(m, 42);
+    if rounded_mant == 1024 {
+        // Mantissa carried out → bump the exponent (never reaches Inf for a<65520).
+        return sign | ((f16_exp + 1) << 10);
+    }
+    sign | (f16_exp << 10) | (rounded_mant as u16)
+}
+
+/// `val >> shift`, rounded to nearest with ties to even.
+fn round_shift_u64(val: u64, shift: u32) -> u64 {
+    if shift == 0 {
+        return val;
+    }
+    if shift >= 64 {
+        return 0;
+    }
+    let quotient = val >> shift;
+    let remainder = val & ((1u64 << shift) - 1);
+    let half = 1u64 << (shift - 1);
+    if remainder > half || (remainder == half && (quotient & 1) == 1) {
+        quotient + 1
+    } else {
+        quotient
+    }
+}
+
 /// `Math.sumPrecise(numbers)`: the correctly-rounded sum of the finite f64s, via
 /// Shewchuk's non-overlapping-partials algorithm. NaN if any input is NaN or if
 /// both +∞ and −∞ appear; otherwise the lone infinity if present. The empty sum

@@ -322,6 +322,8 @@ pub const DV_PROTO_METHODS: &[&str] = &[
     "getFloat64", "getBigInt64", "getBigUint64", "setInt8", "setUint8", "setInt16",
     "setUint16", "setInt32", "setUint32", "setFloat32", "setFloat64", "setBigInt64",
     "setBigUint64",
+    // append-only — keep below DV_METHOD_BASE + count < ARRAYBUFFER_SLICE (396).
+    "getFloat16", "setFloat16",
 ];
 pub const DV_METHOD_BASE: u16 = 372;
 pub const ARRAYBUFFER_SLICE: u16 = 396;

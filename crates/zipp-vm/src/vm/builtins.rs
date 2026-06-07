@@ -969,9 +969,18 @@ impl<'p> Vm<'p> {
             "Float64" => 8,
             "BigInt64" => 9,
             "BigUint64" => 10,
+            "Float16" => 16, // sentinel (not a TA_KIND); a 2-byte half float
             _ => return Ok(None),
         };
-        let size = native::TA_KINDS[kind as usize].1;
+        let size = if kind == 16 { 2 } else { native::TA_KINDS[kind as usize].1 };
+        // SetViewValue step 3: writing through a DataView backed by an immutable
+        // ArrayBuffer is a TypeError — BEFORE the byteOffset/value coercions (their
+        // valueOf must not run). (Reads are fine on an immutable buffer.)
+        if op == 1 && self.immutable_buffers.contains(&buffer) {
+            return Err(Thrown(
+                "TypeError: Cannot set a value on a DataView backed by an immutable ArrayBuffer".into(),
+            ));
+        }
         // requestIndex = ToIndex(arg0): runs valueOf/toString and throws RangeError
         // on a negative / too-large index — BEFORE the bounds check (and, for set*,
         // before the value conversion below) per GetViewValue/SetViewValue order.
@@ -1032,13 +1041,22 @@ impl<'p> Vm<'p> {
                 6 => Value::num(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
                 7 => Value::num(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
                 8 => Value::num(f64::from_le_bytes(b)),
+                16 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes(
+                    [b[0], b[1]],
+                ))),
                 9 => self.make_bigint(i64::from_le_bytes(b) as i128),
                 _ => self.make_bigint(u64::from_le_bytes(b) as i128),
             }))
         } else {
             // write
             let v = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-            let mut bytes = if kind >= 9 {
+            let mut bytes = if kind == 16 {
+                // Float16: ToNumber → nearest binary16 bits → 2 bytes (in [0..2]).
+                let f = self.to_number_coerce(v)?;
+                let mut a = [0u8; 8];
+                a[..2].copy_from_slice(&crate::vm::helpers_num2::f64_to_f16_bits(f).to_le_bytes());
+                a
+            } else if kind >= 9 {
                 let n = self.to_bigint(v)?;
                 if kind == 9 {
                     (n as i64).to_le_bytes()
