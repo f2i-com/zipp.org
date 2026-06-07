@@ -4586,7 +4586,28 @@ impl<'a> FnCompiler<'a> {
     }
 
     /// Emit a write of `src` to `binding`.
+    /// True if `r` is the register holding a named function/generator expression's
+    /// own name — an IMMUTABLE binding inside its body.
+    fn is_self_name_reg(&self, r: Reg) -> bool {
+        self.self_name.as_ref().is_some_and(|(_, sr)| *sr == r)
+    }
+
     fn store_binding(&mut self, b: &Binding, src: Reg) {
+        // A named function expression's own name is an immutable binding: assigning
+        // to it inside the body throws a TypeError in strict mode and is a silent
+        // no-op in sloppy mode (the RHS in `src` was already evaluated for its side
+        // effects). Unlike `const`, the sloppy case does NOT throw.
+        if let Binding::Local(r) | Binding::LocalCell(r) = b {
+            if self.is_self_name_reg(*r) {
+                if self.cx.in_strict {
+                    let e = self.alloc_reg();
+                    self.emit(Instr::NewError { dst: e, kind: 1, arg: None, opts: None });
+                    self.emit(Instr::Throw { src: e });
+                    self.next_reg -= 1;
+                }
+                return;
+            }
+        }
         // Assignment to a `const` binding is a runtime TypeError (PutValue on an
         // immutable binding). The RHS has already been evaluated into `src` (its
         // side effects must happen first), so emit the throw now. Initialization
@@ -5182,7 +5203,7 @@ impl<'a> FnCompiler<'a> {
                 // A const local takes the store_binding path so the RHS is evaluated
                 // (side effects) and the assignment then throws a TypeError.
                 if let Binding::Local(r) = binding {
-                    if !self.const_regs.contains(&r) {
+                    if !self.const_regs.contains(&r) && !self.is_self_name_reg(r) {
                         // Plain mutable local: evaluate the RHS directly into its reg.
                         let v = self.compile_named_init(r, &a.right, &name)?;
                         if v != r {
@@ -5228,7 +5249,7 @@ impl<'a> FnCompiler<'a> {
             // >>= >>>= |= ^= &=`).
             other => {
                 if let Binding::Local(r) = binding {
-                    if !self.const_regs.contains(&r) {
+                    if !self.const_regs.contains(&r) && !self.is_self_name_reg(r) {
                         // Plain mutable local: compute in place.
                         let rhs = self.expr(&a.right)?;
                         let instr = compound_assign_instr(other, r, r, rhs)
