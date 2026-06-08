@@ -2032,6 +2032,19 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
                 self.fn_props.get(&pidx).map(enum_keys).unwrap_or_default()
             }
+            // A boxed String (e.g. `Object.create(O, "abc")` → ToObject) exposes its
+            // char indices as own enumerable keys; reading each yields a char string,
+            // which then fails ToPropertyDescriptor (a non-object) → TypeError.
+            HeapObj::Boxed { kind: 0, value } => {
+                let v = *value;
+                let n = self.heap.str_cow(v.heap_index()).map(|s| s.chars().count()).unwrap_or(0);
+                let mut ks: Vec<String> = (0..n).map(|i| i.to_string()).collect();
+                // Plus any own enumerable properties added to the String wrapper.
+                if let Some(m) = self.arr_props.get(&pidx) {
+                    ks.extend(enum_keys(m));
+                }
+                ks
+            }
             _ => self.arr_props.get(&pidx).map(enum_keys).unwrap_or_default(),
         };
         for k in keys {
