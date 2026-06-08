@@ -12,54 +12,12 @@ impl<'p> Vm<'p> {
     /// numbers). Mirrors JS semantics where they differ from Rust's f64 methods:
     /// `round` is half-up (so −2.5 → −2, not −3); `sign` preserves ±0 and maps
     /// NaN→NaN; `min`/`max` are NaN-sticky (any NaN arg ⇒ NaN).
-    pub(crate) fn eval_math(&self, op: crate::bytecode::MathFn, base: usize, arg_base: u16, argc: u16) -> Result<f64, Thrown> {
-        use crate::bytecode::MathFn as M;
-        let arg = |i: u16| -> Result<f64, Thrown> {
-            if i < argc {
-                self.to_number(self.get(base, arg_base + i))
-            } else {
-                Ok(f64::NAN)
-            }
-        };
-        Ok(match op {
-            M::Min | M::Max | M::Hypot => {
-                let mut acc = match op {
-                    M::Min => f64::INFINITY,
-                    M::Max => f64::NEG_INFINITY,
-                    _ => 0.0, // Hypot: sum of squares
-                };
-                let mut hypot_inf = false;
-                for i in 0..argc {
-                    let v = arg(i)?;
-                    acc = match op {
-                        M::Min => {
-                            if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.min(v) }
-                        }
-                        M::Max => {
-                            if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.max(v) }
-                        }
-                        _ => {
-                            // Math.hypot: a ±Infinity argument forces +Infinity, even
-                            // if another argument is NaN (spec step 3).
-                            if v.is_infinite() {
-                                hypot_inf = true;
-                            }
-                            acc + v * v
-                        }
-                    };
-                }
-                if matches!(op, M::Hypot) {
-                    if hypot_inf { f64::INFINITY } else { acc.sqrt() }
-                } else {
-                    acc
-                }
-            }
-            M::Pow => arg(0)?.powf(arg(1)?),
-            M::Atan2 => arg(0)?.atan2(arg(1)?),
-            // Math.imul(a,b): ToUint32 multiply, result as signed int32.
-            M::Imul => (to_uint32(arg(0)?).wrapping_mul(to_uint32(arg(1)?)) as i32) as f64,
-            _ => math_unary(op, arg(0)?),
-        })
+    pub(crate) fn eval_math(&mut self, op: crate::bytecode::MathFn, base: usize, arg_base: u16, argc: u16) -> Result<f64, Thrown> {
+        // Snapshot the argument registers FIRST (a ToNumber coercion below may run a
+        // user valueOf that re-enters the VM and pushes registers), then delegate to
+        // the shared value-form evaluator, which ToNumber-coerces each argument.
+        let args: Vec<Value> = (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+        self.eval_math_args(op, &args)
     }
 
     /// `Math.<op>` reduced to a single f64 result (used by the `MathSpread`
@@ -70,24 +28,24 @@ impl<'p> Vm<'p> {
 
     /// Evaluate a Math method over an argument SLICE (the value-form `Math.abs`
     /// invoked as a native), mirroring `eval_math`'s register-based variant.
-    pub(crate) fn eval_math_args(&self, op: crate::bytecode::MathFn, args: &[Value]) -> Result<f64, Thrown> {
+    pub(crate) fn eval_math_args(&mut self, op: crate::bytecode::MathFn, args: &[Value]) -> Result<f64, Thrown> {
         use crate::bytecode::MathFn as M;
-        let arg = |i: usize| -> Result<f64, Thrown> {
-            match args.get(i) {
-                Some(v) => self.to_number(*v),
-                None => Ok(f64::NAN),
-            }
-        };
+        let at = |args: &[Value], i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
         Ok(match op {
             M::Min | M::Max | M::Hypot => {
+                // ToNumber EVERY argument (observable valueOf/toString, left-to-right)
+                // before reducing.
+                let mut nums = Vec::with_capacity(args.len());
+                for &v in args {
+                    nums.push(self.to_number_coerce(v)?);
+                }
                 let mut acc = match op {
                     M::Min => f64::INFINITY,
                     M::Max => f64::NEG_INFINITY,
                     _ => 0.0,
                 };
                 let mut hypot_inf = false;
-                for i in 0..args.len() {
-                    let v = arg(i)?;
+                for v in nums {
                     acc = match op {
                         M::Min => if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.min(v) },
                         M::Max => if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.max(v) },
@@ -107,10 +65,26 @@ impl<'p> Vm<'p> {
                     acc
                 }
             }
-            M::Pow => arg(0)?.powf(arg(1)?),
-            M::Atan2 => arg(0)?.atan2(arg(1)?),
-            M::Imul => (to_uint32(arg(0)?).wrapping_mul(to_uint32(arg(1)?)) as i32) as f64,
-            _ => math_unary(op, arg(0)?),
+            // The two-arg ops coerce arg0 then arg1 (ToNumber, left-to-right).
+            M::Pow => {
+                let a = self.to_number_coerce(at(args, 0))?;
+                let b = self.to_number_coerce(at(args, 1))?;
+                a.powf(b)
+            }
+            M::Atan2 => {
+                let a = self.to_number_coerce(at(args, 0))?;
+                let b = self.to_number_coerce(at(args, 1))?;
+                a.atan2(b)
+            }
+            M::Imul => {
+                let a = self.to_number_coerce(at(args, 0))?;
+                let b = self.to_number_coerce(at(args, 1))?;
+                (to_uint32(a).wrapping_mul(to_uint32(b)) as i32) as f64
+            }
+            _ => {
+                let x = self.to_number_coerce(at(args, 0))?;
+                math_unary(op, x)
+            }
         })
     }
 
