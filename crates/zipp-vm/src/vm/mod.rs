@@ -329,6 +329,11 @@ pub struct Vm<'p> {
     weakset_proto: u32,
     weakref_proto: u32,
     finreg_proto: u32,
+    /// The `WeakRef` / `FinalizationRegistry` constructor objects, so the
+    /// value-form `[[Construct]]` (Reflect.construct / subclassing) can build an
+    /// instance and honour `newTarget.prototype`.
+    weakref_ctor: u32,
+    finreg_ctor: u32,
     /// Error prototypes, indexed by the canonical error kind (0=Error.prototype,
     /// 1=TypeError.prototype, …, 7=AggregateError.prototype). The subtype protos
     /// chain to `error_protos[0]`; every error instance links here via `proto_of`

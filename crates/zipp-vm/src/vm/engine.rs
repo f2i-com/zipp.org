@@ -155,6 +155,8 @@ impl<'p> Vm<'p> {
             async_dispose_fn: None,
             using_resources: std::collections::HashMap::new(),
             using_next_id: 0,
+            weakref_ctor: 0,
+            finreg_ctor: 0,
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),

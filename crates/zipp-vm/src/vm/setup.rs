@@ -814,6 +814,8 @@ impl<'p> Vm<'p> {
         let weakset_ctor = build(self, &[], Some(weakset_proto));
         let weakref_ctor = build(self, &[], Some(weakref_proto));
         let finreg_ctor = build(self, &[], Some(finreg_proto));
+        self.weakref_ctor = weakref_ctor;
+        self.finreg_ctor = finreg_ctor;
         // Error hierarchy: `Error` + the 7 native subtypes. Each is a constructor
         // VALUE (is_ctor object with a `.prototype`) whose prototype carries own
         // `name`/`message`/`constructor` (+ `Error.prototype.toString`). Every error

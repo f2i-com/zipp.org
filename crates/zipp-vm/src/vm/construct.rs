@@ -654,19 +654,52 @@ impl<'p> Vm<'p> {
             return self.build_function_kind(args, 3);
         }
         if ci == self.arraybuffer_ctor && ci != 0 {
-            return self.build_array_buffer(args);
+            let r = self.build_array_buffer(args)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.arraybuffer_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.sab_ctor && ci != 0 {
-            return self.build_shared_array_buffer(args);
+            let r = self.build_shared_array_buffer(args)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.sab_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.disposablestack_ctor && ci != 0 {
-            return Ok(Value::heap(self.alloc_disposable_stack(false)));
+            let r = Value::heap(self.alloc_disposable_stack(false));
+            let over = self.newtarget_proto_override(new_target, cv, self.disposablestack_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.asyncdisposablestack_ctor && ci != 0 {
-            return Ok(Value::heap(self.alloc_disposable_stack(true)));
+            let r = Value::heap(self.alloc_disposable_stack(true));
+            let over =
+                self.newtarget_proto_override(new_target, cv, self.asyncdisposablestack_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.suppressederror_ctor && ci != 0 {
-            return self.build_suppressed_error(args);
+            let r = self.build_suppressed_error(args)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.suppressederror_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
+        }
+        if ci == self.weakref_ctor && ci != 0 {
+            let t = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !self.is_object_value(t) {
+                return Err(Thrown("TypeError: WeakRef: target must be an object".into()));
+            }
+            let over = self.newtarget_proto_override(new_target, cv, self.weakref_proto)?;
+            let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));
+            return Ok(self.set_ctor_proto(wr, over));
+        }
+        if ci == self.finreg_ctor && ci != 0 {
+            let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if self.type_of(cb) != "function" {
+                return Err(Thrown(
+                    "TypeError: FinalizationRegistry: cleanup callback must be callable".into(),
+                ));
+            }
+            let over = self.newtarget_proto_override(new_target, cv, self.finreg_proto)?;
+            let fr = Value::heap(
+                self.heap.alloc(HeapObj::FinalizationRegistry { cleanup: cb, tokens: Vec::new() }),
+            );
+            return Ok(self.set_ctor_proto(fr, over));
         }
         if ci == self.shadowrealm_ctor && ci != 0 {
             let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -677,7 +710,9 @@ impl<'p> Vm<'p> {
             return Ok(Value::heap(idx));
         }
         if ci == self.dataview_ctor && ci != 0 {
-            return self.build_data_view(args);
+            let r = self.build_data_view(args)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.dataview_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if let Some(k) = self.ta_ctors.iter().position(|&c| c == ci && ci != 0) {
             return self.build_typed_array(k as u8, args);
