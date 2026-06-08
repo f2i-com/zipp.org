@@ -141,7 +141,7 @@ impl Vm<'_> {
                 Microtask::AsyncResume { activation, input } => {
                     root_idx!(*activation);
                     match input {
-                        Resume::Value(v) | Resume::Throw(v) => root_val!(*v),
+                        Resume::Value(v) | Resume::Throw(v) | Resume::Return(v) => root_val!(*v),
                     }
                 }
                 Microtask::ThenableJob { thenable, then, promise } => {

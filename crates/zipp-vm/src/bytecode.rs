@@ -165,14 +165,13 @@ pub enum Instr {
     /// `dst = yield val` — suspend the current generator, handing `val` out as
     /// the yielded value. On resume the value passed to `.next(v)` lands in `dst`.
     Yield { dst: Reg, val: Reg },
-    /// Suspension point for an ASYNC `yield*` delegation step: behaves exactly like
-    /// `Yield` (hands `val` out; resume delivers the `.next(v)` value into `dst`), but
-    /// is a DISTINCT op so the async-generator driver can tell it is delegating. When
-    /// `.throw()` reaches an async generator suspended here and the inner iterator has
-    /// no usable `throw`, the spec requires a TypeError (not the raw thrown value);
-    /// the driver special-cases this op for that. (Full forwarding of a present inner
-    /// `throw`/`return` is a future extension.)
-    AsyncYieldDelegate { dst: Reg, val: Reg },
+    /// Suspension point for an ASYNC `yield*` delegation step: hands `val` out like
+    /// `Yield`. On resume the driver delivers the resume MODE into `mode_dst`
+    /// (0 = next, 2 = return) and the value into `val_dst`, so the yield* loop forwards
+    /// next/return to the inner iterator. A `.throw()` instead unwinds to the loop's
+    /// surrounding handler (it does not resume here). Distinct op so the async-gen
+    /// driver recognises a delegating suspension.
+    AsyncYieldDelegate { mode_dst: Reg, val_dst: Reg, val: Reg },
     /// `RequireObject(val)` — throw a TypeError if `val` is not an Object. Used after
     /// awaiting an async iterator's `next()` result (the iterator-result must be an
     /// Object per the spec; a non-object result is a TypeError, NOT a thenable).
@@ -189,6 +188,11 @@ pub enum Instr {
     /// delegated iterator observes it (and `arguments.length === 1`). A built-in
     /// generator/positional source ignores `next_fn` (cursor via `idx`).
     AsyncIterNextStep { dst: Reg, iter: Reg, idx: Reg, sent: Reg, next_fn: Reg },
+    /// One async `yield*` RETURN-delegation step. Looks up the inner iterator's
+    /// `return`: if absent (undefined/null), sets `has_dst` to false (the yield* loop
+    /// then makes the OUTER generator return `ret`); otherwise calls it with `ret`,
+    /// sets `has_dst` true and writes the (to-be-awaited) result into `dst`.
+    AsyncIterReturnStep { dst: Reg, has_dst: Reg, iter: Reg, ret: Reg },
     /// `yield*` suspension point: yield `val` like `Yield`, but on resume DELIVER
     /// the resume MODE (0 = next, 1 = throw, 2 = return) into `mode_dst` and the
     /// resume value into `val_dst` — instead of `Yield`'s in-body throw/return

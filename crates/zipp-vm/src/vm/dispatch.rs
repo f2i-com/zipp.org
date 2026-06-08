@@ -2941,10 +2941,10 @@ impl<'p> Vm<'p> {
                         return Ok(v);
                     }
                     Instr::AsyncYieldDelegate { val, .. } => {
-                        // An async `yield*` step: suspend exactly like `Yield` (the
-                        // resume `.next(v)` value is delivered into `dst` by
-                        // drive_async_gen). The distinct op lets the async-gen driver
-                        // recognise a delegating suspension for `.throw()` handling.
+                        // An async `yield*` step: suspend exactly like `Yield`. On resume
+                        // drive_async_gen delivers (mode, value) into mode_dst/val_dst.
+                        // The distinct op lets the driver recognise a delegating
+                        // suspension for `.throw()`/`.return()` handling.
                         let v = self.get(base, val);
                         let f = self.frames.pop().unwrap();
                         self.pending_yield_handlers = f.handlers;
@@ -3015,6 +3015,20 @@ impl<'p> Vm<'p> {
                             }
                         };
                         self.set(base, dst, result);
+                        ip += 1;
+                    }
+                    Instr::AsyncIterReturnStep { dst, has_dst, iter, ret } => {
+                        let it = self.get(base, iter);
+                        let r = self.get(base, ret);
+                        let m = self.get_member(it, "return", it)?;
+                        if m.is_nullish() || !self.is_callable(m) {
+                            // No `return` method → the outer generator just returns `ret`.
+                            self.set(base, has_dst, Value::bool(false));
+                        } else {
+                            let res = self.call_value(m, it, &[r])?;
+                            self.set(base, dst, res);
+                            self.set(base, has_dst, Value::bool(true));
+                        }
                         ip += 1;
                     }
                     Instr::AsyncIterThrowStep { dst, iter, exc } => {

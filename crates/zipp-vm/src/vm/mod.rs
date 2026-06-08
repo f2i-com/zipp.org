@@ -113,6 +113,10 @@ pub(crate) enum ReactionKind {
 pub(crate) enum Resume {
     Value(Value),
     Throw(Value),
+    /// Resume an async generator suspended at an async `yield*` (AsyncYieldDelegate)
+    /// because the consumer called `.return(v)` — the loop delegates to the inner
+    /// iterator's `return`. Only meaningful for an async generator at a delegate point.
+    Return(Value),
 }
 
 /// A queued microtask (the whole event loop). `Reaction` runs a promise reaction

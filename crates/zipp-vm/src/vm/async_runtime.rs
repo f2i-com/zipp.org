@@ -661,15 +661,33 @@ impl<'p> Vm<'p> {
                 }
             }
             "return" => {
-                // Force completion: settle with { value: arg, done: true }. (v1
-                // does not resume `finally` blocks inside the body.)
-                if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
-                    g.state = GenState::Completed;
-                    g.regs.clear();
-                    g.handlers.clear();
+                // If suspended inside an async `yield*` (at an AsyncYieldDelegate),
+                // RESUME the body with a return mode so the yield* loop can delegate to
+                // the inner iterator's `return`. Otherwise force completion: settle with
+                // { value: arg, done: true } (v1 does not resume `finally` blocks).
+                let at_delegate = match self.heap.get(idx) {
+                    HeapObj::AsyncGenerator(g) => {
+                        let fid = g.func;
+                        matches!(g.state, GenState::Suspended(ip)
+                            if matches!(self.func(fid as usize).code.get(ip),
+                                Some(Instr::AsyncYieldDelegate { .. })))
+                    }
+                    _ => false,
+                };
+                if at_delegate {
+                    if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                        g.queue.push((Value::UNDEFINED, p));
+                    }
+                    self.drive_async_gen(idx, Resume::Return(arg0));
+                } else {
+                    if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                        g.state = GenState::Completed;
+                        g.regs.clear();
+                        g.handlers.clear();
+                    }
+                    let r = self.iter_result(arg0, true);
+                    self.resolve(p, r);
                 }
-                let r = self.iter_result(arg0, true);
-                self.resolve(p, r);
             }
             "throw" => {
                 // If suspended inside an async `yield*` (at an AsyncYieldDelegate),
@@ -817,14 +835,29 @@ impl<'p> Vm<'p> {
         } else {
             match input {
                 Resume::Value(v) => {
-                    let dst = match self.func(fid as usize).code[resume_ip] {
-                        Instr::Yield { dst, .. } => Some(dst),
-                        Instr::AsyncYieldDelegate { dst, .. } => Some(dst),
-                        Instr::Await { dst, .. } => Some(dst),
-                        _ => None,
-                    };
-                    if let Some(d) = dst {
-                        self.regs[new_base + d as usize] = v;
+                    // A `.next(v)` resume: deliver v. At an AsyncYieldDelegate also set
+                    // its mode register to 0 (next) so the yield* loop continues.
+                    match self.func(fid as usize).code[resume_ip] {
+                        Instr::AsyncYieldDelegate { mode_dst, val_dst, .. } => {
+                            self.regs[new_base + mode_dst as usize] = Value::int(0);
+                            self.regs[new_base + val_dst as usize] = v;
+                        }
+                        Instr::Yield { dst, .. } | Instr::Await { dst, .. } => {
+                            self.regs[new_base + dst as usize] = v;
+                        }
+                        _ => {}
+                    }
+                    self.frames[stop].ip = resume_ip + 1;
+                    self.run_loop(stop)
+                }
+                Resume::Return(v) => {
+                    // A `.return(v)` resume at an async yield* delegate: set mode 2
+                    // (return) + the value, so the loop delegates to inner.return.
+                    if let Instr::AsyncYieldDelegate { mode_dst, val_dst, .. } =
+                        self.func(fid as usize).code[resume_ip]
+                    {
+                        self.regs[new_base + mode_dst as usize] = Value::int(2);
+                        self.regs[new_base + val_dst as usize] = v;
                     }
                     self.frames[stop].ip = resume_ip + 1;
                     self.run_loop(stop)
@@ -1492,6 +1525,18 @@ impl<'p> Vm<'p> {
                     } else {
                         Err(Thrown(String::new()))
                     }
+                }
+                // Resume::Return is only produced for an async GENERATOR at a yield*
+                // delegate; a plain async function never receives it. Treat the value
+                // like a normal await resumption defensively.
+                Resume::Return(v) => {
+                    if let Instr::Await { dst, .. } =
+                        self.func(fid as usize).code[resume_ip]
+                    {
+                        self.regs[new_base + dst as usize] = v;
+                    }
+                    self.frames[stop].ip = resume_ip + 1;
+                    self.run_loop(stop)
                 }
             }
         };

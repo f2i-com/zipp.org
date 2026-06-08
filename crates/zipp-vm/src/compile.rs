@@ -6083,6 +6083,8 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadUndefined { dst: sent });
                 let tstep = self.alloc_reg();
                 let taw = self.alloc_reg();
+                let mode = self.alloc_reg(); // resume mode from AsyncYieldDelegate: 0 next / 2 return
+                let hasret = self.alloc_reg(); // does the inner iterator have a `return`?
                 let done_name = self.string_name("done");
                 let value_name = self.string_name("value");
                 // --- one next(sent) step: r = await iter.next(sent); require Object ---
@@ -6100,10 +6102,36 @@ impl<'a> FnCompiler<'a> {
                 let ph = self.here();
                 self.emit(Instr::PushHandler { catch_target: 0, catch_reg: excr });
                 self.handler_depth += 1;
-                self.emit(Instr::AsyncYieldDelegate { dst: sent, val: value });
+                // Suspend; resume delivers (mode, value) into (mode, sent).
+                self.emit(Instr::AsyncYieldDelegate { mode_dst: mode, val_dst: sent, val: value });
                 self.emit(Instr::PopHandler);
                 self.handler_depth -= 1;
+                // mode 2 (return) → return-delegation; mode 0 (next, falsy) → loop.
+                let jret = self.here();
+                self.emit(Instr::JumpIfTrue { cond: mode, target: 0 });
                 self.emit(Instr::Jump { target: top });
+                // --- return delegation: outer .return(sent). Delegate to inner.return;
+                //     no method → outer returns `sent`; else await, then finish-return
+                //     (done) or yield the value and continue. ---
+                let ret_label = self.here();
+                self.patch_jump(jret, ret_label);
+                self.emit(Instr::AsyncIterReturnStep { dst: tstep, has_dst: hasret, iter, ret: sent });
+                let jhas = self.here();
+                self.emit(Instr::JumpIfTrue { cond: hasret, target: 0 });
+                self.emit(Instr::Return { src: sent }); // no inner return → generator returns `sent`
+                let has_ret = self.here();
+                self.patch_jump(jhas, has_ret);
+                self.emit(Instr::Await { dst: taw, val: tstep });
+                self.emit(Instr::RequireObject { val: taw });
+                self.emit(Instr::GetProp { dst: done, obj: taw, name: done_name });
+                let jretdone = self.here();
+                self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // inner.return done → generator returns value
+                self.emit(Instr::GetProp { dst: value, obj: taw, name: value_name });
+                self.emit(Instr::Jump { target: yield_pt }); // not done → yield value, continue
+                let ret_done = self.here();
+                self.patch_jump(jretdone, ret_done);
+                self.emit(Instr::GetProp { dst: value, obj: taw, name: value_name });
+                self.emit(Instr::Return { src: value }); // generator returns inner.return's value
                 // --- catch: an outer .throw(excr) was injected here. Delegate to the
                 //     inner iterator's throw (or TypeError if it has none), await the
                 //     result, then either finish (done) or yield the delegated value. ---
