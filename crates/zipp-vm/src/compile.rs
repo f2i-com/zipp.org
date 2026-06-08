@@ -3633,7 +3633,25 @@ impl<'a> FnCompiler<'a> {
         // IterNext advances for array/string/Map/Set (ignored for a generator,
         // which it drives via `.next()`). One loop shape handles every iterable.
         let iter_reg = self.declare_local("<forof.iter>");
+        // The iterable expression is evaluated with the loop's `let`/`const` binding(s)
+        // already in scope but in their TDZ — so `for (let x of [x]) {}` throws a
+        // ReferenceError (the inner `x` shadows, uninitialized), per
+        // ForIn/OfHeadEvaluation. Mark the names as TDZ for the duration of `f.right`.
+        let tdz_added: Vec<String> = match &f.left {
+            ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical() => {
+                let mut names = std::collections::HashSet::new();
+                capture::collect_pattern_names(&d.declarations[0].id, &mut names);
+                names
+                    .into_iter()
+                    .filter(|n| self.param_tdz.insert(n.clone()))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         let v = self.expr_into(&f.right, iter_reg)?;
+        for n in &tdz_added {
+            self.param_tdz.remove(n);
+        }
         if v != iter_reg {
             self.emit(Instr::Move { dst: iter_reg, src: v });
         }
@@ -3791,7 +3809,23 @@ impl<'a> FnCompiler<'a> {
         let assign_tgt = f.left.as_assignment_target();
 
         let obj_reg = self.declare_local("<forin.obj>");
+        // The right-hand expression sees the loop's `let`/`const` binding(s) in their
+        // TDZ (`for (let x in x) {}` throws a ReferenceError), per ForIn/OfHeadEvaluation.
+        let tdz_added: Vec<String> = match &f.left {
+            ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical() => {
+                let mut names = std::collections::HashSet::new();
+                capture::collect_pattern_names(&d.declarations[0].id, &mut names);
+                names
+                    .into_iter()
+                    .filter(|n| self.param_tdz.insert(n.clone()))
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         let v = self.expr_into(&f.right, obj_reg)?;
+        for n in &tdz_added {
+            self.param_tdz.remove(n);
+        }
         if v != obj_reg {
             self.emit(Instr::Move { dst: obj_reg, src: v });
         }
