@@ -1923,8 +1923,11 @@ impl<'a> FnCompiler<'a> {
                         bind_name = c.id.as_ref().map(|i| i.name.to_string());
                     }
                     other => {
+                        // `export default <AssignmentExpression>`: an anonymous
+                        // function/arrow/class expression is named "default"
+                        // (NamedEvaluation), like `const default = …` would.
                         let expr = other.as_expression().ok_or("unsupported default export")?;
-                        let v = self.expr_into(expr, tmp)?;
+                        let v = self.compile_named_init(tmp, expr, "default")?;
                         if v != tmp {
                             self.emit(Instr::Move { dst: tmp, src: v });
                         }
