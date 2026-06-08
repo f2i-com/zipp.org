@@ -165,6 +165,23 @@ pub enum Instr {
     /// `dst = yield val` — suspend the current generator, handing `val` out as
     /// the yielded value. On resume the value passed to `.next(v)` lands in `dst`.
     Yield { dst: Reg, val: Reg },
+    /// Suspension point for an ASYNC `yield*` delegation step: behaves exactly like
+    /// `Yield` (hands `val` out; resume delivers the `.next(v)` value into `dst`), but
+    /// is a DISTINCT op so the async-generator driver can tell it is delegating. When
+    /// `.throw()` reaches an async generator suspended here and the inner iterator has
+    /// no usable `throw`, the spec requires a TypeError (not the raw thrown value);
+    /// the driver special-cases this op for that. (Full forwarding of a present inner
+    /// `throw`/`return` is a future extension.)
+    AsyncYieldDelegate { dst: Reg, val: Reg },
+    /// `RequireObject(val)` — throw a TypeError if `val` is not an Object. Used after
+    /// awaiting an async iterator's `next()` result (the iterator-result must be an
+    /// Object per the spec; a non-object result is a TypeError, NOT a thenable).
+    RequireObject { val: Reg },
+    /// One async `yield*` THROW-delegation step: `dst = iter.throw(exc)`. Looks up the
+    /// inner iterator's `throw`; if it is absent (undefined/null) or not callable,
+    /// throws a TypeError (the spec's "iterator has no throw" case). Otherwise calls
+    /// it with `exc` and writes the (to-be-awaited) result into `dst`.
+    AsyncIterThrowStep { dst: Reg, iter: Reg, exc: Reg },
     /// `yield*` suspension point: yield `val` like `Yield`, but on resume DELIVER
     /// the resume MODE (0 = next, 1 = throw, 2 = return) into `mode_dst` and the
     /// resume value into `val_dst` — instead of `Yield`'s in-body throw/return

@@ -672,12 +672,33 @@ impl<'p> Vm<'p> {
                 self.resolve(p, r);
             }
             "throw" => {
-                if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
-                    g.state = GenState::Completed;
-                    g.regs.clear();
-                    g.handlers.clear();
+                // If suspended inside an async `yield*` (at an AsyncYieldDelegate),
+                // RESUME the body with the thrown value so the yield* loop's catch
+                // can delegate to the inner iterator's `throw` (calling it, or — when
+                // it is absent — throwing a TypeError) per the spec. Otherwise the
+                // throw force-completes the generator, rejecting with the thrown value.
+                let at_delegate = match self.heap.get(idx) {
+                    HeapObj::AsyncGenerator(g) => {
+                        let fid = g.func;
+                        matches!(g.state, GenState::Suspended(ip)
+                            if matches!(self.func(fid as usize).code.get(ip),
+                                Some(Instr::AsyncYieldDelegate { .. })))
+                    }
+                    _ => false,
+                };
+                if at_delegate {
+                    if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                        g.queue.push(p);
+                    }
+                    self.drive_async_gen(idx, Resume::Throw(arg0));
+                } else {
+                    if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
+                        g.state = GenState::Completed;
+                        g.regs.clear();
+                        g.handlers.clear();
+                    }
+                    self.reject(p, arg0);
                 }
-                self.reject(p, arg0);
             }
             _ => return None,
         }
@@ -699,7 +720,7 @@ impl<'p> Vm<'p> {
                             self.func(g.func as usize).code.get(ip),
                             // A `GenStart` marker = freshly constructed (prologue ran
                             // eagerly), ready to run the body on this first `.next()`.
-                            Some(Instr::Yield { .. } | Instr::GenStart)
+                            Some(Instr::Yield { .. } | Instr::AsyncYieldDelegate { .. } | Instr::GenStart)
                         )
                 }
             },
@@ -798,6 +819,7 @@ impl<'p> Vm<'p> {
                 Resume::Value(v) => {
                     let dst = match self.func(fid as usize).code[resume_ip] {
                         Instr::Yield { dst, .. } => Some(dst),
+                        Instr::AsyncYieldDelegate { dst, .. } => Some(dst),
                         Instr::Await { dst, .. } => Some(dst),
                         _ => None,
                     };
@@ -820,11 +842,17 @@ impl<'p> Vm<'p> {
         };
         // Yielded a value → resolve the front queued promise with {value, done:false}.
         if let Some((y, yield_ip)) = self.pending_yield.take() {
+            // Preserve the body's `try` handlers across the suspension so a later
+            // `.throw()`/`.return()` (or a yield* throw-delegation) can unwind into
+            // them on resume — the await path already does this; the yield path used
+            // to drop them.
+            let handlers = std::mem::take(&mut self.pending_yield_handlers);
             let back = self.regs.split_off(new_base);
             let front = match self.heap.get_mut(idx) {
                 HeapObj::AsyncGenerator(g) => {
                     g.state = GenState::Suspended(yield_ip);
                     g.regs = back;
+                    g.handlers = handlers;
                     (!g.queue.is_empty()).then(|| g.queue.remove(0))
                 }
                 _ => None,

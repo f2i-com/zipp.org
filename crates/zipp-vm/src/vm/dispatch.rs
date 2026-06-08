@@ -2940,6 +2940,40 @@ impl<'p> Vm<'p> {
                         self.pending_yield = Some((v, ip));
                         return Ok(v);
                     }
+                    Instr::AsyncYieldDelegate { val, .. } => {
+                        // An async `yield*` step: suspend exactly like `Yield` (the
+                        // resume `.next(v)` value is delivered into `dst` by
+                        // drive_async_gen). The distinct op lets the async-gen driver
+                        // recognise a delegating suspension for `.throw()` handling.
+                        let v = self.get(base, val);
+                        let f = self.frames.pop().unwrap();
+                        self.pending_yield_handlers = f.handlers;
+                        self.pending_yield = Some((v, ip));
+                        return Ok(v);
+                    }
+                    Instr::RequireObject { val } => {
+                        let v = self.get(base, val);
+                        if !self.is_object_value(v) {
+                            return Err(Thrown(
+                                "TypeError: iterator result is not an object".into(),
+                            ));
+                        }
+                        ip += 1;
+                    }
+                    Instr::AsyncIterThrowStep { dst, iter, exc } => {
+                        let it = self.get(base, iter);
+                        let e = self.get(base, exc);
+                        let m = self.get_member(it, "throw", it)?;
+                        if m.is_nullish() || !self.is_callable(m) {
+                            // No usable `throw` on the delegated iterator → TypeError.
+                            return Err(Thrown(
+                                "TypeError: the iterator does not provide a 'throw' method".into(),
+                            ));
+                        }
+                        let res = self.call_value(m, it, &[e])?;
+                        self.set(base, dst, res);
+                        ip += 1;
+                    }
                     Instr::IterDelegate { value_dst, done_dst, ret_dst, iter, mode, sent } => {
                         let iter_v = self.get(base, iter);
                         let mode_code = self.get(base, mode).as_int();

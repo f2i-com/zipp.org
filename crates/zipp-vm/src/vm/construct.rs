@@ -1782,13 +1782,37 @@ impl<'p> Vm<'p> {
     /// strings, Map/Set, sync generators) passes through (ForAwaitNext drives it).
     pub(crate) fn get_async_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+            // GetMethod(@@asyncIterator): undefined/null ⇒ absent (fall back to the
+            // sync iterator); present-but-not-callable ⇒ TypeError (do NOT fall back —
+            // reading @@iterator could run a getter the spec must not trigger). A
+            // returned iterator must be an Object.
             let am = self.get_prop(v, "@@asyncIterator")?;
-            if self.is_callable(am) {
-                return self.call_value(am, v, &[]);
+            if !am.is_nullish() {
+                if !self.is_callable(am) {
+                    return Err(Thrown(
+                        "TypeError: [Symbol.asyncIterator] is not a function".into(),
+                    ));
+                }
+                let it = self.call_value(am, v, &[])?;
+                if !self.is_object_value(it) {
+                    return Err(Thrown(
+                        "TypeError: [Symbol.asyncIterator]() returned a non-object".into(),
+                    ));
+                }
+                return Ok(it);
             }
             let sm = self.get_prop(v, "@@iterator")?;
-            if self.is_callable(sm) {
-                return self.call_value(sm, v, &[]);
+            if !sm.is_nullish() {
+                if !self.is_callable(sm) {
+                    return Err(Thrown("TypeError: [Symbol.iterator] is not a function".into()));
+                }
+                let it = self.call_value(sm, v, &[])?;
+                if !self.is_object_value(it) {
+                    return Err(Thrown(
+                        "TypeError: [Symbol.iterator]() returned a non-object".into(),
+                    ));
+                }
+                return Ok(it);
             }
         }
         Ok(v)

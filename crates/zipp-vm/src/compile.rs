@@ -6037,32 +6037,92 @@ impl<'a> FnCompiler<'a> {
         if y.delegate {
             let arg = y.argument.as_ref().ok_or("yield* requires an operand")?;
             if self.in_async {
-                // ASYNC `yield*` (async generator): drive the operand via IterNext,
-                // yielding each element. Sent values / return-value / throw-return
-                // delegation are approximated (the async delegation protocol is a
-                // separate path). Left UNCHANGED — adding sync GetIterator here
-                // regresses the async-gen yield* throw/return tests.
+                // ASYNC `yield*` (delegation inside an `async function*`): drive the
+                // operand's ASYNC iterator, awaiting each step exactly like the working
+                // `for await` codegen, and async-yield each value; the `yield*`
+                // expression evaluates to the inner iterator's final `{value}` once it
+                // is done. Uses only existing, proven ops (GetAsyncIterator /
+                // ForAwaitNext / Await / Yield) — no VM change, and no ip-0 suspension
+                // so the iter-170 resume-delivery hazard does not apply.
+                //
+                // SCOPE (minimal slice): next-OUT delegation + completion value + async
+                // iterator acquisition + error propagation (an abrupt operand / inner
+                // next() unwinds the async-gen activation, rejecting its front promise).
+                // NOT yet: forwarding the value sent to the OUTER .next(v) into the
+                // inner iterator (ForAwaitNext calls next() with no arg, so the sent
+                // value is discarded into `sink`), nor delegating the outer
+                // .throw()/.return() into the inner iterator (those force-complete the
+                // async gen) — both are a separate, larger follow-up.
                 let save = self.next_reg;
+                // All registers are allocated once and kept stable: the whole window is
+                // saved/restored across each suspension, and the non-linear control flow
+                // (the throw-delegation catch jumps back into the loop) makes
+                // per-iteration reclaim unsafe.
                 let iter = self.alloc_reg();
                 let v = self.expr_into(arg, iter)?;
                 if v != iter {
                     self.emit(Instr::Move { dst: iter, src: v });
                 }
+                self.emit(Instr::GetAsyncIterator { dst: iter, src: iter });
                 let idx = self.alloc_reg();
                 self.emit(Instr::LoadInt { dst: idx, val: 0 });
-                let elem = self.alloc_reg();
+                let excr = self.alloc_reg(); // catch reg for an injected outer .throw()
+                let step = self.alloc_reg();
+                let r = self.alloc_reg();
                 let done = self.alloc_reg();
-                let sink = self.alloc_reg(); // discards the value sent to next()
+                let value = self.alloc_reg();
+                let sink = self.alloc_reg(); // discards the value sent to outer .next()
+                let tstep = self.alloc_reg();
+                let taw = self.alloc_reg();
+                let done_name = self.string_name("done");
+                let value_name = self.string_name("value");
+                // --- one next() step: r = await iter.next(); require Object ---
                 let top = self.here();
-                self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter, idx });
+                self.emit(Instr::ForAwaitNext { dst: step, iter, idx });
+                self.emit(Instr::Await { dst: r, val: step });
+                self.emit(Instr::RequireObject { val: r });
+                self.emit(Instr::GetProp { dst: done, obj: r, name: done_name });
                 let jdone = self.here();
-                self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
-                self.emit(Instr::Yield { dst: sink, val: elem });
+                self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → yield* value (r.value)
+                self.emit(Instr::GetProp { dst: value, obj: r, name: value_name });
+                // --- (async-)yield the value, with a handler that delegates an outer
+                //     .throw() into the inner iterator's `throw` ---
+                let yield_pt = self.here();
+                let ph = self.here();
+                self.emit(Instr::PushHandler { catch_target: 0, catch_reg: excr });
+                self.handler_depth += 1;
+                self.emit(Instr::AsyncYieldDelegate { dst: sink, val: value });
+                self.emit(Instr::PopHandler);
+                self.handler_depth -= 1;
                 self.emit(Instr::Jump { target: top });
+                // --- catch: an outer .throw(excr) was injected here. Delegate to the
+                //     inner iterator's throw (or TypeError if it has none), await the
+                //     result, then either finish (done) or yield the delegated value. ---
+                let catch_label = self.here();
+                if let Instr::PushHandler { catch_target, .. } = &mut self.code[ph as usize] {
+                    *catch_target = catch_label;
+                }
+                self.emit(Instr::AsyncIterThrowStep { dst: tstep, iter, exc: excr });
+                self.emit(Instr::Await { dst: taw, val: tstep });
+                self.emit(Instr::RequireObject { val: taw });
+                self.emit(Instr::GetProp { dst: done, obj: taw, name: done_name });
+                let jdone2 = self.here();
+                self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // inner.throw done → value
+                self.emit(Instr::GetProp { dst: value, obj: taw, name: value_name });
+                self.emit(Instr::Jump { target: yield_pt }); // re-yield the delegated value
+                // done via inner.throw: yield* value = taw.value.
+                let done_label2 = self.here();
+                self.patch_jump(jdone2, done_label2);
+                self.emit(Instr::GetProp { dst, obj: taw, name: value_name });
+                let jend = self.here();
+                self.emit(Instr::Jump { target: 0 });
+                // done via next(): yield* value = r.value.
+                let done_label = self.here();
+                self.patch_jump(jdone, done_label);
+                self.emit(Instr::GetProp { dst, obj: r, name: value_name });
                 let end = self.here();
-                self.patch_jump(jdone, end);
+                self.patch_jump(jend, end);
                 self.next_reg = save;
-                self.emit(Instr::LoadUndefined { dst });
                 return Ok(dst);
             }
             // SYNC `yield*` — the full delegation protocol (spec 14.4.14 step 5):
