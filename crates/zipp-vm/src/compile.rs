@@ -5845,6 +5845,17 @@ impl<'a> FnCompiler<'a> {
                 self.next_reg = save;
                 Ok(())
             }
+            T::PrivateFieldExpression(m) => {
+                // `[this.#x] = arr` / `({a: this.#x} = o)`: a private field as a
+                // destructuring target — brand-checked PrivateSet (the target
+                // reference is taken before the value per the destructuring driver).
+                let save = self.next_reg;
+                let obj = self.expr(&m.object)?;
+                let name = self.string_name(&private_key(&m.field.name));
+                self.emit(Instr::SetPrivate { obj, name, val: src });
+                self.next_reg = save;
+                Ok(())
+            }
             T::ArrayAssignmentTarget(arr) => self.assign_array_target(arr, src),
             T::ObjectAssignmentTarget(o) => self.assign_object_target(o, src),
             _ => Err("unsupported destructuring-assignment target in the zipp-vm subset".into()),
@@ -5886,6 +5897,14 @@ impl<'a> FnCompiler<'a> {
                 let obj = self.expr(&m.object)?;
                 let key = self.expr(&m.expression)?;
                 self.emit(Instr::SetIndex { obj, key, val });
+                self.next_reg = save;
+                Ok(())
+            }
+            M::PrivateFieldExpression(m) => {
+                let save = self.next_reg;
+                let obj = self.expr(&m.object)?;
+                let name = self.string_name(&private_key(&m.field.name));
+                self.emit(Instr::SetPrivate { obj, name, val });
                 self.next_reg = save;
                 Ok(())
             }
@@ -6184,7 +6203,7 @@ impl<'a> FnCompiler<'a> {
                     if val != dst {
                         self.emit(Instr::Move { dst, src: val });
                     }
-                    self.emit(Instr::SetProp { obj, name, val: dst });
+                    self.emit(Instr::SetPrivate { obj, name, val: dst });
                 } else {
                     let cur = self.temp();
                     self.emit(Instr::GetProp { dst: cur, obj, name });
@@ -6192,7 +6211,7 @@ impl<'a> FnCompiler<'a> {
                     let instr = compound_assign_instr(a.operator, dst, cur, rhs)
                         .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                     self.emit(instr);
-                    self.emit(Instr::SetProp { obj, name, val: dst });
+                    self.emit(Instr::SetPrivate { obj, name, val: dst });
                 }
                 return Ok(dst);
             }

@@ -510,6 +510,12 @@ pub enum Instr {
     GetProp { dst: Reg, obj: Reg, name: u32 },
     /// `obj.<string_constants[name]> = val` — static property write.
     SetProp { obj: Reg, name: u32, val: Reg },
+    /// `obj.#name = val` — a PRIVATE field/element write (PrivateSet). Unlike
+    /// SetProp it brand-checks first: if the private element is NOT present on
+    /// `obj` (PrivateFieldFind/PrivateElementFind empty), throw a TypeError. Used
+    /// for user `this.#x = v` (incl. as a destructuring target), NOT for the
+    /// field-initializer add (that is AddPrivateField).
+    SetPrivate { obj: Reg, name: u32, val: Reg },
     /// Define an own writable/enumerable/configurable data property directly on a
     /// fresh object — CreateDataProperty, NOT [[Set]]: used for object-literal data
     /// properties, which must ignore any inherited accessor / non-writable property.

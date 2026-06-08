@@ -1,4 +1,4 @@
-#![allow(unused_imports)]
+﻿#![allow(unused_imports)]
 use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
@@ -17,7 +17,7 @@ impl<'p> Vm<'p> {
     /// value and unwind to the nearest handler at or above `stop_depth`. If one
     /// exists, execution resumes at its catch target; otherwise the throw
     /// propagates out (with `pending_throw` left set so an enclosing `run_loop`
-    /// — e.g. the caller of a builtin callback — can still catch it).
+    /// â€” e.g. the caller of a builtin callback â€” can still catch it).
     pub(crate) fn run_loop(&mut self, stop_depth: usize) -> Result<Value, Thrown> {
         loop {
             match self.dispatch_body(stop_depth) {
@@ -26,7 +26,7 @@ impl<'p> Vm<'p> {
                     let tv = match self.pending_throw {
                         Some(v) => v,
                         None => {
-                            // Internal error (TypeError/RangeError/…) with no
+                            // Internal error (TypeError/RangeError/â€¦) with no
                             // explicit thrown value: synthesise a real Error
                             // object so `catch (e)` sees `e.name`/`e.message` and
                             // `e instanceof TypeError`, matching JS.
@@ -36,7 +36,7 @@ impl<'p> Vm<'p> {
                         }
                     };
                     if self.unwind_to_handler(tv, stop_depth) {
-                        self.pending_throw = None; // caught — resume at catch
+                        self.pending_throw = None; // caught â€” resume at catch
                         continue;
                     }
                     // Uncaught here; propagate. If the carried message is empty
@@ -55,7 +55,7 @@ impl<'p> Vm<'p> {
     /// Pop frames from the top down to (but not below) `stop_depth`, looking for
     /// a `try` handler. A `Catch` deposits `tv` in its register and resumes at the
     /// catch target. A `Finally` deposits a throw completion (kind 2 + the reason)
-    /// into its registers and resumes at the finally target — `EndFinally`
+    /// into its registers and resumes at the finally target â€” `EndFinally`
     /// re-throws after the finally runs. Either way execution resumes (`true`). If
     /// the boundary is reached with no handler, return `false` (propagate).
     pub(crate) fn unwind_to_handler(&mut self, tv: Value, stop_depth: usize) -> bool {
@@ -88,7 +88,7 @@ impl<'p> Vm<'p> {
     /// on the innermost `Finally`, deposits the completion (`kind` 1=return + the
     /// `value`) into its registers and returns its target so the caller resumes
     /// there (`EndFinally` later re-leaves). Returns `None` when no finally is
-    /// pending — the caller performs the real leave (pop the frame).
+    /// pending â€” the caller performs the real leave (pop the frame).
     pub(crate) fn route_through_finally(&mut self, kind: i32, value: Value) -> Option<u32> {
         let top = self.frames.len() - 1;
         let base = self.frames[top].base;
@@ -111,7 +111,7 @@ impl<'p> Vm<'p> {
     /// Route a `break`/`continue` (`JumpFinally`) that exits one or more `try`
     /// blocks. Pops handlers in the current frame until the stack is back to
     /// `floor` (the handler depth at the target loop): a `Catch` being exited is
-    /// discarded, and the first `Finally` encountered is run first — a kind-3
+    /// discarded, and the first `Finally` encountered is run first â€” a kind-3
     /// (jump) completion is deposited (the `floor` packed into the kind word's
     /// upper bits, the jump `target` in the value register) so `EndFinally`
     /// resumes the unwind toward `target`. Returns the finally body to run, or
@@ -126,7 +126,7 @@ impl<'p> Vm<'p> {
                 self.regs[base + val_reg as usize] = Value::int(target as i32);
                 return Some(ftarget);
             }
-            // A `Catch` handler being exited has no body to run — discard it.
+            // A `Catch` handler being exited has no body to run â€” discard it.
         }
         None
     }
@@ -152,7 +152,7 @@ impl<'p> Vm<'p> {
             // loop; we never mutate program functions during execution.
             let code: &Vec<Instr> = unsafe { &*code };
 
-            // ── JIT tier ──
+            // â”€â”€ JIT tier â”€â”€
             // On fresh frame entry (ip == 0), if this function has compiled
             // native code, run it over the frame's register window. The native
             // code shares `self.regs`, so on a bail the interpreter resumes with
@@ -164,17 +164,17 @@ impl<'p> Vm<'p> {
             // (`jit_recurse_depth == 0`). Once a native self-call has deopted and
             // we're finishing it on the interpreter, re-entering the JIT for the
             // continuation would livelock: native recurses 256, deopts, the
-            // interpreter re-enters native, recurses 256, deopts… forever,
+            // interpreter re-enters native, recurses 256, deoptsâ€¦ forever,
             // because the per-call native depth counter resets each return and
             // interpreter frames never reach MAX_FRAMES. Staying interpreted in
-            // that subtree lets frames accumulate monotonically → RangeError.
+            // that subtree lets frames accumulate monotonically â†’ RangeError.
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             if ip == 0
                 && self.jit_enabled
                 && self.jit_recurse_depth == 0
                 // Runtime `eval`/`new Function` functions live past the program's
                 // function table (leaked boxes addressed via `func()`); the JIT
-                // indexes `program.functions` directly, so never JIT them — they
+                // indexes `program.functions` directly, so never JIT them â€” they
                 // always interpret.
                 && (func_id as usize) < self.main_func_count
                 && !self.func(func_id as usize).is_generator
@@ -192,7 +192,7 @@ impl<'p> Vm<'p> {
                     // (a) a normal deopt (non-int operand, overflow): resume the
                     //     interpreter at the recorded ip with consistent regs.
                     // (b) a self-recursive call threw (e.g. RangeError) and the
-                    //     helper signalled deopt with `pending_throw` set — the
+                    //     helper signalled deopt with `pending_throw` set â€” the
                     //     whole native chain must UNWIND, not resume. Detect (b)
                     //     by the pending throw and return Err so `run_loop`
                     //     dispatches it to the nearest handler / propagates it.
@@ -213,7 +213,7 @@ impl<'p> Vm<'p> {
                     // The self-function's current global Value (a heap Func),
                     // stable since hoist_functions ran at startup. Embedded so a
                     // JIT'd `LoadGlobal(self_slot)` stores the REAL function (not
-                    // a placeholder) — required for a deopted self-Call to
+                    // a placeholder) â€” required for a deopted self-Call to
                     // resolve the callee correctly in the interpreter.
                     let self_val = proto_ref
                         .name_global
@@ -297,9 +297,9 @@ impl<'p> Vm<'p> {
                     Instr::LoadGlobal { dst, idx } => {
                         let v = self.globals[idx as usize];
                         if v.is_uninitialized() {
-                            // Referenced but never declared → ReferenceError. The
-                            // name is in `program.global_names`, or — for a slot an
-                            // `eval` drew from the EVAL_POOL — in `eval_global_map`.
+                            // Referenced but never declared â†’ ReferenceError. The
+                            // name is in `program.global_names`, or â€” for a slot an
+                            // `eval` drew from the EVAL_POOL â€” in `eval_global_map`.
                             let name = self
                                 .program
                                 .global_names
@@ -318,7 +318,7 @@ impl<'p> Vm<'p> {
                             // property there, not in this slot. The global object's
                             // own properties ARE global bindings, so a bare read
                             // resolves to it. Own-only: inherited Object.prototype
-                            // members (`toString`, …) are NOT global bindings, so an
+                            // members (`toString`, â€¦) are NOT global bindings, so an
                             // undeclared name still ReferenceErrors. Slot-only names
                             // (`global_by_name`) are excluded by checking the ObjMap
                             // directly, preserving their uninitialized ReferenceError.
@@ -393,7 +393,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
-                    // Identical to `Add` — a JIT routing hint only (see bytecode).
+                    // Identical to `Add` â€” a JIT routing hint only (see bytecode).
                     Instr::StrConcat { dst, a, b } => {
                         let r = self.add(base, a, b)?;
                         self.set(base, dst, r);
@@ -473,7 +473,7 @@ impl<'p> Vm<'p> {
                     Instr::ToNum { dst, a } => {
                         let va = self.get(base, a);
                         // `+x`: numbers pass through (keep Int tag); `+bigint` throws
-                        // (unary plus is not defined on BigInt); else ToNumber STRICT —
+                        // (unary plus is not defined on BigInt); else ToNumber STRICT â€”
                         // a BigInt reached via ToPrimitive (a boxed `Object(1n)`, or an
                         // object whose valueOf returns a BigInt) is also a TypeError.
                         let r = if va.is_number() {
@@ -514,7 +514,7 @@ impl<'p> Vm<'p> {
                         let vb = self.get(base, b);
                         // BigInt bitwise: &/|/^/<</>> on two BigInts (incl. wrapper
                         // objects, via bigint_binop's ToNumeric); `>>>` is not defined
-                        // for BigInt (TypeError); mixing → TypeError.
+                        // for BigInt (TypeError); mixing â†’ TypeError.
                         match op {
                             B::Ushr => {
                                 if self.this_bigint_value(va).is_some()
@@ -559,7 +559,7 @@ impl<'p> Vm<'p> {
                             B::Ushr => {
                                 let s = to_uint32(self.to_number_coerce(vb)?) & 31;
                                 let u = to_uint32(self.to_number_coerce(va)?) >> s;
-                                // u32 may exceed i32::MAX → keep numeric range.
+                                // u32 may exceed i32::MAX â†’ keep numeric range.
                                 if u <= i32::MAX as u32 {
                                     Value::int(u as i32)
                                 } else {
@@ -601,7 +601,7 @@ impl<'p> Vm<'p> {
                             }
                         } else if let Some(b) = self.bigint_value(va) {
                             // `++`/`--` (this op backs every UpdateExpression) on a
-                            // BigInt operand stays a BigInt — ToNumeric keeps the type
+                            // BigInt operand stays a BigInt â€” ToNumeric keeps the type
                             // (so `n++` yields `n + 1n`, not the Number coercion).
                             self.make_bigint(b.wrapping_add(imm as i128))
                         } else {
@@ -750,8 +750,8 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
-                            // Materialize the spread source's elements (array/set →
-                            // elements; string → chars; map → [k,v] entries) WITHOUT
+                            // Materialize the spread source's elements (array/set â†’
+                            // elements; string â†’ chars; map â†’ [k,v] entries) WITHOUT
                             // holding a heap borrow across the fresh allocations.
                             let mut chars: Option<Vec<char>> = None;
                             let mut map_pairs: Option<Vec<(Value, Value)>> = None;
@@ -822,7 +822,7 @@ impl<'p> Vm<'p> {
                         let excluded =
                             &consts[exclude_start as usize..exclude_start as usize + exclude_count as usize];
                         // Copy src's own enumerable keys except the destructured
-                        // siblings — Getting each (CopyDataProperties), so a getter's
+                        // siblings â€” Getting each (CopyDataProperties), so a getter's
                         // VALUE is copied (not the accessor) and a throw propagates.
                         let keys: Vec<String> = if s.is_heap() {
                             match self.heap.get(s.heap_index()) {
@@ -894,15 +894,15 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         // `extends superclass`: the superclass must be `null` (proto
-                        // parent null) or a constructor — anything else (a plain
-                        // object, a number, …) is a TypeError per ClassDefinition-
+                        // parent null) or a constructor â€” anything else (a plain
+                        // object, a number, â€¦) is a TypeError per ClassDefinition-
                         // Evaluation, thrown here at class creation.
                         let parent_idx = match parent {
                             Some(p) => {
                                 let pv = self.get(base, p);
                                 // Symbol/BigInt HAVE a [[Construct]] (it throws on a
                                 // `super()` call) so they ARE valid extends values
-                                // even though `new Symbol()` throws — IsConstructor is
+                                // even though `new Symbol()` throws â€” IsConstructor is
                                 // true for them, unlike e.g. `parseInt`.
                                 let ctor_like = self.is_constructor(pv)
                                     || (pv.is_heap()
@@ -916,7 +916,7 @@ impl<'p> Vm<'p> {
                                             .into(),
                                     ));
                                 } else {
-                                    // protoParent = Get(superclass, "prototype") — runs
+                                    // protoParent = Get(superclass, "prototype") â€” runs
                                     // an accessor `prototype` (exactly once) and must be
                                     // an Object or null; anything else (a bound
                                     // function's absent prototype, a getter returning a
@@ -1000,7 +1000,7 @@ impl<'p> Vm<'p> {
                         let cv = self.get(base, class);
                         // ToPropertyKey the computed key the SAME way get_index/set_index
                         // do (ToPrimitive string-hint, Symbols kept, real ToString for a
-                        // function/object) — `display` produced a debug string (e.g.
+                        // function/object) â€” `display` produced a debug string (e.g.
                         // "function" for a function-expression key), so the member was
                         // stored under a key the access could never recompute.
                         let kraw = self.get(base, key);
@@ -1019,7 +1019,7 @@ impl<'p> Vm<'p> {
                         let fv = self.materialize_callable(func, base, cur_closure);
                         // SetFunctionName from the evaluated key (NamedEvaluation):
                         // the compile-time proto carried only a "<class>.[computed]"
-                        // placeholder. A Symbol key → "[description]" (or "" when it
+                        // placeholder. A Symbol key â†’ "[description]" (or "" when it
                         // has none); a getter/setter gets the "get "/"set " prefix.
                         let name_prefix = match kind {
                             1 | 4 => 1, // getter / static getter
@@ -1029,7 +1029,7 @@ impl<'p> Vm<'p> {
                         self.set_fn_name_from_key(fv, k, name_prefix);
                         if let HeapObj::Class(c) = self.heap.get_mut(cv.heap_index()) {
                             if kind == 3 {
-                                // Static method — non-enumerable (like a named one).
+                                // Static method â€” non-enumerable (like a named one).
                                 let attr = PropAttr {
                                     writable: true,
                                     enumerable: false,
@@ -1140,14 +1140,14 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperMethod { dst, home_class_id, name, arg_base, argc } => {
                         // `func()` returns `&'p`, so the interned name key outlives
-                        // any `&mut self` below — and resolves eval functions too.
+                        // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
                         // super.m() resolves m via the super base (the home object's
-                        // [[Prototype]]) with `this` = the receiver — like a normal
+                        // [[Prototype]]) with `this` = the receiver â€” like a normal
                         // property get + call (and like SuperMethodComputed). This
                         // reaches inherited methods, accessors, and base-class super
-                        // (→ %Object.prototype%), not just own parent-class methods.
+                        // (â†’ %Object.prototype%), not just own parent-class methods.
                         let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
@@ -1165,7 +1165,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::SuperMethodSpread { dst, home_class_id, name, args } => {
-                        // `super.name(...args)` — like SuperMethod but the arguments come
+                        // `super.name(...args)` â€” like SuperMethod but the arguments come
                         // from a spread array; `this` = the current receiver.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
@@ -1326,7 +1326,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
                         let arr = if argc == 1 && self.get(base, arg_base).is_number() {
-                            // `Array(n)` → n HOLES (absent elements), not n undefineds.
+                            // `Array(n)` â†’ n HOLES (absent elements), not n undefineds.
                             let n = self.get(base, arg_base).as_f64();
                             if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
                                 return Err(Thrown("RangeError: Invalid array length".into()));
@@ -1545,7 +1545,7 @@ impl<'p> Vm<'p> {
                     Instr::CallMethodSpread { dst, obj, name, args } => {
                         let recv = self.get(base, obj);
                         // `func()` returns `&'p`, so the interned name key outlives
-                        // any `&mut self` below — and resolves eval functions too.
+                        // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
                         let args_v = self.get(base, args);
@@ -1563,7 +1563,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::CallMethodComputedSpread { dst, obj, key, args } => {
-                        // `obj[key](...args)` — bind `this` = obj (unlike CallSpread on
+                        // `obj[key](...args)` â€” bind `this` = obj (unlike CallSpread on
                         // the GET result). Builtin method first, else resolve off the
                         // receiver via the computed key and call with `this = recv`.
                         let recv = self.get(base, obj);
@@ -1625,7 +1625,7 @@ impl<'p> Vm<'p> {
                             // isNaN/isFinite are `Number::isNaN/isFinite(? ToNumber(x))`:
                             // ToNumber coerces objects (@@toPrimitive/valueOf/toString)
                             // and propagates abrupt completions (a throwing valueOf, a
-                            // Symbol arg → TypeError), so route through to_number_coerce.
+                            // Symbol arg â†’ TypeError), so route through to_number_coerce.
                             G::IsNaN => Value::bool(self.to_number_coerce(a0)?.is_nan()),
                             G::IsFinite => {
                                 Value::bool(self.to_number_coerce(a0)?.is_finite())
@@ -1644,7 +1644,7 @@ impl<'p> Vm<'p> {
                         let k = self.get(base, key);
                         let o = self.get(base, obj);
                         // The `in` operator (and `#x in`) require an Object right
-                        // operand — a primitive RHS is a TypeError (checked before
+                        // operand â€” a primitive RHS is a TypeError (checked before
                         // ToPropertyKey on the key, per spec order).
                         if !self.is_object_value(o) {
                             let kd = self.display(k);
@@ -1675,7 +1675,7 @@ impl<'p> Vm<'p> {
                             .string_constants[name as usize]
                             .clone();
                         // HasBindingFor a with environment: [[HasProperty]] (own or
-                        // inherited), then the @@unscopables filter — an own/inherited
+                        // inherited), then the @@unscopables filter â€” an own/inherited
                         // `@@unscopables` object whose `key` entry is truthy hides the
                         // binding (so e.g. `with([]) { values }` reaches the outer
                         // binding, not Array.prototype.values).
@@ -1696,7 +1696,7 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let c = self.get(base, ctor);
                         // `Symbol.hasInstance`: if the RHS defines a callable
-                        // @@hasInstance, it fully governs `instanceof` — invoke it
+                        // @@hasInstance, it fully governs `instanceof` â€” invoke it
                         // with the LHS and coerce the result to boolean. (Ordinary
                         // functions/classes have no own @@hasInstance here, so they
                         // fall through to the prototype-chain check below.)
@@ -1721,10 +1721,10 @@ impl<'p> Vm<'p> {
                         // A class uses its `extends` chain; a constructor FUNCTION
                         // checks whether `F.prototype` is in `v`'s prototype chain.
                         // Any other CALLABLE right operand (%Function.prototype%, a
-                        // native function, …) still uses OrdinaryHasInstance.
+                        // native function, â€¦) still uses OrdinaryHasInstance.
                         // `Symbol`/`BigInt` are callable globals (typeof "function")
                         // but not constructors (is_ctor false), so `is_callable` skips
-                        // them; for `instanceof` they ARE valid right operands —
+                        // them; for `instanceof` they ARE valid right operands â€”
                         // OrdinaryHasInstance reads their .prototype and yields false
                         // for a non-wrapper LHS (e.g. `x instanceof Symbol`), never a
                         // "not callable" TypeError. (deepEqual.js guards these with
@@ -1737,7 +1737,7 @@ impl<'p> Vm<'p> {
                             match self.heap.get(c.heap_index()) {
                                 HeapObj::Class(_) => 1u8,
                                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } => 2,
-                                // Built-in constructor globals (Map/Set/Date/WeakMap/…)
+                                // Built-in constructor globals (Map/Set/Date/WeakMap/â€¦)
                                 // are objects but constructable: use prototype-chain check.
                                 HeapObj::Object(m) if m.is_ctor => 2,
                                 _ if c_callable => 3,
@@ -1757,7 +1757,7 @@ impl<'p> Vm<'p> {
                                         || self.instanceof_via_proto(v, c))
                             }
                             2 => self.instanceof_via_proto(v, c),
-                            // A plain callable RHS: spec OrdinaryHasInstance — reads
+                            // A plain callable RHS: spec OrdinaryHasInstance â€” reads
                             // `C.prototype` via [[Get]] (a getter runs; a non-object
                             // prototype throws), returns false for a primitive LHS.
                             3 => self.ordinary_has_instance(c, v)?,
@@ -1786,8 +1786,8 @@ impl<'p> Vm<'p> {
                             S::NumberIsFinite => Value::bool(num_is_finite(a0)),
                             S::NumberIsSafeInteger => Value::bool(num_is_safe_integer(a0)),
                             S::StringFromCharCode => {
-                                // ToUint16(ToNumber(v)) per arg — strict ToNumber
-                                // (ToPrimitive-aware, BigInt/Symbol → TypeError, a
+                                // ToUint16(ToNumber(v)) per arg â€” strict ToNumber
+                                // (ToPrimitive-aware, BigInt/Symbol â†’ TypeError, a
                                 // throwing valueOf propagates rather than being
                                 // swallowed to 0).
                                 let mut s = String::new();
@@ -1931,14 +1931,14 @@ impl<'p> Vm<'p> {
 
                     Instr::Jump { target } => {
                         let t = target as usize;
-                        // A backward jump is a loop back-edge — poll the GC here so
+                        // A backward jump is a loop back-edge â€” poll the GC here so
                         // a tight allocating loop (which never leaves this inner
                         // loop) still gets collected. Safe: all live Values are in
                         // regs, and gc_lock guards any native built-in up-stack.
                         if t < ip {
                             self.maybe_gc();
                         }
-                        // ── OSR tier ── a backward jump is a loop back-edge. After
+                        // â”€â”€ OSR tier â”€â”€ a backward jump is a loop back-edge. After
                         // the region heats up, compile `[target, ip]` (the loop
                         // body, headed at `target`) and run it natively; the
                         // native code returns the ip to resume at (a clean loop
@@ -2124,7 +2124,7 @@ impl<'p> Vm<'p> {
                     Instr::MakeArrow { dst, func_id, this_reg } => {
                         // Like MakeClosure, but the resulting closure also captures the
                         // defining frame's effective `this` (register `this_reg` =
-                        // `this_override.unwrap_or(0)` at the definition site — usually
+                        // `this_override.unwrap_or(0)` at the definition site â€” usually
                         // reg 0, but the class value inside a static field initializer)
                         // so a later call binds it lexically (FuncProto::lexical_this).
                         let sources = &self.func(func_id as usize).upvalues;
@@ -2336,12 +2336,12 @@ impl<'p> Vm<'p> {
                     Instr::ImportCall { dst, spec, phase, opts } => {
                         // import(spec [, opts]) / import.defer / import.source.
                         // Spec order: ToString(spec); then a non-undefined non-object
-                        // `opts` → TypeError; `import.source` → SyntaxError (source
+                        // `opts` â†’ TypeError; `import.source` â†’ SyntaxError (source
                         // phase unavailable for a text module); otherwise resolve the
                         // specifier against the script's dir, load + evaluate the
                         // module ONCE (cached by path so re-import yields the SAME
                         // namespace), and resolve with its (snapshot) namespace. A
-                        // missing file / no base dir → TypeError; a throw during
+                        // missing file / no base dir â†’ TypeError; a throw during
                         // ToString or evaluation rejects with that value. import()
                         // never throws synchronously. Everything that may GC runs
                         // BEFORE the promise is allocated; the settle value is rooted
@@ -2462,6 +2462,24 @@ impl<'p> Vm<'p> {
                         self.set_prop(o, &key, v, strict)?;
                         ip += 1;
                     }
+                    Instr::SetPrivate { obj, name, val } => {
+                        // PrivateSet (user `this.#x = v`): brand-check first â€” the
+                        // private element must be present on the receiver, else a
+                        // TypeError (mirrors the GetProp brand check). Private writes
+                        // are always strict.
+                        let o = self.get(base, obj);
+                        let v = self.get(base, val);
+                        let key = self.func(func_id as usize)
+                            .string_constants[name as usize]
+                            .clone();
+                        if !self.has_property_str(o, &key) {
+                            return Err(Thrown(format!(
+                                "TypeError: Cannot write private member {key} to an object whose class did not declare it"
+                            )));
+                        }
+                        self.set_prop(o, &key, v, true)?;
+                        ip += 1;
+                    }
                     Instr::InitDataProp { obj, name, val } => {
                         // CreateDataProperty on a fresh object-literal object: a plain
                         // own w/e/c data property, ignoring the prototype chain.
@@ -2482,7 +2500,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::DeleteProp { dst, obj, name, strict } => {
                         let o = self.get(base, obj);
-                        // `delete obj.x` does ToObject(base) — null/undefined throw a
+                        // `delete obj.x` does ToObject(base) â€” null/undefined throw a
                         // TypeError (RequireObjectCoercible); other primitives box and
                         // delete returns true.
                         self.require_object_coercible(o)?;
@@ -2500,8 +2518,8 @@ impl<'p> Vm<'p> {
                     Instr::DeleteIndex { dst, obj, key, strict } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
-                        let ks = self.to_property_key(k)?; // ToPropertyKey (symbol → prop_key, object → ToString)
-                        // `delete obj[k]` does ToObject(base) after ToPropertyKey —
+                        let ks = self.to_property_key(k)?; // ToPropertyKey (symbol â†’ prop_key, object â†’ ToString)
+                        // `delete obj[k]` does ToObject(base) after ToPropertyKey â€”
                         // null/undefined throw a TypeError (other primitives box and
                         // delete returns true).
                         self.require_object_coercible(o)?;
@@ -2571,9 +2589,9 @@ impl<'p> Vm<'p> {
                             }
                             // A bound or native function: run via call_value (fixes
                             // `this`/prepends bound args, or dispatches the builtin).
-                            // A CombinatorResolver (a Promise.all/race/… resolve/reject
+                            // A CombinatorResolver (a Promise.all/race/â€¦ resolve/reject
                             // element) is callable too: a userland thenable invokes it
-                            // directly as `onFulfilled(v)` — route it through call_value
+                            // directly as `onFulfilled(v)` â€” route it through call_value
                             // so it performs its combinator step instead of throwing
                             // "not a function". %Function.prototype% is also a callable.
                             if matches!(
@@ -2591,7 +2609,7 @@ impl<'p> Vm<'p> {
                         }
                         // A built-in constructor object invoked as a function
                         // (e.g. an Intl service ctor without `new`), or an
-                        // [[IsHTMLDDA]] exotic called directly (→ undefined).
+                        // [[IsHTMLDDA]] exotic called directly (â†’ undefined).
                         if callee_v.is_heap()
                             && (matches!(self.heap.get(callee_v.heap_index()), HeapObj::Object(m) if m.is_ctor)
                                 || self.is_htmldda.contains(&callee_v.heap_index()))
@@ -2652,26 +2670,26 @@ impl<'p> Vm<'p> {
                     Instr::CallMethod { dst, obj, name, arg_base, argc } => {
                         let recv = self.get(base, obj);
                         // `program` outlives the VM, so borrow the method name
-                        // with the program's lifetime (NOT self's) — avoids
+                        // with the program's lifetime (NOT self's) â€” avoids
                         // cloning the name string on every method call (a heap
                         // alloc per `a.push(i)` / `a.map(cb)` etc.).
                         // `func()` returns `&'p`, so the interned name key outlives
-                        // any `&mut self` below — and resolves eval functions too.
+                        // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
-                        // Hot fast path: `arr.push(x)` — the most common
+                        // Hot fast path: `arr.push(x)` â€” the most common
                         // per-element array idiom. Append directly, skipping the
-                        // try_builtin_method → dispatch_builtin_method → array_method
+                        // try_builtin_method â†’ dispatch_builtin_method â†’ array_method
                         // layering (and the args-gather), then return the new length.
                         // A FROZEN array (or one whose `length` was made non-writable)
-                        // must throw — skip the fast path so it routes through
+                        // must throw â€” skip the fast path so it routes through
                         // array_method's guard. The side tables are empty for an
                         // ordinary array, so this is a no-op in the build-a-list case.
                         if argc == 1
                             && key == "push"
                             && recv.is_heap()
                             // A prototype carrying integer indices means push's new
-                            // index may resolve to a prototype setter (OrdinarySet) —
+                            // index may resolve to a prototype setter (OrdinarySet) â€”
                             // route through array_method's proto-aware path.
                             && !self.array_proto_has_index
                             && !(!self.arr_props.is_empty()
@@ -2779,8 +2797,8 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         // Pass the resolved method VALUE as the callee (so LoadCallee and
-                        // object-method `super` — which reads [[HomeObject]] keyed by the
-                        // executing function value — find it, even for a no-upvalue method).
+                        // object-method `super` â€” which reads [[HomeObject]] keyed by the
+                        // executing function value â€” find it, even for a no-upvalue method).
                         self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, prop)?;
                         break;
                     }
@@ -2965,7 +2983,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::DisposeScope { scope, kind_reg, val_reg } => {
                         // DisposeResources: run this scope's disposers LIFO, merging
-                        // any throw with the incoming completion (kind&3==2 ⇒ the
+                        // any throw with the incoming completion (kind&3==2 â‡’ the
                         // block already threw) into a SuppressedError chain; rewrite
                         // kind/val so the following EndFinally re-raises the merge.
                         let id = self.get(base, scope).as_int() as u32;
@@ -2986,9 +3004,9 @@ impl<'p> Vm<'p> {
                     Instr::RegisterAsyncDisposable { scope, val } => {
                         // CreateDisposableResource (async hint): null/undefined still
                         // pushes an INERT record (so disposal performs one Await); a
-                        // non-object → TypeError; else GetDisposeMethod(async): read
+                        // non-object â†’ TypeError; else GetDisposeMethod(async): read
                         // @@asyncDispose FIRST (once), fall back to @@dispose only when
-                        // it is nullish; both absent/non-callable → TypeError.
+                        // it is nullish; both absent/non-callable â†’ TypeError.
                         let v = self.get(base, val);
                         let id = self.get(base, scope).as_int() as u32;
                         if v.is_nullish() {
@@ -3024,7 +3042,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Instr::AsyncDisposeNext { scope, res, done } => {
-                        // Pop the LAST (LIFO) disposer of the scope. Empty → done. An
+                        // Pop the LAST (LIFO) disposer of the scope. Empty â†’ done. An
                         // inert `undefined` entry yields res=undefined (nothing called).
                         // A real bound disposer is CALLED here (carrying its `this`);
                         // its result is left in `res` for the caller to Await. A sync
@@ -3110,7 +3128,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::Random { dst } => {
-                        // xorshift64* → a uniform double in [0, 1) (top 53 bits).
+                        // xorshift64* â†’ a uniform double in [0, 1) (top 53 bits).
                         let mut x = self.rng_state;
                         x ^= x >> 12;
                         x ^= x << 25;
@@ -3273,7 +3291,7 @@ impl<'p> Vm<'p> {
                         let r = self.get(base, ret);
                         let m = self.get_member(it, "return", it)?;
                         if m.is_nullish() || !self.is_callable(m) {
-                            // No `return` method → the outer generator just returns `ret`.
+                            // No `return` method â†’ the outer generator just returns `ret`.
                             self.set(base, has_dst, Value::bool(false));
                         } else {
                             let res = self.call_value(m, it, &[r])?;
@@ -3287,7 +3305,7 @@ impl<'p> Vm<'p> {
                         let e = self.get(base, exc);
                         let m = self.get_member(it, "throw", it)?;
                         if m.is_nullish() || !self.is_callable(m) {
-                            // No usable `throw` on the delegated iterator → TypeError.
+                            // No usable `throw` on the delegated iterator â†’ TypeError.
                             return Err(Thrown(
                                 "TypeError: the iterator does not provide a 'throw' method".into(),
                             ));
@@ -3325,7 +3343,7 @@ impl<'p> Vm<'p> {
                         // for `drive_async` to park into the heap AsyncState. Unlike
                         // a generator yield, we CAPTURE the frame's `try` handlers
                         // (carried in `pending_await`) so they can be restored on
-                        // resume — letting `try { await p } catch (e)` see a
+                        // resume â€” letting `try { await p } catch (e)` see a
                         // rejection thrown back in at the await point. The async
                         // frame is always the top (and the run_loop stop frame) at
                         // an await, so popping returns to `drive_async`.
@@ -3367,7 +3385,7 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         // A user iterator object (`@@iterator` already resolved by
-                        // GetIterator): pull the next result via `.next()`. Lazy —
+                        // GetIterator): pull the next result via `.next()`. Lazy â€”
                         // a `break` simply stops calling it.
                         if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
                             let next = self.get_prop(it, "next")?;
@@ -3442,7 +3460,7 @@ impl<'p> Vm<'p> {
                                     )));
                                 }
                             }
-                            // Array/Set element, string char, Map [k,v] — positional,
+                            // Array/Set element, string char, Map [k,v] â€” positional,
                             // wrapped in a {value, done} the loop awaits (a tick).
                             _ => {
                                 let cursor = array_index(self.get(base, idx)).unwrap_or(0);
@@ -3481,7 +3499,7 @@ impl<'p> Vm<'p> {
     /// is no compiled code for this function.
     ///
     /// The native code reads/writes `self.regs[base..]` directly via a raw
-    /// pointer taken here and used ONLY for the duration of the call — nothing
+    /// pointer taken here and used ONLY for the duration of the call â€” nothing
     /// in between can resize `self.regs` (the JIT subset issues no calls/allocs).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn try_run_jit(&mut self, func_id: u32, base: usize) -> Option<(Value, u32)> {
@@ -3489,7 +3507,7 @@ impl<'p> Vm<'p> {
         // SAFETY: `jitfn` points into self.jit.compiled (stable for the call).
         // `regs_ptr` is valid for the frame's reg_count slots. A self-call op
         // routes through `jit_self_call` (passed the `vm` pointer below) which
-        // may resize self.regs for the recursive frame — but it RESTORES regs to
+        // may resize self.regs for the recursive frame â€” but it RESTORES regs to
         // this length before returning, and the native code re-reads its window
         // base from the callee-saved register only relative to `regs_ptr`, which
         // stays valid because jit_self_call uses a SEPARATE save/restore of the
@@ -3515,7 +3533,7 @@ impl<'p> Vm<'p> {
         // borrow is held while the sync mutates globals/heap below.
         let field_plan = unsafe { (*region).field_plan().cloned() };
 
-        // ── pre-run sync ── load the promoted object's fields into the scratch
+        // â”€â”€ pre-run sync â”€â”€ load the promoted object's fields into the scratch
         // pool globals the native code reads as ordinary globals.
         if let Some(ref p) = field_plan {
             let obj = self.globals[p.obj_global as usize];
@@ -3534,7 +3552,7 @@ impl<'p> Vm<'p> {
         // after); regs/globals do not move during a region run.
         let resume = unsafe { (*region).run(regs_ptr, vm_ptr) };
 
-        // ── post-run sync ── flush the pool globals back to the object's fields,
+        // â”€â”€ post-run sync â”€â”€ flush the pool globals back to the object's fields,
         // so the interpreter (which resumes on the ORIGINAL bytecode, reading the
         // object) sees consistent values. Runs on EVERY exit (clean or bail).
         if let Some(ref p) = field_plan {
@@ -3570,7 +3588,7 @@ impl<'p> Vm<'p> {
     }
 
     /// Render a thrown value for the UNCAUGHT-throw message (the `Outcome.error`
-    /// string). An Error-like object (`{message,…}` or one with a `.message`)
+    /// string). An Error-like object (`{message,â€¦}` or one with a `.message`)
     /// prints `name: message`; otherwise the value's string form. Catchable
     /// throws bind the real `Value`, so this is only the top-level report.
     pub(crate) fn throw_message(&self, v: Value) -> String {
@@ -3588,12 +3606,12 @@ impl<'p> Vm<'p> {
         format!("Uncaught {}", self.display(v))
     }
 
-    // ── register access ──
+    // â”€â”€ register access â”€â”€
     //
     // Unchecked: the compiler allocates `reg_count` registers per function and
-    // never emits a register index ≥ `reg_count` (it tracks a `max_reg`
+    // never emits a register index â‰¥ `reg_count` (it tracks a `max_reg`
     // high-water mark), and every frame resizes `self.regs` to
-    // `base + reg_count` on entry — so `base + r` is always in bounds. We index
+    // `base + reg_count` on entry â€” so `base + r` is always in bounds. We index
     // `self.regs` freshly each call (no cached pointer), so a reallocation of
     // the register Vec by a re-entrant call/alloc is handled correctly. The
     // `debug_assert!` turns any compiler bug into a loud test failure in debug
@@ -3611,7 +3629,7 @@ impl<'p> Vm<'p> {
         }
     }
 
-    // ── call setup ──
+    // â”€â”€ call setup â”€â”€
 
     /// Resolve a value to a callable function id, or throw a TypeError.
     /// The cell heap-index captured at upvalue slot `idx` of the closure heap
@@ -3712,7 +3730,7 @@ impl<'p> Vm<'p> {
 
         let new_base = self.regs.len();
         // Never grow past the pinned capacity (would realloc and dangle a live
-        // native window pointer) — throw a catchable RangeError instead.
+        // native window pointer) â€” throw a catchable RangeError instead.
         if self.regs_would_overflow(new_base + callee_regs) {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
