@@ -2557,7 +2557,9 @@ impl<'p> Vm<'p> {
                 self.atomics_op(name, args)?
             }
             DISPOSABLE_USE | DISPOSABLE_ADOPT | DISPOSABLE_DEFER | DISPOSABLE_DISPOSE
-            | DISPOSABLE_DISPOSE_ASYNC | DISPOSABLE_MOVE | DISPOSABLE_DISPOSED_GET => {
+            | DISPOSABLE_DISPOSE_ASYNC | DISPOSABLE_MOVE | DISPOSABLE_DISPOSED_GET
+            | ASYNC_DISPOSABLE_USE | ASYNC_DISPOSABLE_ADOPT | ASYNC_DISPOSABLE_DEFER
+            | ASYNC_DISPOSABLE_MOVE => {
                 self.disposable_op(id, this, args)?
             }
             GEN_NEXT | GEN_RETURN | GEN_THROW => {

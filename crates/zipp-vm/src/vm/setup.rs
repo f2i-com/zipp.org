@@ -1918,11 +1918,11 @@ impl<'p> Vm<'p> {
         // Promise) instead of `dispose`, and [Symbol.asyncDispose].
         {
             let methods: &[(&str, u16)] = &[
-                ("use", native::DISPOSABLE_USE),
-                ("adopt", native::DISPOSABLE_ADOPT),
-                ("defer", native::DISPOSABLE_DEFER),
+                ("use", native::ASYNC_DISPOSABLE_USE),
+                ("adopt", native::ASYNC_DISPOSABLE_ADOPT),
+                ("defer", native::ASYNC_DISPOSABLE_DEFER),
                 ("disposeAsync", native::DISPOSABLE_DISPOSE_ASYNC),
-                ("move", native::DISPOSABLE_MOVE),
+                ("move", native::ASYNC_DISPOSABLE_MOVE),
             ];
             let p = build(self, methods, None);
             self.proto_of.insert(p, Value::heap(obj_proto));

@@ -337,10 +337,32 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn disposable_op(&mut self, op: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
         use native::*;
+        // Normalize an AsyncDisposableStack method to its shared behaviour op, and
+        // record the required stack KIND: a sync method (DisposableStack.*) needs a
+        // sync stack, an async method (AsyncDisposableStack.*) needs an async stack —
+        // a cross-brand call (e.g. DisposableStack.prototype.move on an async stack)
+        // is a TypeError. (`disposed` getter is shared → no kind requirement.)
+        let (op, want_async): (u16, Option<bool>) = match op {
+            ASYNC_DISPOSABLE_USE => (DISPOSABLE_USE, Some(true)),
+            ASYNC_DISPOSABLE_ADOPT => (DISPOSABLE_ADOPT, Some(true)),
+            ASYNC_DISPOSABLE_DEFER => (DISPOSABLE_DEFER, Some(true)),
+            ASYNC_DISPOSABLE_MOVE => (DISPOSABLE_MOVE, Some(true)),
+            DISPOSABLE_DISPOSE_ASYNC => (op, Some(true)),
+            DISPOSABLE_DISPOSE | DISPOSABLE_USE | DISPOSABLE_ADOPT | DISPOSABLE_DEFER
+            | DISPOSABLE_MOVE => (op, Some(false)),
+            _ => (op, None),
+        };
         if !(this.is_heap() && self.dispose_stacks.contains_key(&this.heap_index())) {
             return Err(Thrown("TypeError: receiver is not a DisposableStack".into()));
         }
         let ti = this.heap_index();
+        if let Some(want) = want_async {
+            if self.async_stacks.contains(&ti) != want {
+                return Err(Thrown(
+                    "TypeError: receiver is the wrong kind of disposable stack".into(),
+                ));
+            }
+        }
         let disposed = self.dispose_stacks.get(&ti).map(|(_, d)| *d).unwrap_or(true);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // Mutating methods reject a disposed stack with a ReferenceError.

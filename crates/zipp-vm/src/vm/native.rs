@@ -219,6 +219,14 @@ pub const ARR_FROM_ASYNC: u16 = 891;
 // %AsyncIteratorPrototype%[@@asyncDispose] (ES2024): calls this.return() and
 // awaits it, resolving to undefined; delegates to a lazily-compiled JS polyfill.
 pub const ASYNC_ITER_DISPOSE: u16 = 892;
+// AsyncDisposableStack.prototype.use/adopt/defer/move — same behaviour as the
+// sync DisposableStack ops but with an ASYNC brand check (the receiver must be an
+// AsyncDisposableStack), so a sync stack passed to an async method (or vice
+// versa) throws a TypeError.
+pub const ASYNC_DISPOSABLE_USE: u16 = 893;
+pub const ASYNC_DISPOSABLE_ADOPT: u16 = 894;
+pub const ASYNC_DISPOSABLE_DEFER: u16 = 895;
+pub const ASYNC_DISPOSABLE_MOVE: u16 = 896;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -990,6 +998,10 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_EVAL => ("eval", 1),
         SAB_GROW => ("grow", 1),
         DISPOSABLE_USE => ("use", 1),
+        ASYNC_DISPOSABLE_USE => ("use", 1),
+        ASYNC_DISPOSABLE_ADOPT => ("adopt", 2),
+        ASYNC_DISPOSABLE_DEFER => ("defer", 1),
+        ASYNC_DISPOSABLE_MOVE => ("move", 0),
         DISPOSABLE_ADOPT => ("adopt", 2),
         DISPOSABLE_DEFER => ("defer", 1),
         DISPOSABLE_DISPOSE => ("dispose", 0),
