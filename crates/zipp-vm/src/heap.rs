@@ -492,6 +492,10 @@ pub enum HeapObj {
         /// time. `UNDEFINED` when the source needs the generic step path (a generator,
         /// or a multi-source zip/concat helper).
         next: Value,
+        /// `[[GeneratorState]] == "executing"` brand: set while a `.next()` step is in
+        /// flight so that a callback re-entering `.next()`/`.return()` on the same
+        /// helper is a TypeError (GeneratorValidate) rather than infinite recursion.
+        running: bool,
     },
     /// A class value (`class C {…}`). Fields live in the boxed [`ClassData`]:
     /// `ctor` is the func id that runs instance field initializers then the user

@@ -560,6 +560,7 @@ impl<'p> Vm<'p> {
             done: false,
             inner: Value::UNDEFINED,
             next,
+            running: false,
         });
         if self.iterator_helper_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.iterator_helper_proto));
@@ -586,6 +587,11 @@ impl<'p> Vm<'p> {
     fn ih_set_inner(&mut self, idx: u32, v: Value) {
         if let HeapObj::IterHelper { inner, .. } = self.heap.get_mut(idx) {
             *inner = v;
+        }
+    }
+    pub(crate) fn ih_set_running(&mut self, idx: u32, v: bool) {
+        if let HeapObj::IterHelper { running, .. } = self.heap.get_mut(idx) {
+            *running = v;
         }
     }
 
@@ -794,10 +800,31 @@ impl<'p> Vm<'p> {
     }
 
     /// Lazy `.next()` for an Iterator Helper (the `%IteratorHelperPrototype%.next`).
+    /// Guards re-entrancy: a callback that calls `.next()` on the *same* helper while
+    /// a step is in flight gets a TypeError (GeneratorValidate "executing"), not a
+    /// stack overflow / silent wrong answer. The `running` brand is always cleared.
     pub(crate) fn iter_helper_next(&mut self, idx: u32) -> Result<Value, Thrown> {
+        match self.heap.get(idx) {
+            HeapObj::IterHelper { running: true, .. } => {
+                return Err(Thrown("TypeError: Iterator is already running".into()));
+            }
+            HeapObj::IterHelper { .. } => {}
+            _ => {
+                return Err(Thrown(
+                    "TypeError: Iterator Helper next called on incompatible receiver".into(),
+                ))
+            }
+        }
+        self.ih_set_running(idx, true);
+        let r = self.iter_helper_next_inner(idx);
+        self.ih_set_running(idx, false);
+        r
+    }
+
+    fn iter_helper_next_inner(&mut self, idx: u32) -> Result<Value, Thrown> {
         loop {
             let (source, kind, arg, n, cidx, done, inner, next) = match self.heap.get(idx) {
-                HeapObj::IterHelper { source, kind, arg, n, idx, done, inner, next } => {
+                HeapObj::IterHelper { source, kind, arg, n, idx, done, inner, next, .. } => {
                     (*source, *kind, *arg, *n, *idx, *done, *inner, *next)
                 }
                 _ => {

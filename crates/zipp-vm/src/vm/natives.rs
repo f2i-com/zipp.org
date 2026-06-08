@@ -1848,7 +1848,14 @@ impl<'p> Vm<'p> {
             ITER_HELPER_RETURN => {
                 if this.is_heap() {
                     let (kind, source, inner, was_done) = match self.heap.get(this.heap_index()) {
-                        HeapObj::IterHelper { kind, source, inner, done, .. } => {
+                        HeapObj::IterHelper { kind, source, inner, done, running, .. } => {
+                            // Re-entrant return() while a step is executing is a TypeError
+                            // (GeneratorValidate), the same as a re-entrant next().
+                            if *running {
+                                return Err(Thrown(
+                                    "TypeError: Iterator is already running".into(),
+                                ));
+                            }
                             (*kind, *source, *inner, *done)
                         }
                         _ => (0, Value::UNDEFINED, Value::UNDEFINED, true),
@@ -1870,18 +1877,29 @@ impl<'p> Vm<'p> {
                     // Mark done first (a re-entrant return is then a no-op), then
                     // close the underlying iterator — `inner` for concat (its
                     // `source` is the pair-array), else `source`. Skip if already
-                    // done or not yet started (no live underlying iterator).
+                    // done or not yet started (no live underlying iterator). The
+                    // `running` brand is held across the close so that a source's
+                    // return() re-entering this helper's return()/next() is a TypeError
+                    // (the spec models the close as the closure resuming "executing").
                     if let HeapObj::IterHelper { done, .. } = self.heap.get_mut(this.heap_index()) {
                         *done = true;
                     }
-                    if !was_done && kind == 7 {
-                        // zip: close every still-open input iterator.
-                        self.iz_close_all(this.heap_index());
-                    } else if !was_done {
-                        let target = if kind == 6 { inner } else { source };
-                        if self.is_object_value(target) {
-                            self.iterator_close(target)?;
-                        }
+                    if !was_done {
+                        self.ih_set_running(this.heap_index(), true);
+                        let r = if kind == 7 {
+                            // zip: close every still-open input iterator.
+                            self.iz_close_all(this.heap_index());
+                            Ok(())
+                        } else {
+                            let target = if kind == 6 { inner } else { source };
+                            if self.is_object_value(target) {
+                                self.iterator_close(target)
+                            } else {
+                                Ok(())
+                            }
+                        };
+                        self.ih_set_running(this.heap_index(), false);
+                        r?;
                     }
                 }
                 self.iter_result(Value::UNDEFINED, true)
