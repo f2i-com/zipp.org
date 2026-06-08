@@ -2591,7 +2591,9 @@ impl<'p> Vm<'p> {
                 self.dataview_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
             }
             ARRAYBUFFER_SLICE => {
-                if !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::ArrayBuffer { .. })) {
+                // slice requires a non-shared ArrayBuffer receiver.
+                let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                if shared || !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::ArrayBuffer { .. })) {
                     return Err(Thrown(
                         "TypeError: ArrayBuffer.prototype.slice called on incompatible receiver".into(),
                     ));
@@ -2599,7 +2601,8 @@ impl<'p> Vm<'p> {
                 self.arraybuffer_method(this.heap_index(), "slice", args)?.unwrap_or(Value::UNDEFINED)
             }
             ARRAYBUFFER_RESIZE => {
-                if !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::ArrayBuffer { .. })) {
+                let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
+                if shared || !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::ArrayBuffer { .. })) {
                     return Err(Thrown(
                         "TypeError: ArrayBuffer.prototype.resize called on incompatible receiver".into(),
                     ));
@@ -2638,13 +2641,18 @@ impl<'p> Vm<'p> {
                 .contains(&id) =>
             {
                 let (name, kind) = BUFFER_GETTERS[(id - BUFFER_GETTER_BASE) as usize];
+                // The ArrayBuffer getters (kind 0: byteLength/maxByteLength/resizable/
+                // detached) require IsSharedArrayBuffer(this) to be false — a
+                // SharedArrayBuffer is the same HeapObj internally but must be rejected.
+                let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
                 let ok = this.is_heap()
                     && matches!(
                         (kind, self.heap.get(this.heap_index())),
                         (0, HeapObj::ArrayBuffer { .. })
                             | (1, HeapObj::TypedArray { .. })
                             | (2, HeapObj::DataView { .. })
-                    );
+                    )
+                    && !(kind == 0 && shared);
                 if !ok {
                     return Err(Thrown(format!(
                         "TypeError: get {name} called on an incompatible receiver"
