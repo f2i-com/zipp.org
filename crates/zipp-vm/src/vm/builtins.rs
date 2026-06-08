@@ -130,6 +130,19 @@ impl<'p> Vm<'p> {
             }
             "propertyIsEnumerable" => {
                 let key = self.to_property_key(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                // On a Proxy, [[GetOwnProperty]] runs the gopd trap (which can be
+                // user JS), so own_is_enumerable (&self) can't reach it — consult
+                // proxy_gopd and report the descriptor's [[Enumerable]].
+                if recv.is_heap() && self.proxy_parts(recv.heap_index()).is_some() {
+                    let en = match self.proxy_gopd(recv, &key)? {
+                        Some(desc) => {
+                            let e = self.get_prop(desc, "enumerable")?;
+                            self.truthy(e)
+                        }
+                        None => false,
+                    };
+                    return Ok(Some(Value::bool(en)));
+                }
                 return Ok(Some(Value::bool(self.own_is_enumerable(recv, &key))));
             }
             "isPrototypeOf" => {

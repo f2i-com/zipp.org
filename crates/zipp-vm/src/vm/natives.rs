@@ -274,7 +274,20 @@ impl<'p> Vm<'p> {
             PROTO_PROP_ENUM => {
                 let k = self.to_property_key(a0)?;
                 self.require_object_coercible(this)?; // ToObject(this)
-                Value::bool(self.own_is_enumerable(this, &k))
+                // On a Proxy, [[GetOwnProperty]] runs the gopd trap (user JS), so
+                // own_is_enumerable (&self) can't reach it — consult proxy_gopd.
+                if this.is_heap() && self.proxy_parts(this.heap_index()).is_some() {
+                    let en = match self.proxy_gopd(this, &k)? {
+                        Some(desc) => {
+                            let e = self.get_prop(desc, "enumerable")?;
+                            self.truthy(e)
+                        }
+                        None => false,
+                    };
+                    Value::bool(en)
+                } else {
+                    Value::bool(self.own_is_enumerable(this, &k))
+                }
             }
             // isPrototypeOf: a non-object argument is `false` BEFORE ToObject(this).
             PROTO_IS_PROTO_OF => {
