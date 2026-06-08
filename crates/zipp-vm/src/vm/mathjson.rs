@@ -476,6 +476,40 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// `[[Get]](holder, key)` for the reviver walk: a canonical array index goes
+    /// through `get_index` (so an absent element reads up the prototype chain), any
+    /// other key through the named `[[Get]]`. Both observe getters / Proxy traps.
+    fn json_get(&mut self, holder: Value, key: &str) -> Result<Value, Thrown> {
+        if let Ok(i) = key.parse::<u32>() {
+            if i.to_string() == *key {
+                return self.get_index(holder, Value::num(i as f64));
+            }
+        }
+        self.get_prop(holder, key)
+    }
+
+    /// CreateDataProperty(target, key, value): `target.[[DefineOwnProperty]]` with a
+    /// fresh `{value, writable, enumerable, configurable}` data descriptor. A Proxy's
+    /// defineProperty trap may throw (propagated); an ordinary object that REJECTS the
+    /// define (e.g. a non-configurable existing prop) just returns false — no throw.
+    fn json_create_data(&mut self, target: Value, key: &str, value: Value) -> Result<(), Thrown> {
+        let is_proxy = target.is_heap()
+            && matches!(self.heap.get(target.heap_index()), HeapObj::Proxy { .. });
+        let mut m = crate::heap::ObjMap::new();
+        m.set("value", value);
+        m.set("writable", Value::TRUE);
+        m.set("enumerable", Value::TRUE);
+        m.set("configurable", Value::TRUE);
+        let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+        let r = self.object_define_property(target, key, desc);
+        if is_proxy {
+            r
+        } else {
+            let _ = r; // ordinary [[DefineOwnProperty]] never throws; a reject is false
+            Ok(())
+        }
+    }
+
     /// InternalizeJSONProperty: walk the parsed tree bottom-up, replacing each
     /// `holder[key]` with `reviver.call(holder, key, value, context)`. Children
     /// are revived before their parent; a child revived to `undefined` is
@@ -489,75 +523,66 @@ impl<'p> Vm<'p> {
         reviver: Value,
         src: Option<&JsonSrc>,
     ) -> Result<Value, Thrown> {
-        // Read `holder[key]`, routing a numeric key on an array to its element
-        // (`get_prop` only handles named properties).
-        let val = match self.array_element_index(holder, key) {
-            Some(i) => match self.heap.get(holder.heap_index()) {
-                HeapObj::Array(items) => items.get(i).copied().unwrap_or(Value::UNDEFINED),
-                _ => Value::UNDEFINED,
-            },
-            None => self.get_prop(holder, key)?,
-        };
-        if val.is_heap() {
-            // Snapshot the child shape under a short borrow, then recurse (no heap
-            // borrow may be held across the reviver re-entry).
-            enum Kind {
-                Arr(usize),
-                Obj(Vec<String>),
-                Other,
-            }
-            let kind = match self.heap.get(val.heap_index()) {
-                HeapObj::Array(items) => Kind::Arr(items.len()),
-                HeapObj::Object(map) => {
-                    let mut keys = Vec::new();
-                    for i in 0..map.keys.len() {
-                        if map.attrs[i].enumerable && !is_hidden_key(&map.keys[i]) {
-                            keys.push(map.keys[i].clone());
-                        }
+        // 1. val = ? Get(holder, name)  — a real [[Get]] (getters / Proxy / the
+        // prototype chain are all observed, e.g. a deleted element reads its inherited
+        // value).
+        let val = self.json_get(holder, key)?;
+        // 2. If Type(val) is Object: recurse into its elements / enumerable props
+        // using REAL object operations so a reviver that mutates the holder (changing
+        // length, replacing a value with a Proxy, making a prop non-configurable, …)
+        // is observed and any abrupt completion propagates.
+        if val.is_heap() && self.is_object_value(val) {
+            if self.value_is_array(val) {
+                // 2.b.ii  len = ? ToLength(? Get(val, "length"))
+                let lenv = self.get_prop(val, "length")?;
+                let lenf = self.to_number_coerce(lenv)?;
+                let len: u64 = if lenf.is_nan() || lenf <= 0.0 {
+                    0
+                } else {
+                    lenf.min(9007199254740991.0) as u64
+                };
+                let mut i: u64 = 0;
+                while i < len {
+                    let k = i.to_string();
+                    // Source tracking only applies to the ORIGINAL parsed element at
+                    // this position; a reviver-replaced value has no source (the kind
+                    // check below falls to None for a replaced array/object, and a
+                    // replaced primitive keeps the positional node — matching the
+                    // common unmodified case without a value snapshot).
+                    let child = match src {
+                        Some(JsonSrc::Arr(v)) => v.get(i as usize),
+                        _ => None,
+                    };
+                    let nv = self.internalize_json(val, &k, reviver, child)?;
+                    if nv.is_undefined() {
+                        self.delete_property(val, &k)?; // ? val.[[Delete]](ToString(I))
+                    } else {
+                        self.json_create_data(val, &k, nv)?; // ? CreateDataProperty
                     }
-                    // InternalizeJSONProperty visits keys in EnumerableOwnPropertyNames
-                    // order: integer indices ascending, then the rest in insertion order.
-                    let ord = spec_key_order(&keys);
-                    let keys = ord.into_iter().map(|i| keys[i].clone()).collect();
-                    Kind::Obj(keys)
+                    i += 1;
                 }
-                _ => Kind::Other,
-            };
-            match kind {
-                Kind::Arr(len) => {
-                    for i in 0..len {
-                        let k = i.to_string();
-                        let child = match src {
-                            Some(JsonSrc::Arr(v)) => v.get(i),
-                            _ => None,
-                        };
-                        let nv = self.internalize_json(val, &k, reviver, child)?;
-                        // Array elements: write/clear in place (a deleted element
-                        // becomes a hole, which serialises back as `null`).
-                        if let HeapObj::Array(items) = self.heap.get_mut(val.heap_index()) {
-                            if i < items.len() {
-                                items[i] = if nv.is_undefined() { Value::UNDEFINED } else { nv };
-                            }
+            } else {
+                // 2.c  keys = ? EnumerableOwnPropertyNames(val, key)  — proxy-aware
+                // (the ownKeys trap may throw), in integer-then-insertion order.
+                let keys_v = self.object_enum_own(val, crate::vm::EnumWhat::Keys)?;
+                let keys: Vec<String> = match self.heap.get(keys_v.heap_index()) {
+                    HeapObj::Array(a) => a.iter().map(|&k| self.display(k)).collect(),
+                    _ => Vec::new(),
+                };
+                for k in keys {
+                    let child = match src {
+                        Some(JsonSrc::Obj(pairs)) => {
+                            pairs.iter().find(|(pk, _)| pk == &k).map(|(_, s)| s)
                         }
-                    }
-                }
-                Kind::Obj(keys) => {
-                    for k in keys {
-                        let child = match src {
-                            Some(JsonSrc::Obj(pairs)) => {
-                                pairs.iter().find(|(pk, _)| pk == &k).map(|(_, s)| s)
-                            }
-                            _ => None,
-                        };
-                        let nv = self.internalize_json(val, &k, reviver, child)?;
-                        if nv.is_undefined() {
-                            self.delete_property(val, &k)?;
-                        } else {
-                            self.set_prop(val, &k, nv, false)?;
-                        }
+                        _ => None,
+                    };
+                    let nv = self.internalize_json(val, &k, reviver, child)?;
+                    if nv.is_undefined() {
+                        self.delete_property(val, &k)?;
+                    } else {
+                        self.json_create_data(val, &k, nv)?;
                     }
                 }
-                Kind::Other => {}
             }
         }
         let context = self.make_json_context(src);
