@@ -157,6 +157,8 @@ impl<'p> Vm<'p> {
             using_next_id: 0,
             weakref_ctor: 0,
             finreg_ctor: 0,
+            weakmap_ctor: 0,
+            weakset_ctor: 0,
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),

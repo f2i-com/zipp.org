@@ -812,6 +812,8 @@ impl<'p> Vm<'p> {
         }
         let weakmap_ctor = build(self, &[], Some(weakmap_proto));
         let weakset_ctor = build(self, &[], Some(weakset_proto));
+        self.weakmap_ctor = weakmap_ctor;
+        self.weakset_ctor = weakset_ctor;
         let weakref_ctor = build(self, &[], Some(weakref_proto));
         let finreg_ctor = build(self, &[], Some(finreg_proto));
         self.weakref_ctor = weakref_ctor;

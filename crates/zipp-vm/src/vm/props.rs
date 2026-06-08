@@ -2536,7 +2536,10 @@ impl<'p> Vm<'p> {
             .get(&obj.heap_index())
             .and_then(|p| p.is_heap().then(|| p.heap_index()))
             .unwrap_or(proto);
-        Ok(self.proto_member(eff, key))
+        // Accessor-aware so an inherited getter on the type's prototype (e.g. a
+        // user-redefined `set`/`add`) is INVOKED with `obj` as the receiver, not
+        // returned as the raw getter function.
+        self.proto_member_get(eff, key, obj)
     }
 
     /// Property GET with an explicit `receiver` — the original object a lookup

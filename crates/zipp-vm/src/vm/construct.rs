@@ -679,6 +679,28 @@ impl<'p> Vm<'p> {
             let over = self.newtarget_proto_override(new_target, cv, self.suppressederror_proto)?;
             return Ok(self.set_ctor_proto(r, over));
         }
+        if ci == self.weakmap_ctor && ci != 0 {
+            let over = self.newtarget_proto_override(new_target, cv, self.weakmap_proto)?;
+            let wm = Value::heap(
+                self.heap.alloc(HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() }),
+            );
+            let wm = self.set_ctor_proto(wm, over);
+            let it = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !it.is_nullish() {
+                self.add_entries_via_adder(wm, it, true)?;
+            }
+            return Ok(wm);
+        }
+        if ci == self.weakset_ctor && ci != 0 {
+            let over = self.newtarget_proto_override(new_target, cv, self.weakset_proto)?;
+            let ws = Value::heap(self.heap.alloc(HeapObj::WeakSet(Vec::new())));
+            let ws = self.set_ctor_proto(ws, over);
+            let it = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !it.is_nullish() {
+                self.add_entries_via_adder(ws, it, false)?;
+            }
+            return Ok(ws);
+        }
         if ci == self.weakref_ctor && ci != 0 {
             let t = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !self.is_object_value(t) {
