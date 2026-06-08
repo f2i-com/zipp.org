@@ -2909,6 +2909,70 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
+                    Instr::OpenUsingScope { dst } => {
+                        // Allocate a fresh `using` resource scope; its id (in a
+                        // register, so it rides the frame across suspensions) keys
+                        // the disposer list in `using_resources`.
+                        let id = self.using_next_id;
+                        self.using_next_id = self.using_next_id.wrapping_add(1);
+                        self.using_resources.insert(id, Vec::new());
+                        self.set(base, dst, Value::int(id as i32));
+                        ip += 1;
+                    }
+                    Instr::RegisterDisposable { scope, val } => {
+                        // CreateDisposableResource (sync hint): null/undefined adds
+                        // nothing; a non-object, or an object whose @@dispose is
+                        // absent/non-callable, throws a TypeError AT the declaration
+                        // (which unwinds through the enclosing finally so already-
+                        // registered resources are still disposed).
+                        let v = self.get(base, val);
+                        if v.is_nullish() {
+                            ip += 1;
+                        } else {
+                            if !self.is_object_value(v) {
+                                return Err(Thrown(
+                                    "TypeError: a 'using' declaration value is not an object".into(),
+                                ));
+                            }
+                            let method = self.get_member(v, "@@dispose", v)?;
+                            if !self.is_callable(method) {
+                                return Err(Thrown(
+                                    "TypeError: the 'using' value's [Symbol.dispose] is not a function"
+                                        .into(),
+                                ));
+                            }
+                            let disposer = Value::heap(self.heap.alloc(HeapObj::Bound {
+                                target: method,
+                                this: v,
+                                args: Vec::new(),
+                            }));
+                            let id = self.get(base, scope).as_int() as u32;
+                            if let Some(d) = self.using_resources.get_mut(&id) {
+                                d.push(disposer);
+                            }
+                            ip += 1;
+                        }
+                    }
+                    Instr::DisposeScope { scope, kind_reg, val_reg } => {
+                        // DisposeResources: run this scope's disposers LIFO, merging
+                        // any throw with the incoming completion (kind&3==2 ⇒ the
+                        // block already threw) into a SuppressedError chain; rewrite
+                        // kind/val so the following EndFinally re-raises the merge.
+                        let id = self.get(base, scope).as_int() as u32;
+                        let disposers =
+                            self.using_resources.remove(&id).unwrap_or_default();
+                        let raw = self.regs[base + kind_reg as usize].as_int();
+                        let incoming = if raw & 3 == 2 {
+                            Some(self.regs[base + val_reg as usize])
+                        } else {
+                            None
+                        };
+                        if let Some(v) = self.dispose_resource_list(disposers, incoming)? {
+                            self.regs[base + kind_reg as usize] = Value::int(2);
+                            self.regs[base + val_reg as usize] = v;
+                        }
+                        ip += 1;
+                    }
                     Instr::JumpFinally { target, floor } => {
                         // A `break`/`continue` exiting one or more `try` blocks:
                         // run each intervening `finally` first, popping any

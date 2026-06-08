@@ -143,6 +143,40 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(idx))
     }
 
+    /// DisposeResources (§9.5.6): run `disposers` in REVERSE (LIFO), merging any
+    /// thrown error into the running `completion` — when a completion is already
+    /// pending, the new error becomes a `SuppressedError{error: new, suppressed:
+    /// prior}`; otherwise the error becomes the completion as-is. `completion` is
+    /// `None` for a normal incoming completion or `Some(v)` for a pending throw `v`.
+    /// Returns `Ok(None)` (normal) or `Ok(Some(v))` (the merged completion is a
+    /// throw of `v`). Each disposer is a `Bound{method, this}` so it is called with
+    /// `this` = its resource value and no arguments.
+    pub(crate) fn dispose_resource_list(
+        &mut self,
+        disposers: Vec<Value>,
+        mut completion: Option<Value>,
+    ) -> Result<Option<Value>, Thrown> {
+        // The drained disposer list and the running `completion` are Rust locals
+        // (not in a register / map), so a GC during a disposer call could sweep
+        // them — suspend GC for the loop (the established hold-Values-across-a-
+        // callback pattern).
+        let _gc = self.gc_lock_guard();
+        for d in disposers.into_iter().rev() {
+            if self.call_value(d, Value::UNDEFINED, &[]).is_err() {
+                // Thrown carries only a message; recapture the REAL thrown Value.
+                let ev = self
+                    .pending_throw
+                    .take()
+                    .unwrap_or_else(|| self.make_error(1, None));
+                completion = Some(match completion {
+                    Some(prior) => self.build_suppressed_error(&[ev, prior, Value::UNDEFINED])?,
+                    None => ev,
+                });
+            }
+        }
+        Ok(completion)
+    }
+
     /// Allocate a fresh `DisposableStack` instance (a plain object linked to
     /// %DisposableStack.prototype%, with an empty, not-yet-disposed disposer stack).
     pub(crate) fn alloc_disposable_stack(&mut self, is_async: bool) -> u32 {

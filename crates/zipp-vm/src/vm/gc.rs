@@ -211,6 +211,11 @@ impl Vm<'_> {
                 root_val!(v);
             }
         }
+        for disposers in self.using_resources.values() {
+            for &v in disposers {
+                root_val!(v);
+            }
+        }
         for m in self.fn_props.values().chain(self.arr_props.values()) {
             for &v in &m.vals {
                 root_val!(v);

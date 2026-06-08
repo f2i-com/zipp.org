@@ -421,6 +421,14 @@ pub struct Vm<'p> {
     disposablestack_ctor: u32,
     disposablestack_proto: u32,
     dispose_stacks: std::collections::HashMap<u32, (Vec<Value>, bool)>,
+    /// Per-block `using`-declaration resource scopes, keyed by a monotonic id
+    /// (`using_next_id`) that the `OpenUsingScope` op hands back in a register.
+    /// Each value is the scope's list of disposers (a @@dispose method bound to its
+    /// resource value), pushed by `RegisterDisposable` and drained LIFO by
+    /// `DisposeScope` on block exit. The disposers are GC roots (see gc.rs); the
+    /// entry is removed when its `DisposeScope` runs.
+    using_resources: std::collections::HashMap<u32, Vec<Value>>,
+    using_next_id: u32,
     /// `AsyncDisposableStack` ctor + prototype, and the set of dispose-stack
     /// instances that are ASYNC (their `use` prefers @@asyncDispose and their
     /// disposal goes through `disposeAsync`, which returns a Promise).

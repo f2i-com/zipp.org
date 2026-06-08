@@ -857,14 +857,20 @@ impl Compiler {
             }
         }
 
-        for s in body {
-            // Top-level function declarations were materialised at entry above.
-            if !is_script {
-                if let ox::Statement::FunctionDeclaration(_) = s {
-                    continue;
+        if FnCompiler::block_has_using(body) {
+            // A function/generator/async body with a top-level `using` disposes its
+            // resources on return/throw — same finally desugar as a block.
+            fc.compile_using_block(body, !is_script)?;
+        } else {
+            for s in body {
+                // Top-level function declarations were materialised at entry above.
+                if !is_script {
+                    if let ox::Statement::FunctionDeclaration(_) = s {
+                        continue;
+                    }
                 }
+                fc.stmt(s)?;
             }
-            fc.stmt(s)?;
         }
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
         fc.cx.new_target_ok = parent_nt;
@@ -1324,6 +1330,11 @@ struct FnCompiler<'a> {
     /// to `JumpFinally` instead of `Jump`. Maintained across try/catch/finally
     /// regions (see `try_with_finally` / `try_catch_only`).
     handler_depth: usize,
+    /// Register holding the runtime resource-scope id of the innermost enclosing
+    /// `using` block currently being compiled (set by `compile_using_block`), so a
+    /// `using` declaration's `RegisterDisposable` knows which scope to push onto.
+    /// `None` outside any `using` block; saved/restored across block nesting.
+    using_scope_reg: Option<Reg>,
 }
 
 /// Pending `break`/`continue` jumps for one enclosing breakable construct. A
@@ -1404,6 +1415,7 @@ impl<'a> FnCompiler<'a> {
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
             handler_depth: 0,
+            using_scope_reg: None,
             self_name: None,
             captured,
             cell_regs: HashSet::new(),
@@ -1707,8 +1719,14 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                 }
-                for st in &b.body {
-                    self.stmt(st)?;
+                if Self::block_has_using(&b.body) {
+                    // A block with a top-level `using` declaration disposes its
+                    // resources on every exit — desugar onto a synthetic finally.
+                    self.compile_using_block(&b.body, false)?;
+                } else {
+                    for st in &b.body {
+                        self.stmt(st)?;
+                    }
                 }
                 self.pop_scope();
             }
@@ -2154,6 +2172,23 @@ impl<'a> FnCompiler<'a> {
                 self.next_reg -= 1;
             } else {
                 self.emit(Instr::LoadUndefined { dst: reg });
+            }
+            // A sync `using x = init` registers its resource for disposal at block
+            // exit (after the binding is stored). `await using` binds like `let`
+            // but is not yet disposed (deferred). `using_scope_reg` is set by the
+            // enclosing `compile_using_block`; it is always present for a `using`
+            // declaration (the block/body that contains one is wrapped).
+            if d.kind == ox::VariableDeclarationKind::Using {
+                if let Some(scope_reg) = self.using_scope_reg {
+                    if is_cell {
+                        let t = self.temp();
+                        self.emit(Instr::CellGet { dst: t, cell: reg });
+                        self.emit(Instr::RegisterDisposable { scope: scope_reg, val: t });
+                        self.next_reg -= 1;
+                    } else {
+                        self.emit(Instr::RegisterDisposable { scope: scope_reg, val: reg });
+                    }
+                }
             }
         }
         Ok(())
@@ -3412,6 +3447,70 @@ impl<'a> FnCompiler<'a> {
         let after = self.here();
         self.patch_jump(skip, after);
         let _ = catch_start;
+        Ok(())
+    }
+
+    /// True iff `body` declares a top-level `using`/`await using` resource. Only
+    /// such blocks/bodies get the disposal scaffolding — every other block keeps
+    /// its byte-for-byte-identical fast path (the zero-regression gate).
+    fn block_has_using(body: &[ox::Statement]) -> bool {
+        body.iter().any(|st| {
+            matches!(st,
+                ox::Statement::VariableDeclaration(d)
+                    if matches!(d.kind,
+                        ox::VariableDeclarationKind::Using
+                        | ox::VariableDeclarationKind::AwaitUsing))
+        })
+    }
+
+    /// Compile a statement list that contains `using` declarations: desugar it onto
+    /// the existing `PushFinally`/`EndFinally` machinery so the registered resources
+    /// are disposed (LIFO, SuppressedError-chained) on EVERY exit — normal, throw,
+    /// break, continue, return. A fresh runtime resource-scope id lives in
+    /// `scope_reg` and becomes `using_scope_reg` for the body, so each `using`'s
+    /// `RegisterDisposable` pushes onto it. (Sync `using` only this iteration;
+    /// `await using` still binds like `let` but is not yet disposed.)
+    fn compile_using_block(&mut self, body: &[ox::Statement], skip_fn_decls: bool) -> R<()> {
+        // NB: unlike `try_with_finally`, do NOT reset the completion register — a
+        // `using` block's own completion is empty (UpdateEmpty), so it must
+        // PRESERVE the prior eval completion (`4; {using x=null;}` ⇒ 4). The
+        // DisposeScope/EndFinally epilogue never writes the completion register.
+        let scope_reg = self.alloc_reg();
+        let kind_reg = self.alloc_reg();
+        let val_reg = self.alloc_reg();
+        self.emit(Instr::OpenUsingScope { dst: scope_reg });
+
+        let fin_push = self.here();
+        self.emit(Instr::PushFinally { target: 0, kind_reg, val_reg });
+        self.handler_depth += 1;
+
+        let prev_scope = self.using_scope_reg.replace(scope_reg);
+        for st in body {
+            // Function-body callers materialise top-level function declarations at
+            // entry and skip them here (mirrors the non-using body loop).
+            if skip_fn_decls {
+                if let ox::Statement::FunctionDeclaration(_) = st {
+                    continue;
+                }
+            }
+            self.stmt(st)?;
+        }
+        self.using_scope_reg = prev_scope;
+
+        self.emit_leave_finally_normal(kind_reg);
+        let normal_jump = self.here();
+        self.emit(Instr::Jump { target: 0 });
+
+        self.handler_depth -= 1;
+        let fin_start = self.here();
+        if let Instr::PushFinally { target, .. } = &mut self.code[fin_push as usize] {
+            *target = fin_start;
+        }
+        self.patch_jump(normal_jump, fin_start);
+
+        self.emit(Instr::DisposeScope { scope: scope_reg, kind_reg, val_reg });
+        self.emit(Instr::EndFinally { kind_reg, val_reg });
+        self.next_reg -= 3; // reclaim scope_reg / kind_reg / val_reg
         Ok(())
     }
 

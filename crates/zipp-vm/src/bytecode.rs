@@ -563,6 +563,23 @@ pub enum Instr {
     /// pending throw, resume a pending `break`/`continue` jump (chaining through any
     /// intervening finally), or fall through on normal completion.
     EndFinally { kind_reg: Reg, val_reg: Reg },
+
+    // ── Explicit Resource Management (`using` declarations) ──
+    /// Open a fresh per-block sync-disposal scope: allocate an empty disposer list
+    /// in `using_resources` and store its id (as an int Value) in `dst`. The id
+    /// lives in a register so it is saved/restored with the frame (generator-safe).
+    OpenUsingScope { dst: Reg },
+    /// Register a `using` resource (CreateDisposableResource, sync hint): `val` is
+    /// the already-bound initializer value; `scope` holds the enclosing scope id.
+    /// null/undefined → add nothing; a non-object → TypeError; an object whose
+    /// @@dispose is absent/null/non-callable → TypeError; otherwise push a
+    /// disposer (the @@dispose method bound to the value) onto the scope's list.
+    RegisterDisposable { scope: Reg, val: Reg },
+    /// Finally-body op: take the `scope` id's disposer list, run it LIFO building a
+    /// SuppressedError chain merged with the incoming completion in `kind_reg`/
+    /// `val_reg` (kind&3==2 ⇒ already a throw); rewrite kind_reg/val_reg so the
+    /// following `EndFinally` re-raises the merged completion.
+    DisposeScope { scope: Reg, kind_reg: Reg, val_reg: Reg },
     /// A `break`/`continue` that exits one or more `try` blocks: route through every
     /// intervening `finally` (running each, popping any intervening `catch`) before
     /// landing at `target`. `floor` is the handler-stack depth at the target

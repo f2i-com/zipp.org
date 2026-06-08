@@ -152,6 +152,8 @@ impl<'p> Vm<'p> {
             module_own: std::collections::HashMap::new(),
             closure_home: std::collections::HashMap::new(),
             from_async_fn: None,
+            using_resources: std::collections::HashMap::new(),
+            using_next_id: 0,
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),
