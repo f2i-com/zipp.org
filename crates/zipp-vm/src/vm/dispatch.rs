@@ -2960,6 +2960,63 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    Instr::AsyncIterNextStep { dst, iter, idx, sent, next_fn } => {
+                        // Like ForAwaitNext, but CALLS the cached next method (next_fn,
+                        // captured once at GetIterator time) with the `.next(v)` sent
+                        // value (yield* sent-value forwarding + no re-get of `next`).
+                        let it = self.get(base, iter);
+                        let sent_v = self.get(base, sent);
+                        let nf = self.get(base, next_fn);
+                        if !it.is_heap() {
+                            return Err(Thrown(format!(
+                                "TypeError: {} is not iterable",
+                                self.display(it)
+                            )));
+                        }
+                        let result = match self.heap.get(it.heap_index()) {
+                            HeapObj::AsyncGenerator(_) => self
+                                .async_generator_method(it.heap_index(), "next", &[sent_v])
+                                .unwrap_or(Value::UNDEFINED),
+                            HeapObj::Generator { .. } => self
+                                .generator_method(it.heap_index(), "next", &[sent_v])?
+                                .unwrap_or(Value::UNDEFINED),
+                            HeapObj::Object(_) => {
+                                if self.is_callable(nf) {
+                                    self.call_value(nf, it, &[sent_v])?
+                                } else {
+                                    return Err(Thrown(format!(
+                                        "TypeError: {} is not iterable",
+                                        self.display(it)
+                                    )));
+                                }
+                            }
+                            _ => {
+                                let cursor = array_index(self.get(base, idx)).unwrap_or(0);
+                                let len = match self.heap.get(it.heap_index()) {
+                                    HeapObj::Array(items) => items.len(),
+                                    HeapObj::Set(items) => items.len(),
+                                    HeapObj::Str(s) => s.char_len,
+                                    HeapObj::Cons { len, .. } => *len,
+                                    HeapObj::Map { keys, .. } => keys.len(),
+                                    _ => {
+                                        return Err(Thrown(format!(
+                                            "TypeError: {} is not iterable",
+                                            self.display(it)
+                                        )))
+                                    }
+                                };
+                                if cursor < len {
+                                    let val = self.get_index(it, Value::int(cursor as i32))?;
+                                    self.set(base, idx, Value::int((cursor + 1) as i32));
+                                    self.iter_result(val, false)
+                                } else {
+                                    self.iter_result(Value::UNDEFINED, true)
+                                }
+                            }
+                        };
+                        self.set(base, dst, result);
+                        ip += 1;
+                    }
                     Instr::AsyncIterThrowStep { dst, iter, exc } => {
                         let it = self.get(base, iter);
                         let e = self.get(base, exc);

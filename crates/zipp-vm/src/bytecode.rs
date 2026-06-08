@@ -182,6 +182,13 @@ pub enum Instr {
     /// throws a TypeError (the spec's "iterator has no throw" case). Otherwise calls
     /// it with `exc` and writes the (to-be-awaited) result into `dst`.
     AsyncIterThrowStep { dst: Reg, iter: Reg, exc: Reg },
+    /// One async `yield*` NEXT-delegation step: `dst = next_fn.call(iter, sent)`. Like
+    /// `ForAwaitNext` but uses the `next` method CACHED once at GetIterator time
+    /// (`next_fn`) — the spec's IteratorRecord.[[NextMethod]] is not re-read each step —
+    /// and forwards `sent` (the value passed to the OUTER generator's `.next(v)`) so a
+    /// delegated iterator observes it (and `arguments.length === 1`). A built-in
+    /// generator/positional source ignores `next_fn` (cursor via `idx`).
+    AsyncIterNextStep { dst: Reg, iter: Reg, idx: Reg, sent: Reg, next_fn: Reg },
     /// `yield*` suspension point: yield `val` like `Yield`, but on resume DELIVER
     /// the resume MODE (0 = next, 1 = throw, 2 = return) into `mode_dst` and the
     /// resume value into `val_dst` — instead of `Yield`'s in-body throw/return

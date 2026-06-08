@@ -6066,19 +6066,28 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::GetAsyncIterator { dst: iter, src: iter });
                 let idx = self.alloc_reg();
                 self.emit(Instr::LoadInt { dst: idx, val: 0 });
+                // Cache the inner iterator's `next` ONCE (IteratorRecord.[[NextMethod]]),
+                // matching the spec's get-next-once ordering for a user iterator.
+                let next_fn = self.alloc_reg();
+                let next_name = self.string_name("next");
+                self.emit(Instr::GetProp { dst: next_fn, obj: iter, name: next_name });
                 let excr = self.alloc_reg(); // catch reg for an injected outer .throw()
                 let step = self.alloc_reg();
                 let r = self.alloc_reg();
                 let done = self.alloc_reg();
                 let value = self.alloc_reg();
-                let sink = self.alloc_reg(); // discards the value sent to outer .next()
+                // The value sent to the OUTER `.next(v)` — forwarded into the inner
+                // iterator's next() each step (initially undefined). The
+                // AsyncYieldDelegate resume writes the new sent value here.
+                let sent = self.alloc_reg();
+                self.emit(Instr::LoadUndefined { dst: sent });
                 let tstep = self.alloc_reg();
                 let taw = self.alloc_reg();
                 let done_name = self.string_name("done");
                 let value_name = self.string_name("value");
-                // --- one next() step: r = await iter.next(); require Object ---
+                // --- one next(sent) step: r = await iter.next(sent); require Object ---
                 let top = self.here();
-                self.emit(Instr::ForAwaitNext { dst: step, iter, idx });
+                self.emit(Instr::AsyncIterNextStep { dst: step, iter, idx, sent, next_fn });
                 self.emit(Instr::Await { dst: r, val: step });
                 self.emit(Instr::RequireObject { val: r });
                 self.emit(Instr::GetProp { dst: done, obj: r, name: done_name });
@@ -6091,7 +6100,7 @@ impl<'a> FnCompiler<'a> {
                 let ph = self.here();
                 self.emit(Instr::PushHandler { catch_target: 0, catch_reg: excr });
                 self.handler_depth += 1;
-                self.emit(Instr::AsyncYieldDelegate { dst: sink, val: value });
+                self.emit(Instr::AsyncYieldDelegate { dst: sent, val: value });
                 self.emit(Instr::PopHandler);
                 self.handler_depth -= 1;
                 self.emit(Instr::Jump { target: top });
