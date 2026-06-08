@@ -1722,7 +1722,17 @@ impl<'p> Vm<'p> {
                         // checks whether `F.prototype` is in `v`'s prototype chain.
                         // Any other CALLABLE right operand (%Function.prototype%, a
                         // native function, …) still uses OrdinaryHasInstance.
-                        let c_callable = c.is_heap() && self.is_callable(c);
+                        // `Symbol`/`BigInt` are callable globals (typeof "function")
+                        // but not constructors (is_ctor false), so `is_callable` skips
+                        // them; for `instanceof` they ARE valid right operands —
+                        // OrdinaryHasInstance reads their .prototype and yields false
+                        // for a non-wrapper LHS (e.g. `x instanceof Symbol`), never a
+                        // "not callable" TypeError. (deepEqual.js guards these with
+                        // `typeof X === 'function'`, then does `v instanceof X`.)
+                        let c_callable = c.is_heap()
+                            && (self.is_callable(c)
+                                || (self.symbol_ctor != 0 && c.heap_index() == self.symbol_ctor)
+                                || (self.bigint_ctor != 0 && c.heap_index() == self.bigint_ctor));
                         let kind = if c.is_heap() {
                             match self.heap.get(c.heap_index()) {
                                 HeapObj::Class(_) => 1u8,
