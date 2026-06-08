@@ -273,31 +273,54 @@ impl<'p> Vm<'p> {
         let mut iters: Vec<Value> = Vec::new();
         let mut keys: Vec<Value> = Vec::new();
         if keyed {
-            let key_arr = self.object_enum_own(iterables, crate::vm::EnumWhat::Keys)?;
+            // zipKeyed walks the FULL own-key list ([[OwnPropertyKeys]] — integer,
+            // string, THEN symbol keys), and per key interleaves [[GetOwnProperty]]
+            // (skip absent / non-enumerable) → [[Get]] (skip undefined value) →
+            // GetIteratorFlattenable(reject-primitives). Any abrupt completion closes
+            // the already-opened iterators (reverse) first.
+            let key_arr = self.object_own_keys(iterables)?;
             let key_list = match self.heap.get(key_arr.heap_index()) {
                 HeapObj::Array(a) => a.clone(),
                 _ => Vec::new(),
             };
+            macro_rules! close_and_throw {
+                ($e:expr) => {{
+                    self.iz_close_others_abrupt(&iters, usize::MAX);
+                    return Err($e);
+                }};
+            }
             for k in key_list {
-                let ks = self.to_js_string(k)?;
-                // Any abrupt completion while opening closes the already-opened
-                // iterators (in reverse) before propagating.
+                let ks = self.key_of(k);
+                // [[GetOwnProperty]] (the gopd trap may throw for a Proxy).
+                let desc = match self.proxy_gopd(iterables, &ks) {
+                    Ok(Some(d)) => d,
+                    Ok(None) => self.object_get_own_property_descriptor(iterables, &ks),
+                    Err(e) => close_and_throw!(e),
+                };
+                if desc.is_undefined() {
+                    continue; // property absent (e.g. deleted by an earlier [[Get]]).
+                }
+                let en = match self.get_prop(desc, "enumerable") {
+                    Ok(v) => v,
+                    Err(e) => close_and_throw!(e),
+                };
+                if !self.truthy(en) {
+                    continue; // non-enumerable own keys are skipped (no [[Get]]).
+                }
+                // [[Get]] the value; a key whose value is undefined is skipped.
                 let value = match self.get_member(iterables, &ks, iterables) {
                     Ok(v) => v,
-                    Err(e) => {
-                        self.iz_close_others_abrupt(&iters, usize::MAX);
-                        return Err(e);
-                    }
+                    Err(e) => close_and_throw!(e),
                 };
+                if value == Value::UNDEFINED {
+                    continue;
+                }
                 match self.get_iterator_flattenable(value, true) {
                     Ok(it) => {
                         iters.push(it);
                         keys.push(k);
                     }
-                    Err(e) => {
-                        self.iz_close_others_abrupt(&iters, usize::MAX);
-                        return Err(e);
-                    }
+                    Err(e) => close_and_throw!(e),
                 }
             }
         } else {
@@ -336,7 +359,7 @@ impl<'p> Vm<'p> {
         if mode == 1 && padding_option != Value::UNDEFINED {
             if keyed {
                 for (i, slot) in padding.iter_mut().enumerate() {
-                    let ks = self.to_js_string(keys[i])?;
+                    let ks = self.key_of(keys[i]);
                     *slot = self.get_member(padding_option, &ks, padding_option)?;
                 }
             } else {
@@ -623,7 +646,9 @@ impl<'p> Vm<'p> {
             };
             let mut m = ObjMap::new();
             for i in 0..count {
-                let ks = self.to_js_string(keys[i])?;
+                // key_of keeps a symbol key's internal `@@`-prop key, so the result
+                // object carries the original Symbol property (not "Symbol(...)").
+                let ks = self.key_of(keys[i]);
                 m.set(&ks, results[i]);
             }
             // The zipKeyed result is a NULL-prototype ordinary object (its keyed
