@@ -188,6 +188,14 @@ impl<'p> Vm<'p> {
         {
             return Value::bool(false);
         }
+        // A callable's intrinsic `prototype` (normal function, class constructor,
+        // generator) is a non-configurable own property — `delete f.prototype`
+        // fails (false), even after the value was reassigned. (Arrow / bound / most
+        // native functions have no `prototype`, so callable_has_prototype is false
+        // and a missing-property delete still returns true below.)
+        if key == "prototype" && self.callable_has_prototype(obj) {
+            return Value::bool(false);
+        }
         // A callable's `name`/`length` are configurable: record the deletion so
         // the synthesized property stops appearing (own-property queries + reads).
         if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {

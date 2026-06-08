@@ -1353,7 +1353,9 @@ impl<'p> Vm<'p> {
                 "TypeError: Function has non-object prototype in instanceof check".into(),
             ));
         }
-        let mut cur = self.object_get_prototype_of(v);
+        // Walk V's prototype chain via [[GetPrototypeOf]] (proxy-trap-aware): a
+        // throwing getPrototypeOf trap propagates per OrdinaryHasInstance step 7.b.
+        let mut cur = self.get_prototype_of_checked(v)?;
         for _ in 0..10_000 {
             if !cur.is_heap() {
                 return Ok(false);
@@ -1361,7 +1363,7 @@ impl<'p> Vm<'p> {
             if cur == p {
                 return Ok(true);
             }
-            cur = self.object_get_prototype_of(cur);
+            cur = self.get_prototype_of_checked(cur)?;
         }
         Ok(false)
     }
