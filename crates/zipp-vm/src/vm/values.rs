@@ -472,6 +472,79 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// Build the `arguments` object for a (non-arrow) function activation. The
+    /// element store is still a dense Array (so `arguments[i]`/`.length` stay fast),
+    /// but it is given the spec-mandated ordinary shape:
+    ///   - [[Prototype]] = %Object.prototype% (arguments is NOT an Array — it must
+    ///     not inherit Array.prototype methods);
+    ///   - own @@iterator = %Array.prototype.values% { w:t, e:f, c:t };
+    ///   - own `callee`: a sloppy function gets a data property = the function
+    ///     { w:t, e:f, c:t }; a strict function gets the %ThrowTypeError% poison-pill
+    ///     accessor { e:f, c:f } (the unmapped-arguments callee).
+    /// (The exotic-vs-ordinary `length` distinction is left as-is for now.)
+    pub(crate) fn build_arguments_object(
+        &mut self,
+        args: Vec<Value>,
+        callee: Value,
+        is_strict: bool,
+    ) -> Value {
+        let obj_proto = self.obj_proto;
+        let array_values = self.default_array_iter;
+        // The canonical %ThrowTypeError% (set up at init); fall back to a fresh one
+        // only in the unlikely event a strict arguments object is built pre-setup.
+        let thrower = if is_strict {
+            if self.throw_type_error != Value::UNDEFINED {
+                self.throw_type_error
+            } else {
+                Value::heap(self.heap.alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR)))
+            }
+        } else {
+            Value::UNDEFINED
+        };
+        let idx = self.heap.alloc(HeapObj::Array(args));
+        if obj_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(obj_proto));
+        }
+        let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+        m.define(
+            "@@iterator",
+            array_values,
+            PropAttr {
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
+        );
+        if is_strict {
+            m.define(
+                "callee",
+                thrower,
+                PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    accessor: true,
+                    setter: thrower,
+                },
+            );
+        } else {
+            m.define(
+                "callee",
+                callee,
+                PropAttr {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                },
+            );
+        }
+        Value::heap(idx)
+    }
+
     /// Allocate a fresh unique `Symbol` with description `desc` (a string Value or
     /// UNDEFINED) and a unique internal prop_key (`@@sym:N`). Recorded in
     /// `symbol_keys` so the symbol can be reflected from an own property key.

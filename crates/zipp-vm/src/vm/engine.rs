@@ -201,6 +201,7 @@ impl<'p> Vm<'p> {
             gen_proto: 0,
             asyncgen_proto: 0,
             default_array_iter: Value::UNDEFINED,
+            throw_type_error: Value::UNDEFINED,
             iterator_ctor: 0,
             dollar262: 0,
             array_iter_proto: 0,
@@ -804,7 +805,8 @@ impl<'p> Vm<'p> {
         // callback invoked here (e.g. an array-method callback that reads
         // `arguments[2]`) sees every argument — matching the direct Call op.
         if let Some(areg) = arguments_reg {
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+            let is_strict = self.func(func_id as usize).is_strict;
+            let arr = self.build_arguments_object(args.to_vec(), callee, is_strict);
             self.regs[new_base + areg as usize] = arr;
         }
 

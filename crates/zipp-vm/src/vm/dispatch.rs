@@ -3796,7 +3796,8 @@ impl<'p> Vm<'p> {
             let argsv: Vec<Value> = (0..argc as usize)
                 .map(|i| self.regs[caller_base + arg_base as usize + i])
                 .collect();
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(argsv)));
+            let is_strict = self.func(func_id as usize).is_strict;
+            let arr = self.build_arguments_object(argsv, callee_val, is_strict);
             self.regs[new_base + areg as usize] = arr;
         }
 

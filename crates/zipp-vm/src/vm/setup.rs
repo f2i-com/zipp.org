@@ -384,6 +384,9 @@ impl<'p> Vm<'p> {
         // intrinsic, { enumerable:false, configurable:true }. Ordinary functions
         // have no own caller/arguments and inherit these throwing accessors.
         let thrower = Value::heap(self.heap.alloc(HeapObj::Native(FN_THROW_TYPE_ERROR)));
+        // Cache the single canonical %ThrowTypeError% so a strict arguments object's
+        // callee poison-pill reuses THIS instance (intrinsic identity is observable).
+        self.throw_type_error = thrower;
         let restricted_attr = PropAttr {
             writable: false,
             enumerable: false,
