@@ -188,6 +188,15 @@ impl<'p> Vm<'p> {
         {
             return Value::bool(false);
         }
+        // An Array's `length` is a non-configurable own property — `delete arr.length`
+        // fails (false), leaving the length intact. An `arguments` exotic is
+        // Array-backed but its `length` IS configurable, so exclude it.
+        if key == "length"
+            && matches!(self.heap.get(idx), HeapObj::Array(_))
+            && !self.arguments_objs.contains(&idx)
+        {
+            return Value::bool(false);
+        }
         // A callable's intrinsic `prototype` (normal function, class constructor,
         // generator) is a non-configurable own property — `delete f.prototype`
         // fails (false), even after the value was reassigned. (Arrow / bound / most
