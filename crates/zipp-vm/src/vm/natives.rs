@@ -1211,6 +1211,13 @@ impl<'p> Vm<'p> {
                                 OBJ_SEAL => m.seal(),
                                 _ => m.extensible = false,
                             }
+                            // Freezing an Array also makes `length` non-writable (its
+                            // descriptor + assignment honour array_length_nonwritable).
+                            if id == OBJ_FREEZE
+                                && matches!(self.heap.get(idx), HeapObj::Array(_))
+                            {
+                                self.array_length_nonwritable.insert(idx);
+                            }
                         }
                     }
                 }
@@ -1233,8 +1240,12 @@ impl<'p> Vm<'p> {
                         | HeapObj::Cons { .. }
                         | HeapObj::Symbol { .. }
                         | HeapObj::BigInt(_) => (true, true, false),
+                        // An exotic object (Array / TypedArray / Map / Set / …) whose
+                        // elements live outside arr_props: the explicit seal/freeze
+                        // markers are authoritative (the vacuous attrs-based check
+                        // can't see the dense elements).
                         _ => self.arr_props.get(&o.heap_index()).map_or((false, false, true), |m| {
-                            (m.is_frozen(), m.is_sealed(), m.extensible)
+                            (m.frozen, m.sealed, m.extensible)
                         }),
                     }
                 } else {

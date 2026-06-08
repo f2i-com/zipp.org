@@ -908,7 +908,14 @@ impl<'p> Vm<'p> {
                         // A hole has no own property descriptor (falls to undefined).
                         Ok(i) if i.to_string() == key && i < dense_len && !items[i].is_hole() => {
                             let v = items[i];
-                            return self.make_data_descriptor(v, true, true, true);
+                            // A frozen array's elements are non-writable AND
+                            // non-configurable; a sealed (not frozen) array's are
+                            // non-configurable but still writable.
+                            let (frozen, sealed) = self
+                                .arr_props
+                                .get(&idx)
+                                .map_or((false, false), |m| (m.frozen, m.sealed));
+                            return self.make_data_descriptor(v, !frozen, true, !(frozen || sealed));
                         }
                         _ => None,
                     }

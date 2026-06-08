@@ -41,6 +41,12 @@ pub struct ObjMap {
     /// `JSON.rawJSON`. `JSON.isRawJSON` reports it, and `JSON.stringify` emits
     /// the object's `"rawJSON"` string property verbatim instead of serialising.
     pub is_raw_json: bool,
+    /// Explicit Object.seal / Object.freeze markers. For a PLAIN object the
+    /// per-property `attrs` already encode sealed/frozen, but an exotic object
+    /// whose elements live OUTSIDE this map (a dense Array's Vec, a TypedArray's
+    /// buffer) has no per-element attrs, so seal/freeze on it is recorded here.
+    pub sealed: bool,
+    pub frozen: bool,
 }
 
 /// One property's attributes — the ECMAScript property-descriptor flags plus an
@@ -74,6 +80,8 @@ impl ObjMap {
             extensible: true,
             is_ctor: false,
             is_raw_json: false,
+            sealed: false,
+            frozen: false,
         }
     }
 
@@ -90,6 +98,7 @@ impl ObjMap {
     /// `Object.seal`: clear extensibility and make every own property non-configurable.
     pub fn seal(&mut self) {
         self.extensible = false;
+        self.sealed = true;
         for a in &mut self.attrs {
             a.configurable = false;
         }
@@ -98,6 +107,8 @@ impl ObjMap {
     /// `Object.freeze`: seal, and make every own data property non-writable too.
     pub fn freeze(&mut self) {
         self.extensible = false;
+        self.sealed = true;
+        self.frozen = true;
         for a in &mut self.attrs {
             a.configurable = false;
             if !a.accessor {

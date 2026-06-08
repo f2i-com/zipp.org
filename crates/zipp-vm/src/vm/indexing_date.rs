@@ -339,6 +339,16 @@ impl<'p> Vm<'p> {
                 ));
             }
         }
+        // A FROZEN array has non-writable elements: ANY index write (even to an
+        // existing element) is rejected (sloppy no-op / strict TypeError). A sealed
+        // (not frozen) array keeps writable elements — only NEW indices are blocked
+        // by the non-extensible check below.
+        if array_index(key).is_some()
+            && matches!(self.heap.get(idx), HeapObj::Array(_))
+            && self.arr_props.get(&idx).map_or(false, |m| m.frozen)
+        {
+            return self.reject_write(&self.key_of(key), strict);
+        }
         // A NEW index (past the current length) on a non-extensible array adds an own
         // property → rejected (sloppy no-op / strict TypeError). An in-range index is
         // already present and stays writable. Likewise, extending past the current

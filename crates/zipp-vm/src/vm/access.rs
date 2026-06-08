@@ -463,8 +463,11 @@ impl<'p> Vm<'p> {
             // makes `length` non-writable), rejects assignment (sloppy no-op / strict
             // TypeError) — the ToNumber/RangeError coercion above still runs first,
             // per OrdinarySet.
+            // A frozen array's `length` is non-writable (freeze records it in
+            // array_length_nonwritable); a merely sealed array keeps a writable
+            // length, so use the explicit `frozen` flag, not the vacuous is_frozen().
             if self.array_length_nonwritable.contains(&idx)
-                || self.arr_props.get(&idx).is_some_and(|m| m.is_frozen())
+                || self.arr_props.get(&idx).is_some_and(|m| m.frozen)
             {
                 return self.reject_write("length", strict);
             }
