@@ -635,7 +635,17 @@ impl<'p> Vm<'p> {
                 self.install_agg_errors(e, errors_arg)?;
                 e
             } else {
-                self.make_error(k as u8, args.first().copied())
+                // Coerce `message` with a real ToString FIRST (observable / abrupt):
+                // a Symbol message throws TypeError, and a throwing toString /
+                // @@toPrimitive propagates — before the error object is allocated.
+                let msg = match args.first().copied() {
+                    Some(m) if m != Value::UNDEFINED => {
+                        let s = self.to_js_string(m)?;
+                        Some(self.alloc_str(s))
+                    }
+                    _ => None,
+                };
+                self.make_error(k as u8, msg)
             };
             return Ok(self.set_ctor_proto(e, over));
         }

@@ -2207,25 +2207,22 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::NewError { dst, kind, arg, opts, errors } => {
-                        // AggregateError coerces its message with a real ToString
-                        // (observable user `toString` / abrupt completion), per spec
-                        // step 2 — BEFORE the errors are iterated. Other errors keep
-                        // make_error's infallible coercion.
-                        let msg = if kind == 7 {
-                            match arg {
-                                Some(r) => {
-                                    let m = self.get(base, r);
-                                    if m == Value::UNDEFINED {
-                                        None
-                                    } else {
-                                        let s = self.to_js_string(m)?;
-                                        Some(self.alloc_str(s))
-                                    }
+                        // The message is coerced with a real ToString (observable user
+                        // `toString` / `@@toPrimitive`, abrupt completion) for EVERY
+                        // error kind: a Symbol message throws TypeError and a throwing
+                        // coercion propagates — before the error is allocated (and, for
+                        // AggregateError, before the errors are iterated).
+                        let msg = match arg {
+                            Some(r) => {
+                                let m = self.get(base, r);
+                                if m == Value::UNDEFINED {
+                                    None
+                                } else {
+                                    let s = self.to_js_string(m)?;
+                                    Some(self.alloc_str(s))
                                 }
-                                None => None,
                             }
-                        } else {
-                            arg.map(|r| self.get(base, r))
+                            None => None,
                         };
                         let v = self.make_error(kind, msg);
                         // InstallErrorCause (ES2022): an options object with a `cause`
