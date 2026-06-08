@@ -313,7 +313,11 @@ pub struct AsyncGenState {
     pub state: GenState,
     pub regs: Vec<Value>,
     pub handlers: Vec<Handler>,
-    pub queue: Vec<u32>,
+    /// Pending `.next()` requests, FIFO: `(sent_arg, result_promise)`. The `sent_arg`
+    /// is the value passed to `.next(v)`; it must be stored (not just the promise)
+    /// because a request can be QUEUED while the generator is awaiting, and the value
+    /// must be delivered to the eventual `yield` when the request is finally serviced.
+    pub queue: Vec<(Value, u32)>,
 }
 
 /// A heap-allocated object.

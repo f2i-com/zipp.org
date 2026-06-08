@@ -376,7 +376,8 @@ impl Vm<'_> {
                 for &v in &s.regs {
                     m_val!(v);
                 }
-                for &q in &s.queue {
+                for &(arg, q) in &s.queue {
+                    m_val!(arg);
                     m_idx!(q);
                 }
             }

@@ -650,7 +650,7 @@ impl<'p> Vm<'p> {
         match name {
             "next" => {
                 if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
-                    g.queue.push(p);
+                    g.queue.push((arg0, p));
                 }
                 // Only kick the driver if the generator is idle at a yield (or not
                 // started, or completed-to-drain). If it's awaiting a promise or
@@ -688,7 +688,7 @@ impl<'p> Vm<'p> {
                 };
                 if at_delegate {
                     if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
-                        g.queue.push(p);
+                        g.queue.push((Value::UNDEFINED, p)); // driven now via Resume::Throw
                     }
                     self.drive_async_gen(idx, Resume::Throw(arg0));
                 } else {
@@ -733,7 +733,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn async_gen_drain_done(&mut self, idx: u32) {
         loop {
             let p = match self.heap.get_mut(idx) {
-                HeapObj::AsyncGenerator(g) if !g.queue.is_empty() => g.queue.remove(0),
+                HeapObj::AsyncGenerator(g) if !g.queue.is_empty() => g.queue.remove(0).1,
                 _ => break,
             };
             let r = self.iter_result(Value::UNDEFINED, true);
@@ -776,7 +776,7 @@ impl<'p> Vm<'p> {
             let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
             if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
                 if !g.queue.is_empty() {
-                    let p = g.queue.remove(0);
+                    let p = g.queue.remove(0).1;
                     self.reject(p, e);
                 }
             }
@@ -857,13 +857,18 @@ impl<'p> Vm<'p> {
                 }
                 _ => None,
             };
-            if let Some(p) = front {
+            if let Some((_, p)) = front {
                 let r = self.iter_result(y, false);
                 self.resolve(p, r);
             }
-            // More `.next()` calls already queued → service the next one now.
-            if matches!(self.heap.get(idx), HeapObj::AsyncGenerator(g) if !g.queue.is_empty()) {
-                self.drive_async_gen(idx, Resume::Value(Value::UNDEFINED));
+            // More `.next()` calls already queued → service the next one now,
+            // delivering ITS stored `.next(v)` argument to this yield (not undefined).
+            let next_arg = match self.heap.get(idx) {
+                HeapObj::AsyncGenerator(g) => g.queue.first().map(|&(a, _)| a),
+                _ => None,
+            };
+            if let Some(arg) = next_arg {
+                self.drive_async_gen(idx, Resume::Value(arg));
             }
             return;
         }
@@ -891,7 +896,7 @@ impl<'p> Vm<'p> {
                     }
                     _ => None,
                 };
-                if let Some(p) = front {
+                if let Some((_, p)) = front {
                     let r = self.iter_result(ret, true);
                     self.resolve(p, r);
                 }
@@ -911,7 +916,7 @@ impl<'p> Vm<'p> {
                     }
                     _ => None,
                 };
-                if let Some(p) = front {
+                if let Some((_, p)) = front {
                     self.reject(p, reason);
                 }
                 self.async_gen_drain_done(idx);

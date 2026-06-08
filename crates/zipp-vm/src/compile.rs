@@ -6184,7 +6184,18 @@ impl<'a> FnCompiler<'a> {
                 t
             }
         };
-        self.emit(Instr::Yield { dst, val });
+        // In an ASYNC generator, `yield v` is AsyncGeneratorYield: it first AWAITs the
+        // value (so `yield Promise.reject(e)` rejects the consumer's `.next()`, and
+        // `yield Promise.resolve(x)` yields the unwrapped `x`), then suspends. The
+        // Await and the Yield are distinct suspension points, each resumed
+        // independently, so the resume `.next(v)` value still lands in `dst`.
+        if self.in_async {
+            let awaited = self.temp();
+            self.emit(Instr::Await { dst: awaited, val });
+            self.emit(Instr::Yield { dst, val: awaited });
+        } else {
+            self.emit(Instr::Yield { dst, val });
+        }
         Ok(dst)
     }
 
