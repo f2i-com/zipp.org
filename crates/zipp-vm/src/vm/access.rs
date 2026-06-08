@@ -376,6 +376,13 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
+        // A Symbol PRIMITIVE receiver: PutValue boxes it, but [[Set]]'s receiver is
+        // the primitive itself, so the write can't create a property — a strict
+        // TypeError, a sloppy no-op. (A boxed wrapper Object(sym) is a real object
+        // and takes the normal path below.)
+        if matches!(self.heap.get(idx), HeapObj::Symbol { .. }) {
+            return self.reject_write(key, strict);
+        }
         // `undefined` / `NaN` / `Infinity` on the global object are non-writable,
         // non-configurable data properties: assigning them is a sloppy no-op and a
         // strict TypeError — never a shadowing own property.
