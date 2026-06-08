@@ -782,6 +782,38 @@ impl<'p> Vm<'p> {
             // Array.prototype[Symbol.iterator] and switch to the iterator protocol.
             self.default_array_iter = vf;
         }
+        // `Array.prototype[Symbol.unscopables]` — a null-prototype object whose own
+        // data properties (each {value:true, writable, enumerable, configurable})
+        // name the post-ES5 array methods hidden from `with` scopes. `with` itself
+        // is intentionally ABSENT. The @@unscopables property is non-writable,
+        // non-enumerable, configurable.
+        let mut unsc = ObjMap::new();
+        let unsc_data_attr = PropAttr {
+            writable: true,
+            enumerable: true,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        for name in [
+            "at", "copyWithin", "entries", "fill", "find", "findIndex", "findLast",
+            "findLastIndex", "flat", "flatMap", "includes", "keys", "toReversed",
+            "toSorted", "toSpliced", "values",
+        ] {
+            unsc.define(name, Value::TRUE, unsc_data_attr);
+        }
+        let unsc_idx = self.heap.alloc(HeapObj::Object(unsc));
+        self.proto_of.insert(unsc_idx, Value::NULL);
+        let unsc_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        if let HeapObj::Object(m) = self.heap.get_mut(self.arr_proto) {
+            m.define("@@unscopables", Value::heap(unsc_idx), unsc_attr);
+        }
         self.weakmap_proto = weakmap_proto;
         self.weakset_proto = weakset_proto;
         self.weakref_proto = weakref_proto;
