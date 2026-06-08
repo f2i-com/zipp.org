@@ -331,12 +331,16 @@ impl<'p> Vm<'p> {
         }
         // A NEW index (past the current length) on a non-extensible array adds an own
         // property → rejected (sloppy no-op / strict TypeError). An in-range index is
-        // already present and stays writable. (Checked before the &mut borrow below.)
+        // already present and stays writable. Likewise, extending past the current
+        // length grows `length`, so a non-writable `length` (defineProperty / freeze)
+        // rejects it — Array [[DefineOwnProperty]]: index >= oldLen && length
+        // non-writable → false. (Checked before the &mut borrow below.)
         if let Some(i) = array_index(key) {
             let present = matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
             if !present
                 && matches!(self.heap.get(idx), HeapObj::Array(_))
-                && self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
+                && (self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
+                    || self.array_length_nonwritable.contains(&idx))
             {
                 return self.reject_write(&self.key_of(key), strict);
             }

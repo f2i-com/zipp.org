@@ -637,7 +637,13 @@ impl<'p> Vm<'p> {
                     // An in-range index is already present and stays writable.
                     let present =
                         matches!(self.heap.get(idx), HeapObj::Array(items) if n < items.len());
-                    if !present && self.arr_props.get(&idx).map_or(false, |m| !m.extensible) {
+                    // Extending past the current length grows `length`; a non-writable
+                    // `length` (defineProperty / freeze) rejects that — Array
+                    // [[DefineOwnProperty]]: index >= oldLen && length non-writable → false.
+                    if !present
+                        && (self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
+                            || self.array_length_nonwritable.contains(&idx))
+                    {
                         return self.reject_write(key, strict);
                     }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {

@@ -1639,6 +1639,17 @@ impl<'p> Vm<'p> {
                         HeapObj::Array(items) => (items.len(), items.get(i).copied()),
                         _ => (0, None),
                     };
+                    // Array [[DefineOwnProperty]] for an array index P=n: if n >= the
+                    // current length and `length` is non-writable (defineProperty /
+                    // freeze), the define fails — it would grow `length` (ArraySetLength
+                    // forbidden). `n >= dense_len` already implies the index is absent
+                    // (a special override keeps a dense placeholder). A TypeError from
+                    // DefinePropertyOrThrow; the array is left unchanged.
+                    if i >= dense_len && self.array_length_nonwritable.contains(&idx) {
+                        return Err(Thrown(format!(
+                            "TypeError: Cannot define property {i}: array length is not writable"
+                        )));
+                    }
                     let plain = PropAttr {
                         writable: true,
                         enumerable: true,
