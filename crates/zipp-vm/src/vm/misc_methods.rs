@@ -208,6 +208,10 @@ impl<'p> Vm<'p> {
             recv.is_heap().then(|| self.heap.get(recv.heap_index()))
         {
             *value
+        } else if recv.is_heap() && self.bool_proto != 0 && recv.heap_index() == self.bool_proto {
+            // %Boolean.prototype% is itself a Boolean object whose [[BooleanData]]
+            // is false — so `Boolean.prototype.valueOf()` is `false`, not a throw.
+            Value::bool(false)
         } else {
             return Err(Thrown(format!(
                 "TypeError: Boolean.prototype.{name} requires that 'this' be a Boolean"

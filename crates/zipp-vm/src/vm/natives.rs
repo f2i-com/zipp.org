@@ -3265,6 +3265,10 @@ impl<'p> Vm<'p> {
                     // unwrapped above), else TypeError — unlike the coercing methods below.
                     if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
                         this
+                    } else if this.is_heap() && self.str_proto != 0 && this.heap_index() == self.str_proto {
+                        // %String.prototype% is itself a String exotic whose
+                        // [[StringData]] is the empty string.
+                        self.alloc_str(String::new())
                     } else {
                         return Err(Thrown(format!(
                             "TypeError: String.prototype.{m} requires that 'this' be a String"
