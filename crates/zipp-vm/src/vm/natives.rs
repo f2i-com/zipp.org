@@ -1022,6 +1022,52 @@ impl<'p> Vm<'p> {
                                 "TypeError: Abstract class TypedArray not directly constructable".into(),
                             ));
                         }
+                        // A user-defined constructor as `this`: %TypedArray%.from/of
+                        // are generic — collect the source into a list, Construct(this,
+                        // «len»), then CreateDataPropertyOrThrow each element (mirrors
+                        // Array.of). Only a non-constructor `this` is a TypeError.
+                        if self.is_constructor(this) {
+                            let items: Vec<Value> = if id == TA_FROM {
+                                let arr = self.array_from(
+                                    Value::UNDEFINED,
+                                    a0,
+                                    a1,
+                                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                                )?;
+                                match self.heap.get(arr.heap_index()) {
+                                    HeapObj::Array(v) => v.clone(),
+                                    _ => Vec::new(),
+                                }
+                            } else {
+                                args.to_vec()
+                            };
+                            let n = items.len();
+                            let _gc = self.gc_lock_guard();
+                            let target = self.construct(this, &[Value::num(n as f64)])?;
+                            // TypedArrayCreate: ValidateTypedArray(result) + length
+                            // guard — the constructor must return a TypedArray that is
+                            // at least the requested length, else TypeError, BEFORE any
+                            // element is written.
+                            if !target.is_heap()
+                                || !matches!(
+                                    self.heap.get(target.heap_index()),
+                                    HeapObj::TypedArray { .. }
+                                )
+                            {
+                                return Err(Thrown(
+                                    "TypeError: TypedArray.from/of constructor did not return a TypedArray".into(),
+                                ));
+                            }
+                            if self.ta_effective_len(target.heap_index()).unwrap_or(0) < n {
+                                return Err(Thrown(
+                                    "TypeError: TypedArray.from/of constructor returned a TypedArray shorter than the requested length".into(),
+                                ));
+                            }
+                            for (i, v) in items.into_iter().enumerate() {
+                                self.create_data_property_or_throw(target, i, v)?;
+                            }
+                            return Ok(target);
+                        }
                         return Err(Thrown(
                             "TypeError: this is not a TypedArray constructor".into(),
                         ));
