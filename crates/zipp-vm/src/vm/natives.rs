@@ -1135,15 +1135,7 @@ impl<'p> Vm<'p> {
             }
             OBJ_FROM_ENTRIES => {
                 let src = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let entries = if src.is_heap() { self.iterate_to_vec(src)? } else { Vec::new() };
-                let mut map = ObjMap::new();
-                for e in entries {
-                    let k = self.get_index(e, Value::int(0))?;
-                    let v = self.get_index(e, Value::int(1))?;
-                    let ks = self.display(k);
-                    map.set(&ks, v);
-                }
-                Value::heap(self.heap.alloc(HeapObj::Object(map)))
+                self.object_from_entries(src)?
             }
             OBJ_GET_OWN_DESCS => {
                 let a = args.first().copied().unwrap_or(Value::UNDEFINED);

@@ -2129,6 +2129,53 @@ impl<'p> Vm<'p> {
         self.iterator_close_inner(iter, true)
     }
 
+    /// `Object.fromEntries(iterable)` = AddEntriesFromIterable: RequireObjectCoercible,
+    /// GetIterator, then step-by-step — per entry read [0]/[1] via [[Get]] and add the
+    /// property IMMEDIATELY. Any abrupt while processing an entry closes the iterator
+    /// (keeping the original thrown value), per IfAbruptCloseIterator.
+    pub(crate) fn object_from_entries(&mut self, src: Value) -> Result<Value, Thrown> {
+        self.require_object_coercible(src)?;
+        let _gc = self.gc_lock_guard();
+        // get_iterator_object (not get_iterator) so an array yields a real, steppable
+        // iterator object rather than the dense fast-path value.
+        let iter = self.get_iterator_object(src)?;
+        let mut map = ObjMap::new();
+        macro_rules! close_and_throw {
+            ($e:expr) => {{
+                let saved = self.pending_throw;
+                let _ = self.iterator_close(iter);
+                self.pending_throw = saved;
+                return Err($e);
+            }};
+        }
+        loop {
+            let entry = match self.iterator_step(iter)? {
+                Some(e) => e,
+                None => break,
+            };
+            if !self.is_object_value(entry) {
+                let msg = self.alloc_str("Iterator value is not an entry object".to_string());
+                let te = self.make_error(1, Some(msg));
+                self.pending_throw = Some(te);
+                close_and_throw!(Thrown("TypeError: Iterator value is not an entry object".into()));
+            }
+            let k = match self.get_index(entry, Value::int(0)) {
+                Ok(k) => k,
+                Err(e) => close_and_throw!(e),
+            };
+            let v = match self.get_index(entry, Value::int(1)) {
+                Ok(v) => v,
+                Err(e) => close_and_throw!(e),
+            };
+            let pk = match self.to_property_key(k) {
+                Ok(pk) => pk,
+                Err(e) => close_and_throw!(e),
+            };
+            map.set(&pk, v);
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Object(map))))
+    }
+
     /// IteratorClose 7.4.x. `strict` selects GetMethod semantics for the `return`
     /// method: when true (for-of/for-await break+normal, Iterator helpers), a
     /// PRESENT but non-callable `return` is a TypeError; when false (the eager

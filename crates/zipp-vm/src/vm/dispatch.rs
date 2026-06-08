@@ -1809,17 +1809,7 @@ impl<'p> Vm<'p> {
                                 self.alloc_str(s)
                             }
                             S::ObjectAssign => self.object_assign(&args)?,
-                            S::ObjectFromEntries => {
-                                let entries = self.iterate_to_vec(a0)?;
-                                let mut map = ObjMap::new();
-                                for e in entries {
-                                    let kv = self.get_index(e, Value::int(0))?;
-                                    let k = self.display(kv);
-                                    let v = self.get_index(e, Value::int(1))?;
-                                    map.set(&k, v);
-                                }
-                                Value::heap(self.heap.alloc(HeapObj::Object(map)))
-                            }
+                            S::ObjectFromEntries => self.object_from_entries(a0)?,
                             S::PromiseResolve => {
                                 // Promise.resolve(p) of an existing Promise is identity.
                                 if a0.is_heap()
