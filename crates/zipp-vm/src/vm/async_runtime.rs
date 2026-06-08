@@ -1443,6 +1443,13 @@ impl<'p> Vm<'p> {
         map.define("errors", errs, attr);
         let idx = self.heap.alloc(HeapObj::Object(map));
         self.error_data.insert(idx); // [[ErrorData]] internal slot
+        // Link [[Prototype]] to %AggregateError.prototype% (error_protos[7]) so the
+        // internally-created error is a real AggregateError instance:
+        // getPrototypeOf === AggregateError.prototype and `.constructor` resolves to
+        // AggregateError (instanceof already held via the error-ctor name check).
+        if self.error_protos[7] != 0 {
+            self.proto_of.insert(idx, Value::heap(self.error_protos[7]));
+        }
         Value::heap(idx)
     }
 
