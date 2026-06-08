@@ -395,6 +395,12 @@ pub struct Vm<'p> {
     /// reads the LIVE binding without colliding with another module's same-named
     /// export. [[Set]] is a no-op. Pruned on GC sweep.
     module_namespaces: std::collections::HashMap<u32, std::collections::HashMap<String, u32>>,
+    /// Modules CURRENTLY being linked (cycle detection): resolved path → its OWN
+    /// export name→live-slot map (re-exports not yet resolved). Present only during
+    /// `import_module`; a re-export back into an in-progress module (a self/mutual
+    /// cycle) resolves against this own-exports snapshot instead of recursing. Holds
+    /// only slot indices into `globals` (a GC root), so it needs no separate rooting.
+    module_own: std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, u32>>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).

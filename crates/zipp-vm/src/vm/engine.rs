@@ -149,6 +149,7 @@ impl<'p> Vm<'p> {
             module_base_dir: None,
             module_cache: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
+            module_own: std::collections::HashMap::new(),
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),
@@ -858,43 +859,173 @@ impl<'p> Vm<'p> {
         self.run_eval_program(eval_prog, this_override, false).map(|(v, _)| v)
     }
 
-    /// Parse + load a MODULE file for a dynamic `import()`: compile it as a module
-    /// (strict; `export`/`import` declarations handled), run it in this realm, and
-    /// return its (exported name, local name) pairs. The caller reads each local's
-    /// top-level (eval-global) binding afterward to build the namespace. A parse or
-    /// compile error, or a throw during evaluation, propagates as `Err`.
-    pub(crate) fn load_module(&mut self, code: &str) -> Result<Vec<(String, u32)>, Thrown> {
+    /// Recursively load + LINK a MODULE file for a dynamic `import()`, returning its
+    /// (fully-linked) Module Namespace exotic. Cached by canonical path so a re-import
+    /// (or a cycle) yields the SAME namespace. Steps: (1) cache hit → return; (2) read
+    /// + compile as a module (strict); a real `import` decl / `export * as ns` → reject
+    /// (unlinkable); (3) run the body in its own per-module env → OWN export live slots;
+    /// (4) mark in-progress (module_own) and resolve `export … from` / `export *`
+    /// re-exports by recursively loading the dependency and pointing this namespace's
+    /// names at the dependency's live slots; (5) build + cache the namespace. A parse/
+    /// compile error, a missing dependency, or a throw during evaluation propagates as
+    /// `Err`. The given `path` is canonicalized; relative re-export specifiers resolve
+    /// against the module's own directory.
+    pub(crate) fn import_module(
+        &mut self,
+        raw_path: &std::path::Path,
+    ) -> Result<Value, Thrown> {
+        let path = std::fs::canonicalize(raw_path)
+            .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        if let Some(&ns) = self.module_cache.get(&path) {
+            return Ok(ns);
+        }
+        let code = std::fs::read_to_string(&path)
+            .map_err(|_| Thrown("TypeError: module not found".into()))?;
         let allocator = oxc_allocator::Allocator::default();
         let ret =
-            oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::mjs()).parse();
+            oxc_parser::Parser::new(&allocator, &code, oxc_span::SourceType::mjs()).parse();
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, code, true, false) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
-        // A module that depends on another module needs linking (not modelled yet);
-        // reject so the import does not resolve an unlinked namespace. (Err without
-        // setting pending_throw → the caller rejects with a TypeError, a non-Syntax
-        // host resolution error, as the spec's HostResolveImportedModule would.)
+        // A real `import` declaration / `export * as ns from` needs linking we don't
+        // model; reject (Err without pending_throw → the caller rejects with a host
+        // TypeError, as the spec's HostResolveImportedModule would). Re-exports are
+        // modelled below.
         if prog.module_has_imports {
             return Err(Thrown("TypeError: module dependencies are not supported".into()));
         }
         let exports = prog.module_exports.clone();
         let names = prog.global_names.clone();
-        // Run the module in its OWN environment: its declared globals are remapped
-        // to fresh per-module slots (module=true), so its exports don't collide with
-        // another module's same-named bindings. `gmap[i]` is the live slot for
+        let reexports = prog.module_reexports.clone();
+        let star_reexports = prog.module_star_reexports.clone();
+        let dir = path.parent().map(|p| p.to_path_buf());
+        // Run the module in its OWN environment: its declared globals are remapped to
+        // fresh per-module slots (module=true). `gmap[i]` is the live slot for
         // compile-time global slot `i`.
         let (_completion, gmap) = self.run_eval_program(prog, None, true)?;
-        let mut out: Vec<(String, u32)> = Vec::with_capacity(exports.len());
+        // OWN exports (exported name → live slot), in source order.
+        let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
+        let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for (exported, local) in exports {
             if let Some(i) = names.iter().position(|n| *n == local) {
-                out.push((exported, gmap[i]));
+                full.push((exported.clone(), gmap[i]));
+                own_map.insert(exported, gmap[i]);
             }
         }
-        Ok(out)
+        // Mark in-progress BEFORE resolving re-exports so a self/mutual cycle resolves
+        // against this own-exports snapshot (and `all_exports`/`resolve_export` consult
+        // `module_own` before recursing, so cycles terminate). The link phase runs in a
+        // helper so the in-progress marker is removed on EVERY exit (incl. error),
+        // never leaving a stale marker that would mis-resolve a later import.
+        self.module_own.insert(path.clone(), own_map);
+        let linked = self.link_module_reexports(full, &reexports, &star_reexports, dir.as_deref());
+        self.module_own.remove(&path);
+        let full = linked?;
+        // build_module_namespace dedups (first wins) and sorts the keys; it is the
+        // ONLY place a heap Value is materialized — the recursion above carries only
+        // (String, slot:u32) pairs (slots into the GC-rooted `globals`), so no unrooted
+        // Value can exist across a GC-triggering recursive load.
+        let ns = self.build_module_namespace(&full);
+        self.module_cache.insert(path, ns);
+        Ok(ns)
+    }
+
+    /// Resolve a module's re-exports into `full` (the export name→slot list). Split out
+    /// of `import_module` so the in-progress (`module_own`) marker is cleaned up by the
+    /// caller on every exit path. A name a `export {x} from` dependency doesn't export
+    /// is OMITTED (the namespace lacks that key) — spec says reject (SyntaxError), but
+    /// omission is the safe contained-slice choice and doesn't affect well-formed
+    /// modules. `export *` copies all of the dependency's exports except `default`.
+    fn link_module_reexports(
+        &mut self,
+        mut full: Vec<(String, u32)>,
+        reexports: &[(String, String, String)],
+        star_reexports: &[String],
+        dir: Option<&std::path::Path>,
+    ) -> Result<Vec<(String, u32)>, Thrown> {
+        for (exported, imported, spec) in reexports {
+            let dep = match dir {
+                Some(d) => d.join(spec),
+                None => std::path::PathBuf::from(spec),
+            };
+            if let Some(slot) = self.resolve_export(&dep, imported)? {
+                full.push((exported.clone(), slot));
+            }
+        }
+        for spec in star_reexports {
+            let dep = match dir {
+                Some(d) => d.join(spec),
+                None => std::path::PathBuf::from(spec),
+            };
+            for (name, slot) in self.all_exports(&dep)? {
+                full.push((name, slot));
+            }
+        }
+        Ok(full)
+    }
+
+    /// Resolve a single exported `name` from the module at `raw_path` to its live
+    /// global slot (for `export … from` linking). Consults the namespace cache, then
+    /// the in-progress own-exports map (cycle break), else recursively loads it.
+    /// `Ok(None)` if the module doesn't export `name`.
+    fn resolve_export(
+        &mut self,
+        raw_path: &std::path::Path,
+        name: &str,
+    ) -> Result<Option<u32>, Thrown> {
+        let dep = std::fs::canonicalize(raw_path)
+            .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        if let Some(&ns) = self.module_cache.get(&dep) {
+            return Ok(self
+                .module_namespaces
+                .get(&ns.heap_index())
+                .and_then(|m| m.get(name).copied()));
+        }
+        if let Some(m) = self.module_own.get(&dep) {
+            return Ok(m.get(name).copied());
+        }
+        let ns = self.import_module(&dep)?;
+        Ok(self
+            .module_namespaces
+            .get(&ns.heap_index())
+            .and_then(|m| m.get(name).copied()))
+    }
+
+    /// Enumerate all exports of the module at `raw_path` (excluding `default`) as
+    /// (name, live slot), for `export * from`. Uses the cache / in-progress map, else
+    /// recursively loads it.
+    fn all_exports(
+        &mut self,
+        raw_path: &std::path::Path,
+    ) -> Result<Vec<(String, u32)>, Thrown> {
+        let dep = std::fs::canonicalize(raw_path)
+            .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        let collect = |m: &std::collections::HashMap<String, u32>| -> Vec<(String, u32)> {
+            m.iter()
+                .filter(|(n, _)| n.as_str() != "default")
+                .map(|(n, s)| (n.clone(), *s))
+                .collect()
+        };
+        if let Some(&ns) = self.module_cache.get(&dep) {
+            return Ok(self
+                .module_namespaces
+                .get(&ns.heap_index())
+                .map(collect)
+                .unwrap_or_default());
+        }
+        if let Some(m) = self.module_own.get(&dep) {
+            return Ok(collect(m));
+        }
+        let ns = self.import_module(&dep)?;
+        Ok(self
+            .module_namespaces
+            .get(&ns.heap_index())
+            .map(collect)
+            .unwrap_or_default())
     }
 
     /// Install a compiled eval/module Program into the live realm (remap its global

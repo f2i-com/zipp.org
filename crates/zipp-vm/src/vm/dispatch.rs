@@ -2271,27 +2271,16 @@ impl<'p> Vm<'p> {
                                 } else {
                                     match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
                                         None => Err(self.make_error(1, None)),
-                                        Some(p) => {
-                                            if let Some(ns) = self.module_cache.get(&p).copied() {
-                                                Ok(ns)
-                                            } else {
-                                                match std::fs::read_to_string(&p) {
-                                                    Err(_) => Err(self.make_error(1, None)),
-                                                    Ok(code) => match self.load_module(&code) {
-                                                        Ok(exports) => {
-                                                            let ns =
-                                                                self.build_module_namespace(&exports);
-                                                            self.module_cache.insert(p, ns);
-                                                            Ok(ns)
-                                                        }
-                                                        Err(_) => Err(self
-                                                            .pending_throw
-                                                            .take()
-                                                            .unwrap_or_else(|| self.make_error(1, None))),
-                                                    },
-                                                }
-                                            }
-                                        }
+                                        // import_module canonicalizes, caches, runs, and
+                                        // recursively links re-exports; the returned value
+                                        // IS the fully-linked namespace.
+                                        Some(p) => match self.import_module(&p) {
+                                            Ok(ns) => Ok(ns),
+                                            Err(_) => Err(self
+                                                .pending_throw
+                                                .take()
+                                                .unwrap_or_else(|| self.make_error(1, None))),
+                                        },
                                     }
                                 }
                             }

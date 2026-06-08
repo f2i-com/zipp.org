@@ -302,6 +302,8 @@ pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
         hoisted_globals: c.hoisted_globals,
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
+        module_reexports: std::mem::take(&mut c.module_reexports),
+        module_star_reexports: std::mem::take(&mut c.module_star_reexports),
         module_decl_globals,
     })
 }
@@ -334,6 +336,8 @@ pub fn compile_eval(
         hoisted_globals: c.hoisted_globals,
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
+        module_reexports: std::mem::take(&mut c.module_reexports),
+        module_star_reexports: std::mem::take(&mut c.module_star_reexports),
         module_decl_globals,
     })
 }
@@ -405,11 +409,15 @@ struct Compiler {
     /// top-level (eval-global) binding after the module runs to build its
     /// namespace. Empty for scripts/eval (which have no `export`).
     module_exports: Vec<(String, String)>,
-    /// True if a module has any `import` declaration, a re-export (`export … from`),
-    /// or `export *` — i.e. a dependency on another module. The loader cannot link
-    /// dependencies yet, so such a module rejects the dynamic `import()` rather than
-    /// loading an unlinked (incorrect) namespace.
+    /// True if a module has a real `import` declaration or `export * as ns from` —
+    /// dependencies the loader cannot link yet, so such a module rejects the dynamic
+    /// `import()`. RE-EXPORTS are recorded in the two fields below instead.
     module_has_imports: bool,
+    /// `export {imported as exported} from 'spec'` re-exports: (exported, imported,
+    /// specifier). Resolved by the loader against the dependency module.
+    module_reexports: Vec<(String, String, String)>,
+    /// `export * from 'spec'` star re-exports: the specifier string.
+    module_star_reexports: Vec<String>,
 }
 
 impl Compiler {
@@ -433,6 +441,8 @@ impl Compiler {
             decl_globals: HashSet::new(),
             module_exports: Vec::new(),
             module_has_imports: false,
+            module_reexports: Vec::new(),
+            module_star_reexports: Vec::new(),
         }
     }
 
@@ -1791,10 +1801,16 @@ impl<'a> FnCompiler<'a> {
                 self.cx.module_has_imports = true;
             }
             S::ExportNamedDeclaration(e) => {
-                // `export {x} from './m'` (re-export) needs the other module — not
-                // modelled yet; mark the module unloadable.
-                if e.source.is_some() {
-                    self.cx.module_has_imports = true;
+                // `export {imported as exported} from './m'` (re-export): record the
+                // (exported, imported, specifier) triples so the loader can resolve
+                // them against the dependency module. No local binding is created.
+                if let Some(src) = &e.source {
+                    let spec = src.value.to_string();
+                    for spec_item in &e.specifiers {
+                        let exported = module_export_name(&spec_item.exported);
+                        let imported = module_export_name(&spec_item.local);
+                        self.cx.module_reexports.push((exported, imported, spec.clone()));
+                    }
                     return Ok(());
                 }
                 // `export var/let/const/function/class …`: compile the inner
@@ -1868,9 +1884,16 @@ impl<'a> FnCompiler<'a> {
                     .module_exports
                     .push(("default".to_string(), "*default*".to_string()));
             }
-            S::ExportAllDeclaration(_) => {
-                // `export * from './m'` — needs the other module; not modelled yet.
-                self.cx.module_has_imports = true;
+            S::ExportAllDeclaration(e) => {
+                if e.exported.is_some() {
+                    // `export * as ns from './m'` creates a namespace-object export —
+                    // needs a nested namespace exotic; gate for now.
+                    self.cx.module_has_imports = true;
+                } else {
+                    // `export * from './m'` — copy all of the dependency's exports
+                    // (except default) into this module's namespace at link time.
+                    self.cx.module_star_reexports.push(e.source.value.to_string());
+                }
             }
             _ => return Err("unsupported statement (not in the zipp-vm v1 subset yet)".into()),
         }

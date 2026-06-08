@@ -852,9 +852,19 @@ pub struct Program {
     /// binding after the module runs to build the import's namespace. Empty for
     /// ordinary scripts / eval.
     pub module_exports: Vec<(String, String)>,
-    /// True if the module depends on another module (`import …`, `export … from`,
-    /// `export *`) — the loader cannot link those yet, so the import rejects.
+    /// True if the module has a real `import` declaration (binding or side-effect)
+    /// or `export * as ns from` — these need full linking the loader doesn't model,
+    /// so the dynamic import rejects. RE-EXPORTS (`export … from`, `export *`) are
+    /// modelled separately (see `module_reexports`/`module_star_reexports`) and do
+    /// NOT set this flag.
     pub module_has_imports: bool,
+    /// `export {imported as exported} from 'spec'` re-exports, as
+    /// (exported, imported, specifier). The loader recursively loads `spec` and
+    /// points the namespace's `exported` at the dependency's live `imported` slot.
+    pub module_reexports: Vec<(String, String, String)>,
+    /// `export * from 'spec'` star re-exports, as the specifier. The loader copies
+    /// every export of `spec` (except `default`) into this module's namespace.
+    pub module_star_reexports: Vec<String>,
     /// Compile-time global slots DECLARED by a module's top level (var/let/const/
     /// function/class + the synthetic `*default*`). When loading a module these are
     /// remapped to PER-MODULE FRESH slots (not the realm's shared by-name slots) so
