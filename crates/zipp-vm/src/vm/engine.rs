@@ -564,6 +564,31 @@ impl<'p> Vm<'p> {
         main
     }
 
+    /// Run a MODULE as the program entry. The top-level body (func 0) is an async
+    /// activation so top-level `await` works; the event loop then drains to
+    /// completion (settling promises, running queued async tests). An uncaught
+    /// top-level rejection is surfaced as the program error.
+    pub fn run_module(&mut self) -> Result<Value, Thrown> {
+        use crate::heap::PromiseState;
+        self.setup_globals();
+        self.hoist_functions();
+        self.set_gc_floor();
+        // Module top-level `this` is undefined. alloc_async builds + drives the
+        // activation to its first await; drain_microtasks runs it to completion.
+        let p = self.alloc_async(0, NO_CLOSURE, Value::UNDEFINED, &[]);
+        self.drain_microtasks();
+        if p.is_heap() {
+            if let HeapObj::Promise { state: PromiseState::Rejected, result, .. } =
+                self.heap.get(p.heap_index())
+            {
+                let reason = *result;
+                let msg = self.display(reason);
+                return Err(Thrown(msg));
+            }
+        }
+        Ok(Value::UNDEFINED)
+    }
+
     /// Invoke a callable `Value` with `this` and `args`, running it to
     /// completion, and return its result. Used by builtin methods that take
     /// callbacks (`map`/`filter`/`reduce`/`sort`). The callee executes on the

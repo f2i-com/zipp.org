@@ -83,6 +83,37 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
     }
 }
 
+/// Run `src` as an ES MODULE entry: the top level is an async context (top-level
+/// `await`), declarations are module-scoped, and the event loop drains to
+/// completion. `base_dir` resolves relative imports. Like [`run_with_base`] but
+/// for `flags:[module]` test262 tests and `.mjs` entry points.
+pub fn run_module_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, src, SourceType::mjs()).parse();
+    if !ret.errors.is_empty() {
+        return Err(format!("SyntaxError: {}", ret.errors[0]));
+    }
+    let program = compile::compile_module(&ret.program, src)?;
+    if std::env::var_os("ZIPP_VM_DUMP").is_some() {
+        for (fid, f) in program.functions.iter().enumerate() {
+            eprintln!("── fn {fid} (regs={}, params={}) ──", f.reg_count, f.param_count);
+            for (ip, instr) in f.code.iter().enumerate() {
+                eprintln!("  {ip:4}  {instr:?}");
+            }
+        }
+    }
+    let mut vm = vm::Vm::new(&program);
+    vm.set_module_base_dir(base_dir);
+    match vm.run_module() {
+        Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+        Err(thrown) => Ok(Outcome {
+            output: std::mem::take(&mut vm.output),
+            errput: std::mem::take(&mut vm.errput),
+            error: Some(thrown.0),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

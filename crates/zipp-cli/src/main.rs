@@ -84,6 +84,28 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        Some("mjs") => {
+            // Run a file as an ES MODULE (top-level await; module-scoped
+            // declarations; the event loop drains to completion). Used for
+            // `flags:[module]` test262 tests and `.mjs` entry points.
+            let path = it.next().ok_or("usage: zipp mjs <file.mjs>")?;
+            let src =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+            let base_dir = std::path::Path::new(path)
+                .parent()
+                .map(|p| if p.as_os_str().is_empty() { std::path::Path::new(".").to_path_buf() } else { p.to_path_buf() });
+            let outcome = zipp_vm::run_module_with_base(&src, base_dir)?;
+            for line in &outcome.output {
+                println!("{line}");
+            }
+            for line in &outcome.errput {
+                eprintln!("{line}");
+            }
+            if let Some(err) = outcome.error {
+                return Err(err);
+            }
+            Ok(())
+        }
         Some("--help") | Some("-h") | None => {
             println!("ZIPP v0 — sound-TS-subset language (PLAN.md)\n");
             println!("usage:");

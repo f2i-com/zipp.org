@@ -288,7 +288,18 @@ fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool) {
 }
 
 pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
+    compile_program_inner(prog, source, false)
+}
+
+/// Compile a MODULE as the program entry: the top level is an async context
+/// (top-level `await`), and the VM runs func 0 as an async activation.
+pub fn compile_module(prog: &ox::Program, source: &str) -> R<Program> {
+    compile_program_inner(prog, source, true)
+}
+
+fn compile_program_inner(prog: &ox::Program, source: &str, module_mode: bool) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
+    c.module_mode = module_mode;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
@@ -361,6 +372,10 @@ struct Compiler {
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
     eval_mode: bool,
+    /// True when compiling a MODULE as the program entry (not a dynamic import):
+    /// the top-level body is an ASYNC context (top-level `await` is allowed), so
+    /// func 0 is compiled with `in_async` and the VM runs it as an async activation.
+    module_mode: bool,
     /// Force strict mode for the whole compilation, regardless of a `"use strict"`
     /// directive — set for a DIRECT eval invoked from strict-mode code (the
     /// evaluated string inherits the caller's strictness).
@@ -435,6 +450,7 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             source,
             eval_mode: false,
+            module_mode: false,
             force_strict: false,
             force_new_target_ok: false,
             in_strict: false,
@@ -544,6 +560,8 @@ impl Compiler {
         // variables and catch params are true locals — so it still needs a
         // captured set, or a closure over such a local can't box it.
         let captured = capture::captured_locals(&[], &prog.body);
+        // A MODULE entry's top level is an async context (top-level `await`).
+        let top_async = self.module_mode;
         let top = self.compile_function_body(
             None,
             None, // a script has no self-name binding
@@ -554,7 +572,7 @@ impl Compiler {
             &prog.directives,
             true,
             false, // top-level script is not a generator
-            false, // top-level script is not async
+            top_async, // a module top level is async (top-level await)
             captured,
             Vec::new(),
         )?;

@@ -82,8 +82,7 @@ def run_one(args, get_harness, path):
         return ("SKIP", f"read-error {e}", path)
     meta = parse_frontmatter(src)
     flags = meta["flags"]
-    if "module" in flags:
-        return ("SKIP", "module", path)        # ESM not supported yet
+    is_module = "module" in flags
     if "CanBlockIsFalse" in flags or "CanBlockIsTrue" in flags:
         return ("SKIP", "agent", path)
     # Assemble.
@@ -111,7 +110,10 @@ def run_one(args, get_harness, path):
         os.write(fd, assembled.encode("utf-8"))
         os.close(fd)
         try:
-            p = subprocess.run([args.zipp, "js", tmp], capture_output=True,
+            # A `flags:[module]` test runs as an ES module (top-level await,
+            # module scope); the assembled harness + test is one module.
+            subcmd = "mjs" if is_module else "js"
+            p = subprocess.run([args.zipp, subcmd, tmp], capture_output=True,
                                encoding="utf-8", errors="replace", timeout=args.timeout)
             verdict, sig = classify(meta, p.returncode, p.stdout or "", p.stderr or "")
         except subprocess.TimeoutExpired:
