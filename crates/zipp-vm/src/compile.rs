@@ -5725,16 +5725,29 @@ impl<'a> FnCompiler<'a> {
             ox::AssignmentTarget::StaticMemberExpression(m)
                 if matches!(&m.object, ox::Expression::Super(_)) =>
             {
-                let pid = self.super_class.ok_or("`super.x = …` is only valid in a derived class")?;
+                let pid = self.super_class;
+                if pid.is_none() && !self.super_home_obj {
+                    return Err("`super.x = …` is only valid in a method".into());
+                }
                 let name = self.string_name(m.property.name.as_str());
+                // A super GET/SET routes to the class op (home_class_id) or the
+                // object-method op ([[HomeObject]]), depending on the lexical context.
+                let emit_get = |s: &mut Self, d: Reg| match pid {
+                    Some(p) => s.emit(Instr::SuperGet { dst: d, home_class_id: p, name }),
+                    None => s.emit(Instr::SuperGetObj { dst: d, name }),
+                };
+                let emit_set = |s: &mut Self, v: Reg| match pid {
+                    Some(p) => s.emit(Instr::SuperSet { home_class_id: p, name, val: v }),
+                    None => s.emit(Instr::SuperSetObj { name, val: v }),
+                };
                 if is_logical {
-                    self.emit(Instr::SuperGet { dst, home_class_id: pid, name });
+                    emit_get(self, dst);
                     let j = self.emit_logical_skip(a.operator, dst);
                     let v = self.expr_into(&a.right, dst)?;
                     if v != dst {
                         self.emit(Instr::Move { dst, src: v });
                     }
-                    self.emit(Instr::SuperSet { home_class_id: pid, name, val: dst });
+                    emit_set(self, dst);
                     let end = self.here();
                     self.patch_jump(j, end);
                 } else if matches!(a.operator, Op::Assign) {
@@ -5742,15 +5755,15 @@ impl<'a> FnCompiler<'a> {
                     if val != dst {
                         self.emit(Instr::Move { dst, src: val });
                     }
-                    self.emit(Instr::SuperSet { home_class_id: pid, name, val: dst });
+                    emit_set(self, dst);
                 } else {
                     let cur = self.temp();
-                    self.emit(Instr::SuperGet { dst: cur, home_class_id: pid, name });
+                    emit_get(self, cur);
                     let rhs = self.expr(&a.right)?;
                     let instr = compound_assign_instr(a.operator, dst, cur, rhs)
                         .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                     self.emit(instr);
-                    self.emit(Instr::SuperSet { home_class_id: pid, name, val: dst });
+                    emit_set(self, dst);
                 }
                 return Ok(dst);
             }
@@ -5821,20 +5834,31 @@ impl<'a> FnCompiler<'a> {
             ox::AssignmentTarget::ComputedMemberExpression(m)
                 if matches!(&m.object, ox::Expression::Super(_)) =>
             {
-                let pid = self.super_class.ok_or("`super[k] = …` is only valid in a derived class")?;
+                let pid = self.super_class;
+                if pid.is_none() && !self.super_home_obj {
+                    return Err("`super[k] = …` is only valid in a method".into());
+                }
                 let key = self.expr(&m.expression)?;
                 let key_reg = self.alloc_reg();
                 if key != key_reg {
                     self.emit(Instr::Move { dst: key_reg, src: key });
                 }
+                let emit_get = |s: &mut Self, d: Reg| match pid {
+                    Some(p) => s.emit(Instr::SuperGetComputed { dst: d, home_class_id: p, key: key_reg }),
+                    None => s.emit(Instr::SuperGetObjComputed { dst: d, key: key_reg }),
+                };
+                let emit_set = |s: &mut Self, v: Reg| match pid {
+                    Some(p) => s.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: v }),
+                    None => s.emit(Instr::SuperSetObjComputed { key: key_reg, val: v }),
+                };
                 if is_logical {
-                    self.emit(Instr::SuperGetComputed { dst, home_class_id: pid, key: key_reg });
+                    emit_get(self, dst);
                     let j = self.emit_logical_skip(a.operator, dst);
                     let v = self.expr_into(&a.right, dst)?;
                     if v != dst {
                         self.emit(Instr::Move { dst, src: v });
                     }
-                    self.emit(Instr::SuperSetComputed { home_class_id: pid, key: key_reg, val: dst });
+                    emit_set(self, dst);
                     let end = self.here();
                     self.patch_jump(j, end);
                 } else if matches!(a.operator, Op::Assign) {
@@ -5842,15 +5866,15 @@ impl<'a> FnCompiler<'a> {
                     if val != dst {
                         self.emit(Instr::Move { dst, src: val });
                     }
-                    self.emit(Instr::SuperSetComputed { home_class_id: pid, key: key_reg, val: dst });
+                    emit_set(self, dst);
                 } else {
                     let cur = self.temp();
-                    self.emit(Instr::SuperGetComputed { dst: cur, home_class_id: pid, key: key_reg });
+                    emit_get(self, cur);
                     let rhs = self.expr(&a.right)?;
                     let instr = compound_assign_instr(a.operator, dst, cur, rhs)
                         .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                     self.emit(instr);
-                    self.emit(Instr::SuperSetComputed { home_class_id: pid, key: key_reg, val: dst });
+                    emit_set(self, dst);
                 }
                 return Ok(dst);
             }
@@ -6533,12 +6557,15 @@ impl<'a> FnCompiler<'a> {
         // `super.method(args)` — call an inherited method with the current `this`.
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             if matches!(&m.object, ox::Expression::Super(_)) {
-                let pid = self
-                    .super_class
-                    .ok_or("`super.method(...)` is only valid in a derived class")?;
                 let name = self.string_name(m.property.name.as_str());
                 let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
-                self.emit(Instr::SuperMethod { dst, home_class_id: pid, name, arg_base, argc });
+                if let Some(pid) = self.super_class {
+                    self.emit(Instr::SuperMethod { dst, home_class_id: pid, name, arg_base, argc });
+                } else if self.super_home_obj {
+                    self.emit(Instr::SuperMethodObj { dst, name, arg_base, argc });
+                } else {
+                    return Err("`super.method(...)` is only valid in a method".into());
+                }
                 return Ok(dst);
             }
         }
@@ -6857,14 +6884,21 @@ impl<'a> FnCompiler<'a> {
         // `super[expr](args…)` — computed inherited-method call.
         if let ox::Expression::ComputedMemberExpression(m) = &c.callee {
             if matches!(&m.object, ox::Expression::Super(_)) {
-                let pid = self.super_class.ok_or("`super[x](...)` is only valid in a derived class")?;
+                let is_class = self.super_class;
+                if is_class.is_none() && !self.super_home_obj {
+                    return Err("`super[x](...)` is only valid in a method".into());
+                }
                 let key = self.expr(&m.expression)?;
                 let key_reg = self.alloc_reg();
                 if key != key_reg {
                     self.emit(Instr::Move { dst: key_reg, src: key });
                 }
                 let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
-                self.emit(Instr::SuperMethodComputed { dst, home_class_id: pid, key: key_reg, arg_base, argc });
+                if let Some(pid) = is_class {
+                    self.emit(Instr::SuperMethodComputed { dst, home_class_id: pid, key: key_reg, arg_base, argc });
+                } else {
+                    self.emit(Instr::SuperMethodObjComputed { dst, key: key_reg, arg_base, argc });
+                }
                 return Ok(dst);
             }
         }

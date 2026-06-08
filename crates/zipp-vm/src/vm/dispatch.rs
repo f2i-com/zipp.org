@@ -1288,6 +1288,42 @@ impl<'p> Vm<'p> {
                         self.super_set_obj(proto, &ks, this, v)?;
                         ip += 1;
                     }
+                    Instr::SuperMethodObj { dst, name, arg_base, argc } => {
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].clone();
+                        let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        self.require_object_coercible(proto)?;
+                        let this = self.get(base, 0);
+                        let m = self.get_member(proto, &key, this)?;
+                        if !self.is_callable(m) {
+                            return Err(Thrown(format!("TypeError: super.{key} is not a function")));
+                        }
+                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                        for i in 0..argc {
+                            args.push(self.get(base, arg_base + i));
+                        }
+                        let r = self.call_value(m, this, &args)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::SuperMethodObjComputed { dst, key, arg_base, argc } => {
+                        let kv = self.get(base, key);
+                        let ks = self.to_property_key(kv)?;
+                        let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        self.require_object_coercible(proto)?;
+                        let this = self.get(base, 0);
+                        let m = self.get_member(proto, &ks, this)?;
+                        if !self.is_callable(m) {
+                            return Err(Thrown(format!("TypeError: super[{ks}] is not a function")));
+                        }
+                        let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
+                        for i in 0..argc {
+                            args.push(self.get(base, arg_base + i));
+                        }
+                        let r = self.call_value(m, this, &args)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
                         let arr = if argc == 1 && self.get(base, arg_base).is_number() {
                             // `Array(n)` → n HOLES (absent elements), not n undefineds.

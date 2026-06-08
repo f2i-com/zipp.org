@@ -279,6 +279,12 @@ pub enum Instr {
     SuperSetObj { name: u32, val: Reg },
     /// `super[key] = val` inside an object method (computed form).
     SuperSetObjComputed { key: Reg, val: Reg },
+    /// `dst = super.name(args…)` inside an OBJECT method: resolve `name` on
+    /// GetPrototypeOf the executing closure's [[HomeObject]], call it with
+    /// `this` = the current receiver.
+    SuperMethodObj { dst: Reg, name: u32, arg_base: Reg, argc: u16 },
+    /// `dst = super[key](args…)` inside an object method (computed form).
+    SuperMethodObjComputed { dst: Reg, key: Reg, arg_base: Reg, argc: u16 },
     /// `dst = new callee(args…)` — construct an instance. `callee` must be a
     /// class value; builds an object, installs the methods, runs the ctor.
     New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
