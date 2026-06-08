@@ -1588,49 +1588,33 @@ impl<'p> Vm<'p> {
                     .enumerate()
                     .map(|(i, c)| (i.to_string(), self.alloc_str(c.to_string())))
                     .collect()
-            } else if self.proxy_parts(src.heap_index()).is_some() {
-                // CopyDataProperties over a Proxy source: [[OwnPropertyKeys]] (the
-                // ownKeys trap), then per key [[GetOwnProperty]] (the gopd trap) for
-                // enumerability, then Get — each trap propagates an abrupt completion
-                // (a plain snapshot would swallow it).
-                let keys = self.proxy_own_keys(src)?.unwrap_or_default();
-                let mut pv = Vec::new();
-                for k in keys {
-                    // (Symbol keys are copied elsewhere; here mirror the string path.)
-                    if !(k.is_heap() && self.heap.is_str_like(k.heap_index())) {
-                        continue;
-                    }
-                    let ks = self.display(k);
-                    let enumerable = match self.proxy_gopd(src, &ks)? {
-                        Some(d) if d != Value::UNDEFINED => {
-                            let en = self.get_prop(d, "enumerable")?;
-                            self.truthy(en)
-                        }
-                        _ => false,
-                    };
-                    if enumerable {
-                        let v = self.get_prop(src, &ks)?;
-                        pv.push((ks, v));
-                    }
-                }
-                pv
             } else {
-                // Collect the source's own ENUMERABLE keys, then Get each — so a
-                // getter is invoked and its VALUE is copied (not the accessor
-                // function), and a throwing getter propagates, per CopyDataProperties.
-                let keys: Vec<String> = match self.heap.get(src.heap_index()) {
-                    HeapObj::Object(map) => spec_key_order(&map.keys)
-                        .into_iter()
-                        .filter(|&i| map.attrs[i].enumerable)
-                        .map(|i| map.keys[i].clone())
-                        .collect(),
-                    HeapObj::Array(items) => (0..items.len()).map(|i| i.to_string()).collect(),
+                // CopyDataProperties: ? from.[[OwnPropertyKeys]]() (integer, string,
+                // THEN symbol — symbols INCLUDED), and per key ? [[GetOwnProperty]]
+                // (skip absent / non-enumerable) then ? [[Get]]. object_own_keys +
+                // proxy_gopd route through a Proxy's ownKeys/gopd traps and a getter
+                // fires (its abrupt propagates), so a snapshot can't swallow them.
+                let keys_v = self.object_own_keys(src)?;
+                let keys: Vec<Value> = match self.heap.get(keys_v.heap_index()) {
+                    HeapObj::Array(a) => a.clone(),
                     _ => Vec::new(),
                 };
                 let mut pv = Vec::with_capacity(keys.len());
                 for k in keys {
-                    let v = self.get_prop(src, &k)?;
-                    pv.push((k, v));
+                    let ks = self.key_of(k);
+                    let desc = match self.proxy_gopd(src, &ks)? {
+                        Some(d) => d,
+                        None => self.object_get_own_property_descriptor(src, &ks),
+                    };
+                    if desc.is_undefined() {
+                        continue;
+                    }
+                    let en = self.get_prop(desc, "enumerable")?;
+                    if !self.truthy(en) {
+                        continue;
+                    }
+                    let v = self.get_member(src, &ks, src)?;
+                    pv.push((ks, v));
                 }
                 pv
             };
