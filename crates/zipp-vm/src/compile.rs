@@ -418,6 +418,11 @@ struct Compiler {
     module_reexports: Vec<(String, String, String)>,
     /// `export * from 'spec'` star re-exports: the specifier string.
     module_star_reexports: Vec<String>,
+    /// Transient: set by the object-literal compiler right before compiling a concise
+    /// method / get-set accessor value, so that function's body compiles with
+    /// `super_home_obj = true` (object-method super). Consumed (taken) when the
+    /// function body starts compiling.
+    obj_method_super: bool,
 }
 
 impl Compiler {
@@ -443,6 +448,7 @@ impl Compiler {
             module_has_imports: false,
             module_reexports: Vec::new(),
             module_star_reexports: Vec::new(),
+            obj_method_super: false,
         }
     }
 
@@ -609,6 +615,9 @@ impl Compiler {
         fc.is_script = is_script;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
+        // An object-literal concise method / accessor compiles with object-method
+        // super (set transiently by the object-literal compiler just before this).
+        fc.super_home_obj = std::mem::take(&mut fc.cx.obj_method_super);
         // eval completion-value accumulator: a low, never-reclaimed register
         // (allocated right after `this`/params, below every statement's
         // save/restore high-water) seeded to `undefined`.
@@ -1020,6 +1029,7 @@ impl Compiler {
         enclosing: Vec<EnclosingFn>,
         super_class: Option<u32>,
         super_static: bool,
+        super_home_obj: bool,
     ) -> R<FuncProto> {
         let parent_strict = self.in_strict;
         let is_strict = parent_strict || has_use_strict(&a.body.directives);
@@ -1031,6 +1041,10 @@ impl Compiler {
         // arrows already capture), so propagating the enclosing method's compile-time
         // home-class id is sufficient.
         fc.super_class = super_class;
+        // An arrow inside an OBJECT method inherits its object-method super context, so
+        // `super.x` in the arrow resolves via the runtime [[HomeObject]] (which the
+        // arrow's MakeArrow copies from the enclosing method's closure).
+        fc.super_home_obj = super_home_obj;
         // An arrow inherits the enclosing method's static-ness (so `super.x` in an
         // arrow inside a static method resolves against the parent CLASS).
         fc.super_static = super_static;
@@ -1191,6 +1205,12 @@ struct FnCompiler<'a> {
     /// for `super.x`/`super.m()`, which resolve at runtime via the home prototype's
     /// [[Prototype]] (so they work in base classes too, reaching %Object.prototype%).
     super_class: Option<u32>,
+    /// True when compiling an OBJECT-LITERAL method/accessor (or an arrow lexically
+    /// inside one). `super.x` then resolves via the runtime [[HomeObject]] (the object
+    /// the method was defined in) — emitted as the Super*Obj ops — rather than the
+    /// compile-time class home. Mutually distinct from `super_class` (a fresh function
+    /// has neither unless set for its kind).
+    super_home_obj: bool,
     /// True when compiling a STATIC class element (static method/getter/setter or
     /// `static { … }` block, and arrows lexically inside one). Selects the static
     /// super base (the class's [[Prototype]] = parent class) at runtime. Baked into
@@ -1353,6 +1373,7 @@ impl<'a> FnCompiler<'a> {
             arguments_reg: None,
             uses_arguments: false,
             super_class: None,
+            super_home_obj: false,
             super_static: false,
             derived_class: false,
             this_override: None,
@@ -3110,7 +3131,7 @@ impl<'a> FnCompiler<'a> {
         let captured = capture::captured_locals(&names, &a.body.statements);
         let enclosing = self.child_enclosing();
         let mut proto =
-            self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class, self.super_static)?;
+            self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class, self.super_static, self.super_home_obj)?;
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
         let has_upvalues = !proto.upvalues.is_empty();
@@ -4348,11 +4369,17 @@ impl<'a> FnCompiler<'a> {
             // ordinary property reads of the `Symbol` global (whose key_of maps to
             // the engine's `@@iterator` convention, so iteration is unchanged).
         }
-        // `super.name` — read an inherited property through the lexical superclass.
+        // `super.name` — read an inherited property through the lexical home: a class
+        // method via its home class, an object method via its runtime [[HomeObject]].
         if matches!(&m.object, ox::Expression::Super(_)) {
-            let pid = self.super_class.ok_or("`super.x` is only valid in a derived class")?;
             let name = self.string_name(m.property.name.as_str());
-            self.emit(Instr::SuperGet { dst, home_class_id: pid, name });
+            if let Some(pid) = self.super_class {
+                self.emit(Instr::SuperGet { dst, home_class_id: pid, name });
+            } else if self.super_home_obj {
+                self.emit(Instr::SuperGetObj { dst, name });
+            } else {
+                return Err("`super.x` is only valid in a method".into());
+            }
             return Ok(dst);
         }
         let obj = self.expr(&m.object)?;
@@ -4367,9 +4394,15 @@ impl<'a> FnCompiler<'a> {
     fn computed_member(&mut self, m: &ox::ComputedMemberExpression, dst: Reg) -> R<Reg> {
         // `super[expr]` — computed inherited-property read.
         if matches!(&m.object, ox::Expression::Super(_)) {
-            let pid = self.super_class.ok_or("`super[x]` is only valid in a derived class")?;
-            let key = self.expr(&m.expression)?;
-            self.emit(Instr::SuperGetComputed { dst, home_class_id: pid, key });
+            if let Some(pid) = self.super_class {
+                let key = self.expr(&m.expression)?;
+                self.emit(Instr::SuperGetComputed { dst, home_class_id: pid, key });
+            } else if self.super_home_obj {
+                let key = self.expr(&m.expression)?;
+                self.emit(Instr::SuperGetObjComputed { dst, key });
+            } else {
+                return Err("`super[x]` is only valid in a method".into());
+            }
             return Ok(dst);
         }
         let obj = self.expr(&m.object)?;
@@ -4633,7 +4666,12 @@ impl<'a> FnCompiler<'a> {
                             self.emit(Instr::LoadConst { dst: kr, idx });
                             kr
                         };
+                        // An accessor is a method: it gets a [[HomeObject]], so `super`
+                        // inside it resolves via the object (set the transient flag the
+                        // function-body compiler consumes).
+                        self.cx.obj_method_super = true;
                         let func = self.expr(&p.value)?;
+                        self.cx.obj_method_super = false;
                         // `Function.prototype.toString` of an object accessor is the
                         // whole `get k(){}` / `set k(v){}`; the value-Function span
                         // omits the `get`/`set` and the key, so patch the just-
@@ -4644,6 +4682,7 @@ impl<'a> FnCompiler<'a> {
                         self.cx.functions[fid].non_constructable = true; // accessor = method
                         let is_setter = matches!(p.kind, ox::PropertyKind::Set);
                         self.emit(Instr::DefineAccessor { obj: dst, key, func, is_setter });
+                        self.emit(Instr::SetHomeObject { method: func, home: dst });
                         // SetFunctionName: a getter/setter is named "get k"/"set k"
                         // (a Symbol key → "get [desc]"), at runtime so a computed key
                         // is handled too.
@@ -4656,7 +4695,12 @@ impl<'a> FnCompiler<'a> {
                         // Computed key `{[expr]: v}` → SetIndex.
                         let ke = p.key.as_expression().ok_or("unsupported computed object key")?;
                         let key = self.expr(ke)?;
+                        // A computed concise method gets a [[HomeObject]] (for super).
+                        if p.method {
+                            self.cx.obj_method_super = true;
+                        }
                         let v = self.expr(&p.value)?;
+                        self.cx.obj_method_super = false;
                         // A computed concise method `{ [expr](){} }` (incl. `*`/`async`):
                         // its toString is the whole `[expr](){}` — the value-Function span
                         // omits the computed key + modifiers, so patch it with the
@@ -4674,6 +4718,9 @@ impl<'a> FnCompiler<'a> {
                             self.emit(Instr::SetFnNameFromKey { func: v, key, prefix: 0 });
                         }
                         self.emit(Instr::SetIndex { obj: dst, key, val: v });
+                        if p.method {
+                            self.emit(Instr::SetHomeObject { method: v, home: dst });
+                        }
                     } else {
                         // Static identifier / string / number literal key.
                         let key = match &p.key {
@@ -4688,11 +4735,17 @@ impl<'a> FnCompiler<'a> {
                         // EXCEPT `{ __proto__: fn }` (a proto-setter, not a data
                         // property): its function value stays anonymous.
                         let vtmp = self.alloc_reg();
+                        // A concise method gets a [[HomeObject]] (for `super`); a plain
+                        // `k: function(){}` data property does NOT.
+                        if p.method {
+                            self.cx.obj_method_super = true;
+                        }
                         let v = if key == "__proto__" && !p.method {
                             self.expr_into(&p.value, vtmp)?
                         } else {
                             self.compile_named_init(vtmp, &p.value, &key)?
                         };
+                        self.cx.obj_method_super = false;
                         // Shorthand method `{ m(){}, *g(){}, async a(){} }`: its
                         // toString is the whole `m(){}` (the value-Function span omits
                         // the name/modifiers). Patch the proto just compiled (last).
@@ -4710,6 +4763,9 @@ impl<'a> FnCompiler<'a> {
                             self.emit(Instr::SetProp { obj: dst, name, val: v });
                         } else {
                             self.emit(Instr::InitDataProp { obj: dst, name, val: v });
+                        }
+                        if p.method {
+                            self.emit(Instr::SetHomeObject { method: v, home: dst });
                         }
                     }
                 }

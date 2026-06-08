@@ -405,6 +405,12 @@ pub struct Vm<'p> {
     /// cycle) resolves against this own-exports snapshot instead of recursing. Holds
     /// only slot indices into `globals` (a GC root), so it needs no separate rooting.
     module_own: std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, u32>>,
+    /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
+    /// them), keyed by the closure's heap index → the object the method was defined
+    /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class
+    /// methods use the compile-time `home_class_id` path instead. Values are GC roots;
+    /// dead closure keys are pruned on sweep.
+    closure_home: std::collections::HashMap<u32, Value>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).

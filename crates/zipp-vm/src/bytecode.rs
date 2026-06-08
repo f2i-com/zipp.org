@@ -265,6 +265,20 @@ pub enum Instr {
     SuperSet { home_class_id: u32, name: u32, val: Reg },
     /// `super[key] = val`: computed form of SuperSet (`key` is a register).
     SuperSetComputed { home_class_id: u32, key: Reg, val: Reg },
+    /// Set the `[[HomeObject]]` of an OBJECT-LITERAL method/accessor closure `method`
+    /// to `home` (the object being built), so `super.x` inside it resolves via
+    /// GetPrototypeOf(home). Emitted by the object-literal codegen for concise
+    /// methods and get/set accessors.
+    SetHomeObject { method: Reg, home: Reg },
+    /// `dst = super.name` inside an OBJECT method: resolve on GetPrototypeOf the
+    /// executing closure's `[[HomeObject]]`, with `this` = the current receiver.
+    SuperGetObj { dst: Reg, name: u32 },
+    /// `dst = super[key]` inside an object method (computed form).
+    SuperGetObjComputed { dst: Reg, key: Reg },
+    /// `super.name = val` inside an object method.
+    SuperSetObj { name: u32, val: Reg },
+    /// `super[key] = val` inside an object method (computed form).
+    SuperSetObjComputed { key: Reg, val: Reg },
     /// `dst = new callee(args…)` — construct an instance. `callee` must be a
     /// class value; builds an object, installs the methods, runs the ctor.
     New { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },

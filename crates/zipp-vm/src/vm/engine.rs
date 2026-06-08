@@ -150,6 +150,7 @@ impl<'p> Vm<'p> {
             module_cache: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
             module_own: std::collections::HashMap::new(),
+            closure_home: std::collections::HashMap::new(),
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),

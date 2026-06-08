@@ -1273,6 +1273,43 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// The super BASE for an OBJECT-method `super.x`: GetPrototypeOf([[HomeObject]]),
+    /// where the home object is looked up by the executing closure (`callee`) in
+    /// `closure_home`. `UNDEFINED` if there is no home (then the caller's
+    /// RequireObjectCoercible throws — shouldn't happen for well-formed object super).
+    pub(crate) fn obj_super_base(&mut self, callee: Value) -> Value {
+        let home = if callee.is_heap() {
+            self.closure_home.get(&callee.heap_index()).copied().unwrap_or(Value::UNDEFINED)
+        } else {
+            Value::UNDEFINED
+        };
+        if home.is_heap() {
+            self.object_get_prototype_of(home)
+        } else {
+            Value::UNDEFINED
+        }
+    }
+
+    /// `super.key = v` for an OBJECT method: like `super_set` but the base prototype
+    /// is already resolved from the home object. An inherited setter on the chain is
+    /// invoked with `this` = the receiver; otherwise the value is set on the receiver.
+    pub(crate) fn super_set_obj(
+        &mut self,
+        proto: Value,
+        key: &str,
+        this: Value,
+        v: Value,
+    ) -> Result<(), Thrown> {
+        self.require_object_coercible(proto)?;
+        let setter = self.lookup_accessor(proto, key, true);
+        if self.is_callable(setter) {
+            self.call_value(setter, this, &[v])?;
+        } else {
+            self.set_prop(this, key, v, true)?;
+        }
+        Ok(())
+    }
+
     /// Run a class's constructor contribution on an existing instance `obj` —
     /// for `super(...)` and the implicit-super chain. An explicit ctor runs its
     /// own `super`; an implicit one runs the parent chain then its fields.

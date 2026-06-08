@@ -125,6 +125,9 @@ impl Vm<'_> {
         for v in self.module_cache.values() {
             root_val!(*v);
         }
+        for v in self.closure_home.values() {
+            root_val!(*v);
+        }
         if let Some((v, _)) = self.pending_yield {
             root_val!(v);
         }
@@ -267,6 +270,7 @@ impl Vm<'_> {
         self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.error_data.retain(|&k| marks[k as usize]);
         self.module_namespaces.retain(|&k, _| marks[k as usize]);
+        self.closure_home.retain(|&k, _| marks[k as usize]);
         self.dispose_stacks.retain(|&k, _| marks[k as usize]);
         self.async_stacks.retain(|&k| marks[k as usize]);
         self.shadow_realms.retain(|&k| marks[k as usize]);

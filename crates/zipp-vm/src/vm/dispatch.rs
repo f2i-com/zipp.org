@@ -1242,6 +1242,52 @@ impl<'p> Vm<'p> {
                         self.super_set(home_class_id, &ks, this, v, is_static)?;
                         ip += 1;
                     }
+                    Instr::SetHomeObject { method, home } => {
+                        let m = self.get(base, method);
+                        if m.is_heap() {
+                            let h = self.get(base, home);
+                            self.closure_home.insert(m.heap_index(), h);
+                        }
+                        ip += 1;
+                    }
+                    Instr::SuperGetObj { dst, name } => {
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].clone();
+                        let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        self.require_object_coercible(proto)?;
+                        let this = self.get(base, 0);
+                        let r = self.get_member(proto, &key, this)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::SuperGetObjComputed { dst, key } => {
+                        let kv = self.get(base, key);
+                        let ks = self.to_property_key(kv)?;
+                        let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        self.require_object_coercible(proto)?;
+                        let this = self.get(base, 0);
+                        let r = self.get_member(proto, &ks, this)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::SuperSetObj { name, val } => {
+                        let key =
+                            self.func(func_id as usize).string_constants[name as usize].clone();
+                        let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        let this = self.get(base, 0);
+                        let v = self.get(base, val);
+                        self.super_set_obj(proto, &key, this, v)?;
+                        ip += 1;
+                    }
+                    Instr::SuperSetObjComputed { key, val } => {
+                        let kv = self.get(base, key);
+                        let ks = self.to_property_key(kv)?;
+                        let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        let this = self.get(base, 0);
+                        let v = self.get(base, val);
+                        self.super_set_obj(proto, &ks, this, v)?;
+                        ip += 1;
+                    }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
                         let arr = if argc == 1 && self.get(base, arg_base).is_number() {
                             // `Array(n)` → n HOLES (absent elements), not n undefineds.
@@ -2048,6 +2094,14 @@ impl<'p> Vm<'p> {
                         let v = Value::heap(
                             self.heap.alloc(HeapObj::Closure { func: func_id, upvalues: cells, this_val }),
                         );
+                        // An arrow inside an object method inherits that method's
+                        // [[HomeObject]] lexically (so `super.x` in the arrow resolves).
+                        let callee = self.frames[frame_idx].callee;
+                        if callee.is_heap() {
+                            if let Some(&home) = self.closure_home.get(&callee.heap_index()) {
+                                self.closure_home.insert(v.heap_index(), home);
+                            }
+                        }
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2678,8 +2732,10 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let callee_v = if closure != NO_CLOSURE { Value::heap(closure) } else { Value::UNDEFINED };
-                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, callee_v)?;
+                        // Pass the resolved method VALUE as the callee (so LoadCallee and
+                        // object-method `super` — which reads [[HomeObject]] keyed by the
+                        // executing function value — find it, even for a no-upvalue method).
+                        self.setup_call(fid, closure, recv, base, arg_base, argc, dst, ip + 1, prop)?;
                         break;
                     }
 
