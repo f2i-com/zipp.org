@@ -1888,7 +1888,18 @@ impl<'p> Vm<'p> {
     /// comparator).
     fn sort_values(&mut self, items: &mut Vec<Value>, cmp: Value) -> Result<(), Thrown> {
         if self.is_callable(cmp) {
+            // SortCompare always orders `undefined` elements AFTER every defined
+            // value and NEVER passes them to the comparator. Partition them out,
+            // sort the rest, then re-append (the default-comparator branch below
+            // does the equivalent via its None-is-Greater key ordering).
+            let undef = items.iter().filter(|&&v| v == Value::UNDEFINED).count();
+            if undef > 0 {
+                items.retain(|&v| v != Value::UNDEFINED);
+            }
             self.comparator_sort(items, cmp)?;
+            for _ in 0..undef {
+                items.push(Value::UNDEFINED);
+            }
         } else {
             let mut keyed: Vec<(Option<String>, Value)> = Vec::with_capacity(items.len());
             for v in std::mem::take(items) {
