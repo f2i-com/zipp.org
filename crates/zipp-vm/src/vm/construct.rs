@@ -998,17 +998,20 @@ impl<'p> Vm<'p> {
                 }
             }
         } else {
-            // No own constructor: run the parent's ctor (implicit `super(...args)`)
-            // then this class's field initializers.
+            // No own constructor: run the parent's ctor (implicit `super(...args)`),
+            // threading its PRODUCED `this` (a base ctor's object-return becomes the
+            // instance), then this class's field initializers on it.
+            let mut inst = obj;
             if let Some(pidx) = parent {
-                self.run_class_ctor(Value::heap(pidx), obj, args, new_target)?;
+                inst = self.run_class_ctor(Value::heap(pidx), inst, args, new_target)?;
             }
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
-                self.call_value(f, obj, &[])?;
+                self.call_value(f, inst, &[])?;
             }
             // Clear any super() mark a nested parent ctor left on this instance.
-            self.super_called.remove(&obj.heap_index());
+            self.super_called.remove(&inst.heap_index());
+            return Ok(inst);
         }
         Ok(obj)
     }
@@ -1394,9 +1397,9 @@ impl<'p> Vm<'p> {
     /// Run a class's constructor contribution on an existing instance `obj` —
     /// for `super(...)` and the implicit-super chain. An explicit ctor runs its
     /// own `super`; an implicit one runs the parent chain then its fields.
-    pub(crate) fn run_class_ctor(&mut self, cval: Value, obj: Value, args: &[Value], new_target: Value) -> Result<(), Thrown> {
+    pub(crate) fn run_class_ctor(&mut self, cval: Value, obj: Value, args: &[Value], new_target: Value) -> Result<Value, Thrown> {
         if !cval.is_heap() {
-            return Ok(());
+            return Ok(obj);
         }
         let (ctor, ctor_ups, has_explicit, parent) = match self.heap.get(cval.heap_index()) {
             HeapObj::Class(c) => (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent),
@@ -1411,7 +1414,7 @@ impl<'p> Vm<'p> {
                 // representation so its methods work and it is a real instanceof. The
                 // instance keeps its own (subclass) prototype, recorded in proto_of.
                 if self.brand_builtin_subclass(cval, obj, args)? {
-                    return Ok(());
+                    return Ok(obj);
                 }
                 if let Some(k) = self.error_ctors.iter().position(|&c| c == cval.heap_index()) {
                     // `class X extends Error` instance: it has the [[ErrorData]] slot.
@@ -1435,27 +1438,37 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                return Ok(());
+                return Ok(obj);
             }
         };
         if has_explicit {
+            // An explicit ctor produces `this`: its object-return (return-override)
+            // becomes the effective instance; a non-object/undefined return keeps obj.
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
                 // `new.target` propagates unchanged through super() to the parent ctor.
                 self.pending_new_target = new_target;
-                self.call_value(f, obj, args)?;
+                let r = self.call_value(f, obj, args)?;
+                return Ok(if self.is_object_value(r) { r } else { obj });
             }
+            Ok(obj)
         } else {
+            // Implicit ctor: run the parent chain (threading its produced `this`),
+            // then this class's field initializers on it.
+            let mut eff = obj;
             if let Some(pidx) = parent {
-                self.run_class_ctor(Value::heap(pidx), obj, args, new_target)?;
+                eff = self.run_class_ctor(Value::heap(pidx), eff, args, new_target)?;
             }
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
                 self.pending_new_target = new_target;
-                self.call_value(f, obj, &[])?;
+                let r = self.call_value(f, eff, &[])?;
+                if self.is_object_value(r) {
+                    eff = r;
+                }
             }
+            Ok(eff)
         }
-        Ok(())
     }
 
     /// `Object.assign(target, ...sources)`: copy each source's own enumerable

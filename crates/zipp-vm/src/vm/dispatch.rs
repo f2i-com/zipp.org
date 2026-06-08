@@ -1119,7 +1119,15 @@ impl<'p> Vm<'p> {
                         }
                         // `super(...)` keeps the derived activation's new.target.
                         let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
-                        self.run_class_ctor(parent, this, &args, nt)?;
+                        // super() PRODUCES `this`: if the parent ctor object-returns a
+                        // different instance (return-override), rebind reg 0 so the rest
+                        // of the derived ctor body operates on it. (super_called stays
+                        // keyed on the original pre-allocated `this`, which construct()
+                        // uses for the missing-super check.)
+                        let produced = self.run_class_ctor(parent, this, &args, nt)?;
+                        if produced.is_heap() {
+                            self.set(base, 0, produced);
+                        }
                         if this.is_heap() {
                             self.super_called.insert(this.heap_index());
                         }
@@ -1132,7 +1140,10 @@ impl<'p> Vm<'p> {
                         let args_v = self.get(base, args);
                         let arg_vec = self.array_snapshot(args_v.heap_index());
                         let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
-                        self.run_class_ctor(parent, this, &arg_vec, nt)?;
+                        let produced = self.run_class_ctor(parent, this, &arg_vec, nt)?;
+                        if produced.is_heap() {
+                            self.set(base, 0, produced);
+                        }
                         if this.is_heap() {
                             self.super_called.insert(this.heap_index());
                         }
