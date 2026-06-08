@@ -786,6 +786,22 @@ impl<'p> Vm<'p> {
                 }
                 return Ok(if digits.is_empty() { f64::NAN } else { acc });
             }
+            // The only Infinity spellings a StringNumericLiteral accepts are the
+            // exact `Infinity` / `+Infinity` / `-Infinity` (capital I, full word).
+            match t {
+                "Infinity" | "+Infinity" => return Ok(f64::INFINITY),
+                "-Infinity" => return Ok(f64::NEG_INFINITY),
+                _ => {}
+            }
+            // Rust's f64 parser also accepts word forms (`inf`, `infinity`, `INF`,
+            // `nan`, …) that are NOT valid JS numeric strings. A valid JS decimal /
+            // scientific literal begins (after an optional sign) with a digit or `.`,
+            // never a letter — so reject a letter-led body (`Infinity` was handled
+            // above). A decimal that overflows (`1e400`) still parses to Infinity.
+            let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+            if body.as_bytes().first().is_some_and(|b| b.is_ascii_alphabetic()) {
+                return Ok(f64::NAN);
+            }
             return Ok(t.parse::<f64>().unwrap_or(f64::NAN));
         }
         Ok(f64::NAN)
