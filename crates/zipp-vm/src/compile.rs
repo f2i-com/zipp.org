@@ -3932,6 +3932,27 @@ impl<'a> FnCompiler<'a> {
             }
         };
 
+        // `for (using x of it)` / `for (await using x of it)`: each iteration
+        // disposes the loop variable's resource at the end of the iteration (a
+        // per-iteration disposal scope). Allocate the scope/completion registers
+        // once (stable across iterations); OpenUsingScope writes a fresh scope id
+        // each turn. Only a simple-identifier head is a using declaration.
+        let using_async: Option<bool> = match &f.left {
+            ox::ForStatementLeft::VariableDeclaration(d) => match d.kind {
+                ox::VariableDeclarationKind::Using => Some(false),
+                ox::VariableDeclarationKind::AwaitUsing => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        let using_regs = using_async.map(|_| {
+            (
+                self.declare_local("<forof.uscope>"),
+                self.declare_local("<forof.ukind>"),
+                self.declare_local("<forof.uval>"),
+            )
+        });
+
         let top = self.here();
         let save = self.next_reg;
         let done = self.alloc_reg();
@@ -3990,7 +4011,60 @@ impl<'a> FnCompiler<'a> {
         }
         self.next_reg = save; // reclaim done + elem temps
 
+        // Per-iteration `using` disposal: open a fresh scope, register the loop
+        // variable's value, and wrap the body in a finally that disposes it on every
+        // iteration exit (normal/throw/break/continue). Nested INSIDE the for-of's
+        // close-on-throw handler, so a body throw disposes the resource first, then
+        // closes the iterator.
+        let using_fin = if let (Some(is_async), Some((sreg, kreg, vreg))) =
+            (using_async, using_regs)
+        {
+            self.emit(Instr::OpenUsingScope { dst: sreg });
+            let src = if var_is_cell {
+                let t = self.alloc_reg();
+                self.emit(Instr::CellGet { dst: t, cell: var_reg });
+                t
+            } else {
+                var_reg
+            };
+            if is_async {
+                self.emit(Instr::RegisterAsyncDisposable { scope: sreg, val: src });
+            } else {
+                self.emit(Instr::RegisterDisposable { scope: sreg, val: src });
+            }
+            if var_is_cell {
+                self.next_reg -= 1;
+            }
+            let push_at = self.here();
+            self.emit(Instr::PushFinally { target: 0, kind_reg: kreg, val_reg: vreg });
+            self.handler_depth += 1;
+            Some((is_async, sreg, kreg, vreg, push_at))
+        } else {
+            None
+        };
+
         self.stmt(&f.body)?;
+
+        // Close the per-iteration `using` finally (its DisposeScope/await-loop runs
+        // on the normal path here, and on abrupt exits via the finally handler).
+        if let Some((is_async, sreg, kreg, vreg, push_at)) = using_fin {
+            self.emit_leave_finally_normal(kreg);
+            self.handler_depth -= 1;
+            let jto_fin = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            let fin_start = self.here();
+            if let Instr::PushFinally { target, .. } = &mut self.code[push_at as usize] {
+                *target = fin_start;
+            }
+            self.patch_jump(jto_fin, fin_start);
+            if is_async {
+                self.emit_async_dispose_loop(sreg, kreg, vreg);
+            } else {
+                self.emit(Instr::DisposeScope { scope: sreg, kind_reg: kreg, val_reg: vreg });
+            }
+            self.emit(Instr::EndFinally { kind_reg: kreg, val_reg: vreg });
+        }
+
         // Normal iteration completion: pop the close-on-throw handler before looping.
         if close_push.is_some() {
             self.emit(Instr::PopHandler);
