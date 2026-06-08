@@ -1897,17 +1897,23 @@ impl<'a> FnCompiler<'a> {
                 // valid identifier, so no user collision) and export it as "default".
                 let slot = self.cx.global_slot("*default*") as u32;
                 let tmp = self.temp();
+                // `export default function f(){}` / `class C{}` also binds the NAME
+                // (f / C) as a module-local declaration, so code in the module can
+                // reference it (the slot is module-declared for per-module isolation).
+                let mut bind_name: Option<String> = None;
                 match &e.declaration {
                     K::FunctionDeclaration(f) => {
                         let (id, has_up) = self
                             .compile_func_expr(f.id.as_ref().map(|i| i.name.to_string()), f)?;
                         self.emit_make_callable(tmp, id, has_up);
+                        bind_name = f.id.as_ref().map(|i| i.name.to_string());
                     }
                     K::ClassDeclaration(c) => {
                         let r = self.class_expr(c, tmp, None)?;
                         if r != tmp {
                             self.emit(Instr::Move { dst: tmp, src: r });
                         }
+                        bind_name = c.id.as_ref().map(|i| i.name.to_string());
                     }
                     other => {
                         let expr = other.as_expression().ok_or("unsupported default export")?;
@@ -1918,6 +1924,11 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
                 self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                if let Some(name) = bind_name {
+                    let nslot = self.cx.global_slot(&name) as u32;
+                    self.cx.decl_globals.insert(nslot); // module-declared → per-module slot
+                    self.emit(Instr::StoreGlobal { idx: nslot, src: tmp });
+                }
                 self.next_reg -= 1;
                 self.cx
                     .module_exports
