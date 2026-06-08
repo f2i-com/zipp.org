@@ -265,6 +265,16 @@ impl<'p> Vm<'p> {
                 return self.ta_element_set(idx, i, val);
             }
             let k = self.key_of(key);
+            // A valid integer index given as a STRING ("0") still writes the element.
+            if let Some(i) = self.ta_valid_index(idx, &k) {
+                return self.ta_element_set(idx, i, val);
+            }
+            // A CanonicalNumericIndexString that isn't a valid integer index
+            // (non-integer, "-0", out of range) is a silent no-op that NEVER
+            // reaches the prototype — IntegerIndexedExotic [[Set]] (10.4.5.5).
+            if self.is_canonical_numeric_index(&k) {
+                return Ok(());
+            }
             return self.set_prop(obj, &k, val, strict);
         }
         // Callable / class computed assignment (`fn["x"] = v`, `C["s"] = v`) is

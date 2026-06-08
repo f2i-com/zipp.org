@@ -2845,6 +2845,11 @@ impl<'p> Vm<'p> {
                 "BYTES_PER_ELEMENT" => Value::num(size as f64),
                 "buffer" => Value::heap(buffer),
                 "@@toStringTag" => self.alloc_str(native::TA_KINDS[kind as usize].0.to_string()),
+                // A CanonicalNumericIndexString that is NOT a valid integer index
+                // (non-integer "1.1", "-0", or out of range) is an absent own
+                // property of an integer-indexed exotic: return undefined WITHOUT
+                // consulting the prototype (10.4.5.4 [[Get]]).
+                _ if self.is_canonical_numeric_index(key) => Value::UNDEFINED,
                 // Accessor-aware so a user getter on the type prototype fires with
                 // the TA instance as receiver (SpeciesConstructor's this.constructor).
                 _ => return self.proto_member_get(self.ta_protos[kind as usize], key, obj),
