@@ -73,7 +73,9 @@ impl<'p> Vm<'p> {
         let mut idx = v.heap_index();
         for _ in 0..1000 {
             match self.heap.get(idx) {
-                HeapObj::Array(_) => return true,
+                // An `arguments` exotic is Array-backed internally but is an ordinary
+                // object ([[ParameterMap]]), NOT an Array exotic — IsArray is false.
+                HeapObj::Array(_) => return !self.arguments_objs.contains(&idx),
                 HeapObj::Proxy { target, revoked, .. } if !*revoked && target.is_heap() => {
                     idx = target.heap_index();
                 }

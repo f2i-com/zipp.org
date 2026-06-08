@@ -28,6 +28,7 @@ impl<'p> Vm<'p> {
                     M::Max => f64::NEG_INFINITY,
                     _ => 0.0, // Hypot: sum of squares
                 };
+                let mut hypot_inf = false;
                 for i in 0..argc {
                     let v = arg(i)?;
                     acc = match op {
@@ -37,10 +38,21 @@ impl<'p> Vm<'p> {
                         M::Max => {
                             if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.max(v) }
                         }
-                        _ => acc + v * v,
+                        _ => {
+                            // Math.hypot: a ±Infinity argument forces +Infinity, even
+                            // if another argument is NaN (spec step 3).
+                            if v.is_infinite() {
+                                hypot_inf = true;
+                            }
+                            acc + v * v
+                        }
                     };
                 }
-                if matches!(op, M::Hypot) { acc.sqrt() } else { acc }
+                if matches!(op, M::Hypot) {
+                    if hypot_inf { f64::INFINITY } else { acc.sqrt() }
+                } else {
+                    acc
+                }
             }
             M::Pow => arg(0)?.powf(arg(1)?),
             M::Atan2 => arg(0)?.atan2(arg(1)?),
@@ -73,15 +85,27 @@ impl<'p> Vm<'p> {
                     M::Max => f64::NEG_INFINITY,
                     _ => 0.0,
                 };
+                let mut hypot_inf = false;
                 for i in 0..args.len() {
                     let v = arg(i)?;
                     acc = match op {
                         M::Min => if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.min(v) },
                         M::Max => if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.max(v) },
-                        _ => acc + v * v,
+                        _ => {
+                            // Math.hypot: a ±Infinity argument forces +Infinity even
+                            // when another argument is NaN (spec step 3).
+                            if v.is_infinite() {
+                                hypot_inf = true;
+                            }
+                            acc + v * v
+                        }
                     };
                 }
-                if matches!(op, M::Hypot) { acc.sqrt() } else { acc }
+                if matches!(op, M::Hypot) {
+                    if hypot_inf { f64::INFINITY } else { acc.sqrt() }
+                } else {
+                    acc
+                }
             }
             M::Pow => arg(0)?.powf(arg(1)?),
             M::Atan2 => arg(0)?.atan2(arg(1)?),
