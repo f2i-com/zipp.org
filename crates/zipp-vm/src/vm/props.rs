@@ -2879,7 +2879,19 @@ impl<'p> Vm<'p> {
                 _ if self.is_canonical_numeric_index(key) => Value::UNDEFINED,
                 // Accessor-aware so a user getter on the type prototype fires with
                 // the TA instance as receiver (SpeciesConstructor's this.constructor).
-                _ => return self.proto_member_get(self.ta_protos[kind as usize], key, obj),
+                // Consult the instance's REAL [[Prototype]] (a custom proto from
+                // Reflect.construct's newTarget / Object.setPrototypeOf), falling
+                // back to the intrinsic %TypedArray.prototype% when unset.
+                _ => {
+                    let proto = self
+                        .proto_of
+                        .get(&obj.heap_index())
+                        .copied()
+                        .filter(|p| p.is_heap())
+                        .map(|p| p.heap_index())
+                        .unwrap_or(self.ta_protos[kind as usize]);
+                    return self.proto_member_get(proto, key, obj);
+                }
             });
         }
         if let HeapObj::ArrayBuffer { data, .. } = self.heap.get(obj.heap_index()) {
@@ -2901,7 +2913,14 @@ impl<'p> Vm<'p> {
                     matches!(self.heap.get(ai), HeapObj::ArrayBuffer { detached: true, .. }),
                 ),
                 _ => {
-                    let proto = if shared { self.sab_proto } else { self.arraybuffer_proto };
+                    let default = if shared { self.sab_proto } else { self.arraybuffer_proto };
+                    let proto = self
+                        .proto_of
+                        .get(&ai)
+                        .copied()
+                        .filter(|p| p.is_heap())
+                        .map(|p| p.heap_index())
+                        .unwrap_or(default);
                     self.proto_member(proto, key)
                 }
             });
@@ -2921,7 +2940,16 @@ impl<'p> Vm<'p> {
                 "byteLength" => Value::num(byte_length as f64),
                 "byteOffset" => Value::num(byte_offset as f64),
                 "buffer" => Value::heap(buffer),
-                _ => self.proto_member(self.dataview_proto, key),
+                _ => {
+                    let proto = self
+                        .proto_of
+                        .get(&obj.heap_index())
+                        .copied()
+                        .filter(|p| p.is_heap())
+                        .map(|p| p.heap_index())
+                        .unwrap_or(self.dataview_proto);
+                    self.proto_member(proto, key)
+                }
             });
         }
         // Temporal.Duration: field getters + sign/blank; methods via the prototype.
