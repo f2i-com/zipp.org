@@ -2173,21 +2173,30 @@ impl<'a> FnCompiler<'a> {
             } else {
                 self.emit(Instr::LoadUndefined { dst: reg });
             }
-            // A sync `using x = init` registers its resource for disposal at block
-            // exit (after the binding is stored). `await using` binds like `let`
-            // but is not yet disposed (deferred). `using_scope_reg` is set by the
-            // enclosing `compile_using_block`; it is always present for a `using`
-            // declaration (the block/body that contains one is wrapped).
-            if d.kind == ox::VariableDeclarationKind::Using {
-                if let Some(scope_reg) = self.using_scope_reg {
-                    if is_cell {
-                        let t = self.temp();
-                        self.emit(Instr::CellGet { dst: t, cell: reg });
-                        self.emit(Instr::RegisterDisposable { scope: scope_reg, val: t });
-                        self.next_reg -= 1;
-                    } else {
-                        self.emit(Instr::RegisterDisposable { scope: scope_reg, val: reg });
-                    }
+            // A `using`/`await using x = init` registers its resource for disposal
+            // at block exit (after the binding is stored). `using_scope_reg` is set
+            // by the enclosing `compile_using_block`; it is always present for such a
+            // declaration (the block/body/try that contains one is wrapped).
+            let using_async = match d.kind {
+                ox::VariableDeclarationKind::Using => Some(false),
+                ox::VariableDeclarationKind::AwaitUsing => Some(true),
+                _ => None,
+            };
+            if let (Some(is_async_using), Some(scope_reg)) = (using_async, self.using_scope_reg) {
+                let src = if is_cell {
+                    let t = self.temp();
+                    self.emit(Instr::CellGet { dst: t, cell: reg });
+                    t
+                } else {
+                    reg
+                };
+                if is_async_using {
+                    self.emit(Instr::RegisterAsyncDisposable { scope: scope_reg, val: src });
+                } else {
+                    self.emit(Instr::RegisterDisposable { scope: scope_reg, val: src });
+                }
+                if is_cell {
+                    self.next_reg -= 1;
                 }
             }
         }
@@ -3461,6 +3470,59 @@ impl<'a> FnCompiler<'a> {
         })
     }
 
+    /// True iff `body` declares a top-level `await using` — such a scope disposes
+    /// ASYNCHRONOUSLY (each dispose result is awaited), so its finally epilogue is
+    /// the awaited disposal loop rather than the single sync `DisposeScope` op.
+    fn block_has_await_using(body: &[ox::Statement]) -> bool {
+        body.iter().any(|st| {
+            matches!(st,
+                ox::Statement::VariableDeclaration(d)
+                    if d.kind == ox::VariableDeclarationKind::AwaitUsing)
+        })
+    }
+
+    /// Emit the async-disposal epilogue (the finally body for an `await using`
+    /// scope): a loop that pops each disposer LIFO, calls it, and AWAITs the result,
+    /// catching a sync throw or an awaited rejection and merging it into the
+    /// completion (`kind_reg`/`val_reg`) as a SuppressedError chain. An inert
+    /// (null-initializer) record still performs one `Await(undefined)`, so an
+    /// evaluated `await using x = null` yields a microtask tick; a scope that was
+    /// opened but registered nothing (a `break` before the declaration) runs the
+    /// loop zero times and awaits nothing.
+    fn emit_async_dispose_loop(&mut self, scope_reg: Reg, kind_reg: Reg, val_reg: Reg) {
+        let save = self.next_reg;
+        let res = self.alloc_reg();
+        let done = self.alloc_reg();
+        let exc = self.alloc_reg();
+
+        let loop_top = self.here();
+        let push_at = self.here();
+        self.emit(Instr::PushHandler { catch_target: 0, catch_reg: exc });
+        self.emit(Instr::AsyncDisposeNext { scope: scope_reg, res, done });
+        let jdone = self.here();
+        self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+        self.emit(Instr::Await { dst: res, val: res });
+        self.emit(Instr::PopHandler);
+        self.emit(Instr::Jump { target: loop_top });
+
+        let done_path = self.here();
+        self.emit(Instr::PopHandler);
+        let jafter = self.here();
+        self.emit(Instr::Jump { target: 0 });
+
+        let cat = self.here();
+        self.emit(Instr::MergeDispose { kind_reg, val_reg, err: exc });
+        self.emit(Instr::Jump { target: loop_top });
+
+        let after = self.here();
+        if let Instr::PushHandler { catch_target, .. } = &mut self.code[push_at as usize] {
+            *catch_target = cat;
+        }
+        self.patch_jump(jdone, done_path);
+        self.patch_jump(jafter, after);
+        self.next_reg = save; // reclaim res/done/exc
+    }
+
     /// Compile a statement list that contains `using` declarations: desugar it onto
     /// the existing `PushFinally`/`EndFinally` machinery so the registered resources
     /// are disposed (LIFO, SuppressedError-chained) on EVERY exit — normal, throw,
@@ -3506,7 +3568,13 @@ impl<'a> FnCompiler<'a> {
         }
         self.patch_jump(normal_jump, fin_start);
 
-        self.emit(Instr::DisposeScope { scope: scope_reg, kind_reg, val_reg });
+        // An `await using` scope (in an async context) disposes asynchronously —
+        // emit the awaited disposal loop; otherwise the single sync DisposeScope op.
+        if Self::block_has_await_using(body) && self.in_async {
+            self.emit_async_dispose_loop(scope_reg, kind_reg, val_reg);
+        } else {
+            self.emit(Instr::DisposeScope { scope: scope_reg, kind_reg, val_reg });
+        }
         self.emit(Instr::EndFinally { kind_reg, val_reg });
         self.next_reg -= 3; // reclaim scope_reg / kind_reg / val_reg
         Ok(())

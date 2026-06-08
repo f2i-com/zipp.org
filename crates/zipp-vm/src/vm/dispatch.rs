@@ -2973,6 +2973,91 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    Instr::RegisterAsyncDisposable { scope, val } => {
+                        // CreateDisposableResource (async hint): null/undefined still
+                        // pushes an INERT record (so disposal performs one Await); a
+                        // non-object → TypeError; else GetDisposeMethod(async): read
+                        // @@asyncDispose FIRST (once), fall back to @@dispose only when
+                        // it is nullish; both absent/non-callable → TypeError.
+                        let v = self.get(base, val);
+                        let id = self.get(base, scope).as_int() as u32;
+                        if v.is_nullish() {
+                            if let Some(d) = self.using_resources.get_mut(&id) {
+                                d.push(Value::UNDEFINED); // inert: awaited, not called
+                            }
+                            ip += 1;
+                        } else {
+                            if !self.is_object_value(v) {
+                                return Err(Thrown(
+                                    "TypeError: an 'await using' declaration value is not an object".into(),
+                                ));
+                            }
+                            let mut method = self.get_member(v, "@@asyncDispose", v)?;
+                            if !self.is_callable(method) {
+                                method = self.get_member(v, "@@dispose", v)?;
+                            }
+                            if !self.is_callable(method) {
+                                return Err(Thrown(
+                                    "TypeError: the 'await using' value has no callable [Symbol.asyncDispose] or [Symbol.dispose]"
+                                        .into(),
+                                ));
+                            }
+                            let disposer = Value::heap(self.heap.alloc(HeapObj::Bound {
+                                target: method,
+                                this: v,
+                                args: Vec::new(),
+                            }));
+                            if let Some(d) = self.using_resources.get_mut(&id) {
+                                d.push(disposer);
+                            }
+                            ip += 1;
+                        }
+                    }
+                    Instr::AsyncDisposeNext { scope, res, done } => {
+                        // Pop the LAST (LIFO) disposer of the scope. Empty → done. An
+                        // inert `undefined` entry yields res=undefined (nothing called).
+                        // A real bound disposer is CALLED here (carrying its `this`);
+                        // its result is left in `res` for the caller to Await. A sync
+                        // throw propagates (caught by the loop's handler).
+                        let id = self.get(base, scope).as_int() as u32;
+                        let entry = self
+                            .using_resources
+                            .get_mut(&id)
+                            .and_then(|d| d.pop());
+                        match entry {
+                            None => {
+                                self.set(base, done, Value::bool(true));
+                                self.set(base, res, Value::UNDEFINED);
+                                ip += 1;
+                            }
+                            Some(d) => {
+                                self.set(base, done, Value::bool(false));
+                                let r = if d.is_nullish() {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.call_value(d, Value::UNDEFINED, &[])?
+                                };
+                                self.set(base, res, r);
+                                ip += 1;
+                            }
+                        }
+                    }
+                    Instr::MergeDispose { kind_reg, val_reg, err } => {
+                        // DisposeResources error chaining for the async loop's catch
+                        // arm: chain into a SuppressedError if a throw is already
+                        // pending, else make the completion a throw of `err`.
+                        let e = self.get(base, err);
+                        let raw = self.regs[base + kind_reg as usize].as_int();
+                        if raw & 3 == 2 {
+                            let prior = self.regs[base + val_reg as usize];
+                            let merged = self.build_suppressed_error(&[e, prior, Value::UNDEFINED])?;
+                            self.regs[base + val_reg as usize] = merged;
+                        } else {
+                            self.regs[base + kind_reg as usize] = Value::int(2);
+                            self.regs[base + val_reg as usize] = e;
+                        }
+                        ip += 1;
+                    }
                     Instr::JumpFinally { target, floor } => {
                         // A `break`/`continue` exiting one or more `try` blocks:
                         // run each intervening `finally` first, popping any

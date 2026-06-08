@@ -580,6 +580,28 @@ pub enum Instr {
     /// `val_reg` (kind&3==2 ⇒ already a throw); rewrite kind_reg/val_reg so the
     /// following `EndFinally` re-raises the merged completion.
     DisposeScope { scope: Reg, kind_reg: Reg, val_reg: Reg },
+    /// Register an `await using` resource (CreateDisposableResource, ASYNC hint):
+    /// like `RegisterDisposable` but the dispose method is `@@asyncDispose` (read
+    /// FIRST, read once), falling back to `@@dispose` only when `@@asyncDispose` is
+    /// nullish; both nullish/non-callable on a non-null object → TypeError. A
+    /// null/undefined value still pushes an INERT record (a plain `undefined`) — so
+    /// the disposal still performs one `Await` (the spec's async asymmetry), unlike
+    /// sync where nullish adds nothing.
+    RegisterAsyncDisposable { scope: Reg, val: Reg },
+    /// Async-disposal step: pop the LAST (LIFO) entry of `scope`'s disposer list. If
+    /// the list is empty, set `done` true. An inert `undefined` entry → `res` =
+    /// undefined (nothing called). A real disposer (a bound `@@asyncDispose`/
+    /// `@@dispose`) is CALLED here (may throw synchronously) and its result lands in
+    /// `res` for the caller to `Await`. The compiler emits this under a handler that
+    /// spans the following `Await`, so a sync throw or an awaited rejection both
+    /// route to the merge step.
+    AsyncDisposeNext { scope: Reg, res: Reg, done: Reg },
+    /// Merge a disposer error `err` into the completion in `kind_reg`/`val_reg`
+    /// (DisposeResources error chaining): if already a throw (kind&3==2), wrap as
+    /// `SuppressedError{error: err, suppressed: val}`; else set the completion to a
+    /// throw of `err`. Used by the async-disposal loop's catch arm (the sync path
+    /// does this inside `DisposeScope`'s native helper).
+    MergeDispose { kind_reg: Reg, val_reg: Reg, err: Reg },
     /// A `break`/`continue` that exits one or more `try` blocks: route through every
     /// intervening `finally` (running each, popping any intervening `catch`) before
     /// landing at `target`. `floor` is the handler-stack depth at the target
