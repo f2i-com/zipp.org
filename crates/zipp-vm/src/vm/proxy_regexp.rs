@@ -311,14 +311,20 @@ impl<'p> Vm<'p> {
                 self.to_js_string(r)?
             } else {
                 // GetSubstitution: read the named-capture group object's own props.
-                let named_list: Vec<(String, Option<String>)> = if named_defined && named_v.is_heap() {
-                    let keys: Vec<String> = match self.heap.get(named_v.heap_index()) {
-                        HeapObj::Object(m) => m.keys.clone(),
-                        _ => Vec::new(),
-                    };
+                // Step l.i.1 — when `groups` is not undefined it is ToObject'd, so a
+                // primitive (e.g. a string `groups`) is boxed and its properties
+                // (`$<length>` etc.) become readable; ToObject(null) throws.
+                let named_list: Vec<(String, Option<String>)> = if named_defined {
+                    let obj = self.to_object(named_v)?;
+                    let names_v = self.object_own_property_names(obj)?;
+                    let key_vals = self.array_snapshot(names_v.heap_index());
+                    let mut keys: Vec<String> = Vec::with_capacity(key_vals.len());
+                    for k in key_vals {
+                        keys.push(self.display(k));
+                    }
                     let mut v = Vec::with_capacity(keys.len());
                     for k in keys {
-                        let val = self.get_prop(named_v, &k)?;
+                        let val = self.get_prop(obj, &k)?;
                         let sv = if val == Value::UNDEFINED { None } else { Some(self.to_js_string(val)?) };
                         v.push((k, sv));
                     }
