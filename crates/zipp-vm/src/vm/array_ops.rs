@@ -573,9 +573,11 @@ impl<'p> Vm<'p> {
         let search = args.first().copied().unwrap_or(Value::UNDEFINED);
         let lv = self.get_prop(this, "length")?;
         let lenf = self.to_number_coerce(lv)?;
-        // ToLength (clamped to the dense-array ceiling, as elsewhere).
+        // ToLength: clamp to 2^53-1 (NOT the dense-array ceiling) — search is per-index
+        // via Get/HasProperty, so a fromIndex near a huge `length` reads only the few
+        // indices in range (indexOf/lastIndexOf/includes on `{length: 2**53, ...}`).
         let len: i64 = if lenf > 0.0 {
-            lenf.min(crate::vm::MAX_DENSE_ARRAY_LEN as f64) as i64
+            lenf.min(9_007_199_254_740_991.0) as i64
         } else {
             0
         };
@@ -603,7 +605,7 @@ impl<'p> Vm<'p> {
                     if self.has_property(this, idxv(k)) {
                         let v = self.get_index(this, idxv(k))?;
                         if self.values_strict_eq(v, search) {
-                            return Ok(Some(Value::int(k as i32)));
+                            return Ok(Some(Value::num(k as f64))); // index may exceed i32 (length up to 2^53-1)
                         }
                     }
                     k -= 1;
@@ -625,7 +627,7 @@ impl<'p> Vm<'p> {
                     } else if self.has_property(this, idxv(k)) {
                         let v = self.get_index(this, idxv(k))?;
                         if self.values_strict_eq(v, search) {
-                            return Ok(Some(Value::int(k as i32)));
+                            return Ok(Some(Value::num(k as f64))); // index may exceed i32 (length up to 2^53-1)
                         }
                     }
                     k += 1;
