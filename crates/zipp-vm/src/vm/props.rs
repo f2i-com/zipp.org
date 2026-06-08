@@ -3251,8 +3251,14 @@ impl<'p> Vm<'p> {
                 Ok(self.proto_member(self.fn_proto, key))
             }
             // `map.size` / `set.size` — an accessor property, not a method.
-            HeapObj::Map { keys, .. } if key == "size" => Ok(len_value(keys.len())),
-            HeapObj::Set(items) if key == "size" => Ok(len_value(items.len())),
+            // Deleted entries are tombstoned (Value::HOLE) without shifting indices
+            // (so live iterators/forEach stay valid), so size counts only live slots.
+            HeapObj::Map { keys, .. } if key == "size" => {
+                Ok(len_value(keys.iter().filter(|k| !k.is_hole()).count()))
+            }
+            HeapObj::Set(items) if key == "size" => {
+                Ok(len_value(items.iter().filter(|v| !v.is_hole()).count()))
+            }
             // A method as a VALUE on a Map/Set/Date/Promise instance
             // (`new Map().set`, `d.getHours`) → the corresponding prototype.
             HeapObj::Map { .. } => self.exotic_own_or_proto(obj, self.map_proto, key),

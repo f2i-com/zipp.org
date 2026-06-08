@@ -764,7 +764,9 @@ impl<'p> Vm<'p> {
                                         }
                                     }
                                     HeapObj::Set(items) => {
-                                        let elems = items.clone();
+                                        // Skip tombstoned (deleted) slots.
+                                        let elems: Vec<Value> =
+                                            items.iter().copied().filter(|v| !v.is_hole()).collect();
                                         if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
                                             d.extend(elems);
                                         }
@@ -2079,9 +2081,12 @@ impl<'p> Vm<'p> {
                                 HeapObj::Array(items) => len_value(items.len()),
                                 HeapObj::Str(s) => len_value(s.char_len),
                                 HeapObj::Cons { len, .. } => len_value(*len),
-                                // for-of over a Map/Set iterates `size` slots.
+                                // for-of over a Map/Set iterates `size` slots (a Set's
+                                // tombstoned/deleted slots don't count).
                                 HeapObj::Map { keys, .. } => len_value(keys.len()),
-                                HeapObj::Set(items) => len_value(items.len()),
+                                HeapObj::Set(items) => {
+                                    len_value(items.iter().filter(|v| !v.is_hole()).count())
+                                }
                                 _ => Value::int(0),
                             }
                         } else {
@@ -3279,7 +3284,11 @@ impl<'p> Vm<'p> {
                                 }
                             }
                             _ => {
-                                let cursor = array_index(self.get(base, idx)).unwrap_or(0);
+                                let mut cursor = array_index(self.get(base, idx)).unwrap_or(0);
+                                // A Set's tombstoned (deleted) slots are skipped.
+                                while matches!(self.heap.get(it.heap_index()), HeapObj::Set(items) if cursor < items.len() && items[cursor].is_hole()) {
+                                    cursor += 1;
+                                }
                                 let len = match self.heap.get(it.heap_index()) {
                                     HeapObj::Array(items) => items.len(),
                                     HeapObj::Set(items) => items.len(),
@@ -3425,7 +3434,11 @@ impl<'p> Vm<'p> {
                             }
                         }
                         // Array/Set element, string char, or Map [k,v] at the cursor.
-                        let cursor = array_index(self.get(base, idx)).unwrap_or(0);
+                        let mut cursor = array_index(self.get(base, idx)).unwrap_or(0);
+                        // A Set's tombstoned (deleted) slots are skipped.
+                        while matches!(self.heap.get(it.heap_index()), HeapObj::Set(items) if cursor < items.len() && items[cursor].is_hole()) {
+                            cursor += 1;
+                        }
                         let len = match self.heap.get(it.heap_index()) {
                             HeapObj::Array(items) => items.len(),
                             HeapObj::Set(items) => items.len(),
@@ -3482,7 +3495,11 @@ impl<'p> Vm<'p> {
                             // Array/Set element, string char, Map [k,v] â€” positional,
                             // wrapped in a {value, done} the loop awaits (a tick).
                             _ => {
-                                let cursor = array_index(self.get(base, idx)).unwrap_or(0);
+                                let mut cursor = array_index(self.get(base, idx)).unwrap_or(0);
+                                // A Set's tombstoned (deleted) slots are skipped.
+                                while matches!(self.heap.get(it.heap_index()), HeapObj::Set(items) if cursor < items.len() && items[cursor].is_hole()) {
+                                    cursor += 1;
+                                }
                                 let len = match self.heap.get(it.heap_index()) {
                                     HeapObj::Array(items) => items.len(),
                                     HeapObj::Set(items) => items.len(),

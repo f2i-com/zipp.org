@@ -2369,7 +2369,10 @@ impl<'p> Vm<'p> {
         let plan = if v.is_heap() {
             match self.heap.get(v.heap_index()) {
                 HeapObj::Array(items) => Plan::Vals(items.clone()),
-                HeapObj::Set(items) => Plan::Vals(items.clone()),
+                // A Set's tombstoned (deleted) slots are skipped.
+                HeapObj::Set(items) => {
+                    Plan::Vals(items.iter().copied().filter(|v| !v.is_hole()).collect())
+                }
                 HeapObj::Str(_) | HeapObj::Cons { .. } => {
                     Plan::Chars(self.heap.str_cow(v.heap_index()).unwrap().chars().collect())
                 }

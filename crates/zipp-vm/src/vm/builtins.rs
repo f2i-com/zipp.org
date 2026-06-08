@@ -1808,7 +1808,10 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let (Some(i), HeapObj::Set(items)) = (pos, self.heap.get_mut(idx)) {
-                    items.remove(i);
+                    // Tombstone (don't shift): a live forEach / iterator holds an index
+                    // cursor, so removing the slot would skip the next element. The
+                    // slot is filtered out by size / has / iteration / set algebra.
+                    items[i] = Value::HOLE;
                     return Ok(Some(Value::bool(true)));
                 }
                 Ok(Some(Value::bool(false)))
@@ -1836,23 +1839,27 @@ impl<'p> Vm<'p> {
                         HeapObj::Set(items) if i < items.len() => items[i],
                         _ => break,
                     };
+                    i += 1;
+                    // A tombstoned (deleted) slot is skipped.
+                    if v.is_hole() {
+                        continue;
+                    }
                     // callback(value, value, set) — value passed twice, mirroring Map.
                     self.call_value(cb, this_arg, &[v, v, recv])?;
-                    i += 1;
                 }
                 Ok(Some(Value::UNDEFINED))
             }
             // keys() === values() for a Set; both yield the values (real iterator).
             "keys" | "values" => {
                 let v = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.clone(),
+                    HeapObj::Set(items) => items.iter().copied().filter(|v| !v.is_hole()).collect(),
                     _ => Vec::new(),
                 };
                 Ok(Some(self.make_iterator(v, self.set_iter_proto)))
             }
             "entries" => {
-                let items = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.clone(),
+                let items: Vec<Value> = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.iter().copied().filter(|v| !v.is_hole()).collect(),
                     _ => Vec::new(),
                 };
                 let entries: Vec<Value> = items
@@ -1878,7 +1885,9 @@ impl<'p> Vm<'p> {
                     Value,
                 ) = match a0.is_heap().then(|| self.heap.get(a0.heap_index())) {
                     Some(HeapObj::Set(items)) => {
-                        let items = items.clone();
+                        // Skip tombstoned (deleted) slots.
+                        let items: Vec<Value> =
+                            items.iter().copied().filter(|v| !v.is_hole()).collect();
                         let n = items.len() as i64;
                         (Some(items), n, Value::UNDEFINED, Value::UNDEFINED)
                     }
@@ -1921,8 +1930,8 @@ impl<'p> Vm<'p> {
                 // getters of a Set-like argument may have mutated this Set (the spec
                 // copies O.[[SetData]] at this point, so any element added by the getters
                 // is included — see union/difference/symmetricDifference mutation tests).
-                let this_items = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.clone(),
+                let this_items: Vec<Value> = match self.heap.get(idx) {
+                    HeapObj::Set(items) => items.iter().copied().filter(|v| !v.is_hole()).collect(),
                     _ => Vec::new(),
                 };
                 let mem = |hay: &[Value], v: Value, vm: &Self| hay.iter().any(|x| vm.same_value_zero(*x, v));
@@ -1944,8 +1953,8 @@ impl<'p> Vm<'p> {
                         // — the LIVE receiver, which the keys() iterator may have mutated —
                         // not by the result. (See symmetricDifference set-like-class-mutation.)
                         let okeys = self.set_rec_keys(&other_real, other_keys, a0)?;
-                        let o_live = match self.heap.get(idx) {
-                            HeapObj::Set(items) => items.clone(),
+                        let o_live: Vec<Value> = match self.heap.get(idx) {
+                            HeapObj::Set(items) => items.iter().copied().filter(|v| !v.is_hole()).collect(),
                             _ => Vec::new(),
                         };
                         let mut r = this_items.clone();
@@ -2012,6 +2021,9 @@ impl<'p> Vm<'p> {
                                     _ => break,
                                 };
                                 index += 1;
+                                if e.is_hole() {
+                                    continue; // tombstoned (deleted) slot
+                                }
                                 if !self.set_rec_has(&other_real, other_has, a0, e)? {
                                     ok = false;
                                     break;
@@ -2069,6 +2081,9 @@ impl<'p> Vm<'p> {
                                     _ => break,
                                 };
                                 index += 1;
+                                if e.is_hole() {
+                                    continue; // tombstoned (deleted) slot
+                                }
                                 if self.set_rec_has(&other_real, other_has, a0, e)? {
                                     disjoint = false;
                                     break;
