@@ -4421,7 +4421,7 @@ impl<'a> FnCompiler<'a> {
                 // in the Temporal Dead Zone: reading it throws a ReferenceError.
                 if self.param_tdz.contains(id.name.as_str()) {
                     let e = self.alloc_reg();
-                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None });
+                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
                     self.emit(Instr::Throw { src: e });
                     return Ok(dst);
                 }
@@ -5333,7 +5333,7 @@ impl<'a> FnCompiler<'a> {
                 // no [[Delete]]). Not a SyntaxError, so it's thrown when evaluated.
                 if matches!(&m.object, ox::Expression::Super(_)) {
                     let e = self.alloc_reg();
-                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None });
+                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
                     self.emit(Instr::Throw { src: e });
                     return Ok(dst);
                 }
@@ -5349,7 +5349,7 @@ impl<'a> FnCompiler<'a> {
                 if matches!(&m.object, ox::Expression::Super(_)) {
                     let _ = self.expr(&m.expression)?;
                     let e = self.alloc_reg();
-                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None });
+                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
                     self.emit(Instr::Throw { src: e });
                     return Ok(dst);
                 }
@@ -5682,7 +5682,7 @@ impl<'a> FnCompiler<'a> {
             if self.is_self_name_reg(*r) {
                 if self.cx.in_strict {
                     let e = self.alloc_reg();
-                    self.emit(Instr::NewError { dst: e, kind: 1, arg: None, opts: None });
+                    self.emit(Instr::NewError { dst: e, kind: 1, arg: None, opts: None, errors: None });
                     self.emit(Instr::Throw { src: e });
                     self.next_reg -= 1;
                 }
@@ -5700,7 +5700,7 @@ impl<'a> FnCompiler<'a> {
         };
         if is_const {
             let e = self.alloc_reg();
-            self.emit(Instr::NewError { dst: e, kind: 1, arg: None, opts: None });
+            self.emit(Instr::NewError { dst: e, kind: 1, arg: None, opts: None, errors: None });
             self.emit(Instr::Throw { src: e });
             self.next_reg -= 1;
             return;
@@ -6804,6 +6804,24 @@ impl<'a> FnCompiler<'a> {
         // as its SECOND argument (`new AggregateError(errors, message)`).
         let kidx = error_kind_index(kind);
         let msg_pos = if kidx == 7 { 1 } else { 0 };
+        // AggregateError's first argument is the `errors` iterable. Evaluate it FIRST
+        // (matching left-to-right argument evaluation); the NewError op IterableToList's
+        // it into a non-enumerable own `errors` array, AFTER coercing the message.
+        let errors = if kidx == 7 {
+            match args.first().and_then(|a| a.as_expression()) {
+                Some(e) => {
+                    let t = self.temp();
+                    let v = self.expr_into(e, t)?;
+                    if v != t {
+                        self.emit(Instr::Move { dst: t, src: v });
+                    }
+                    Some(t)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let arg = match args.get(msg_pos).and_then(|a| a.as_expression()) {
             Some(e) => {
                 let t = self.temp();
@@ -6829,9 +6847,10 @@ impl<'a> FnCompiler<'a> {
             }
             None => None,
         };
-        self.emit(Instr::NewError { dst, kind: kidx, arg, opts });
-        // Reclaim the message + options temps (allocated in order).
-        self.next_reg -= arg.is_some() as Reg + opts.is_some() as Reg;
+        self.emit(Instr::NewError { dst, kind: kidx, arg, opts, errors });
+        // Reclaim the errors + message + options temps (allocated in that order).
+        self.next_reg -=
+            errors.is_some() as Reg + arg.is_some() as Reg + opts.is_some() as Reg;
         Ok(dst)
     }
 

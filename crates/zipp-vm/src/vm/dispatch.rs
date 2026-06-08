@@ -2236,8 +2236,27 @@ impl<'p> Vm<'p> {
                         self.require_object_coercible(v)?;
                         ip += 1;
                     }
-                    Instr::NewError { dst, kind, arg, opts } => {
-                        let msg = arg.map(|r| self.get(base, r));
+                    Instr::NewError { dst, kind, arg, opts, errors } => {
+                        // AggregateError coerces its message with a real ToString
+                        // (observable user `toString` / abrupt completion), per spec
+                        // step 2 — BEFORE the errors are iterated. Other errors keep
+                        // make_error's infallible coercion.
+                        let msg = if kind == 7 {
+                            match arg {
+                                Some(r) => {
+                                    let m = self.get(base, r);
+                                    if m == Value::UNDEFINED {
+                                        None
+                                    } else {
+                                        let s = self.to_js_string(m)?;
+                                        Some(self.alloc_str(s))
+                                    }
+                                }
+                                None => None,
+                            }
+                        } else {
+                            arg.map(|r| self.get(base, r))
+                        };
                         let v = self.make_error(kind, msg);
                         // InstallErrorCause (ES2022): an options object with a `cause`
                         // gives the error a non-enumerable own `cause` property.
@@ -2259,6 +2278,15 @@ impl<'p> Vm<'p> {
                                     );
                                 }
                             }
+                        }
+                        // AggregateError installs `errors` LAST (after message + cause):
+                        // a non-enumerable own array of IterableToList(firstArg). It runs
+                        // even when the arg is absent (`new AggregateError()`) so that
+                        // IterableToList(undefined) throws the required TypeError.
+                        if kind == 7 {
+                            let errors_arg =
+                                errors.map(|er| self.get(base, er)).unwrap_or(Value::UNDEFINED);
+                            self.install_agg_errors(v, errors_arg)?;
                         }
                         self.set(base, dst, v);
                         ip += 1;

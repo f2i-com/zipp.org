@@ -619,9 +619,24 @@ impl<'p> Vm<'p> {
         // `Reflect.construct(RangeError, [msg])`). Mirrors the compile-lowered
         // `new TypeError(msg)` path. AggregateError takes the message as arg[1].
         if let Some(k) = self.error_ctors.iter().position(|&c| c == cv.heap_index()) {
-            let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
             let over = self.newtarget_proto_override(new_target, cv, self.error_protos[k])?;
-            let e = self.make_error(k as u8, msg);
+            // AggregateError (k==7) takes its message as arg[1] and coerces it with a
+            // real ToString (observable / abrupt) before iterating arg[0] into `errors`.
+            let e = if k == 7 {
+                let msg = match args.get(1).copied() {
+                    Some(m) if m != Value::UNDEFINED => {
+                        let s = self.to_js_string(m)?;
+                        Some(self.alloc_str(s))
+                    }
+                    _ => None,
+                };
+                let e = self.make_error(7, msg);
+                let errors_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.install_agg_errors(e, errors_arg)?;
+                e
+            } else {
+                self.make_error(k as u8, args.first().copied())
+            };
             return Ok(self.set_ctor_proto(e, over));
         }
         // ArrayBuffer / DataView / TypedArray constructors used as values.
@@ -1883,7 +1898,12 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(_) => {
                     let m = self.get_prop(v, "@@iterator")?;
                     if self.is_callable(m) {
-                        return self.call_value(m, v, &[]);
+                        let it = self.call_value(m, v, &[])?;
+                        // GetIterator step 5: a non-object iterator is a TypeError.
+                        if !self.is_object_value(it) {
+                            return Err(Thrown("TypeError: iterator is not an object".into()));
+                        }
+                        return Ok(it);
                     }
                 }
                 // A plain array: fast-path the default iterator (IterNext walks the
@@ -2145,6 +2165,12 @@ impl<'p> Vm<'p> {
                 let mut out = Vec::new();
                 loop {
                     let res = self.call_value(next, v, &[])?;
+                    // IteratorNext step 3: a non-object result is a TypeError.
+                    if !self.is_object_value(res) {
+                        return Err(Thrown(
+                            "TypeError: iterator.next() returned a non-object".into(),
+                        ));
+                    }
                     let done = self.get_prop(res, "done")?;
                     if self.truthy(done) {
                         break;

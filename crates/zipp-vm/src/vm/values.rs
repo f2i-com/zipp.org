@@ -449,6 +449,29 @@ impl<'p> Vm<'p> {
         Value::heap(obj)
     }
 
+    /// AggregateError(errors, …): install the `errors` data property — a
+    /// non-enumerable, writable, configurable own array built from
+    /// IterableToList(errorsArg) (spec 20.5.7.1 steps 4-5). `iterate_to_vec` runs the
+    /// argument's iterator (user code) under a GC lock, so `err` stays live across it.
+    pub(crate) fn install_agg_errors(&mut self, err: Value, errors_arg: Value) -> Result<(), Thrown> {
+        let list = self.iterate_to_vec(errors_arg)?;
+        let arr = Value::heap(self.heap.alloc(HeapObj::Array(list)));
+        if let HeapObj::Object(m) = self.heap.get_mut(err.heap_index()) {
+            m.define(
+                "errors",
+                arr,
+                PropAttr {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Allocate a fresh unique `Symbol` with description `desc` (a string Value or
     /// UNDEFINED) and a unique internal prop_key (`@@sym:N`). Recorded in
     /// `symbol_keys` so the symbol can be reflected from an own property key.

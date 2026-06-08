@@ -439,7 +439,9 @@ pub enum Instr {
     /// 7=AggregateError); `arg` (when present) is coerced to the `message` string.
     /// `opts` (when present) is the options object — if it has a `cause`, a
     /// non-enumerable own `cause` is installed (ES2022 InstallErrorCause).
-    NewError { dst: Reg, kind: u8, arg: Option<Reg>, opts: Option<Reg> },
+    /// `errors` (AggregateError only) is the first argument — IterableToList'd into
+    /// a non-enumerable own `errors` array AFTER the message is coerced.
+    NewError { dst: Reg, kind: u8, arg: Option<Reg>, opts: Option<Reg>, errors: Option<Reg> },
     /// `dst = Symbol(desc?)` — a fresh unique Symbol primitive. `desc` (when present)
     /// is coerced to a string description (undefined → no description).
     MakeSymbol { dst: Reg, desc: Option<Reg> },
