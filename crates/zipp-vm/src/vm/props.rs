@@ -1799,7 +1799,11 @@ impl<'p> Vm<'p> {
         // the synthesized intrinsic below so a value-only redefine keeps the
         // {writable:false, enumerable:false, configurable:true} attrs and counts as a
         // redefinition (not a brand-new property the extensible check could block).
-        if target != 0 && key == "prototype" {
+        // Only a callable/class that OWNS the synthesized `prototype` (ordinary
+        // function / class) ignores a redefinition. A bound function / arrow / async
+        // / method has no intrinsic `prototype`, so an explicit one is a real own
+        // property (stored in fn_props below).
+        if target != 0 && key == "prototype" && self.callable_has_prototype(obj) {
             return Ok(());
         }
         let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
@@ -3178,10 +3182,22 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
             ) =>
             {
-                if let Some(m) = self.fn_props.get(&obj.heap_index()) {
-                    if let Some(v) = m.get(key) {
-                        return Ok(v);
+                // An own property in the fn_props bag (incl. an explicitly defined
+                // `prototype` on a bound/arrow/async fn) shadows the inherited chain;
+                // an accessor invokes its getter with the receiver.
+                if let Some((accessor, raw)) = self
+                    .fn_props
+                    .get(&obj.heap_index())
+                    .and_then(|m| m.pos(key).map(|i| (m.attrs[i].accessor, m.vals[i])))
+                {
+                    if accessor {
+                        return if raw == Value::UNDEFINED {
+                            Ok(Value::UNDEFINED)
+                        } else {
+                            self.call_value(raw, receiver, &[])
+                        };
                     }
+                    return Ok(raw);
                 }
                 // Poison-pill: `caller`/`arguments` on a STRICT or BOUND function are
                 // the %ThrowTypeError% accessors (AddRestrictedFunctionProperties).

@@ -837,6 +837,15 @@ impl<'p> Vm<'p> {
         };
         if let Some(p) = builtin_proto {
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            // Promise(executor): IsCallable(executor) (step 2) is checked BEFORE
+            // OrdinaryCreateFromConstructor reads newTarget.prototype (step 3) — so a
+            // non-callable executor throws even when newTarget.prototype would throw.
+            if p == self.promise_proto && self.promise_proto != 0 && !self.is_callable(a0) {
+                return Err(Thrown(format!(
+                    "TypeError: Promise resolver {} is not a function",
+                    self.display(a0)
+                )));
+            }
             // OrdinaryCreateFromConstructor: a foreign newTarget (Reflect.construct /
             // cross-realm / derived super) sets the instance's [[Prototype]] to
             // newTarget.prototype rather than the built-in's default `p`.
