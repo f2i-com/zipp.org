@@ -357,20 +357,42 @@ impl<'p> Vm<'p> {
         // whose per-key property supplies that key's padding.
         let mut padding: Vec<Value> = vec![Value::UNDEFINED; count];
         if mode == 1 && padding_option != Value::UNDEFINED {
+            // Any abrupt completion while reading padding must first IteratorCloseAll
+            // the already-opened input iterators (reverse), keeping the abrupt value.
+            macro_rules! pad_throw {
+                ($e:expr) => {{
+                    self.iz_close_others_abrupt(&iters, usize::MAX);
+                    return Err($e);
+                }};
+            }
             if keyed {
                 for (i, slot) in padding.iter_mut().enumerate() {
                     let ks = self.key_of(keys[i]);
-                    *slot = self.get_member(padding_option, &ks, padding_option)?;
-                }
-            } else {
-                let pad_iter = self.get_iterator_flattenable(padding_option, false)?;
-                for slot in padding.iter_mut() {
-                    match self.iterator_step(pad_iter)? {
-                        Some(v) => *slot = v,
-                        None => break,
+                    match self.get_member(padding_option, &ks, padding_option) {
+                        Ok(v) => *slot = v,
+                        Err(e) => pad_throw!(e),
                     }
                 }
-                let _ = self.iterator_close(pad_iter);
+            } else {
+                // The padding option is iterated via real GetIterator (a non-iterable
+                // such as `{}` is a TypeError — unlike GetIteratorFlattenable, which
+                // would treat it as its own iterator).
+                let pad_iter = match self.get_iterator_direct(padding_option) {
+                    Ok(it) => it,
+                    Err(e) => pad_throw!(e),
+                };
+                for slot in padding.iter_mut() {
+                    match self.iterator_step(pad_iter) {
+                        Ok(Some(v)) => *slot = v,
+                        Ok(None) => break,
+                        Err(e) => pad_throw!(e),
+                    }
+                }
+                // IteratorClose(padding): a throwing return() propagates (closing the
+                // inputs first).
+                if let Err(e) = self.iterator_close(pad_iter) {
+                    pad_throw!(e);
+                }
             }
         }
         let source = Value::heap(self.heap.alloc(HeapObj::Array(iters)));
