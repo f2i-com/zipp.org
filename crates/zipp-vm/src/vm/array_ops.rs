@@ -420,6 +420,11 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<Option<Value>, Thrown> {
         let _gc = self.gc_lock_guard();
+        // O = ToObject(this value): a primitive receiver (e.g. a string passed via
+        // `Array.prototype.forEach.call("abc", …)`) is boxed, so iteration reads the
+        // wrapper's indexed properties AND the callback's 3rd argument is the object
+        // (`obj instanceof String`), per every method's step 1.
+        let this = self.to_object(this)?;
         let lv = self.get_prop(this, "length")?;
         let lenf = self.to_number_coerce(lv)?;
         // ToLength: a positive length (incl. +Infinity / "Infinity" / a huge finite)
