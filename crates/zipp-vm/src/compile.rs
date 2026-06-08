@@ -3427,9 +3427,7 @@ impl<'a> FnCompiler<'a> {
         // exiting it must pop the stale handler — see `emit_loop_jump`).
         self.handler_depth += 1;
         self.push_scope();
-        for s in &t.block.body {
-            self.stmt(s)?;
-        }
+        self.compile_stmt_list(&t.block.body, false)?;
         self.pop_scope();
         // After the try body the catch handler is no longer active (the catch body
         // runs with it already popped by the unwind).
@@ -3514,6 +3512,27 @@ impl<'a> FnCompiler<'a> {
         Ok(())
     }
 
+    /// Compile a statement list, transparently adding `using`-disposal scaffolding
+    /// when the list declares a top-level `using` (else the byte-for-byte-identical
+    /// plain loop). Used by the statement-list contexts that are NOT the
+    /// `BlockStatement` arm — try/catch/finally bodies — so `using` inside them is
+    /// disposed at the end of that block, like any other block.
+    fn compile_stmt_list(&mut self, body: &[ox::Statement], skip_fn_decls: bool) -> R<()> {
+        if Self::block_has_using(body) {
+            self.compile_using_block(body, skip_fn_decls)
+        } else {
+            for s in body {
+                if skip_fn_decls {
+                    if let ox::Statement::FunctionDeclaration(_) = s {
+                        continue;
+                    }
+                }
+                self.stmt(s)?;
+            }
+            Ok(())
+        }
+    }
+
     /// `try … finally { F }` (with or without a catch). The finally runs on every
     /// exit path via a `PushFinally` handler + `EndFinally` epilogue.
     fn try_with_finally(
@@ -3551,9 +3570,7 @@ impl<'a> FnCompiler<'a> {
 
         // Try body.
         self.push_scope();
-        for s in &t.block.body {
-            self.stmt(s)?;
-        }
+        self.compile_stmt_list(&t.block.body, false)?;
         self.pop_scope();
 
         // Normal-completion jumps (from the try body and, if present, the catch
@@ -3657,9 +3674,7 @@ impl<'a> FnCompiler<'a> {
                 self.cell_regs.insert(e_reg);
             }
         }
-        for s in &handler.body.body {
-            self.stmt(s)?;
-        }
+        self.compile_stmt_list(&handler.body.body, false)?;
         self.pop_scope();
         Ok(())
     }
