@@ -1969,7 +1969,10 @@ impl<'p> Vm<'p> {
         // `...rest` present `max` is unbounded so the loop ran to `done` and we skip.
         let _ = is_gen;
         if !iter_done {
-            self.iterator_close(iter)?;
+            // Lenient close: the eager drain runs before the pattern's per-element
+            // defaults/targets, so a non-callable `return` must not pre-empt a
+            // later default-expression throw (which is the value the spec keeps).
+            self.iterator_close_inner(iter, false)?;
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
     }
@@ -1990,18 +1993,41 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn iterator_close(&mut self, iter: Value) -> Result<(), Thrown> {
+        self.iterator_close_inner(iter, true)
+    }
+
+    /// IteratorClose 7.4.x. `strict` selects GetMethod semantics for the `return`
+    /// method: when true (for-of/for-await break+normal, Iterator helpers), a
+    /// PRESENT but non-callable `return` is a TypeError; when false (the eager
+    /// destructuring drain in `iter_to_array`, which closes BEFORE the per-element
+    /// defaults/targets run — so it cannot know the spec completion type yet), a
+    /// non-callable `return` is skipped, preserving the original behaviour so a
+    /// later default-expression throw is the value that propagates (the spec's
+    /// "if completion is a throw completion, return completion").
+    fn iterator_close_inner(&mut self, iter: Value, strict: bool) -> Result<(), Thrown> {
         if !iter.is_heap() {
             return Ok(());
         }
+        // A generator's `return` resumes the suspended body with a RETURN completion
+        // so any `finally` spanning the yield runs (GeneratorResume semantics) — not
+        // a no-op. The {value,done} result is discarded.
         if matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. }) {
+            self.generator_method(iter.heap_index(), "return", &[])?;
             return Ok(());
         }
         let ret = self.get_prop(iter, "return")?;
-        if self.is_callable(ret) {
-            let r = self.call_value(ret, iter, &[])?;
-            if !self.is_object_value(r) {
-                return Err(Thrown("TypeError: iterator return() result is not an object".into()));
+        if ret.is_nullish() {
+            return Ok(());
+        }
+        if !self.is_callable(ret) {
+            if strict {
+                return Err(Thrown("TypeError: iterator return() is not callable".into()));
             }
+            return Ok(());
+        }
+        let r = self.call_value(ret, iter, &[])?;
+        if !self.is_object_value(r) {
+            return Err(Thrown("TypeError: iterator return() result is not an object".into()));
         }
         Ok(())
     }
