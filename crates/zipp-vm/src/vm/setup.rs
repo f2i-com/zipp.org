@@ -533,6 +533,25 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
+        // Reflect[Symbol.toStringTag] = "Reflect" (non-writable/enumerable,
+        // configurable) so Object.prototype.toString.call(Reflect) is "[object
+        // Reflect]" — like Math/JSON/Atomics.
+        {
+            let rtag = self.alloc_str("Reflect".to_string());
+            if let HeapObj::Object(m) = self.heap.get_mut(reflect_ctor) {
+                m.define(
+                    "@@toStringTag",
+                    rtag,
+                    PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    },
+                );
+            }
+        }
         // `WeakMap`/`WeakSet`: distinct prototypes (get/set/has/delete, add/has/delete
         // — deliberately NO size/keys/values/iteration). Construction is compile-lowered
         // to NewWeakMap/NewWeakSet.

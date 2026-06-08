@@ -1548,11 +1548,14 @@ impl<'p> Vm<'p> {
                 if !self.is_object_value(a0) {
                     return Err(Thrown("TypeError: Reflect.defineProperty called on non-object".into()));
                 }
+                // ToPropertyKey(propertyKey) is step 2 — BEFORE ToPropertyDescriptor
+                // (step 3) — so a throwing key coercion propagates ahead of the
+                // descriptor's "must be an object" check.
+                let key = self.to_property_key(a1)?;
                 let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_object_value(desc) {
                     return Err(Thrown("TypeError: Property description must be an object".into()));
                 }
-                let key = self.to_property_key(a1)?;
                 // ToPropertyDescriptor(desc) is validated FIRST: an invalid
                 // descriptor (a non-callable get/set, or mixed accessor+data) is a
                 // THROW that propagates — only a rejected [[DefineOwnProperty]]
