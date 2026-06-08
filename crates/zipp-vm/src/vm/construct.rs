@@ -227,7 +227,32 @@ impl<'p> Vm<'p> {
     /// the live `[[Get]]` (get_member) reads, so re-assignments inside the module are
     /// observed through `ns.x` (live bindings).
     pub(crate) fn build_module_namespace(&mut self, exports: &[(String, u32)]) -> Value {
-        let _gc = self.gc_lock_guard(); // hold the alloc'd values across allocations
+        let idx = self.alloc_empty_namespace();
+        self.populate_module_namespace(idx, exports);
+        Value::heap(idx)
+    }
+
+    /// Allocate an EMPTY Module Namespace exotic (null proto, no keys yet) and an empty
+    /// live-slot map. Used to register a module in the loader cache BEFORE its body
+    /// runs (so a self/cyclic `import` returns the same object); the caller then calls
+    /// `populate_module_namespace` once the export slots are known. The slot map can be
+    /// seeded immediately (own exports) so a self-import observes live bindings during
+    /// evaluation.
+    pub(crate) fn alloc_empty_namespace(&mut self) -> u32 {
+        let m = ObjMap::new();
+        let idx = self.heap.alloc(HeapObj::Object(m));
+        self.proto_of.insert(idx, Value::NULL);
+        self.module_namespaces.insert(idx, std::collections::HashMap::new());
+        idx
+    }
+
+    /// Fill a (possibly pre-registered) Module Namespace exotic `idx` with its exports:
+    /// the ObjMap stores a SNAPSHOT value (for key order / descriptors / reflection,
+    /// read AFTER the body runs) and `@@toStringTag`, becomes non-extensible; the
+    /// `module_namespaces` slot map (read by the live `[[Get]]`) is set to the full
+    /// export -> live-slot mapping.
+    pub(crate) fn populate_module_namespace(&mut self, idx: u32, exports: &[(String, u32)]) {
+        let _gc = self.gc_lock_guard();
         // Resolve each export's value (first export of a name wins), then sort the
         // names (the spec orders namespace keys via Array.prototype.sort default).
         let mut pairs: Vec<(String, Value, u32)> = Vec::new();
@@ -270,10 +295,10 @@ impl<'p> Vm<'p> {
             },
         );
         m.extensible = false;
-        let idx = self.heap.alloc(HeapObj::Object(m));
-        self.proto_of.insert(idx, Value::NULL);
+        if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
+            *slot = m;
+        }
         self.module_namespaces.insert(idx, slot_map);
-        Value::heap(idx)
     }
 
     pub(crate) fn disposable_op(&mut self, op: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {

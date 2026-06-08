@@ -1903,13 +1903,20 @@ impl<'a> FnCompiler<'a> {
                 let mut bind_name: Option<String> = None;
                 match &e.declaration {
                     K::FunctionDeclaration(f) => {
-                        let (id, has_up) = self
-                            .compile_func_expr(f.id.as_ref().map(|i| i.name.to_string()), f)?;
+                        // An ANONYMOUS default-exported function/generator is named
+                        // "default" (NamedEvaluation); a named one keeps its name.
+                        let fname = f
+                            .id
+                            .as_ref()
+                            .map(|i| i.name.to_string())
+                            .unwrap_or_else(|| "default".to_string());
+                        let (id, has_up) = self.compile_func_expr(Some(fname), f)?;
                         self.emit_make_callable(tmp, id, has_up);
                         bind_name = f.id.as_ref().map(|i| i.name.to_string());
                     }
                     K::ClassDeclaration(c) => {
-                        let r = self.class_expr(c, tmp, None)?;
+                        // An ANONYMOUS default-exported class is named "default".
+                        let r = self.class_expr(c, tmp, if c.id.is_none() { Some("default") } else { None })?;
                         if r != tmp {
                             self.emit(Instr::Move { dst: tmp, src: r });
                         }

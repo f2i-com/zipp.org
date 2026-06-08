@@ -929,10 +929,10 @@ impl<'p> Vm<'p> {
         let reexports = prog.module_reexports.clone();
         let star_reexports = prog.module_star_reexports.clone();
         let dir = path.parent().map(|p| p.to_path_buf());
-        // Run the module in its OWN environment: its declared globals are remapped to
-        // fresh per-module slots (module=true). `gmap[i]` is the live slot for
-        // compile-time global slot `i`.
-        let (_completion, gmap) = self.run_eval_program(prog, None, true)?;
+        // PREPARE the module's environment (declared globals → fresh per-module slots,
+        // install funcs/classes, hoist) WITHOUT running the body yet. `gmap[i]` is the
+        // live slot for compile-time global slot `i`.
+        let (gmap, base_func) = self.prepare_eval_program(prog, true)?;
         // OWN exports (exported name → live slot), in source order.
         let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
         let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -942,22 +942,39 @@ impl<'p> Vm<'p> {
                 own_map.insert(exported, gmap[i]);
             }
         }
-        // Mark in-progress BEFORE resolving re-exports so a self/mutual cycle resolves
-        // against this own-exports snapshot (and `all_exports`/`resolve_export` consult
-        // `module_own` before recursing, so cycles terminate). The link phase runs in a
-        // helper so the in-progress marker is removed on EVERY exit (incl. error),
-        // never leaving a stale marker that would mis-resolve a later import.
+        // PRE-REGISTER the namespace (with the OWN-export live slot map already set) in
+        // the loader cache BEFORE running the body — so a self/cyclic dynamic
+        // `import('./this')` during evaluation returns this SAME object with live
+        // bindings, instead of re-evaluating the module (which recurses forever). The
+        // ObjMap keys (for reflection/descriptors) are filled AFTER the body runs, so
+        // their snapshot values are correct.
+        let ns_idx = self.alloc_empty_namespace();
+        self.module_namespaces.insert(ns_idx, own_map.clone());
+        self.module_cache.insert(path.clone(), Value::heap(ns_idx));
+        // Mark in-progress for re-export cycle resolution (resolve_export/all_exports
+        // consult `module_own`). Run the body, then resolve `export … from`/`export *`
+        // re-exports, then fill the namespace. The recursion carries only
+        // (String, slot:u32) — no unrooted heap Value across a GC-triggering load.
         self.module_own.insert(path.clone(), own_map);
-        let linked = self.link_module_reexports(full, &reexports, &star_reexports, dir.as_deref());
+        let exec = self.execute_eval_program(base_func, None);
+        let linked = match exec {
+            Ok(_) => self.link_module_reexports(full, &reexports, &star_reexports, dir.as_deref()),
+            Err(e) => Err(e),
+        };
         self.module_own.remove(&path);
-        let full = linked?;
-        // build_module_namespace dedups (first wins) and sorts the keys; it is the
-        // ONLY place a heap Value is materialized — the recursion above carries only
-        // (String, slot:u32) pairs (slots into the GC-rooted `globals`), so no unrooted
-        // Value can exist across a GC-triggering recursive load.
-        let ns = self.build_module_namespace(&full);
-        self.module_cache.insert(path, ns);
-        Ok(ns)
+        match linked {
+            Ok(full) => {
+                self.populate_module_namespace(ns_idx, &full);
+                Ok(Value::heap(ns_idx))
+            }
+            Err(e) => {
+                // The module threw / a dependency failed: discard the half-built entry
+                // so a later import re-evaluates rather than seeing a partial namespace.
+                self.module_cache.remove(&path);
+                self.module_namespaces.remove(&ns_idx);
+                Err(e)
+            }
+        }
     }
 
     /// Resolve a module's re-exports into `full` (the export name→slot list). Split out
@@ -1058,12 +1075,16 @@ impl<'p> Vm<'p> {
     /// slots, function ids, and class ids onto the running tables; hoist `var`s and
     /// top-level functions) and run its top-level function to completion, returning
     /// the completion value.
-    fn run_eval_program(
+    /// Phases 1-5: remap the program's global slots onto live slots (the `gmap`),
+    /// install its functions + classes, and hoist vars/functions — WITHOUT running
+    /// the top-level body. Returns `(gmap, base_func)`; the caller runs the body via
+    /// `execute_eval_program` (split out so a module can register its namespace in the
+    /// loader cache between prepare and execute, for self/cyclic imports).
+    fn prepare_eval_program(
         &mut self,
         eval_prog: crate::bytecode::Program,
-        this_override: Option<Value>,
         module: bool,
-    ) -> Result<(Value, Vec<u32>), Thrown> {
+    ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // Runtime base ids: eval functions and classes are appended past the
         // compile-time tables (parallel to global slots).
@@ -1178,11 +1199,18 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // 7. Run the eval script function (global id `base_func`) to completion in
-        //    global scope (`this` = globalThis), returning its completion value.
+        Ok((gmap, base_func))
+    }
+
+    /// Phase 6: run a prepared eval/module top-level function (`base_func`) to
+    /// completion, returning its completion value. `this_override` is the caller's
+    /// `this` for a DIRECT eval; otherwise the top level runs with `this` = globalThis.
+    fn execute_eval_program(
+        &mut self,
+        base_func: u32,
+        this_override: Option<Value>,
+    ) -> Result<Value, Thrown> {
         let script = Value::heap(self.heap.alloc(HeapObj::Func(base_func)));
-        // A DIRECT eval inherits the caller's `this` (e.g. inside a class field
-        // initializer / method); an indirect eval runs in global scope (globalThis).
         let this = this_override.unwrap_or_else(|| {
             if self.global_this != 0 {
                 Value::heap(self.global_this)
@@ -1190,7 +1218,20 @@ impl<'p> Vm<'p> {
                 Value::UNDEFINED
             }
         });
-        let completion = self.call_value(script, this, &[])?;
+        self.call_value(script, this, &[])
+    }
+
+    /// Install a compiled eval/module program and run its top-level body, returning
+    /// `(completion, gmap)`. (prepare + execute; modules that need namespace
+    /// pre-registration call the two halves directly — see `import_module`.)
+    fn run_eval_program(
+        &mut self,
+        eval_prog: crate::bytecode::Program,
+        this_override: Option<Value>,
+        module: bool,
+    ) -> Result<(Value, Vec<u32>), Thrown> {
+        let (gmap, base_func) = self.prepare_eval_program(eval_prog, module)?;
+        let completion = self.execute_eval_program(base_func, this_override)?;
         Ok((completion, gmap))
     }
 }
