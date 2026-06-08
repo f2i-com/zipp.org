@@ -642,7 +642,9 @@ impl<'p> Vm<'p> {
         // ArrayBuffer / DataView / TypedArray constructors used as values.
         let ci = cv.heap_index();
         if ci == self.function_ctor && ci != 0 {
-            return self.build_function(args);
+            let over = self.newtarget_proto_override(new_target, cv, self.fn_proto)?;
+            let r = self.build_function(args)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.gen_fn_ctor && ci != 0 {
             return self.build_function_kind(args, 1);
@@ -737,7 +739,12 @@ impl<'p> Vm<'p> {
             return Ok(self.set_ctor_proto(r, over));
         }
         if let Some(k) = self.ta_ctors.iter().position(|&c| c == ci && ci != 0) {
-            return self.build_typed_array(k as u8, args);
+            let r = self.build_typed_array(k as u8, args)?;
+            // OrdinaryCreateFromConstructor: a foreign/derived newTarget sets the
+            // instance's [[Prototype]] (cross-realm intrinsic fallback when its
+            // .prototype is not an object).
+            let over = self.newtarget_proto_override(new_target, cv, self.ta_protos[k])?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.ta_base_ctor && ci != 0 {
             return Err(Thrown("TypeError: Abstract class TypedArray not directly constructable".into()));

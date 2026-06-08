@@ -262,6 +262,15 @@ impl<'p> Vm<'p> {
                 "TypeError: Array species constructor is not an object".into(),
             ));
         } else {
+            // ArraySpeciesCreate step 6.c.i: a constructor that is ANOTHER realm's
+            // %Array% intrinsic is treated as undefined — so its @@species getter is
+            // NOT consulted (cross-realm).
+            if self.is_constructor(ctor)
+                && self.get_function_realm(ctor) != 0
+                && self.realm_ctor_main.get(&ctor.heap_index()) == Some(&self.array_ctor)
+            {
+                return Ok(None);
+            }
             let s = self.get_prop(ctor, "@@species")?;
             if s == Value::NULL {
                 Value::UNDEFINED
