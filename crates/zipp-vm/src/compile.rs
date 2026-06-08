@@ -5009,6 +5009,14 @@ impl<'a> FnCompiler<'a> {
     fn delete_expr(&mut self, arg: &ox::Expression, dst: Reg) -> R<Reg> {
         match arg {
             ox::Expression::StaticMemberExpression(m) => {
+                // `delete super.x` is a runtime ReferenceError (a super reference has
+                // no [[Delete]]). Not a SyntaxError, so it's thrown when evaluated.
+                if matches!(&m.object, ox::Expression::Super(_)) {
+                    let e = self.alloc_reg();
+                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None });
+                    self.emit(Instr::Throw { src: e });
+                    return Ok(dst);
+                }
                 let obj = self.expr(&m.object)?;
                 let name = self.string_name(&m.property.name);
                 let strict = self.cx.in_strict;
@@ -5016,6 +5024,15 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             ox::Expression::ComputedMemberExpression(m) => {
+                // `delete super[expr]`: evaluate `expr` (its side effects + ToPropertyKey
+                // happen), then throw a ReferenceError — a super reference has no delete.
+                if matches!(&m.object, ox::Expression::Super(_)) {
+                    let _ = self.expr(&m.expression)?;
+                    let e = self.alloc_reg();
+                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None });
+                    self.emit(Instr::Throw { src: e });
+                    return Ok(dst);
+                }
                 let obj = self.expr(&m.object)?;
                 let key = self.expr(&m.expression)?;
                 let strict = self.cx.in_strict;
