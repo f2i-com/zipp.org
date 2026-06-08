@@ -1847,8 +1847,8 @@ impl<'p> Vm<'p> {
             }
             ITER_HELPER_RETURN => {
                 if this.is_heap() {
-                    let (kind, source, inner, was_done) = match self.heap.get(this.heap_index()) {
-                        HeapObj::IterHelper { kind, source, inner, done, running, .. } => {
+                    let (kind, source, inner, was_done, started) = match self.heap.get(this.heap_index()) {
+                        HeapObj::IterHelper { kind, source, inner, done, running, idx, .. } => {
                             // Re-entrant return() while a step is executing is a TypeError
                             // (GeneratorValidate), the same as a re-entrant next().
                             if *running {
@@ -1856,9 +1856,13 @@ impl<'p> Vm<'p> {
                                     "TypeError: Iterator is already running".into(),
                                 ));
                             }
-                            (*kind, *source, *inner, *done)
+                            // `idx > 0` ⇒ the helper has yielded (suspended at a yield),
+                            // so its return() resumes it in the "executing" state. A
+                            // suspended-START return completes WITHOUT that brand, so a
+                            // re-entrant next()/return() during its close does not throw.
+                            (*kind, *source, *inner, *done, *idx > 0)
                         }
-                        _ => (0, Value::UNDEFINED, Value::UNDEFINED, true),
+                        _ => (0, Value::UNDEFINED, Value::UNDEFINED, true, false),
                     };
                     // kind 5 = the WrapForValidIterator (Iterator.from): its return()
                     // DELEGATES — GetMethod(iterator, "return") and, if present, returns
@@ -1885,11 +1889,17 @@ impl<'p> Vm<'p> {
                         *done = true;
                     }
                     if !was_done {
-                        self.ih_set_running(this.heap_index(), true);
+                        // Only a suspended-YIELD return resumes "executing".
+                        if started {
+                            self.ih_set_running(this.heap_index(), true);
+                        }
                         let r = if kind == 7 {
-                            // zip: close every still-open input iterator.
-                            self.iz_close_all(this.heap_index());
-                            Ok(())
+                            // zip: close every still-open input iterator (reverse,
+                            // first close error propagates).
+                            match self.iz_close_all(this.heap_index()) {
+                                Some(e) => Err(e),
+                                None => Ok(()),
+                            }
                         } else {
                             let target = if kind == 6 { inner } else { source };
                             if self.is_object_value(target) {
@@ -1898,7 +1908,9 @@ impl<'p> Vm<'p> {
                                 Ok(())
                             }
                         };
-                        self.ih_set_running(this.heap_index(), false);
+                        if started {
+                            self.ih_set_running(this.heap_index(), false);
+                        }
                         r?;
                     }
                 }

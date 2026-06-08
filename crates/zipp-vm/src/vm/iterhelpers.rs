@@ -152,26 +152,39 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// GetIteratorFlattenable: obtain a steppable iterator from any iterable
-    /// (arrays/strings/Map/Set via @@iterator) or an object that is itself an
-    /// iterator (has a callable `.next`).
-    pub(crate) fn get_iterator_flattenable(&mut self, v: Value) -> Result<Value, Thrown> {
-        if v.is_heap()
-            && !matches!(
-                self.heap.get(v.heap_index()),
-                HeapObj::Symbol { .. } | HeapObj::BigInt(_)
-            )
-        {
-            let m = self.get_prop(v, "@@iterator")?;
-            if self.is_callable(m) {
-                return self.call_value(m, v, &[]);
+    /// GetIteratorFlattenable(obj, primitiveHandling): obtain a steppable iterator
+    /// from an iterable (via @@iterator) or an object that is itself an iterator
+    /// (no @@iterator → the object IS the iterator record). `reject_primitives`
+    /// selects the spec mode: reject-primitives (flatMap/zip elements) throws for
+    /// ANY non-object; iterate-string-primitives (Iterator.from / zip padding)
+    /// additionally allows a String (which is then iterated).
+    pub(crate) fn get_iterator_flattenable(
+        &mut self,
+        v: Value,
+        reject_primitives: bool,
+    ) -> Result<Value, Thrown> {
+        if !self.is_object_value(v) {
+            let is_str = v.is_heap()
+                && matches!(self.heap.get(v.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. });
+            if reject_primitives || !is_str {
+                return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
             }
-            let next = self.get_prop(v, "next")?;
-            if self.is_callable(next) {
-                return Ok(v);
-            }
+            // iterate-string-primitives: a String is iterable — fall through.
         }
-        Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))))
+        // GetMethod(@@iterator): undefined/null ⇒ the object IS the iterator record;
+        // present-but-non-callable ⇒ TypeError; a returned iterator must be an Object.
+        let m = self.get_prop(v, "@@iterator")?;
+        if m.is_nullish() {
+            return Ok(v);
+        }
+        if !self.is_callable(m) {
+            return Err(Thrown("TypeError: [Symbol.iterator] is not a function".into()));
+        }
+        let it = self.call_value(m, v, &[])?;
+        if !self.is_object_value(it) {
+            return Err(Thrown("TypeError: [Symbol.iterator]() returned a non-object".into()));
+        }
+        Ok(it)
     }
 
     /// `Iterator.concat(...items)` (ES2025). Each item must be an Object with a
@@ -228,7 +241,16 @@ impl<'p> Vm<'p> {
             if m == Value::UNDEFINED {
                 0
             } else {
-                match self.to_js_string(m)?.as_str() {
+                // The spec does NO coercion: `mode` must be one of the three string
+                // PRIMITIVES (a String wrapper / Symbol / number / {toString} is a
+                // TypeError, with no toString call).
+                let is_str_prim = m.is_heap()
+                    && matches!(
+                        self.heap.get(m.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. }
+                    );
+                let s = if is_str_prim { self.to_js_string(m)? } else { String::new() };
+                match s.as_str() {
                     "shortest" => 0,
                     "longest" => 1,
                     "strict" => 2,
@@ -263,17 +285,17 @@ impl<'p> Vm<'p> {
                 let value = match self.get_member(iterables, &ks, iterables) {
                     Ok(v) => v,
                     Err(e) => {
-                        let _ = self.iz_close_except(&iters, usize::MAX);
+                        self.iz_close_others_abrupt(&iters, usize::MAX);
                         return Err(e);
                     }
                 };
-                match self.get_iterator_flattenable(value) {
+                match self.get_iterator_flattenable(value, true) {
                     Ok(it) => {
                         iters.push(it);
                         keys.push(k);
                     }
                     Err(e) => {
-                        let _ = self.iz_close_except(&iters, usize::MAX);
+                        self.iz_close_others_abrupt(&iters, usize::MAX);
                         return Err(e);
                     }
                 }
@@ -281,23 +303,26 @@ impl<'p> Vm<'p> {
         } else {
             // A real (steppable) iterator over the input — `get_iterator` returns a
             // plain array unchanged (no `.next()`), so use the @@iterator call form.
-            let input_iter = self.get_iterator_flattenable(iterables)?;
+            let input_iter = self.get_iterator_direct(iterables)?;
             loop {
                 match self.iterator_step(input_iter) {
                     Ok(None) => break,
-                    Ok(Some(value)) => match self.get_iterator_flattenable(value) {
+                    Ok(Some(value)) => match self.get_iterator_flattenable(value, true) {
                         Ok(it) => iters.push(it),
                         Err(e) => {
                             // Close the input iterator + the already-opened inner
-                            // iterators (in reverse), then propagate.
+                            // iterators (in reverse), then propagate — keeping the
+                            // original abrupt value (close throws are discarded).
+                            let saved = self.pending_throw;
                             let _ = self.iterator_close(input_iter);
                             let _ = self.iz_close_except(&iters, usize::MAX);
+                            self.pending_throw = saved;
                             return Err(e);
                         }
                     },
                     Err(e) => {
                         // The input iterator's step threw; close the opened inners.
-                        let _ = self.iz_close_except(&iters, usize::MAX);
+                        self.iz_close_others_abrupt(&iters, usize::MAX);
                         return Err(e);
                     }
                 }
@@ -315,7 +340,7 @@ impl<'p> Vm<'p> {
                     *slot = self.get_member(padding_option, &ks, padding_option)?;
                 }
             } else {
-                let pad_iter = self.get_iterator_flattenable(padding_option)?;
+                let pad_iter = self.get_iterator_flattenable(padding_option, false)?;
                 for slot in padding.iter_mut() {
                     match self.iterator_step(pad_iter)? {
                         Some(v) => *slot = v,
@@ -353,13 +378,22 @@ impl<'p> Vm<'p> {
     /// Close every still-open iterator in `iters` EXCEPT index `except`, in
     /// reverse order (spec IfAbruptCloseIterators closes highest-index first).
     /// Returns the first close error (if any). A `null` slot is already closed.
+    ///
+    /// IteratorClose threads ONE completion: once a throw is recorded, later close
+    /// throws are DISCARDED. The Thrown error STRING already keeps the first, but the
+    /// real thrown VALUE rides on `self.pending_throw`, which each close overwrites —
+    /// so snapshot the first close's value and restore it after every later throw.
     fn iz_close_except(&mut self, iters: &[Value], except: usize) -> Option<Thrown> {
         let mut err = None;
+        let mut first_pt: Option<Value> = None;
         for j in (0..iters.len()).rev() {
             if j != except && iters[j] != Value::NULL {
                 if let Err(e) = self.iterator_close(iters[j]) {
                     if err.is_none() {
                         err = Some(e);
+                        first_pt = self.pending_throw;
+                    } else {
+                        self.pending_throw = first_pt;
                     }
                 }
             }
@@ -367,27 +401,89 @@ impl<'p> Vm<'p> {
         err
     }
 
-    /// Close every still-open iterator of a zip helper (for `.return()`).
-    pub(crate) fn iz_close_all(&mut self, helper_idx: u32) {
+    /// Close the other iterators after an ABRUPT completion at index `except`,
+    /// keeping `self.pending_throw` (the original abrupt value) intact — every close
+    /// throw is discarded so the original completion wins (value AND string).
+    fn iz_close_others_abrupt(&mut self, iters: &[Value], except: usize) {
+        let saved = self.pending_throw;
+        let _ = self.iz_close_except(iters, except);
+        self.pending_throw = saved;
+    }
+
+    /// Close `iters[lo..hi]` in REVERSE, discarding their close throws but keeping
+    /// the current `self.pending_throw` (an already-set completion value) intact.
+    fn iz_close_range_keep(&mut self, iters: &[Value], lo: usize, hi: usize) {
+        let saved = self.pending_throw;
+        let hi = hi.min(iters.len());
+        for j in (lo..hi).rev() {
+            if iters[j] != Value::NULL {
+                let _ = self.iterator_close(iters[j]);
+            }
+        }
+        self.pending_throw = saved;
+    }
+
+    /// Close every open iterator EXCEPT `except`, in reverse, keeping pending_throw.
+    fn iz_close_all_except_keep(&mut self, iters: &[Value], except: usize) {
+        let saved = self.pending_throw;
+        for j in (0..iters.len()).rev() {
+            if j != except && iters[j] != Value::NULL {
+                let _ = self.iterator_close(iters[j]);
+            }
+        }
+        self.pending_throw = saved;
+    }
+
+    /// Build the strict-mode "iterators have different lengths" TypeError, recording
+    /// its VALUE on `pending_throw` so a subsequent close (which the caller runs with
+    /// `*_keep`) cannot leak its own error value past it.
+    fn iz_strict_type_error(&mut self) -> Thrown {
+        let msg =
+            self.alloc_str("Iterator.zip strict: iterators have different lengths".to_string());
+        let te = self.make_error(1, Some(msg));
+        self.pending_throw = Some(te);
+        Thrown("TypeError: Iterator.zip strict: iterators have different lengths".into())
+    }
+
+    /// Close every still-open iterator of a zip helper (for `.return()`), in REVERSE
+    /// order, propagating the FIRST close error (later throws discarded, value+string).
+    pub(crate) fn iz_close_all(&mut self, helper_idx: u32) -> Option<Thrown> {
         let source = match self.heap.get(helper_idx) {
             HeapObj::IterHelper { source, .. } => *source,
-            _ => return,
+            _ => return None,
         };
         let iters = match self.heap.get(source.heap_index()) {
             HeapObj::Array(a) => a.clone(),
             _ => Vec::new(),
         };
-        for it in iters {
-            if it != Value::NULL {
-                let _ = self.iterator_close(it);
+        self.iz_close_except(&iters, usize::MAX)
+    }
+
+    /// Lazy `.next()` for a zip helper, with the same re-entrancy guard as the
+    /// single-source helpers (GeneratorValidate): a user iterator's `next()` that
+    /// re-enters this helper while a step is executing is a TypeError.
+    pub(crate) fn iter_zip_next(&mut self, idx: u32) -> Result<Value, Thrown> {
+        match self.heap.get(idx) {
+            HeapObj::IterHelper { running: true, .. } => {
+                return Err(Thrown("TypeError: Iterator is already running".into()));
+            }
+            HeapObj::IterHelper { .. } => {}
+            _ => {
+                return Err(Thrown(
+                    "TypeError: Iterator Helper next on incompatible receiver".into(),
+                ))
             }
         }
+        self.ih_set_running(idx, true);
+        let r = self.iter_zip_next_inner(idx);
+        self.ih_set_running(idx, false);
+        r
     }
 
     /// One step of a zip Iterator Helper (kind 7): step every open iterator in
     /// lockstep and assemble one tuple (an Array for zip, a keyed object for
     /// zipKeyed) per the mode.
-    pub(crate) fn iter_zip_next(&mut self, idx: u32) -> Result<Value, Thrown> {
+    fn iter_zip_next_inner(&mut self, idx: u32) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
         let (source, arg, inner, mode, done) = match self.heap.get(idx) {
             HeapObj::IterHelper { source, arg, inner, n, done, .. } => {
@@ -398,7 +494,7 @@ impl<'p> Vm<'p> {
         if done {
             return Ok(self.iter_result(Value::UNDEFINED, true));
         }
-        let iters: Vec<Value> = match self.heap.get(source.heap_index()) {
+        let mut iters: Vec<Value> = match self.heap.get(source.heap_index()) {
             HeapObj::Array(a) => a.clone(),
             _ => Vec::new(),
         };
@@ -433,7 +529,7 @@ impl<'p> Vm<'p> {
                             // Abrupt: close the others (their errors are swallowed —
                             // the original abrupt completion wins).
                             self.ih_set_done(idx);
-                            let _ = self.iz_close_except(&iters, i);
+                            self.iz_close_others_abrupt(&iters, i);
                             return Err(e);
                         }
                     }
@@ -449,7 +545,11 @@ impl<'p> Vm<'p> {
                     }
                     match self.iterator_step(iters[i]) {
                         Ok(None) => {
+                            // Mark exhausted in BOTH the heap (persists to the next
+                            // step) and the local copy (so an abrupt close below skips
+                            // it — a done iterator must not have return() called).
                             self.iz_close_slot(idx, i);
+                            iters[i] = Value::NULL;
                             results[i] = pad(i);
                         }
                         Ok(Some(v)) => {
@@ -458,7 +558,7 @@ impl<'p> Vm<'p> {
                         }
                         Err(e) => {
                             self.ih_set_done(idx);
-                            let _ = self.iz_close_except(&iters, i);
+                            self.iz_close_others_abrupt(&iters, i);
                             return Err(e);
                         }
                     }
@@ -475,41 +575,40 @@ impl<'p> Vm<'p> {
                         Ok(None) => {
                             self.ih_set_done(idx);
                             if i == 0 {
-                                // The rest must also be done now.
+                                // The first ended; the rest must ALSO be done now.
+                                // Iterators that return done need no close; only an
+                                // iterator that YIELDS (mismatch, close j..) or whose
+                                // step THROWS (close j+1.., it's the abrupt source)
+                                // triggers a close — both in reverse, keeping the
+                                // surviving completion value.
                                 for j in 1..count {
                                     match self.iterator_step(iters[j]) {
                                         Ok(None) => {}
                                         Ok(Some(_)) => {
-                                            for &it in iters.iter().skip(j + 1) {
-                                                let _ = self.iterator_close(it);
-                                            }
-                                            return Err(Thrown(
-                                                "TypeError: Iterator.zip strict: iterators have different lengths".into(),
-                                            ));
+                                            let thr = self.iz_strict_type_error();
+                                            self.iz_close_range_keep(&iters, j, count);
+                                            return Err(thr);
                                         }
                                         Err(e) => {
-                                            for &it in iters.iter().skip(j + 1) {
-                                                let _ = self.iterator_close(it);
-                                            }
+                                            self.iz_close_range_keep(&iters, j + 1, count);
                                             return Err(e);
                                         }
                                     }
                                 }
                                 return Ok(self.iter_result(Value::UNDEFINED, true));
                             }
-                            // An earlier iterator yielded a value but this one ended.
-                            for &it in iters.iter().skip(i + 1) {
-                                let _ = self.iterator_close(it);
-                            }
-                            return Err(Thrown(
-                                "TypeError: Iterator.zip strict: iterators have different lengths".into(),
-                            ));
+                            // An earlier iterator yielded a value but this one ended:
+                            // length mismatch. Close every OTHER open iterator (the
+                            // earlier yielders + the not-yet-stepped tail), reverse.
+                            let thr = self.iz_strict_type_error();
+                            self.iz_close_all_except_keep(&iters, i);
+                            return Err(thr);
                         }
                         Ok(Some(v)) => results[i] = v,
                         Err(e) => {
                             // Abrupt step: close the others, the original wins.
                             self.ih_set_done(idx);
-                            let _ = self.iz_close_except(&iters, i);
+                            self.iz_close_others_abrupt(&iters, i);
                             return Err(e);
                         }
                     }
@@ -535,6 +634,10 @@ impl<'p> Vm<'p> {
         } else {
             Value::heap(self.heap.alloc(HeapObj::Array(results)))
         };
+        // Mark the helper "started" (suspended at a yield): `.return()` then resumes
+        // it in the "executing" state, vs a suspended-START return which completes
+        // without the executing brand. `idx` is otherwise unused for kind 7.
+        self.ih_inc_idx(idx);
         Ok(self.iter_result(out, false))
     }
 
@@ -929,7 +1032,7 @@ impl<'p> Vm<'p> {
                             let mapped =
                                 self.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])?;
                             self.ih_inc_idx(idx);
-                            let it = self.get_iterator_flattenable(mapped)?;
+                            let it = self.get_iterator_flattenable(mapped, true)?;
                             self.ih_set_inner(idx, it);
                             continue;
                         }
@@ -989,7 +1092,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn iterator_from(&mut self, o: Value) -> Result<Value, Thrown> {
         // A string yields its code-point iterator; otherwise get the iterable's
         // iterator (or use it directly if it is one).
-        let it = self.get_iterator_flattenable(o)?;
+        let it = self.get_iterator_flattenable(o, false)?;
         // If the iterator ALREADY inherits %Iterator.prototype% (OrdinaryHasInstance
         // (%Iterator%, it) — e.g. a generator or a built-in iterator), return it
         // unwrapped; only a foreign iterator gets the WrapForValidIterator wrapper.
