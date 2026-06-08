@@ -1820,40 +1820,46 @@ impl<'p> Vm<'p> {
                 let (val, done) = if let Some((coll, kind)) = live {
                     // Live Map/Set iterator: step the backing collection, skipping
                     // tombstoned (deleted) slots; appends made after creation are seen.
+                    // Once the cursor reaches the end the iterator is PERMANENTLY done
+                    // (a later add is NOT iterated), marked by index == usize::MAX.
                     let mut result = (Value::UNDEFINED, true);
-                    loop {
-                        // Copy out the (key, value) at `index` (or stop), releasing the
-                        // heap borrow before any allocation below.
-                        let pair: Option<(Value, Value)> = match self.heap.get(coll) {
-                            HeapObj::Set(items) => {
-                                if index >= items.len() {
-                                    break;
+                    if index != usize::MAX {
+                        loop {
+                            // Copy out the (key, value) at `index` (or stop), releasing
+                            // the heap borrow before any allocation below.
+                            let pair: Option<(Value, Value)> = match self.heap.get(coll) {
+                                HeapObj::Set(items) => {
+                                    if index >= items.len() {
+                                        break;
+                                    }
+                                    let v = items[index];
+                                    (!v.is_hole()).then_some((v, v))
                                 }
-                                let v = items[index];
-                                (!v.is_hole()).then_some((v, v))
-                            }
-                            HeapObj::Map { keys, vals } => {
-                                if index >= keys.len() {
-                                    break;
+                                HeapObj::Map { keys, vals } => {
+                                    if index >= keys.len() {
+                                        break;
+                                    }
+                                    let k = keys[index];
+                                    (!k.is_hole()).then_some((k, vals[index]))
                                 }
-                                let k = keys[index];
-                                (!k.is_hole()).then_some((k, vals[index]))
-                            }
-                            _ => break, // collection gone
-                        };
-                        index += 1;
-                        if let Some((k, v)) = pair {
-                            let yielded = match kind {
-                                0 => k,
-                                1 => v,
-                                _ => Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))),
+                                _ => break, // collection gone
                             };
-                            result = (yielded, false);
-                            break;
+                            index += 1;
+                            if let Some((k, v)) = pair {
+                                let yielded = match kind {
+                                    0 => k,
+                                    1 => v,
+                                    _ => Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))),
+                                };
+                                result = (yielded, false);
+                                break;
+                            }
                         }
                     }
+                    // Persist the cursor; on exhaustion latch permanent-done.
+                    let store = if result.1 { usize::MAX } else { index };
                     if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
-                        *i = index;
+                        *i = store;
                     }
                     result
                 } else {
