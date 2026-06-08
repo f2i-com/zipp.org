@@ -2585,12 +2585,18 @@ impl<'p> Vm<'p> {
                 if !this.is_heap()
                     || !matches!(self.heap.get(this.heap_index()), HeapObj::AsyncGenerator(_))
                 {
-                    return Err(Thrown(format!(
+                    // AsyncGeneratorEnqueue: a non-async-generator `this` REJECTS the
+                    // returned promise with a TypeError, not a synchronous throw.
+                    let err = self.alloc_error_from_message(&format!(
                         "TypeError: {name} called on a non-async-generator object"
-                    )));
+                    ));
+                    let p = self.alloc_promise();
+                    self.reject(p, err);
+                    Value::heap(p)
+                } else {
+                    self.async_generator_method(this.heap_index(), name, args)
+                        .unwrap_or(Value::UNDEFINED)
                 }
-                self.async_generator_method(this.heap_index(), name, args)
-                    .unwrap_or(Value::UNDEFINED)
             }
             SHADOWREALM_EVALUATE | SHADOWREALM_IMPORTVALUE => {
                 self.shadowrealm_op(id, this, args)?
