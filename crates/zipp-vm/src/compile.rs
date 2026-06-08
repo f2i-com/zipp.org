@@ -720,19 +720,26 @@ impl Compiler {
         // a top-level function name (already var-scoped).
         if !is_script && !fc.cx.in_strict {
             let mut blockers = std::collections::HashSet::new();
+            // `protect`: params + lexical/class names a same-named block function
+            // must NOT touch (B.3.3 skip). Existing FUNCTION names are blockers (no
+            // NEW b33 var) but are NOT protected — a block function updates them.
+            let mut protect = std::collections::HashSet::new();
             for p in params {
                 blockers.insert(p.clone());
+                protect.insert(p.clone());
             }
             for s in body {
                 match s {
                     ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
                         for decl in &d.declarations {
                             capture::collect_pattern_names(&decl.id, &mut blockers);
+                            capture::collect_pattern_names(&decl.id, &mut protect);
                         }
                     }
                     ox::Statement::ClassDeclaration(c) => {
                         if let Some(id) = &c.id {
                             blockers.insert(id.name.to_string());
+                            protect.insert(id.name.to_string());
                         }
                     }
                     ox::Statement::FunctionDeclaration(f) => {
@@ -743,6 +750,7 @@ impl Compiler {
                     _ => {}
                 }
             }
+            fc.protect_names = protect;
             let mut b33 = std::collections::HashSet::new();
             for s in body {
                 collect_b33_block_fns(s, false, &blockers, &mut b33);
@@ -1334,6 +1342,12 @@ struct FnCompiler<'a> {
     /// synced to the function value when the block declaration executes. Excludes
     /// names with a lexical conflict (which would be an early error → B.3.3 skipped).
     b33_names: std::collections::HashSet<String>,
+    /// Annex B B.3.3: function-body-level names that a same-named block function
+    /// must NOT overwrite — formal parameters, lexical (`let`/`const`) bindings,
+    /// and class declarations. A block function with one of these names stays
+    /// purely block-local (the "skip" cases), unlike a name matching an existing
+    /// `var`/function (which gets the function-scoped update via `b33_names`).
+    protect_names: std::collections::HashSet<String>,
     /// Function-body-level lexical (`let`/`const`/`class`) names that were
     /// pre-created as cells at entry because a nested function captures them, so a
     /// function materialised at entry (forward reference) can bind their cell. The
@@ -1456,6 +1470,7 @@ impl<'a> FnCompiler<'a> {
             enclosing,
             with_stack: Vec::new(),
             b33_names: std::collections::HashSet::new(),
+            protect_names: std::collections::HashSet::new(),
             entry_lexicals: std::collections::HashSet::new(),
         };
         // Register 0 is reserved for `this` in every function (undefined for
@@ -3286,6 +3301,37 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::MakeArrow { dst, func_id: id, this_reg });
     }
 
+    /// Compile an `if`/`else` BRANCH. Annex B B.3.3: a bare FunctionDeclaration
+    /// used directly as a branch (not inside a `{ }` block) is block-scoped to
+    /// that branch. Declare it block-local first — using the SAME guard as the
+    /// BlockStatement hoisting pre-pass — so `func_decl` binds the local instead
+    /// of overwriting an enclosing parameter / lexical of the same name. The
+    /// Annex B function-scoped `var` assignment (b33_names / s0reg in func_decl)
+    /// still runs for the non-conflicting case.
+    fn branch_stmt(&mut self, s: &ox::Statement) -> R<()> {
+        if let ox::Statement::FunctionDeclaration(f) = s {
+            if let Some(id) = &f.id {
+                let nm = id.name.as_str();
+                self.push_scope();
+                // Block-local when the name must stay block-scoped: strict mode, an
+                // enclosing-block lexical conflict, a protected param/lexical/class
+                // (skip), or a B.3.3 var name (block-local + func-scope sync). NOT
+                // for a same-named existing function (it is directly updated).
+                if self.cx.in_strict
+                    || self.block_fn_conflicts(nm)
+                    || self.protect_names.contains(nm)
+                    || self.b33_names.contains(nm)
+                {
+                    self.declare_local(nm);
+                }
+                let r = self.stmt(s);
+                self.pop_scope();
+                return r;
+            }
+        }
+        self.stmt(s)
+    }
+
     fn if_stmt(&mut self, i: &ox::IfStatement) -> R<()> {
         // The statement's completion V starts as undefined (a not-taken / empty
         // branch yields undefined, not the prior statement's value). No-op outside
@@ -3294,13 +3340,13 @@ impl<'a> FnCompiler<'a> {
         let cond = self.expr(&i.test)?;
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 }); // patched
-        self.stmt(&i.consequent)?;
+        self.branch_stmt(&i.consequent)?;
         if let Some(alt) = &i.alternate {
             let jmp = self.here();
             self.emit(Instr::Jump { target: 0 }); // patched
             let else_start = self.here();
             self.patch_jump(jf, else_start);
-            self.stmt(alt)?;
+            self.branch_stmt(alt)?;
             let end = self.here();
             self.patch_jump(jmp, end);
         } else {
@@ -3880,8 +3926,21 @@ impl<'a> FnCompiler<'a> {
                 match st {
                     ox::Statement::FunctionDeclaration(f) => {
                         if let Some(id) = &f.id {
-                            if self.cx.in_strict || f.generator || f.r#async {
-                                self.declare_local(id.name.as_str());
+                            // Block-local in strict / generator / async (always
+                            // lexical), on a lexical conflict, or for a protected
+                            // param/lexical/class or a B.3.3 var name — so Annex B
+                            // param/lexical skip-leak applies in case bodies too. A
+                            // same-named existing function is directly updated, not
+                            // shadowed.
+                            let nm = id.name.as_str();
+                            if self.cx.in_strict
+                                || f.generator
+                                || f.r#async
+                                || self.block_fn_conflicts(nm)
+                                || self.protect_names.contains(nm)
+                                || self.b33_names.contains(nm)
+                            {
+                                self.declare_local(nm);
                             }
                         }
                     }
