@@ -1351,6 +1351,10 @@ struct LoopCtx {
     /// The `handler_depth` in effect where this loop/switch was entered — the
     /// `floor` a `break`/`continue` targeting it must unwind the handler stack to.
     handler_depth: usize,
+    /// For a `for-of` / `for-await-of` frame: the register holding the live
+    /// iterator, so an abrupt `return` out of the body runs IteratorClose on it
+    /// (a normal `break` already closes via its own block). `None` for other loops.
+    iter_close: Option<Reg>,
 }
 
 /// One active `with` scope (see `FnCompiler::with_stack`).
@@ -1370,6 +1374,7 @@ impl LoopCtx {
             is_loop: true,
             label,
             handler_depth,
+            iter_close: None,
         }
     }
     fn switch_frame(label: Option<String>, handler_depth: usize) -> LoopCtx {
@@ -1379,6 +1384,7 @@ impl LoopCtx {
             is_loop: false,
             label,
             handler_depth,
+            iter_close: None,
         }
     }
 }
@@ -1811,11 +1817,23 @@ impl<'a> FnCompiler<'a> {
             }
             S::SwitchStatement(s) => self.switch_stmt(s)?,
             S::ReturnStatement(r) => {
-                if let Some(arg) = &r.argument {
-                    let v = self.expr(arg)?;
-                    self.emit(Instr::Return { src: v });
-                } else {
-                    self.emit(Instr::ReturnUndefined);
+                // Evaluate the return value FIRST (its side effects precede the
+                // iterator closes), then run IteratorClose on every enclosing for-of /
+                // for-await-of (innermost first) — a `return` is an abrupt completion
+                // that closes the iterator (a throwing `return()` then propagates,
+                // discarding the value). `break`/`throw` already close via their paths.
+                let v = match &r.argument {
+                    Some(arg) => Some(self.expr(arg)?),
+                    None => None,
+                };
+                let iters: Vec<Reg> =
+                    self.loop_ctx.iter().rev().filter_map(|c| c.iter_close).collect();
+                for it in iters {
+                    self.emit(Instr::IterClose { iter: it });
+                }
+                match v {
+                    Some(v) => self.emit(Instr::Return { src: v }),
+                    None => self.emit(Instr::ReturnUndefined),
                 }
             }
             S::FunctionDeclaration(f) => self.func_decl(f)?,
@@ -4046,6 +4064,9 @@ impl<'a> FnCompiler<'a> {
         // The handler is OUTSIDE the IterNext/done-check above, so a throwing
         // `next()` (or normal exhaustion) does NOT close the iterator (per spec).
         self.loop_ctx.push(LoopCtx::loop_frame(self.pending_label.take(), self.handler_depth));
+        // Record the iterator so a `return` out of the body closes it (the
+        // close-on-throw handler and the break-close block cover the other exits).
+        self.loop_ctx.last_mut().unwrap().iter_close = Some(iter_reg);
         let close_push = if let Some(er) = exc_reg {
             let at = self.here();
             self.emit(Instr::PushHandler { catch_target: 0, catch_reg: er });
