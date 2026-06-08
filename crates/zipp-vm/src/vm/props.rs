@@ -2755,6 +2755,19 @@ impl<'p> Vm<'p> {
             }
             return Ok(Value::UNDEFINED);
         }
+        // A String exotic object reports each in-range char index as an own data
+        // property, so OrdinaryGet (this path) must read the wrapped char. Bracket
+        // access (`s["0"]`) is handled in get_index; this covers the INDIRECT entry
+        // points — a Proxy with no `get` trap forwarding to a boxed-String target,
+        // or Reflect.get(boxedString, "0", receiver). Gated on a canonical numeric
+        // key so non-index gets skip the boxed-String check.
+        if let Some(i) = canonical_index_str(key) {
+            if let Some((sval, len)) = self.string_exotic_chars(obj) {
+                if i < len {
+                    return self.get_index(sval, Value::int(i as i32));
+                }
+            }
+        }
         // A function's / class's `.name` and `.length` — synthesized own data
         // properties (configurable, so a prior `delete` suppresses them).
         if key == "name" || key == "length" {
