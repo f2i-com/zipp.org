@@ -1607,7 +1607,10 @@ impl<'p> Vm<'p> {
             // Only a CANONICAL decimal (`"0"`, `"10"`) is an array index; `"00"` /
             // `" 1"` are ordinary named properties → generic path.
             if let Ok(i) = key.parse::<usize>() {
-                if i.to_string() == key {
+                // A canonical ARRAY index is 0..2^32-2; `"4294967295"` (2^32-1) and
+                // beyond are ORDINARY named properties → fall through to the generic
+                // arr_props path (not a dense slot, no dense-limit error).
+                if i.to_string() == key && i < 0xFFFF_FFFF {
                     if i >= crate::vm::MAX_DENSE_ARRAY_LEN {
                         return Err(Thrown(
                             "RangeError: array index exceeds the engine's dense-array limit".into(),
@@ -1669,9 +1672,24 @@ impl<'p> Vm<'p> {
             }
             if key == "length" {
                 // `length` is a non-configurable, non-enumerable data property
-                // (ArraySetLength, 15.4.5.1) — writable by default. Reject making it
-                // configurable or enumerable, or turning it into an accessor.
+                // (ArraySetLength, 15.4.5.1) — writable by default.
                 let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
+                // ArraySetLength steps 2-5: with a [[Value]], newLen = ToUint32(value)
+                // and numberLen = ToNumber(value) are BOTH computed (so valueOf runs
+                // TWICE), and `newLen != numberLen` (a non-uint32 length like -1 / NaN
+                // / >=2^32) is a RangeError — BEFORE the attribute / writability checks.
+                let new_len: Option<usize> = if let Some(v) = value {
+                    let nu = self.to_number_coerce(v)?; // ToNumber inside ToUint32
+                    let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
+                    let number_len = self.to_number_coerce(v)?; // numberLen = ToNumber(value)
+                    if u != number_len {
+                        return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                    Some(u as usize)
+                } else {
+                    None
+                };
+                // Reject making `length` configurable or enumerable, or an accessor.
                 if get.is_some() || set.is_some() || d_cf == Some(true) || d_en == Some(true) {
                     return Err(Thrown("TypeError: Cannot redefine property: length".into()));
                 }
@@ -1686,12 +1704,8 @@ impl<'p> Vm<'p> {
                     if d_wr == Some(true) {
                         return Err(Thrown("TypeError: Cannot redefine property: length".into()));
                     }
-                    if let Some(v) = value {
-                        let n = self.to_number_coerce(v)?;
-                        if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
-                            return Err(Thrown("RangeError: Invalid array length".into()));
-                        }
-                        if n as usize != cur_len {
+                    if let Some(nl) = new_len {
+                        if nl != cur_len {
                             return Err(Thrown(
                                 "TypeError: Cannot redefine property: length".into(),
                             ));
@@ -1699,17 +1713,12 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(());
                 }
-                if let Some(v) = value {
-                    let n = self.to_number_coerce(v)?;
-                    if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
-                        return Err(Thrown("RangeError: Invalid array length".into()));
-                    }
-                    if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
+                if let Some(new_len) = new_len {
+                    if new_len > crate::vm::MAX_DENSE_ARRAY_LEN {
                         return Err(Thrown(
                             "RangeError: array length exceeds the engine's dense-array limit".into(),
                         ));
                     }
-                    let new_len = n as usize;
                     let cur_len = match self.heap.get(idx) {
                         HeapObj::Array(items) => items.len(),
                         _ => 0,
