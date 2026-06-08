@@ -1611,6 +1611,7 @@ impl<'p> Vm<'p> {
             }
             JSON_STRINGIFY => {
                 let space = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let space = self.json_coerce_space(space)?;
                 let indent = self.json_indent(space);
                 let replacer = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let (replacer_fn, allowlist) = self.json_resolve_replacer(replacer)?;

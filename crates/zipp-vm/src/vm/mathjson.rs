@@ -93,6 +93,46 @@ impl<'p> Vm<'p> {
     /// The per-level indent string for `JSON.stringify`'s `space` argument: a
     /// number → that many spaces (clamped 0..10); a string → its first 10 chars;
     /// anything else → empty (compact output).
+    /// JSON.stringify `space` coercion (spec sec-json.stringify step 5): a Number
+    /// wrapper object is read as ToNumber(space) and a String wrapper as
+    /// ToString(space) — both honouring an overridden `valueOf`/`toString` (so
+    /// `new Number(1)` with `valueOf:()=>3` indents by 3, and a throwing `valueOf`
+    /// propagates). Everything else passes through unchanged to `json_indent`.
+    pub(crate) fn json_coerce_space(&mut self, space: Value) -> Result<Value, Thrown> {
+        if !space.is_heap() {
+            return Ok(space);
+        }
+        match self.heap.get(space.heap_index()) {
+            HeapObj::Boxed { kind: 1, .. } => {
+                // ToPrimitive(space, number) honouring overrides, then ToNumber.
+                let prim = if let Some(p) = self.symbol_to_primitive(space, "number")? {
+                    p
+                } else {
+                    let mut found = None;
+                    for name in ["valueOf", "toString"] {
+                        let f = self.get_prop(space, name)?;
+                        if self.is_callable(f) {
+                            let r = self.call_value(f, space, &[])?;
+                            if !self.is_object_value(r) {
+                                found = Some(r);
+                                break;
+                            }
+                        }
+                    }
+                    found.ok_or_else(|| {
+                        Thrown("TypeError: Cannot convert object to primitive value".into())
+                    })?
+                };
+                Ok(Value::num(self.to_number(prim)?))
+            }
+            HeapObj::Boxed { kind: 0, .. } => {
+                let s = self.to_js_string(space)?;
+                Ok(self.alloc_str(s))
+            }
+            _ => Ok(space),
+        }
+    }
+
     pub(crate) fn json_indent(&self, space: Value) -> String {
         if space.is_number() {
             let n = space.as_f64();
