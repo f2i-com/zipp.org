@@ -1085,6 +1085,21 @@ impl<'p> Vm<'p> {
                         );
                     }
                 }
+                // A boxed Number/Boolean/Symbol/BigInt wrapper (kind != 0; kind 0 =
+                // String is handled above) has no exotic own properties — only the
+                // ones assigned to the wrapper, in the arr_props side table. (e.g.
+                // `Object.assign(12, "ab")` boxes the target and copies "0"/"1".)
+                HeapObj::Boxed { .. } => {
+                    if let Some(m) = self.arr_props.get(&idx) {
+                        keys.extend(
+                            spec_key_order(&m.keys)
+                                .into_iter()
+                                .map(|i| &m.keys[i])
+                                .filter(|k| !is_hidden_key(k))
+                                .cloned(),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
