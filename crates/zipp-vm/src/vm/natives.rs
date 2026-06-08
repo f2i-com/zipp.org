@@ -1141,18 +1141,27 @@ impl<'p> Vm<'p> {
                 let a = args.first().copied().unwrap_or(Value::UNDEFINED);
                 self.require_object_coercible(a)?; // ToObject(O): null/undefined throw
                 let o = self.to_object(a)?;
-                let names = self.object_own_property_names(o)?;
+                // [[OwnPropertyKeys]] — STRING and SYMBOL keys (in spec order), not
+                // just strings: the result object mirrors every own key. `key_of`
+                // yields the internal key (the `@@`-key for a Symbol), so `map.set`
+                // recreates a symbol-keyed property.
+                let names = self.object_own_keys(o)?;
                 let keys: Vec<Value> = match self.heap.get(names.heap_index()) {
                     HeapObj::Array(items) => items.clone(),
                     _ => Vec::new(),
                 };
                 let mut map = ObjMap::new();
                 for kv in keys {
-                    let ks = self.display(kv);
+                    let ks = self.key_of(kv);
                     let desc = match self.proxy_gopd(o, &ks)? {
                         Some(d) => d,
                         None => self.object_get_own_property_descriptor(o, &ks),
                     };
+                    // CreateDataProperty only for a DEFINED descriptor (a Proxy's gopd
+                    // trap may report undefined → that key is omitted from the result).
+                    if desc.is_undefined() {
+                        continue;
+                    }
                     map.set(&ks, desc);
                 }
                 Value::heap(self.heap.alloc(HeapObj::Object(map)))
