@@ -1759,7 +1759,15 @@ impl<'a> FnCompiler<'a> {
                             // (Annex B is not honored in strict mode, so the function
                             // stays block-local and does not leak past the block).
                             let nm = id.name.as_str();
-                            if !self.is_script || self.cx.in_strict || self.block_fn_conflicts(nm) {
+                            // Block-local for strict / enclosing-block lexical
+                            // conflict / a protected param-lexical-class name / a
+                            // B.3.3 var name. A name matching an existing function is
+                            // NOT shadowed — it is directly updated (B.3.3).
+                            if self.cx.in_strict
+                                || self.block_fn_conflicts(nm)
+                                || self.protect_names.contains(nm)
+                                || self.b33_names.contains(nm)
+                            {
                                 self.declare_local(nm);
                             }
                         }
