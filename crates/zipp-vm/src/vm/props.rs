@@ -1973,9 +1973,16 @@ impl<'p> Vm<'p> {
                 ));
             }
         }
-        let extensible = match self.heap.get(idx) {
-            HeapObj::Object(m) => m.extensible,
-            _ => true,
+        let extensible = if target == 3 {
+            // Exotic objects (TypedArray / Map / Set / Date / RegExp / … whose named
+            // own props live in the arr_props side table) keep their extensible flag
+            // there — set by Object.preventExtensions/seal/freeze; default true.
+            self.arr_props.get(&idx).map_or(true, |m| m.extensible)
+        } else {
+            match self.heap.get(idx) {
+                HeapObj::Object(m) => m.extensible,
+                _ => true,
+            }
         };
         let (attr, stored) = self
             .merge_property_descriptor(key, existing, extensible, value, get, set, d_wr, d_en, d_cf)?;
