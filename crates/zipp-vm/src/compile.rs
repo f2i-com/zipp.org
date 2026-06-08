@@ -1167,10 +1167,34 @@ fn capture_source(chain: &[EnclosingFn], name: &str) -> Option<UpvalSource> {
 fn method_source(text: String, is_static: bool) -> String {
     if is_static {
         if let Some(rest) = text.strip_prefix("static") {
-            return rest.trim_start().to_string();
+            // The MethodDefinition's [[SourceText]] starts at its first real token
+            // (name / get / set / async / * / [). Whitespace AND comments between
+            // `static` and that token are trivia, not part of the method source.
+            return skip_leading_trivia(rest).to_string();
         }
     }
     text
+}
+
+/// Drop leading whitespace and comments (`// …` line + `/* … */` block) — the
+/// trivia between a `static` keyword and the start of the MethodDefinition.
+fn skip_leading_trivia(s: &str) -> &str {
+    let mut t = s.trim_start();
+    loop {
+        if let Some(rest) = t.strip_prefix("//") {
+            t = match rest.find(|c| c == '\n' || c == '\r') {
+                Some(i) => rest[i..].trim_start(),
+                None => "",
+            };
+        } else if let Some(rest) = t.strip_prefix("/*") {
+            t = match rest.find("*/") {
+                Some(i) => rest[i + 2..].trim_start(),
+                None => "",
+            };
+        } else {
+            return t;
+        }
+    }
 }
 
 fn placeholder(name: &str) -> FuncProto {
