@@ -774,14 +774,18 @@ impl<'p> Vm<'p> {
             );
         }
         if ci == self.duration_ctor && ci != 0 {
-            return self.build_duration(args);
+            let r = self.build_duration(args)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.duration_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.plaindate_ctor && ci != 0 {
             let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
             let d = self.temporal_ctor_int(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             self.validate_calendar_identifier(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
-            return self.make_plain_date(y, m, d);
+            let r = self.make_plain_date(y, m, d)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.plaindate_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.plaintime_ctor && ci != 0 {
             let mut f = [0i64; 6];
@@ -791,7 +795,9 @@ impl<'p> Vm<'p> {
                     *slot = self.temporal_ctor_int(v)?;
                 }
             }
-            return self.make_plain_time(f);
+            let r = self.make_plain_time(f)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.plaintime_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.plaindatetime_ctor && ci != 0 {
             // year/month/day are required: an undefined coerces to NaN → RangeError.
@@ -804,11 +810,15 @@ impl<'p> Vm<'p> {
                 }
             }
             self.validate_calendar_identifier(args.get(9).copied().unwrap_or(Value::UNDEFINED))?;
-            return self.make_plain_date_time(f);
+            let r = self.make_plain_date_time(f)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.plaindatetime_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.instant_ctor && ci != 0 {
             let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-            return self.make_instant(ns);
+            let r = self.make_instant(ns)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.instant_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.plainyearmonth_ctor && ci != 0 {
             // (year, month, calendar?, referenceISODay=1)
@@ -819,7 +829,9 @@ impl<'p> Vm<'p> {
                 Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1,
             };
-            return self.make_plain_year_month(y, m, rd);
+            let r = self.make_plain_year_month(y, m, rd)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.plainyearmonth_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.plainmonthday_ctor && ci != 0 {
             // (month, day, calendar?, referenceISOYear=1972)
@@ -830,11 +842,15 @@ impl<'p> Vm<'p> {
                 Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1972,
             };
-            return self.make_plain_month_day(m, d, ry);
+            let r = self.make_plain_month_day(m, d, ry)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.plainmonthday_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.zoneddatetime_ctor && ci != 0 {
             self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-            return self.make_zoned_date_time(args);
+            let r = self.make_zoned_date_time(args)?;
+            let over = self.newtarget_proto_override(new_target, cv, self.zoneddatetime_proto)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         // Intl.<service> constructors.
         if self.intl_ctors[0] != 0 {
