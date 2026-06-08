@@ -519,6 +519,59 @@ impl<'p> Vm<'p> {
                 return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
             }
         }
+        // A callable (function / closure / bound / native): enumerate its own keys in
+        // canonical [[OwnPropertyKeys]] order — length/name/prototype keep their
+        // chronological-first slot even after a defineProperty override (see
+        // object_own_property_names) — keeping only the enumerable ones. An intrinsic
+        // length/name/prototype is non-enumerable unless a fn_props override made it
+        // enumerable, so only fn_props-backed keys can appear; their order follows the
+        // canonical key order, NOT raw fn_props insertion order.
+        if obj.is_heap()
+            && matches!(
+                self.heap.get(obj.heap_index()),
+                HeapObj::Func(_)
+                    | HeapObj::Closure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Native(_)
+            )
+        {
+            let idx = obj.heap_index();
+            let names_v = self.object_own_property_names(obj)?;
+            let names: Vec<String> = self
+                .array_snapshot(names_v.heap_index())
+                .into_iter()
+                .filter_map(|k| {
+                    (k.is_heap() && self.heap.is_str_like(k.heap_index())).then(|| self.display(k))
+                })
+                .collect();
+            let mut out: Vec<Value> = Vec::new();
+            for k in names {
+                let enumerable = self
+                    .fn_props
+                    .get(&idx)
+                    .and_then(|m| m.pos(&k).map(|i| m.attrs[i].enumerable))
+                    .unwrap_or(false);
+                if !enumerable {
+                    continue;
+                }
+                match what {
+                    EnumWhat::Keys => {
+                        let kv = self.alloc_str(k);
+                        out.push(kv);
+                    }
+                    EnumWhat::Values => {
+                        let v = self.get_member(obj, &k, obj)?;
+                        out.push(v);
+                    }
+                    EnumWhat::Entries => {
+                        let v = self.get_member(obj, &k, obj)?;
+                        let kv = self.alloc_str(k);
+                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))));
+                    }
+                }
+            }
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+        }
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Array(items) => {
@@ -1042,21 +1095,46 @@ impl<'p> Vm<'p> {
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. }
                 | HeapObj::Native(_) => {
-                    if has_length {
+                    // length, name, then prototype are created at function-definition
+                    // time, so they keep their chronological-FIRST position even after
+                    // a defineProperty moves the override into the fn_props bag (which
+                    // clears the synthesized-intrinsic flag) — and are excluded from
+                    // the fn_props tail below. `prototype` is intrinsic only for real
+                    // functions (callable_has_prototype): an arrow's later-assigned
+                    // `prototype` is an ordinary property and stays in chronological
+                    // order. (Matters for Object.keys once one is made enumerable.)
+                    let fp_has = |k: &str| {
+                        self.fn_props.get(&idx).map_or(false, |m| m.pos(k).is_some())
+                    };
+                    let has_proto_early = self.callable_has_prototype(obj);
+                    if has_length || fp_has("length") {
                         keys.push("length".to_string());
                     }
-                    if has_name {
+                    if has_name || fp_has("name") {
                         keys.push("name".to_string());
                     }
-                    // An ordinary function / generator owns `prototype` (after
-                    // name/length), unless it was reassigned into the fn_props bag.
-                    if self.callable_has_prototype(obj)
-                        && self.fn_props.get(&idx).map_or(true, |m| m.pos("prototype").is_none())
-                    {
+                    if has_proto_early {
                         keys.push("prototype".to_string());
                     }
                     if let Some(m) = self.fn_props.get(&idx) {
-                        keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
+                        keys.extend(
+                            m.keys
+                                .iter()
+                                .filter(|k| {
+                                    if is_hidden_key(k) {
+                                        return false;
+                                    }
+                                    match k.as_str() {
+                                        // Always emitted early on a callable.
+                                        "length" | "name" => false,
+                                        // Early only for real functions; an arrow's
+                                        // assigned `prototype` stays chronological.
+                                        "prototype" => !has_proto_early,
+                                        _ => true,
+                                    }
+                                })
+                                .cloned(),
+                        );
                     }
                 }
                 // A String exotic (boxed `new String(s)` or a raw string): the
