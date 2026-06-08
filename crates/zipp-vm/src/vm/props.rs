@@ -1827,30 +1827,49 @@ impl<'p> Vm<'p> {
                         HeapObj::Array(items) => items.len(),
                         _ => 0,
                     };
-                    // Shrinking past a NON-configurable index is forbidden: the
-                    // element can't be deleted, so length stops there and a
-                    // TypeError is thrown (ArraySetLength steps 16-17).
+                    // Shrinking past a NON-configurable index does a PARTIAL shrink:
+                    // delete the deletable indices above it, stop the length at
+                    // blocker+1, set the length non-writable if requested, THEN throw
+                    // (ArraySetLength steps 16-17). `effective_len` is where the length
+                    // actually lands; `blocked` records that a TypeError is due.
+                    let mut effective_len = new_len;
+                    let mut blocked = false;
                     if new_len < cur_len {
-                        for i in new_len..cur_len {
-                            if let Some((a, _)) = self.array_index_override(idx, i) {
-                                if !a.configurable {
-                                    return Err(Thrown(
-                                        "TypeError: Cannot redefine property: length".into(),
-                                    ));
-                                }
+                        // Walk DOWN from the top; the highest non-configurable
+                        // (non-deletable) index in [new_len, cur_len) is the blocker.
+                        let mut i = cur_len;
+                        while i > new_len {
+                            i -= 1;
+                            if self
+                                .array_index_override(idx, i)
+                                .map_or(false, |(a, _)| !a.configurable)
+                            {
+                                effective_len = i + 1;
+                                blocked = true;
+                                break;
                             }
                         }
                         // Drop any (configurable) special overrides being truncated.
                         if let Some(m) = self.arr_props.get_mut(&idx) {
-                            for i in new_len..cur_len {
+                            for i in effective_len..cur_len {
                                 m.remove(&i.to_string());
                             }
                         }
                     }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        items.resize(new_len, Value::UNDEFINED);
+                        items.resize(effective_len, Value::UNDEFINED);
                     }
                     self.heap.bump_version(idx);
+                    if blocked {
+                        // A partial shrink still applies `writable:false` (newWritable)
+                        // before throwing.
+                        if d_wr == Some(false) {
+                            self.array_length_nonwritable.insert(idx);
+                        }
+                        return Err(Thrown(
+                            "TypeError: Cannot redefine property: length".into(),
+                        ));
+                    }
                 }
                 // Record a newly non-writable length (writable was true above) so
                 // future writes / mutators / the descriptor honour it.
