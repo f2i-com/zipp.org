@@ -832,7 +832,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 let proto = self.regexp_string_iter_proto;
-                Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto }))
+                Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto, live: None }))
             }
             REGEXP_GET_GLOBAL
             | REGEXP_GET_IGNORECASE
@@ -1808,20 +1808,66 @@ impl<'p> Vm<'p> {
             FR_REGISTER => self.finreg_method(this, "register", args)?,
             FR_UNREGISTER => self.finreg_method(this, "unregister", args)?,
             ITER_NEXT => {
-                let (val, done) = match this.is_heap().then(|| self.heap.get_mut(this.heap_index())) {
-                    Some(HeapObj::Iterator { items, index, .. }) => {
-                        if *index < items.len() {
-                            let v = items[*index];
-                            *index += 1;
-                            (v, false)
-                        } else {
-                            (Value::UNDEFINED, true)
-                        }
-                    }
+                let it_idx = this.heap_index();
+                let (live, mut index) = match this.is_heap().then(|| self.heap.get(it_idx)) {
+                    Some(HeapObj::Iterator { live, index, .. }) => (*live, *index),
                     _ => {
                         return Err(Thrown(
                             "TypeError: Iterator.prototype.next called on incompatible receiver".into(),
                         ))
+                    }
+                };
+                let (val, done) = if let Some((coll, kind)) = live {
+                    // Live Map/Set iterator: step the backing collection, skipping
+                    // tombstoned (deleted) slots; appends made after creation are seen.
+                    let mut result = (Value::UNDEFINED, true);
+                    loop {
+                        // Copy out the (key, value) at `index` (or stop), releasing the
+                        // heap borrow before any allocation below.
+                        let pair: Option<(Value, Value)> = match self.heap.get(coll) {
+                            HeapObj::Set(items) => {
+                                if index >= items.len() {
+                                    break;
+                                }
+                                let v = items[index];
+                                (!v.is_hole()).then_some((v, v))
+                            }
+                            HeapObj::Map { keys, vals } => {
+                                if index >= keys.len() {
+                                    break;
+                                }
+                                let k = keys[index];
+                                (!k.is_hole()).then_some((k, vals[index]))
+                            }
+                            _ => break, // collection gone
+                        };
+                        index += 1;
+                        if let Some((k, v)) = pair {
+                            let yielded = match kind {
+                                0 => k,
+                                1 => v,
+                                _ => Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))),
+                            };
+                            result = (yielded, false);
+                            break;
+                        }
+                    }
+                    if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                        *i = index;
+                    }
+                    result
+                } else {
+                    match self.heap.get_mut(it_idx) {
+                        HeapObj::Iterator { items, index: i, .. } => {
+                            if *i < items.len() {
+                                let v = items[*i];
+                                *i += 1;
+                                (v, false)
+                            } else {
+                                (Value::UNDEFINED, true)
+                            }
+                        }
+                        _ => unreachable!(),
                     }
                 };
                 let mut m = ObjMap::new();

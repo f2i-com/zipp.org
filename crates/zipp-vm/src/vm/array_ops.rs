@@ -231,7 +231,20 @@ impl<'p> Vm<'p> {
 
     /// Allocate a built-in iterator over a snapshot of `items` with prototype `proto`.
     pub(crate) fn make_iterator(&mut self, items: Vec<Value>, proto: u32) -> Value {
-        Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto }))
+        Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto, live: None }))
+    }
+
+    /// Allocate a LIVE Map/Set iterator over the backing collection `coll` (its heap
+    /// index) with prototype `proto`. `kind`: 0 = keys, 1 = values, 2 = entries. Each
+    /// `.next()` steps the live collection (skipping deleted/tombstoned slots), so a
+    /// delete/add performed after the iterator is created is reflected.
+    pub(crate) fn make_live_iterator(&mut self, coll: u32, kind: u8, proto: u32) -> Value {
+        Value::heap(self.heap.alloc(HeapObj::Iterator {
+            items: Vec::new(),
+            index: 0,
+            proto,
+            live: Some((coll, kind)),
+        }))
     }
 
     /// ArraySpeciesCreate(originalArray, length), but returns `None` to signal that

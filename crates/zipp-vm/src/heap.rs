@@ -471,8 +471,12 @@ pub enum HeapObj {
     /// A built-in iterator (Array/Map/Set `entries()`/`keys()`/`values()` and the
     /// default `@@iterator`). A snapshot of the values to yield plus a cursor;
     /// `proto` is its prototype heap index (%ArrayIteratorPrototype% etc., distinct
-    /// per collection). `.next()` yields `items[index]` then advances.
-    Iterator { items: Vec<Value>, index: usize, proto: u32 },
+    /// per collection). `.next()` yields `items[index]` then advances. When `live`
+    /// is `Some((coll, kind))` it is a LIVE Map/Set iterator that steps the backing
+    /// collection `coll` at `index` (skipping tombstoned/HOLE slots) instead of the
+    /// `items` snapshot, so a delete/add after the iterator is created is observed
+    /// (`kind`: 0 = keys, 1 = values, 2 = entries `[k, v]`).
+    Iterator { items: Vec<Value>, index: usize, proto: u32, live: Option<(u32, u8)> },
     /// A lazy Iterator Helper (the result of `Iterator.prototype.{map,filter,
     /// take,drop,flatMap}`). `source` is the underlying iterator; `kind` selects
     /// the transform (0=map,1=filter,2=take,3=drop,4=flatMap); `arg` is the

@@ -1529,44 +1529,19 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::UNDEFINED))
             }
-            // Real iterators over %MapIteratorPrototype% (snapshot semantics).
+            // LIVE iterators over %MapIteratorPrototype% (step the backing store, so a
+            // delete/add after the iterator is created is observed).
             "keys" => {
-                let v = match self.heap.get(idx) {
-                    HeapObj::Map { keys, .. } => {
-                        keys.iter().copied().filter(|k| !k.is_hole()).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                Ok(Some(self.make_iterator(v, self.map_iter_proto)))
+                let proto = self.map_iter_proto;
+                Ok(Some(self.make_live_iterator(idx, 0, proto)))
             }
             "values" => {
-                // Skip tombstoned entries (key is HOLE), keeping the matching value.
-                let v = match self.heap.get(idx) {
-                    HeapObj::Map { keys, vals } => keys
-                        .iter()
-                        .zip(vals.iter())
-                        .filter(|(k, _)| !k.is_hole())
-                        .map(|(_, v)| *v)
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                Ok(Some(self.make_iterator(v, self.map_iter_proto)))
+                let proto = self.map_iter_proto;
+                Ok(Some(self.make_live_iterator(idx, 1, proto)))
             }
             "entries" => {
-                let pairs: Vec<(Value, Value)> = match self.heap.get(idx) {
-                    HeapObj::Map { keys, vals } => keys
-                        .iter()
-                        .copied()
-                        .zip(vals.iter().copied())
-                        .filter(|(k, _)| !k.is_hole())
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                let entries: Vec<Value> = pairs
-                    .into_iter()
-                    .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))
-                    .collect();
-                Ok(Some(self.make_iterator(entries, self.map_iter_proto)))
+                let proto = self.map_iter_proto;
+                Ok(Some(self.make_live_iterator(idx, 2, proto)))
             }
             _ => Ok(None),
         }
@@ -1867,24 +1842,15 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::UNDEFINED))
             }
-            // keys() === values() for a Set; both yield the values (real iterator).
+            // keys() === values() for a Set; both yield the values. A LIVE iterator
+            // (steps the backing store) so a delete/add after creation is observed.
             "keys" | "values" => {
-                let v = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.iter().copied().filter(|v| !v.is_hole()).collect(),
-                    _ => Vec::new(),
-                };
-                Ok(Some(self.make_iterator(v, self.set_iter_proto)))
+                let proto = self.set_iter_proto;
+                Ok(Some(self.make_live_iterator(idx, 1, proto)))
             }
             "entries" => {
-                let items: Vec<Value> = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.iter().copied().filter(|v| !v.is_hole()).collect(),
-                    _ => Vec::new(),
-                };
-                let entries: Vec<Value> = items
-                    .into_iter()
-                    .map(|v| Value::heap(self.heap.alloc(HeapObj::Array(vec![v, v]))))
-                    .collect();
-                Ok(Some(self.make_iterator(entries, self.set_iter_proto)))
+                let proto = self.set_iter_proto;
+                Ok(Some(self.make_live_iterator(idx, 2, proto)))
             }
             // ES2025 set methods. `other` must be set-like; the common (and tested)
             // case is a real Set, whose elements we read directly.

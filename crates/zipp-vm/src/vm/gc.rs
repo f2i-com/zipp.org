@@ -430,11 +430,15 @@ impl Vm<'_> {
             }
             HeapObj::Intl { resolved, .. } => m_idx!(*resolved),
             HeapObj::Symbol { desc, .. } => m_val!(*desc),
-            HeapObj::Iterator { items, proto, .. } => {
+            HeapObj::Iterator { items, proto, live, .. } => {
                 for &v in items {
                     m_val!(v);
                 }
                 m_idx!(*proto);
+                // A live Map/Set iterator keeps its backing collection alive.
+                if let Some((coll, _)) = live {
+                    m_idx!(*coll);
+                }
             }
             HeapObj::IterHelper { source, arg, inner, next, .. } => {
                 m_val!(*source);
