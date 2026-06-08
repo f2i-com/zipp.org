@@ -2376,9 +2376,13 @@ impl<'p> Vm<'p> {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => {
                     Plan::Chars(self.heap.str_cow(v.heap_index()).unwrap().chars().collect())
                 }
-                HeapObj::Map { keys, vals } => {
-                    Plan::Pairs(keys.iter().copied().zip(vals.iter().copied()).collect())
-                }
+                HeapObj::Map { keys, vals } => Plan::Pairs(
+                    keys.iter()
+                        .copied()
+                        .zip(vals.iter().copied())
+                        .filter(|(k, _)| !k.is_hole())
+                        .collect(),
+                ),
                 _ => return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v)))),
             }
         } else {

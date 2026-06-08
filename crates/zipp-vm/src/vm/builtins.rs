@@ -1487,8 +1487,11 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let (Some(i), HeapObj::Map { keys, vals }) = (pos, self.heap.get_mut(idx)) {
-                    keys.remove(i);
-                    vals.remove(i);
+                    // Tombstone (don't shift): a live forEach / iterator holds an index
+                    // cursor. A tombstoned key (HOLE) is filtered out everywhere the
+                    // entries are enumerated.
+                    keys[i] = Value::HOLE;
+                    vals[i] = Value::UNDEFINED;
                     return Ok(Some(Value::bool(true)));
                 }
                 Ok(Some(Value::bool(false)))
@@ -1516,32 +1519,47 @@ impl<'p> Vm<'p> {
                         HeapObj::Map { keys, vals } if i < keys.len() => (keys[i], vals[i]),
                         _ => break,
                     };
+                    i += 1;
+                    // A tombstoned (deleted) entry is skipped.
+                    if k.is_hole() {
+                        continue;
+                    }
                     // callback(value, key, map)
                     self.call_value(cb, this_arg, &[v, k, recv])?;
-                    i += 1;
                 }
                 Ok(Some(Value::UNDEFINED))
             }
             // Real iterators over %MapIteratorPrototype% (snapshot semantics).
             "keys" => {
                 let v = match self.heap.get(idx) {
-                    HeapObj::Map { keys, .. } => keys.clone(),
+                    HeapObj::Map { keys, .. } => {
+                        keys.iter().copied().filter(|k| !k.is_hole()).collect()
+                    }
                     _ => Vec::new(),
                 };
                 Ok(Some(self.make_iterator(v, self.map_iter_proto)))
             }
             "values" => {
+                // Skip tombstoned entries (key is HOLE), keeping the matching value.
                 let v = match self.heap.get(idx) {
-                    HeapObj::Map { vals, .. } => vals.clone(),
+                    HeapObj::Map { keys, vals } => keys
+                        .iter()
+                        .zip(vals.iter())
+                        .filter(|(k, _)| !k.is_hole())
+                        .map(|(_, v)| *v)
+                        .collect(),
                     _ => Vec::new(),
                 };
                 Ok(Some(self.make_iterator(v, self.map_iter_proto)))
             }
             "entries" => {
                 let pairs: Vec<(Value, Value)> = match self.heap.get(idx) {
-                    HeapObj::Map { keys, vals } => {
-                        keys.iter().copied().zip(vals.iter().copied()).collect()
-                    }
+                    HeapObj::Map { keys, vals } => keys
+                        .iter()
+                        .copied()
+                        .zip(vals.iter().copied())
+                        .filter(|(k, _)| !k.is_hole())
+                        .collect(),
                     _ => Vec::new(),
                 };
                 let entries: Vec<Value> = pairs
