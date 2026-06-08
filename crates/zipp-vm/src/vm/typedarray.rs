@@ -358,11 +358,29 @@ impl<'p> Vm<'p> {
     /// Validate an Atomics receiver/index: the receiver must be an INTEGER
     /// TypedArray (not Uint8Clamped/Float32/Float64), and the index in
     /// `[0, length)`. Returns `(ta_heap_index, element_index, kind)`.
-    pub(crate) fn atomic_validate(&mut self, ta: Value, idx: Value) -> Result<(u32, usize, u8), Thrown> {
+    /// ValidateIntegerTypedArray + ValidateAtomicAccess. The type/kind/shared checks
+    /// happen BEFORE the index is coerced (so a poisoned-valueOf index on a wrong
+    /// array type throws the spec TypeError, not the index error). `waitable` ⇒ the
+    /// view must be Int32Array/BigInt64Array (wait/waitAsync/notify); `needs_shared`
+    /// ⇒ its buffer must be a SharedArrayBuffer (wait).
+    pub(crate) fn atomic_validate(
+        &mut self,
+        ta: Value,
+        idx: Value,
+        waitable: bool,
+        needs_shared: bool,
+        is_write: bool,
+    ) -> Result<(u32, usize, u8), Thrown> {
         let ti = match ta.is_heap().then(|| self.heap.get(ta.heap_index())) {
             Some(HeapObj::TypedArray { kind, .. }) => {
-                // Uint8Clamped(2), Float32(7), Float64(8) are not integer types.
-                if matches!(*kind, 2 | 7 | 8) {
+                if waitable {
+                    if !matches!(*kind, 5 | 9) {
+                        return Err(Thrown(
+                            "TypeError: Atomics operation requires an Int32Array or BigInt64Array".into(),
+                        ));
+                    }
+                } else if matches!(*kind, 2 | 7 | 8) {
+                    // Uint8Clamped(2), Float32(7), Float64(8) are not integer types.
                     return Err(Thrown(
                         "TypeError: Atomics operation requires an integer TypedArray".into(),
                     ));
@@ -375,16 +393,38 @@ impl<'p> Vm<'p> {
                 ))
             }
         };
+        if needs_shared {
+            let shared = matches!(self.heap.get(ti),
+                HeapObj::TypedArray { buffer, .. } if self.shared_buffers.contains(buffer));
+            if !shared {
+                return Err(Thrown("TypeError: Atomics.wait requires a SharedArrayBuffer".into()));
+            }
+        }
+        // ValidateTypedArray step 4: a ~write~ access on an immutable-buffer-backed
+        // view is a TypeError, raised BEFORE the index/value are coerced.
+        if is_write {
+            let buffer = match self.heap.get(ti) {
+                HeapObj::TypedArray { buffer, .. } => *buffer,
+                _ => 0,
+            };
+            if self.immutable_buffers.contains(&buffer) {
+                return Err(Thrown(
+                    "TypeError: Cannot perform an Atomics write on an immutable ArrayBuffer".into(),
+                ));
+            }
+        }
         let kind = match self.heap.get(ti) {
             HeapObj::TypedArray { kind, .. } => *kind,
             _ => 0,
         };
-        let i = self.to_integer_or_zero(idx)?;
+        // ToIndex(requestIndex): RangeError on a negative index, TypeError on a
+        // Symbol/BigInt — coerced AFTER the type/buffer checks above.
+        let i = self.to_index(idx)?;
         let len = self.ta_effective_len(ti).unwrap_or(0);
-        if i < 0 || i as usize >= len {
+        if i >= len {
             return Err(Thrown("RangeError: Atomics index out of bounds".into()));
         }
-        Ok((ti, i as usize, kind))
+        Ok((ti, i, kind))
     }
 
     /// Execute an `Atomics.<op>` call. Single-threaded, so read-modify-write ops
@@ -402,7 +442,13 @@ impl<'p> Vm<'p> {
         if op == "pause" {
             return Ok(Value::UNDEFINED);
         }
-        let (ti, i, kind) = self.atomic_validate(a0, a1)?;
+        let waitable = matches!(op, "wait" | "waitAsync" | "notify");
+        let needs_shared = op == "wait";
+        let is_write = matches!(
+            op,
+            "store" | "add" | "sub" | "and" | "or" | "xor" | "exchange" | "compareExchange"
+        );
+        let (ti, i, kind) = self.atomic_validate(a0, a1, waitable, needs_shared, is_write)?;
         let is_bigint = native::TA_KINDS[kind as usize].2;
         // waitAsync(ta, index, value, timeout) -> { async, value }. Single agent:
         // never truly blocks. value differs -> {async:false, value:"not-equal"};
@@ -448,20 +494,11 @@ impl<'p> Vm<'p> {
             }
             return Ok(Value::heap(obj));
         }
-        // wait/notify need Int32Array or BigInt64Array; wait additionally needs a
-        // SharedArrayBuffer. No real waiters in a single agent.
+        // wait/notify: the Int32Array/BigInt64Array + SharedArrayBuffer checks
+        // already ran in atomic_validate (before the index coercion). No real waiters
+        // in a single agent.
         if op == "wait" || op == "notify" {
-            if !matches!(kind, 5 | 9) {
-                return Err(Thrown(format!(
-                    "TypeError: Atomics.{op} requires an Int32Array or BigInt64Array"
-                )));
-            }
             if op == "wait" {
-                let shared = matches!(self.heap.get(ti),
-                    HeapObj::TypedArray { buffer, .. } if self.shared_buffers.contains(buffer));
-                if !shared {
-                    return Err(Thrown("TypeError: Atomics.wait requires a SharedArrayBuffer".into()));
-                }
                 let cur = self.ta_element_get(ti, i);
                 let eq = if is_bigint {
                     self.to_bigint(a2)? == self.to_bigint(cur)?
@@ -471,9 +508,16 @@ impl<'p> Vm<'p> {
                 // Equal value would block; with no notifier this returns "timed-out".
                 return Ok(self.alloc_str(if eq { "timed-out" } else { "not-equal" }.to_string()));
             }
+            // notify(ta, index, count): ToIntegerOrInfinity(count) runs (so a Symbol /
+            // throwing valueOf is observed, after the index coercion) even though a
+            // single agent wakes 0 waiters. An immutable / non-shared buffer is fine.
+            if a2 != Value::UNDEFINED {
+                let _ = self.to_number_strict(a2)?;
+            }
             return Ok(Value::num(0.0));
         }
-        // load / store / read-modify-write.
+        // load / store / read-modify-write. (Immutable-buffer writes already threw in
+        // atomic_validate, before any coercion.)
         if is_bigint {
             let v_in = if op == "load" { 0 } else { self.to_bigint(a2)? };
             let cur = self.ta_element_get(ti, i);
