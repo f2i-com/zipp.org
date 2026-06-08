@@ -2176,6 +2176,64 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Object(map))))
     }
 
+    /// AddEntriesFromIterable using a collection's OBSERVABLE adder (Map/WeakMap
+    /// `set` for `pair`, Set/WeakSet `add` otherwise): the adder is read once and
+    /// called per entry, so a custom/overridden adder and its validation (e.g.
+    /// CanBeHeldWeakly for a WeakMap, which now accepts non-registered symbols) run,
+    /// and any abrupt closes the iterator keeping the original thrown value.
+    pub(crate) fn add_entries_via_adder(
+        &mut self,
+        coll: Value,
+        iterable: Value,
+        pair: bool,
+    ) -> Result<(), Thrown> {
+        let adder_name = if pair { "set" } else { "add" };
+        let adder = self.get_member(coll, adder_name, coll)?;
+        if !self.is_callable(adder) {
+            return Err(Thrown(format!("TypeError: {adder_name} is not a function")));
+        }
+        let _gc = self.gc_lock_guard();
+        let iter = self.get_iterator_object(iterable)?;
+        macro_rules! close_and_throw {
+            ($e:expr) => {{
+                let saved = self.pending_throw;
+                let _ = self.iterator_close(iter);
+                self.pending_throw = saved;
+                return Err($e);
+            }};
+        }
+        loop {
+            let entry = match self.iterator_step(iter)? {
+                Some(e) => e,
+                None => break,
+            };
+            if pair {
+                if !self.is_object_value(entry) {
+                    let msg = self.alloc_str("Iterator value is not an entry object".to_string());
+                    let te = self.make_error(1, Some(msg));
+                    self.pending_throw = Some(te);
+                    close_and_throw!(Thrown(
+                        "TypeError: Iterator value is not an entry object".into()
+                    ));
+                }
+                let k = match self.get_index(entry, Value::int(0)) {
+                    Ok(k) => k,
+                    Err(e) => close_and_throw!(e),
+                };
+                let v = match self.get_index(entry, Value::int(1)) {
+                    Ok(v) => v,
+                    Err(e) => close_and_throw!(e),
+                };
+                if let Err(e) = self.call_value(adder, coll, &[k, v]) {
+                    close_and_throw!(e);
+                }
+            } else if let Err(e) = self.call_value(adder, coll, &[entry]) {
+                close_and_throw!(e);
+            }
+        }
+        Ok(())
+    }
+
     /// IteratorClose 7.4.x. `strict` selects GetMethod semantics for the `return`
     /// method: when true (for-of/for-await break+normal, Iterator helpers), a
     /// PRESENT but non-callable `return` is a TypeError; when false (the eager

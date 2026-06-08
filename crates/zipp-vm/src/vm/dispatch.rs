@@ -1430,51 +1430,31 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::NewWeakMap { dst, src } => {
-                        let (mut keys, mut vals): (Vec<Value>, Vec<Value>) = (Vec::new(), Vec::new());
+                        // Build empty, then AddEntriesFromIterable via the observable
+                        // `set` adder (so non-registered symbol keys validate via
+                        // CanBeHeldWeakly, the adder is observably called, and an
+                        // abrupt closes the iterator).
+                        let wm = Value::heap(
+                            self.heap.alloc(HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() }),
+                        );
                         if let Some(s) = src {
                             let sv = self.get(base, s);
                             if !sv.is_nullish() {
-                                for e in self.iterate_to_vec(sv)? {
-                                    let k = self.get_index(e, Value::int(0))?;
-                                    let v = self.get_index(e, Value::int(1))?;
-                                    if !self.is_object_value(k) {
-                                        return Err(Thrown(
-                                            "TypeError: Invalid value used as weak map key".into(),
-                                        ));
-                                    }
-                                    match keys.iter().position(|kk| self.same_value_zero(*kk, k)) {
-                                        Some(i) => vals[i] = v,
-                                        None => {
-                                            keys.push(k);
-                                            vals.push(v);
-                                        }
-                                    }
-                                }
+                                self.add_entries_via_adder(wm, sv, true)?;
                             }
                         }
-                        let m = Value::heap(self.heap.alloc(HeapObj::WeakMap { keys, vals }));
-                        self.set(base, dst, m);
+                        self.set(base, dst, wm);
                         ip += 1;
                     }
                     Instr::NewWeakSet { dst, src } => {
-                        let mut items: Vec<Value> = Vec::new();
+                        let ws = Value::heap(self.heap.alloc(HeapObj::WeakSet(Vec::new())));
                         if let Some(s) = src {
                             let sv = self.get(base, s);
                             if !sv.is_nullish() {
-                                for e in self.iterate_to_vec(sv)? {
-                                    if !self.is_object_value(e) {
-                                        return Err(Thrown(
-                                            "TypeError: Invalid value used in weak set".into(),
-                                        ));
-                                    }
-                                    if !items.iter().any(|x| self.same_value_zero(*x, e)) {
-                                        items.push(e);
-                                    }
-                                }
+                                self.add_entries_via_adder(ws, sv, false)?;
                             }
                         }
-                        let s = Value::heap(self.heap.alloc(HeapObj::WeakSet(items)));
-                        self.set(base, dst, s);
+                        self.set(base, dst, ws);
                         ip += 1;
                     }
                     Instr::NewWeakRef { dst, target } => {
