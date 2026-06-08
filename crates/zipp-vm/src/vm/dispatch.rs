@@ -1604,15 +1604,23 @@ impl<'p> Vm<'p> {
                             }
                             G::Boolean => Value::bool(argc >= 1 && self.truthy(a0)),
                             G::ParseInt => {
-                                let s = self.display(a0);
+                                // ToString(string) FIRST (observable toString, abrupt),
+                                // then radix = ToInt32(ToNumber(radix)) (NaN/±Infinity
+                                // → 0 = default base).
+                                let s = self.to_js_string(a0)?;
                                 let radix = if argc >= 2 {
-                                    self.to_number(self.get(base, arg_base + 1))? as i32
+                                    let rv = self.get(base, arg_base + 1);
+                                    let r = self.to_number_coerce(rv)?;
+                                    if r.is_finite() { r as i64 as i32 } else { 0 }
                                 } else {
                                     0
                                 };
                                 Value::num(parse_int(&s, radix))
                             }
-                            G::ParseFloat => Value::num(parse_float(&self.display(a0))),
+                            G::ParseFloat => {
+                                let s = self.to_js_string(a0)?;
+                                Value::num(parse_float(&s))
+                            }
                             // isNaN/isFinite are `Number::isNaN/isFinite(? ToNumber(x))`:
                             // ToNumber coerces objects (@@toPrimitive/valueOf/toString)
                             // and propagates abrupt completions (a throwing valueOf, a

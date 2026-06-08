@@ -2134,11 +2134,22 @@ impl<'p> Vm<'p> {
             NUM_IS_SAFE_INTEGER => Value::bool(num_is_safe_integer(a0)),
             // Global functions as values.
             GLOBAL_PARSE_INT => {
-                let s = self.display(a0);
-                let radix = if args.len() >= 2 { self.to_number(a1)? as i32 } else { 0 };
+                // ToString(string) — observable (calls toString, not valueOf) and
+                // abrupt; then radix = ToInt32(ToNumber(radix)) (NaN/±Infinity → 0,
+                // i.e. the default base). ToString runs BEFORE the radix coercion.
+                let s = self.to_js_string(a0)?;
+                let radix = if args.len() >= 2 {
+                    let r = self.to_number_coerce(a1)?;
+                    if r.is_finite() { r as i64 as i32 } else { 0 }
+                } else {
+                    0
+                };
                 Value::num(parse_int(&s, radix))
             }
-            GLOBAL_PARSE_FLOAT => Value::num(parse_float(&self.display(a0))),
+            GLOBAL_PARSE_FLOAT => {
+                let s = self.to_js_string(a0)?;
+                Value::num(parse_float(&s))
+            }
             // URI codecs. The `extra`/`reserved` byte sets are the ASCII chars
             // kept verbatim beyond uriUnescaped (encode) / left percent-escaped
             // (decode). Malformed input → URIError.
