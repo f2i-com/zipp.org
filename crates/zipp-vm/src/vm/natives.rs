@@ -1397,6 +1397,20 @@ impl<'p> Vm<'p> {
                 if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
                     return Ok(Value::bool(b));
                 }
+                // TypedArray [[Set]] step ii: a canonical numeric index whose
+                // Receiver is NOT the typed array itself AND which is an out-of-bounds
+                // (invalid) integer index returns true WITHOUT coercing the value. The
+                // same-receiver case falls through to the element write below (which
+                // does coerce + re-check bounds, per TypedArraySetElement).
+                if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. }) {
+                    if let Some(i) = array_index(kv) {
+                        if !self.same_value(a0, receiver)
+                            && i >= self.ta_effective_len(a0.heap_index()).unwrap_or(0)
+                        {
+                            return Ok(Value::bool(true));
+                        }
+                    }
+                }
                 // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
                 // (target's own, then up the prototype chain). Only ordinary Object
                 // links carry inline descriptors here; a class-instance/exotic link

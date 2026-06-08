@@ -282,7 +282,10 @@ impl<'p> Vm<'p> {
                 o
             }
         } else {
-            let f = self.to_number(v)?;
+            // ToNumber(value) per SetTypedArrayElement: an object element runs
+            // valueOf/@@toPrimitive (which a test may use to resize/detach the buffer
+            // — re-checked below) and a Symbol/abrupt completion propagates.
+            let f = self.to_number_coerce(v)?;
             ta_encode(kind, f)
         };
         // Re-check bounds after coercion (a valueOf could have resized the buffer).
@@ -583,8 +586,10 @@ impl<'p> Vm<'p> {
             return Ok(ta);
         }
         // new TA(typedArray) / new TA(array | iterable | array-like) → copy
-        // element-by-element.
-        if a0.is_heap() && !a0.is_uninitialized() {
+        // element-by-element. Only an OBJECT first argument takes this path; a
+        // primitive (Symbol/BigInt/string/number) is a LENGTH argument →
+        // ToIndex (a Symbol/BigInt throws TypeError) below.
+        if self.is_object_value(a0) && !a0.is_uninitialized() {
             let src: Vec<Value> = if let Some(src_ta) = self.as_typed_array(a0) {
                 let len = match self.heap.get(src_ta) {
                     HeapObj::TypedArray { length, .. } => *length,
