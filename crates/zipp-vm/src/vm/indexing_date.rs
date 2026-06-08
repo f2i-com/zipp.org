@@ -416,15 +416,18 @@ impl<'p> Vm<'p> {
     /// is NaN, so side effects match spec). Returns `None` if any component is NaN.
     fn date_components(&mut self, args: &[Value]) -> Result<Option<[i64; 7]>, Thrown> {
         let mut comp = [0i64, 0, 1, 0, 0, 0, 0];
-        let mut any_nan = false;
+        let mut any_non_finite = false;
         for (i, &v) in args.iter().enumerate().take(7) {
             let n = self.to_number_coerce(v)?;
-            if n.is_nan() {
-                any_nan = true;
+            // MakeDay/MakeTime/MakeDate require every component to be finite — an
+            // Infinity / -Infinity / NaN field (e.g. `new Date(Infinity, 1, 70)`)
+            // makes the whole time value NaN (an Invalid Date), not a clamped 0.
+            if !n.is_finite() {
+                any_non_finite = true;
             }
             comp[i] = if n.is_finite() { n as i64 } else { 0 };
         }
-        Ok(if any_nan { None } else { Some(comp) })
+        Ok(if any_non_finite { None } else { Some(comp) })
     }
 
     /// `Date.UTC(year, month0, …)` → epoch ms (NaN with no args / a NaN field).
