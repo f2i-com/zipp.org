@@ -1479,9 +1479,14 @@ impl<'p> Vm<'p> {
                                 self.alloc_str(s)
                             }
                             1 => {
-                                // Number box: ToNumber(arg) (no arg -> +0).
+                                // Number box: ToNumber(arg) (no arg -> +0) — observable
+                                // (a user valueOf/toString runs) and abrupt; plain
+                                // `to_number` would return NaN for an object.
                                 let n = match arg {
-                                    Some(a) => self.to_number(self.get(base, a))?,
+                                    Some(a) => {
+                                        let v = self.get(base, a);
+                                        self.to_number_coerce(v)?
+                                    }
                                     None => 0.0,
                                 };
                                 Value::num(n)

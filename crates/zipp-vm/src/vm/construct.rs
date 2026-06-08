@@ -919,7 +919,9 @@ impl<'p> Vm<'p> {
                 return self.to_object(a0);
             }
             if p == self.num_proto && self.num_proto != 0 {
-                let n = if args.is_empty() { 0.0 } else { self.to_number(a0)? };
+                // ToNumber(value) — observable (a user valueOf/toString runs) and
+                // abrupt; `to_number` alone returns NaN for a plain object.
+                let n = if args.is_empty() { 0.0 } else { self.to_number_coerce(a0)? };
                 let r = Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 1, value: Value::num(n) }));
                 return Ok(self.set_ctor_proto(r, over));
             }
