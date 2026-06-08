@@ -1534,50 +1534,60 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                // Collect the PRESENT (non-hole) elements; holes are absent indices
-                // (SortIndexedProperties skips them) and re-appear as holes at the end,
-                // with the length preserved.
-                let (mut snapshot, total_len) = match self.heap.get(idx) {
+                let receiver = Value::heap(idx);
+                // Fast path: a plain dense array (no side table, no holes) — every
+                // index 0..len is an own present element, so the raw backing slice is
+                // observably identical to the [[Get]]/[[Set]] protocol. Keeps the hot
+                // path at snapshot speed.
+                let fast = match self.heap.get(idx) {
                     HeapObj::Array(items) => {
-                        let total = items.len();
-                        (items.iter().copied().filter(|v| !v.is_hole()).collect::<Vec<_>>(), total)
+                        !self.arr_props.contains_key(&idx) && items.iter().all(|v| !v.is_hole())
                     }
-                    _ => (Vec::new(), 0),
+                    _ => false,
                 };
-                if self.is_callable(cmp) {
-                    // Comparator sort: stable O(n log n) bottom-up merge sort,
-                    // re-entering the VM for each comparison.
-                    self.comparator_sort(&mut snapshot, cmp)?;
-                } else {
-                    // Default sort (no comparator): SortCompare coerces each element
-                    // with ToString (invoking a user toString/valueOf — a Symbol is a
-                    // TypeError) and compares by code units; `undefined` elements sort
-                    // to the end. Keys are precomputed because ToString may run JS,
-                    // which can't happen inside the sort comparator.
-                    let mut keyed: Vec<(Option<String>, Value)> =
-                        Vec::with_capacity(snapshot.len());
-                    for v in std::mem::take(&mut snapshot) {
-                        let key = if v == Value::UNDEFINED {
-                            None // undefined sorts last
-                        } else {
-                            Some(self.to_js_string(v)?)
-                        };
-                        keyed.push((key, v));
+                if fast {
+                    let mut snapshot = match self.heap.get(idx) {
+                        HeapObj::Array(items) => items.clone(),
+                        _ => Vec::new(),
+                    };
+                    self.sort_values(&mut snapshot, cmp)?;
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        *items = snapshot;
                     }
-                    keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
-                        (Some(a), Some(b)) => a.cmp(b),
-                        (None, None) => std::cmp::Ordering::Equal,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                    });
-                    snapshot = keyed.into_iter().map(|(_, v)| v).collect();
+                    return Ok(Some(receiver));
                 }
-                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                    items.clear();
-                    items.append(&mut snapshot);
-                    items.resize(total_len, Value::HOLE); // holes re-appended at the end
+                // SortIndexedProperties via the [[Get]]/[[Set]]/[[Delete]] protocol:
+                // own/inherited accessor INDICES fire their getters/setters, holes read
+                // their prototype value, and a getter that mutates the array mid-sort is
+                // observed. `len` is read ONCE up front (LengthOfArrayLike).
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len(),
+                    _ => {
+                        let lv = self.get_prop(receiver, "length")?;
+                        let n = self.to_number_coerce(lv)?;
+                        if n.is_nan() || n <= 0.0 {
+                            0
+                        } else {
+                            n.min((u32::MAX as f64) - 1.0) as usize
+                        }
+                    }
+                };
+                let mut gathered = Vec::new();
+                for i in 0..len {
+                    // array_iter_get = ? HasProperty(O,i) ? ? Get(O,i) : skip.
+                    if let Some(v) = self.array_iter_get(receiver, i)? {
+                        gathered.push(v);
+                    }
                 }
-                Ok(Some(Value::heap(idx)))
+                let item_count = gathered.len();
+                self.sort_values(&mut gathered, cmp)?;
+                for (j, v) in gathered.into_iter().enumerate() {
+                    self.set_index(receiver, Value::num(j as f64), v, true)?;
+                }
+                for j in item_count..len {
+                    self.delete_property(receiver, &j.to_string())?;
+                }
+                Ok(Some(receiver))
             }
             "reduceRight" => {
                 let cb = arg0;
@@ -1867,6 +1877,31 @@ impl<'p> Vm<'p> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// SortIndexedProperties' compare step over the gathered present values: the user
+    /// comparator if callable (a throwing compare propagates), else the default sort
+    /// (SortCompare): ToString each element by code units, `undefined` last. Default
+    /// keys are precomputed because ToString runs JS (which can't happen inside the
+    /// comparator).
+    fn sort_values(&mut self, items: &mut Vec<Value>, cmp: Value) -> Result<(), Thrown> {
+        if self.is_callable(cmp) {
+            self.comparator_sort(items, cmp)?;
+        } else {
+            let mut keyed: Vec<(Option<String>, Value)> = Vec::with_capacity(items.len());
+            for v in std::mem::take(items) {
+                let key = if v == Value::UNDEFINED { None } else { Some(self.to_js_string(v)?) };
+                keyed.push((key, v));
+            }
+            keyed.sort_by(|(ka, _), (kb, _)| match (ka, kb) {
+                (Some(a), Some(b)) => a.cmp(b),
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some(_), None) => std::cmp::Ordering::Less,
+            });
+            *items = keyed.into_iter().map(|(_, v)| v).collect();
+        }
+        Ok(())
     }
 
     /// Stable bottom-up merge sort driven by a JS comparator (`cmp(a,b) < 0` ⇒
