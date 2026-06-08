@@ -216,6 +216,9 @@ pub const ERROR_IS_ERROR: u16 = 890;
 // Array.fromAsync(asyncItems, mapfn?, thisArg?) (ES2024): a native stub that
 // delegates to a lazily-compiled JS polyfill (reuses for-await-of + await).
 pub const ARR_FROM_ASYNC: u16 = 891;
+// %AsyncIteratorPrototype%[@@asyncDispose] (ES2024): calls this.return() and
+// awaits it, resolving to undefined; delegates to a lazily-compiled JS polyfill.
+pub const ASYNC_ITER_DISPOSE: u16 = 892;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -933,6 +936,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         FR_UNREGISTER => ("unregister", 1),
         ITER_NEXT => ("next", 0),
         ITER_SELF => ("[Symbol.iterator]", 0),
+        ASYNC_ITER_DISPOSE => ("[Symbol.asyncDispose]", 0),
         ITER_MAP => ("map", 1),
         ITER_FILTER => ("filter", 1),
         ITER_TAKE => ("take", 1),

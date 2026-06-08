@@ -95,6 +95,26 @@ impl<'p> Vm<'p> {
         map.define("constructor", obj, nonenum);
         let p = self.heap.alloc(HeapObj::Object(map));
         self.prototypes.insert(idx, p);
+        // A generator / async-generator FUNCTION's `.prototype` object chains to
+        // %GeneratorPrototype% / %AsyncGeneratorPrototype% (whose own [[Prototype]]
+        // is %IteratorPrototype% / %AsyncIteratorPrototype%), so
+        // `getPrototypeOf(getPrototypeOf(g.prototype))` reaches the iterator root —
+        // matching the spec and unblocking the AsyncIteratorPrototype tests.
+        let fn_id = match self.heap.get(idx) {
+            HeapObj::Func(id) => Some(*id as usize),
+            HeapObj::Closure { func, .. } => Some(*func as usize),
+            _ => None,
+        };
+        if let Some(fid) = fn_id {
+            let fp = self.func(fid);
+            let (is_gen, is_async) = (fp.is_generator, fp.is_async);
+            if is_gen {
+                let gp = if is_async { self.asyncgen_proto } else { self.gen_proto };
+                if gp != 0 {
+                    self.proto_of.insert(p, Value::heap(gp));
+                }
+            }
+        }
         // Link the prototype chain to the parent's prototype (a parent class's
         // own prototype, or a built-in parent ctor's `.prototype`).
         if let Some(par) = parent {
@@ -623,7 +643,14 @@ impl<'p> Vm<'p> {
         // %AsyncGeneratorPrototype% (next/return/throw returning Promises +
         // @@toStringTag "AsyncGenerator"), chained appropriately. Async-generator
         // instances delegate here.
-        let async_iter_root = build(self, &[("@@asyncIterator", ITER_SELF)], None);
+        let async_iter_root = build(
+            self,
+            &[
+                ("@@asyncIterator", ITER_SELF),
+                ("@@asyncDispose", native::ASYNC_ITER_DISPOSE),
+            ],
+            None,
+        );
         self.proto_of.insert(async_iter_root, Value::heap(obj_proto));
         let asyncgen_proto = build(
             self,

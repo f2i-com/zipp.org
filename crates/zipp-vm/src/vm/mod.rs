@@ -415,6 +415,9 @@ pub struct Vm<'p> {
     /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
     /// the first `Array.fromAsync(...)` invocation.
     from_async_fn: Option<Value>,
+    /// The lazily-compiled `%AsyncIteratorPrototype%[@@asyncDispose]` JS polyfill
+    /// (an async function). Compiled on first call via `do_eval`, cached + GC-rooted.
+    async_dispose_fn: Option<Value>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).

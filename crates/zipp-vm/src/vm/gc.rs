@@ -131,6 +131,9 @@ impl Vm<'_> {
         if let Some(v) = self.from_async_fn {
             root_val!(v);
         }
+        if let Some(v) = self.async_dispose_fn {
+            root_val!(v);
+        }
         if let Some((v, _)) = self.pending_yield {
             root_val!(v);
         }

@@ -152,6 +152,7 @@ impl<'p> Vm<'p> {
             module_own: std::collections::HashMap::new(),
             closure_home: std::collections::HashMap::new(),
             from_async_fn: None,
+            async_dispose_fn: None,
             using_resources: std::collections::HashMap::new(),
             using_next_id: 0,
             disposablestack_ctor: 0,
@@ -934,6 +935,30 @@ impl<'p> Vm<'p> {
 })"#;
         let f = self.do_eval(SRC, false, false, None)?;
         self.from_async_fn = Some(f);
+        Ok(f)
+    }
+
+    /// `%AsyncIteratorPrototype%[@@asyncDispose]`, as a lazily-compiled JS polyfill
+    /// (an async function). Reads `this.return`; if nullish, resolves to undefined;
+    /// a present non-callable `return` rejects with a TypeError; otherwise calls it
+    /// and awaits the result (so a rejected result rejects), resolving to undefined.
+    /// Compiled once via `do_eval`, cached + GC-rooted; called with `this` = the
+    /// iterator and returns a Promise.
+    pub(crate) fn async_dispose_polyfill(&mut self) -> Result<Value, Thrown> {
+        if let Some(f) = self.async_dispose_fn {
+            return Ok(f);
+        }
+        const SRC: &str = r#"(async function() {
+  var O = this;
+  var ret = O.return;
+  if (ret === undefined || ret === null) return undefined;
+  if (typeof ret !== 'function')
+    throw new TypeError('the iterator [Symbol.iterator] return method is not callable');
+  await ret.call(O);
+  return undefined;
+})"#;
+        let f = self.do_eval(SRC, false, false, None)?;
+        self.async_dispose_fn = Some(f);
         Ok(f)
     }
 

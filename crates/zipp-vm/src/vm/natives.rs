@@ -948,6 +948,13 @@ impl<'p> Vm<'p> {
                 let f = self.from_async_polyfill()?;
                 self.call_value(f, this, args)?
             }
+            ASYNC_ITER_DISPOSE => {
+                // %AsyncIteratorPrototype%[@@asyncDispose]: delegate to a lazily-
+                // compiled JS polyfill, invoked with `this` = the iterator. Returns
+                // a Promise that calls+awaits this.return() and resolves undefined.
+                let f = self.async_dispose_polyfill()?;
+                self.call_value(f, this, args)?
+            }
             ARR_OF => {
                 // Array.of(...items): A = IsConstructor(this) ? Construct(this,«len»)
                 // : ArrayCreate(len); then CreateDataPropertyOrThrow each item. The
