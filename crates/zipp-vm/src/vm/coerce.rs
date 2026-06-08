@@ -842,7 +842,6 @@ impl<'p> Vm<'p> {
         if matches!(
             self.heap.get(v.heap_index()),
             HeapObj::Date(_)
-                | HeapObj::Boxed { .. }
                 | HeapObj::Symbol { .. }
                 | HeapObj::BigInt(_)
                 | HeapObj::Str(_)
@@ -850,6 +849,8 @@ impl<'p> Vm<'p> {
         ) {
             return self.to_number(v);
         }
+        // A boxed wrapper (and any ordinary object) ToPrimitive(number) first, so an
+        // overridden valueOf/toString fires; a plain wrapper still yields its [[xData]].
         let prim = self.to_primitive_number(v)?;
         self.to_number(prim)
     }
@@ -930,12 +931,10 @@ impl<'p> Vm<'p> {
     /// ToPrimitive(v, "number"): the `@@toPrimitive` hook, else OrdinaryToPrimitive
     /// (`valueOf` then `toString`, first primitive wins; TypeError if neither does).
     pub(crate) fn to_primitive_number(&mut self, v: Value) -> Result<Value, Thrown> {
-        // A boxed primitive wrapper yields its wrapped primitive directly.
-        if v.is_heap() {
-            if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
-                return Ok(*value);
-            }
-        }
+        // A boxed primitive wrapper runs OrdinaryToPrimitive (valueOf/toString) like
+        // any object: a PLAIN wrapper's built-in valueOf returns its [[xData]], but an
+        // OVERRIDDEN valueOf/toString/@@toPrimitive must be honoured (`+new Number(1)`
+        // with a custom valueOf).
         if let Some(p) = self.symbol_to_primitive(v, "number")? {
             return Ok(p);
         }
@@ -970,11 +969,10 @@ impl<'p> Vm<'p> {
         ) {
             return Ok(v);
         }
-        // A boxed primitive wrapper (String/Number/Boolean/Symbol/BigInt) yields
-        // its wrapped primitive — the built-in valueOf would return the same.
-        if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
-            return Ok(*value);
-        }
+        // A boxed primitive wrapper runs OrdinaryToPrimitive (valueOf/toString) — a
+        // plain wrapper's built-in valueOf returns its [[xData]], but an overridden
+        // valueOf/toString/@@toPrimitive is honoured (`new Number(1) + 0` with a
+        // custom valueOf, `==` on a wrapper, …).
         if let Some(p) = self.symbol_to_primitive(v, "default")? {
             return Ok(p);
         }
