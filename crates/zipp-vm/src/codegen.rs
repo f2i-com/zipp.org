@@ -1819,6 +1819,9 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::Move { .. }
             | Instr::LoadGlobal { .. }
             | Instr::StoreGlobal { .. }
+            // A `let`/`const` global write (TDZ-checked); inside a hot loop region the
+            // binding is already initialized, so the JIT treats it like StoreGlobal.
+            | Instr::StoreGlobalStrict { .. }
             | Instr::Add { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
@@ -1945,7 +1948,7 @@ fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Option<(usize, u
                 }
                 g = Some(idx);
             }
-            Instr::StoreGlobal { idx, .. } => {
+            Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } => {
                 if Some(idx) == g {
                     return None; // g mutated in the loop
                 }
@@ -2259,7 +2262,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
                     glob_order.push(idx);
                 }
             }
-            Instr::StoreGlobal { idx, .. } => {
+            Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } => {
                 glob_first_read.entry(idx).or_insert(false);
                 if !glob_order.contains(&idx) {
                     glob_order.push(idx);
@@ -2513,7 +2516,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
 fn instr_uses(i: &Instr) -> Vec<u16> {
     match *i {
         Instr::Move { src, .. } => vec![src],
-        Instr::StoreGlobal { src, .. } => vec![src],
+        Instr::StoreGlobal { src, .. } | Instr::StoreGlobalStrict { src, .. } => vec![src],
         Instr::AddInt { a, .. } | Instr::Neg { a, .. } => vec![a],
         Instr::Add { a, b, .. }
         | Instr::Sub { a, b, .. }
@@ -2628,7 +2631,7 @@ fn plan_field_promotion(proto: &FuncProto, start: u32, end: u32) -> Option<Field
     // The object ref must be stable (G not re-stored) and its ref reg must not
     // escape (used only as the GetProp/SetProp receiver, nowhere else).
     for instr in &code[s..=e] {
-        if let Instr::StoreGlobal { idx, .. } = *instr {
+        if let Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } = *instr {
             if idx == g {
                 return None;
             }
@@ -2757,7 +2760,7 @@ fn compile_region_regalloc(
                 let g = plan.glob_home[&idx];
                 dynasm!(ops ; movsd Rx(d), Rx(g));
             }
-            Instr::StoreGlobal { idx, src } => {
+            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
                 let g = plan.glob_home[&idx];
                 let srx = xh(&plan, src);
                 dynasm!(ops ; movsd Rx(g), Rx(srx));
@@ -2890,6 +2893,9 @@ fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::Move { .. }
             | Instr::LoadGlobal { .. }
             | Instr::StoreGlobal { .. }
+            // `let`/`const` global write: inside a hot loop region the binding is
+            // already initialized, so it's treated like StoreGlobal.
+            | Instr::StoreGlobalStrict { .. }
             | Instr::Add { .. }
             | Instr::Sub { .. }
             | Instr::Mul { .. }
@@ -3032,7 +3038,7 @@ fn compile_region_int(
                 let g = plan.glob_home[&idx];
                 dynasm!(ops ; movdqa Rx(d), Rx(g));
             }
-            Instr::StoreGlobal { idx, src } => {
+            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
                 let g = plan.glob_home[&idx];
                 let srx = xh(&plan, src);
                 dynasm!(ops ; movdqa Rx(g), Rx(srx));
@@ -3556,7 +3562,7 @@ fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
-            Instr::StoreGlobal { idx, src } => {
+            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
                 dynasm!(ops
                     ; mov rax, [rbx + dreg(src)]
                     ; mov [r12 + (idx as i32) * 8], rax
