@@ -133,14 +133,16 @@ impl<'p> Vm<'p> {
         Ok(list.into_iter().next().unwrap_or_else(|| "en".to_string()))
     }
 
-    /// Read a string option (returns `default` if undefined); validates against
-    /// `allowed` when non-empty (→ RangeError).
-    pub(crate) fn opt_string(
+    /// Read + ToString-cast a string option (returns `default` if undefined),
+    /// WITHOUT any allowed-list validation. The Temporal GetDifferenceSettings
+    /// order-of-operations reads (and casts) every option before validating any,
+    /// so callers that must defer the disallowed-value RangeError read with this
+    /// and validate afterward (`unit_allowed`).
+    pub(crate) fn opt_string_raw(
         &mut self,
         options: Value,
         key: &str,
         default: &str,
-        allowed: &[&str],
     ) -> Result<String, Thrown> {
         if options == Value::UNDEFINED {
             return Ok(default.to_string());
@@ -149,10 +151,29 @@ impl<'p> Vm<'p> {
         if v == Value::UNDEFINED {
             return Ok(default.to_string());
         }
-        let s = self.to_js_string(v)?;
-        if !allowed.is_empty() && !allowed.contains(&s.as_str()) {
+        self.to_js_string(v)
+    }
+
+    /// RangeError if `s` is not in `allowed` (when non-empty) — the deferred
+    /// validation half of `opt_string_raw`.
+    pub(crate) fn unit_allowed(&self, s: &str, key: &str, allowed: &[&str]) -> Result<(), Thrown> {
+        if !allowed.is_empty() && !allowed.contains(&s) {
             return Err(Thrown(format!("RangeError: Value {s} out of range for option {key}")));
         }
+        Ok(())
+    }
+
+    /// Read a string option (returns `default` if undefined); validates against
+    /// `allowed` when non-empty (→ RangeError) — read and validate in one step.
+    pub(crate) fn opt_string(
+        &mut self,
+        options: Value,
+        key: &str,
+        default: &str,
+        allowed: &[&str],
+    ) -> Result<String, Thrown> {
+        let s = self.opt_string_raw(options, key, default)?;
+        self.unit_allowed(&s, key, allowed)?;
         Ok(s)
     }
 
@@ -269,13 +290,15 @@ impl<'p> Vm<'p> {
         // GetDifferenceSettings reads the options in this exact order: largestUnit,
         // roundingIncrement, roundingMode, then smallestUnit — and only AFTER all four
         // are read does it resolve an "auto" largestUnit and run the range validations.
-        let lu_raw = self.opt_string(options, "largestUnit", "auto", &largest_allowed)?;
+        // Read+cast all four with no validation, THEN validate the unit lists — so a
+        // disallowed largestUnit does not throw before smallestUnit is even read.
+        let lu_raw = self.opt_string_raw(options, "largestUnit", "auto")?;
         let inc = self.read_rounding_increment(options)?;
         let mode = self.read_rounding_mode(options, "trunc")?;
-        let su = normalize_unit(
-            &self.opt_string(options, "smallestUnit", "nanosecond", small_allowed)?,
-            "nanosecond",
-        );
+        let su_raw = self.opt_string_raw(options, "smallestUnit", "nanosecond")?;
+        self.unit_allowed(&lu_raw, "largestUnit", &largest_allowed)?;
+        self.unit_allowed(&su_raw, "smallestUnit", small_allowed)?;
+        let su = normalize_unit(&su_raw, "nanosecond");
         // An "auto"/absent largestUnit resolves to LargerOfTwoTemporalUnits(default,
         // smallestUnit) — the lower rank — so e.g. smallestUnit "hour" yields
         // largestUnit "hour" instead of wrongly defaulting to the (smaller) default.

@@ -851,12 +851,18 @@ impl<'p> Vm<'p> {
                 let date_units = &[
                     "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
                 ];
-                // GetDifferenceSettings: smallestUnit (default "day"), largestUnit
-                // (default "auto" → the larger of smallestUnit and "day").
-                let smallest =
-                    normalize_unit(&self.opt_string(opts, "smallestUnit", "day", date_units)?, "day");
-                let largest_raw =
-                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", date_units)?, "auto");
+                // GetDifferenceSettings order-of-operations: read (and cast) all
+                // options first — largestUnit, roundingIncrement, roundingMode,
+                // smallestUnit — and only THEN validate. smallestUnit defaults to
+                // "day", largestUnit to "auto" (→ the larger of smallestUnit/"day").
+                let largest_str = self.opt_string_raw(opts, "largestUnit", "auto")?;
+                let inc = self.read_rounding_increment(opts)?;
+                let mode = self.read_rounding_mode(opts, "trunc")?;
+                let smallest_str = self.opt_string_raw(opts, "smallestUnit", "day")?;
+                self.unit_allowed(&largest_str, "largestUnit", date_units)?;
+                self.unit_allowed(&smallest_str, "smallestUnit", date_units)?;
+                let smallest = normalize_unit(&smallest_str, "day");
+                let largest_raw = normalize_unit(&largest_str, "auto");
                 let order = ["year", "month", "week", "day"];
                 let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(3);
                 let largest = if largest_raw == "auto" {
@@ -869,8 +875,6 @@ impl<'p> Vm<'p> {
                         "RangeError: smallestUnit is larger than largestUnit".into(),
                     ));
                 }
-                let inc = self.read_rounding_increment(opts)?;
-                let mode = self.read_rounding_mode(opts, "trunc")?;
                 // since = negate(until): always compute the forward (this → other)
                 // difference with a sign-negated rounding mode, then negate the result.
                 // (Swapping operands for `since` would anchor the day-of-month borrow on
@@ -1521,14 +1525,18 @@ impl<'p> Vm<'p> {
                     "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
                     "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
                 ];
-                // smallestUnit default "nanosecond"; largestUnit default "auto" →
-                // the larger of smallestUnit and "day".
-                let smallest = normalize_unit(
-                    &self.opt_string(opts, "smallestUnit", "nanosecond", all_units)?,
-                    "nanosecond",
-                );
-                let largest_raw =
-                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", all_units)?, "auto");
+                // GetDifferenceSettings order-of-operations: read+cast all options
+                // (largestUnit, roundingIncrement, roundingMode, smallestUnit) before
+                // validating. smallestUnit default "nanosecond"; largestUnit default
+                // "auto" → the larger of smallestUnit and "day".
+                let largest_str = self.opt_string_raw(opts, "largestUnit", "auto")?;
+                let inc = self.read_rounding_increment(opts)?;
+                let mode = self.read_rounding_mode(opts, "trunc")?;
+                let smallest_str = self.opt_string_raw(opts, "smallestUnit", "nanosecond")?;
+                self.unit_allowed(&largest_str, "largestUnit", all_units)?;
+                self.unit_allowed(&smallest_str, "smallestUnit", all_units)?;
+                let smallest = normalize_unit(&smallest_str, "nanosecond");
+                let largest_raw = normalize_unit(&largest_str, "auto");
                 let order = [
                     "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
                     "microsecond", "nanosecond",
@@ -1544,8 +1552,6 @@ impl<'p> Vm<'p> {
                         "RangeError: smallestUnit is larger than largestUnit".into(),
                     ));
                 }
-                let inc = self.read_rounding_increment(opts)?;
-                let mode = self.read_rounding_mode(opts, "trunc")?;
                 // A time-unit increment must evenly divide its next-highest unit
                 // (day/week/month/year carry no per-unit bound here).
                 if let Some(max) = max_increment(&smallest) {
@@ -2926,11 +2932,17 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: options must be an object or undefined".into()));
                 }
                 let ym_units = &["auto", "year", "years", "month", "months"];
-                // smallestUnit default "month"; largestUnit default "auto" → "year".
-                let smallest =
-                    normalize_unit(&self.opt_string(opts, "smallestUnit", "month", ym_units)?, "month");
-                let largest_raw =
-                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", ym_units)?, "auto");
+                // GetDifferenceSettings order: read+cast largestUnit, roundingIncrement,
+                // roundingMode, smallestUnit before validating. smallestUnit default
+                // "month"; largestUnit default "auto" → "year".
+                let largest_str = self.opt_string_raw(opts, "largestUnit", "auto")?;
+                let inc = self.read_rounding_increment(opts)?;
+                let mode = self.read_rounding_mode(opts, "trunc")?;
+                let smallest_str = self.opt_string_raw(opts, "smallestUnit", "month")?;
+                self.unit_allowed(&largest_str, "largestUnit", ym_units)?;
+                self.unit_allowed(&smallest_str, "smallestUnit", ym_units)?;
+                let smallest = normalize_unit(&smallest_str, "month");
+                let largest_raw = normalize_unit(&largest_str, "auto");
                 let largest = if largest_raw == "auto" { "year".to_string() } else { largest_raw };
                 let rank = |u: &str| if u == "year" { 0 } else { 1 };
                 if rank(&smallest) < rank(&largest) {
@@ -2938,8 +2950,6 @@ impl<'p> Vm<'p> {
                         "RangeError: smallestUnit is larger than largestUnit".into(),
                     ));
                 }
-                let inc = self.read_rounding_increment(opts)?;
-                let mode = self.read_rounding_mode(opts, "trunc")?;
                 let from = y * 12 + (m - 1);
                 let to = o.0 * 12 + (o.1 - 1);
                 let total_months = if name == "until" { to - from } else { from - to };
