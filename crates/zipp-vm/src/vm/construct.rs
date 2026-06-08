@@ -589,9 +589,12 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
         }
-        // A constructor from a `$262.createRealm()` realm.
+        // A constructor from a `$262.createRealm()` realm. A realm-TAGGED Proxy
+        // (built by `new otherRealm.Proxy(t, h)`, which tags the instance with the
+        // realm) is still a Proxy: its [[Construct]] must run the construct trap
+        // below, not this generic realm-ctor path — so exclude proxies here.
         let cr = self.get_function_realm(cv);
-        if cr != 0 {
+        if cr != 0 && self.proxy_parts(cv.heap_index()).is_none() {
             // If we know the MAIN-realm constructor it mirrors, build a REAL instance
             // by delegating to it with `cv` as newTarget (so the instance's
             // [[Prototype]] is the realm's `X.prototype`), then tag it with the realm.
