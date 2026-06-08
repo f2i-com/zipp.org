@@ -3341,10 +3341,43 @@ impl<'a> FnCompiler<'a> {
 
     fn for_stmt(&mut self, f: &ox::ForStatement) -> R<()> {
         self.push_scope();
+        // `for (using x = r; …) body` / `for (await using …)`: the resource is
+        // LOOP-scoped (disposed ONCE when the for-statement completes, normal or
+        // abrupt), unlike for-of which disposes per-iteration. Open a scope + a
+        // finally wrapping the whole loop; the `using` init registers x into it.
+        let using_async: Option<bool> = match &f.init {
+            Some(ox::ForStatementInit::VariableDeclaration(d)) => match d.kind {
+                ox::VariableDeclarationKind::Using => Some(false),
+                ox::VariableDeclarationKind::AwaitUsing => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        let using_ctx = if let Some(is_async) = using_async {
+            let sreg = self.declare_local("<for.uscope>");
+            let kreg = self.declare_local("<for.ukind>");
+            let vreg = self.declare_local("<for.uval>");
+            self.emit(Instr::OpenUsingScope { dst: sreg });
+            let push_at = self.here();
+            self.emit(Instr::PushFinally { target: 0, kind_reg: kreg, val_reg: vreg });
+            self.handler_depth += 1;
+            Some((is_async, sreg, kreg, vreg, push_at))
+        } else {
+            None
+        };
         // init
         if let Some(init) = &f.init {
             match init {
-                ox::ForStatementInit::VariableDeclaration(d) => self.var_decl(d)?,
+                ox::ForStatementInit::VariableDeclaration(d) => {
+                    // While compiling the `using` init, route its RegisterDisposable
+                    // to the loop scope (restored after, so a using-block in the body
+                    // uses its own scope).
+                    let prev = using_ctx.map(|(_, s, _, _, _)| self.using_scope_reg.replace(s));
+                    self.var_decl(d)?;
+                    if let Some(p) = prev {
+                        self.using_scope_reg = p;
+                    }
+                }
                 other => {
                     let e = other
                         .as_expression()
@@ -3398,6 +3431,27 @@ impl<'a> FnCompiler<'a> {
         }
         for b in ctx.break_jumps {
             self.patch_jump(b, end);
+        }
+        // Loop-scoped `using` disposal: the normal exit (test false) and `break`
+        // land at `end` and run DisposeScope once; a throw/return out of the body
+        // routes through the finally handler. (break/continue are plain jumps —
+        // loop_ctx's floor is the handler depth INCLUDING this finally.)
+        if let Some((is_async, sreg, kreg, vreg, push_at)) = using_ctx {
+            self.emit_leave_finally_normal(kreg);
+            self.handler_depth -= 1;
+            let jto = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            let fin = self.here();
+            if let Instr::PushFinally { target, .. } = &mut self.code[push_at as usize] {
+                *target = fin;
+            }
+            self.patch_jump(jto, fin);
+            if is_async {
+                self.emit_async_dispose_loop(sreg, kreg, vreg);
+            } else {
+                self.emit(Instr::DisposeScope { scope: sreg, kind_reg: kreg, val_reg: vreg });
+            }
+            self.emit(Instr::EndFinally { kind_reg: kreg, val_reg: vreg });
         }
         self.pop_scope();
         Ok(())
