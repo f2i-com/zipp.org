@@ -151,6 +151,7 @@ impl<'p> Vm<'p> {
             module_namespaces: std::collections::HashMap::new(),
             module_own: std::collections::HashMap::new(),
             closure_home: std::collections::HashMap::new(),
+            from_async_fn: None,
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),
@@ -883,6 +884,55 @@ impl<'p> Vm<'p> {
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
         self.run_eval_program(eval_prog, this_override, false).map(|(v, _)| v)
+    }
+
+    /// The `Array.fromAsync` implementation, as a lazily-compiled JS polyfill
+    /// (an async function value). Spec behaviour expressed in JS so it reuses the
+    /// engine's `for await`/`await` machinery; compiled once via `do_eval`, then
+    /// cached + GC-rooted. Called with `this` = the receiver constructor C; returns
+    /// a Promise the top-level microtask drain progresses.
+    pub(crate) fn from_async_polyfill(&mut self) -> Result<Value, Thrown> {
+        if let Some(f) = self.from_async_fn {
+            return Ok(f);
+        }
+        const SRC: &str = r#"(async function fromAsync(items, mapfn, thisArg) {
+  var C = this;
+  if (items === undefined || items === null)
+    throw new TypeError('Array.fromAsync requires an array-like or iterable object');
+  if (mapfn !== undefined && typeof mapfn !== 'function')
+    throw new TypeError('Array.fromAsync mapper is not a function');
+  var usingAsync = items[Symbol.asyncIterator];
+  var usingSync = (usingAsync === undefined || usingAsync === null) ? items[Symbol.iterator] : undefined;
+  if ((usingAsync !== undefined && usingAsync !== null) || (usingSync !== undefined && usingSync !== null)) {
+    var A = (typeof C === 'function') ? new C() : [];
+    var k = 0;
+    for await (var v of items) {
+      if (k >= 9007199254740991) throw new TypeError('Array.fromAsync result exceeds the maximum length');
+      var mapped = (mapfn !== undefined) ? await mapfn.call(thisArg, v, k) : v;
+      Object.defineProperty(A, k, { value: mapped, writable: true, enumerable: true, configurable: true });
+      k = k + 1;
+    }
+    A.length = k;
+    return A;
+  } else {
+    var arrayLike = Object(items);
+    var ln = Number(arrayLike.length);
+    var len = Number.isNaN(ln) ? 0 : Math.max(0, Math.min(Math.trunc(ln), 9007199254740991));
+    var A = (typeof C === 'function') ? new C(len) : new Array(len);
+    var k = 0;
+    while (k < len) {
+      var kValue = await arrayLike[k];
+      var mapped = (mapfn !== undefined) ? await mapfn.call(thisArg, kValue, k) : kValue;
+      Object.defineProperty(A, k, { value: mapped, writable: true, enumerable: true, configurable: true });
+      k = k + 1;
+    }
+    A.length = len;
+    return A;
+  }
+})"#;
+        let f = self.do_eval(SRC, false, false, None)?;
+        self.from_async_fn = Some(f);
+        Ok(f)
     }
 
     /// Recursively load + LINK a MODULE file for a dynamic `import()`, returning its

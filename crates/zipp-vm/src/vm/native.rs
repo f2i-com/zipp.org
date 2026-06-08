@@ -213,6 +213,9 @@ pub const REGEXP_LEGACY_GET: u16 = 888;
 pub const REGEXP_LEGACY_SET: u16 = 889;
 // Error.isError(arg) (ES2024): true iff arg has the [[ErrorData]] internal slot.
 pub const ERROR_IS_ERROR: u16 = 890;
+// Array.fromAsync(asyncItems, mapfn?, thisArg?) (ES2024): a native stub that
+// delegates to a lazily-compiled JS polyfill (reuses for-await-of + await).
+pub const ARR_FROM_ASYNC: u16 = 891;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -865,6 +868,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         PROXY_REVOCABLE => ("revocable", 2),
         ARR_IS_ARRAY => ("isArray", 1),
         ARR_FROM => ("from", 1),
+        ARR_FROM_ASYNC => ("fromAsync", 1),
         ARR_OF => ("of", 0),
         ARR_JOIN => ("join", 1),
         ARR_PUSH => ("push", 1),

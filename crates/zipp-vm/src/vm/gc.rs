@@ -128,6 +128,9 @@ impl Vm<'_> {
         for v in self.closure_home.values() {
             root_val!(*v);
         }
+        if let Some(v) = self.from_async_fn {
+            root_val!(v);
+        }
         if let Some((v, _)) = self.pending_yield {
             root_val!(v);
         }

@@ -941,6 +941,13 @@ impl<'p> Vm<'p> {
             }
             ARR_IS_ARRAY => Value::bool(self.value_is_array(a0)),
             ARR_FROM => self.array_from(this, a0, a1, args.get(2).copied().unwrap_or(Value::UNDEFINED))?,
+            ARR_FROM_ASYNC => {
+                // Delegate to a lazily-compiled JS polyfill (an async function),
+                // invoked with `this` = the receiver constructor C. It returns a
+                // Promise; the top-level microtask drain progresses it.
+                let f = self.from_async_polyfill()?;
+                self.call_value(f, this, args)?
+            }
             ARR_OF => {
                 // Array.of(...items): A = IsConstructor(this) ? Construct(this,«len»)
                 // : ArrayCreate(len); then CreateDataPropertyOrThrow each item. The

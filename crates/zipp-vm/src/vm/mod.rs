@@ -411,6 +411,10 @@ pub struct Vm<'p> {
     /// methods use the compile-time `home_class_id` path instead. Values are GC roots;
     /// dead closure keys are pruned on sweep.
     closure_home: std::collections::HashMap<u32, Value>,
+    /// The lazily-compiled `Array.fromAsync` JS polyfill (an async function value).
+    /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
+    /// the first `Array.fromAsync(...)` invocation.
+    from_async_fn: Option<Value>,
     /// `DisposableStack` ctor + prototype. An instance is a plain Object linked to
     /// `disposablestack_proto`; its disposer stack + disposed flag live in
     /// `dispose_stacks` (the disposers are zero-arg callable thunks, GC-traced).
