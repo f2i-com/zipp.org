@@ -394,6 +394,10 @@ pub struct Vm<'p> {
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep.
     error_data: std::collections::HashSet<u32>,
+    /// Heap indices of `arguments` exotic objects (they are Array-backed but carry a
+    /// [[ParameterMap]]), so `Object.prototype.toString` tags them `[object
+    /// Arguments]` rather than `[object Array]`. Pruned on GC sweep.
+    arguments_objs: std::collections::HashSet<u32>,
     /// Directory the running script was loaded from, used to resolve a dynamic
     /// `import(specifier)` against the filesystem (relative + bare specifiers).
     /// `None` when running from a string (eval/embedding) — then `import()` has no

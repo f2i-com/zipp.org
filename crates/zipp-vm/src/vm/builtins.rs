@@ -217,6 +217,9 @@ impl<'p> Vm<'p> {
         let builtin = if this.is_heap() {
             match self.heap.get(this.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "String",
+                // An `arguments` exotic ([[ParameterMap]]) tags "Arguments" even
+                // though it is Array-backed internally.
+                HeapObj::Array(_) if self.arguments_objs.contains(&this.heap_index()) => "Arguments",
                 HeapObj::Array(_) => "Array",
                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) | HeapObj::Bound { .. } => {
                     "Function"

@@ -146,6 +146,7 @@ impl<'p> Vm<'p> {
             shared_buffers: std::collections::HashSet::new(),
             immutable_buffers: std::collections::HashSet::new(),
             error_data: std::collections::HashSet::new(),
+            arguments_objs: std::collections::HashSet::new(),
             module_base_dir: None,
             module_cache: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),

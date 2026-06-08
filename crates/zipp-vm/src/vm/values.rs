@@ -502,6 +502,7 @@ impl<'p> Vm<'p> {
             Value::UNDEFINED
         };
         let idx = self.heap.alloc(HeapObj::Array(args));
+        self.arguments_objs.insert(idx); // [[ParameterMap]] marker (toString tag)
         if obj_proto != 0 {
             self.proto_of.insert(idx, Value::heap(obj_proto));
         }
