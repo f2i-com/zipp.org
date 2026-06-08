@@ -2876,7 +2876,16 @@ impl<'p> Vm<'p> {
         }
         if let HeapObj::DataView { buffer, byte_offset, byte_length } = self.heap.get(obj.heap_index()) {
             let (buffer, byte_offset, byte_length) = (*buffer, *byte_offset, *byte_length);
+            // byteLength / byteOffset throw a TypeError when the viewed buffer is
+            // detached (IsViewOutOfBounds); `buffer` itself is still readable.
+            let detached =
+                matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. });
             return Ok(match key {
+                "byteLength" | "byteOffset" if detached => {
+                    return Err(Thrown(format!(
+                        "TypeError: get DataView.prototype.{key}: the viewed buffer is detached"
+                    )))
+                }
                 "byteLength" => Value::num(byte_length as f64),
                 "byteOffset" => Value::num(byte_offset as f64),
                 "buffer" => Value::heap(buffer),
