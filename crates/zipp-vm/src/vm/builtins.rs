@@ -236,7 +236,14 @@ impl<'p> Vm<'p> {
                 _ if self.str_proto != 0 && this.heap_index() == self.str_proto => "String",
                 _ if self.bool_proto != 0 && this.heap_index() == self.bool_proto => "Boolean",
                 _ if self.arr_proto != 0 && this.heap_index() == self.arr_proto => "Array",
-                _ if self.error_name(this.heap_index()).is_some() => "Error",
+                // [[ErrorData]] ⇒ "Error". An error INSTANCE carries an own
+                // error-name; the Error/NativeError PROTOTYPES also have a `name`
+                // property but NO [[ErrorData]], so exclude them (they tag "Object").
+                _ if self.error_name(this.heap_index()).is_some()
+                    && !self.error_protos.contains(&this.heap_index()) =>
+                {
+                    "Error"
+                }
                 _ if callable => "Function",
                 _ => "Object",
             }
