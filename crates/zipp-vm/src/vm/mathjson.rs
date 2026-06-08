@@ -159,35 +159,52 @@ impl<'p> Vm<'p> {
         if self.is_callable(replacer) {
             return Ok((replacer, None));
         }
+        // IsArray on a revoked Proxy is a TypeError (value_is_array approximates it
+        // as false, so check explicitly before the PropertyList branch).
         if replacer.is_heap() {
-            let idx = replacer.heap_index();
-            if let HeapObj::Array(items) = self.heap.get(idx) {
-                let items = items.clone();
-                let mut list: Vec<String> = Vec::new();
-                for it in items {
-                    let key = if it.is_number() {
-                        Some(self.to_js_string(it)?)
-                    } else if it.is_heap() {
-                        match self.heap.get(it.heap_index()) {
-                            HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                                self.heap.str_cow(it.heap_index()).map(|s| s.into_owned())
-                            }
-                            HeapObj::Boxed { kind, .. } if *kind == 0 || *kind == 1 => {
-                                Some(self.to_js_string(it)?)
-                            }
-                            _ => None,
+            if let HeapObj::Proxy { revoked: true, .. } = self.heap.get(replacer.heap_index()) {
+                return Err(Thrown("TypeError: Cannot perform IsArray on a revoked Proxy".into()));
+            }
+        }
+        // An array (or Proxy-wrapping-array) replacer is a PropertyList: read its
+        // length + each element via REAL [[Get]] (a revoked/throwing proxy throws),
+        // keeping only string / number / (String|Number)-object items, deduped, in
+        // order. A non-array object replacer is ignored (no filter).
+        if replacer.is_heap() && self.value_is_array(replacer) {
+            let lenv = self.get_prop(replacer, "length")?;
+            let lenf = self.to_number_coerce(lenv)?;
+            let len: u64 = if lenf.is_nan() || lenf <= 0.0 {
+                0
+            } else {
+                lenf.min(9007199254740991.0) as u64
+            };
+            let mut list: Vec<String> = Vec::new();
+            let mut k: u64 = 0;
+            while k < len {
+                let it = self.get_index(replacer, Value::num(k as f64))?;
+                let item = if it.is_number() {
+                    Some(self.to_js_string(it)?)
+                } else if it.is_heap() {
+                    match self.heap.get(it.heap_index()) {
+                        HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                            self.heap.str_cow(it.heap_index()).map(|s| s.into_owned())
                         }
-                    } else {
-                        None
-                    };
-                    if let Some(k) = key {
-                        if !list.contains(&k) {
-                            list.push(k);
+                        HeapObj::Boxed { kind, .. } if *kind == 0 || *kind == 1 => {
+                            Some(self.to_js_string(it)?)
                         }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(s) = item {
+                    if !list.contains(&s) {
+                        list.push(s);
                     }
                 }
-                return Ok((Value::UNDEFINED, Some(list)));
+                k += 1;
             }
+            return Ok((Value::UNDEFINED, Some(list)));
         }
         Ok((Value::UNDEFINED, None))
     }
@@ -247,31 +264,48 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let idx = v.heap_index();
-        // Extract under a short borrow; recursion needs &mut self, so no heap
-        // borrow may be held across it.
-        enum Node {
-            Str(String),
-            Omit,
-            BigInt,
-            Boxed(Value),
-            Arr(Vec<Value>),
-            Obj(Vec<(String, Value)>),
-            EmptyObj,
-            /// A `JSON.rawJSON` object: emit its stored text verbatim.
-            Raw(String),
-        }
-        let node = match self.heap.get(idx) {
+        // Leaf / primitive-wrapper cases (no recursion into properties).
+        match self.heap.get(idx) {
             HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                Node::Str(self.heap.str_cow(idx).unwrap().into_owned())
+                let s = self.heap.str_cow(idx).unwrap().into_owned();
+                return Ok(Some(json_quote(&s)));
             }
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
             | HeapObj::Native(_)
-            | HeapObj::Symbol { .. } => Node::Omit,
-            HeapObj::BigInt(_) => Node::BigInt,
-            HeapObj::Boxed { value, .. } => Node::Boxed(*value),
-            HeapObj::Array(items) => Node::Arr(items.clone()),
+            | HeapObj::Symbol { .. } => return Ok(None),
+            HeapObj::BigInt(_) => {
+                return Err(Thrown("TypeError: Do not know how to serialize a BigInt".into()))
+            }
+            // A boxed primitive serializes as ToString / ToNumber / its boolean —
+            // observably invoking the wrapper's toString/valueOf (which may throw).
+            HeapObj::Boxed { kind: 0, .. } => {
+                let s = self.to_js_string(v)?;
+                return Ok(Some(json_quote(&s)));
+            }
+            HeapObj::Boxed { kind: 1, .. } => {
+                // ToNumber(wrapper): ToPrimitive(number) so an overridden
+                // valueOf/@@toPrimitive fires (to_number_coerce reads [[NumberData]]).
+                let prim = self.to_primitive_number(v)?;
+                let n = self.to_number(prim)?;
+                return Ok(Some(if n.is_finite() { fmt_f64(n) } else { "null".to_string() }));
+            }
+            HeapObj::Boxed { kind: 2, value } => {
+                let b = self.truthy(*value);
+                return Ok(Some(if b { "true" } else { "false" }.to_string()));
+            }
+            // A boxed BigInt (Object(0n)) throws like a primitive BigInt; a boxed
+            // Symbol falls through to SerializeJSONObject ("{}").
+            HeapObj::Boxed { value, .. } => {
+                if value.is_heap()
+                    && matches!(self.heap.get(value.heap_index()), HeapObj::BigInt(_))
+                {
+                    return Err(Thrown(
+                        "TypeError: Do not know how to serialize a BigInt".into(),
+                    ));
+                }
+            }
             HeapObj::Object(map) if map.is_raw_json => {
                 // [[IsRawJSON]]: emit the stored "rawJSON" text verbatim.
                 let raw_val = map.get("rawJSON").unwrap_or(Value::UNDEFINED);
@@ -280,88 +314,100 @@ impl<'p> Vm<'p> {
                     .str_cow(raw_val.heap_index())
                     .map(|c| c.into_owned())
                     .unwrap_or_default();
-                Node::Raw(s)
+                return Ok(Some(s));
             }
-            HeapObj::Object(map) => {
-                let mut pairs = Vec::new();
-                if let Some(allow) = allowlist {
-                    // Array-replacer (PropertyList): emit keys in the allowlist's
-                    // order, only those the object owns enumerably.
-                    for k in allow {
-                        if let Some(pos) = map.keys.iter().position(|kk| kk == k) {
-                            if map.attrs[pos].enumerable && !is_hidden_key(&map.keys[pos]) {
-                                pairs.push((k.clone(), map.vals[pos]));
-                            }
-                        }
-                    }
-                } else {
-                    let order = spec_key_order(&map.keys);
-                    for i in order {
-                        if map.attrs[i].enumerable && !is_hidden_key(&map.keys[i]) {
-                            pairs.push((map.keys[i].clone(), map.vals[i]));
-                        }
-                    }
-                }
-                Node::Obj(pairs)
-            }
-            HeapObj::Map { .. } | HeapObj::Set(_) | HeapObj::Generator { .. } => Node::EmptyObj,
-            _ => Node::Omit,
-        };
-        match node {
-            Node::Omit => Ok(None),
-            Node::Raw(s) => Ok(Some(s)),
-            Node::Str(s) => Ok(Some(json_quote(&s))),
-            Node::BigInt => Err(Thrown("TypeError: Do not know how to serialize a BigInt".into())),
-            // A boxed Number/String/Boolean serializes as its wrapped primitive.
-            // The replacer has already fired on the wrapper, so don't re-apply it.
-            Node::Boxed(inner) => {
-                self.json_value(holder, key, inner, indent, depth, visited, Value::UNDEFINED, allowlist)
-            }
-            Node::EmptyObj => Ok(Some("{}".to_string())),
-            Node::Arr(items) => {
-                if visited.contains(&idx) {
-                    return Err(Thrown("TypeError: Converting circular structure to JSON".into()));
-                }
-                visited.push(idx);
-                let mut parts = Vec::with_capacity(items.len());
-                for (i, e) in items.iter().enumerate() {
-                    let ks = i.to_string();
-                    // Array elements ignore the PropertyList allowlist (which only
-                    // filters object keys), but a function replacer still applies.
-                    let part = self
-                        .json_value(v, &ks, *e, indent, depth + 1, visited, replacer, None)?
-                        .unwrap_or_else(|| "null".to_string());
-                    parts.push(part);
-                }
-                visited.pop();
-                Ok(Some(if parts.is_empty() {
-                    "[]".to_string()
-                } else {
-                    wrap_json(&parts, '[', ']', indent, depth)
-                }))
-            }
-            Node::Obj(pairs) => {
-                if visited.contains(&idx) {
-                    return Err(Thrown("TypeError: Converting circular structure to JSON".into()));
-                }
-                visited.push(idx);
-                let sep = if indent.is_empty() { ":" } else { ": " };
-                let mut parts = Vec::new();
-                for (k, val) in pairs {
-                    if let Some(vs) =
-                        self.json_value(v, &k, val, indent, depth + 1, visited, replacer, allowlist)?
-                    {
-                        parts.push(format!("{}{}{}", json_quote(&k), sep, vs));
-                    }
-                }
-                visited.pop();
-                Ok(Some(if parts.is_empty() {
-                    "{}".to_string()
-                } else {
-                    wrap_json(&parts, '{', '}', indent, depth)
-                }))
-            }
+            _ => {}
         }
+        // SerializeJSONArray / SerializeJSONObject. Both read properties via REAL
+        // [[Get]] (so getters / Proxy traps fire and abrupt completions propagate),
+        // and detect cycles via `visited`. The PropertyList allowlist is GLOBAL — it
+        // filters object keys at EVERY nesting level, including objects inside arrays.
+        if visited.contains(&idx) {
+            return Err(Thrown("TypeError: Converting circular structure to JSON".into()));
+        }
+        visited.push(idx);
+        let result = if self.value_is_array(v) {
+            // len = ToLength(Get(val, "length"))
+            let lenv = self.get_prop(v, "length")?;
+            let lenf = self.to_number_coerce(lenv)?;
+            let len: u64 = if lenf.is_nan() || lenf <= 0.0 {
+                0
+            } else {
+                lenf.min(9007199254740991.0) as u64
+            };
+            let mut parts = Vec::with_capacity(len.min(1024) as usize);
+            let mut i: u64 = 0;
+            while i < len {
+                let ks = i.to_string();
+                let e = match self.json_get(v, &ks) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        visited.pop();
+                        return Err(e);
+                    }
+                };
+                let part = match self
+                    .json_value(v, &ks, e, indent, depth + 1, visited, replacer, allowlist)
+                {
+                    Ok(p) => p.unwrap_or_else(|| "null".to_string()),
+                    Err(e) => {
+                        visited.pop();
+                        return Err(e);
+                    }
+                };
+                parts.push(part);
+                i += 1;
+            }
+            if parts.is_empty() {
+                "[]".to_string()
+            } else {
+                wrap_json(&parts, '[', ']', indent, depth)
+            }
+        } else {
+            // EnumerableOwnPropertyNames(val) — or the PropertyList, when given.
+            let keys: Vec<String> = match allowlist {
+                Some(a) => a.to_vec(),
+                None => {
+                    let kv = match self.object_enum_own(v, crate::vm::EnumWhat::Keys) {
+                        Ok(kv) => kv,
+                        Err(e) => {
+                            visited.pop();
+                            return Err(e);
+                        }
+                    };
+                    match self.heap.get(kv.heap_index()) {
+                        HeapObj::Array(a) => a.iter().map(|&k| self.display(k)).collect(),
+                        _ => Vec::new(),
+                    }
+                }
+            };
+            let sep = if indent.is_empty() { ":" } else { ": " };
+            let mut parts = Vec::new();
+            for k in keys {
+                let val = match self.json_get(v, &k) {
+                    Ok(val) => val,
+                    Err(e) => {
+                        visited.pop();
+                        return Err(e);
+                    }
+                };
+                match self.json_value(v, &k, val, indent, depth + 1, visited, replacer, allowlist) {
+                    Ok(Some(vs)) => parts.push(format!("{}{}{}", json_quote(&k), sep, vs)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        visited.pop();
+                        return Err(e);
+                    }
+                }
+            }
+            if parts.is_empty() {
+                "{}".to_string()
+            } else {
+                wrap_json(&parts, '{', '}', indent, depth)
+            }
+        };
+        visited.pop();
+        Ok(Some(result))
     }
 
     /// Parse a JSON string into a Value, or throw SyntaxError. Recursive-descent
