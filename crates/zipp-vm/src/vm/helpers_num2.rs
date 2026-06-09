@@ -586,7 +586,10 @@ pub(crate) fn to_fixed(n: f64, f: usize) -> String {
         return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
     }
     if n.abs() >= 1e21 {
-        return format!("{n}");
+        // JS switches to exponential here — use the ECMAScript Number→String
+        // (`fmt_f64`), NOT Rust's `{}` which prints the full decimal: e.g.
+        // `(1e21).toFixed(2)` is "1e+21", not "1000000000000000000000".
+        return fmt_f64(n);
     }
     let neg = n.is_sign_negative();
     // Exact decimal of |n| with 30 guard digits past `f`; the digit at index `f`
