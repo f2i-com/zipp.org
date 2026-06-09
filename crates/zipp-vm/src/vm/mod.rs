@@ -233,6 +233,11 @@ pub struct Vm<'p> {
     /// per source call site, keyed by (function id, per-function site index). The
     /// cached objects are permanent GC roots (they live as long as the realm).
     template_cache: std::collections::HashMap<(u32, u32), Value>,
+    /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index:
+    /// (matcher regexp heap idx, subject string, global flag, done latch). Its
+    /// `next()` drives RegExpExec (honouring a user `exec`) one match at a time,
+    /// rather than matchAll eagerly collecting every match up front.
+    regexp_string_iters: std::collections::HashMap<u32, (u32, Value, bool, bool)>,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on

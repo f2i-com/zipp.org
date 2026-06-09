@@ -92,6 +92,7 @@ impl<'p> Vm<'p> {
             microtasks: std::collections::VecDeque::new(),
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
+            regexp_string_iters: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),
             proto_of: std::collections::HashMap::new(),
             fn_props: std::collections::HashMap::new(),

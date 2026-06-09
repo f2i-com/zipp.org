@@ -236,6 +236,11 @@ impl Vm<'_> {
         for v in self.template_cache.values() {
             root_val!(*v);
         }
+        // A live lazy RegExpStringIterator keeps its matcher + subject string alive.
+        for (regexp, string, _, _) in self.regexp_string_iters.values() {
+            root_idx!(*regexp);
+            root_val!(*string);
+        }
         for v in self.zdt_tz.values() {
             root_val!(*v);
         }
@@ -284,6 +289,7 @@ impl Vm<'_> {
         self.ab_max.retain(|&k, _| marks[k as usize]);
         self.ta_tracking.retain(|&k| marks[k as usize]);
         self.dv_tracking.retain(|&k| marks[k as usize]);
+        self.regexp_string_iters.retain(|&k, _| marks[k as usize]);
         self.shared_buffers.retain(|&k| marks[k as usize]);
         self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.error_data.retain(|&k| marks[k as usize]);

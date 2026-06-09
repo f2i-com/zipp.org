@@ -813,39 +813,14 @@ impl<'p> Vm<'p> {
                 let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
                 self.set_regexp_last_index(matcher_idx, li);
                 let s_val = self.alloc_str(s.clone());
-                let mut items: Vec<Value> = Vec::new();
-                let mut guard = 0u32;
-                loop {
-                    guard += 1;
-                    if guard > 1_000_000 {
-                        break;
-                    }
-                    let r = self.regexp_exec(matcher_idx, s_val)?;
-                    if r == Value::NULL {
-                        break;
-                    }
-                    items.push(r);
-                    if !global {
-                        break;
-                    }
-                    // Empty match: advance one char so the loop terminates.
-                    let empty = matches!(
-                        self.heap.get(r.heap_index()),
-                        HeapObj::Array(a) if a.first().is_some_and(|v| {
-                            matches!(self.heap.get(v.heap_index()), HeapObj::Str(s) if s.char_len == 0)
-                        })
-                    );
-                    if empty {
-                        let cur_v = match self.heap.get(matcher_idx) {
-                            HeapObj::RegExp { last_index, .. } => *last_index,
-                            _ => Value::int(0),
-                        };
-                        let cur = self.to_integer_or_zero(cur_v).unwrap_or(0).max(0) as usize;
-                        self.set_regexp_last_index(matcher_idx, cur + 1);
-                    }
-                }
+                // Build a LAZY %RegExpStringIterator%: an empty Iterator object whose
+                // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
+                // exec/lastIndex side effects are observable per step, not up front.
                 let proto = self.regexp_string_iter_proto;
-                Value::heap(self.heap.alloc(HeapObj::Iterator { items, index: 0, proto, live: None }))
+                let it =
+                    self.heap.alloc(HeapObj::Iterator { items: Vec::new(), index: 0, proto, live: None });
+                self.regexp_string_iters.insert(it, (matcher_idx, s_val, global, false));
+                Value::heap(it)
             }
             REGEXP_GET_GLOBAL
             | REGEXP_GET_IGNORECASE
@@ -1887,6 +1862,36 @@ impl<'p> Vm<'p> {
                         ))
                     }
                 };
+                // A lazy %RegExpStringIterator%: run ONE RegExpExec (via the abstract
+                // protocol, honouring a user `exec`) per next(). A null result, or the
+                // single match of a non-global regex, latches done; a global empty
+                // match advances lastIndex so the next step makes progress.
+                if let Some(&(regexp, string, global, done)) = self.regexp_string_iters.get(&it_idx) {
+                    let (value, ret_done, latch) = if done {
+                        (Value::UNDEFINED, true, true)
+                    } else {
+                        let r = self.regexp_exec_abstract(regexp, string)?;
+                        if r == Value::NULL {
+                            (Value::UNDEFINED, true, true)
+                        } else if !global {
+                            (r, false, true)
+                        } else {
+                            let m0 = self.get_index(r, Value::int(0))?;
+                            let m0s = self.to_js_string(m0)?;
+                            if m0s.is_empty() {
+                                let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
+                                let cur = self.to_integer_or_zero(cur_v).unwrap_or(0).max(0) as usize;
+                                self.set_regexp_last_index(regexp, cur + 1);
+                            }
+                            (r, false, false)
+                        }
+                    };
+                    self.regexp_string_iters.insert(it_idx, (regexp, string, global, latch));
+                    let mut m = ObjMap::new();
+                    m.set("value", value);
+                    m.set("done", Value::bool(ret_done));
+                    return Ok(Value::heap(self.heap.alloc(HeapObj::Object(m))));
+                }
                 // A live TypedArray iterator (keys/values/entries) re-reads the view's
                 // current length each step, so a resizable buffer's grow yields new
                 // elements; an out-of-bounds view (detached, or a fixed-length view on
