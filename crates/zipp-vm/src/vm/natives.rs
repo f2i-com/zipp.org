@@ -2992,8 +2992,8 @@ impl<'p> Vm<'p> {
                 // non-string primitive → TypeError, an invalid ISO string → RangeError),
                 // so overflow is read only once the item is known-processable.
                 let (y, m, d) = if self.is_object_value(a0) {
-                    let reject = self.read_overflow(a1)?;
-                    self.to_plain_date_overflow(a0, reject)?
+                    // Object: read the bag fields, THEN options.overflow (order-of-ops).
+                    self.to_plain_date_overflow(a0, Some(a1))?
                 } else {
                     let r = self.to_plain_date(a0)?;
                     self.read_overflow(a1)?;

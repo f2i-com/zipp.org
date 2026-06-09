@@ -577,7 +577,7 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn to_plain_date(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
-        self.to_plain_date_overflow(v, false)
+        self.to_plain_date_overflow(v, None)
     }
 
     /// ToTemporalDate with an overflow mode (constrain clamps; reject throws on
@@ -585,10 +585,13 @@ impl<'p> Vm<'p> {
     pub(crate) fn to_plain_date_overflow(
         &mut self,
         v: Value,
-        reject: bool,
+        options: Option<Value>,
     ) -> Result<(i64, i64, i64), Thrown> {
         if v.is_heap() {
             if let Some(t) = self.plain_date_fields(v.heap_index()) {
+                if let Some(o) = options {
+                    self.read_overflow(o)?;
+                }
                 return Ok(t);
             }
             // A ZonedDateTime or PlainDateTime yields its calendar date.
@@ -599,6 +602,9 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let Some(f) = date {
+                    if let Some(o) = options {
+                        self.read_overflow(o)?;
+                    }
                     return Ok((f[0], f[1], f[2]));
                 }
             }
@@ -629,6 +635,14 @@ impl<'p> Vm<'p> {
                 if y_opt.is_none() || m_raw.is_none() || d_opt.is_none() {
                     return Err(Thrown("TypeError: PlainDate-like requires year, month, day".into()));
                 }
+                // GetTemporalOverflowOption: read + validate options.overflow AFTER
+                // the field GETs (order-of-operations) but BEFORE the algorithmic
+                // validation (monthCode validity / range); absent options → constrain.
+                let reject = if let Some(o) = options {
+                    self.read_overflow(o)?
+                } else {
+                    false
+                };
                 let (m_val, m_valid) = m_raw.unwrap();
                 if !m_valid {
                     return Err(Thrown(
