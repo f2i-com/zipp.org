@@ -3047,6 +3047,18 @@ impl<'p> Vm<'p> {
                 let from = y * 12 + (m - 1);
                 let to = o.0 * 12 + (o.1 - 1);
                 let total_months = if name == "until" { to - from } else { from - to };
+                // DifferenceTemporalPlainYearMonth sets each operand's reference Day=1
+                // and range-checks that date; the very-minimum YM (-271821-04) has a
+                // day-1 reference date (-271821-04-01) BELOW the ISO date limit, so a
+                // non-zero difference involving it is a RangeError. Equal operands
+                // short-circuit to a zero Duration before any range check.
+                if total_months != 0
+                    && (!iso_date_in_range(y, m, 1) || !iso_date_in_range(o.0, o.1, 1))
+                {
+                    return Err(Thrown(
+                        "RangeError: PlainYearMonth difference is outside the representable range".into(),
+                    ));
+                }
                 let mut f = [0i64; 10];
                 if largest == "year" {
                     if smallest == "year" {
