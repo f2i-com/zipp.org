@@ -666,11 +666,26 @@ impl<'p> Vm<'p> {
         }
         let ord = match (ab, bb) {
             (Some(x), Some(y)) => Some(x.cmp(&y)),
-            (Some(x), None) => cmp_i128_f64(x, self.to_number(vb)?),
-            (None, Some(y)) => cmp_i128_f64(y, self.to_number(va)?).map(|o| o.reverse()),
+            (Some(x), None) => self.cmp_bigint_other(x, vb)?,
+            (None, Some(y)) => self.cmp_bigint_other(y, va)?.map(|o| o.reverse()),
             (None, None) => unreachable!(),
         };
         Ok(Some(ord))
+    }
+
+    /// Relational comparison of a BigInt `x` against a non-BigInt operand. A
+    /// STRING is StringToBigInt'd (EXACT — `"9007199254740993"` is not rounded
+    /// through f64; whitespace-only → 0n; a non-integer string → undefined, i.e.
+    /// unordered so every relational result is false). A Number/Boolean compares
+    /// by mathematical value.
+    fn cmp_bigint_other(&self, x: i128, other: Value) -> Result<Option<std::cmp::Ordering>, Thrown> {
+        if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
+            if let Some(s) = self.heap.str_cow(other.heap_index()) {
+                let y = if s.trim().is_empty() { Some(0i128) } else { parse_bigint_str(&s) };
+                return Ok(y.map(|y| x.cmp(&y)));
+            }
+        }
+        Ok(cmp_i128_f64(x, self.to_number(other)?))
     }
 
     /// The i128 value of a BigInt heap object, if `v` is one.
