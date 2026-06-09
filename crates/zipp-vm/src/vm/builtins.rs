@@ -797,17 +797,31 @@ impl<'p> Vm<'p> {
                             "TypeError: Cannot create a subarray view of a detached ArrayBuffer".into(),
                         ));
                     }
-                    return Ok(Some(self.alloc_typed_array(buffer, kind, new_offset, new_len)));
+                    let result = self.alloc_typed_array(buffer, kind, new_offset, new_len);
+                    // A subarray of a length-tracking view with no explicit `end` is
+                    // itself length-tracking (newLength stays auto), so it grows/shrinks
+                    // with the resizable buffer rather than snapshotting the length.
+                    if a1 == Value::UNDEFINED && self.ta_tracking.contains(&idx) {
+                        self.ta_tracking.insert(result.heap_index());
+                    }
+                    return Ok(Some(result));
                 }
                 if !self.is_constructor(species) {
                     return Err(Thrown(
                         "TypeError: TypedArray [Symbol.species] is not a constructor".into(),
                     ));
                 }
-                let result = self.construct(
-                    species,
-                    &[Value::heap(buffer), Value::num(new_offset as f64), Value::num(new_len as f64)],
-                )?;
+                // TypedArraySpeciesCreate: a length-tracking source with no explicit
+                // `end` passes NO newLength (it stays auto), so the species view tracks
+                // the resizable buffer instead of snapshotting the current length.
+                let result = if a1 == Value::UNDEFINED && self.ta_tracking.contains(&idx) {
+                    self.construct(species, &[Value::heap(buffer), Value::num(new_offset as f64)])?
+                } else {
+                    self.construct(
+                        species,
+                        &[Value::heap(buffer), Value::num(new_offset as f64), Value::num(new_len as f64)],
+                    )?
+                };
                 if !matches!(self.heap.get(result.heap_index()), HeapObj::TypedArray { .. }) {
                     return Err(Thrown(
                         "TypeError: TypedArray [Symbol.species] did not return a TypedArray".into(),

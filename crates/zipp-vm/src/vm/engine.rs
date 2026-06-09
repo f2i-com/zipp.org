@@ -97,6 +97,7 @@ impl<'p> Vm<'p> {
             arr_props: std::collections::HashMap::new(),
             ab_max: std::collections::HashMap::new(),
             ta_tracking: std::collections::HashSet::new(),
+            dv_tracking: std::collections::HashSet::new(),
             deleted_callable_intrinsics: std::collections::HashSet::new(),
             deleted_globals: std::collections::HashSet::new(),
             array_length_nonwritable: std::collections::HashSet::new(),

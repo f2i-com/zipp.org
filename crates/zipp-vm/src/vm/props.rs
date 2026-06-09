@@ -2927,16 +2927,24 @@ impl<'p> Vm<'p> {
         }
         if let HeapObj::DataView { buffer, byte_offset, byte_length } = self.heap.get(obj.heap_index()) {
             let (buffer, byte_offset, byte_length) = (*buffer, *byte_offset, *byte_length);
-            // byteLength / byteOffset throw a TypeError when the viewed buffer is
-            // detached (IsViewOutOfBounds); `buffer` itself is still readable.
+            // IsViewOutOfBounds: byteLength / byteOffset throw a TypeError when the
+            // viewed buffer is detached, or when a resizable buffer has shrunk so the
+            // view no longer fits (fixed-length: offset+length > current size;
+            // length-tracking: offset > current size). `buffer` stays readable.
             let detached =
                 matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. });
+            let tracking = self.dv_tracking.contains(&obj.heap_index());
+            let cur = self.array_buffer_len(buffer);
+            let oob = detached
+                || if tracking { byte_offset > cur } else { byte_offset + byte_length > cur };
             return Ok(match key {
-                "byteLength" | "byteOffset" if detached => {
+                "byteLength" | "byteOffset" if oob => {
                     return Err(Thrown(format!(
-                        "TypeError: get DataView.prototype.{key}: the viewed buffer is detached"
+                        "TypeError: get DataView.prototype.{key}: the viewed buffer is out of bounds"
                     )))
                 }
+                // A length-tracking view reports the buffer's current remaining size.
+                "byteLength" if tracking => Value::num((cur - byte_offset) as f64),
                 "byteLength" => Value::num(byte_length as f64),
                 "byteOffset" => Value::num(byte_offset as f64),
                 "buffer" => Value::heap(buffer),

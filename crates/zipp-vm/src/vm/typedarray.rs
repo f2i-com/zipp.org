@@ -708,9 +708,11 @@ impl<'p> Vm<'p> {
         if byte_offset > buf_len {
             return Err(Thrown("RangeError: invalid DataView offset".into()));
         }
-        let byte_length = match args.get(2) {
-            Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
-            _ => buf_len.saturating_sub(byte_offset),
+        let auto_length = matches!(args.get(2), None | Some(&Value::UNDEFINED));
+        let byte_length = if auto_length {
+            buf_len.saturating_sub(byte_offset)
+        } else {
+            self.to_index(args[2])?
         };
         if byte_offset + byte_length > buf_len {
             return Err(Thrown("RangeError: invalid DataView offset/length".into()));
@@ -718,6 +720,12 @@ impl<'p> Vm<'p> {
         let idx = self.heap.alloc(HeapObj::DataView { buffer: buf, byte_offset, byte_length });
         if self.dataview_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.dataview_proto));
+        }
+        // An auto-length DataView (no explicit byteLength) over a resizable /
+        // growable buffer tracks the buffer's current size (byteLength follows it,
+        // and byteLength/byteOffset throw once the offset is out of bounds).
+        if auto_length && self.ab_max.contains_key(&buf) {
+            self.dv_tracking.insert(idx);
         }
         Ok(Value::heap(idx))
     }

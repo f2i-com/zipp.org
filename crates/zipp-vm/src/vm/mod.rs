@@ -255,6 +255,11 @@ pub struct Vm<'p> {
     /// no explicit length): heap idx set. Their effective length follows the
     /// buffer's current byte length.
     ta_tracking: std::collections::HashSet<u32>,
+    /// Length-tracking DataViews (created on a resizable/growable buffer with no
+    /// explicit byteLength): heap idx set. Their byteLength follows the buffer's
+    /// current size, and byteLength/byteOffset throw (IsViewOutOfBounds) once the
+    /// offset exceeds the shrunk buffer.
+    dv_tracking: std::collections::HashSet<u32>,
     /// Callables expose `name`/`length` as synthesized own properties (computed
     /// from the proto, not stored). They're `configurable: true`, so `delete
     /// fn.name` must make them vanish — recorded here as `(heap_idx, 0=name |
