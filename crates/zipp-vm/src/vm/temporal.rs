@@ -3047,15 +3047,24 @@ impl<'p> Vm<'p> {
                 let from = y * 12 + (m - 1);
                 let to = o.0 * 12 + (o.1 - 1);
                 let total_months = if name == "until" { to - from } else { from - to };
-                // Round to smallestUnit: whole years round to a multiple of 12·inc.
-                let step = if smallest == "year" { 12 * inc } else { inc };
-                let rounded = round_increment(total_months as i128, step, &mode) as i64;
                 let mut f = [0i64; 10];
                 if largest == "year" {
-                    f[0] = rounded / 12;
-                    f[1] = rounded % 12;
+                    if smallest == "year" {
+                        // Round the whole-year count to the increment (a year = 12 mo).
+                        f[0] = round_increment(total_months as i128, 12 * inc, &mode) as i64 / 12;
+                    } else {
+                        // Split years out FIRST, then round ONLY the months remainder
+                        // to the increment (years aren't rounded); carry across 12 if
+                        // the rounded remainder overflows. (Trunc division keeps the
+                        // sign for `since`'s negative difference.)
+                        let years = total_months / 12;
+                        let rem = total_months % 12;
+                        let rm = round_increment(rem as i128, inc, &mode) as i64;
+                        f[0] = years + rm / 12;
+                        f[1] = rm % 12;
+                    }
                 } else {
-                    f[1] = rounded;
+                    f[1] = round_increment(total_months as i128, inc, &mode) as i64;
                 }
                 Ok(Some(self.make_duration(f)))
             }
