@@ -378,7 +378,14 @@ impl<'p> Vm<'p> {
                 self.reject(p, e);
                 return;
             }
-            if matches!(self.heap.get(value.heap_index()), HeapObj::Promise { .. }) {
+            if matches!(self.heap.get(value.heap_index()), HeapObj::Promise { .. })
+                && !self.has_own_property(value, "then")
+            {
+                // A native promise with the INTRINSIC `then` adopts state directly
+                // (a valid optimisation of the resolve procedure). An OWN/overridden
+                // `then` must be OBSERVED instead — the spec does
+                // Get(resolution,"then") and enqueues PromiseResolveThenableJob — so
+                // a shadowed `then` falls through to the generic thenable adoption.
                 let inner = value.heap_index();
                 self.then_internal(inner, Value::UNDEFINED, Value::UNDEFINED, Some(p));
                 return;
