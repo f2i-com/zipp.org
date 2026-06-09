@@ -599,7 +599,9 @@ impl<'p> Vm<'p> {
                 self.heap.get(p.heap_index())
             {
                 let reason = *result;
-                let msg = self.display(reason);
+                // Render the rejection like an uncaught throw ("Name: message")
+                // rather than display() (which gives "[object Object]" for an Error).
+                let msg = self.throw_message(reason);
                 return Err(Thrown(msg));
             }
         }

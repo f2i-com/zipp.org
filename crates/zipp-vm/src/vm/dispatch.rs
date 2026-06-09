@@ -3811,11 +3811,25 @@ impl<'p> Vm<'p> {
     /// throws bind the real `Value`, so this is only the top-level report.
     pub(crate) fn throw_message(&self, v: Value) -> String {
         if v.is_heap() {
-            if let HeapObj::Object(map) = self.heap.get(v.heap_index()) {
-                let name = map.get("name").map(|n| self.display(n));
-                let msg = map.get("message").map(|m| self.display(m));
+            if let HeapObj::Object(_) = self.heap.get(v.heap_index()) {
+                let idx = v.heap_index();
+                // `name`: own/inherited "name", else the constructor's name — so a
+                // nameless user error (e.g. the harness Test262Error, which sets only
+                // `.message` but has constructor.name "Test262Error") reports
+                // "Test262Error: …" rather than "Error: …", matching V8/Node (and
+                // letting a negative-test type substring-match its stderr).
+                let name = self
+                    .read_data_prop(idx, "name")
+                    .map(|n| self.display(n))
+                    .or_else(|| {
+                        self.read_data_prop(idx, "constructor")
+                            .map(|c| self.callable_name(c))
+                            .filter(|s| !s.is_empty())
+                    });
+                let msg = self.read_data_prop(idx, "message").map(|m| self.display(m));
                 return match (name, msg) {
                     (Some(n), Some(m)) => format!("{n}: {m}"),
+                    (Some(n), None) => n,
                     (None, Some(m)) => format!("Error: {m}"),
                     _ => self.display(v),
                 };
