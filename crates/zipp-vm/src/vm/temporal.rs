@@ -3063,7 +3063,9 @@ impl<'p> Vm<'p> {
                 let day = self.opt_int_field(a0, "day")?.ok_or_else(|| {
                     Thrown("TypeError: toPlainDate requires a day".into())
                 })?;
-                Ok(Some(self.make_plain_date(y, m, day)?))
+                // Default overflow is "constrain": clamp the day to the month.
+                let cd = day.min(days_in_month(y, m));
+                Ok(Some(self.make_plain_date(y, m, cd)?))
             }
             "getISOFields" => {
                 let cal = self.alloc_str("iso8601".to_string());
@@ -3130,7 +3132,7 @@ impl<'p> Vm<'p> {
                 // ±Infinity/NaN) even though this ISO engine always stores 1972 as
                 // the reference ISO year. Required-field presence + this year coercion
                 // precede a calendar-invalid monthCode's RangeError.
-                let _year = self.opt_int_field(v, "year")?;
+                let year_field = self.opt_int_field(v, "year")?;
                 if m_raw.is_none() || d_opt.is_none() {
                     return Err(Thrown(
                         "TypeError: PlainMonthDay-like requires month and day".into(),
@@ -3144,8 +3146,13 @@ impl<'p> Vm<'p> {
                 }
                 let mut m = m_val;
                 let mut d = d_opt.unwrap();
+                // The supplied `year` (if any) decides whether the day overflows
+                // (e.g. Feb-29 is valid only in a leap year); absent → 1972 (leap),
+                // so a bare {month:2,day:29} stays valid. The stored reference year
+                // is always 1972 regardless.
+                let eff_year = year_field.unwrap_or(1972);
                 if reject {
-                    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
+                    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(eff_year, m) {
                         return Err(Thrown("RangeError: month-day out of range".into()));
                     }
                 } else {
@@ -3154,7 +3161,7 @@ impl<'p> Vm<'p> {
                         return Err(Thrown("RangeError: month-day out of range".into()));
                     }
                     m = m.min(12);
-                    d = d.min(days_in_month(1972, m));
+                    d = d.min(days_in_month(eff_year, m));
                 }
                 return Ok((1972, m, d));
             }
@@ -3239,7 +3246,10 @@ impl<'p> Vm<'p> {
                 let year = self.opt_int_field(a0, "year")?.ok_or_else(|| {
                     Thrown("TypeError: toPlainDate requires a year".into())
                 })?;
-                Ok(Some(self.make_plain_date(year, m, d)?))
+                // Default overflow is "constrain": clamp the day to the month (e.g.
+                // PlainMonthDay(2,29).toPlainDate({year:2023}) → 2023-02-28).
+                let cd = d.min(days_in_month(year, m));
+                Ok(Some(self.make_plain_date(year, m, cd)?))
             }
             "getISOFields" => {
                 let cal = self.alloc_str("iso8601".to_string());
