@@ -712,6 +712,11 @@ pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
     ("getOrInsert", 4, 2), ("getOrInsertComputed", 4, 2),
     // Date.prototype.toTemporalInstant (kind 6) — appended (keeps existing ids).
     ("toTemporalInstant", 6, 0),
+    // Annex B String.prototype.trimLeft / trimRight (kind 1) — legacy aliases of
+    // trimStart / trimEnd; appended (keeps existing ids). setup.rs overwrites
+    // their proto slots with the trimStart/trimEnd VALUES so they are the SAME
+    // function object (===, name "trimStart"/"trimEnd").
+    ("trimLeft", 1, 0), ("trimRight", 1, 0),
 ];
 
 /// `(name, kind)` for a prototype-method native id, if it is one.

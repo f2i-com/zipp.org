@@ -301,6 +301,24 @@ impl<'p> Vm<'p> {
         self.arr_proto = build(self, &arr_methods, None);
         self.str_proto = build(self, &str_methods, None);
         let str_proto = self.str_proto;
+        // `String.prototype.trimLeft`/`trimRight` ARE `trimStart`/`trimEnd` — the
+        // SAME function objects (Annex B legacy aliases), so trimLeft===trimStart
+        // and trimLeft.name is "trimStart". `build` installed distinct natives;
+        // alias the slots to the trimStart/trimEnd values (mirrors the Set
+        // keys→values and Date toGMTString→toUTCString aliasing).
+        for (alias, canon) in [("trimLeft", "trimStart"), ("trimRight", "trimEnd")] {
+            let canon_fn = match self.heap.get(str_proto) {
+                HeapObj::Object(p) => p.get(canon),
+                _ => None,
+            };
+            if let Some(cf) = canon_fn {
+                if let HeapObj::Object(p) = self.heap.get_mut(str_proto) {
+                    if let Some(i) = p.pos(alias) {
+                        p.vals[i] = cf;
+                    }
+                }
+            }
+        }
         let num_proto = build(self, &num_methods, None);
         let set_proto = build(self, &set_methods, None);
         // `Set.prototype.keys` IS `%Set.prototype.values%` — the SAME function object
