@@ -3052,9 +3052,15 @@ impl<'p> Vm<'p> {
             }
             PLAINDATETIME_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
-                let f = if self.is_object_value(a0) {
+                let f = if self.is_object_value(a0)
+                    && !matches!(self.heap.get(a0.heap_index()), HeapObj::Temporal { .. })
+                {
+                    // Plain bag: one PrepareTemporalFields pass (field gets, then
+                    // the required-y/m/d TypeError), THEN options.overflow, THEN
+                    // the deferred monthCode/range validation (order-of-ops).
+                    let bag = self.read_pdt_bag(a0, false)?;
                     let reject = self.read_overflow(a1)?;
-                    self.to_plain_date_time_overflow(a0, reject)?
+                    Self::finish_pdt_fields(&bag, reject)?
                 } else {
                     let r = self.to_plain_date_time(a0)?;
                     self.read_overflow(a1)?;

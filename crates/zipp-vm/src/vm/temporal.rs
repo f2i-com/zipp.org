@@ -7,6 +7,17 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// The result of one PrepareTemporalFields pass over a PlainDateTime-like
+/// property bag (see [`Vm::read_pdt_bag`]): the raw slot-mapped fields, the
+/// deferred monthCode validity, and — for ZonedDateTime-like bags — the
+/// validated `offset` (ns) and the raw `timeZone` value.
+pub(crate) struct PdtBag {
+    pub(crate) f: [i64; 9],
+    month_code_invalid: bool,
+    pub(crate) bag_off: Option<i64>,
+    pub(crate) tz: Value,
+}
+
 impl<'p> Vm<'p> {
     pub(crate) fn make_duration(&mut self, f: [i64; 10]) -> Value {
         let idx = self.heap.alloc(HeapObj::Temporal { kind: 0, fields: f.to_vec() });
@@ -214,6 +225,13 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: total() argument must be a string or object".into()));
                 }
                 let rel = if is_string { Value::UNDEFINED } else { self.get_prop(a0, "relativeTo")? };
+                // GetTemporalRelativeToOption resolves the anchor (the full
+                // ToRelativeTemporalObject read sequence) at the relativeTo slot,
+                // BEFORE options.unit is read — even for a time unit, so
+                // total({unit:"ns"}) against a ZonedDateTime at the limit still
+                // throws on overflow.
+                let anchor =
+                    if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
                 let unit_v = if is_string { a0 } else { self.get_prop(a0, "unit")? };
                 if unit_v == Value::UNDEFINED {
                     return Err(Thrown("RangeError: unit is required".into()));
@@ -228,11 +246,6 @@ impl<'p> Vm<'p> {
                     || f[1] != 0
                     || f[2] != 0
                     || matches!(unit.as_str(), "year" | "month" | "week");
-                // ToRelativeTemporalObject: a provided relativeTo is resolved (and its
-                // target instant validated) even for a time unit — total({unit:"ns"})
-                // against a ZonedDateTime at the limit still throws on overflow.
-                let anchor =
-                    if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
                 if needs_cal && anchor.is_none() {
                     return Err(Thrown(
                         "RangeError: a relativeTo option is required for years, months, or weeks"
@@ -283,11 +296,16 @@ impl<'p> Vm<'p> {
                     }
                 };
                 // A relativeTo anchor enables calendar-unit rounding/balancing.
+                // GetTemporalDurationRoundingSettings resolves the anchor (the full
+                // ToRelativeTemporalObject read sequence) at the relativeTo slot,
+                // BEFORE roundingIncrement/roundingMode/smallestUnit are read.
                 let rel = if options == Value::UNDEFINED {
                     Value::UNDEFINED
                 } else {
                     self.get_prop(options, "relativeTo")?
                 };
+                let anchor =
+                    if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
                 let inc = self.read_rounding_increment(options)?;
                 let mode = if options == Value::UNDEFINED {
                     "halfExpand".to_string()
@@ -368,8 +386,7 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                if rel != Value::UNDEFINED {
-                    let (start, zoned) = self.relative_to_dt(rel)?;
+                if let Some((start, zoned)) = anchor {
                     check_relative_target(start, f, zoned)?;
                     let r = self.round_duration_relative(f, start, &smallest, &largest, inc, &mode)?;
                     return Ok(Some(self.make_duration(r)));
@@ -1421,84 +1438,105 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid datetime string '{s}'")));
             }
             if self.is_object_value(v) {
-                self.validate_iso_calendar_field(v)?;
-                let mut f = [0i64; 9];
-                let mut have_date = [false; 3];
-                // PrepareTemporalFields reads EVERY field in alphabetical order:
-                // day, hour, microsecond, millisecond, minute, month, monthCode,
-                // nanosecond, second, year (observable via getter side effects).
-                // Slots: 0=year 1=month 2=day 3=hour 4=minute 5=second 6=ms 7=us 8=ns.
-                if let Some(x) = self.opt_int_field(v, "day")? {
-                    f[2] = x;
-                    have_date[2] = true;
-                }
-                if let Some(x) = self.opt_int_field(v, "hour")? {
-                    f[3] = x;
-                }
-                if let Some(x) = self.opt_int_field(v, "microsecond")? {
-                    f[7] = x;
-                }
-                if let Some(x) = self.opt_int_field(v, "millisecond")? {
-                    f[6] = x;
-                }
-                if let Some(x) = self.opt_int_field(v, "minute")? {
-                    f[4] = x;
-                }
-                let mut month_code_invalid = false;
-                if let Some((x, valid)) = self.read_month_field_raw(v)? {
-                    // month then monthCode (alphabetical, inside read_month_field_raw);
-                    // a calendar-invalid monthCode's RangeError is deferred (below).
-                    f[1] = x;
-                    have_date[1] = true;
-                    month_code_invalid = !valid;
-                }
-                if let Some(x) = self.opt_int_field(v, "nanosecond")? {
-                    f[8] = x;
-                }
-                if let Some(x) = self.opt_int_field(v, "second")? {
-                    f[5] = x;
-                }
-                if let Some(x) = self.opt_int_field(v, "year")? {
-                    f[0] = x;
-                    have_date[0] = true;
-                }
-                if !have_date.iter().all(|&b| b) {
-                    return Err(Thrown("TypeError: PlainDateTime-like requires year, month, day".into()));
-                }
-                // Required-field presence + the year coercion above precede a
-                // calendar-invalid monthCode's RangeError.
-                if month_code_invalid {
-                    return Err(Thrown(
-                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
-                    ));
-                }
-                // date: month/day; time: hour..nanosecond (maxes 23/59/59/999/999/999).
-                let maxes = [23, 59, 59, 999, 999, 999];
-                if reject {
-                    if !(1..=12).contains(&f[1]) || f[2] < 1 || f[2] > days_in_month(f[0], f[1]) {
-                        return Err(Thrown("RangeError: invalid date fields".into()));
-                    }
-                    for (i, &mx) in maxes.iter().enumerate() {
-                        if f[3 + i] < 0 || f[3 + i] > mx {
-                            return Err(Thrown("RangeError: time field out of range".into()));
-                        }
-                    }
-                } else {
-                    // "constrain" clamps only the upper bound; month/day below 1 is a
-                    // hard floor that rejects (time fields legitimately clamp up from 0).
-                    if f[1] < 1 || f[2] < 1 {
-                        return Err(Thrown("RangeError: invalid date fields".into()));
-                    }
-                    f[1] = f[1].min(12);
-                    f[2] = f[2].min(days_in_month(f[0], f[1]));
-                    for (i, &mx) in maxes.iter().enumerate() {
-                        f[3 + i] = f[3 + i].clamp(0, mx);
-                    }
-                }
-                return Ok(f);
+                let bag = self.read_pdt_bag(v, false)?;
+                return Self::finish_pdt_fields(&bag, reject);
             }
         }
         Err(Thrown("TypeError: cannot convert value to a Temporal.PlainDateTime".into()))
+    }
+
+    /// PrepareTemporalFields/PrepareCalendarFields for a PlainDateTime-like
+    /// property bag: validates the calendar, then reads EVERY field via
+    /// observable Gets in ALPHABETICAL order — day, hour, microsecond,
+    /// millisecond, minute, month+monthCode, nanosecond, [offset,] second,
+    /// [timeZone,] year — with the offset/timeZone reads (ZonedDateTime-like
+    /// bags, `with_offset_tz`) at their alphabetical slots. The required y/m/d
+    /// presence TypeError is raised here, at the end of field preparation;
+    /// the deferred monthCode-validity RangeError and the overflow regulation
+    /// live in [`Self::finish_pdt_fields`] so callers can read their options
+    /// bag in between (order-of-operations).
+    /// Slots: 0=year 1=month 2=day 3=hour 4=minute 5=second 6=ms 7=us 8=ns.
+    pub(crate) fn read_pdt_bag(&mut self, v: Value, with_offset_tz: bool) -> Result<PdtBag, Thrown> {
+        self.validate_iso_calendar_field(v)?;
+        let mut f = [0i64; 9];
+        let mut have_date = [false; 3];
+        let mut month_code_invalid = false;
+        if let Some(x) = self.opt_int_field(v, "day")? {
+            f[2] = x;
+            have_date[2] = true;
+        }
+        if let Some(x) = self.opt_int_field(v, "hour")? {
+            f[3] = x;
+        }
+        if let Some(x) = self.opt_int_field(v, "microsecond")? {
+            f[7] = x;
+        }
+        if let Some(x) = self.opt_int_field(v, "millisecond")? {
+            f[6] = x;
+        }
+        if let Some(x) = self.opt_int_field(v, "minute")? {
+            f[4] = x;
+        }
+        if let Some((x, valid)) = self.read_month_field_raw(v)? {
+            // month then monthCode (alphabetical, inside read_month_field_raw);
+            // a calendar-invalid monthCode's RangeError is deferred to
+            // finish_pdt_fields.
+            f[1] = x;
+            have_date[1] = true;
+            month_code_invalid = !valid;
+        }
+        if let Some(x) = self.opt_int_field(v, "nanosecond")? {
+            f[8] = x;
+        }
+        let bag_off = if with_offset_tz { self.validate_bag_offset_field(v)? } else { None };
+        if let Some(x) = self.opt_int_field(v, "second")? {
+            f[5] = x;
+        }
+        let tz = if with_offset_tz { self.get_prop(v, "timeZone")? } else { Value::UNDEFINED };
+        if let Some(x) = self.opt_int_field(v, "year")? {
+            f[0] = x;
+            have_date[0] = true;
+        }
+        if !have_date.iter().all(|&b| b) {
+            return Err(Thrown("TypeError: PlainDateTime-like requires year, month, day".into()));
+        }
+        Ok(PdtBag { f, month_code_invalid, bag_off, tz })
+    }
+
+    /// InterpretTemporalDateTimeFields: the deferred calendar-invalid monthCode
+    /// RangeError (after the caller's options reads), then constrain/reject
+    /// regulation of the date and time fields.
+    pub(crate) fn finish_pdt_fields(bag: &PdtBag, reject: bool) -> Result<[i64; 9], Thrown> {
+        let mut f = bag.f;
+        if bag.month_code_invalid {
+            return Err(Thrown(
+                "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+            ));
+        }
+        // date: month/day; time: hour..nanosecond (maxes 23/59/59/999/999/999).
+        let maxes = [23, 59, 59, 999, 999, 999];
+        if reject {
+            if !(1..=12).contains(&f[1]) || f[2] < 1 || f[2] > days_in_month(f[0], f[1]) {
+                return Err(Thrown("RangeError: invalid date fields".into()));
+            }
+            for (i, &mx) in maxes.iter().enumerate() {
+                if f[3 + i] < 0 || f[3 + i] > mx {
+                    return Err(Thrown("RangeError: time field out of range".into()));
+                }
+            }
+        } else {
+            // "constrain" clamps only the upper bound; month/day below 1 is a
+            // hard floor that rejects (time fields legitimately clamp up from 0).
+            if f[1] < 1 || f[2] < 1 {
+                return Err(Thrown("RangeError: invalid date fields".into()));
+            }
+            f[1] = f[1].min(12);
+            f[2] = f[2].min(days_in_month(f[0], f[1]));
+            for (i, &mx) in maxes.iter().enumerate() {
+                f[3 + i] = f[3 + i].clamp(0, mx);
+            }
+        }
+        Ok(f)
     }
 
     pub(crate) fn plain_date_time_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
@@ -2306,30 +2344,33 @@ impl<'p> Vm<'p> {
                 let _ = self.read_zdt_options(options, "reject")?;
                 return Ok(self.make_zoned_date_time_raw(ns, off, item.heap_index())?);
             }
-            if matches!(self.heap.get(item.heap_index()), HeapObj::Object(_)) {
-                // The calendar field is resolved (and validated) before the timeZone
-                // requirement, so an invalid calendar is a RangeError even when the
-                // timeZone is absent.
-                self.validate_iso_calendar_field(item)?;
-                let tzv = self.get_prop(item, "timeZone")?;
-                if tzv == Value::UNDEFINED {
+            if self.is_object_value(item)
+                && !matches!(self.heap.get(item.heap_index()), HeapObj::Temporal { .. })
+            {
+                // ToTemporalZonedDateTime: ONE PrepareCalendarFields pass (a Proxy
+                // bag included — the previous HeapObj::Object gate bounced those)
+                // reads calendar then the date/time fields alphabetically with
+                // offset and timeZone at their slots; then the timeZone-required
+                // TypeError; then the disambiguation/offset/overflow options; then
+                // InterpretTemporalDateTimeFields.
+                let bag = self.read_pdt_bag(item, true)?;
+                if bag.tz == Value::UNDEFINED {
                     return Err(Thrown(
                         "TypeError: Temporal.ZonedDateTime.from requires a timeZone property".into(),
                     ));
                 }
                 // ToTemporalTimeZoneIdentifier: a string is parsed, a wrong type
                 // (null/boolean/number/bigint/symbol) is a TypeError — not coerced.
-                let (id, offset) = self.parse_tz_arg(tzv)?;
-                let bag_off = self.validate_bag_offset_field(item)?;
+                let (id, offset) = self.parse_tz_arg(bag.tz)?;
                 let (off_opt, reject) = self.read_zdt_options(options, "reject")?;
-                let f = self.to_plain_date_time_overflow(item, reject)?;
+                let f = Self::finish_pdt_fields(&bag, reject)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
                 // Offset agreement: a bag `offset` is reconciled with the zone's offset
                 // per the `offset` option. zipp's zones carry a single fixed offset, so:
                 // reject → must equal it (else RangeError); use → use the bag offset for
                 // the instant; ignore/prefer → use the zone offset.
-                let eff = match bag_off {
+                let eff = match bag.bag_off {
                     None => offset,
                     Some(b) => match off_opt.as_str() {
                         "use" => b,
@@ -2486,22 +2527,28 @@ impl<'p> Vm<'p> {
     /// a bag carrying a `timeZone`). The flag selects the tighter ±nsMaxInstant epoch
     /// bound (vs the PlainDateTime ±(nsMaxInstant+nsPerDay) bound) for range checks.
     pub(crate) fn relative_to_dt(&mut self, rel: Value) -> Result<([i64; 9], bool), Thrown> {
-        let mut is_zoned = false;
+        let is_zoned = false;
         if rel.is_heap() {
             if matches!(self.heap.get(rel.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
                 return Ok((self.zdt_local(rel.heap_index()), true));
             }
-            // A property bag carrying a `timeZone` is a ZonedDateTime-like: the
-            // time zone is validated (a non-string/non-object is a TypeError, an
-            // invalid string a RangeError), then the wall-clock date/time is the
-            // anchor. (A plain string relativeTo isn't an object, so it skips this.)
-            if self.is_object_value(rel) {
-                let tz = self.get_prop(rel, "timeZone")?;
-                if tz != Value::UNDEFINED {
-                    self.parse_tz_arg(tz)?;
-                    self.validate_bag_offset_field(rel)?;
-                    is_zoned = true;
+            // A property bag is read in ONE PrepareCalendarFields pass (calendar,
+            // then the fields alphabetically with offset and timeZone at their
+            // slots — the old code peeked timeZone FIRST and never read offset).
+            // A bag carrying a timeZone is ZonedDateTime-like: the zone is
+            // validated, and the wall-clock date/time is the anchor. Temporal
+            // instances (PlainDate/PlainDateTime) fall through to the lenient
+            // conversion below, which reads no observable properties on them.
+            if self.is_object_value(rel)
+                && !matches!(self.heap.get(rel.heap_index()), HeapObj::Temporal { .. })
+            {
+                let bag = self.read_pdt_bag(rel, true)?;
+                let zoned = bag.tz != Value::UNDEFINED;
+                if zoned {
+                    self.parse_tz_arg(bag.tz)?;
                 }
+                let f = Self::finish_pdt_fields(&bag, false)?;
+                return Ok((f, zoned));
             }
         }
         // A plain STRING relativeTo (ToRelativeTemporalObject) uses a LOOSER grammar
