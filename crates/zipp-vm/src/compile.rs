@@ -4997,13 +4997,20 @@ impl<'a> FnCompiler<'a> {
     fn build_template_strings(&mut self, quasi: &ox::TemplateLiteral, dst: Reg) -> R<()> {
         let nq = quasi.quasis.len() as u16;
         let save = self.next_reg;
-        // Cooked array → dst.
+        // Cooked array → dst. A quasi with an ILLEGAL escape sequence has no cooked
+        // value (oxc sets `cooked` to None) — in a TAGGED template that element is
+        // `undefined` (only the tag sees it; an untagged template would be a syntax
+        // error), so load undefined rather than masking it as "".
         let cooked_base = self.next_reg;
         for q in &quasi.quasis {
             let r = self.alloc_reg();
-            let cooked = q.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
-            let idx = self.add_string_const(cooked);
-            self.emit(Instr::LoadConst { dst: r, idx });
+            match q.value.cooked.as_ref() {
+                Some(s) => {
+                    let idx = self.add_string_const(s.as_str());
+                    self.emit(Instr::LoadConst { dst: r, idx });
+                }
+                None => self.emit(Instr::LoadUndefined { dst: r }),
+            }
         }
         self.emit(Instr::NewArray { dst, arg_base: cooked_base, argc: nq });
         self.next_reg = save;
