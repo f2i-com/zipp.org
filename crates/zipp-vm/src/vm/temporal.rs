@@ -3248,20 +3248,25 @@ fn is_valid_duration(f: &[f64; 10]) -> bool {
     if est.abs() <= two53 - 16.0 {
         return true;
     }
-    // Ambiguous band. Exact i128 nanosecond total; bail out (reject) if any field
-    // is beyond i64 range, which here can only arise from sign-cancellation (an
-    // invalid mixed-sign duration) and would overflow the i128 products anyway.
-    if f[3..10].iter().any(|x| x.abs() >= 9.0e18) {
-        return false;
+    // Ambiguous band. Exact i128 nanosecond total via checked arithmetic: a SINGLE
+    // large sub-day field (e.g. milliseconds ≈ 9.007e18 ⇒ 9.007e15 s, a valid
+    // duration) has an i128 product well within range, so it must NOT be rejected;
+    // only a genuine i128 overflow (extreme/mixed-sign cancellation) is out of range.
+    let total_ns: Option<i128> = (|| {
+        let mul = |v: f64, scale: i128| (v as i128).checked_mul(scale);
+        let mut acc = mul(f[3], 86_400_000_000_000)?;
+        acc = acc.checked_add(mul(f[4], 3_600_000_000_000)?)?;
+        acc = acc.checked_add(mul(f[5], 60_000_000_000)?)?;
+        acc = acc.checked_add(mul(f[6], 1_000_000_000)?)?;
+        acc = acc.checked_add(mul(f[7], 1_000_000)?)?;
+        acc = acc.checked_add(mul(f[8], 1_000)?)?;
+        acc = acc.checked_add(f[9] as i128)?;
+        Some(acc)
+    })();
+    match total_ns {
+        Some(ns) => ns.unsigned_abs() < 9_007_199_254_740_992u128 * 1_000_000_000,
+        None => false,
     }
-    let total_ns: i128 = (f[3] as i128) * 86_400_000_000_000
-        + (f[4] as i128) * 3_600_000_000_000
-        + (f[5] as i128) * 60_000_000_000
-        + (f[6] as i128) * 1_000_000_000
-        + (f[7] as i128) * 1_000_000
-        + (f[8] as i128) * 1_000
-        + (f[9] as i128);
-    total_ns.unsigned_abs() < 9_007_199_254_740_992u128 * 1_000_000_000
 }
 
 /// Validate the `[...]` annotation suffix of a Temporal ISO string per the
