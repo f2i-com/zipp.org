@@ -2064,11 +2064,21 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_zdt(result_ns, off, id)?))
             }
             "until" | "since" => {
-                // Difference of two ZonedDateTimes (fixed-offset): the difference of
-                // their local wall-clocks. Default largestUnit is "hour".
+                // DifferenceZonedDateTime works in the RECEIVER's zone: re-express
+                // the other operand's exact time at the receiver's offset before
+                // differencing wall-clocks, so cross-zone operands diff by exact
+                // time (diffing each side's own wall-clock made any pair with the
+                // same local time spuriously equal). Default largestUnit is "hour".
                 let other = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let oz = self.zoned_date_time_from(other, Value::UNDEFINED)?;
-                let of = self.zdt_local(oz.heap_index());
+                let of = {
+                    let o_ns = self.zdt_epoch_ns(oz.heap_index()).unwrap_or(0);
+                    let my_off = self.zdt_offset_ns(idx);
+                    let local = o_ns + my_off as i128;
+                    let (oy, om, od) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
+                    let t = ns_to_time(local.rem_euclid(DAY_NS));
+                    [oy, om, od, t[0], t[1], t[2], t[3], t[4], t[5]]
+                };
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 // GetOptionsObject: a defined non-object options bag is a TypeError
                 // (a primitive must not be read for properties / silently ignored).
@@ -2407,6 +2417,19 @@ impl<'p> Vm<'p> {
         let (f, str_offset, id, zone_offset, behaviour) = parse_zdt_string(&s)
             .ok_or_else(|| Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")))?;
         let (off_opt, _reject) = self.read_zdt_options(options, "reject")?;
+        // InterpretISODateTimeOffset step 6 (OPTION behaviour, offset prefer/
+        // reject): CheckISODaysRange rejects a WALL date beyond ±10^8 epoch days
+        // even when the resulting instant is exactly representable (e.g.
+        // '-271821-04-19T23:00-01:00[-01:00]' has epoch == nsMin but wall date
+        // -271821-04-19). Never applies to Z/wall behaviours or use/ignore.
+        if behaviour == 2
+            && matches!(off_opt.as_str(), "prefer" | "reject")
+            && iso_to_epoch_days(f[0], f[1], f[2]).abs() > 100_000_000
+        {
+            return Err(Thrown(
+                "RangeError: ZonedDateTime is outside the representable range".into(),
+            ));
+        }
         let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
             + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
         // Offset agreement (InterpretISODateTimeOffset): a `Z` designator (EXACT) fixes
@@ -4173,7 +4196,14 @@ fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String, i64, i8)> {
             if let Some(zpos) = t.find(['Z', 'z']) {
                 (&t[..zpos], 0i64, 1i8)
             } else if let Some(opos) = t.find(['+', '-']) {
-                (&t[..opos], parse_offset_ns(&t[opos..])? as i64, 2i8)
+                // The offset must satisfy the strict UTC-offset grammar (2-digit
+                // hour, consistent ':'/no-':' groups) — parse_offset_ns alone
+                // strips separators and accepted mixed forms like '+00:0000'.
+                let off_str = &t[opos..];
+                if !valid_offset_string(off_str) {
+                    return None;
+                }
+                (&t[..opos], parse_offset_ns(off_str)? as i64, 2i8)
             } else {
                 (t, tz_offset, 0i8)
             }

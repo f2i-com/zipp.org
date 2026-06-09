@@ -1454,10 +1454,11 @@ pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
                     if frac.is_empty() {
                         return None; // a "," / "." with no fractional digits
                     }
-                    // Sub-unit nanoseconds = frac × unit_secs × 1e9, half-expand
-                    // rounded. Cap the fraction length so the i128 math can't
-                    // overflow (extra digits are sub-nanosecond).
-                    frac.truncate(18);
+                    // TemporalDurationString grammar: at most 9 fraction digits
+                    // (sub-nanosecond digits are a syntax error, not rounding).
+                    if frac.len() > 9 {
+                        return None;
+                    }
                     let l = frac.len() as u32;
                     let numer: i128 = frac.parse().ok()?;
                     let denom: i128 = 10i128.pow(l);
@@ -1468,8 +1469,8 @@ pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
                     let divisors = [60_000_000_000i128, 1_000_000_000, 1_000_000, 1_000, 1];
                     let start = match c {
                         'H' | 'h' => 0,
-                        'M' => 1,
-                        _ => 2, // S
+                        'M' | 'm' => 1, // designators are case-insensitive
+                        _ => 2,         // S
                     };
                     let mut rem = sub_ns;
                     for (k, &div) in divisors.iter().enumerate().skip(start) {
