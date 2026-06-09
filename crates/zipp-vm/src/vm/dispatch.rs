@@ -636,22 +636,24 @@ impl<'p> Vm<'p> {
                     }
 
                     Instr::Lt { dst, a, b } => {
-                        let r = self.cmp_lt(base, a, b)?;
+                        let r = self.cmp_lt(base, a, b, true)?;
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
                     Instr::Le { dst, a, b } => {
-                        let r = self.cmp_le(base, a, b)?;
+                        let r = self.cmp_le(base, a, b, true)?;
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
                     Instr::Gt { dst, a, b } => {
-                        let r = self.cmp_lt(base, b, a)?;
+                        // `a > b` ≡ IsLessThan(b, a, LeftFirst=false): swap registers,
+                        // but the source-left operand `a` must still coerce first.
+                        let r = self.cmp_lt(base, b, a, false)?;
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
                     Instr::Ge { dst, a, b } => {
-                        let r = self.cmp_le(base, b, a)?;
+                        let r = self.cmp_le(base, b, a, false)?;
                         self.set(base, dst, Value::bool(r));
                         ip += 1;
                     }
@@ -2093,7 +2095,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Instr::JumpIfNotLt { a, b, target } => {
-                        let r = self.cmp_lt(base, a, b)?;
+                        let r = self.cmp_lt(base, a, b, true)?;
                         if !r {
                             ip = target as usize;
                         } else {
@@ -2101,7 +2103,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Instr::JumpIfNotLe { a, b, target } => {
-                        let r = self.cmp_le(base, a, b)?;
+                        let r = self.cmp_le(base, a, b, true)?;
                         if !r {
                             ip = target as usize;
                         } else {

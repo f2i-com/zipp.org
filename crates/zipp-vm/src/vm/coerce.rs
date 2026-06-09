@@ -590,17 +590,26 @@ impl<'p> Vm<'p> {
     }
 
     #[inline]
-    pub(crate) fn cmp_lt(&mut self, base: usize, a: u16, b: u16) -> Result<bool, Thrown> {
+    pub(crate) fn cmp_lt(&mut self, base: usize, a: u16, b: u16, left_first: bool) -> Result<bool, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() < vb.as_int());
         }
-        // Abstract relational comparison: ToPrimitive (number hint) both operands
-        // first (`[2] < 10`, `{valueOf(){return 5}} < 10`), then compare two
-        // strings lexicographically, else numerically.
-        let va = self.to_primitive_default(va)?;
-        let vb = self.to_primitive_default(vb)?;
+        // Abstract relational comparison: ToPrimitive (number hint) both operands,
+        // then compare two strings lexicographically, else numerically. The SOURCE
+        // left operand must be coerced first: `<` passes (a,b) with left_first=true;
+        // `>` passes the registers SWAPPED (b,a) with left_first=false, so the
+        // original left operand `b` is ToPrimitive'd before `a` (spec LeftFirst).
+        let (va, vb) = if left_first {
+            let pa = self.to_primitive_default(va)?;
+            let pb = self.to_primitive_default(vb)?;
+            (pa, pb)
+        } else {
+            let pb = self.to_primitive_default(vb)?;
+            let pa = self.to_primitive_default(va)?;
+            (pa, pb)
+        };
         if let Some(o) = self.str_relational(va, vb) {
             return Ok(o.is_lt());
         }
@@ -610,14 +619,23 @@ impl<'p> Vm<'p> {
         Ok(self.to_number(va)? < self.to_number(vb)?)
     }
     #[inline]
-    pub(crate) fn cmp_le(&mut self, base: usize, a: u16, b: u16) -> Result<bool, Thrown> {
+    pub(crate) fn cmp_le(&mut self, base: usize, a: u16, b: u16, left_first: bool) -> Result<bool, Thrown> {
         let va = self.get(base, a);
         let vb = self.get(base, b);
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() <= vb.as_int());
         }
-        let va = self.to_primitive_default(va)?;
-        let vb = self.to_primitive_default(vb)?;
+        // ToPrimitive the SOURCE left operand first (see cmp_lt). `>=` swaps the
+        // registers (b,a) with left_first=false so `b` coerces before `a`.
+        let (va, vb) = if left_first {
+            let pa = self.to_primitive_default(va)?;
+            let pb = self.to_primitive_default(vb)?;
+            (pa, pb)
+        } else {
+            let pb = self.to_primitive_default(vb)?;
+            let pa = self.to_primitive_default(va)?;
+            (pa, pb)
+        };
         if let Some(o) = self.str_relational(va, vb) {
             return Ok(o.is_le());
         }
