@@ -1913,6 +1913,16 @@ impl<'p> Vm<'p> {
                         .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
                         .unwrap_or(false)
             }
+            // A TypedArray: a canonical in-bounds integer index is an own enumerable
+            // element; a non-canonical defineProperty'd key lives in arr_props.
+            HeapObj::TypedArray { .. } => {
+                self.ta_valid_index(obj.heap_index(), key).is_some()
+                    || self
+                        .arr_props
+                        .get(&obj.heap_index())
+                        .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
+                        .unwrap_or(false)
+            }
             // A function's assigned own properties live in `fn_props`.
             HeapObj::Func(_)
             | HeapObj::Closure { .. }

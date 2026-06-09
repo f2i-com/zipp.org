@@ -70,6 +70,10 @@ impl<'p> Vm<'p> {
         let nonenum =
             PropAttr { writable: true, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
         let mut map = ObjMap::new();
+        // `constructor` is installed at prototype creation (before user methods), so
+        // it is the FIRST string key — getOwnPropertyNames lists it after any integer
+        // keys but before the declared methods (e.g. ['1','2','constructor','a','c']).
+        map.define("constructor", obj, nonenum);
         for (k, v) in &methods {
             map.define(k, *v, nonenum);
         }
@@ -92,7 +96,6 @@ impl<'p> Vm<'p> {
                 map.define(k, Value::UNDEFINED, a);
             }
         }
-        map.define("constructor", obj, nonenum);
         let p = self.heap.alloc(HeapObj::Object(map));
         self.prototypes.insert(idx, p);
         // A generator / async-generator FUNCTION's `.prototype` object chains to
