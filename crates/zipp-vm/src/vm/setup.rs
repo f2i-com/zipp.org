@@ -322,6 +322,22 @@ impl<'p> Vm<'p> {
         let map_proto = build(self, &map_methods, None);
         let bool_proto = build(self, &bool_methods, None);
         let date_proto = build(self, &date_methods, None);
+        // `Date.prototype.toGMTString` IS `Date.prototype.toUTCString` — the SAME
+        // function object (the Annex B legacy alias), so they compare === and
+        // toGMTString.name is "toUTCString". `build` installed two distinct
+        // natives; alias the toGMTString slot to the toUTCString value in place
+        // (mirrors the Set keys→values aliasing above).
+        let date_utc_fn = match self.heap.get(date_proto) {
+            HeapObj::Object(p) => p.get("toUTCString"),
+            _ => None,
+        };
+        if let Some(ufn) = date_utc_fn {
+            if let HeapObj::Object(p) = self.heap.get_mut(date_proto) {
+                if let Some(i) = p.pos("toGMTString") {
+                    p.vals[i] = ufn;
+                }
+            }
+        }
         let promise_proto = build(self, &promise_methods, None);
         // Store the proto indices so Map/Set/Date/Promise instances can delegate
         // method-as-value access to them (get_prop), mirroring arr_proto/str_proto.
