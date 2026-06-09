@@ -808,7 +808,7 @@ impl<'p> Vm<'p> {
                     [0i64; 6]
                 };
                 let local = (iso_to_epoch_days(y, m, d) as i128) * DAY_NS + time_to_ns(&time);
-                Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)))
+                Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)?))
             }
             "with" => {
                 self.reject_temporal_like(a0)?;
@@ -1459,7 +1459,7 @@ impl<'p> Vm<'p> {
                 let (id, offset) = self.parse_tz_arg(a0)?;
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS
                     + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
-                Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)))
+                Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)?))
             }
             "with" => {
                 self.reject_temporal_like(a0)?;
@@ -1804,7 +1804,7 @@ impl<'p> Vm<'p> {
                 let local = self.zdt_epoch_ns(idx).unwrap_or(0) + off;
                 let midnight_local = local.div_euclid(DAY_NS) * DAY_NS;
                 let new_ns = midnight_local - off;
-                Ok(Some(self.make_zoned_date_time_raw(new_ns, self.zdt_offset_ns(idx), idx)))
+                Ok(Some(self.make_zoned_date_time_raw(new_ns, self.zdt_offset_ns(idx), idx)?))
             }
             "equals" => {
                 // ToTemporalZonedDateTime casts the argument (string / property bag /
@@ -1824,14 +1824,14 @@ impl<'p> Vm<'p> {
                 let (id, offset) =
                     self.parse_tz_arg(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 let ns = self.zdt_epoch_ns(idx).unwrap_or(0);
-                Ok(Some(self.alloc_zdt(ns, offset, id)))
+                Ok(Some(self.alloc_zdt(ns, offset, id)?))
             }
             "withCalendar" => {
                 // ISO 8601 only — accept "iso8601"/undefined/a calendar-bearing
                 // Temporal, reject a wrong type (TypeError) or other calendar (RangeError).
                 self.validate_calendar_value(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 let (ns, off) = (self.zdt_epoch_ns(idx).unwrap_or(0), self.zdt_offset_ns(idx));
-                Ok(Some(self.make_zoned_date_time_raw(ns, off, idx)))
+                Ok(Some(self.make_zoned_date_time_raw(ns, off, idx)?))
             }
             "withPlainTime" => {
                 let tv = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -1844,7 +1844,7 @@ impl<'p> Vm<'p> {
                 let off = self.zdt_offset_ns(idx);
                 let local = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS + time_to_ns(&time);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
+                Ok(Some(self.alloc_zdt(local - off as i128, off, id)?))
             }
             "add" | "subtract" => {
                 // Fixed-offset zones: apply the same calendar/clock arithmetic as
@@ -1884,7 +1884,7 @@ impl<'p> Vm<'p> {
                         "RangeError: ZonedDateTime result is outside the supported range".into(),
                     ));
                 }
-                Ok(Some(self.alloc_zdt(result_ns, off, id)))
+                Ok(Some(self.alloc_zdt(result_ns, off, id)?))
             }
             "until" | "since" => {
                 // Difference of two ZonedDateTimes (fixed-offset): the difference of
@@ -1979,7 +1979,7 @@ impl<'p> Vm<'p> {
                 let off = self.zdt_offset_ns(idx);
                 let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                Ok(Some(self.alloc_zdt(local - off as i128, off, id)))
+                Ok(Some(self.alloc_zdt(local - off as i128, off, id)?))
             }
             "with" => {
                 // Merge date/time fields from the bag over the current local
@@ -2083,7 +2083,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
-                Ok(Some(self.alloc_zdt(instant, zone_off, id)))
+                Ok(Some(self.alloc_zdt(instant, zone_off, id)?))
             }
             _ => Ok(None),
         }
@@ -2091,7 +2091,12 @@ impl<'p> Vm<'p> {
 
     /// Build a ZonedDateTime from epoch ns + offset, copying the time-zone id of an
     /// existing instance `src` (used by methods that derive a new ZDT in place).
-    pub(crate) fn make_zoned_date_time_raw(&mut self, ns: i128, offset_ns: i64, src: u32) -> Value {
+    pub(crate) fn make_zoned_date_time_raw(&mut self, ns: i128, offset_ns: i64, src: u32) -> Result<Value, Thrown> {
+        if ns.abs() > NS_MAX_INSTANT {
+            return Err(Thrown(
+                "RangeError: ZonedDateTime is outside the representable range".into(),
+            ));
+        }
         let _gc = self.gc_lock_guard();
         let hi = (ns >> 64) as i64;
         let lo = ns as i64;
@@ -2102,7 +2107,7 @@ impl<'p> Vm<'p> {
         if let Some(tz) = self.zdt_tz.get(&src).copied() {
             self.zdt_tz.insert(idx, tz);
         }
-        Value::heap(idx)
+        Ok(Value::heap(idx))
     }
 
     /// `Temporal.ZonedDateTime.from(item[, options])`. From a ZDT instance → a copy;
@@ -2116,7 +2121,7 @@ impl<'p> Vm<'p> {
                 // The disambiguation/offset/overflow options are validated even for a
                 // ZonedDateTime instance (the result is still a copy).
                 let _ = self.read_zdt_options(options, "reject")?;
-                return Ok(self.make_zoned_date_time_raw(ns, off, item.heap_index()));
+                return Ok(self.make_zoned_date_time_raw(ns, off, item.heap_index())?);
             }
             if matches!(self.heap.get(item.heap_index()), HeapObj::Object(_)) {
                 // The calendar field is resolved (and validated) before the timeZone
@@ -2156,7 +2161,7 @@ impl<'p> Vm<'p> {
                         }
                     },
                 };
-                return Ok(self.alloc_zdt(local - eff as i128, offset, id));
+                return Ok(self.alloc_zdt(local - eff as i128, offset, id)?);
             }
         }
         // An Object was handled above; only a String is parseable. Any other value —
@@ -2200,11 +2205,18 @@ impl<'p> Vm<'p> {
                 }
             }
         };
-        Ok(self.alloc_zdt(local - eff as i128, zone_offset, id))
+        Ok(self.alloc_zdt(local - eff as i128, zone_offset, id)?)
     }
 
     /// Allocate a ZonedDateTime from epoch ns, offset, and an (owned) tz id.
-    pub(crate) fn alloc_zdt(&mut self, ns: i128, offset_ns: i64, id: String) -> Value {
+    /// IsValidEpochNanoseconds: an out-of-range instant is a RangeError (so every
+    /// ZDT-producing path is guarded centrally, not per-caller).
+    pub(crate) fn alloc_zdt(&mut self, ns: i128, offset_ns: i64, id: String) -> Result<Value, Thrown> {
+        if ns.abs() > NS_MAX_INSTANT {
+            return Err(Thrown(
+                "RangeError: ZonedDateTime is outside the representable range".into(),
+            ));
+        }
         let hi = (ns >> 64) as i64;
         let lo = ns as i64;
         let idx = self.heap.alloc(HeapObj::Temporal { kind: 7, fields: vec![hi, lo, offset_ns] });
@@ -2213,7 +2225,7 @@ impl<'p> Vm<'p> {
         }
         let idv = self.alloc_str(id);
         self.zdt_tz.insert(idx, idv);
-        Value::heap(idx)
+        Ok(Value::heap(idx))
     }
 
     /// Resolve a time-zone argument (a string id, or an object with a `timeZone`
@@ -2627,7 +2639,7 @@ impl<'p> Vm<'p> {
             }
             "toZonedDateTimeISO" | "toZonedDateTime" => {
                 let (id, offset) = self.parse_tz_arg(a0)?;
-                Ok(Some(self.alloc_zdt(ns, offset, id)))
+                Ok(Some(self.alloc_zdt(ns, offset, id)?))
             }
             "add" | "subtract" => {
                 let dur = self.to_duration(a0)?;

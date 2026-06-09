@@ -3224,7 +3224,7 @@ impl<'p> Vm<'p> {
             NOW_ZONEDDATETIME_ISO => {
                 let (id, offset) = self.now_tz_id(a0)?;
                 let ns = Self::now_epoch_ns();
-                self.alloc_zdt(ns, offset, id)
+                self.alloc_zdt(ns, offset, id)?
             }
             NOW_TIMEZONE_ID => self.alloc_str("UTC".to_string()),
             // Shared Temporal toLocaleString: no Intl — same string as toString,
