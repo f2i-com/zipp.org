@@ -1160,7 +1160,19 @@ impl<'p> Vm<'p> {
                 // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
                 // back to their Symbol values via the prop_key registry.
                 let mut syms: Vec<Value> = Vec::new();
-                if a0.is_heap() {
+                if a0.is_heap() && self.proxy_parts(a0.heap_index()).is_some() {
+                    // A Proxy: drive [[OwnPropertyKeys]] (the ownKeys trap and its
+                    // target-key invariant checks — a violation throws) via
+                    // object_own_keys, then keep only the Symbol keys.
+                    let all = self.object_own_keys(a0)?;
+                    for k in self.array_snapshot(all.heap_index()) {
+                        if k.is_heap()
+                            && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. })
+                        {
+                            syms.push(k);
+                        }
+                    }
+                } else if a0.is_heap() {
                     if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
                         let keys: Vec<String> =
                             m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect();
