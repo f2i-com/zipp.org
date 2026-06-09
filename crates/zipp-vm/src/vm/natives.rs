@@ -3088,12 +3088,20 @@ impl<'p> Vm<'p> {
                 self.make_instant(ns)?
             }
             INST_FROM_EPOCH_MS => {
-                let ns = (self.to_number(a0)? as i128) * 1_000_000;
-                self.make_instant(ns)?
+                // ToNumber (BigInt/Symbol → TypeError) then NumberToBigInt (a
+                // non-integral / non-finite Number → RangeError).
+                let n = self.to_number_strict(a0)?;
+                if !n.is_finite() || n.fract() != 0.0 {
+                    return Err(Thrown("RangeError: epochMilliseconds must be an integer".into()));
+                }
+                self.make_instant((n as i128) * 1_000_000)?
             }
             INST_FROM_EPOCH_SEC => {
-                let ns = (self.to_number(a0)? as i128) * 1_000_000_000;
-                self.make_instant(ns)?
+                let n = self.to_number_strict(a0)?;
+                if !n.is_finite() || n.fract() != 0.0 {
+                    return Err(Thrown("RangeError: epochSeconds must be an integer".into()));
+                }
+                self.make_instant((n as i128) * 1_000_000_000)?
             }
             INST_FROM_EPOCH_NS => {
                 let ns = self.to_bigint(a0)?;
