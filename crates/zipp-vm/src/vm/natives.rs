@@ -8,6 +8,71 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
+    /// OrdinarySetWithOwnDescriptor's receiver tail for Reflect.set when the
+    /// governing descriptor is a writable data property (a TypedArray element
+    /// included) but the Receiver differs from its holder: CreateDataProperty
+    /// on the RECEIVER with the RAW (uncoerced) value. A TypedArray receiver's
+    /// canonical keys instead use its own element semantics (a valid index
+    /// writes the coerced element; anything else refuses without coercing);
+    /// an accessor / non-writable / non-extensible-and-absent receiver own
+    /// descriptor refuses.
+    fn reflect_set_on_receiver(
+        &mut self,
+        receiver: Value,
+        kv: Value,
+        value: Value,
+    ) -> Result<bool, Thrown> {
+        if !self.is_object_value(receiver) {
+            return Ok(false);
+        }
+        let key = self.key_of(kv);
+        let ridx = receiver.heap_index();
+        if matches!(self.heap.get(ridx), HeapObj::TypedArray { .. })
+            && self.is_canonical_numeric_index(&key)
+        {
+            return match self.ta_valid_index(ridx, &key) {
+                Some(i) => {
+                    self.ta_element_set(ridx, i, value)?;
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
+        }
+        let own = match self.heap.get(ridx) {
+            HeapObj::Object(m) => {
+                m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
+            }
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                self.fn_props
+                    .get(&ridx)
+                    .and_then(|m| m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable)))
+            }
+            _ => self
+                .arr_props
+                .get(&ridx)
+                .and_then(|m| m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))),
+        };
+        match own {
+            Some((true, _)) => Ok(false),
+            Some((false, false)) => Ok(false),
+            None => {
+                let ext = match self.heap.get(ridx) {
+                    HeapObj::Object(m) => m.extensible,
+                    _ => self.arr_props.get(&ridx).map_or(true, |m| m.extensible),
+                };
+                if !ext {
+                    return Ok(false);
+                }
+                self.set_index(receiver, kv, value, false)?;
+                Ok(true)
+            }
+            _ => {
+                self.set_index(receiver, kv, value, false)?;
+                Ok(true)
+            }
+        }
+    }
+
     /// The bare name of a callable value, for the `function <name>() { [native
     /// code] }` form of `toString`. Synthetic names (`<arrow>`, `<anonymous>`)
     /// and `Class.method` qualifiers are stripped; unknown → empty.
@@ -1545,27 +1610,27 @@ impl<'p> Vm<'p> {
                 if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
                     return Ok(Value::bool(b));
                 }
-                // TypedArray [[Set]] step ii: a canonical numeric index whose
-                // Receiver is NOT the typed array itself AND which is an out-of-bounds
-                // (invalid) integer index returns true WITHOUT coercing the value. The
-                // same-receiver case falls through to the element write below (which
-                // does coerce + re-check bounds, per TypedArraySetElement).
-                if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. }) {
-                    if let Some(i) = array_index(kv) {
-                        if !self.same_value(a0, receiver)
-                            && i >= self.ta_effective_len(a0.heap_index()).unwrap_or(0)
-                        {
-                            return Ok(Value::bool(true));
+                // TypedArray [[Set]] (10.4.5.5) step 1, for any canonical numeric
+                // key: SameValue(O, Receiver) runs TypedArraySetElement (coerce the
+                // value — observable — then bounds-checked write or silent drop) and
+                // returns true; an altered Receiver with an INVALID index returns
+                // true with NO coercion; a valid index continues OrdinarySet on the
+                // RECEIVER with the RAW value (the element is a writable data prop).
+                if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
+                    && self.is_canonical_numeric_index(&key)
+                {
+                    if self.same_value(a0, receiver) {
+                        match self.ta_valid_index(a0.heap_index(), &key) {
+                            Some(i) => self.ta_element_set(a0.heap_index(), i, value)?,
+                            None => self.ta_coerce_for_set(a0.heap_index(), value)?,
                         }
-                    } else if self.is_canonical_numeric_index(&key)
-                        && !self.same_value(a0, receiver)
-                        && self.ta_valid_index(a0.heap_index(), &key).is_none()
-                    {
-                        // A canonical-but-invalid STRING index ("1.5", "-1", "-0")
-                        // with an altered Receiver: step ii.1 returns true with NO
-                        // value coercion (valueOf must not run).
                         return Ok(Value::bool(true));
                     }
+                    if self.ta_valid_index(a0.heap_index(), &key).is_none() {
+                        return Ok(Value::bool(true));
+                    }
+                    let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+                    return Ok(Value::bool(b));
                 }
                 // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
                 // (target's own, then up the prototype chain). Only ordinary Object
@@ -1573,6 +1638,7 @@ impl<'p> Vm<'p> {
                 // falls back to the simpler target-write below.
                 let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
                 let mut fell_back = false;
+                let mut ta_chain_node: Option<u32> = None;
                 let mut cur = a0;
                 loop {
                     match self.heap.get(cur.heap_index()) {
@@ -1587,6 +1653,12 @@ impl<'p> Vm<'p> {
                                 break;
                             }
                         }
+                        // A TypedArray on the prototype chain ABSORBS canonical
+                        // numeric keys (its [[Set]] governs); handled below.
+                        HeapObj::TypedArray { .. } if self.is_canonical_numeric_index(&key) => {
+                            ta_chain_node = Some(cur.heap_index());
+                            break;
+                        }
                         _ => {
                             fell_back = true;
                             break;
@@ -1597,6 +1669,22 @@ impl<'p> Vm<'p> {
                         break;
                     }
                     cur = p;
+                }
+                if let Some(c) = ta_chain_node {
+                    // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
+                    // TA [[Set]] step 1 as above, with the ORIGINAL receiver.
+                    if self.same_value(Value::heap(c), receiver) {
+                        match self.ta_valid_index(c, &key) {
+                            Some(i) => self.ta_element_set(c, i, value)?,
+                            None => self.ta_coerce_for_set(c, value)?,
+                        }
+                        return Ok(Value::bool(true));
+                    }
+                    if self.ta_valid_index(c, &key).is_none() {
+                        return Ok(Value::bool(true));
+                    }
+                    let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+                    return Ok(Value::bool(b));
                 }
                 let result = if fell_back {
                     let ok = match self.heap.get(a0.heap_index()) {
@@ -1610,7 +1698,35 @@ impl<'p> Vm<'p> {
                             }
                             None => m.extensible,
                         },
-                        _ => true,
+                        // Exotic/callable targets keep defineProperty'd descriptors
+                        // in the arr_props/fn_props side tables — honour them:
+                        // accessor-without-setter and non-writable data reject, a
+                        // NEW named prop on a non-extensible target rejects.
+                        _ => {
+                            let h = a0.heap_index();
+                            let side = match self.heap.get(h) {
+                                HeapObj::Func(_)
+                                | HeapObj::Closure { .. }
+                                | HeapObj::Bound { .. }
+                                | HeapObj::Native(_) => self.fn_props.get(&h),
+                                _ => self.arr_props.get(&h),
+                            };
+                            match side.and_then(|m| {
+                                m.pos(&key).map(|i| {
+                                    (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter)
+                                })
+                            }) {
+                                Some((true, _, setter)) => setter != Value::UNDEFINED,
+                                Some((_, w, _)) => w,
+                                None => {
+                                    if canonical_index_str(&key).is_some() {
+                                        true
+                                    } else {
+                                        side.map_or(true, |m| m.extensible)
+                                    }
+                                }
+                            }
+                        }
                     };
                     if ok {
                         self.set_index(a0, kv, value, false)?;
