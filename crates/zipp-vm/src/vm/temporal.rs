@@ -1902,6 +1902,22 @@ impl<'p> Vm<'p> {
     /// instant is `fields = [ns hi, ns lo, offsetNanoseconds]` and the time-zone id
     /// is held in `zdt_tz` (GC-traced). Stage 1: UTC + numeric-offset zones carry a
     /// real offset; a named zone is accepted with offset 0 (no tz database yet).
+    /// Whether `s` (starting with '+'/'-') is a syntactically valid time-zone
+    /// offset IDENTIFIER: `±HH`, `±HHMM`, or `±HH:MM` — minute precision at
+    /// most (digit-range validation happens in the actual offset parse).
+    fn offset_identifier_shape_ok(s: &str) -> bool {
+        let rest = &s.as_bytes()[1..];
+        match rest.len() {
+            2 | 4 => rest.iter().all(u8::is_ascii_digit),
+            5 => {
+                rest[2] == b':'
+                    && rest[..2].iter().all(u8::is_ascii_digit)
+                    && rest[3..].iter().all(u8::is_ascii_digit)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn make_zoned_date_time(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
         let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?;
@@ -1911,6 +1927,20 @@ impl<'p> Vm<'p> {
         let tzarg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         if tzarg == Value::UNDEFINED {
             return Err(Thrown("TypeError: Temporal.ZonedDateTime requires a time zone".into()));
+        }
+        // The CONSTRUCTOR's time zone is an IDENTIFIER (ParseTimeZoneIdentifier):
+        // a named id or a minute-precision UTC offset. An ISO datetime string
+        // with a bracketed annotation and a sub-minute offset are RangeErrors
+        // here, though both are valid for from()/property-bag timeZone fields
+        // (ToTemporalTimeZoneIdentifier extracts the bracket there).
+        if tzarg.is_heap() && self.heap.is_str_like(tzarg.heap_index()) {
+            let s = self.heap.str_cow(tzarg.heap_index()).unwrap().into_owned();
+            let t = s.trim();
+            if t.contains('[')
+                || (t.starts_with(['+', '-']) && !Self::offset_identifier_shape_ok(t))
+            {
+                return Err(Thrown(format!("RangeError: invalid time zone \"{s}\"")));
+            }
         }
         // ToTemporalTimeZoneIdentifier: a wrong-type time zone is a TypeError.
         let (id, offset_ns) = self.parse_tz_arg(tzarg)?;
