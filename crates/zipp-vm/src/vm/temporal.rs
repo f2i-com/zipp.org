@@ -618,9 +618,12 @@ impl<'p> Vm<'p> {
             }
             if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
-                let y_opt = self.opt_int_field(v, "year")?;
-                let m_opt = self.read_month_field(v)?; // monthCode or month
+                // PrepareTemporalFields reads the fields in ALPHABETICAL order:
+                // day, month, monthCode (inside read_month_field), year — observable
+                // via the property-bag getters' side effects (order-of-operations).
                 let d_opt = self.opt_int_field(v, "day")?;
+                let m_opt = self.read_month_field(v)?; // month then monthCode
+                let y_opt = self.opt_int_field(v, "year")?;
                 if y_opt.is_none() || m_opt.is_none() || d_opt.is_none() {
                     return Err(Thrown("TypeError: PlainDate-like requires year, month, day".into()));
                 }
@@ -1073,21 +1076,30 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid time string '{s}'")));
             }
             if self.is_object_value(v) {
-                let names =
-                    ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
-                let maxes = [23, 59, 59, 999, 999, 999];
+                // PrepareTemporalFields reads fields in ALPHABETICAL order (observable
+                // via getter side effects): hour, microsecond, millisecond, minute,
+                // nanosecond, second — each into its canonical slot (0=hour 1=minute
+                // 2=second 3=ms 4=us 5=ns) with its max.
+                let fields: [(&str, usize, i64); 6] = [
+                    ("hour", 0, 23),
+                    ("microsecond", 4, 999),
+                    ("millisecond", 3, 999),
+                    ("minute", 1, 59),
+                    ("nanosecond", 5, 999),
+                    ("second", 2, 59),
+                ];
                 let mut f = [0i64; 6];
                 let mut any = false;
-                for (i, nm) in names.iter().enumerate() {
+                for &(nm, slot, mx) in &fields {
                     if let Some(x) = self.opt_int_field(v, nm)? {
                         any = true;
                         if reject {
-                            if x < 0 || x > maxes[i] {
+                            if x < 0 || x > mx {
                                 return Err(Thrown(format!("RangeError: {nm} out of range")));
                             }
-                            f[i] = x;
+                            f[slot] = x;
                         } else {
-                            f[i] = x.clamp(0, maxes[i]);
+                            f[slot] = x.clamp(0, mx);
                         }
                     }
                 }
@@ -1289,25 +1301,40 @@ impl<'p> Vm<'p> {
                 self.validate_iso_calendar_field(v)?;
                 let mut f = [0i64; 9];
                 let mut have_date = [false; 3];
-                if let Some(x) = self.opt_int_field(v, "year")? {
-                    f[0] = x;
-                    have_date[0] = true;
-                }
-                if let Some(x) = self.read_month_field(v)? {
-                    // monthCode ("M11") or month
-                    f[1] = x;
-                    have_date[1] = true;
-                }
+                // PrepareTemporalFields reads EVERY field in alphabetical order:
+                // day, hour, microsecond, millisecond, minute, month, monthCode,
+                // nanosecond, second, year (observable via getter side effects).
+                // Slots: 0=year 1=month 2=day 3=hour 4=minute 5=second 6=ms 7=us 8=ns.
                 if let Some(x) = self.opt_int_field(v, "day")? {
                     f[2] = x;
                     have_date[2] = true;
                 }
-                let time_names =
-                    ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
-                for (i, nm) in time_names.iter().enumerate() {
-                    if let Some(x) = self.opt_int_field(v, nm)? {
-                        f[3 + i] = x;
-                    }
+                if let Some(x) = self.opt_int_field(v, "hour")? {
+                    f[3] = x;
+                }
+                if let Some(x) = self.opt_int_field(v, "microsecond")? {
+                    f[7] = x;
+                }
+                if let Some(x) = self.opt_int_field(v, "millisecond")? {
+                    f[6] = x;
+                }
+                if let Some(x) = self.opt_int_field(v, "minute")? {
+                    f[4] = x;
+                }
+                if let Some(x) = self.read_month_field(v)? {
+                    // month then monthCode (alphabetical, inside read_month_field)
+                    f[1] = x;
+                    have_date[1] = true;
+                }
+                if let Some(x) = self.opt_int_field(v, "nanosecond")? {
+                    f[8] = x;
+                }
+                if let Some(x) = self.opt_int_field(v, "second")? {
+                    f[5] = x;
+                }
+                if let Some(x) = self.opt_int_field(v, "year")? {
+                    f[0] = x;
+                    have_date[0] = true;
                 }
                 if !have_date.iter().all(|&b| b) {
                     return Err(Thrown("TypeError: PlainDateTime-like requires year, month, day".into()));
@@ -2684,8 +2711,9 @@ impl<'p> Vm<'p> {
             }
             if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
-                let yv = self.get_prop(v, "year")?;
+                // Alphabetical field order: month, monthCode (read_month_field), year.
                 let m = self.read_month_field(v)?;
+                let yv = self.get_prop(v, "year")?;
                 if yv == Value::UNDEFINED || m.is_none() {
                     return Err(Thrown(
                         "TypeError: PlainYearMonth-like requires year and month".into(),
