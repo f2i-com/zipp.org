@@ -1357,15 +1357,24 @@ impl<'p> Vm<'p> {
                         "TypeError: Promise.withResolvers called on a non-constructor".into(),
                     ));
                 }
-                let p = self.alloc_promise();
-                let resolve = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
-                );
-                let reject = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true }),
-                );
+                // NewPromiseCapability(C): the native Promise builds a native promise
+                // + its resolving functions directly; a subclass / custom C must run
+                // its executor so `resolve`/`reject` are ITS captured functions and
+                // `promise` is the object it produced.
+                let (promise, resolve, reject) = if this == self.promise_ctor_value() {
+                    let p = self.alloc_promise();
+                    let res = Value::heap(
+                        self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
+                    );
+                    let rej = Value::heap(
+                        self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true }),
+                    );
+                    (Value::heap(p), res, rej)
+                } else {
+                    self.new_promise_capability(this)?
+                };
                 let mut map = ObjMap::new();
-                map.set("promise", Value::heap(p));
+                map.set("promise", promise);
                 map.set("resolve", resolve);
                 map.set("reject", reject);
                 Value::heap(self.heap.alloc(HeapObj::Object(map)))
@@ -1374,16 +1383,39 @@ impl<'p> Vm<'p> {
                 if !self.is_constructor(this) {
                     return Err(Thrown("TypeError: Promise.try called on a non-constructor".into()));
                 }
-                let p = self.alloc_promise();
                 let rest: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
-                match self.call_value(a0, Value::UNDEFINED, &rest) {
-                    Ok(v) => self.resolve(p, v),
-                    Err(Thrown(msg)) => {
-                        let e = self.alloc_error_from_message(&msg);
-                        self.reject(p, e);
+                if this == self.promise_ctor_value() {
+                    let p = self.alloc_promise();
+                    match self.call_value(a0, Value::UNDEFINED, &rest) {
+                        Ok(v) => self.resolve(p, v),
+                        Err(Thrown(msg)) => {
+                            // Preserve the actual thrown VALUE, not a reconstructed
+                            // error from its message string.
+                            let e = match self.pending_throw.take() {
+                                Some(v) => v,
+                                None => self.alloc_error_from_message(&msg),
+                            };
+                            self.reject(p, e);
+                        }
                     }
+                    Value::heap(p)
+                } else {
+                    // NewPromiseCapability(C): settle through C's captured resolve/reject.
+                    let (promise, resolve, reject) = self.new_promise_capability(this)?;
+                    match self.call_value(a0, Value::UNDEFINED, &rest) {
+                        Ok(v) => {
+                            self.call_value(resolve, Value::UNDEFINED, &[v])?;
+                        }
+                        Err(Thrown(msg)) => {
+                            let e = match self.pending_throw.take() {
+                                Some(v) => v,
+                                None => self.alloc_error_from_message(&msg),
+                            };
+                            self.call_value(reject, Value::UNDEFINED, &[e])?;
+                        }
+                    }
+                    promise
                 }
-                Value::heap(p)
             }
             // Reflect namespace. apply/construct accept any callable target; the
             // property-reflecting methods require Type(target) === Object (else TypeError).
