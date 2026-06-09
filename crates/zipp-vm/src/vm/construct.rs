@@ -669,14 +669,34 @@ impl<'p> Vm<'p> {
             return self.build_function_kind(args, 3);
         }
         if ci == self.arraybuffer_ctor && ci != 0 {
-            let r = self.build_array_buffer(args)?;
+            // The observable argument coercions run BEFORE newTarget.prototype
+            // is read (OrdinaryCreateFromConstructor), and allocation after both.
+            let (n, max) = self.validate_array_buffer_args(args)?;
             let over = self.newtarget_proto_override(new_target, cv, self.arraybuffer_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
+            if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
+                return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
+            }
+            let buf = self.alloc_array_buffer(n);
+            if let Some(m) = max {
+                self.ab_max.insert(buf, m);
+            }
+            return Ok(self.set_ctor_proto(Value::heap(buf), over));
         }
         if ci == self.sab_ctor && ci != 0 {
-            let r = self.build_shared_array_buffer(args)?;
+            let (n, max) = self.validate_array_buffer_args(args)?;
             let over = self.newtarget_proto_override(new_target, cv, self.sab_proto)?;
-            return Ok(self.set_ctor_proto(r, over));
+            if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
+                return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
+            }
+            let buf = self.alloc_array_buffer(n);
+            if let Some(m) = max {
+                self.ab_max.insert(buf, m);
+            }
+            self.shared_buffers.insert(buf);
+            if self.sab_proto != 0 {
+                self.proto_of.insert(buf, Value::heap(self.sab_proto));
+            }
+            return Ok(self.set_ctor_proto(Value::heap(buf), over));
         }
         if ci == self.disposablestack_ctor && ci != 0 {
             let r = Value::heap(self.alloc_disposable_stack(false));

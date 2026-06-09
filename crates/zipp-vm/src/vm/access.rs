@@ -272,13 +272,14 @@ impl<'p> Vm<'p> {
                 removed |= c.static_getters.len() != gl || c.static_setters.len() != sl;
                 removed
             }
-            // A TypedArray's named/symbol own property lives in arr_props (its
-            // integer indices were handled above — they can't be deleted).
-            HeapObj::TypedArray { .. } => {
-                self.arr_props.get_mut(&idx).map_or(false, |m| m.remove(key))
-            }
             // A function's assigned own property (`delete fn.x`).
-            _ => self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key)),
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key))
+            }
+            // Every other exotic heap kind (TypedArray, DataView, ArrayBuffer,
+            // Map, Set, Date, RegExp, Promise, Boxed, ...) keeps its named/symbol
+            // own properties in arr_props — where define_property put them.
+            _ => self.arr_props.get_mut(&idx).map_or(false, |m| m.remove(key)),
         };
         if removed {
             self.heap.bump_version(idx); // a key was removed → slots shifted (IC)

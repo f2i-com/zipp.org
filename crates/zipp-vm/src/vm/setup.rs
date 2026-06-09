@@ -1205,6 +1205,31 @@ impl<'p> Vm<'p> {
                 .collect();
             let ta_base_proto = build(self, &ta_methods, None);
             self.proto_of.insert(ta_base_proto, Value::heap(obj_proto));
+            // Same-function-object requirements: @@iterator IS values, and
+            // toString IS Array.prototype.toString (the generic array join path
+            // already handles a TypedArray receiver).
+            let ta_values_fn = match self.heap.get(ta_base_proto) {
+                HeapObj::Object(m) => m.get("values"),
+                _ => None,
+            };
+            if let Some(vf) = ta_values_fn {
+                if let HeapObj::Object(p) = self.heap.get_mut(ta_base_proto) {
+                    if let Some(i) = p.pos("@@iterator") {
+                        p.vals[i] = vf;
+                    }
+                }
+            }
+            let arr_tostring = match self.heap.get(self.arr_proto) {
+                HeapObj::Object(p) => p.get("toString"),
+                _ => None,
+            };
+            if let Some(ts) = arr_tostring {
+                if let HeapObj::Object(p) = self.heap.get_mut(ta_base_proto) {
+                    if let Some(i) = p.pos("toString") {
+                        p.vals[i] = ts;
+                    }
+                }
+            }
             self.ta_base_proto = ta_base_proto;
             let ta_base_ctor = build(self, &[], Some(ta_base_proto));
             self.ta_base_ctor = ta_base_ctor;
@@ -1298,8 +1323,17 @@ impl<'p> Vm<'p> {
             self.arraybuffer_proto = arraybuffer_proto;
             let arraybuffer_ctor = build(self, &[("isView", ARRAYBUFFER_ISVIEW)], Some(arraybuffer_proto));
             self.arraybuffer_ctor = arraybuffer_ctor;
+            let ab_tag_attr = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let ab_tag = self.alloc_str("ArrayBuffer".to_string());
             if let HeapObj::Object(m) = self.heap.get_mut(arraybuffer_proto) {
                 m.define("constructor", Value::heap(arraybuffer_ctor), method_attr);
+                m.define("@@toStringTag", ab_tag, ab_tag_attr);
             }
             // SharedArrayBuffer: a parallel to ArrayBuffer (shared buffers reuse the
             // ArrayBuffer representation, flagged in `shared_buffers`). Reuses
@@ -1344,6 +1378,10 @@ impl<'p> Vm<'p> {
                 .collect();
             let dataview_proto = build(self, &dv_methods, None);
             self.proto_of.insert(dataview_proto, Value::heap(obj_proto));
+            let dv_tag = self.alloc_str("DataView".to_string());
+            if let HeapObj::Object(m) = self.heap.get_mut(dataview_proto) {
+                m.define("@@toStringTag", dv_tag, ab_tag_attr);
+            }
             self.dataview_proto = dataview_proto;
             // Register byteLength/maxByteLength/resizable/detached (ArrayBuffer),
             // byteLength/byteOffset/length (%TypedArray%.prototype), and byteLength/

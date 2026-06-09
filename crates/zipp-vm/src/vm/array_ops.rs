@@ -1217,6 +1217,17 @@ impl<'p> Vm<'p> {
             }
             // `Array.prototype.toString()` is `join()` with the default "," sep.
             "join" | "toString" => {
+                // A TypedArray receiver (TypedArray.prototype.toString IS
+                // Array.prototype.toString) goes through this.join, i.e.
+                // %TypedArray%.prototype.join, whose ValidateTypedArray rejects a
+                // detached/out-of-bounds view before any element reads.
+                if matches!(self.heap.get(idx), HeapObj::TypedArray { .. })
+                    && self.ta_effective_len(idx).is_none()
+                {
+                    return Err(Thrown(
+                        "TypeError: TypedArray is detached or out of bounds".into(),
+                    ));
+                }
                 // ToString the separator (undefined -> ","), and ToString each
                 // element — invoking a custom `toString`/`@@toPrimitive`, not the
                 // infallible `display`. (to_js_string short-circuits primitives to

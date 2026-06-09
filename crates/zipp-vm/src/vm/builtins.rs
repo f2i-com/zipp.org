@@ -714,7 +714,9 @@ impl<'p> Vm<'p> {
                         let mut j = i;
                         while j > 0 {
                             let r = self.call_value(cmp, Value::UNDEFINED, &[snap[j - 1], snap[j]])?;
-                            if self.value_num(r) > 0.0 {
+                            // ToNumber on the comparator result (observable on
+                            // objects; abrupt propagates; NaN acts as +0).
+                            if self.to_number_coerce(r)? > 0.0 {
                                 snap.swap(j - 1, j);
                                 j -= 1;
                             } else {
@@ -723,9 +725,16 @@ impl<'p> Vm<'p> {
                         }
                     }
                 } else {
+                    // Default TypedArray sort: ascending with -0 before +0
+                    // (total_cmp) and ALL NaNs last regardless of their sign bit.
                     snap.sort_by(|a, b| {
                         let (x, y) = (self.value_num(*a), self.value_num(*b));
-                        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+                        match (x.is_nan(), y.is_nan()) {
+                            (true, true) => std::cmp::Ordering::Equal,
+                            (true, false) => std::cmp::Ordering::Greater,
+                            (false, true) => std::cmp::Ordering::Less,
+                            (false, false) => x.total_cmp(&y),
+                        }
                     });
                 }
                 Ok(Some(self.ta_build_from(kind, &snap)?))
@@ -867,7 +876,9 @@ impl<'p> Vm<'p> {
                         let mut j = i;
                         while j > 0 {
                             let r = self.call_value(cmp, Value::UNDEFINED, &[snap[j - 1], snap[j]])?;
-                            if self.value_num(r) > 0.0 {
+                            // ToNumber on the comparator result (observable on
+                            // objects; abrupt propagates; NaN acts as +0).
+                            if self.to_number_coerce(r)? > 0.0 {
                                 snap.swap(j - 1, j);
                                 j -= 1;
                             } else {
@@ -876,9 +887,16 @@ impl<'p> Vm<'p> {
                         }
                     }
                 } else {
+                    // Default TypedArray sort: ascending with -0 before +0
+                    // (total_cmp) and ALL NaNs last regardless of their sign bit.
                     snap.sort_by(|a, b| {
                         let (x, y) = (self.value_num(*a), self.value_num(*b));
-                        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+                        match (x.is_nan(), y.is_nan()) {
+                            (true, true) => std::cmp::Ordering::Equal,
+                            (true, false) => std::cmp::Ordering::Greater,
+                            (false, true) => std::cmp::Ordering::Less,
+                            (false, false) => x.total_cmp(&y),
+                        }
                     });
                 }
                 for (i, v) in snap.into_iter().enumerate() {

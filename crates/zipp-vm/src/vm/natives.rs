@@ -3510,6 +3510,22 @@ impl<'p> Vm<'p> {
                     Some(HeapObj::Boxed { value, .. }) if kind != 0 => *value,
                     _ => this,
                 };
+                // TypedArray.prototype.toString IS Array.prototype.toString (one
+                // function object), but a TypedArray receiver goes through
+                // this.join = %TypedArray%.prototype.join, whose ValidateTypedArray
+                // rejects a detached/out-of-bounds view — route it to the TA
+                // implementation rather than the generic array-like materialize.
+                if kind == 0
+                    && m == "toString"
+                    && matches!(
+                        this.is_heap().then(|| self.heap.get(this.heap_index())),
+                        Some(HeapObj::TypedArray { .. })
+                    )
+                {
+                    return Ok(self
+                        .typed_array_method(this.heap_index(), m, args)?
+                        .unwrap_or(Value::UNDEFINED));
+                }
                 // Promise.prototype.then is brand-checked (IsPromise); catch and
                 // finally are generic (they Invoke `this.then`, so an overridden /
                 // non-callable / throwing `this.then`, a thenable receiver, and a

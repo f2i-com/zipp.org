@@ -304,37 +304,43 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
-    /// `new ArrayBuffer(byteLength)`.
-    pub(crate) fn build_array_buffer(&mut self, args: &[Value]) -> Result<Value, Thrown> {
-        let n = match args.first() {
-            Some(&v) if v != Value::UNDEFINED => self.to_number(v)?,
-            _ => 0.0,
-        };
-        if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
-            return Err(Thrown("RangeError: Invalid ArrayBuffer length".into()));
-        }
-        if n > MAX_ARRAY_BUFFER_LEN as f64 {
-            return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
-        }
-        // `maxByteLength` (resizable ArrayBuffer): validated, then recorded so the
-        // buffer is `resizable` and `resize` accepts up to that length.
+    /// The ArrayBuffer/SharedArrayBuffer constructor's observable argument
+    /// coercions, split from allocation so the ctor can run them BEFORE
+    /// OrdinaryCreateFromConstructor reads newTarget.prototype: ToIndex(length)
+    /// (undefined/NaN -> 0, fractional truncates, negative/huge -> RangeError,
+    /// objects run ToPrimitive with abrupt propagation), then the options bag's
+    /// maxByteLength (ToIndex, must be >= length).
+    pub(crate) fn validate_array_buffer_args(
+        &mut self,
+        args: &[Value],
+    ) -> Result<(usize, Option<usize>), Thrown> {
+        let n = self.to_index(args.first().copied().unwrap_or(Value::UNDEFINED))?;
         let mut max_byte_length: Option<usize> = None;
         if let Some(&opt) = args.get(1) {
             if self.is_object_value(opt) {
                 let mbl = self.get_prop(opt, "maxByteLength")?;
                 if mbl != Value::UNDEFINED {
-                    let m = self.to_number(mbl)?;
-                    if !m.is_finite() || m < 0.0 || m.fract() != 0.0 || m > MAX_ARRAY_BUFFER_LEN as f64 {
+                    let m = self.to_index(mbl)?;
+                    if m > MAX_ARRAY_BUFFER_LEN as usize {
                         return Err(Thrown("RangeError: invalid maxByteLength".into()));
                     }
                     if m < n {
                         return Err(Thrown("RangeError: maxByteLength < byteLength".into()));
                     }
-                    max_byte_length = Some(m as usize);
+                    max_byte_length = Some(m);
                 }
             }
         }
-        let buf = self.alloc_array_buffer(n as usize);
+        Ok((n, max_byte_length))
+    }
+
+    /// `new ArrayBuffer(byteLength)`.
+    pub(crate) fn build_array_buffer(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        let (n, max_byte_length) = self.validate_array_buffer_args(args)?;
+        if n > MAX_ARRAY_BUFFER_LEN as usize {
+            return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
+        }
+        let buf = self.alloc_array_buffer(n);
         if let Some(m) = max_byte_length {
             self.ab_max.insert(buf, m);
         }
@@ -599,29 +605,37 @@ impl<'p> Vm<'p> {
                 Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
                 _ => 0,
             };
+            // InitializeTypedArrayFromArrayBuffer order: the offset-alignment
+            // RangeError precedes the length coercion, and the detached-buffer
+            // TypeError (the buffer may have been detached at entry, or by a
+            // ToIndex valueOf above) precedes the byte-length RangeErrors --
+            // detaching clears the data, which would otherwise mask it.
+            if byte_offset % size != 0 {
+                return Err(Thrown("RangeError: invalid TypedArray length/offset".into()));
+            }
+            let explicit: Option<usize> = match args.get(2) {
+                Some(&v) if v != Value::UNDEFINED => Some(self.to_index(v)?),
+                _ => None,
+            };
+            if matches!(self.heap.get(buf), HeapObj::ArrayBuffer { detached: true, .. }) {
+                return Err(Thrown(
+                    "TypeError: Cannot construct a TypedArray on a detached ArrayBuffer".into(),
+                ));
+            }
             let buf_len = self.array_buffer_len(buf);
             // A length-tracking view: no explicit length on a resizable buffer.
-            let explicit_len = matches!(args.get(2), Some(&v) if v != Value::UNDEFINED);
-            let tracking = !explicit_len && self.ab_max.contains_key(&buf);
-            let length = match args.get(2) {
-                Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
-                _ => {
+            let tracking = explicit.is_none() && self.ab_max.contains_key(&buf);
+            let length = match explicit {
+                Some(l) => l,
+                None => {
                     if buf_len < byte_offset || (buf_len - byte_offset) % size != 0 {
                         return Err(Thrown("RangeError: byte length not a multiple of element size".into()));
                     }
                     (buf_len - byte_offset) / size
                 }
             };
-            if byte_offset % size != 0 || byte_offset + length * size > buf_len {
+            if byte_offset + length * size > buf_len {
                 return Err(Thrown("RangeError: invalid TypedArray length/offset".into()));
-            }
-            // InitializeTypedArrayFromArrayBuffer step: the buffer must not be
-            // detached (it may have been at entry, or detached by a ToIndex valueOf
-            // on byteOffset/length above).
-            if matches!(self.heap.get(buf), HeapObj::ArrayBuffer { detached: true, .. }) {
-                return Err(Thrown(
-                    "TypeError: Cannot construct a TypedArray on a detached ArrayBuffer".into(),
-                ));
             }
             let ta = self.alloc_typed_array(buf, kind, byte_offset, length);
             if tracking {
@@ -635,10 +649,23 @@ impl<'p> Vm<'p> {
         // ToIndex (a Symbol/BigInt throws TypeError) below.
         if self.is_object_value(a0) && !a0.is_uninitialized() {
             let src: Vec<Value> = if let Some(src_ta) = self.as_typed_array(a0) {
-                let len = match self.heap.get(src_ta) {
-                    HeapObj::TypedArray { length, .. } => *length,
+                let src_kind = match self.heap.get(src_ta) {
+                    HeapObj::TypedArray { kind, .. } => *kind,
                     _ => 0,
                 };
+                // A BigInt<->Number content-type mismatch is a TypeError, and the
+                // source length is its EFFECTIVE length (a detached/out-of-bounds
+                // view rejects; a length-tracking view follows its buffer).
+                if native::TA_KINDS[src_kind as usize].2 != native::TA_KINDS[kind as usize].2 {
+                    return Err(Thrown(
+                        "TypeError: Cannot construct a TypedArray from a source of a different content type".into(),
+                    ));
+                }
+                let len = self.ta_effective_len(src_ta).ok_or_else(|| {
+                    Thrown(
+                        "TypeError: Cannot construct a TypedArray from an out-of-bounds or detached source".into(),
+                    )
+                })?;
                 (0..len).map(|i| self.ta_element_get(src_ta, i)).collect()
             } else {
                 // A custom iterable (callable `@@iterator`) is iterated; anything
@@ -646,6 +673,13 @@ impl<'p> Vm<'p> {
                 // (read ToLength(`length`), then indices 0..length). The length read
                 // and each element read propagate abrupt completions.
                 let it = self.get_prop(a0, "@@iterator")?;
+                // GetMethod: a defined non-callable @@iterator is a TypeError;
+                // undefined/null take the array-like path.
+                if it != Value::UNDEFINED && it != Value::NULL && !self.is_callable(it) {
+                    return Err(Thrown(
+                        "TypeError: object is not iterable ([Symbol.iterator] is not a function)".into(),
+                    ));
+                }
                 if self.is_callable(it) {
                     self.iterate_to_vec(a0)?
                 } else {
@@ -675,19 +709,12 @@ impl<'p> Vm<'p> {
             }
             return Ok(ta);
         }
-        // new TA(length)
-        let length = if a0 == Value::UNDEFINED {
-            0
-        } else {
-            let n = self.to_number(a0)?;
-            if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
-                return Err(Thrown("RangeError: invalid typed array length".into()));
-            }
-            if n > (MAX_ARRAY_BUFFER_LEN / size as i64) as f64 {
-                return Err(Thrown("RangeError: typed array length exceeds the maximum".into()));
-            }
-            n as usize
-        };
+        // new TA(length): ToIndex (undefined/NaN -> 0, fractional truncates,
+        // negative/too-large -> RangeError, Symbol/BigInt -> TypeError).
+        let length = if a0 == Value::UNDEFINED { 0 } else { self.to_index(a0)? };
+        if length > (MAX_ARRAY_BUFFER_LEN / size as i64) as usize {
+            return Err(Thrown("RangeError: typed array length exceeds the maximum".into()));
+        }
         let buf = self.alloc_array_buffer(length * size);
         Ok(self.alloc_typed_array(buf, kind, 0, length))
     }
