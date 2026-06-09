@@ -413,6 +413,16 @@ impl<'p> Vm<'p> {
         if b.is_bool() {
             return self.loose_eq(a, Value::num(if b.as_bool() { 1.0 } else { 0.0 }));
         }
+        // A Symbol primitive is never loosely equal to a Number here (two Symbols
+        // are both-heap and handled above; Symbol-vs-string is both-heap too). It
+        // must NOT be ToNumber'd — that throws — so short-circuit to false. This
+        // is reached when the object side ToPrimitive'd to a Symbol (e.g.
+        // `0 == {[Symbol.toPrimitive]: () => Symbol()}`).
+        let a_sym = a.is_heap() && matches!(self.heap.get(a.heap_index()), HeapObj::Symbol { .. });
+        let b_sym = b.is_heap() && matches!(self.heap.get(b.heap_index()), HeapObj::Symbol { .. });
+        if a_sym || b_sym {
+            return Ok(false);
+        }
         // number vs string: coerce string to number.
         // string vs object / number vs object: coerce via to_number (objects
         // become NaN here, matching `1 == {}` → false; `"[object Object]"`
