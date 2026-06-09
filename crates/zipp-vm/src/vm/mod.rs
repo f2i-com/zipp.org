@@ -238,6 +238,20 @@ pub struct Vm<'p> {
     /// `next()` drives RegExpExec (honouring a user `exec`) one match at a time,
     /// rather than matchAll eagerly collecting every match up front.
     regexp_string_iters: std::collections::HashMap<u32, (u32, Value, bool, bool)>,
+    /// Monotone counter minting a fresh private brand per class evaluation (1 = first;
+    /// 0 = unbranded).
+    next_private_brand: u64,
+    /// A class method/getter/setter VALUE (and the class VALUE itself, for ctor /
+    /// field-init / static blocks) heap index → the ORDERED lexical private-brand
+    /// CHAIN of its class body: own brand first, then each lexically ENCLOSING
+    /// class's brand. A private access threaded with lexical DEPTH d checks the
+    /// receiver against `chain[d]` — the SPECIFIC declaring class's brand. Pruned by GC.
+    method_brand: std::collections::HashMap<u32, Vec<u64>>,
+    /// Extra private brands installed on a specific INSTANCE that its `map.class`
+    /// chain does not cover — namely a constructor RETURN-OVERRIDE object, which
+    /// receives a class's private fields/brand without becoming an instanceof that
+    /// class. Checked by `instance_has_brand` alongside the class chain. Pruned by GC.
+    instance_brand: std::collections::HashMap<u32, Vec<u64>>,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on

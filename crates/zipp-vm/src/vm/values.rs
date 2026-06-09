@@ -235,6 +235,75 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The ORDERED lexical private-brand chain of the class body currently
+    /// executing — resolved from the running frame's callee (a method/getter/setter
+    /// VALUE, or the class value for the ctor/field-init/static block; both recorded
+    /// in `method_brand` at MakeClass). `None` outside a class body.
+    pub(crate) fn current_private_brands(&self) -> Option<&Vec<u64>> {
+        let callee = self.frames.last()?.callee;
+        if !callee.is_heap() {
+            return None;
+        }
+        self.method_brand.get(&callee.heap_index())
+    }
+
+    /// Whether `receiver` was constructed by a class evaluation carrying `brand`
+    /// (or one of its ancestors) — i.e. the private brand is installed on it.
+    /// Walks the instance's class chain collecting each ClassData.private_brand.
+    pub(crate) fn instance_has_brand(&self, receiver: Value, brand: u64) -> bool {
+        if !receiver.is_heap() {
+            return false;
+        }
+        let mut cur = match self.heap.get(receiver.heap_index()) {
+            HeapObj::Object(m) => m.class,
+            // A static private member's receiver IS the class value itself.
+            HeapObj::Class(_) => Some(receiver.heap_index()),
+            _ => None,
+        };
+        while let Some(cidx) = cur {
+            match self.heap.get(cidx) {
+                HeapObj::Class(c) => {
+                    if c.private_brand == brand {
+                        return true;
+                    }
+                    cur = c.parent;
+                }
+                _ => break,
+            }
+        }
+        // Extra brands installed on a return-override instance (not covered by its
+        // class chain).
+        self.instance_brand.get(&receiver.heap_index()).is_some_and(|bs| bs.contains(&brand))
+    }
+
+    /// Install a class's own private brand on a constructor RETURN-OVERRIDE instance
+    /// — one whose `map.class` chain does not already carry the brand (a normal
+    /// instance is branded via its class link, so this is a no-op for it).
+    pub(crate) fn brand_instance(&mut self, inst: Value, classval: Value) {
+        if !inst.is_heap() || !classval.is_heap() {
+            return;
+        }
+        let own = self.method_brand.get(&classval.heap_index()).and_then(|c| c.first()).copied();
+        if let Some(own) = own {
+            if !self.instance_has_brand(inst, own) {
+                self.instance_brand.entry(inst.heap_index()).or_default().push(own);
+            }
+        }
+    }
+
+    /// Brand-aware private presence: `Some(true/false)` when the accessing class
+    /// body's brand chain is resolvable, `None` when not (the caller keeps its
+    /// textual check). With a lexical `depth` it checks the SPECIFIC declaring
+    /// class's brand (chain[depth]); without one it accepts ANY chain brand (the
+    /// pre-depth foundation behaviour).
+    pub(crate) fn private_brand_ok(&self, receiver: Value, depth: Option<usize>) -> Option<bool> {
+        let chain = self.current_private_brands()?;
+        match depth {
+            Some(d) => chain.get(d).map(|&b| self.instance_has_brand(receiver, b)),
+            None => Some(chain.iter().any(|&b| self.instance_has_brand(receiver, b))),
+        }
+    }
+
     /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`
     /// but is `&mut` so it can dispatch a `has` trap — both when `obj` itself is a
     /// Proxy AND when a Proxy sits in the prototype chain (e.g.

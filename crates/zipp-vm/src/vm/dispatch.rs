@@ -985,6 +985,23 @@ impl<'p> Vm<'p> {
                         let setters = materialize(self, &cd.setters);
                         let static_getters = materialize(self, &cd.static_getters);
                         let static_setters = materialize(self, &cd.static_setters);
+                        // Mint a fresh per-evaluation private brand + build the ORDERED
+                        // lexical brand CHAIN: this class's own brand first, then every
+                        // brand of the class body minting it (the running frame), so a
+                        // private access threaded with lexical DEPTH d resolves
+                        // chain[d] = the specific declaring class's brand.
+                        let private_brand = self.next_private_brand;
+                        self.next_private_brand += 1;
+                        let enclosing = self.current_private_brands().cloned();
+                        let mut lex_brands = vec![private_brand];
+                        if let Some(e) = enclosing {
+                            lex_brands.extend(e);
+                        }
+                        for (_, mv) in methods.iter().chain(getters.iter()).chain(setters.iter()) {
+                            if mv.is_heap() {
+                                self.method_brand.insert(mv.heap_index(), lex_brands.clone());
+                            }
+                        }
                         let mut statics = ObjMap::new();
                         // Static methods are non-enumerable (writable + configurable),
                         // like instance methods. Static *fields* are added later via
@@ -1023,9 +1040,14 @@ impl<'p> Vm<'p> {
                             computed_field_keys: Vec::new(),
                             source: cd.source,
                             ctor_upvalues,
+                            private_brand,
                         }))));
                         // Remember it so `super` in a derived class can reach it.
                         self.class_values[class_id as usize] = Some(v);
+                        // The class value itself carries the lexical brand chain so the
+                        // ctor / field initializers / static blocks (frame.callee = the
+                        // class value) resolve the same brands.
+                        self.method_brand.insert(v.heap_index(), lex_brands);
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -1696,7 +1718,17 @@ impl<'p> Vm<'p> {
                         // regular `in` (and Reflect.has) reports it absent. The
                         // ergonomic brand check `#x in obj` sets `brand` and skips
                         // this filter so it still observes the private element.
-                        let r = if !brand && is_private_key(&self.key_of(k)) {
+                        let r = if brand {
+                            // `#x in obj` ergonomic brand check: present iff the element
+                            // exists textually AND the receiver carries the accessing
+                            // class's brand (textual fallback when none resolvable).
+                            let key = self.key_of(k);
+                            let textual = self.has_property_str(o, &key);
+                            match self.private_brand_ok(o, None) {
+                                Some(b) => textual && b,
+                                None => textual,
+                            }
+                        } else if is_private_key(&self.key_of(k)) {
                             false
                         } else {
                             // Proxy-aware [[HasProperty]]: dispatches a `has` trap
@@ -2500,10 +2532,22 @@ impl<'p> Vm<'p> {
                         // (`obj.#x`) from an object whose class did not declare it
                         // is a TypeError (has_property_str walks instance own fields
                         // + private methods/getters on the class chain).
-                        if is_private_key(&key) && !self.has_property_str(o, &key) {
-                            return Err(Thrown(format!(
-                                "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                            )));
+                        // PrivateFieldGet present iff the element exists textually AND
+                        // (when the accessing class's brand chain is resolvable) the
+                        // receiver carries the declaring class's brand — the textual
+                        // half rejects a wholly-absent member, the brand half rejects a
+                        // same-named member of a DIFFERENT class evaluation.
+                        if is_private_key(&key) {
+                            let textual = self.has_property_str(o, &key);
+                            let present = match self.private_brand_ok(o, None) {
+                                Some(b) => textual && b,
+                                None => textual,
+                            };
+                            if !present {
+                                return Err(Thrown(format!(
+                                    "TypeError: Cannot read private member {key} from an object whose class did not declare it"
+                                )));
+                            }
                         }
                         let r = self.get_prop(o, &key)?;
                         self.set(base, dst, r);
@@ -2529,7 +2573,12 @@ impl<'p> Vm<'p> {
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
-                        if !self.has_property_str(o, &key) {
+                        let textual = self.has_property_str(o, &key);
+                        let present = match self.private_brand_ok(o, None) {
+                            Some(b) => textual && b,
+                            None => textual,
+                        };
+                        if !present {
                             return Err(Thrown(format!(
                                 "TypeError: Cannot write private member {key} to an object whose class did not declare it"
                             )));
@@ -2734,6 +2783,22 @@ impl<'p> Vm<'p> {
                         // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
+                        // PrivateMethodCall brand check (`obj.#m()`): the receiver must
+                        // carry the declaring class's brand, else a TypeError. Gated on
+                        // is_private_key so ordinary calls (push/map/…) only pay a
+                        // leading-'#' test; textual fallback when no brand resolvable.
+                        if is_private_key(key) {
+                            let textual = self.has_property_str(recv, key);
+                            let present = match self.private_brand_ok(recv, None) {
+                                Some(b) => textual && b,
+                                None => textual,
+                            };
+                            if !present {
+                                return Err(Thrown(format!(
+                                    "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+                                )));
+                            }
+                        }
                         // Hot fast path: `arr.push(x)` â€” the most common
                         // per-element array idiom. Append directly, skipping the
                         // try_builtin_method â†’ dispatch_builtin_method â†’ array_method

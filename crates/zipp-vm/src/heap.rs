@@ -297,6 +297,10 @@ pub struct ClassData {
     /// ctor. Empty unless the class is nested in a function and its ctor/fields
     /// close over a local of that function.
     pub ctor_upvalues: Vec<u32>,
+    /// A fresh per-EVALUATION private brand id, minted at MakeClass, giving each
+    /// class evaluation a distinct private-name identity (so two classes that both
+    /// declare `#m` don't collide). 0 = unbranded.
+    pub private_brand: u64,
 }
 
 /// Boxed payload of a [`HeapObj::AsyncState`] (see that variant's docs). Boxed for

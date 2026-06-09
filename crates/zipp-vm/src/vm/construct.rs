@@ -1087,6 +1087,14 @@ impl<'p> Vm<'p> {
             // returns an object/array replaces the instance.
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
+                // The ctor (incl. field initializers) runs in the class body's private
+                // scope: give its function value the class's lexical brand chain so
+                // `this.#x` + classes defined in field initializers resolve.
+                if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
+                    if f.is_heap() {
+                        self.method_brand.insert(f.heap_index(), brands);
+                    }
+                }
                 // `new.target` for the class constructor body (the next frame entered).
                 self.pending_new_target = new_target;
                 let result = self.call_value(f, obj, args);
@@ -1097,6 +1105,8 @@ impl<'p> Vm<'p> {
                 let ret = result?;
                 // Any object return replaces the new instance.
                 if self.is_object_value(ret) {
+                    // A return-override result receives this class's private brand.
+                    self.brand_instance(ret, cv);
                     return Ok(ret);
                 }
                 if parent.is_some() {
@@ -1126,8 +1136,16 @@ impl<'p> Vm<'p> {
             }
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
+                if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
+                    if f.is_heap() {
+                        self.method_brand.insert(f.heap_index(), brands);
+                    }
+                }
                 self.call_value(f, inst, &[])?;
             }
+            // This class's field initializers ran on `inst` — brand it (covers a
+            // return-override instance from the parent chain).
+            self.brand_instance(inst, cv);
             // Clear any super() mark a nested parent ctor left on this instance.
             self.super_called.remove(&inst.heap_index());
             return Ok(inst);
@@ -1567,10 +1585,18 @@ impl<'p> Vm<'p> {
             // becomes the effective instance; a non-object/undefined return keeps obj.
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
+                if let Some(brands) = self.method_brand.get(&cval.heap_index()).cloned() {
+                    if f.is_heap() {
+                        self.method_brand.insert(f.heap_index(), brands);
+                    }
+                }
                 // `new.target` propagates unchanged through super() to the parent ctor.
                 self.pending_new_target = new_target;
                 let r = self.call_value(f, obj, args)?;
-                return Ok(if self.is_object_value(r) { r } else { obj });
+                let result = if self.is_object_value(r) { r } else { obj };
+                // A return-override result receives this class's private brand.
+                self.brand_instance(result, cval);
+                return Ok(result);
             }
             Ok(obj)
         } else {
@@ -1582,12 +1608,20 @@ impl<'p> Vm<'p> {
             }
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
+                if let Some(brands) = self.method_brand.get(&cval.heap_index()).cloned() {
+                    if f.is_heap() {
+                        self.method_brand.insert(f.heap_index(), brands);
+                    }
+                }
                 self.pending_new_target = new_target;
                 let r = self.call_value(f, eff, &[])?;
                 if self.is_object_value(r) {
                     eff = r;
                 }
             }
+            // This class's field initializers ran on `eff` — brand it (covers a
+            // return-override instance produced by the parent chain).
+            self.brand_instance(eff, cval);
             Ok(eff)
         }
     }

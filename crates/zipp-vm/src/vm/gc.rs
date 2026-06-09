@@ -290,6 +290,8 @@ impl Vm<'_> {
         self.ta_tracking.retain(|&k| marks[k as usize]);
         self.dv_tracking.retain(|&k| marks[k as usize]);
         self.regexp_string_iters.retain(|&k, _| marks[k as usize]);
+        self.method_brand.retain(|&k, _| marks[k as usize]);
+        self.instance_brand.retain(|&k, _| marks[k as usize]);
         self.shared_buffers.retain(|&k| marks[k as usize]);
         self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.error_data.retain(|&k| marks[k as usize]);
