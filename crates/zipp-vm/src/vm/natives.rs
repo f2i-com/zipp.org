@@ -1073,12 +1073,26 @@ impl<'p> Vm<'p> {
                         // «len»), then CreateDataPropertyOrThrow each element (mirrors
                         // Array.of). Only a non-constructor `this` is a TypeError.
                         if self.is_constructor(this) {
+                            // Spec order: mapfn validated BEFORE the source is
+                            // touched; the source collects WITHOUT mapping; the
+                            // target is constructed and write-validated; only then
+                            // does the mapper run, interleaved with per-element
+                            // [[Set]] writes (coercion throws propagate; writes to
+                            // a shrunk/detached target silently drop).
+                            let _gc = self.gc_lock_guard();
+                            let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
+                            if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
+                                return Err(Thrown(
+                                    "TypeError: TypedArray.from mapfn is not a function".into(),
+                                ));
+                            }
+                            let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                             let items: Vec<Value> = if id == TA_FROM {
                                 let arr = self.array_from(
                                     Value::UNDEFINED,
                                     a0,
-                                    a1,
-                                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                                    Value::UNDEFINED,
+                                    Value::UNDEFINED,
                                 )?;
                                 match self.heap.get(arr.heap_index()) {
                                     HeapObj::Array(v) => v.clone(),
@@ -1088,29 +1102,46 @@ impl<'p> Vm<'p> {
                                 args.to_vec()
                             };
                             let n = items.len();
-                            let _gc = self.gc_lock_guard();
                             let target = self.construct(this, &[Value::num(n as f64)])?;
-                            // TypedArrayCreate: ValidateTypedArray(result) + length
-                            // guard — the constructor must return a TypedArray that is
-                            // at least the requested length, else TypeError, BEFORE any
-                            // element is written.
-                            if !target.is_heap()
-                                || !matches!(
-                                    self.heap.get(target.heap_index()),
-                                    HeapObj::TypedArray { .. }
-                                )
+                            // TypedArrayCreate: ValidateTypedArray in write mode —
+                            // a non-TypedArray, an immutable-backed result, or one
+                            // shorter than requested is a TypeError BEFORE any
+                            // element coercion or mapper call.
+                            let tidx = match target
+                                .is_heap()
+                                .then(|| self.heap.get(target.heap_index()))
                             {
-                                return Err(Thrown(
-                                    "TypeError: TypedArray.from/of constructor did not return a TypedArray".into(),
-                                ));
-                            }
-                            if self.ta_effective_len(target.heap_index()).unwrap_or(0) < n {
+                                Some(HeapObj::TypedArray { buffer, .. }) => {
+                                    let b = *buffer;
+                                    if self.immutable_buffers.contains(&b) {
+                                        return Err(Thrown(
+                                            "TypeError: TypedArray.from/of constructor returned a TypedArray backed by an immutable ArrayBuffer".into(),
+                                        ));
+                                    }
+                                    target.heap_index()
+                                }
+                                _ => {
+                                    return Err(Thrown(
+                                        "TypeError: TypedArray.from/of constructor did not return a TypedArray".into(),
+                                    ))
+                                }
+                            };
+                            if self.ta_effective_len(tidx).unwrap_or(0) < n {
                                 return Err(Thrown(
                                     "TypeError: TypedArray.from/of constructor returned a TypedArray shorter than the requested length".into(),
                                 ));
                             }
                             for (i, v) in items.into_iter().enumerate() {
-                                self.create_data_property_or_throw(target, i, v)?;
+                                let mv = if mapfn != Value::UNDEFINED {
+                                    self.call_value(
+                                        mapfn,
+                                        this_arg,
+                                        &[v, Value::num(i as f64)],
+                                    )?
+                                } else {
+                                    v
+                                };
+                                self.ta_element_set(tidx, i, mv)?;
                             }
                             return Ok(target);
                         }
@@ -1119,12 +1150,47 @@ impl<'p> Vm<'p> {
                         ));
                     }
                 };
-                let arr = if id == TA_FROM {
-                    self.array_from(Value::UNDEFINED, a0, a1, args.get(2).copied().unwrap_or(Value::UNDEFINED))?
+                // The built-in ctor path follows the same spec order: validate
+                // mapfn, collect the source unmapped, CREATE the target, then run
+                // the mapper interleaved with [[Set]] writes — the mapper can
+                // detach/shrink the (already-existing) result, whose later writes
+                // then silently drop.
+                let _gc = self.gc_lock_guard();
+                let mapfn = if id == TA_FROM { a1 } else { Value::UNDEFINED };
+                if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
+                    return Err(Thrown(
+                        "TypeError: TypedArray.from mapfn is not a function".into(),
+                    ));
+                }
+                let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let items: Vec<Value> = if id == TA_FROM {
+                    let arr = self.array_from(
+                        Value::UNDEFINED,
+                        a0,
+                        Value::UNDEFINED,
+                        Value::UNDEFINED,
+                    )?;
+                    match self.heap.get(arr.heap_index()) {
+                        HeapObj::Array(v) => v.clone(),
+                        _ => Vec::new(),
+                    }
                 } else {
-                    Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())))
+                    args.to_vec()
                 };
-                self.build_typed_array(kind, &[arr])?
+                let n = items.len();
+                let size = native::TA_KINDS[kind as usize].1;
+                let buf = self.alloc_array_buffer(n * size);
+                let target = self.alloc_typed_array(buf, kind, 0, n);
+                let tidx = target.heap_index();
+                for (i, v) in items.into_iter().enumerate() {
+                    let mv = if mapfn != Value::UNDEFINED {
+                        self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
+                    } else {
+                        v
+                    };
+                    self.ta_element_set(tidx, i, mv)?;
+                }
+                target
             }
             // %TypedArray%.prototype accessor getters. The data accessors throw on a
             // non-TypedArray receiver; @@toStringTag returns undefined instead.
