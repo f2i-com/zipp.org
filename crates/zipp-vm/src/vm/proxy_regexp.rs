@@ -445,6 +445,12 @@ impl<'p> Vm<'p> {
             let ctor = self.get_prop(rx, "constructor")?;
             if ctor == Value::UNDEFINED {
                 default_ctor
+            } else if !self.is_object_value(ctor) {
+                // SpeciesConstructor step 5: a defined-but-non-object constructor
+                // (false / "string" / 86 / null) is a TypeError, before @@species.
+                return Err(Thrown(
+                    "TypeError: Symbol.split constructor property is not an object".into(),
+                ));
             } else {
                 let sp = self.get_prop(ctor, "@@species")?;
                 if sp == Value::UNDEFINED || sp == Value::NULL {
