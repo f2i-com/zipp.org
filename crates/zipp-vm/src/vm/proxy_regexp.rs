@@ -315,6 +315,9 @@ impl<'p> Vm<'p> {
                 // primitive (e.g. a string `groups`) is boxed and its properties
                 // (`$<length>` etc.) become readable; ToObject(null) throws.
                 let named_list: Vec<(String, Option<String>)> = if named_defined {
+                    // ToObject(namedCaptures): null throws a TypeError (the public
+                    // Object(null) would return {}, but this is the internal op).
+                    self.require_object_coercible(named_v)?;
                     let obj = self.to_object(named_v)?;
                     let names_v = self.object_own_property_names(obj)?;
                     let key_vals = self.array_snapshot(names_v.heap_index());
