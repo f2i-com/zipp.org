@@ -27,6 +27,12 @@ impl<'p> Vm<'p> {
         };
         if raw.is_empty() || raw.starts_with('<') {
             String::new()
+        } else if raw.contains('[') {
+            // A computed "[Symbol.xxx]" name (optionally "get/set [Symbol.xxx]")
+            // contains a '.' INSIDE the brackets that must NOT be treated as a
+            // namespace-qualifier separator — keep it whole so toString renders
+            // `function [Symbol.match]() { [native code] }` per the spec grammar.
+            raw
         } else {
             raw.rsplit('.').next().unwrap_or(&raw).to_string()
         }
