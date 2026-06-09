@@ -1594,6 +1594,41 @@ impl<'p> Vm<'p> {
         Ok((value, get, set, writable, enumerable, configurable))
     }
 
+    /// SetIntegrityLevel's per-key walk for a Proxy `proxy`, after a successful
+    /// [[PreventExtensions]]: O.[[OwnPropertyKeys]](), then for each key whose
+    /// [[GetOwnProperty]] is not undefined, DefinePropertyOrThrow a PARTIAL
+    /// integrity descriptor — `{configurable:false}` for an accessor or under
+    /// `seal`, `{configurable:false, writable:false}` for a data property under
+    /// `freeze`. Drives the proxy ownKeys / getOwnPropertyDescriptor /
+    /// defineProperty traps (in spec key order) via the existing helpers.
+    pub(crate) fn proxy_set_integrity(&mut self, proxy: Value, freeze: bool) -> Result<(), Thrown> {
+        // The keys Vec holds un-rooted Values across the trap re-entries.
+        let _gc = self.gc_lock_guard();
+        let keys = match self.proxy_own_keys(proxy)? {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        for kv in keys {
+            let key = self.key_of(kv);
+            let cur = self.proxy_gopd(proxy, &key)?;
+            if let Some(desc) = cur {
+                if desc == Value::UNDEFINED {
+                    continue;
+                }
+                let is_accessor =
+                    self.has_own_property(desc, "get") || self.has_own_property(desc, "set");
+                let mut m = ObjMap::new();
+                m.set("configurable", Value::bool(false));
+                if freeze && !is_accessor {
+                    m.set("writable", Value::bool(false));
+                }
+                let idesc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                self.object_define_property(proxy, &key, idesc)?;
+            }
+        }
+        Ok(())
+    }
+
     /// `Object.defineProperty(obj, key, descriptor)` — define/redefine an own
     /// property with explicit attributes (unspecified attrs default to false on a
     /// new property; an existing non-configurable property rejects most changes).

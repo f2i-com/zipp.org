@@ -1234,9 +1234,13 @@ impl<'p> Vm<'p> {
                             "TypeError: {m} 'preventExtensions' trap returned falsish"
                         )));
                     }
-                    if id == OBJ_PREVENT_EXT {
-                        return Ok(o);
+                    // preventExtensions succeeded. freeze/seal also run the per-key
+                    // integrity walk (ownKeys → getOwnPropertyDescriptor →
+                    // defineProperty traps) on the Proxy.
+                    if id != OBJ_PREVENT_EXT {
+                        self.proxy_set_integrity(o, id == OBJ_FREEZE)?;
                     }
+                    return Ok(o);
                 }
                 if o.is_heap() {
                     let idx = o.heap_index();
