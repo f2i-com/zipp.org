@@ -3048,13 +3048,26 @@ impl<'p> Vm<'p> {
         }
         // Temporal.Duration: field getters + sign/blank; methods via the prototype.
         if let HeapObj::Temporal { kind: 0, .. } = self.heap.get(obj.heap_index()) {
-            let f = self.duration_fields(obj.heap_index()).unwrap_or([0; 10]);
+            let f = self.duration_fields(obj.heap_index()).unwrap_or([0.0; 10]);
             if let Some(i) = native::DURATION_FIELDS.iter().position(|n| *n == key) {
-                return Ok(Value::num(f[i] as f64));
+                return Ok(Value::num(f[i]));
             }
             return Ok(match key {
-                "sign" => Value::num(Self::duration_sign(&f) as f64),
-                "blank" => Value::bool(f.iter().all(|&x| x == 0)),
+                "sign" => Value::num(
+                    f.iter()
+                        .map(|&x| {
+                            if x > 0.0 {
+                                1.0
+                            } else if x < 0.0 {
+                                -1.0
+                            } else {
+                                0.0
+                            }
+                        })
+                        .find(|&s| s != 0.0)
+                        .unwrap_or(0.0),
+                ),
+                "blank" => Value::bool(f.iter().all(|&x| x == 0.0)),
                 _ => self.proto_member(self.duration_proto, key),
             });
         }

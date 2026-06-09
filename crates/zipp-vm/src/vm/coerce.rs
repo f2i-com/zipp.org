@@ -1120,9 +1120,10 @@ impl<'p> Vm<'p> {
             match self.heap.get(v.heap_index()) {
                 HeapObj::Proxy { target, .. } => return self.display(*target),
                 HeapObj::Temporal { kind: 0, fields } => {
-                    let mut f = [0i64; 10];
+                    // Duration fields store f64 BITS in the i64 slots.
+                    let mut f = [0f64; 10];
                     for (i, s) in f.iter_mut().enumerate() {
-                        *s = *fields.get(i).unwrap_or(&0);
+                        *s = f64::from_bits(*fields.get(i).unwrap_or(&0) as u64);
                     }
                     duration_to_string(&f)
                 }
@@ -1267,9 +1268,10 @@ impl<'p> Vm<'p> {
                 return self.inspect_nested(t);
             }
             HeapObj::Temporal { kind: 0, fields } => {
-                let mut f = [0i64; 10];
+                // Duration fields store f64 BITS in the i64 slots.
+                let mut f = [0f64; 10];
                 for (i, s) in f.iter_mut().enumerate() {
-                    *s = *fields.get(i).unwrap_or(&0);
+                    *s = f64::from_bits(*fields.get(i).unwrap_or(&0) as u64);
                 }
                 format!("Temporal.Duration <{}>", duration_to_string(&f))
             }

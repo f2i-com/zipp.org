@@ -2964,12 +2964,14 @@ impl<'p> Vm<'p> {
                 self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
             }
             TEMPORAL_DURATION_FROM => {
-                let f = self.to_duration(a0)?;
+                // The EXACT f64 record: from() must store ℝ(𝔽(field)) untouched
+                // by i64 saturation (a 4.5e21-microseconds field survives).
+                let f = self.to_duration_f64(a0)?;
                 self.make_duration(f)
             }
             TEMPORAL_DURATION_COMPARE => {
-                let fa = self.to_duration(a0)?;
-                let fb = self.to_duration(a1)?;
+                let fa = self.to_duration_f64(a0)?;
+                let fb = self.to_duration_f64(a1)?;
                 let opts = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 Value::num(self.duration_compare(fa, fb, opts)?)
             }

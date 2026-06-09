@@ -19,25 +19,39 @@ pub(crate) struct PdtBag {
 }
 
 impl<'p> Vm<'p> {
-    pub(crate) fn make_duration(&mut self, f: [i64; 10]) -> Value {
-        let idx = self.heap.alloc(HeapObj::Temporal { kind: 0, fields: f.to_vec() });
+    /// Duration fields are float64-representable integers per the spec; the
+    /// kind-0 heap record stores each field's f64 BITS in the i64 slots (the
+    /// Vec<i64> shape — and thus GC tracing — is unchanged). Every reader goes
+    /// through duration_fields; a missed raw `fields[i]` read would see bit
+    /// patterns, i.e. obvious garbage, not subtle drift.
+    pub(crate) fn make_duration(&mut self, f: [f64; 10]) -> Value {
+        // Canonicalize -0.0 so sign probes and toString never see it.
+        let bits =
+            f.iter().map(|&x| (if x == 0.0 { 0.0f64 } else { x }).to_bits() as i64).collect();
+        let idx = self.heap.alloc(HeapObj::Temporal { kind: 0, fields: bits });
         if self.duration_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.duration_proto));
         }
         Value::heap(idx)
     }
 
-    pub(crate) fn duration_fields(&self, idx: u32) -> Option<[i64; 10]> {
+    pub(crate) fn duration_fields(&self, idx: u32) -> Option<[f64; 10]> {
         match self.heap.get(idx) {
             HeapObj::Temporal { kind: 0, fields } => {
-                let mut f = [0i64; 10];
+                let mut f = [0f64; 10];
                 for (i, s) in f.iter_mut().enumerate() {
-                    *s = *fields.get(i).unwrap_or(&0);
+                    *s = f64::from_bits(*fields.get(i).unwrap_or(&0) as u64);
                 }
                 Some(f)
             }
             _ => None,
         }
+    }
+
+    /// The interim i64 view of a stored Duration for consumers that haven't
+    /// been widened (saturating symmetrically; see dur_to_i64).
+    pub(crate) fn duration_fields_i64(&self, idx: u32) -> Option<[i64; 10]> {
+        self.duration_fields(idx).map(|f| f.map(Self::dur_to_i64))
     }
 
     /// ToIntegerIfIntegral for a Duration field: a Symbol or BigInt is a TypeError
@@ -94,9 +108,7 @@ impl<'p> Vm<'p> {
         if !is_valid_duration(&ff) {
             return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
         }
-        let f = ff.map(Self::dur_to_i64);
-        self.validate_duration(&f)?;
-        Ok(self.make_duration(f))
+        Ok(self.make_duration(ff))
     }
 
     /// ToTemporalDuration with the spec's EXACT field values: every field is a
@@ -107,7 +119,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn to_duration_f64(&mut self, v: Value) -> Result<[f64; 10], Thrown> {
         if let Some(idx) = (v.is_heap()).then(|| v.heap_index()) {
             if let Some(f) = self.duration_fields(idx) {
-                return Ok(f.map(|x| x as f64));
+                return Ok(f);
             }
             if self.heap.is_str_like(idx) {
                 let s = self.heap.str_cow(idx).unwrap().into_owned();
@@ -188,7 +200,7 @@ impl<'p> Vm<'p> {
             "with" => {
                 // Override the supplied fields (a partial-duration object), reading
                 // them in the spec's alphabetical order.
-                let mut nf = f.map(|x| x as f64);
+                let mut nf = f;
                 let mut any = false;
                 for &(i, name) in native::DURATION_FIELDS_ALPHA.iter() {
                     let pv = self.get_prop(a0, name)?;
@@ -203,8 +215,6 @@ impl<'p> Vm<'p> {
                 if !is_valid_duration(&nf) {
                     return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
                 }
-                let nf = nf.map(Self::dur_to_i64);
-                self.validate_duration(&nf)?;
                 Ok(Some(self.make_duration(nf)))
             }
             "toJSON" => Ok(Some(self.alloc_str(duration_to_string(&f)))),
@@ -253,9 +263,9 @@ impl<'p> Vm<'p> {
                 }
                 // Years/months/weeks (in the value or as the requested unit) need a
                 // calendar anchor; any other unit uses the time span directly.
-                let needs_cal = f[0] != 0
-                    || f[1] != 0
-                    || f[2] != 0
+                let needs_cal = f[0] != 0.0
+                    || f[1] != 0.0
+                    || f[2] != 0.0
                     || matches!(unit.as_str(), "year" | "month" | "week");
                 if needs_cal && anchor.is_none() {
                     return Err(Thrown(
@@ -264,17 +274,23 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if let Some((start, zoned, off)) = anchor {
-                    check_relative_target(start, f, zoned, off, true)?;
+                    check_relative_target(start, &f, zoned, off, true)?;
                     if needs_cal {
-                        return Ok(Some(Value::num(duration_total_relative(f, start, &unit)?)));
+                        // Calendar-relative totals stay on the i64 record (the
+                        // calendar fields are small; exactness lives in the
+                        // day+time paths).
+                        return Ok(Some(Value::num(duration_total_relative(
+                            f.map(Self::dur_to_i64),
+                            start,
+                            &unit,
+                        )?)));
                     }
                     // TotalRelativeDuration with a zoned anchor and unit "day":
                     // NudgeToCalendarUnit materializes the NEXT day boundary
                     // (truncated days + sign) as an instant, which must be
                     // representable even when the result itself is exact.
                     if zoned && unit == "day" {
-                        let end = dt_add_dur(start, f);
-                        let diff_ns = dt_epoch_ns(end) - dt_epoch_ns(start);
+                        let diff_ns = dur_end_epoch_ns(start, &f) - dt_epoch_ns(start);
                         let s: i128 = if diff_ns < 0 { -1 } else { 1 };
                         let mut upper = [0i64; 10];
                         upper[3] = (diff_ns / DAY_NS + s) as i64;
@@ -287,8 +303,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                let total_ns = (f[3] as i128) * DAY_NS
-                    + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
+                let total_ns = dur_day_time_ns(&f);
                 // Correctly-rounded single division of the exact rational (casting
                 // total_ns to f64 first would double-round past 2^53).
                 Ok(Some(Value::num(rational_to_f64(total_ns, unit_ns(&unit)))))
@@ -382,7 +397,7 @@ impl<'p> Vm<'p> {
                 ];
                 let urank = |u: &str| all.iter().position(|&x| x == u).unwrap_or(9);
                 let dur_largest =
-                    all.iter().find(|&&u| f[urank(u)] != 0).copied().unwrap_or("nanosecond");
+                    all.iter().find(|&&u| f[urank(u)] != 0.0).copied().unwrap_or("nanosecond");
                 let largest = lu.unwrap_or_else(|| {
                     if urank(dur_largest) < urank(&smallest) {
                         dur_largest.to_string()
@@ -416,21 +431,29 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if let Some((start, zoned, off)) = anchor {
-                    check_relative_target(start, f, zoned, off, true)?;
+                    check_relative_target(start, &f, zoned, off, true)?;
+                    // Calendar-relative rounding stays on the i64 record; the
+                    // exact range check above already ran on the f64 record.
                     let r = self.round_duration_relative(
-                        f, start, &smallest, &largest, inc, &mode, zoned, off,
+                        f.map(Self::dur_to_i64),
+                        start,
+                        &smallest,
+                        &largest,
+                        inc,
+                        &mode,
+                        zoned,
+                        off,
                     )?;
-                    return Ok(Some(self.make_duration(r)));
+                    return Ok(Some(self.make_duration(r.map(|x| x as f64))));
                 }
                 // No relativeTo: calendar units require one.
                 let cal = |u: &str| matches!(u, "year" | "month" | "week");
-                if f[0] != 0 || f[1] != 0 || f[2] != 0 || cal(&smallest) || cal(&largest) {
+                if f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0 || cal(&smallest) || cal(&largest) {
                     return Err(Thrown(
                         "RangeError: a relativeTo option is required for years, months, or weeks".into(),
                     ));
                 }
-                let total_ns = (f[3] as i128) * DAY_NS
-                    + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
+                let total_ns = dur_day_time_ns(&f);
                 let inc_ns = unit_ns(&smallest) * inc;
                 let rounded = round_increment(total_ns, inc_ns, &mode);
                 let balanced = balance_duration_ns(rounded, &largest)?;
@@ -443,9 +466,9 @@ impl<'p> Vm<'p> {
                 // the true mathematical sum.
                 let other = self.to_duration_f64(a0)?;
                 let sign = if name == "add" { 1i64 } else { -1 };
-                if f[0] != 0
-                    || f[1] != 0
-                    || f[2] != 0
+                if f[0] != 0.0
+                    || f[1] != 0.0
+                    || f[2] != 0.0
                     || other[0] != 0.0
                     || other[1] != 0.0
                     || other[2] != 0.0
@@ -461,16 +484,12 @@ impl<'p> Vm<'p> {
                     + (other[7] as i128) * 1_000_000
                     + (other[8] as i128) * 1_000
                     + (other[9] as i128);
-                let total_ns = (f[3] as i128) * DAY_NS
-                    + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]])
-                    + sign as i128 * o_ns;
-                let existing =
-                    |g: &[i64; 10]| (3..10).filter(|&i| g[i] != 0).map(|i| (i - 3) as i32).min().unwrap_or(6);
+                let total_ns = dur_day_time_ns(&f) + sign as i128 * o_ns;
                 let existing_f =
                     |g: &[f64; 10]| (3..10).filter(|&i| g[i] != 0.0).map(|i| (i - 3) as i32).min().unwrap_or(6);
                 let day_units =
                     ["day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
-                let largest = day_units[existing(&f).min(existing_f(&other)) as usize];
+                let largest = day_units[existing_f(&f).min(existing_f(&other)) as usize];
                 // BalanceDuration → the result must be a valid Duration (its total
                 // time, in seconds, below 2^53); balance_duration_ns enforces it.
                 let balanced = balance_duration_ns(total_ns, largest)?;
@@ -1060,7 +1079,7 @@ impl<'p> Vm<'p> {
                 if name == "since" {
                     f.iter_mut().for_each(|x| *x = -*x);
                 }
-                Ok(Some(self.make_duration(f)))
+                Ok(Some(self.make_duration(f.map(|x| x as f64))))
             }
             "getISOFields" => {
                 let cal = self.alloc_str("iso8601".to_string());
@@ -1842,8 +1861,10 @@ impl<'p> Vm<'p> {
                     balance_duration_ns(rounded, &largest)?
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
                     round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
+                        .map(|x| x as f64)
                 } else {
                     round_datetime_diff_daytime(dt1, df, &smallest, &largest, inc, &eff)
+                        .map(|x| x as f64)
                 };
                 if name == "since" {
                     out.iter_mut().for_each(|x| *x = -*x);
@@ -2236,8 +2257,10 @@ impl<'p> Vm<'p> {
                     balance_duration_ns(rounded, &largest)?
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
                     round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
+                        .map(|x| x as f64)
                 } else {
                     round_datetime_diff_daytime(dt1, df, &smallest, &largest, inc, &eff)
+                        .map(|x| x as f64)
                 };
                 if name == "since" {
                     out.iter_mut().for_each(|x| *x = -*x);
@@ -2766,8 +2789,8 @@ impl<'p> Vm<'p> {
     /// are a RangeError and the remaining day+time span is compared directly.
     pub(crate) fn duration_compare(
         &mut self,
-        fa: [i64; 10],
-        fb: [i64; 10],
+        fa: [f64; 10],
+        fb: [f64; 10],
         opts: Value,
     ) -> Result<f64, Thrown> {
         // GetOptionsObject: a non-undefined options must be an object.
@@ -2789,32 +2812,28 @@ impl<'p> Vm<'p> {
         if fa == fb {
             return Ok(0.0);
         }
-        let tot = |f: &[i64; 10]| -> i128 {
-            (f[3] as i128) * DAY_NS
-                + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]])
-        };
         // When NEITHER duration has a date unit (largest unit below "day"), the
         // comparison is a pure time comparison: the resolved relativeTo (whose
         // parse errors above still throw) is never anchored against, so a
         // boundary anchor must not make a 5-minutes-vs-blank compare throw.
-        if fa[..4].iter().all(|&x| x == 0) && fb[..4].iter().all(|&x| x == 0) {
-            return Ok(order(tot(&fa), tot(&fb)));
+        if fa[..4].iter().all(|&x| x == 0.0) && fb[..4].iter().all(|&x| x == 0.0) {
+            return Ok(order(dur_day_time_ns(&fa), dur_day_time_ns(&fb)));
         }
         if let Some((start, zoned, off)) = start {
             // Both anchored end-points must be representable (lenient on the
             // plain start: compare uses day-granular date arithmetic).
-            check_relative_target(start, fa, zoned, off, false)?;
-            check_relative_target(start, fb, zoned, off, false)?;
-            let e1 = dt_epoch_ns(dt_add_dur(start, fa));
-            let e2 = dt_epoch_ns(dt_add_dur(start, fb));
+            check_relative_target(start, &fa, zoned, off, false)?;
+            check_relative_target(start, &fb, zoned, off, false)?;
+            let e1 = dur_end_epoch_ns(start, &fa);
+            let e2 = dur_end_epoch_ns(start, &fb);
             return Ok(order(e1, e2));
         }
-        if fa[..3].iter().any(|&x| x != 0) || fb[..3].iter().any(|&x| x != 0) {
+        if fa[..3].iter().any(|&x| x != 0.0) || fb[..3].iter().any(|&x| x != 0.0) {
             return Err(Thrown(
                 "RangeError: a relativeTo option is required for years, months, or weeks".into(),
             ));
         }
-        Ok(order(tot(&fa), tot(&fb)))
+        Ok(order(dur_day_time_ns(&fa), dur_day_time_ns(&fb)))
     }
 
     /// `Duration.round` with a relativeTo anchor: round the span `start →
@@ -2869,7 +2888,7 @@ impl<'p> Vm<'p> {
                 day_delta = s as i64;
                 rounded = beyond;
             }
-            let mut out = balance_duration_ns(rounded, "hour")?;
+            let mut out = balance_duration_ns(rounded, "hour")?.map(Self::dur_to_i64);
             out[3] = df[3] + day_delta;
             return Ok(out);
         }
@@ -2877,7 +2896,7 @@ impl<'p> Vm<'p> {
             // A day-or-time largestUnit is a pure nanosecond span: round it, balance.
             let total_ns = dt_epoch_ns(end) - dt_epoch_ns(start);
             let rounded = round_increment(total_ns, unit_ns(smallest) * inc, mode);
-            balance_duration_ns(rounded, largest)
+            Ok(balance_duration_ns(rounded, largest)?.map(Self::dur_to_i64))
         } else if matches!(smallest, "year" | "month" | "week") {
             // Calendar largestUnit + calendar smallestUnit → NudgeToCalendarUnit.
             round_relative_datetime_diff(start, end, smallest, largest, inc, mode)
@@ -3554,7 +3573,7 @@ impl<'p> Vm<'p> {
                 } else {
                     f[1] = round_increment(total_months as i128, inc, &mode) as i64;
                 }
-                Ok(Some(self.make_duration(f)))
+                Ok(Some(self.make_duration(f.map(|x| x as f64))))
             }
             "toPlainDate" => {
                 let day = self.opt_int_field(a0, "day")?.ok_or_else(|| {
@@ -4138,24 +4157,47 @@ fn dt_epoch_ns(dt: [i64; 9]) -> i128 {
 /// exclusive ISODateTimeWithinLimits bound and must throw before any arithmetic.
 fn check_relative_target(
     start: [i64; 9],
-    f: [i64; 10],
+    f: &[f64; 10],
     is_zoned: bool,
     offset_ns: i64,
     strict_plain_start: bool,
 ) -> Result<(), Thrown> {
-    let end = dt_add_dur(start, f);
+    let end_ns = dur_end_epoch_ns(start, f);
     let ok = if is_zoned {
-        (dt_epoch_ns(end) - offset_ns as i128).abs() <= NS_MAX_INSTANT
+        (end_ns - offset_ns as i128).abs() <= NS_MAX_INSTANT
     } else {
         let start_ok = !strict_plain_start
-            || f.iter().all(|&x| x == 0)
+            || f.iter().all(|&x| x == 0.0)
             || dt_epoch_ns(start).abs() < NS_MAX_INSTANT + DAY_NS;
-        start_ok && dt_epoch_ns(end).abs() <= NS_MAX_INSTANT + DAY_NS
+        start_ok && end_ns.abs() <= NS_MAX_INSTANT + DAY_NS
     };
     if !ok {
         return Err(Thrown("RangeError: Temporal result is outside the representable range".into()));
     }
     Ok(())
+}
+
+/// Exact i128 nanosecond total of the day+time portion of an f64 duration
+/// record (integer-valued f64 → i128 truncation is exact; the max legal field,
+/// ~9.007e24 ns, is far below 2^127).
+fn dur_day_time_ns(f: &[f64; 10]) -> i128 {
+    (f[3] as i128) * DAY_NS
+        + (f[4] as i128) * 3_600_000_000_000
+        + (f[5] as i128) * 60_000_000_000
+        + (f[6] as i128) * 1_000_000_000
+        + (f[7] as i128) * 1_000_000
+        + (f[8] as i128) * 1_000
+        + (f[9] as i128)
+}
+
+/// The epoch-ns of `start + duration` with EXACT day+time arithmetic: the
+/// calendar part (y/mo/w, each below 2^32 by IsValidDuration so `as i64` is
+/// exact) goes through date math, the day+time portion adds in i128 — a huge
+/// sub-second field must not saturate through an i64 conversion.
+fn dur_end_epoch_ns(start: [i64; 9], f: &[f64; 10]) -> i128 {
+    let cal_end =
+        dt_add_dur(start, [f[0] as i64, f[1] as i64, f[2] as i64, 0, 0, 0, 0, 0, 0, 0]);
+    dt_epoch_ns(cal_end) + dur_day_time_ns(f)
 }
 
 /// `nsMaxInstant` — the inclusive epoch-nanosecond bound of `Temporal.Instant`

@@ -972,10 +972,10 @@ pub(crate) fn is_valid_duration(f: &[f64; 10]) -> bool {
 /// satisfy IsValidDuration (total time below 2^53 seconds), else RangeError.
 /// The lower components are exact (each < 1000/60/24). The previous `as i64`
 /// cast WRAPPED on overflow, letting out-of-range totals masquerade as valid.
-pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> Result<[i64; 10], Thrown> {
-    let sign = total_ns.signum();
+pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> Result<[f64; 10], Thrown> {
+    let sign = total_ns.signum() as f64;
     let mut n = total_ns.abs();
-    let mut f = [0i64; 10];
+    let mut f = [0f64; 10];
     // (field index, unit size in ns) from day down to nanosecond.
     let units = [
         (3usize, DAY_NS),
@@ -995,29 +995,21 @@ pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> Result<[i64;
         "microsecond" => 5,
         _ => 6, // nanosecond
     };
-    let mut overflow = false;
     for (k, &(slot, sz)) in units[start..].iter().enumerate() {
         let q = n / sz;
         n %= sz;
         if k == 0 {
-            // i128→f64 is correctly rounded, giving exactly ℝ(𝔽(q)).
-            let qf = q as f64;
-            // Interim guard while Duration fields are stored as i64: a valid
-            // magnitude beyond i64 (only reachable for sub-second largest
-            // units) throws rather than silently wrapping.
-            if qf >= i64::MAX as f64 {
-                overflow = true;
-                break;
-            }
-            f[slot] = (qf as i64) * sign as i64;
+            // The largest (uncapped) component stores ℝ(𝔽(q)) — i128→f64 is
+            // correctly rounded. Lower components are exact (< 1000/60/24).
+            f[slot] = (q as f64) * sign;
         } else {
-            f[slot] = q as i64 * sign as i64;
+            f[slot] = q as f64 * sign;
         }
     }
     // IsValidDuration on the ROUNDED components: the f64 rounding of the
     // largest field can land exactly on the 2^53-seconds limit even when the
     // exact total was just below it.
-    if overflow || !is_valid_duration(&std::array::from_fn(|i| f[i] as f64)) {
+    if !is_valid_duration(&f) {
         return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
     }
     Ok(f)
@@ -1274,7 +1266,7 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
 
 /// ISO-8601 serialization of a Temporal.Duration (`P1Y2M3DT4H5.5S`). ms/us/ns
 /// fold into fractional seconds. All-zero → "PT0S".
-pub(crate) fn duration_to_string(f: &[i64; 10]) -> String {
+pub(crate) fn duration_to_string(f: &[f64; 10]) -> String {
     // The auto-precision path never rounds, so a duration that was valid at
     // construction can never overflow here — fall back defensively to "PT0S".
     duration_to_string_opts(f, -1, "trunc").unwrap_or_else(|| "PT0S".to_string())
@@ -1291,9 +1283,23 @@ pub(crate) fn duration_to_string(f: &[i64; 10]) -> String {
 /// never balance past days into weeks/months/years. The balanced result is
 /// re-validated against IsValidDuration's `abs < 2^53 s` time bound; `None`
 /// signals the caller to throw a RangeError.
-pub(crate) fn duration_to_string_opts(f: &[i64; 10], digits: i32, mode: &str) -> Option<String> {
-    let sign = f.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0);
-    let a: Vec<i128> = f.iter().map(|x| (*x as i128).abs()).collect();
+pub(crate) fn duration_to_string_opts(f: &[f64; 10], digits: i32, mode: &str) -> Option<String> {
+    let sign = f
+        .iter()
+        .map(|&x| {
+            if x > 0.0 {
+                1
+            } else if x < 0.0 {
+                -1
+            } else {
+                0
+            }
+        })
+        .find(|&s| s != 0)
+        .unwrap_or(0);
+    // Integer-valued f64 → i128 is exact (the max legal field, ~9.007e24 ns,
+    // is far below 2^127).
+    let a: Vec<i128> = f.iter().map(|&x| x.abs() as i128).collect();
     let (y, mo, w, mut d) = (a[0], a[1], a[2], a[3]);
     // RoundTimeDuration + balancing run only when the precision actually rounds —
     // i.e. precision.[[Unit]] ≠ "nanosecond" OR increment ≠ 1 ns, which is exactly
