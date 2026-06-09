@@ -441,10 +441,12 @@ fn fmt_precision(n: f64, p: usize) -> String {
     // Round to p significant figures via exponential form, then read the exponent.
     let exp_str = format!("{a:.*e}", p - 1);
     let epos = exp_str.find('e').unwrap();
-    let mant: f64 = exp_str[..epos].parse().unwrap_or(a);
     let exp: i32 = exp_str[epos + 1..].parse().unwrap_or(0);
     let body = if exp < -6 || exp >= p as i32 {
-        let m = format!("{mant:.*}", p - 1);
+        // The mantissa substring is ALREADY rounded to p significant figures by
+        // the `{:.*e}` formatter — use it directly. Reparsing it into an f64 and
+        // reformatting re-introduces a rounding error (1.2345e27 → 1.2344999…e27).
+        let m = &exp_str[..epos];
         let sign = if exp < 0 { "-" } else { "+" };
         format!("{m}e{sign}{}", exp.abs())
     } else {
