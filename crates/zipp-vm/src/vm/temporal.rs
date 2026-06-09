@@ -507,19 +507,31 @@ impl<'p> Vm<'p> {
         // then roundingMode, then smallestUnit — casting each (the observable
         // get/.toString sequence the order-of-operations tests assert) before applying
         // precedence. smallestUnit, when present, wins over fractionalSecondDigits, but
-        // fsd's read+cast+validation still occurs first.
+        // fsd's read+cast+validation still occurs first. smallestUnit is the LAST
+        // option here, so class-validating right after its read is observably correct;
+        // ZDT/Instant toString read more options in between and compose the pieces.
+        let fsd = self.read_fsd(options)?;
+        let mode = self.read_rounding_mode_opt(options)?;
+        let su = self.read_tostring_unit_token(options)?;
+        let (unit, digits, omit) = Self::tostring_precision(su.as_deref(), fsd)?;
+        Ok((unit, digits, omit, mode))
+    }
+
+    /// GetTemporalFractionalSecondDigitsOption: `auto`/undefined → (1ns, -1,
+    /// trim-zeros); 0..9 → fixed digits. Caller guarantees an object bag.
+    fn read_fsd(&mut self, options: Value) -> Result<(i128, i32, bool), Thrown> {
         let fsd_v = self.get_prop(options, "fractionalSecondDigits")?;
-        let fsd_result: (i128, i32, bool) = if fsd_v == Value::UNDEFINED {
-            (1, -1, false)
+        if fsd_v == Value::UNDEFINED {
+            Ok((1, -1, false))
         } else if !fsd_v.is_number() {
             // A string/null/boolean/bigint/object is ToString'd and must be "auto"
             // (a Symbol throws TypeError inside to_js_string).
             if self.to_js_string(fsd_v)? == "auto" {
-                (1, -1, false)
+                Ok((1, -1, false))
             } else {
-                return Err(Thrown(
+                Err(Thrown(
                     "RangeError: fractionalSecondDigits must be 'auto' or 0..9".into(),
-                ));
+                ))
             }
         } else {
             // A genuine Number is floored into 0..9 (GetStringOrNumberOption).
@@ -531,9 +543,13 @@ impl<'p> Vm<'p> {
             if !(0..=9).contains(&n) {
                 return Err(Thrown("RangeError: fractionalSecondDigits out of range".into()));
             }
-            (10i128.pow(9 - n as u32), n as i32, false)
-        };
-        let mode = self.opt_string(
+            Ok((10i128.pow(9 - n as u32), n as i32, false))
+        }
+    }
+
+    /// options.roundingMode for the toString paths (default "trunc").
+    fn read_rounding_mode_opt(&mut self, options: Value) -> Result<String, Thrown> {
+        self.opt_string(
             options,
             "roundingMode",
             "trunc",
@@ -541,25 +557,56 @@ impl<'p> Vm<'p> {
                 "ceil", "floor", "trunc", "expand", "halfCeil", "halfFloor", "halfTrunc",
                 "halfEven", "halfExpand",
             ],
-        )?;
+        )
+    }
+
+    /// Read options.smallestUnit as a unit TOKEN: any real Temporal unit is
+    /// accepted here (garbage strings RangeError at read); whether the unit
+    /// CLASS is allowed for a time-style toString is deferred to
+    /// [`Self::tostring_precision`], after any later options are read (the
+    /// options-read-before-algorithmic-validation ordering).
+    fn read_tostring_unit_token(&mut self, options: Value) -> Result<Option<String>, Thrown> {
         let su_v = self.get_prop(options, "smallestUnit")?;
-        if su_v != Value::UNDEFINED {
-            let su = normalize_unit(&self.to_js_string(su_v)?, "");
-            let (unit, digits, omit) = match su.as_str() {
-                "minute" => (60_000_000_000i128, 0, true),
-                "second" => (1_000_000_000, 0, false),
-                "millisecond" => (1_000_000, 3, false),
-                "microsecond" => (1_000, 6, false),
-                "nanosecond" => (1, 9, false),
-                _ => {
-                    return Err(Thrown(format!(
-                        "RangeError: invalid smallestUnit for toString: {su}"
-                    )))
-                }
-            };
-            return Ok((unit, digits, omit, mode));
+        if su_v == Value::UNDEFINED {
+            return Ok(None);
         }
-        Ok((fsd_result.0, fsd_result.1, fsd_result.2, mode))
+        let su = normalize_unit(&self.to_js_string(su_v)?, "");
+        if !matches!(
+            su.as_str(),
+            "year"
+                | "month"
+                | "week"
+                | "day"
+                | "hour"
+                | "minute"
+                | "second"
+                | "millisecond"
+                | "microsecond"
+                | "nanosecond"
+        ) {
+            return Err(Thrown(format!("RangeError: invalid smallestUnit for toString: {su}")));
+        }
+        Ok(Some(su))
+    }
+
+    /// ToSecondsStringPrecision unit-class application: minute..nanosecond are
+    /// valid toString smallest units (minute omits seconds); a date unit or
+    /// "hour" is a RangeError. None falls back to fractionalSecondDigits.
+    fn tostring_precision(
+        su: Option<&str>,
+        fsd: (i128, i32, bool),
+    ) -> Result<(i128, i32, bool), Thrown> {
+        match su {
+            None => Ok(fsd),
+            Some("minute") => Ok((60_000_000_000, 0, true)),
+            Some("second") => Ok((1_000_000_000, 0, false)),
+            Some("millisecond") => Ok((1_000_000, 3, false)),
+            Some("microsecond") => Ok((1_000, 6, false)),
+            Some("nanosecond") => Ok((1, 9, false)),
+            Some(u) => {
+                Err(Thrown(format!("RangeError: invalid smallestUnit for toString: {u}")))
+            }
+        }
     }
 
     /// The calendar annotation suffix for a toString() per the `calendarName`
@@ -823,18 +870,29 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.make_plain_date(y, m, d)?))
             }
             "toZonedDateTime" => {
-                let (id, offset) = self.parse_tz_arg(a0)?;
-                let time = if a0.is_heap()
-                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Object(_))
-                {
-                    let pt = self.get_prop(a0, "plainTime")?;
-                    if pt == Value::UNDEFINED {
-                        [0i64; 6]
+                // Spec item handling: an Object item (incl. a Proxy bag — gating on
+                // HeapObj::Object alone missed those) yields timeZone then plainTime
+                // via observable Gets; anything else is itself the time-zone-like.
+                let (id, offset, time) = if self.is_object_value(a0) {
+                    let tzv = self.get_prop(a0, "timeZone")?;
+                    if tzv == Value::UNDEFINED {
+                        // No timeZone property: the item itself is the
+                        // time-zone-like (a ZonedDateTime carries its zone).
+                        let (id, offset) = self.parse_tz_arg(a0)?;
+                        (id, offset, [0i64; 6])
                     } else {
-                        self.to_plain_time(pt)?
+                        let (id, offset) = self.parse_tz_arg(tzv)?;
+                        let pt = self.get_prop(a0, "plainTime")?;
+                        let time = if pt == Value::UNDEFINED {
+                            [0i64; 6]
+                        } else {
+                            self.to_plain_time(pt)?
+                        };
+                        (id, offset, time)
                     }
                 } else {
-                    [0i64; 6]
+                    let (id, offset) = self.parse_tz_arg(a0)?;
+                    (id, offset, [0i64; 6])
                 };
                 let local = (iso_to_epoch_days(y, m, d) as i128) * DAY_NS + time_to_ns(&time);
                 Ok(Some(self.alloc_zdt(local - offset as i128, offset, id)?))
@@ -1196,15 +1254,22 @@ impl<'p> Vm<'p> {
             }
             "with" => {
                 self.reject_temporal_like(a0)?;
-                let names =
-                    ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+                // PrepareTemporalFields reads ALPHABETICALLY (observable getters,
+                // slot-mapped to [h,mi,s,ms,us,ns]) BEFORE the options bag.
+                let fields: [(&str, usize); 6] = [
+                    ("hour", 0),
+                    ("microsecond", 4),
+                    ("millisecond", 3),
+                    ("minute", 1),
+                    ("nanosecond", 5),
+                    ("second", 2),
+                ];
                 let maxes = [23, 59, 59, 999, 999, 999];
-                // Read all the time fields (observable getters) BEFORE the options bag.
                 let mut raw: [Option<i64>; 6] = [None; 6];
                 let mut any = false;
-                for (i, nm) in names.iter().enumerate() {
+                for &(nm, slot) in &fields {
                     if let Some(x) = self.opt_int_field(a0, nm)? {
-                        raw[i] = Some(x);
+                        raw[slot] = Some(x);
                         any = true;
                     }
                 }
@@ -1450,8 +1515,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_str(s)))
             }
             "toString" => {
-                let (unit, digits, omit, mode) = self.time_precision(a0)?;
+                // Options read alphabetically: calendarName precedes the
+                // fractionalSecondDigits/roundingMode/smallestUnit triplet;
+                // smallestUnit is last, so time_precision's read-time unit-class
+                // RangeError is observably in the right place for PlainDateTime.
                 let suf = self.calendar_name_suffix(a0)?;
+                let (unit, digits, omit, mode) = self.time_precision(a0)?;
                 let rounded = round_increment(time_to_ns(&time), unit, &mode);
                 let carry = rounded.div_euclid(DAY_NS) as i64;
                 let t = ns_to_time(rounded.rem_euclid(DAY_NS));
@@ -2091,33 +2160,43 @@ impl<'p> Vm<'p> {
                 let bag = args.first().copied().unwrap_or(Value::UNDEFINED);
                 self.reject_temporal_like(bag)?;
                 let mut f = self.zdt_local(idx);
-                let names = [
-                    "year", "month", "day", "hour", "minute", "second", "millisecond",
-                    "microsecond", "nanosecond",
-                ];
+                // PrepareCalendarFields reads ALPHABETICALLY: day, hour, microsecond,
+                // millisecond, minute, month+monthCode, nanosecond, offset, second,
+                // year — slot-mapped onto the local wall-clock [y,mo,d,h,mi,s,ms,us,ns].
+                // The month slot goes through read_month_field_raw so monthCode is
+                // honoured, month/monthCode agreement is enforced, and a calendar-
+                // invalid code is deferred until after the options bag is read.
                 let mut month_valid = true;
                 let mut any = false;
-                for (i, nm) in names.iter().enumerate() {
-                    // The month slot goes through read_month_field_raw so monthCode is
-                    // honoured, month/monthCode agreement is enforced, and a calendar-
-                    // invalid code is deferred until after the options bag is read.
-                    let v = if i == 1 {
-                        self.read_month_field_raw(bag)?.map(|(mm, valid)| {
+                let mut read_slot = |vm: &mut Self, nm: &str, slot: usize, f: &mut [i64; 9], any: &mut bool| -> Result<(), Thrown> {
+                    let v = if slot == 1 {
+                        vm.read_month_field_raw(bag)?.map(|(mm, valid)| {
                             month_valid = valid;
                             mm
                         })
                     } else {
-                        self.opt_int_field(bag, nm)?
+                        vm.opt_int_field(bag, nm)?
                     };
                     if let Some(x) = v {
-                        f[i] = x;
-                        any = true;
+                        f[slot] = x;
+                        *any = true;
                     }
-                }
-                // Read and validate the bag's `offset` field (a bad string is a
-                // RangeError, a non-string a TypeError); its presence also satisfies the
+                    Ok(())
+                };
+                read_slot(self, "day", 2, &mut f, &mut any)?;
+                read_slot(self, "hour", 3, &mut f, &mut any)?;
+                read_slot(self, "microsecond", 7, &mut f, &mut any)?;
+                read_slot(self, "millisecond", 6, &mut f, &mut any)?;
+                read_slot(self, "minute", 4, &mut f, &mut any)?;
+                read_slot(self, "month", 1, &mut f, &mut any)?;
+                read_slot(self, "nanosecond", 8, &mut f, &mut any)?;
+                // The bag's `offset` field sits at its alphabetical slot (after
+                // nanosecond, before second); a bad string is a RangeError, a
+                // non-string a TypeError. Its presence also satisfies the
                 // "at least one recognized property" requirement.
                 let bag_off = self.validate_bag_offset_field(bag)?;
+                read_slot(self, "second", 5, &mut f, &mut any)?;
+                read_slot(self, "year", 0, &mut f, &mut any)?;
                 if !any && bag_off.is_none() {
                     return Err(Thrown(
                         "TypeError: with() requires at least one recognized property".into(),
@@ -2628,16 +2707,32 @@ impl<'p> Vm<'p> {
     /// `offset` ("auto"/"never") and `timeZoneName` ("auto"/"never"/"critical")
     /// suffixes. Order: `<date>T<time><offset>[tz][u-ca=…]`.
     pub(crate) fn zdt_to_string_opts(&mut self, idx: u32, options: Value) -> Result<String, Thrown> {
-        let (unit, digits, omit, mode) = self.time_precision(options)?;
-        let cal_suf = self.calendar_name_suffix(options)?;
-        let (show_offset, tzn) = if options == Value::UNDEFINED {
-            (true, "auto".to_string())
-        } else {
-            let off_opt = self.opt_string(options, "offset", "auto", &["auto", "never"])?;
-            let tzn =
-                self.opt_string(options, "timeZoneName", "auto", &["auto", "never", "critical"])?;
-            (off_opt != "never", tzn)
-        };
+        // All six options are read in ALPHABETICAL order — calendarName,
+        // fractionalSecondDigits, offset, roundingMode, smallestUnit,
+        // timeZoneName — and only then is the smallestUnit unit-CLASS
+        // validated, so timeZoneName is observably read before the date-unit
+        // RangeError (options-read-before-algorithmic-validation).
+        let (unit, digits, omit, mode, cal_suf, show_offset, tzn) =
+            if options == Value::UNDEFINED {
+                (1, -1, false, "trunc".to_string(), String::new(), true, "auto".to_string())
+            } else {
+                if !self.is_object_value(options) {
+                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                }
+                let cal_suf = self.calendar_name_suffix(options)?;
+                let fsd = self.read_fsd(options)?;
+                let off_opt = self.opt_string(options, "offset", "auto", &["auto", "never"])?;
+                let mode = self.read_rounding_mode_opt(options)?;
+                let su = self.read_tostring_unit_token(options)?;
+                let tzn = self.opt_string(
+                    options,
+                    "timeZoneName",
+                    "auto",
+                    &["auto", "never", "critical"],
+                )?;
+                let (unit, digits, omit) = Self::tostring_precision(su.as_deref(), fsd)?;
+                (unit, digits, omit, mode, cal_suf, off_opt != "never", tzn)
+            };
         let off = self.zdt_offset_ns(idx);
         // Round the instant to the requested unit, then express in the offset.
         // Rounding is on the ABSOLUTE timeline (epoch ns), so it rounds as-if the
@@ -2713,7 +2808,23 @@ impl<'p> Vm<'p> {
         match name {
             "toJSON" => Ok(Some(self.alloc_str(instant_to_string(ns)))),
             "toString" => {
-                let (unit, digits, omit, mode) = self.time_precision(a0)?;
+                // Options read alphabetically — fractionalSecondDigits, roundingMode,
+                // smallestUnit (token), timeZone — with the smallestUnit unit-CLASS
+                // validated only after the timeZone get (the 2025 normative
+                // options-read-before-algorithmic-validation ordering).
+                let (fsd, mode, su) = if a0 == Value::UNDEFINED {
+                    ((1, -1, false), "trunc".to_string(), None)
+                } else {
+                    if !self.is_object_value(a0) {
+                        return Err(Thrown(
+                            "TypeError: options must be an object or undefined".into(),
+                        ));
+                    }
+                    let fsd = self.read_fsd(a0)?;
+                    let mode = self.read_rounding_mode_opt(a0)?;
+                    let su = self.read_tostring_unit_token(a0)?;
+                    (fsd, mode, su)
+                };
                 // The `timeZone` option: undefined -> UTC shown as "Z"; otherwise the
                 // instant is expressed in that zone and the numeric offset is shown.
                 let tz_v = if self.is_object_value(a0) {
@@ -2721,6 +2832,7 @@ impl<'p> Vm<'p> {
                 } else {
                     Value::UNDEFINED
                 };
+                let (unit, digits, omit) = Self::tostring_precision(su.as_deref(), fsd)?;
                 let (offset, tz_str) = if tz_v == Value::UNDEFINED {
                     (0i64, "Z".to_string())
                 } else {
