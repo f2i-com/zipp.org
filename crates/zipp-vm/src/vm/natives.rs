@@ -3131,8 +3131,8 @@ impl<'p> Vm<'p> {
             PLAINYEARMONTH_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
                 let (y, m, rd) = if self.is_object_value(a0) {
-                    let reject = self.read_overflow(a1)?;
-                    self.to_plain_year_month_overflow(a0, reject)?
+                    // Object: read the bag fields, THEN options.overflow (order-of-ops).
+                    self.to_plain_year_month_overflow(a0, Some(a1))?
                 } else {
                     let r = self.to_plain_year_month(a0)?;
                     self.read_overflow(a1)?;
@@ -3194,8 +3194,8 @@ impl<'p> Vm<'p> {
             PLAINMONTHDAY_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
                 let (ry, m, d) = if self.is_object_value(a0) {
-                    let reject = self.read_overflow(a1)?;
-                    self.to_plain_month_day_overflow(a0, reject)?
+                    // Object: read the bag fields, THEN options.overflow (order-of-ops).
+                    self.to_plain_month_day_overflow(a0, Some(a1))?
                 } else {
                     let r = self.to_plain_month_day(a0)?;
                     self.read_overflow(a1)?;

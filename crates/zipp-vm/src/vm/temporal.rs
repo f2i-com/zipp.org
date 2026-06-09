@@ -2773,16 +2773,19 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn to_plain_year_month(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
-        self.to_plain_year_month_overflow(v, false)
+        self.to_plain_year_month_overflow(v, None)
     }
 
     pub(crate) fn to_plain_year_month_overflow(
         &mut self,
         v: Value,
-        reject: bool,
+        options: Option<Value>,
     ) -> Result<(i64, i64, i64), Thrown> {
         if v.is_heap() {
             if let Some(t) = self.pym_fields(v.heap_index()) {
+                if let Some(o) = options {
+                    self.read_overflow(o)?;
+                }
                 return Ok(t);
             }
             if self.heap.is_str_like(v.heap_index()) {
@@ -2818,6 +2821,14 @@ impl<'p> Vm<'p> {
                 // and run the observable ToPrimitive (not the non-`&mut` to_number).
                 let y = self.temporal_ctor_int(yv)?;
                 let (m_val, m_valid) = m_raw.unwrap();
+                // GetTemporalOverflowOption: read + validate options.overflow AFTER the
+                // field GETs + year coercion (order-of-operations) but BEFORE the
+                // calendar-invalid monthCode RangeError; absent options → constrain.
+                let reject = if let Some(o) = options {
+                    self.read_overflow(o)?
+                } else {
+                    false
+                };
                 if !m_valid {
                     return Err(Thrown(
                         "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
@@ -3159,16 +3170,19 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn to_plain_month_day(&mut self, v: Value) -> Result<(i64, i64, i64), Thrown> {
-        self.to_plain_month_day_overflow(v, false)
+        self.to_plain_month_day_overflow(v, None)
     }
 
     pub(crate) fn to_plain_month_day_overflow(
         &mut self,
         v: Value,
-        reject: bool,
+        options: Option<Value>,
     ) -> Result<(i64, i64, i64), Thrown> {
         if v.is_heap() {
             if let Some(t) = self.pmd_fields(v.heap_index()) {
+                if let Some(o) = options {
+                    self.read_overflow(o)?;
+                }
                 return Ok(t);
             }
             if self.heap.is_str_like(v.heap_index()) {
@@ -3195,6 +3209,14 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let (m_val, m_valid) = m_raw.unwrap();
+                // GetTemporalOverflowOption: read + validate options.overflow AFTER the
+                // field GETs + year coercion (order-of-operations) but BEFORE the
+                // calendar-invalid monthCode RangeError; absent options → constrain.
+                let reject = if let Some(o) = options {
+                    self.read_overflow(o)?
+                } else {
+                    false
+                };
                 if !m_valid {
                     return Err(Thrown(
                         "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
