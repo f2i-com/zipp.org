@@ -2553,8 +2553,11 @@ impl<'p> Vm<'p> {
         };
         let off = self.zdt_offset_ns(idx);
         // Round the instant to the requested unit, then express in the offset.
+        // Rounding is on the ABSOLUTE timeline (epoch ns), so it rounds as-if the
+        // value were positive (like Instant.toString) — NOT sign-relative, which
+        // would round a negative epoch the wrong way for expand/ceil/floor.
         let epoch = self.zdt_epoch_ns(idx).unwrap_or(0);
-        let rounded = round_increment(epoch, unit, &mode);
+        let rounded = round_increment_as_if_positive(epoch, unit, &mode);
         let local = rounded + off as i128;
         let t = ns_to_time(local.rem_euclid(DAY_NS));
         let (ny, nm, nd) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
