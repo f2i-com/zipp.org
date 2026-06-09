@@ -3193,7 +3193,23 @@ impl<'p> Vm<'p> {
                 "daysInYear" => Value::num(if is_leap_year(y) { 366.0 } else { 365.0 }),
                 "daysInWeek" => Value::num(7.0),
                 "monthsInYear" => Value::num(12.0),
-                "hoursInDay" => Value::num(24.0),
+                "hoursInDay" => {
+                    // (startOfDay(tomorrow) − startOfDay(today)) / 1h. A fixed-offset
+                    // (incl. UTC) zone's day is exactly 24h, but the next day's start
+                    // can fall outside the representable instant range at the max
+                    // boundary — a RangeError.
+                    const DAY_NS_I: i128 = 86_400_000_000_000;
+                    const NS_MAX: i128 = 8_640_000_000_000_000_000_000;
+                    let today_start = iso_to_epoch_days(y, m, d) as i128 * DAY_NS_I - off as i128;
+                    let tomorrow_start = today_start + DAY_NS_I;
+                    if tomorrow_start.abs() > NS_MAX {
+                        return Err(Thrown(
+                            "RangeError: ZonedDateTime hoursInDay is outside the representable range"
+                                .into(),
+                        ));
+                    }
+                    Value::num(((tomorrow_start - today_start) / 3_600_000_000_000) as f64)
+                }
                 "inLeapYear" => Value::bool(is_leap_year(y)),
                 "monthCode" => self.alloc_str(format!("M{m:02}")),
                 "calendarId" => self.alloc_str("iso8601".to_string()),
