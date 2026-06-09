@@ -960,22 +960,15 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(Value::UNDEFINED))
             }
-            "keys" => {
-                let items: Vec<Value> = (0..len).map(|i| Value::num(i as f64)).collect();
-                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
-            }
+            // Live iterators (kind 0=keys, 1=values, 2=entries): each step re-reads
+            // the view's current length, so a resizable buffer's grow yields new
+            // elements and an out-of-bounds view throws — matching ArrayIterator's
+            // per-step IsTypedArrayOutOfBounds / Get(O, index).
+            "keys" => Ok(Some(self.make_live_iterator(idx, 0, self.array_iter_proto))),
             "values" | "@@iterator" => {
-                let items = self.ta_snapshot(idx);
-                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
+                Ok(Some(self.make_live_iterator(idx, 1, self.array_iter_proto)))
             }
-            "entries" => {
-                let mut items = Vec::with_capacity(len);
-                for i in 0..len {
-                    let e = self.ta_element_get(idx, i);
-                    items.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![Value::num(i as f64), e]))));
-                }
-                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
-            }
+            "entries" => Ok(Some(self.make_live_iterator(idx, 2, self.array_iter_proto))),
             _ => Ok(None),
         }
     }

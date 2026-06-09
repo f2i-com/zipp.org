@@ -1887,6 +1887,53 @@ impl<'p> Vm<'p> {
                         ))
                     }
                 };
+                // A live TypedArray iterator (keys/values/entries) re-reads the view's
+                // current length each step, so a resizable buffer's grow yields new
+                // elements; an out-of-bounds view (detached, or a fixed-length view on
+                // a shrunk buffer) throws TypeError per the spec's per-step check.
+                if let Some((coll, kind)) = live {
+                    if matches!(self.heap.get(coll), HeapObj::TypedArray { .. }) {
+                        // An already-exhausted iterator (latched usize::MAX) is
+                        // permanently done — the spec's "iterating is finished" check
+                        // precedes the out-of-bounds check, so a buffer that became OOB
+                        // AFTER exhaustion does NOT throw.
+                        let result = if index == usize::MAX {
+                            (Value::UNDEFINED, true)
+                        } else {
+                            match self.ta_effective_len(coll) {
+                            None => {
+                                return Err(Thrown(
+                                    "TypeError: TypedArray iterator: the viewed buffer is out of bounds".into(),
+                                ))
+                            }
+                            Some(n) if index >= n => (Value::UNDEFINED, true),
+                            Some(_) => {
+                                let v = match kind {
+                                    0 => Value::num(index as f64),
+                                    1 => self.ta_element_get(coll, index),
+                                    _ => {
+                                        let e = self.ta_element_get(coll, index);
+                                        Value::heap(self.heap.alloc(HeapObj::Array(vec![
+                                            Value::num(index as f64),
+                                            e,
+                                        ])))
+                                    }
+                                };
+                                index += 1;
+                                (v, false)
+                            }
+                            }
+                        };
+                        let store = if result.1 { usize::MAX } else { index };
+                        if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                            *i = store;
+                        }
+                        let mut m = ObjMap::new();
+                        m.set("value", result.0);
+                        m.set("done", Value::bool(result.1));
+                        return Ok(Value::heap(self.heap.alloc(HeapObj::Object(m))));
+                    }
+                }
                 let (val, done) = if let Some((coll, kind)) = live {
                     // Live Map/Set iterator: step the backing collection, skipping
                     // tombstoned (deleted) slots; appends made after creation are seen.
