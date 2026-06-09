@@ -790,6 +790,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.make_plain_date_time([y, m, d, t[0], t[1], t[2], t[3], t[4], t[5]])?))
             }
             "withCalendar" => {
+                // ToTemporalCalendarIdentifier(undefined) is a TypeError — the
+                // argument is required (validate_calendar_value allows undefined for
+                // an optional field-bag calendar, so guard here, not there).
+                if a0 == Value::UNDEFINED {
+                    return Err(Thrown("TypeError: withCalendar requires a calendar argument".into()));
+                }
                 self.validate_calendar_value(a0)?;
                 Ok(Some(self.make_plain_date(y, m, d)?))
             }
@@ -1427,6 +1433,12 @@ impl<'p> Vm<'p> {
             "toPlainYearMonth" => Ok(Some(self.make_plain_year_month(date[0], date[1], 1)?)),
             "toPlainMonthDay" => Ok(Some(self.make_plain_month_day(date[1], date[2], 1972)?)),
             "withCalendar" => {
+                // ToTemporalCalendarIdentifier(undefined) is a TypeError — the
+                // argument is required (validate_calendar_value allows undefined for
+                // an optional field-bag calendar, so guard here, not there).
+                if a0 == Value::UNDEFINED {
+                    return Err(Thrown("TypeError: withCalendar requires a calendar argument".into()));
+                }
                 self.validate_calendar_value(a0)?;
                 Ok(Some(self.make_plain_date_time(f)?))
             }
@@ -1827,9 +1839,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_zdt(ns, offset, id)?))
             }
             "withCalendar" => {
-                // ISO 8601 only — accept "iso8601"/undefined/a calendar-bearing
-                // Temporal, reject a wrong type (TypeError) or other calendar (RangeError).
-                self.validate_calendar_value(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                // ISO 8601 only — accept "iso8601"/a calendar-bearing Temporal,
+                // reject a wrong type (TypeError) or other calendar (RangeError).
+                // The argument is REQUIRED: undefined is a TypeError here.
+                let cal = args.first().copied().unwrap_or(Value::UNDEFINED);
+                if cal == Value::UNDEFINED {
+                    return Err(Thrown("TypeError: withCalendar requires a calendar argument".into()));
+                }
+                self.validate_calendar_value(cal)?;
                 let (ns, off) = (self.zdt_epoch_ns(idx).unwrap_or(0), self.zdt_offset_ns(idx));
                 Ok(Some(self.make_zoned_date_time_raw(ns, off, idx)?))
             }
