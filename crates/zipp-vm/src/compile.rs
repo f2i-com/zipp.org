@@ -331,6 +331,7 @@ pub fn compile_eval(
     force_strict: bool,
     force_new_target_ok: bool,
     inherit_super: Option<bool>,
+    ban_arguments: bool,
 ) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
@@ -341,6 +342,7 @@ pub fn compile_eval(
     // against the u32::MAX SENTINEL, which prepare_eval_program remaps to the
     // caller's runtime class id. Plain nested functions still reset it.
     c.eval_inherit_super = inherit_super;
+    c.in_field_init = ban_arguments;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
@@ -383,6 +385,10 @@ struct Compiler {
     /// script (and its arrows) inherits the caller's home class for `super`
     /// (compiled against the u32::MAX sentinel) — Some(super_static).
     eval_inherit_super: Option<bool>,
+    /// True while compiling a class FIELD INITIALIZER expression (or an eval
+    /// program invoked from one): `arguments` is an early SyntaxError there.
+    /// Arrows inherit (Compiler-level state); function/method bodies reset it.
+    in_field_init: bool,
     /// True when compiling a MODULE as the program entry (not a dynamic import):
     /// the top-level body is an ASYNC context (top-level `await` is allowed), so
     /// func 0 is compiled with `in_async` and the VM runs it as an async activation.
@@ -462,6 +468,7 @@ impl Compiler {
             source,
             eval_mode: false,
             eval_inherit_super: None,
+            in_field_init: false,
             module_mode: false,
             force_strict: false,
             force_new_target_ok: false,
@@ -611,6 +618,12 @@ impl Compiler {
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
         let eval_completion = is_script && self.eval_mode;
+        // A real function body leaves any enclosing field-initializer context
+        // (the eval ROOT script keeps it: PerformEval's ContainsArguments check
+        // spans the eval program's top level and its arrows).
+        let saved_field_init = if is_script { self.in_field_init } else {
+            std::mem::replace(&mut self.in_field_init, false)
+        };
         // Strict if the enclosing scope is strict OR this body opens with a
         // `"use strict"` directive. Propagate it to `cx` for the duration of the
         // body so nested functions/arrows inherit it; restore the parent's after.
@@ -913,6 +926,7 @@ impl Compiler {
 
         let upvalues: Vec<UpvalSource> =
             fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        fc.cx.in_field_init = saved_field_init;
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -977,6 +991,7 @@ impl Compiler {
         // `new.target` is allowed in a class method/ctor/field-init body.
         let parent_nt = self.new_target_ok;
         self.new_target_ok = true;
+        let saved_field_init = std::mem::replace(&mut self.in_field_init, false);
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         fc.cx.in_strict = true;
         fc.super_class = super_class;
@@ -1003,10 +1018,17 @@ impl Compiler {
             fc.emit(Instr::GenStart);
         }
         // Instance field initializers: `this.field = expr` (this = reg 0).
+        // `arguments` is an early SyntaxError inside an initializer (and in any
+        // direct eval / arrow it contains).
         for (fname, finit) in fields {
             let save = fc.next_reg;
             let v = match finit {
-                Some(e) => fc.expr(e)?,
+                Some(e) => {
+                    fc.cx.in_field_init = true;
+                    let r = fc.expr(e);
+                    fc.cx.in_field_init = false;
+                    r?
+                }
                 None => {
                     let t = fc.temp();
                     fc.emit(Instr::LoadUndefined { dst: t });
@@ -1046,6 +1068,7 @@ impl Compiler {
         fc.cx.new_target_ok = parent_nt;
         fc.emit(Instr::ReturnUndefined);
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        fc.cx.in_field_init = saved_field_init;
         Ok(FuncProto {
             name: name.to_string(),
             code: fc.code,
@@ -4579,6 +4602,12 @@ impl<'a> FnCompiler<'a> {
                 // A parameter referenced before its own left-to-right
                 // initialization — `(x = x)` (self) or `(x = y, y)` (forward) — is
                 // in the Temporal Dead Zone: reading it throws a ReferenceError.
+                if id.name == "arguments" && self.cx.in_field_init {
+                    return Err(
+                        "SyntaxError: 'arguments' is not allowed in a class field initializer"
+                            .into(),
+                    );
+                }
                 if self.param_tdz.contains(id.name.as_str()) {
                     let e = self.alloc_reg();
                     self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
@@ -7214,6 +7243,7 @@ impl<'a> FnCompiler<'a> {
                     this_reg,
                     home_class: self.super_class.unwrap_or(u32::MAX),
                     super_static: self.super_static,
+                    ban_arguments: self.cx.in_field_init,
                 });
                 return Ok(dst);
             }

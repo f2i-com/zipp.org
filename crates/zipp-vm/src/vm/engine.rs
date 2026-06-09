@@ -900,6 +900,7 @@ impl<'p> Vm<'p> {
         force_new_target_ok: bool,
         this_override: Option<Value>,
         inherit_super: Option<(u32, bool)>,
+        ban_arguments: bool,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -916,6 +917,7 @@ impl<'p> Vm<'p> {
             force_strict,
             force_new_target_ok,
             inherit_super.map(|(_, s)| s),
+            ban_arguments,
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -968,7 +970,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -992,7 +994,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1025,7 +1027,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
