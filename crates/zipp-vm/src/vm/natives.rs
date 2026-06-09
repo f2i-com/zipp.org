@@ -1328,7 +1328,10 @@ impl<'p> Vm<'p> {
                     let mut map = ObjMap::new();
                     for (i, item) in items.into_iter().enumerate() {
                         let key = self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
-                        let ks = self.display(key);
+                        // ToPropertyKey(key) — runs ToPrimitive, so a key whose
+                        // toString/@@toPrimitive throws propagates (and a Symbol key
+                        // groups under its symbol key), unlike the non-throwing display().
+                        let ks = self.to_property_key(key)?;
                         match map.get(&ks) {
                             Some(arr) => {
                                 if let HeapObj::Array(a) = self.heap.get_mut(arr.heap_index()) {
