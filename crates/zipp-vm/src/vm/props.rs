@@ -3030,7 +3030,10 @@ impl<'p> Vm<'p> {
                         .filter(|p| p.is_heap())
                         .map(|p| p.heap_index())
                         .unwrap_or(default);
-                    self.proto_member(proto, key)
+                    // Accessor-aware (mirrors the TypedArray arm): an inherited
+                    // getter like Object.prototype.__proto__ is INVOKED with the
+                    // buffer as receiver, not returned as a raw function value.
+                    return self.proto_member_get(proto, key, obj);
                 }
             });
         }

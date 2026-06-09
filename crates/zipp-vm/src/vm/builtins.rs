@@ -385,19 +385,38 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: TypedArray [Symbol.species] is not a constructor".into()));
         }
         let result = self.construct(species, &[Value::num(count as f64)])?;
-        match result.is_heap().then(|| self.heap.get(result.heap_index())) {
-            Some(HeapObj::TypedArray { length, .. }) => {
-                if *length < count {
+        // ValidateTypedArray in write access mode: the result must be a
+        // TypedArray, not backed by an immutable buffer, not detached/out of
+        // bounds (its EFFECTIVE length decides - a length-tracking view over a
+        // resizable buffer counts what it currently sees), and long enough.
+        let ridx = match result.is_heap().then(|| self.heap.get(result.heap_index())) {
+            Some(HeapObj::TypedArray { buffer, .. }) => {
+                let b = *buffer;
+                if self.immutable_buffers.contains(&b) {
                     return Err(Thrown(
-                        "TypeError: species-created TypedArray is shorter than required".into(),
+                        "TypeError: species-created TypedArray is backed by an immutable ArrayBuffer".into(),
                     ));
                 }
+                result.heap_index()
             }
             _ => {
                 return Err(Thrown(
                     "TypeError: TypedArray [Symbol.species] did not return a TypedArray".into(),
                 ))
             }
+        };
+        match self.ta_effective_len(ridx) {
+            None => {
+                return Err(Thrown(
+                    "TypeError: species-created TypedArray is detached or out of bounds".into(),
+                ))
+            }
+            Some(eff) if eff < count => {
+                return Err(Thrown(
+                    "TypeError: species-created TypedArray is shorter than required".into(),
+                ))
+            }
+            _ => {}
         }
         Ok(result)
     }
@@ -562,11 +581,31 @@ impl<'p> Vm<'p> {
                     Value::num(found as f64)
                 }))
             }
-            "forEach" | "map" | "filter" | "find" | "findIndex" | "findLast" | "findLastIndex"
+            "map" => {
+                if !self.is_callable(a0) {
+                    return Err(Thrown("TypeError: map callback is not a function".into()));
+                }
+                // TypedArraySpeciesCreate runs FIRST (its user code can resize or
+                // detach buffers), then each element is re-Get, mapped, and Set
+                // into the destination (per-element [[Set]] semantics: coercion
+                // throws propagate; an out-of-bounds destination write no-ops).
+                // The destination is held across user callbacks: guard the GC.
+                let _gc = self.gc_lock_guard();
+                let dest = self.ta_species_create(idx, len)?;
+                for i in 0..len {
+                    let e = self.ta_element_get(idx, i);
+                    let r = self.call_value(a0, a1, &[e, Value::num(i as f64), recv])?;
+                    self.ta_element_set(dest.heap_index(), i, r)?;
+                }
+                Ok(Some(dest))
+            }
+            "forEach" | "filter" | "find" | "findIndex" | "findLast" | "findLastIndex"
             | "every" | "some" => {
                 if !self.is_callable(a0) {
                     return Err(Thrown(format!("TypeError: {name} callback is not a function")));
                 }
+                // `mapped` holds Values across user callbacks: guard the GC.
+                let _gc = self.gc_lock_guard();
                 let mut mapped: Vec<Value> = Vec::new();
                 let order: Vec<usize> = if name == "findLast" || name == "findLastIndex" {
                     (0..len).rev().collect()
@@ -581,7 +620,6 @@ impl<'p> Vm<'p> {
                     let r = self.call_value(a0, a1, &[e, Value::num(i as f64), recv])?;
                     match name {
                         "forEach" => {}
-                        "map" => mapped.push(r),
                         "filter" => {
                             if self.truthy(r) {
                                 mapped.push(e);
@@ -616,8 +654,9 @@ impl<'p> Vm<'p> {
                     }
                 }
                 Ok(Some(match name {
-                    "map" | "filter" => {
-                        // Result via TypedArraySpeciesCreate (constructor[@@species]).
+                    "filter" => {
+                        // Result via TypedArraySpeciesCreate (constructor[@@species]),
+                        // AFTER the callbacks (filter captures the kept count first).
                         let dest = self.ta_species_create(idx, mapped.len())?;
                         for (i, v) in mapped.iter().enumerate() {
                             self.ta_element_set(dest.heap_index(), i, *v)?;
@@ -790,7 +829,12 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot slice a TypedArray backed by a detached buffer".into(),
                     ));
                 }
-                for i in 0..count {
+                // The species create may have SHRUNK the source (resizable buffer):
+                // copy only what it can still see; the destination tail keeps its
+                // constructor zeros.
+                let avail = self.ta_effective_len(idx).unwrap_or(0);
+                let copy = count.min(avail.saturating_sub(start));
+                for i in 0..copy {
                     let v = self.ta_element_get(idx, start + i);
                     self.ta_element_set(dest.heap_index(), i, v)?;
                 }

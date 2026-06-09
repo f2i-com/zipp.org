@@ -658,7 +658,10 @@ impl<'p> Vm<'p> {
             let length = match explicit {
                 Some(l) => l,
                 None => {
-                    if buf_len < byte_offset || (buf_len - byte_offset) % size != 0 {
+                    // A length-tracking view FLOORS over the buffer (its length
+                    // follows resizes), so only a fixed auto-length view requires
+                    // the remaining bytes to divide evenly.
+                    if buf_len < byte_offset || (!tracking && (buf_len - byte_offset) % size != 0) {
                         return Err(Thrown("RangeError: byte length not a multiple of element size".into()));
                     }
                     (buf_len - byte_offset) / size
