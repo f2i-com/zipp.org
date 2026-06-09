@@ -61,6 +61,16 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// Interim f64→i64 storage conversion while Duration fields are i64: `as`
+    /// saturates a large negative value to i64::MIN, whose negation WRAPS back
+    /// to i64::MIN — negated()/abs() would silently corrupt the sign and make
+    /// `d.subtract(d.negated())` cancel to zero instead of overflowing. Clamp
+    /// to ±i64::MAX so saturated magnitudes stay symmetric.
+    fn dur_to_i64(x: f64) -> i64 {
+        let v = x as i64;
+        if v == i64::MIN { i64::MIN + 1 } else { v }
+    }
+
     /// `new Temporal.Duration(y, mo, w, d, h, mi, s, ms, us, ns)` — integer fields.
     pub(crate) fn build_duration(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let mut ff = [0f64; 10];
@@ -73,7 +83,7 @@ impl<'p> Vm<'p> {
         if !is_valid_duration(&ff) {
             return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
         }
-        let f = ff.map(|x| x as i64);
+        let f = ff.map(Self::dur_to_i64);
         self.validate_duration(&f)?;
         Ok(self.make_duration(f))
     }
@@ -116,7 +126,7 @@ impl<'p> Vm<'p> {
                 if !is_valid_duration(&ff) {
                     return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
                 }
-                let f = ff.map(|x| x as i64);
+                let f = ff.map(Self::dur_to_i64);
                 self.validate_duration(&f)?;
                 return Ok(f);
             }
@@ -171,7 +181,7 @@ impl<'p> Vm<'p> {
                 if !is_valid_duration(&nf) {
                     return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
                 }
-                let nf = nf.map(|x| x as i64);
+                let nf = nf.map(Self::dur_to_i64);
                 self.validate_duration(&nf)?;
                 Ok(Some(self.make_duration(nf)))
             }
@@ -375,10 +385,7 @@ impl<'p> Vm<'p> {
                     + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]]);
                 let inc_ns = unit_ns(&smallest) * inc;
                 let rounded = round_increment(total_ns, inc_ns, &mode);
-                let balanced = balance_duration_ns(rounded, &largest);
-                if !is_valid_duration(&std::array::from_fn(|i| balanced[i] as f64)) {
-                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
-                }
+                let balanced = balance_duration_ns(rounded, &largest)?;
                 Ok(Some(self.make_duration(balanced)))
             }
             "add" | "subtract" => {
@@ -399,12 +406,9 @@ impl<'p> Vm<'p> {
                 let day_units =
                     ["day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
                 let largest = day_units[existing(&f).min(existing(&other)) as usize];
-                let balanced = balance_duration_ns(total_ns, largest);
                 // BalanceDuration → the result must be a valid Duration (its total
-                // time, in seconds, below 2^53); else RangeError.
-                if !is_valid_duration(&std::array::from_fn(|i| balanced[i] as f64)) {
-                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
-                }
+                // time, in seconds, below 2^53); balance_duration_ns enforces it.
+                let balanced = balance_duration_ns(total_ns, largest)?;
                 Ok(Some(self.make_duration(balanced)))
             }
             _ => Ok(None),
@@ -1240,7 +1244,7 @@ impl<'p> Vm<'p> {
                 };
                 let inc_ns = unit_ns(&smallest) * inc;
                 let rounded = round_increment(diff, inc_ns, &mode);
-                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest)?)))
             }
             "round" => {
                 let (su, inc, mode) = self.read_round_options(
@@ -1680,7 +1684,7 @@ impl<'p> Vm<'p> {
                         + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
                     let inc_ns = unit_ns(&smallest) * inc;
                     let rounded = round_increment(total_ns, inc_ns, &eff);
-                    balance_duration_ns(rounded, &largest)
+                    balance_duration_ns(rounded, &largest)?
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
                     round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
                 } else {
@@ -2034,7 +2038,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     let rounded = round_increment(total_ns, inc_ns, &eff);
-                    balance_duration_ns(rounded, &largest)
+                    balance_duration_ns(rounded, &largest)?
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
                     round_relative_datetime_diff(dt1, dt2, &smallest, &largest, inc, &eff)?
                 } else {
@@ -2563,7 +2567,7 @@ impl<'p> Vm<'p> {
             // A day-or-time largestUnit is a pure nanosecond span: round it, balance.
             let total_ns = dt_epoch_ns(end) - dt_epoch_ns(start);
             let rounded = round_increment(total_ns, unit_ns(smallest) * inc, mode);
-            Ok(balance_duration_ns(rounded, largest))
+            balance_duration_ns(rounded, largest)
         } else if matches!(smallest, "year" | "month" | "week") {
             // Calendar largestUnit + calendar smallestUnit → NudgeToCalendarUnit.
             round_relative_datetime_diff(start, end, smallest, largest, inc, mode)
@@ -2768,7 +2772,7 @@ impl<'p> Vm<'p> {
                 let diff = if name == "until" { o - ns } else { ns - o };
                 let inc_ns = unit_ns(&smallest) * inc;
                 let rounded = round_increment(diff, inc_ns, &mode);
-                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest))))
+                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest)?)))
             }
             "round" => {
                 let (su, inc, mode) = self.read_round_options(
@@ -3435,54 +3439,6 @@ impl<'p> Vm<'p> {
 /// `IsValidDuration` (spec): all fields finite, |years|/|months|/|weeks| < 2^32,
 /// and the combined days+time span is under 2^53 seconds. Operates on the raw
 /// f64 fields so out-of-range magnitudes are caught before any i64 truncation.
-fn is_valid_duration(f: &[f64; 10]) -> bool {
-    if f.iter().any(|v| !v.is_finite()) {
-        return false;
-    }
-    let two_pow_32 = 4_294_967_296.0_f64; // 2^32
-    if f[0].abs() >= two_pow_32 || f[1].abs() >= two_pow_32 || f[2].abs() >= two_pow_32 {
-        return false;
-    }
-    // The bound is abs(days×86400 + h×3600 + m×60 + s + sub-seconds) < 2^53 s.
-    // An f64 estimate decides everything except a thin band around 2^53 where
-    // rounding is ambiguous (e.g. the spec maximum 2^53-1 + 0.999999999 rounds
-    // up to 2^53 in f64); there, recompute the total exactly in i128 ns.
-    let two53 = 9_007_199_254_740_992.0_f64; // 2^53
-    let est = f[3] * 86_400.0
-        + f[4] * 3_600.0
-        + f[5] * 60.0
-        + f[6]
-        + f[7] / 1e3
-        + f[8] / 1e6
-        + f[9] / 1e9;
-    // Margin must exceed the f64 ULP at 2^53 (which is 2.0, so 1.0 would vanish).
-    if est.abs() >= two53 + 16.0 {
-        return false;
-    }
-    if est.abs() <= two53 - 16.0 {
-        return true;
-    }
-    // Ambiguous band. Exact i128 nanosecond total via checked arithmetic: a SINGLE
-    // large sub-day field (e.g. milliseconds ≈ 9.007e18 ⇒ 9.007e15 s, a valid
-    // duration) has an i128 product well within range, so it must NOT be rejected;
-    // only a genuine i128 overflow (extreme/mixed-sign cancellation) is out of range.
-    let total_ns: Option<i128> = (|| {
-        let mul = |v: f64, scale: i128| (v as i128).checked_mul(scale);
-        let mut acc = mul(f[3], 86_400_000_000_000)?;
-        acc = acc.checked_add(mul(f[4], 3_600_000_000_000)?)?;
-        acc = acc.checked_add(mul(f[5], 60_000_000_000)?)?;
-        acc = acc.checked_add(mul(f[6], 1_000_000_000)?)?;
-        acc = acc.checked_add(mul(f[7], 1_000_000)?)?;
-        acc = acc.checked_add(mul(f[8], 1_000)?)?;
-        acc = acc.checked_add(f[9] as i128)?;
-        Some(acc)
-    })();
-    match total_ns {
-        Some(ns) => ns.unsigned_abs() < 9_007_199_254_740_992u128 * 1_000_000_000,
-        None => false,
-    }
-}
-
 /// Validate the `[...]` annotation suffix of a Temporal ISO string per the
 /// grammar's critical-flag rules: a critical annotation with an unknown key
 /// (anything but `u-ca`) is rejected, at most one time-zone annotation is

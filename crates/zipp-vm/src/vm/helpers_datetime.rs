@@ -895,10 +895,68 @@ pub(crate) fn unit_ns(u: &str) -> i128 {
     }
 }
 
+/// IsValidDuration: every field finite, the calendar fields below 2^32, and the
+/// total time span (days..nanoseconds) strictly below 2^53 seconds in absolute
+/// value. (Moved here from temporal.rs so balance_duration_ns can validate.)
+pub(crate) fn is_valid_duration(f: &[f64; 10]) -> bool {
+    if f.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let two_pow_32 = 4_294_967_296.0_f64; // 2^32
+    if f[0].abs() >= two_pow_32 || f[1].abs() >= two_pow_32 || f[2].abs() >= two_pow_32 {
+        return false;
+    }
+    // The bound is abs(days×86400 + h×3600 + m×60 + s + sub-seconds) < 2^53 s.
+    // An f64 estimate decides everything except a thin band around 2^53 where
+    // rounding is ambiguous (e.g. the spec maximum 2^53-1 + 0.999999999 rounds
+    // up to 2^53 in f64); there, recompute the total exactly in i128 ns.
+    let two53 = 9_007_199_254_740_992.0_f64; // 2^53
+    let est = f[3] * 86_400.0
+        + f[4] * 3_600.0
+        + f[5] * 60.0
+        + f[6]
+        + f[7] / 1e3
+        + f[8] / 1e6
+        + f[9] / 1e9;
+    // Margin must exceed the f64 ULP at 2^53 (which is 2.0, so 1.0 would vanish).
+    if est.abs() >= two53 + 16.0 {
+        return false;
+    }
+    if est.abs() <= two53 - 16.0 {
+        return true;
+    }
+    // Ambiguous band. Exact i128 nanosecond total via checked arithmetic: a SINGLE
+    // large sub-day field (e.g. milliseconds ≈ 9.007e18 ⇒ 9.007e15 s, a valid
+    // duration) has an i128 product well within range, so it must NOT be rejected;
+    // only a genuine i128 overflow (extreme/mixed-sign cancellation) is out of range.
+    let total_ns: Option<i128> = (|| {
+        let mul = |v: f64, scale: i128| (v as i128).checked_mul(scale);
+        let mut acc = mul(f[3], 86_400_000_000_000)?;
+        acc = acc.checked_add(mul(f[4], 3_600_000_000_000)?)?;
+        acc = acc.checked_add(mul(f[5], 60_000_000_000)?)?;
+        acc = acc.checked_add(mul(f[6], 1_000_000_000)?)?;
+        acc = acc.checked_add(mul(f[7], 1_000_000)?)?;
+        acc = acc.checked_add(mul(f[8], 1_000)?)?;
+        acc = acc.checked_add(f[9] as i128)?;
+        Some(acc)
+    })();
+    match total_ns {
+        Some(ns) => ns.unsigned_abs() < 9_007_199_254_740_992u128 * 1_000_000_000,
+        None => false,
+    }
+}
+
 /// Decompose a signed nanosecond total into a Duration's day+time fields
 /// [_,_,_,d,h,mi,s,ms,us,ns], from `largest` (day..nanosecond) down. Used by
 /// Duration round/add/subtract without relativeTo (a day is exactly 24h).
-pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> [i64; 10] {
+///
+/// TemporalDurationFromInternal: the largest (uncapped) component is stored as
+/// a float64-representable integer — its exact i128 count rounds through f64
+/// (so e.g. …551 becomes …552 above 2^53) — and the assembled record must
+/// satisfy IsValidDuration (total time below 2^53 seconds), else RangeError.
+/// The lower components are exact (each < 1000/60/24). The previous `as i64`
+/// cast WRAPPED on overflow, letting out-of-range totals masquerade as valid.
+pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> Result<[i64; 10], Thrown> {
     let sign = total_ns.signum();
     let mut n = total_ns.abs();
     let mut f = [0i64; 10];
@@ -921,11 +979,32 @@ pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> [i64; 10] {
         "microsecond" => 5,
         _ => 6, // nanosecond
     };
-    for &(slot, sz) in &units[start..] {
-        f[slot] = (n / sz) as i64 * sign as i64;
+    let mut overflow = false;
+    for (k, &(slot, sz)) in units[start..].iter().enumerate() {
+        let q = n / sz;
         n %= sz;
+        if k == 0 {
+            // i128→f64 is correctly rounded, giving exactly ℝ(𝔽(q)).
+            let qf = q as f64;
+            // Interim guard while Duration fields are stored as i64: a valid
+            // magnitude beyond i64 (only reachable for sub-second largest
+            // units) throws rather than silently wrapping.
+            if qf >= i64::MAX as f64 {
+                overflow = true;
+                break;
+            }
+            f[slot] = (qf as i64) * sign as i64;
+        } else {
+            f[slot] = q as i64 * sign as i64;
+        }
     }
-    f
+    // IsValidDuration on the ROUNDED components: the f64 rounding of the
+    // largest field can land exactly on the 2^53-seconds limit even when the
+    // exact total was just below it.
+    if overflow || !is_valid_duration(&std::array::from_fn(|i| f[i] as f64)) {
+        return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+    }
+    Ok(f)
 }
 
 /// Maximum (exclusive) roundingIncrement for a time unit (the count of that unit
