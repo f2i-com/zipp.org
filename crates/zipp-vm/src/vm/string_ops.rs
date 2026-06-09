@@ -594,7 +594,9 @@ impl<'p> Vm<'p> {
                     _ => ("sup", None),
                 };
                 let open = if let Some(aname) = attr {
-                    let aval = self.display(arg0).replace('"', "&quot;");
+                    // The attribute value is ToString(value) (can throw, e.g. a
+                    // {toString(){throw}}), not the non-throwing display().
+                    let aval = self.to_js_string(arg0)?.replace('"', "&quot;");
                     format!("<{tag} {aname}=\"{aval}\">")
                 } else {
                     format!("<{tag}>")
