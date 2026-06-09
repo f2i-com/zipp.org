@@ -3023,8 +3023,8 @@ impl<'p> Vm<'p> {
             PLAINTIME_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
                 let f = if self.is_object_value(a0) {
-                    let reject = self.read_overflow(a1)?;
-                    self.to_plain_time_overflow(a0, reject)?
+                    // Object: read the bag fields, THEN options.overflow (order-of-ops).
+                    self.to_plain_time_overflow(a0, Some(a1))?
                 } else {
                     let r = self.to_plain_time(a0)?;
                     self.read_overflow(a1)?;

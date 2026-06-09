@@ -1072,16 +1072,19 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn to_plain_time(&mut self, v: Value) -> Result<[i64; 6], Thrown> {
-        self.to_plain_time_overflow(v, false)
+        self.to_plain_time_overflow(v, None)
     }
 
     pub(crate) fn to_plain_time_overflow(
         &mut self,
         v: Value,
-        reject: bool,
+        options: Option<Value>,
     ) -> Result<[i64; 6], Thrown> {
         if v.is_heap() {
             if let Some(f) = self.plain_time_fields(v.heap_index()) {
+                if let Some(o) = options {
+                    self.read_overflow(o)?;
+                }
                 return Ok(f);
             }
             // A ZonedDateTime or PlainDateTime yields its wall-clock time.
@@ -1092,6 +1095,9 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let Some(f) = f {
+                    if let Some(o) = options {
+                        self.read_overflow(o)?;
+                    }
                     return Ok([f[3], f[4], f[5], f[6], f[7], f[8]]);
                 }
             }
@@ -1116,19 +1122,13 @@ impl<'p> Vm<'p> {
                     ("nanosecond", 5, 999),
                     ("second", 2, 59),
                 ];
-                let mut f = [0i64; 6];
+                // Phase 1: read all field GETs (observable, alphabetical order).
+                let mut raw: [Option<i64>; 6] = [None; 6];
                 let mut any = false;
-                for &(nm, slot, mx) in &fields {
+                for &(nm, slot, _) in &fields {
                     if let Some(x) = self.opt_int_field(v, nm)? {
+                        raw[slot] = Some(x);
                         any = true;
-                        if reject {
-                            if x < 0 || x > mx {
-                                return Err(Thrown(format!("RangeError: {nm} out of range")));
-                            }
-                            f[slot] = x;
-                        } else {
-                            f[slot] = x.clamp(0, mx);
-                        }
                     }
                 }
                 // ToTemporalTimeRecord: a property bag with NO recognized time field
@@ -1138,6 +1138,27 @@ impl<'p> Vm<'p> {
                     return Err(Thrown(
                         "TypeError: object has no recognized Temporal.PlainTime fields".into(),
                     ));
+                }
+                // GetTemporalOverflowOption AFTER the field GETs, before the range
+                // validation; absent options → constrain.
+                let reject = if let Some(o) = options {
+                    self.read_overflow(o)?
+                } else {
+                    false
+                };
+                // Phase 2: apply reject/constrain (pure — no observable side effects).
+                let mut f = [0i64; 6];
+                for &(nm, slot, mx) in &fields {
+                    if let Some(x) = raw[slot] {
+                        if reject {
+                            if x < 0 || x > mx {
+                                return Err(Thrown(format!("RangeError: {nm} out of range")));
+                            }
+                            f[slot] = x;
+                        } else {
+                            f[slot] = x.clamp(0, mx);
+                        }
+                    }
                 }
                 return Ok(f);
             }
