@@ -1395,7 +1395,14 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.perform_promise_then(idx, a0, on_r)?))
             }
             "catch" => {
-                Ok(Some(self.perform_promise_then(idx, Value::UNDEFINED, a0)?))
+                // Spec: Promise.prototype.catch(onRejected) is exactly
+                // Invoke(this, "then", «undefined, onRejected») — it must observably
+                // go through the receiver's own `then`, so an overridden `then` is
+                // seen (mirrors `finally`). Unshadowed receivers reach the intrinsic
+                // `then` via one call_value.
+                let this = Value::heap(idx);
+                let then = self.get_prop(this, "then")?;
+                Ok(Some(self.call_value(then, this, &[Value::UNDEFINED, a0])?))
             }
             "finally" => {
                 // Generic spec algorithm: Invoke(this, "then", «thenFinally,
