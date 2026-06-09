@@ -188,7 +188,18 @@ impl<'p> Vm<'p> {
             HeapObj::Set(_) => self.set_method(idx, name, args),
             HeapObj::Generator { .. } => self.generator_method(idx, name, args),
             HeapObj::AsyncGenerator(_) => Ok(self.async_generator_method(idx, name, args)),
-            HeapObj::Promise { .. } => self.promise_method(idx, name, args),
+            HeapObj::Promise { .. } => {
+                // An OWN (shadowing) `then`/`catch`/`finally` — e.g. a test that
+                // does `p.then = fn` to observe how the built-in invokes it — must
+                // win over the intrinsic. Defer to the caller's get_prop +
+                // call_value so the override runs (mirrors the toString/valueOf
+                // deferral above). Unshadowed promises take the inline path.
+                if self.has_own_property(recv, name) {
+                    Ok(None)
+                } else {
+                    self.promise_method(idx, name, args)
+                }
+            }
             HeapObj::Date(_) => self.date_method(idx, name, args),
             HeapObj::TypedArray { .. } => self.typed_array_method(idx, name, args),
             HeapObj::DataView { .. } => self.dataview_method(idx, name, args),
