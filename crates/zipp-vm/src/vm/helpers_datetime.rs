@@ -1266,7 +1266,7 @@ pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
             num.clear();
             let slot = match c {
                 'Y' | 'y' => 0,
-                'M' => 1,
+                'M' | 'm' => 1, // months (designators are ASCII-case-insensitive)
                 'W' | 'w' => 2,
                 'D' | 'd' => 3,
                 _ => return None,
@@ -1302,7 +1302,7 @@ pub(crate) fn parse_iso_duration(s: &str) -> Option<[i64; 10]> {
                 // (slot, seconds-per-unit) for H/M/S.
                 let (slot, unit_secs): (usize, i128) = match c {
                     'H' | 'h' => (4, 3_600),
-                    'M' => (5, 60),
+                    'M' | 'm' => (5, 60), // minutes (case-insensitive)
                     'S' | 's' => (6, 1),
                     _ => return None,
                 };
