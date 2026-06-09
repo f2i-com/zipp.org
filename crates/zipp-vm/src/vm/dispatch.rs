@@ -275,6 +275,21 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::LoadClassValue { dst, class_id } => {
+                        // The inner class-name binding (used by methods/ctor/static
+                        // blocks + arrows within them). None = accessed before the
+                        // class value is initialized (e.g. `class C extends C`) → TDZ.
+                        match self.class_values.get(class_id as usize).copied().flatten() {
+                            Some(v) => self.set(base, dst, v),
+                            None => {
+                                return Err(Thrown(
+                                    "ReferenceError: class binding accessed before initialization"
+                                        .into(),
+                                ))
+                            }
+                        }
+                        ip += 1;
+                    }
                     Instr::LoadHole { dst } => {
                         // The HOLE sentinel for an elided array-literal element; the
                         // following NewArray/ArrayAppend copies it into the array.

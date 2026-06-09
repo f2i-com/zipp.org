@@ -36,6 +36,10 @@ pub enum Instr {
     /// to itself inside its body (`(function f(){ … f … })`), so self-reference and
     /// nested closures over the name resolve.
     LoadCallee { dst: Reg },
+    /// `dst = class_values[class_id]` — the inner immutable class-name binding
+    /// visible to method/ctor/static-block bodies (and arrows inside them). A
+    /// ReferenceError (TDZ) if the class value is not yet initialized.
+    LoadClassValue { dst: Reg, class_id: u32 },
     /// `dst = <array hole>` — the internal HOLE sentinel, used only to fill an
     /// elided array-literal element (`[1,,3]`) before NewArray/ArrayAppend copies
     /// it into the array. Must never be observed outside that copy.

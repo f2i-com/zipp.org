@@ -1635,6 +1635,17 @@ impl<'a> FnCompiler<'a> {
                 };
             }
         }
+        // The inner class-name binding: inside a class element — and arrows within
+        // it, which inherit `super_class` — the class's own name resolves to the
+        // class value (class_values[class_id]), shadowing any outer binding. This
+        // is checked before upvalues/globals so a named class EXPRESSION's name
+        // (which has no outer binding) and a same-named outer var both yield the
+        // class. Read-only (store_binding throws on assignment).
+        if let Some(cid) = self.super_class {
+            if self.cx.class_names.iter().any(|(n, id)| *id == cid && n == name) {
+                return Binding::ClassName(cid);
+            }
+        }
         // A free variable that resolves in an enclosing function is an upvalue.
         if let Some(idx) = self.resolve_upvalue(name) {
             return Binding::Upvalue(idx);
@@ -4562,6 +4573,10 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::LoadGlobal { dst, idx });
                         Ok(dst)
                     }
+                    Binding::ClassName(class_id) => {
+                        self.emit(Instr::LoadClassValue { dst, class_id });
+                        Ok(dst)
+                    }
                 }
             }
             E::ThisExpression(_) => {
@@ -5524,7 +5539,8 @@ impl<'a> FnCompiler<'a> {
                     || match self.resolve_existing(&id.name) {
                         Some(Binding::Local(_))
                         | Some(Binding::LocalCell(_))
-                        | Some(Binding::Upvalue(_)) => true,
+                        | Some(Binding::Upvalue(_))
+                        | Some(Binding::ClassName(_)) => true,
                         Some(Binding::Global(slot)) => {
                             self.cx.hoisted_globals.contains(&slot)
                                 || self.cx.lexical_globals.contains(&slot)
@@ -5779,7 +5795,8 @@ impl<'a> FnCompiler<'a> {
             || match self.resolve_existing(name) {
                 Some(Binding::Local(_))
                 | Some(Binding::LocalCell(_))
-                | Some(Binding::Upvalue(_)) => true,
+                | Some(Binding::Upvalue(_))
+                | Some(Binding::ClassName(_)) => true,
                 Some(Binding::Global(slot)) => {
                     self.cx.hoisted_globals.contains(&slot)
                         || self.cx.lexical_globals.contains(&slot)
@@ -5810,6 +5827,10 @@ impl<'a> FnCompiler<'a> {
             }
             Binding::Global(idx) => {
                 self.emit(Instr::LoadGlobal { dst, idx: *idx });
+                dst
+            }
+            Binding::ClassName(class_id) => {
+                self.emit(Instr::LoadClassValue { dst, class_id: *class_id });
                 dst
             }
         }
@@ -5846,6 +5867,7 @@ impl<'a> FnCompiler<'a> {
             Binding::Local(r) | Binding::LocalCell(r) => self.const_regs.contains(r),
             Binding::Global(idx) => self.cx.const_globals.contains(idx),
             Binding::Upvalue(_) => false, // a const captured by a closure: not tracked
+            Binding::ClassName(_) => true, // the inner class-name binding is immutable
         };
         if is_const {
             let e = self.alloc_reg();
@@ -5873,6 +5895,8 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::StoreGlobal { idx: *idx, src });
                 }
             }
+            // Unreachable: the inner class binding is const (is_const above threw).
+            Binding::ClassName(_) => {}
         }
     }
 
@@ -7601,6 +7625,10 @@ enum Binding {
     /// function's upvalue list.
     Upvalue(u16),
     Global(u32),
+    /// The inner immutable class-name binding inside a class body (resolved at
+    /// runtime from `class_values[class_id]`); read-only — assignment is a
+    /// TypeError. Visible to methods/ctor/static-blocks and arrows within them.
+    ClassName(u32),
 }
 
 /// The instruction for an arithmetic/bitwise compound assignment (`dst = a <op>
