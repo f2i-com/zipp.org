@@ -1028,7 +1028,18 @@ impl<'p> Vm<'p> {
                         if !declared.is_empty() {
                             self.brand_private_names.insert(private_brand, declared);
                         }
-                        for (_, mv) in methods.iter().chain(getters.iter()).chain(setters.iter()) {
+                        // EVERY class-body callable carries the lexical brand chain —
+                        // including STATIC methods and static accessors (a static
+                        // method's private access must resolve THIS evaluation's
+                        // brand, so an instance of another evaluation of the same
+                        // source fails its brand check with TypeError).
+                        for (_, mv) in methods
+                            .iter()
+                            .chain(getters.iter())
+                            .chain(setters.iter())
+                            .chain(static_getters.iter())
+                            .chain(static_setters.iter())
+                        {
                             if mv.is_heap() {
                                 self.method_brand.insert(mv.heap_index(), lex_brands.clone());
                             }
@@ -1046,6 +1057,9 @@ impl<'p> Vm<'p> {
                         };
                         for (n, fid) in &cd.statics {
                             let fv = self.materialize_callable(*fid, base, cur_closure);
+                            if fv.is_heap() {
+                                self.method_brand.insert(fv.heap_index(), lex_brands.clone());
+                            }
                             statics.define(n, fv, method_attr);
                         }
                         // The constructor (incl. field initializers) captures its

@@ -309,9 +309,22 @@ impl<'p> Vm<'p> {
                 .brand_private_names
                 .get(&b)
                 .is_some_and(|names| names.iter().any(|n| n == key))
-            {
+        {
                 return Some(self.instance_has_brand(receiver, b));
             }
+        }
+        // The name is FOREIGN to the entire lexical chain: the access sits in a
+        // context whose chain is incomplete (e.g. a class defined inside a
+        // STATIC FIELD INITIALIZER runs in the defining frame, so its methods'
+        // chains miss the outer class's brand). Defer to the caller's textual
+        // fallback rather than rejecting — names DECLARED by a chain brand keep
+        // the precise per-evaluation check above.
+        if !chain.iter().any(|&b| {
+            self.brand_private_names.get(&b).is_some_and(|names| !names.is_empty())
+        }) || chain.iter().all(|&b| {
+            self.brand_private_names.get(&b).map_or(true, |names| !names.iter().any(|n| n == key))
+        }) {
+            return None;
         }
         Some(chain.iter().any(|&b| self.instance_has_brand(receiver, b)))
     }
