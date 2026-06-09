@@ -527,7 +527,7 @@ impl<'p> Vm<'p> {
         // setter, or sloppy no-op for a getter-only accessor. (Class-instance
         // chains are handled just below via map.class; `__proto__` was handled
         // at the top.) Only when there's no own property with this key.
-        let needs_proto_walk = match self.heap.get(idx) {
+        let needs_proto_walk = (match self.heap.get(idx) {
             HeapObj::Object(m) => m.class.is_none() && m.pos(key).is_none(),
             // An EXOTIC receiver's inherited getter-only accessor (RegExp
             // global/source/flags, Map/Set size) must govern the write: assigning it
@@ -545,8 +545,19 @@ impl<'p> Vm<'p> {
             | HeapObj::Boxed { .. }
             | HeapObj::ArrayBuffer { .. }
             | HeapObj::DataView { .. } => true,
+            // NOTE: Array is deliberately NOT here — several internal array
+            // operations (concat result-building, arguments mapping) use
+            // [[DefineOwnProperty]] semantics through this path and must create an
+            // own property, not invoke an inherited Array.prototype setter.
             _ => false,
-        } && self.arr_props.get(&idx).map_or(true, |m| m.pos(key).is_none());
+        } && self.arr_props.get(&idx).map_or(true, |m| m.pos(key).is_none()))
+        // A function / bound function / native: an inherited accessor on
+        // Function.prototype governs a write that is not an own property (own
+        // function props live in fn_props, so check via has_own_property).
+        || (matches!(
+            self.heap.get(idx),
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+        ) && !self.has_own_property(obj, key));
         if needs_proto_walk {
             match self.proto_chain_set(idx, key, val, obj)? {
                 ProtoSet::Setter(setter) => {
