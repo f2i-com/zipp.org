@@ -1929,7 +1929,9 @@ impl<'p> Vm<'p> {
                             let m0s = self.to_js_string(m0)?;
                             if m0s.is_empty() {
                                 let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
-                                let cur = self.to_integer_or_zero(cur_v).unwrap_or(0).max(0) as usize;
+                                // ToLength(Get(R,"lastIndex")) — a throwing
+                                // lastIndex.valueOf must propagate, not be swallowed.
+                                let cur = self.to_integer_or_zero(cur_v)?.max(0) as usize;
                                 self.set_regexp_last_index(regexp, cur + 1);
                             }
                             (r, false, false)
