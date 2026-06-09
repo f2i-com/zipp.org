@@ -647,9 +647,20 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
-        // An [[IsHTMLDDA]] exotic (`document.all`) is callable and returns undefined.
+        // An [[IsHTMLDDA]] exotic (`document.all`) is callable: its [[Call]] returns
+        // null when called with NO arguments or a first argument that is the empty
+        // String, and undefined otherwise (Annex B).
         if callee.is_heap() && !self.is_htmldda.is_empty() && self.is_htmldda.contains(&callee.heap_index()) {
-            return Ok(Value::UNDEFINED);
+            let first_is_empty_str = args.first().is_some_and(|a| {
+                a.is_heap()
+                    && self.heap.is_str_like(a.heap_index())
+                    && self.heap.str_cow(a.heap_index()).is_some_and(|s| s.is_empty())
+            });
+            return Ok(if args.is_empty() || first_is_empty_str {
+                Value::NULL
+            } else {
+                Value::UNDEFINED
+            });
         }
         // A callable Proxy: `apply` trap (or call the target).
         if callee.is_heap() {
