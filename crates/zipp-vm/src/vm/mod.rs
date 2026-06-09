@@ -576,6 +576,8 @@ pub struct Vm<'p> {
     /// array destructuring can fast-path plain arrays yet still honour a replaced
     /// `Array.prototype[Symbol.iterator]` (drain via the iterator protocol).
     default_array_iter: Value,
+    /// The pristine %ArrayIteratorPrototype%.next (see default_array_iter).
+    default_array_iter_next: Value,
     /// The single canonical %ThrowTypeError% intrinsic — shared by
     /// Function.prototype.{caller,arguments} and a strict (unmapped) arguments
     /// object's `callee` poison-pill, so all references compare `===`.

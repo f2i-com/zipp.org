@@ -1239,6 +1239,23 @@ impl<'p> Vm<'p> {
             }
             return Ok(true);
         }
+        // `class D extends DataView`: build a real DataView through the builtin
+        // ctor and move it into the instance (the buffer heap index is shared
+        // correctly by the clone; the dv_tracking side-set flag is carried like
+        // the TypedArray arm carries ta_tracking).
+        if cval.is_heap() && cval.heap_index() == self.dataview_ctor && self.dataview_ctor != 0 {
+            let tv = self.build_data_view(args)?;
+            let tvi = tv.heap_index();
+            let cloned = self.heap.get(tvi).clone();
+            *self.heap.get_mut(oidx) = cloned;
+            if self.dv_tracking.contains(&tvi) {
+                self.dv_tracking.insert(oidx);
+            }
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
         if pidx == self.set_proto && self.set_proto != 0 {
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             let mut items: Vec<Value> = Vec::new();
@@ -2085,7 +2102,16 @@ impl<'p> Vm<'p> {
                 // by invoking it (so for-of uses the overridden iterator).
                 HeapObj::Array(_) => {
                     let m = self.get_prop(v, "@@iterator")?;
-                    if m.bits() != self.default_array_iter.bits() {
+                    // The fast path also requires the PRISTINE
+                    // %ArrayIteratorPrototype%.next — a patched next must be
+                    // honoured by going through the real iterator protocol.
+                    let next_intact = match self.heap.get(self.array_iter_proto) {
+                        HeapObj::Object(p) => {
+                            p.get("next") == Some(self.default_array_iter_next)
+                        }
+                        _ => false,
+                    };
+                    if m.bits() != self.default_array_iter.bits() || !next_intact {
                         if self.is_callable(m) {
                             return self.call_value(m, v, &[]);
                         }

@@ -8,6 +8,64 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
+    /// IteratorToList with a PRE-FETCHED @@iterator method (the observable
+    /// trace: no second @@iterator get; `next` fetched once and cached; per
+    /// step `done` is read BEFORE `value`, and `value` is skipped once done).
+    pub(crate) fn iterator_to_list(
+        &mut self,
+        src: Value,
+        method: Value,
+    ) -> Result<Vec<Value>, Thrown> {
+        let iter = self.call_value(method, src, &[])?;
+        if !self.is_object_value(iter) {
+            return Err(Thrown("TypeError: iterator is not an object".into()));
+        }
+        let next = self.get_prop(iter, "next")?;
+        let mut out = Vec::new();
+        loop {
+            let res = self.call_value(next, iter, &[])?;
+            if !self.is_object_value(res) {
+                return Err(Thrown("TypeError: iterator result is not an object".into()));
+            }
+            let done = self.get_prop(res, "done")?;
+            if self.truthy(done) {
+                break;
+            }
+            out.push(self.get_prop(res, "value")?);
+        }
+        Ok(out)
+    }
+
+    /// %TypedArray%.from's source step: GetMethod(source, @@iterator) once (a
+    /// defined non-callable is a TypeError); an iterable source drains to a
+    /// list via the pre-fetched method, while an ARRAY-LIKE source only reads
+    /// ToLength(length) here — its element Gets are deferred until AFTER the
+    /// target is constructed (spec step 12.b runs per-k against the target).
+    fn ta_from_source(&mut self, src: Value) -> Result<(usize, Option<Vec<Value>>), Thrown> {
+        if src == Value::UNDEFINED || src == Value::NULL {
+            return Err(Thrown("TypeError: TypedArray.from source is null or undefined".into()));
+        }
+        let method = self.get_prop(src, "@@iterator")?;
+        if method != Value::UNDEFINED && method != Value::NULL && !self.is_callable(method) {
+            return Err(Thrown("TypeError: source is not iterable".into()));
+        }
+        if self.is_callable(method) {
+            let list = self.iterator_to_list(src, method)?;
+            return Ok((list.len(), Some(list)));
+        }
+        let lenv = self.get_prop(src, "length")?;
+        // ToLength runs the OBSERVABLE ToNumber (a poisoned valueOf throws).
+        let nf = self.to_number_coerce(lenv)?;
+        let n = if nf.is_nan() || nf <= 0.0 {
+            0
+        } else if nf > super::typedarray::MAX_ARRAY_BUFFER_LEN as f64 {
+            return Err(Thrown("RangeError: typed array length exceeds the maximum".into()));
+        } else {
+            nf as usize
+        };
+        Ok((n, None))
+    }
+
     /// OrdinarySetWithOwnDescriptor's receiver tail for Reflect.set when the
     /// governing descriptor is a writable data property (a TypedArray element
     /// included) but the Receiver differs from its holder: CreateDataProperty
@@ -1087,21 +1145,11 @@ impl<'p> Vm<'p> {
                                 ));
                             }
                             let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                            let items: Vec<Value> = if id == TA_FROM {
-                                let arr = self.array_from(
-                                    Value::UNDEFINED,
-                                    a0,
-                                    Value::UNDEFINED,
-                                    Value::UNDEFINED,
-                                )?;
-                                match self.heap.get(arr.heap_index()) {
-                                    HeapObj::Array(v) => v.clone(),
-                                    _ => Vec::new(),
-                                }
+                            let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
+                                self.ta_from_source(a0)?
                             } else {
-                                args.to_vec()
+                                (args.len(), Some(args.to_vec()))
                             };
-                            let n = items.len();
                             let target = self.construct(this, &[Value::num(n as f64)])?;
                             // TypedArrayCreate: ValidateTypedArray in write mode —
                             // a non-TypedArray, an immutable-backed result, or one
@@ -1131,7 +1179,13 @@ impl<'p> Vm<'p> {
                                     "TypeError: TypedArray.from/of constructor returned a TypedArray shorter than the requested length".into(),
                                 ));
                             }
-                            for (i, v) in items.into_iter().enumerate() {
+                            for i in 0..n {
+                                // Array-like sources Get their elements HERE,
+                                // after the target exists (spec step 12.b).
+                                let v = match &list {
+                                    Some(l) => l[i],
+                                    None => self.get_index(a0, Value::int(i as i32))?,
+                                };
                                 let mv = if mapfn != Value::UNDEFINED {
                                     self.call_value(
                                         mapfn,
@@ -1163,26 +1217,20 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let this_arg = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                let items: Vec<Value> = if id == TA_FROM {
-                    let arr = self.array_from(
-                        Value::UNDEFINED,
-                        a0,
-                        Value::UNDEFINED,
-                        Value::UNDEFINED,
-                    )?;
-                    match self.heap.get(arr.heap_index()) {
-                        HeapObj::Array(v) => v.clone(),
-                        _ => Vec::new(),
-                    }
+                let (n, list): (usize, Option<Vec<Value>>) = if id == TA_FROM {
+                    self.ta_from_source(a0)?
                 } else {
-                    args.to_vec()
+                    (args.len(), Some(args.to_vec()))
                 };
-                let n = items.len();
                 let size = native::TA_KINDS[kind as usize].1;
                 let buf = self.alloc_array_buffer(n * size);
                 let target = self.alloc_typed_array(buf, kind, 0, n);
                 let tidx = target.heap_index();
-                for (i, v) in items.into_iter().enumerate() {
+                for i in 0..n {
+                    let v = match &list {
+                        Some(l) => l[i],
+                        None => self.get_index(a0, Value::int(i as i32))?,
+                    };
                     let mv = if mapfn != Value::UNDEFINED {
                         self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
                     } else {
@@ -3078,6 +3126,16 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 self.arraybuffer_method(this.heap_index(), "grow", args)?.unwrap_or(Value::UNDEFINED)
+            }
+            SAB_SLICE => {
+                // Brand check: a SharedArrayBuffer receiver only (a plain
+                // ArrayBuffer must NOT pass through SAB's slice).
+                if !(this.is_heap() && self.shared_buffers.contains(&this.heap_index())) {
+                    return Err(Thrown(
+                        "TypeError: SharedArrayBuffer.prototype.slice called on incompatible receiver".into(),
+                    ));
+                }
+                self.arraybuffer_method(this.heap_index(), "slice", args)?.unwrap_or(Value::UNDEFINED)
             }
             _ if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) => {
                 let (name, _) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];

@@ -257,6 +257,9 @@ pub const SAB_GROW: u16 = 810;
 /// from the instance (`get_member`).
 pub const SAB_GETTER_BASE: u16 = 811;
 pub const SAB_GETTERS: &[&str] = &["byteLength", "maxByteLength", "growable"];
+/// `SharedArrayBuffer.prototype.slice` — a DISTINCT function object from
+/// ArrayBuffer.prototype.slice (each brand-checks its own receiver kind).
+pub const SAB_SLICE: u16 = 814;
 /// `Atomics.*` methods, indexed off this base by `ATOMICS_METHODS` (name, length).
 pub const ATOMICS_BASE: u16 = 820;
 pub const ATOMICS_METHODS: &[(&str, u8)] = &[
@@ -1002,6 +1005,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_IS_FINITE => ("isFinite", 1),
         GLOBAL_EVAL => ("eval", 1),
         SAB_GROW => ("grow", 1),
+        SAB_SLICE => ("slice", 2),
         DISPOSABLE_USE => ("use", 1),
         ASYNC_DISPOSABLE_USE => ("use", 1),
         ASYNC_DISPOSABLE_ADOPT => ("adopt", 2),

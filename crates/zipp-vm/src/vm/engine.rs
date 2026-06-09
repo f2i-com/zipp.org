@@ -213,6 +213,7 @@ impl<'p> Vm<'p> {
             gen_proto: 0,
             asyncgen_proto: 0,
             default_array_iter: Value::UNDEFINED,
+            default_array_iter_next: Value::UNDEFINED,
             throw_type_error: Value::UNDEFINED,
             iterator_ctor: 0,
             dollar262: 0,

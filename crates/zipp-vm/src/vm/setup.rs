@@ -611,6 +611,12 @@ impl<'p> Vm<'p> {
         // iterators delegate here.
         let array_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
         self.array_iter_proto = array_iter_proto;
+        // Remember the pristine `next` so the for-of fast path can detect a
+        // patched %ArrayIteratorPrototype%.next and fall back to the protocol.
+        self.default_array_iter_next = match self.heap.get(array_iter_proto) {
+            HeapObj::Object(m) => m.get("next").unwrap_or(Value::UNDEFINED),
+            _ => Value::UNDEFINED,
+        };
         // Distinct %MapIteratorPrototype% / %SetIteratorPrototype% (same natives,
         // different identity so getPrototypeOf discriminates them).
         self.map_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
@@ -1340,7 +1346,7 @@ impl<'p> Vm<'p> {
             // `slice`; adds `grow` (grow-only), growable/byteLength/maxByteLength
             // accessor getters, and @@toStringTag "SharedArrayBuffer".
             let sab_proto =
-                build(self, &[("slice", ARRAYBUFFER_SLICE), ("grow", native::SAB_GROW)], None);
+                build(self, &[("slice", native::SAB_SLICE), ("grow", native::SAB_GROW)], None);
             self.proto_of.insert(sab_proto, Value::heap(obj_proto));
             self.sab_proto = sab_proto;
             let sab_ctor = build(self, &[], Some(sab_proto));
