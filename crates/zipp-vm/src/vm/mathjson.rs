@@ -47,8 +47,22 @@ impl<'p> Vm<'p> {
                 let mut hypot_inf = false;
                 for v in nums {
                     acc = match op {
-                        M::Min => if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.min(v) },
-                        M::Max => if v.is_nan() || acc.is_nan() { f64::NAN } else { acc.max(v) },
+                        // f64 min/max treat -0 and +0 as equal; spec orders -0 < +0,
+                        // so tie-break on the sign (Min prefers -0, Max prefers +0).
+                        M::Min => if v.is_nan() || acc.is_nan() {
+                            f64::NAN
+                        } else if v == acc {
+                            if v.is_sign_negative() { v } else { acc }
+                        } else {
+                            acc.min(v)
+                        },
+                        M::Max => if v.is_nan() || acc.is_nan() {
+                            f64::NAN
+                        } else if v == acc {
+                            if v.is_sign_positive() { v } else { acc }
+                        } else {
+                            acc.max(v)
+                        },
                         _ => {
                             // Math.hypot: a ±Infinity argument forces +Infinity even
                             // when another argument is NaN (spec step 3).
@@ -69,7 +83,13 @@ impl<'p> Vm<'p> {
             M::Pow => {
                 let a = self.to_number_coerce(at(args, 0))?;
                 let b = self.to_number_coerce(at(args, 1))?;
-                a.powf(b)
+                // Spec: base of magnitude 1 with a NaN/±Infinity exponent is NaN
+                // (C/Rust powf returns 1 for these — a deliberate deviation).
+                if (a == 1.0 || a == -1.0) && (b.is_nan() || b.is_infinite()) {
+                    f64::NAN
+                } else {
+                    a.powf(b)
+                }
             }
             M::Atan2 => {
                 let a = self.to_number_coerce(at(args, 0))?;

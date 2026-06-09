@@ -576,7 +576,16 @@ impl<'p> Vm<'p> {
                         let r = if let Some(bv) = self.bigint_binop(BigOp::Pow, va, vb)? {
                             bv
                         } else {
-                            Value::num(self.to_number_coerce(va)?.powf(self.to_number_coerce(vb)?))
+                            let bb = self.to_number_coerce(va)?;
+                            let ee = self.to_number_coerce(vb)?;
+                            // Spec: |base|==1 with a NaN/±Infinity exponent is NaN
+                            // (C/Rust powf returns 1 — a deliberate deviation).
+                            let p = if (bb == 1.0 || bb == -1.0) && (ee.is_nan() || ee.is_infinite()) {
+                                f64::NAN
+                            } else {
+                                bb.powf(ee)
+                            };
+                            Value::num(p)
                         };
                         self.set(base, dst, r);
                         ip += 1;

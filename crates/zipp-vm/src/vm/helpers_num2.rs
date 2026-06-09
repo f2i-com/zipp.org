@@ -17,7 +17,21 @@ pub(crate) fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
         M::Abs => x.abs(),
         M::Floor => x.floor(),
         M::Ceil => x.ceil(),
-        M::Round => (x + 0.5).floor(),
+        M::Round => {
+            // Spec Math.round: preserve NaN/±Infinity/±0; (0,0.5)→+0, [-0.5,0)→-0
+            // (so 1/Math.round(-0.4) is -Infinity); else half-up via floor(x+0.5).
+            // The explicit (0,0.5)/[-0.5,0) branches also fix the fp edge where
+            // x+0.5 rounds up to 1 for the largest double below 0.5.
+            if x.is_nan() || x.is_infinite() || x == 0.0 {
+                x
+            } else if x > 0.0 && x < 0.5 {
+                0.0
+            } else if x < 0.0 && x >= -0.5 {
+                -0.0
+            } else {
+                (x + 0.5).floor()
+            }
+        }
         M::Trunc => x.trunc(),
         M::Sign => {
             if x.is_nan() {
