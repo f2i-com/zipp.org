@@ -695,6 +695,18 @@ impl<'p> Vm<'p> {
                         "TypeError: RegExp.prototype.compile called on a non-RegExp".into(),
                     ));
                 }
+                // AnnexB: compile is a LEGACY feature — an instance created by a
+                // RegExp SUBCLASS (its [[Prototype]] is not %RegExp.prototype%)
+                // throws TypeError rather than recompiling.
+                if self
+                    .proto_of
+                    .get(&this.heap_index())
+                    .map_or(false, |p| !p.is_heap() || p.heap_index() != self.regexp_proto)
+                {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.compile may not be used on a subclass instance".into(),
+                    ));
+                }
                 // Reuse the constructor path (validates flags, builds the matcher),
                 // then move the freshly built fields into the receiver.
                 let built = self.build_regexp(a0, a1)?;

@@ -1218,6 +1218,17 @@ impl<'p> Vm<'p> {
         };
         // Capture the subclass prototype before re-branding loses the map.class link.
         let sub_proto = self.object_get_prototype_of(obj);
+        // `class S extends Symbol/BigInt`: super() must throw — neither is a
+        // constructor (their call forms exist but [[Construct]] does not).
+        if cval.is_heap() {
+            let ci = cval.heap_index();
+            if ci != 0 && ci == self.symbol_ctor {
+                return Err(Thrown("TypeError: Symbol is not a constructor".into()));
+            }
+            if ci != 0 && ci == self.bigint_ctor {
+                return Err(Thrown("TypeError: BigInt is not a constructor".into()));
+            }
+        }
         // `class T extends Uint8Array` (or any TypedArray kind): build a real typed
         // array through the builtin ctor (handling every arg form — length, array,
         // (buffer, byteOffset, length) on a fixed/resizable buffer) and move it into
@@ -1271,6 +1282,95 @@ impl<'p> Vm<'p> {
             }
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
+        // `class B extends Boolean/Number/String/Date/RegExp`: construct() already
+        // implements each builtin's argument semantics (truthy boxing, ToNumber,
+        // ToString, the Date overloads, pattern/flags); clone the built heap
+        // object into the instance — Boxed/Date/RegExp carry no heap-index-keyed
+        // side state that matters here.
+        if pidx != 0
+            && [self.bool_proto, self.num_proto, self.str_proto, self.date_proto, self.regexp_proto]
+                .contains(&pidx)
+        {
+            let tv = self.construct(cval, args)?;
+            let cloned = self.heap.get(tv.heap_index()).clone();
+            *self.heap.get_mut(oidx) = cloned;
+            // Carry any named own props the build recorded (e.g. a RegExp's
+            // side-table entries) from the temp object to the instance.
+            if let Some(m) = self.arr_props.remove(&tv.heap_index()) {
+                self.arr_props.insert(oidx, m);
+            }
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
+        // `class F extends Function/GeneratorFunction/Async(Generator)Function`:
+        // build the dynamic function through the builtin ctor (construct routes
+        // each ctor to its build_function_kind) and move it into the instance,
+        // carrying the function-keyed side tables so name/length/prototype and
+        // callability follow the instance's heap index.
+        if cval.is_heap()
+            && [self.function_ctor, self.gen_fn_ctor, self.async_fn_ctor, self.asyncgen_fn_ctor]
+                .contains(&cval.heap_index())
+            && cval.heap_index() != 0
+        {
+            let tv = self.construct(cval, args)?;
+            let tvi = tv.heap_index();
+            let cloned = self.heap.get(tvi).clone();
+            *self.heap.get_mut(oidx) = cloned;
+            if let Some(m) = self.fn_props.remove(&tvi) {
+                self.fn_props.insert(oidx, m);
+            }
+            if let Some(p) = self.prototypes.remove(&tvi) {
+                self.prototypes.insert(oidx, p);
+            }
+            if let Some(v) = self.fn_proto_override.remove(&tvi) {
+                self.fn_proto_override.insert(oidx, v);
+            }
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
+        // `class W extends WeakMap/WeakSet`: brand first (so the adder operates
+        // on the real variant), then add iterable entries via the instance's
+        // adder (honouring a subclass override) — modeled on the Map/Set arms.
+        if pidx == self.weakmap_proto && self.weakmap_proto != 0 {
+            *self.heap.get_mut(oidx) = HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() };
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !a0.is_nullish() {
+                let adder = self.get_member(obj, "set", obj)?;
+                if !self.is_callable(adder) {
+                    return Err(Thrown("TypeError: WeakMap.prototype.set is not callable".into()));
+                }
+                for e in self.iterate_to_vec(a0)? {
+                    let k = self.get_index(e, Value::int(0))?;
+                    let v = self.get_index(e, Value::int(1))?;
+                    self.call_value(adder, obj, &[k, v])?;
+                }
+            }
+            return Ok(true);
+        }
+        if pidx == self.weakset_proto && self.weakset_proto != 0 {
+            *self.heap.get_mut(oidx) = HeapObj::WeakSet(Vec::new());
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+            if !a0.is_nullish() {
+                let adder = self.get_member(obj, "add", obj)?;
+                if !self.is_callable(adder) {
+                    return Err(Thrown("TypeError: WeakSet.prototype.add is not callable".into()));
+                }
+                for e in self.iterate_to_vec(a0)? {
+                    self.call_value(adder, obj, &[e])?;
+                }
             }
             return Ok(true);
         }
