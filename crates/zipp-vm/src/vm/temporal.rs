@@ -622,12 +622,20 @@ impl<'p> Vm<'p> {
                 // day, month, monthCode (inside read_month_field), year — observable
                 // via the property-bag getters' side effects (order-of-operations).
                 let d_opt = self.opt_int_field(v, "day")?;
-                let m_opt = self.read_month_field(v)?; // month then monthCode
+                let m_raw = self.read_month_field_raw(v)?; // (month, calendar_valid)
                 let y_opt = self.opt_int_field(v, "year")?;
-                if y_opt.is_none() || m_opt.is_none() || d_opt.is_none() {
+                // Required-field presence (TypeError) and the year coercion above run
+                // BEFORE a well-formed-but-calendar-invalid monthCode's RangeError.
+                if y_opt.is_none() || m_raw.is_none() || d_opt.is_none() {
                     return Err(Thrown("TypeError: PlainDate-like requires year, month, day".into()));
                 }
-                let (y, mut m, mut d) = (y_opt.unwrap(), m_opt.unwrap(), d_opt.unwrap());
+                let (m_val, m_valid) = m_raw.unwrap();
+                if !m_valid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
+                }
+                let (y, mut m, mut d) = (y_opt.unwrap(), m_val, d_opt.unwrap());
                 if reject {
                     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
                         return Err(Thrown("RangeError: invalid date fields".into()));
@@ -1321,10 +1329,13 @@ impl<'p> Vm<'p> {
                 if let Some(x) = self.opt_int_field(v, "minute")? {
                     f[4] = x;
                 }
-                if let Some(x) = self.read_month_field(v)? {
-                    // month then monthCode (alphabetical, inside read_month_field)
+                let mut month_code_invalid = false;
+                if let Some((x, valid)) = self.read_month_field_raw(v)? {
+                    // month then monthCode (alphabetical, inside read_month_field_raw);
+                    // a calendar-invalid monthCode's RangeError is deferred (below).
                     f[1] = x;
                     have_date[1] = true;
+                    month_code_invalid = !valid;
                 }
                 if let Some(x) = self.opt_int_field(v, "nanosecond")? {
                     f[8] = x;
@@ -1338,6 +1349,13 @@ impl<'p> Vm<'p> {
                 }
                 if !have_date.iter().all(|&b| b) {
                     return Err(Thrown("TypeError: PlainDateTime-like requires year, month, day".into()));
+                }
+                // Required-field presence + the year coercion above precede a
+                // calendar-invalid monthCode's RangeError.
+                if month_code_invalid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
                 }
                 // date: month/day; time: hour..nanosecond (maxes 23/59/59/999/999/999).
                 let maxes = [23, 59, 59, 999, 999, 999];
@@ -2711,10 +2729,12 @@ impl<'p> Vm<'p> {
             }
             if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
-                // Alphabetical field order: month, monthCode (read_month_field), year.
-                let m = self.read_month_field(v)?;
+                // Alphabetical field order: month, monthCode (raw), year. A
+                // calendar-invalid monthCode's RangeError defers past required-field
+                // presence (TypeError) and the year coercion (Symbol -> TypeError).
+                let m_raw = self.read_month_field_raw(v)?;
                 let yv = self.get_prop(v, "year")?;
-                if yv == Value::UNDEFINED || m.is_none() {
+                if yv == Value::UNDEFINED || m_raw.is_none() {
                     return Err(Thrown(
                         "TypeError: PlainYearMonth-like requires year and month".into(),
                     ));
@@ -2722,7 +2742,13 @@ impl<'p> Vm<'p> {
                 // ToIntegerWithTruncation: reject a non-finite (NaN/±Infinity) year
                 // and run the observable ToPrimitive (not the non-`&mut` to_number).
                 let y = self.temporal_ctor_int(yv)?;
-                let mut m = m.unwrap();
+                let (m_val, m_valid) = m_raw.unwrap();
+                if !m_valid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
+                }
+                let mut m = m_val;
                 if reject {
                     if !(1..=12).contains(&m) {
                         return Err(Thrown("RangeError: month out of range".into()));
@@ -3057,18 +3083,26 @@ impl<'p> Vm<'p> {
             }
             if self.is_object_value(v) {
                 self.validate_iso_calendar_field(v)?;
-                let m = self.read_month_field(v)?;
+                // Alphabetical field order: day, month, monthCode (raw), year.
                 let d_opt = self.opt_int_field(v, "day")?;
+                let m_raw = self.read_month_field_raw(v)?;
                 // The reference `year` field is read (and finite-checked, rejecting
                 // ±Infinity/NaN) even though this ISO engine always stores 1972 as
-                // the reference ISO year.
+                // the reference ISO year. Required-field presence + this year coercion
+                // precede a calendar-invalid monthCode's RangeError.
                 let _year = self.opt_int_field(v, "year")?;
-                if m.is_none() || d_opt.is_none() {
+                if m_raw.is_none() || d_opt.is_none() {
                     return Err(Thrown(
                         "TypeError: PlainMonthDay-like requires month and day".into(),
                     ));
                 }
-                let mut m = m.unwrap();
+                let (m_val, m_valid) = m_raw.unwrap();
+                if !m_valid {
+                    return Err(Thrown(
+                        "RangeError: monthCode is not valid for the ISO 8601 calendar".into(),
+                    ));
+                }
+                let mut m = m_val;
                 let mut d = d_opt.unwrap();
                 if reject {
                     if !(1..=12).contains(&m) || d < 1 || d > days_in_month(1972, m) {
