@@ -3202,7 +3202,9 @@ impl<'p> Vm<'p> {
                     const NS_MAX: i128 = 8_640_000_000_000_000_000_000;
                     let today_start = iso_to_epoch_days(y, m, d) as i128 * DAY_NS_I - off as i128;
                     let tomorrow_start = today_start + DAY_NS_I;
-                    if tomorrow_start.abs() > NS_MAX {
+                    // GetStartOfDay throws for BOTH boundaries: a nonzero offset can
+                    // push today's local midnight itself past the instant range.
+                    if today_start.abs() > NS_MAX || tomorrow_start.abs() > NS_MAX {
                         return Err(Thrown(
                             "RangeError: ZonedDateTime hoursInDay is outside the representable range"
                                 .into(),

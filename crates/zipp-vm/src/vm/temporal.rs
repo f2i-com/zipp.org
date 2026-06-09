@@ -1453,6 +1453,15 @@ impl<'p> Vm<'p> {
                 let t = ns_to_time(rounded.rem_euclid(DAY_NS));
                 let (ny, nm, nd) =
                     epoch_days_to_iso(iso_to_epoch_days(date[0], date[1], date[2]) + carry);
+                // RoundISODateTime: the rounded result must re-satisfy
+                // ISODateTimeWithinLimits (a day carry at the boundary can push an
+                // in-range datetime exactly onto the exclusive limit).
+                if !iso_datetime_ns_in_range([ny, nm, nd, t[0], t[1], t[2], t[3], t[4], t[5]]) {
+                    return Err(Thrown(
+                        "RangeError: rounded PlainDateTime is outside the representable range"
+                            .into(),
+                    ));
+                }
                 let s = format!(
                     "{}T{}{}",
                     iso_date_string(ny, nm, nd),
@@ -2004,6 +2013,26 @@ impl<'p> Vm<'p> {
                     let total_ns = (df[3] as i128) * DAY_NS
                         + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
                     let inc_ns = unit_ns(&smallest) * inc;
+                    // NudgeToCalendarUnit (smallestUnit "day"): the away-from-zero
+                    // candidate r2 = (trunc(total/inc)+sign)·inc days is materialized
+                    // against the receiver via GetEpochNanosecondsFor and must be a
+                    // representable instant, regardless of which way rounding goes.
+                    // Equal instants short-circuit before any nudge (total == 0).
+                    if smallest == "day" && total_ns != 0 {
+                        let s: i128 = if total_ns < 0 { -1 } else { 1 };
+                        let r2_days = (total_ns / inc_ns + s) * inc;
+                        let off = self.zdt_offset_ns(idx);
+                        let end_ns = (iso_to_epoch_days(f[0], f[1], f[2]) as i128 + r2_days)
+                            * DAY_NS
+                            + time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]])
+                            - off as i128;
+                        if end_ns.abs() > NS_MAX_INSTANT {
+                            return Err(Thrown(
+                                "RangeError: rounding bound is outside the representable range"
+                                    .into(),
+                            ));
+                        }
+                    }
                     let rounded = round_increment(total_ns, inc_ns, &eff);
                     balance_duration_ns(rounded, &largest)
                 } else if matches!(smallest.as_str(), "year" | "month" | "week") {
@@ -2027,13 +2056,27 @@ impl<'p> Vm<'p> {
                     true,
                 )?;
                 let f = self.zdt_local(idx);
+                let off = self.zdt_offset_ns(idx);
+                // RoundISODateTime to "day" measures against the REAL day boundaries:
+                // GetStartOfDay(today) and GetStartOfDay(tomorrow) must both be
+                // representable instants even when the rounded result itself is.
+                if su == "day" {
+                    let start_ns =
+                        (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS - off as i128;
+                    let end_ns = start_ns + DAY_NS;
+                    if start_ns.abs() > NS_MAX_INSTANT || end_ns.abs() > NS_MAX_INSTANT {
+                        return Err(Thrown(
+                            "RangeError: ZonedDateTime day boundary is outside the representable range"
+                                .into(),
+                        ));
+                    }
+                }
                 let time_ns = time_to_ns(&[f[3], f[4], f[5], f[6], f[7], f[8]]);
                 let inc_ns = unit_ns(&su) * inc;
                 let rounded = round_increment(time_ns, inc_ns, &mode);
                 let day_carry = rounded.div_euclid(DAY_NS) as i64;
                 let nt = ns_to_time(rounded.rem_euclid(DAY_NS));
                 let ed = iso_to_epoch_days(f[0], f[1], f[2]) + day_carry;
-                let off = self.zdt_offset_ns(idx);
                 let local = (ed as i128) * DAY_NS + time_to_ns(&nt);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
                 Ok(Some(self.alloc_zdt(local - off as i128, off, id)?))
@@ -3110,6 +3153,37 @@ impl<'p> Vm<'p> {
                         "RangeError: PlainYearMonth difference is outside the representable range".into(),
                     ));
                 }
+                // NudgeToCalendarUnit: when the difference is actually rounded, the
+                // away-from-zero candidate end (start + r2 in the smallest unit, as a
+                // day-1 DATE per CalendarDateAdd) must lie within the ISO date range,
+                // regardless of which way rounding resolves. No rounding happens for
+                // smallestUnit "month" with increment 1, and equal operands return a
+                // zero Duration before any nudge.
+                if (inc != 1 || smallest != "month") && total_months != 0 {
+                    // Spec orientation: the nudged span is receiver → other.
+                    let d_months = if name == "until" { total_months } else { -total_months };
+                    let s = if d_months < 0 { -1i64 } else { 1 };
+                    let inc_i = inc as i64;
+                    let cand_idx = if smallest == "year" {
+                        let r2y = (d_months / 12 / inc_i + s) * inc_i;
+                        (y + r2y) * 12 + (m - 1)
+                    } else if largest == "year" {
+                        // Years split out first; only the months remainder is rounded.
+                        let years = d_months / 12;
+                        let r2m = (d_months % 12 / inc_i + s) * inc_i;
+                        y * 12 + (m - 1) + years * 12 + r2m
+                    } else {
+                        let r2m = (d_months / inc_i + s) * inc_i;
+                        y * 12 + (m - 1) + r2m
+                    };
+                    let (cy, cm) = (cand_idx.div_euclid(12), cand_idx.rem_euclid(12) + 1);
+                    if !iso_date_in_range(cy, cm, 1) {
+                        return Err(Thrown(
+                            "RangeError: rounded PlainYearMonth difference is outside the representable range"
+                                .into(),
+                        ));
+                    }
+                }
                 let mut f = [0i64; 10];
                 if largest == "year" {
                     if smallest == "year" {
@@ -3155,7 +3229,14 @@ impl<'p> Vm<'p> {
     // ── Temporal.PlainMonthDay ──
 
     pub(crate) fn make_plain_month_day(&mut self, m: i64, d: i64, ref_year: i64) -> Result<Value, Thrown> {
-        if !(1..=12).contains(&m) || d < 1 || d > days_in_month(ref_year, m) {
+        // CreateTemporalMonthDay runs ISODateWithinLimits on the FULL reference
+        // date (day-granular is correct here: an explicit referenceISOYear at the
+        // boundary admits only the in-range days, e.g. +275760-09-13 but not -14).
+        if !(1..=12).contains(&m)
+            || d < 1
+            || d > days_in_month(ref_year, m)
+            || !iso_date_in_range(ref_year, m, d)
+        {
             return Err(Thrown("RangeError: invalid month-day value".into()));
         }
         let idx = self.heap.alloc(HeapObj::Temporal { kind: 6, fields: vec![ref_year, m, d] });
