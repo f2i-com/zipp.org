@@ -3413,8 +3413,9 @@ impl<'p> Vm<'p> {
                 }
                 // A class is a function: keys not found as a static fall back to
                 // Function.prototype (so `C.toString()` → the class source via
-                // FN_TO_STRING, and `C.call`/`apply`/`bind` resolve).
-                Ok(self.proto_member(self.fn_proto, key))
+                // FN_TO_STRING, and `C.call`/`apply`/`bind` resolve). Accessor-aware
+                // so an inherited getter on the chain is invoked, not returned raw.
+                self.proto_member_get(self.fn_proto, key, receiver)
             }
             // `map.size` / `set.size` — an accessor property, not a method.
             // Deleted entries are tombstoned (Value::HOLE) without shifting indices
@@ -3533,7 +3534,9 @@ impl<'p> Vm<'p> {
                 let start = self
                     .callable_dynfn_proto(obj.heap_index())
                     .unwrap_or(self.fn_proto);
-                Ok(self.proto_member(start, key))
+                // Accessor-aware so an inherited getter on Function.prototype (or a
+                // dynamic-function intrinsic) is invoked with this = receiver.
+                self.proto_member_get(start, key, receiver)
             }
             _ => Ok(Value::UNDEFINED),
         }
