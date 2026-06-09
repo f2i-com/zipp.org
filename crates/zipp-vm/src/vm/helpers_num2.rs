@@ -28,6 +28,11 @@ pub(crate) fn math_unary(op: crate::bytecode::MathFn, x: f64) -> f64 {
                 0.0
             } else if x < 0.0 && x >= -0.5 {
                 -0.0
+            } else if x.abs() >= 4503599627370496.0 {
+                // |x| >= 2^52: every double is already an integer, and x+0.5 would
+                // round the magnitude UP to the next representable value, so
+                // Math.round(-(2^53-1)) must return x unchanged.
+                x
             } else {
                 (x + 0.5).floor()
             }
