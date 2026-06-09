@@ -2690,7 +2690,15 @@ impl<'p> Vm<'p> {
     // ── Temporal.PlainYearMonth ──
 
     pub(crate) fn make_plain_year_month(&mut self, y: i64, m: i64, ref_day: i64) -> Result<Value, Thrown> {
-        if !(1..=12).contains(&m) || !iso_year_month_in_range(y, m) {
+        // The reference ISO day (explicit via the 4-arg ctor) must be a valid day
+        // of the month (e.g. 32 is a RangeError). The LIMIT is year-month-granular
+        // (iso_year_month_in_range) — NOT the day-granular ISODate bound, which
+        // would wrongly reject valid boundary year-months (min day<19 / max day>13).
+        if !(1..=12).contains(&m)
+            || !iso_year_month_in_range(y, m)
+            || ref_day < 1
+            || ref_day > days_in_month(y, m)
+        {
             return Err(Thrown("RangeError: invalid year-month value".into()));
         }
         let idx = self.heap.alloc(HeapObj::Temporal { kind: 5, fields: vec![y, m, ref_day] });
