@@ -229,6 +229,10 @@ pub struct Vm<'p> {
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).
     template_raws: std::collections::HashMap<u32, Value>,
+    /// GetTemplateObject memoization: the canonical frozen tagged-template object
+    /// per source call site, keyed by (function id, per-function site index). The
+    /// cached objects are permanent GC roots (they live as long as the realm).
+    template_cache: std::collections::HashMap<(u32, u32), Value>,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on

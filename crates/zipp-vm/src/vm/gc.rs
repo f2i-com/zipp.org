@@ -230,6 +230,12 @@ impl Vm<'_> {
         for v in self.template_raws.values() {
             root_val!(*v);
         }
+        // Memoized tagged-template objects are permanent roots (one per source
+        // site, live for the realm's lifetime); their keys are func/site ids, not
+        // heap indices, so the map is never pruned.
+        for v in self.template_cache.values() {
+            root_val!(*v);
+        }
         for v in self.zdt_tz.values() {
             root_val!(*v);
         }

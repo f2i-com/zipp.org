@@ -1342,6 +1342,9 @@ struct FnCompiler<'a> {
     /// synced to the function value when the block declaration executes. Excludes
     /// names with a lexical conflict (which would be an early error → B.3.3 skipped).
     b33_names: std::collections::HashSet<String>,
+    /// Per-function counter assigning a stable site index to each tagged-template
+    /// literal, so the VM can memoize one canonical template object per (func, site).
+    template_site_count: u32,
     /// Annex B B.3.3: function-body-level names that a same-named block function
     /// must NOT overwrite — formal parameters, lexical (`let`/`const`) bindings,
     /// and class declarations. A block function with one of these names stays
@@ -1470,6 +1473,7 @@ impl<'a> FnCompiler<'a> {
             enclosing,
             with_stack: Vec::new(),
             b33_names: std::collections::HashSet::new(),
+            template_site_count: 0,
             protect_names: std::collections::HashSet::new(),
             entry_lexicals: std::collections::HashSet::new(),
         };
@@ -4964,9 +4968,19 @@ impl<'a> FnCompiler<'a> {
                 Tag::Plain(callee_reg)
             }
         };
-        // Build the (cooked + .raw) strings array into a stable register.
+        // The template object is memoized per source site: load the cache; on a hit
+        // (a truthy template object) skip the build, else build + freeze + memoize so
+        // every evaluation of THIS literal yields the same canonical frozen object.
         let strings_reg = self.alloc_reg();
+        let site = self.template_site_count;
+        self.template_site_count += 1;
+        self.emit(Instr::TemplateGetCached { dst: strings_reg, site });
+        let skip = self.here();
+        self.emit(Instr::JumpIfTrue { cond: strings_reg, target: 0 }); // patched: cache hit
         self.build_template_strings(quasi, strings_reg)?;
+        self.emit(Instr::TemplateSetCached { site, src: strings_reg });
+        let after = self.here();
+        self.patch_jump(skip, after);
         // Contiguous argument block: [strings, e0, e1, …].
         let arg_base = self.next_reg;
         for _ in 0..=n {

@@ -3155,6 +3155,20 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    Instr::TemplateGetCached { dst, site } => {
+                        let v = self
+                            .template_cache
+                            .get(&(func_id, site))
+                            .copied()
+                            .unwrap_or(Value::UNDEFINED);
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::TemplateSetCached { site, src } => {
+                        let v = self.get(base, src);
+                        self.template_cache.insert((func_id, site), v);
+                        ip += 1;
+                    }
                     Instr::GetIterator { dst, src } => {
                         let s = self.get(base, src);
                         let it = self.get_iterator(s)?;

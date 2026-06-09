@@ -618,9 +618,15 @@ pub enum Instr {
     /// `Jump` (so JIT-eligible loops stay eligible).
     JumpFinally { target: u32, floor: u16 },
 
-    /// Attach `raw` (an array) as the `.raw` of a tagged-template strings array
-    /// `arr` (arrays can't hold named props, so it lands in a VM side table).
+    /// Finalize a tagged-template object: define `raw` as a frozen `.raw` own
+    /// property of the cooked array `arr` and freeze both arrays.
     SetRaw { arr: Reg, raw: Reg },
+    /// Load the cached tagged-template object for this call SITE (keyed by the
+    /// current function id + `site`), or `undefined` on the first evaluation —
+    /// GetTemplateObject memoizes one canonical frozen object per source location.
+    TemplateGetCached { dst: Reg, site: u32 },
+    /// Memoize the freshly-built tagged-template object `src` for this call site.
+    TemplateSetCached { site: u32, src: Reg },
     /// `Math.random()` → a float in [0, 1) from the VM's PRNG.
     Random { dst: Reg },
     /// Install a method on a class value at runtime under a COMPUTED key
