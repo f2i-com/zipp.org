@@ -754,23 +754,44 @@ impl<'p> Vm<'p> {
                 ))
             }
         };
+        // zipp's BigInt is fixed-width i128: a result beyond ±(2^127−1)
+        // SATURATES to ±i128::MAX instead of wrapping. Wrapping let huge
+        // magnitudes masquerade as small values (2n**128n evaluated to 0n, so
+        // `new Temporal.Instant(2n**128n)` sailed past its range check);
+        // saturation is still lossy for exact-value math beyond i128, but it
+        // preserves the sign and the hugeness, which range validation observes.
+        // ±i128::MAX (not MIN) keeps negation involutive.
+        let sat = |neg: bool| if neg { -i128::MAX } else { i128::MAX };
         let r = match op {
-            BigOp::Add => a.wrapping_add(b),
-            BigOp::Sub => a.wrapping_sub(b),
-            BigOp::Mul => a.wrapping_mul(b),
+            BigOp::Add => a.checked_add(b).unwrap_or_else(|| sat(a < 0)),
+            BigOp::Sub => a.checked_sub(b).unwrap_or_else(|| sat(a < 0)),
+            BigOp::Mul => a.checked_mul(b).unwrap_or_else(|| sat((a < 0) != (b < 0))),
             BigOp::Div | BigOp::Mod if b == 0 => {
                 return Err(Thrown("RangeError: Division by zero".into()))
             }
-            BigOp::Div => a.wrapping_div(b),
-            BigOp::Mod => a.wrapping_rem(b),
+            // checked_div/rem fail only for i128::MIN / -1.
+            BigOp::Div => a.checked_div(b).unwrap_or(i128::MAX),
+            BigOp::Mod => a.checked_rem(b).unwrap_or(0),
             BigOp::Pow if b < 0 => {
                 return Err(Thrown("RangeError: Exponent must be non-negative".into()))
             }
-            BigOp::Pow => a.wrapping_pow(b.min(u32::MAX as i128) as u32),
+            BigOp::Pow => a
+                .checked_pow(b.min(u32::MAX as i128) as u32)
+                .unwrap_or_else(|| sat(a < 0 && b % 2 == 1)),
             BigOp::And => a & b,
             BigOp::Or => a | b,
             BigOp::Xor => a ^ b,
-            BigOp::Shl => a.wrapping_shl(b as u32),
+            BigOp::Shl => {
+                // A left shift is a × 2^b: detect dropped bits by round-trip.
+                if a == 0 || b <= 0 {
+                    a.wrapping_shl(b as u32)
+                } else if b >= 128 {
+                    sat(a < 0)
+                } else {
+                    let r = a.wrapping_shl(b as u32);
+                    if (r >> (b as u32)) == a { r } else { sat(a < 0) }
+                }
+            }
             BigOp::Shr => a.wrapping_shr(b as u32),
         };
         Ok(Some(self.make_bigint(r)))
