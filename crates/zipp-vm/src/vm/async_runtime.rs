@@ -461,6 +461,34 @@ impl<'p> Vm<'p> {
         dep
     }
 
+    /// `Promise.prototype.{then,catch}` PerformPromiseThen with SpeciesConstructor.
+    /// C = SpeciesConstructor(promise, %Promise%) — a throwing/poisoned/non-object
+    /// `constructor` or a throwing `@@species` propagates here (before any reaction
+    /// is queued). When C is the built-in %Promise% the native fast path is kept
+    /// (a plain dependent promise, no capability). Otherwise NewPromiseCapability(C)
+    /// builds the result; for a Promise subclass the capability promise is a native
+    /// HeapObj::Promise, so the reactions settle it directly (matching
+    /// `promise_combine`); the constructed promise is returned verbatim.
+    pub(crate) fn perform_promise_then(
+        &mut self,
+        idx: u32,
+        on_f: Value,
+        on_r: Value,
+    ) -> Result<Value, Thrown> {
+        let c = self.promise_species_constructor(Value::heap(idx))?;
+        if c == self.promise_ctor_value() {
+            let dep = self.then_internal(idx, on_f, on_r, None);
+            return Ok(Value::heap(dep));
+        }
+        let (cap_promise, _resolve, _reject) = self.new_promise_capability(c)?;
+        if cap_promise.is_heap()
+            && matches!(self.heap.get(cap_promise.heap_index()), HeapObj::Promise { .. })
+        {
+            self.then_internal(idx, on_f, on_r, Some(cap_promise.heap_index()));
+        }
+        Ok(cap_promise)
+    }
+
     /// SpeciesConstructor(promise, %Promise%) for `finally`: the receiver's
     /// `constructor`'s `@@species` (defaulting to %Promise% when either is absent),
     /// throwing a TypeError for a non-object `constructor` or a non-constructor

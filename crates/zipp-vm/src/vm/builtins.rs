@@ -1374,12 +1374,10 @@ impl<'p> Vm<'p> {
         match name {
             "then" => {
                 let on_r = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let dep = self.then_internal(idx, a0, on_r, None);
-                Ok(Some(Value::heap(dep)))
+                Ok(Some(self.perform_promise_then(idx, a0, on_r)?))
             }
             "catch" => {
-                let dep = self.then_internal(idx, Value::UNDEFINED, a0, None);
-                Ok(Some(Value::heap(dep)))
+                Ok(Some(self.perform_promise_then(idx, Value::UNDEFINED, a0)?))
             }
             "finally" => {
                 // Generic spec algorithm: Invoke(this, "then", «thenFinally,
