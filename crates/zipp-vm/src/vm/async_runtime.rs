@@ -1367,13 +1367,31 @@ impl<'p> Vm<'p> {
                 }
                 let obj = self.heap.alloc(HeapObj::Object(map));
                 self.proto_of.insert(obj, Value::NULL);
-                let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[Value::heap(obj)]);
+                if let Err(Thrown(msg)) =
+                    self.call_value(cap_resolve, Value::UNDEFINED, &[Value::heap(obj)])
+                {
+                    self.combinator_reject_on_resolve_throw(cap_reject, msg);
+                }
             }
             _ => {
                 let arr = Value::heap(self.heap.alloc(HeapObj::Array(collected)));
-                let _ = self.call_value(cap_resolve, Value::UNDEFINED, &[arr]);
+                if let Err(Thrown(msg)) = self.call_value(cap_resolve, Value::UNDEFINED, &[arr]) {
+                    self.combinator_reject_on_resolve_throw(cap_reject, msg);
+                }
             }
         }
+    }
+
+    /// A combinator's result capability `resolve` threw (a custom subclass may
+    /// install a throwing resolve): per IfAbruptRejectPromise, reject the result
+    /// promise with the thrown VALUE (preserved via `pending_throw`, not a
+    /// reconstructed error).
+    fn combinator_reject_on_resolve_throw(&mut self, cap_reject: Value, msg: String) {
+        let e = match self.pending_throw.take() {
+            Some(v) => v,
+            None => self.alloc_error_from_message(&msg),
+        };
+        let _ = self.call_value(cap_reject, Value::UNDEFINED, &[e]);
     }
 
     /// Perform one combinator step: the input at `index` settled (`kind`) with

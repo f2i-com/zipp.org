@@ -1601,6 +1601,14 @@ impl<'p> Vm<'p> {
                     }
                     Instr::NewPromise { dst, executor } => {
                         let exec = self.get(base, executor);
+                        // The Promise constructor throws synchronously when the
+                        // executor is not callable (spec step 2) — it does NOT
+                        // produce a rejected promise.
+                        if !self.is_callable(exec) {
+                            return Err(Thrown(
+                                "TypeError: Promise resolver is not a function".into(),
+                            ));
+                        }
                         let p = self.alloc_promise();
                         let res = Value::heap(
                             self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
