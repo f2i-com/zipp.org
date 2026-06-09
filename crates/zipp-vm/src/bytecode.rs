@@ -543,7 +543,10 @@ pub enum Instr {
     /// caller's new.target validity (true inside a function/method/field initializer)
     /// so the eval may contain `new.target`. Indirect/sloppy eval still goes through
     /// the ordinary `Call` → `GLOBAL_EVAL` native path.
-    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg },
+    /// `home_class`/`super_static`: the CALLER's compile-time class home (so
+    /// `super.x` inside the eval'd code resolves against the same class) —
+    /// u32::MAX when the eval site has no class context.
+    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool },
 
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.

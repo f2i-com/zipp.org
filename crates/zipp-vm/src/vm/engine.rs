@@ -899,6 +899,7 @@ impl<'p> Vm<'p> {
         force_strict: bool,
         force_new_target_ok: bool,
         this_override: Option<Value>,
+        inherit_super: Option<(u32, bool)>,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -909,12 +910,18 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
         // 2. Compile in eval mode (top-level returns its completion value).
-        let eval_prog = match crate::compile::compile_eval(&ret.program, code, force_strict, force_new_target_ok)
-        {
+        let eval_prog = match crate::compile::compile_eval(
+            &ret.program,
+            code,
+            force_strict,
+            force_new_target_ok,
+            inherit_super.map(|(_, s)| s),
+        ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
-        self.run_eval_program(eval_prog, this_override, false).map(|(v, _)| v)
+        self.run_eval_program(eval_prog, this_override, false, inherit_super.map(|(h, _)| h))
+            .map(|(v, _)| v)
     }
 
     /// The `Array.fromAsync` implementation, as a lazily-compiled JS polyfill
@@ -961,7 +968,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None)?;
+        let f = self.do_eval(SRC, false, false, None, None)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -985,7 +992,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None)?;
+        let f = self.do_eval(SRC, false, false, None, None)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1018,7 +1025,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
@@ -1037,7 +1044,7 @@ impl<'p> Vm<'p> {
         // PREPARE the module's environment (declared globals → fresh per-module slots,
         // install funcs/classes, hoist) WITHOUT running the body yet. `gmap[i]` is the
         // live slot for compile-time global slot `i`.
-        let (gmap, base_func) = self.prepare_eval_program(prog, true)?;
+        let (gmap, base_func) = self.prepare_eval_program(prog, true, None)?;
         // OWN exports (exported name → live slot), in source order.
         let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
         let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -1189,6 +1196,7 @@ impl<'p> Vm<'p> {
         &mut self,
         eval_prog: crate::bytecode::Program,
         module: bool,
+        caller_home: Option<u32>,
     ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // Runtime base ids: eval functions and classes are appended past the
@@ -1273,7 +1281,27 @@ impl<'p> Vm<'p> {
                     | Instr::SuperGetComputed { home_class_id, .. }
                     | Instr::SuperMethodComputed { home_class_id, .. }
                     | Instr::SuperSet { home_class_id, .. }
-                    | Instr::SuperSetComputed { home_class_id, .. } => *home_class_id += base_class,
+                    | Instr::SuperSetComputed { home_class_id, .. } => {
+                        // The SENTINEL marks "the eval caller's home class": swap
+                        // in its RUNTIME class id (already absolute); real ids
+                        // shift past the main program's class table.
+                        if *home_class_id == u32::MAX {
+                            if let Some(h) = caller_home {
+                                *home_class_id = h;
+                            }
+                        } else {
+                            *home_class_id += base_class;
+                        }
+                    }
+                    Instr::DirectEval { home_class, .. } => {
+                        if *home_class == u32::MAX {
+                            if let Some(h) = caller_home {
+                                *home_class = h;
+                            }
+                        } else {
+                            *home_class += base_class;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1334,8 +1362,9 @@ impl<'p> Vm<'p> {
         eval_prog: crate::bytecode::Program,
         this_override: Option<Value>,
         module: bool,
+        caller_home: Option<u32>,
     ) -> Result<(Value, Vec<u32>), Thrown> {
-        let (gmap, base_func) = self.prepare_eval_program(eval_prog, module)?;
+        let (gmap, base_func) = self.prepare_eval_program(eval_prog, module, caller_home)?;
         let completion = self.execute_eval_program(base_func, this_override)?;
         Ok((completion, gmap))
     }

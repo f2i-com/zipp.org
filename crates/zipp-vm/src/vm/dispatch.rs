@@ -2693,7 +2693,7 @@ impl<'p> Vm<'p> {
                     // Direct eval from strict code: the evaluated string inherits
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
-                    Instr::DirectEval { dst, arg, new_target_ok, this_reg } => {
+                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
@@ -2705,7 +2705,9 @@ impl<'p> Vm<'p> {
                             // A direct eval inherits the caller's `this` (reg 0, or
                             // the static-field-initializer's `this_reg`).
                             let caller_this = self.get(base, this_reg);
-                            self.do_eval(&code, true, new_target_ok, Some(caller_this))?
+                            let inherit =
+                                (home_class != u32::MAX).then_some((home_class, super_static));
+                            self.do_eval(&code, true, new_target_ok, Some(caller_this), inherit)?
                         } else {
                             a0
                         };

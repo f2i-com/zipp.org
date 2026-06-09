@@ -330,11 +330,17 @@ pub fn compile_eval(
     source: &str,
     force_strict: bool,
     force_new_target_ok: bool,
+    inherit_super: Option<bool>,
 ) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
     c.force_strict = force_strict;
     c.force_new_target_ok = force_new_target_ok;
+    // A direct eval from a class-member context inherits the caller's home
+    // class: `super.x` in the eval'd top level (and its arrows) compiles
+    // against the u32::MAX SENTINEL, which prepare_eval_program remaps to the
+    // caller's runtime class id. Plain nested functions still reset it.
+    c.eval_inherit_super = inherit_super;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
@@ -373,6 +379,10 @@ struct Compiler {
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
     eval_mode: bool,
+    /// Set for a DIRECT eval from a class-member context: the eval's top-level
+    /// script (and its arrows) inherits the caller's home class for `super`
+    /// (compiled against the u32::MAX sentinel) — Some(super_static).
+    eval_inherit_super: Option<bool>,
     /// True when compiling a MODULE as the program entry (not a dynamic import):
     /// the top-level body is an ASYNC context (top-level `await` is allowed), so
     /// func 0 is compiled with `in_async` and the VM runs it as an async activation.
@@ -451,6 +461,7 @@ impl Compiler {
             hoisted_globals: Vec::new(),
             source,
             eval_mode: false,
+            eval_inherit_super: None,
             module_mode: false,
             force_strict: false,
             force_new_target_ok: false,
@@ -634,6 +645,15 @@ impl Compiler {
         fc.is_script = is_script;
         fc.in_generator = is_generator;
         fc.in_async = is_async;
+        // A direct eval from a class member: the top-level eval script carries
+        // the caller's home class as the u32::MAX sentinel (arrows inherit it;
+        // plain nested functions reset super_class as usual).
+        if is_script {
+            if let Some(stat) = fc.cx.eval_inherit_super {
+                fc.super_class = Some(u32::MAX);
+                fc.super_static = stat;
+            }
+        }
         // An object-literal concise method / accessor compiles with object-method
         // super (set transiently by the object-literal compiler just before this).
         fc.super_home_obj = std::mem::take(&mut fc.cx.obj_method_super);
@@ -7187,7 +7207,14 @@ impl<'a> FnCompiler<'a> {
                 // The effective `this` to inherit: a static field initializer holds
                 // it in `this_override`, otherwise it is reg 0.
                 let this_reg = self.this_override.unwrap_or(0);
-                self.emit(Instr::DirectEval { dst, arg, new_target_ok: self.cx.new_target_ok, this_reg });
+                self.emit(Instr::DirectEval {
+                    dst,
+                    arg,
+                    new_target_ok: self.cx.new_target_ok,
+                    this_reg,
+                    home_class: self.super_class.unwrap_or(u32::MAX),
+                    super_static: self.super_static,
+                });
                 return Ok(dst);
             }
         }
