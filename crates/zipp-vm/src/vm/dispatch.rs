@@ -3623,7 +3623,19 @@ impl<'p> Vm<'p> {
                             HeapObj::Str(s) => s.char_len,
                             HeapObj::Cons { len, .. } => *len,
                             HeapObj::Map { keys, .. } => keys.len(),
-                            HeapObj::TypedArray { length, .. } => *length,
+                            // The LIVE length each step: a tracking view follows its
+                            // resizable buffer (shrink ends early, grow yields more);
+                            // a detached/out-of-bounds view mid-iteration throws.
+                            HeapObj::TypedArray { .. } => {
+                                match self.ta_effective_len(it.heap_index()) {
+                                    Some(n) => n,
+                                    None => {
+                                        return Err(Thrown(
+                                            "TypeError: TypedArray iterator: the viewed buffer is detached or out of bounds".into(),
+                                        ))
+                                    }
+                                }
+                            }
                             _ => {
                                 return Err(Thrown(format!(
                                     "TypeError: {} is not iterable",

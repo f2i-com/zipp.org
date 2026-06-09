@@ -218,13 +218,15 @@ impl<'p> Vm<'p> {
     /// A TypedArray element as its display string (read-only, no allocation) —
     /// for `display`/`inspect` (ToString of a TypedArray is the comma-join).
     pub(crate) fn ta_elem_string(&self, ta_idx: u32, i: usize) -> String {
-        let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
-                (*buffer, *kind, *byte_offset, *length)
+        let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => {
+                (*buffer, *kind, *byte_offset)
             }
             _ => return String::new(),
         };
-        if i >= length {
+        // Bound by the EFFECTIVE length: the raw stored `length` is stale for a
+        // length-tracking view after its resizable buffer grows or shrinks.
+        if i >= self.ta_effective_len(ta_idx).unwrap_or(0) {
             return "undefined".to_string();
         }
         let size = native::TA_KINDS[kind as usize].1;

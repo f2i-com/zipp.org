@@ -514,6 +514,12 @@ impl<'p> Vm<'p> {
                 let mut parts: Vec<String> = Vec::with_capacity(len);
                 for i in 0..len {
                     let el = self.ta_element_get(idx, i);
+                    // A user toLocaleString may shrink the buffer: later reads come
+                    // back undefined, which joins as the empty string per spec.
+                    if el == Value::UNDEFINED || el == Value::NULL {
+                        parts.push(String::new());
+                        continue;
+                    }
                     let f = self.get_prop(el, "toLocaleString")?;
                     let s = if self.is_callable(f) {
                         let r = self.call_value(f, el, &[])?;
@@ -546,28 +552,35 @@ impl<'p> Vm<'p> {
                 } else {
                     0
                 };
-                // Snapshot AFTER coercion: a detach during fromIndex coercion leaves
-                // an empty snapshot, so the search correctly reports not-found.
-                let snap = self.ta_snapshot(idx);
-                let len = snap.len() as i64;
+                // The loop is bounded by the ENTRY length with FRESH per-index
+                // reads: a coercion that shrank/detached the buffer makes the now
+                // out-of-range indices read undefined (Get semantics) — includes
+                // can still match a searched undefined, while indexOf/lastIndexOf
+                // skip them (HasProperty is false); a grow leaves the entry bound.
                 let mut found: i64 = -1;
                 if name == "lastIndexOf" {
-                    let hi = if from < 0 { len + from } else { from.min(len - 1) };
+                    let hi = if from < 0 { entry_len + from } else { from.min(entry_len - 1) };
                     if hi >= 0 {
-                        for i in (0..=(hi as usize).min(snap.len().saturating_sub(1))).rev() {
-                            if self.values_strict_eq(snap[i], a0) {
+                        for i in (0..=hi as usize).rev() {
+                            let e = self.ta_element_get(idx, i);
+                            if e == Value::UNDEFINED {
+                                continue;
+                            }
+                            if self.values_strict_eq(e, a0) {
                                 found = i as i64;
                                 break;
                             }
                         }
                     }
                 } else {
-                    let lo = if from < 0 { (len + from).max(0) } else { from.min(len) } as usize;
-                    for i in lo..snap.len() {
+                    let lo =
+                        if from < 0 { (entry_len + from).max(0) } else { from.min(entry_len) } as usize;
+                    for i in lo..entry_len as usize {
+                        let e = self.ta_element_get(idx, i);
                         let eq = if name == "includes" {
-                            self.same_value_zero(snap[i], a0)
+                            self.same_value_zero(e, a0)
                         } else {
-                            self.values_strict_eq(snap[i], a0)
+                            e != Value::UNDEFINED && self.values_strict_eq(e, a0)
                         };
                         if eq {
                             found = i as i64;
@@ -803,14 +816,19 @@ impl<'p> Vm<'p> {
                     let num = self.to_number_coerce(a1)?;
                     Value::num(num)
                 };
-                if actual < 0.0 || actual >= len as f64 {
+                // The range check runs AFTER both coercions and against the
+                // CURRENT length (a coercion may have resized the buffer)...
+                let cur = self.ta_effective_len(idx).unwrap_or(0);
+                if actual < 0.0 || actual >= cur as f64 {
                     return Err(Thrown("RangeError: invalid typed array index".into()));
                 }
-                let mut snap = self.ta_snapshot(idx);
-                // Panic-safe (a resizable buffer's coercion may have shrunk it).
-                match snap.get_mut(actual as usize) {
-                    Some(slot) => *slot = coerced,
-                    None => return Err(Thrown("RangeError: invalid typed array index".into())),
+                // ...but the result has exactly the ENTRY length: re-Get each
+                // element (shrunk indices read undefined -> 0/0n via Set), and the
+                // replacement is silently skipped when its now-valid index lies
+                // beyond the entry length.
+                let mut snap: Vec<Value> = (0..len).map(|i| self.ta_element_get(idx, i)).collect();
+                if let Some(slot) = snap.get_mut(actual as usize) {
+                    *slot = coerced;
                 }
                 Ok(Some(self.ta_build_from(kind, &snap)?))
             }
@@ -960,7 +978,14 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot copyWithin a detached or out-of-bounds TypedArray".into(),
                     ));
                 }
-                let src: Vec<Value> = (start..end.max(start)).map(|i| self.ta_element_get(idx, i)).collect();
+                // A coercion may have SHRUNK a resizable buffer: both cursors stop
+                // where the higher one falls off the current length (the spec's
+                // byte loop ends at the live boundary).
+                let cur = self.ta_effective_len(idx).unwrap_or(0);
+                let count = end.max(start) - start;
+                let bound = count.min(cur.saturating_sub(start.max(target)));
+                let src: Vec<Value> =
+                    (0..bound).map(|k| self.ta_element_get(idx, start + k)).collect();
                 for (k, v) in src.into_iter().enumerate() {
                     if target + k < len {
                         self.ta_element_set(idx, target + k, v)?;
