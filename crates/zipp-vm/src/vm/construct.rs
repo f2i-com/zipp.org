@@ -769,6 +769,26 @@ impl<'p> Vm<'p> {
         if ci == self.dataview_ctor && ci != 0 {
             let r = self.build_data_view(args)?;
             let over = self.newtarget_proto_override(new_target, cv, self.dataview_proto)?;
+            // OrdinaryCreateFromConstructor read newTarget.prototype (a user
+            // getter may have detached or shrunk the buffer): re-validate the
+            // view per GetViewByteLength before exposing it.
+            if let HeapObj::DataView { buffer, byte_offset, byte_length } =
+                *self.heap.get(r.heap_index())
+            {
+                if matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown(
+                        "TypeError: Cannot construct a DataView on a detached ArrayBuffer".into(),
+                    ));
+                }
+                let bl = self.array_buffer_len(buffer);
+                if byte_offset > bl {
+                    return Err(Thrown("RangeError: invalid DataView offset".into()));
+                }
+                let explicit = matches!(args.get(2), Some(&v) if v != Value::UNDEFINED);
+                if explicit && byte_offset + byte_length > bl {
+                    return Err(Thrown("RangeError: invalid DataView offset/length".into()));
+                }
+            }
             return Ok(self.set_ctor_proto(r, over));
         }
         if let Some(k) = self.ta_ctors.iter().position(|&c| c == ci && ci != 0) {

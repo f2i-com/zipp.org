@@ -1251,11 +1251,16 @@ impl<'p> Vm<'p> {
                     Some(&m) => m,
                     None => return Err(Thrown("TypeError: ArrayBuffer is not resizable".into())),
                 };
+                let n = self.to_integer_or_zero(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                if n < 0 {
+                    return Err(Thrown("RangeError: ArrayBuffer resize length out of range".into()));
+                }
+                // The detached check runs AFTER the newLength coercion (whose
+                // valueOf always runs and may itself detach the buffer).
                 if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
                     return Err(Thrown("TypeError: Cannot resize a detached ArrayBuffer".into()));
                 }
-                let n = self.to_integer_or_zero(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-                if n < 0 || n as usize > max {
+                if n as usize > max {
                     return Err(Thrown("RangeError: ArrayBuffer resize length out of range".into()));
                 }
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(idx) {
@@ -1347,6 +1352,11 @@ impl<'p> Vm<'p> {
                             "TypeError: ArrayBuffer.prototype.slice species returned a detached buffer".into(),
                         ));
                     }
+                    if self.immutable_buffers.contains(&ridx) {
+                        return Err(Thrown(
+                            "TypeError: ArrayBuffer.prototype.slice species returned an immutable ArrayBuffer".into(),
+                        ));
+                    }
                     if ridx == idx {
                         return Err(Thrown(
                             "TypeError: ArrayBuffer.prototype.slice species returned the source buffer".into(),
@@ -1377,6 +1387,19 @@ impl<'p> Vm<'p> {
             // ES2026: copy the buffer's bytes into a new IMMUTABLE ArrayBuffer and
             // detach the original (transfer semantics).
             "transferToImmutable" => {
+                // ArrayBufferCopyAndDetach order: the newLength ToIndex coercion
+                // (observable; may itself detach) runs BEFORE the detached and
+                // immutable receiver checks.
+                let new_len = match args.first() {
+                    Some(&v) if v != Value::UNDEFINED => {
+                        let n = self.to_index_strict(v)?;
+                        if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
+                            return Err(Thrown("RangeError: invalid ArrayBuffer length".into()));
+                        }
+                        n
+                    }
+                    _ => len,
+                };
                 if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
                     return Err(Thrown(
                         "TypeError: Cannot transfer a detached ArrayBuffer".into(),
@@ -1387,18 +1410,6 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot transfer an immutable ArrayBuffer".into(),
                     ));
                 }
-                // Optional newLength (ToIndex): the result is that many bytes, the
-                // source bytes copied in (truncated / zero-filled to fit).
-                let new_len = match args.first() {
-                    Some(&v) if v != Value::UNDEFINED => {
-                        let n = self.to_integer_or_zero(v)?;
-                        if n < 0 || n > super::typedarray::MAX_ARRAY_BUFFER_LEN {
-                            return Err(Thrown("RangeError: invalid ArrayBuffer length".into()));
-                        }
-                        n as usize
-                    }
-                    _ => len,
-                };
                 let bytes: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => data.clone(),
                     _ => Vec::new(),
@@ -1418,16 +1429,39 @@ impl<'p> Vm<'p> {
             }
             // ES2026: like slice but the result is an immutable ArrayBuffer.
             "sliceToImmutable" => {
-                let start = self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
-                let end = self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
+                // Spec order: a detached receiver throws BEFORE the start/end
+                // coercions; the bounds resolve against the ENTRY length; a detach
+                // DURING coercion throws after them; a shrink below the resolved
+                // end is a RangeError (no silent clamping).
+                if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown(
+                        "TypeError: Cannot sliceToImmutable a detached ArrayBuffer".into(),
+                    ));
+                }
+                let start = self.ta_rel_index_strict(
+                    args.first().copied().unwrap_or(Value::UNDEFINED),
+                    0,
+                    len,
+                )?;
+                let end = self.ta_rel_index_strict(
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    len,
+                    len,
+                )?;
+                let fin = end.max(start);
+                if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
+                    return Err(Thrown(
+                        "TypeError: Cannot sliceToImmutable a detached ArrayBuffer".into(),
+                    ));
+                }
                 let slice: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => {
-                        // A coerced index may have detached/shrunk the buffer between
-                        // ta_rel_index and here — clamp to the current length.
-                        let dl = data.len();
-                        let s = start.min(dl);
-                        let e = end.max(start).min(dl);
-                        data[s..e].to_vec()
+                        if data.len() < fin {
+                            return Err(Thrown(
+                                "RangeError: ArrayBuffer was resized below the resolved slice end".into(),
+                            ));
+                        }
+                        data[start..fin].to_vec()
                     }
                     _ => Vec::new(),
                 };
@@ -1442,22 +1476,24 @@ impl<'p> Vm<'p> {
             // bytes and detach the source. `transfer` preserves resizability (keeps
             // maxByteLength); `transferToFixedLength` produces a fixed buffer.
             "transfer" | "transferToFixedLength" => {
+                // ArrayBufferCopyAndDetach order: coerce newLength (observable)
+                // BEFORE the detached and immutable receiver checks.
+                let new_len = match args.first() {
+                    Some(&v) if v != Value::UNDEFINED => {
+                        let n = self.to_index_strict(v)?;
+                        if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
+                            return Err(Thrown("RangeError: invalid ArrayBuffer length".into()));
+                        }
+                        n
+                    }
+                    _ => len,
+                };
                 if matches!(self.heap.get(idx), HeapObj::ArrayBuffer { detached: true, .. }) {
                     return Err(Thrown("TypeError: Cannot transfer a detached ArrayBuffer".into()));
                 }
                 if self.immutable_buffers.contains(&idx) {
                     return Err(Thrown("TypeError: Cannot transfer an immutable ArrayBuffer".into()));
                 }
-                let new_len = match args.first() {
-                    Some(&v) if v != Value::UNDEFINED => {
-                        let n = self.to_integer_or_zero(v)?;
-                        if n < 0 || n > super::typedarray::MAX_ARRAY_BUFFER_LEN {
-                            return Err(Thrown("RangeError: invalid ArrayBuffer length".into()));
-                        }
-                        n as usize
-                    }
-                    _ => len,
-                };
                 let bytes: Vec<u8> = match self.heap.get(idx) {
                     HeapObj::ArrayBuffer { data, .. } => data.clone(),
                     _ => Vec::new(),

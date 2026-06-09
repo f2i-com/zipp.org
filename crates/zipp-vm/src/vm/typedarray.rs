@@ -754,6 +754,38 @@ impl<'p> Vm<'p> {
         Ok(self.alloc_typed_array(buf, kind, 0, length))
     }
 
+    /// Strict ToIndex (the immutable-ArrayBuffer methods): ToNumber rejects
+    /// BigInt/Symbol with TypeError (the lenient to_number converts BigInt);
+    /// NaN -> 0; truncates; negative or beyond 2^53-1 -> RangeError.
+    pub(crate) fn to_index_strict(&mut self, v: Value) -> Result<usize, Thrown> {
+        let n = self.to_number_strict(v)?;
+        let n = if n.is_nan() { 0.0 } else { n.trunc() };
+        if n < 0.0 || n > 9007199254740991.0 {
+            return Err(Thrown("RangeError: index out of range".into()));
+        }
+        Ok(n as usize)
+    }
+
+    /// ta_rel_index with strict ToNumber (BigInt/Symbol -> TypeError): resolve a
+    /// relative start/end argument against `len` with the negative-from-end clamp.
+    pub(crate) fn ta_rel_index_strict(
+        &mut self,
+        v: Value,
+        default: usize,
+        len: usize,
+    ) -> Result<usize, Thrown> {
+        if v == Value::UNDEFINED {
+            return Ok(default);
+        }
+        let n = self.to_number_strict(v)?;
+        let n = if n.is_nan() { 0.0 } else { n.trunc() };
+        Ok(if n < 0.0 {
+            ((len as f64) + n).max(0.0) as usize
+        } else {
+            (n as usize).min(len)
+        })
+    }
+
     /// `new DataView(buffer, byteOffset?, byteLength?)`.
     pub(crate) fn build_data_view(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -765,8 +797,13 @@ impl<'p> Vm<'p> {
             Some(&v) if v != Value::UNDEFINED => self.to_index(v)?,
             _ => 0,
         };
-        // ToIndex(byteOffset) precedes the bounds check, so a negative offset is a
-        // RangeError before `offset > bufferLength` is consulted.
+        // ToIndex(byteOffset) precedes the detached check (its valueOf runs
+        // exactly once, and may itself detach), which precedes the bounds checks.
+        if matches!(self.heap.get(buf), HeapObj::ArrayBuffer { detached: true, .. }) {
+            return Err(Thrown(
+                "TypeError: Cannot construct a DataView on a detached ArrayBuffer".into(),
+            ));
+        }
         if byte_offset > buf_len {
             return Err(Thrown("RangeError: invalid DataView offset".into()));
         }

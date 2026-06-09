@@ -445,7 +445,8 @@ impl<'p> Vm<'p> {
         }
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                let t = s.trim();
+                // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
+                let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
                 if t.is_empty() {
                     return x == 0;
                 }
@@ -823,7 +824,8 @@ impl<'p> Vm<'p> {
             return Ok(*n as f64);
         }
         if let Some(s) = self.heap.str_cow(v.heap_index()) {
-            let t = s.trim();
+            // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
+                let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
             if t.is_empty() {
                 return Ok(0.0);
             }
