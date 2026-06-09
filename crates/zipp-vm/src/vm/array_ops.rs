@@ -692,7 +692,9 @@ impl<'p> Vm<'p> {
         }
         while count > 0 {
             let fk = Value::num(from as f64);
-            if self.has_property(this, fk) {
+            // HasProperty must dispatch a Proxy `has` trap and propagate its abrupt
+            // completion (the &self has_property swallows both).
+            if self.has_property_dyn(this, fk)? {
                 let v = self.get_index(this, fk)?;
                 self.set_index(this, Value::num(to as f64), v, false)?;
             } else {
@@ -1041,11 +1043,40 @@ impl<'p> Vm<'p> {
                     | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
                     | "toSpliced" | "entries" | "keys" | "values" | "toLocaleString"
             ) {
-                // with/toReversed/toSorted/toSpliced build a result of the source
-                // length via ArrayCreate(len), which throws RangeError for
-                // len > 2^32-1 — BEFORE reading any element (a throwing index getter
-                // must not run first).
-                if matches!(name, "with" | "toReversed" | "toSorted" | "toSpliced") {
+                // toSorted: IsCallable(comparefn) precedes ANY length / element read
+                // (a non-callable comparator is a TypeError before the length getter).
+                if name == "toSorted" {
+                    let cmp = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    if cmp != Value::UNDEFINED && !self.is_callable(cmp) {
+                        return Err(Thrown("TypeError: the comparator is not a function".into()));
+                    }
+                }
+                // toReversed reads the live array-like in DESCENDING index order and
+                // builds the reversed result directly (one length read, ArrayCreate
+                // RangeError, then the descending element Gets — array_like_read reads
+                // ascending, which is the wrong observable order here).
+                if name == "toReversed" {
+                    let lv = self.get_prop(Value::heap(idx), "length")?;
+                    let lenf = self.to_number_coerce(lv)?;
+                    let len = if lenf.is_nan() || lenf <= 0.0 {
+                        0usize
+                    } else {
+                        lenf.trunc().min(9_007_199_254_740_991.0) as usize
+                    };
+                    if len as f64 > 4_294_967_295.0 {
+                        return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                    let mut out = Vec::with_capacity(len);
+                    for k in 0..len {
+                        let v = self.get_index(Value::heap(idx), Value::num((len - 1 - k) as f64))?;
+                        out.push(v);
+                    }
+                    return Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))));
+                }
+                // with/toSorted/toSpliced build a result of the source length via
+                // ArrayCreate(len), which throws RangeError for len > 2^32-1 — BEFORE
+                // reading any element (a throwing index getter must not run first).
+                if matches!(name, "with" | "toSorted" | "toSpliced") {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
                     let n = self.to_number_coerce(lv)?;
                     // ArrayCreate(len) requires len <= 2^32-1; a larger finite length OR
