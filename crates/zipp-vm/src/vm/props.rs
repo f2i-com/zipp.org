@@ -2399,30 +2399,30 @@ impl<'p> Vm<'p> {
         Value::UNDEFINED
     }
 
-    pub(crate) fn callable_name_length(&self, obj: Value) -> Option<(String, i32)> {
+    pub(crate) fn callable_name_length(&self, obj: Value) -> Option<(String, f64)> {
         let clean = |n: &str| -> String {
             if n.starts_with('<') { String::new() } else { n.to_string() }
         };
         match self.heap.get(obj.heap_index()) {
             HeapObj::Func(fid) => {
                 let p = self.func(*fid as usize);
-                Some((clean(&p.name), p.length as i32))
+                Some((clean(&p.name), p.length as f64))
             }
             HeapObj::Closure { func, .. } => {
                 let p = self.func(*func as usize);
-                Some((clean(&p.name), p.length as i32))
+                Some((clean(&p.name), p.length as f64))
             }
             // The resolve/reject functions of `new Promise(executor)`, and the
             // Promise.all/allSettled/any resolve/reject ELEMENT functions: anonymous
             // (name ""), length 1, with %Function.prototype% as [[Prototype]].
             HeapObj::BoundResolver { .. } | HeapObj::CombinatorResolver { .. } => {
-                Some((String::new(), 1))
+                Some((String::new(), 1.0))
             }
             HeapObj::Class(c) => {
                 let len = c
                     .ctor
-                    .map(|f| self.func(f as usize).length as i32)
-                    .unwrap_or(0);
+                    .map(|f| self.func(f as usize).length as f64)
+                    .unwrap_or(0.0);
                 Some((clean(&c.name), len))
             }
             // A native value's `name`/`length`: a prototype method
@@ -2436,19 +2436,19 @@ impl<'p> Vm<'p> {
                     .contains(&id)
                 {
                     let (name, _) = native::BUFFER_GETTERS[(id - native::BUFFER_GETTER_BASE) as usize];
-                    return Some((format!("get {name}"), 0));
+                    return Some((format!("get {name}"), 0.0));
                 }
                 if (native::SAB_GETTER_BASE
                     ..native::SAB_GETTER_BASE + native::SAB_GETTERS.len() as u16)
                     .contains(&id)
                 {
                     let name = native::SAB_GETTERS[(id - native::SAB_GETTER_BASE) as usize];
-                    return Some((format!("get {name}"), 0));
+                    return Some((format!("get {name}"), 0.0));
                 }
                 native::proto_method(id)
-                    .map(|(n, _, l)| (n.to_string(), l as i32))
-                    .or_else(|| native::math_method(id).map(|(n, _, l)| (n.to_string(), l as i32)))
-                    .or_else(|| native::static_name_length(id).map(|(n, l)| (n.to_string(), l as i32)))
+                    .map(|(n, _, l)| (n.to_string(), l as f64))
+                    .or_else(|| native::math_method(id).map(|(n, _, l)| (n.to_string(), l as f64)))
+                    .or_else(|| native::static_name_length(id).map(|(n, l)| (n.to_string(), l as f64)))
             }
             HeapObj::Bound { target, args, .. } if target.is_heap() => {
                 // The anonymous functions returned by the Intl format/compare
@@ -2456,9 +2456,9 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Native(tid) = self.heap.get(target.heap_index()) {
                     match *tid {
                         native::INTL_NF_FORMAT | native::INTL_DTF_FORMAT => {
-                            return Some((String::new(), 1));
+                            return Some((String::new(), 1.0));
                         }
-                        native::INTL_COLLATOR_COMPARE => return Some((String::new(), 2)),
+                        native::INTL_COLLATOR_COMPARE => return Some((String::new(), 2.0)),
                         _ => {}
                     }
                 }
@@ -2467,10 +2467,13 @@ impl<'p> Vm<'p> {
                 // numeric length (BoundFunctionCreate / SetFunctionLength+Name). Read
                 // the target's EFFECTIVE name/length so a `defineProperty`-redefined
                 // value flows through to the bound function.
-                let nbound = args.len() as i32;
+                let nbound = args.len() as f64;
                 let (tname, tlen) =
-                    self.effective_name_length(*target).unwrap_or((String::new(), 0));
-                Some((format!("bound {tname}"), (tlen - nbound).max(0)))
+                    self.effective_name_length(*target).unwrap_or((String::new(), 0.0));
+                // L = max(0, ToIntegerOrInfinity(target.length) − boundArgs): a +Inf
+                // target length stays +Inf; the f64 channel avoids the i32 overflow
+                // a 2^31 length would hit.
+                Some((format!("bound {tname}"), (tlen - nbound).max(0.0)))
             }
             _ => None,
         }
@@ -2483,7 +2486,7 @@ impl<'p> Vm<'p> {
     /// frozen intrinsic. A non-string redefined `name` yields "" (per SetFunctionName,
     /// which only adopts a String target name); a non-finite/non-numeric `length`
     /// yields 0.
-    pub(crate) fn effective_name_length(&self, obj: Value) -> Option<(String, i32)> {
+    pub(crate) fn effective_name_length(&self, obj: Value) -> Option<(String, f64)> {
         let (mut name, mut len) = self.callable_name_length(obj)?;
         if obj.is_heap() {
             let idx = obj.heap_index();
@@ -2503,12 +2506,15 @@ impl<'p> Vm<'p> {
                 };
             }
             if let Some(v) = len_ovr {
+                // ToIntegerOrInfinity(value) for the bound-length computation:
+                // a NaN/non-number → 0, +Inf stays +Inf, else truncate toward zero.
                 len = if v.is_int() {
-                    v.as_int() as i32
-                } else if v.is_double() && v.as_f64().is_finite() {
-                    v.as_f64() as i32
+                    v.as_int() as f64
+                } else if v.is_double() {
+                    let d = v.as_f64();
+                    if d.is_nan() { 0.0 } else { d.trunc() }
                 } else {
-                    0
+                    0.0
                 };
             }
         }
@@ -2649,7 +2655,15 @@ impl<'p> Vm<'p> {
             return None;
         }
         let (nm, len) = self.callable_name_length(obj)?;
-        Some(if key == "name" { self.alloc_str(nm) } else { Value::int(len) })
+        Some(if key == "name" {
+            self.alloc_str(nm)
+        } else if len.is_finite() && len >= 0.0 && len <= i32::MAX as f64 && len.fract() == 0.0 {
+            // Keep the common case an integer Value (no representation change);
+            // only +Infinity / a length past i32 range needs a double.
+            Value::int(len as i32)
+        } else {
+            Value::num(len)
+        })
     }
 
     #[inline]
