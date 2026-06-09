@@ -114,6 +114,18 @@ impl<'p> Vm<'p> {
         if let HeapObj::Boxed { kind, value } = self.heap.get(idx) {
             let (k, v) = (*kind, *value);
             return match k {
+                // replace/replaceAll/split/match/search/matchAll delegate to a
+                // searchValue's @@-method with O = the receiver (RequireObjectCoercible,
+                // NOT ToString'd), so a boxed String must pass the box itself — not
+                // its unwrapped [[StringData]] primitive. Other methods operate on
+                // the primitive.
+                0 if matches!(
+                    name,
+                    "replace" | "replaceAll" | "split" | "match" | "search" | "matchAll"
+                ) =>
+                {
+                    Ok(Some(self.string_symbol_method(recv, name, args)?))
+                }
                 0 => self.string_method(v.heap_index(), name, args),
                 1 => self.number_method(v, name, args),
                 _ => match name {
