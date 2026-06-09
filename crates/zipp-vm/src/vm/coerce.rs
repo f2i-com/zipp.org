@@ -665,10 +665,10 @@ impl<'p> Vm<'p> {
         None
     }
 
-    /// JS relational comparison of two STRING operands is lexicographic (by code
-    /// unit) — not numeric. Returns the `Ordering` when both are string-like, else
-    /// `None` (the caller falls back to numeric comparison). Mirrors the engine's
-    /// code-point ordering (≈ UTF-16 for the BMP; astral chars are a known edge).
+    /// JS relational comparison of two STRING operands is lexicographic by UTF-16
+    /// CODE UNIT — not numeric, and not by Unicode code point. Returns the
+    /// `Ordering` when both are string-like, else `None` (the caller falls back to
+    /// numeric comparison).
     pub(crate) fn str_relational(&self, va: Value, vb: Value) -> Option<std::cmp::Ordering> {
         if va.is_heap()
             && vb.is_heap()
@@ -677,7 +677,17 @@ impl<'p> Vm<'p> {
         {
             let sa = self.heap.str_cow(va.heap_index())?;
             let sb = self.heap.str_cow(vb.heap_index())?;
-            return Some(sa.as_ref().cmp(sb.as_ref()));
+            let (a, b) = (sa.as_ref(), sb.as_ref());
+            // Fast path: ASCII byte order == UTF-16 code-unit order (and
+            // `is_ascii` is vectorised), so the hot common case stays a byte cmp.
+            if a.is_ascii() && b.is_ascii() {
+                return Some(a.cmp(b));
+            }
+            // Non-ASCII: an astral (>BMP) char is a UTF-16 surrogate pair
+            // (0xD800–0xDBFF) that sorts BELOW the 0xE000–0xFFFF BMP range, so a
+            // Rust &str (code-point) cmp is wrong. Compare by UTF-16 code units —
+            // identical to a byte cmp for BMP-only strings, just slower.
+            return Some(a.encode_utf16().cmp(b.encode_utf16()));
         }
         None
     }
