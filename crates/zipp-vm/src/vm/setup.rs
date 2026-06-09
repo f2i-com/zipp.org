@@ -1614,6 +1614,11 @@ impl<'p> Vm<'p> {
             tn.define("PlainMonthDay", Value::heap(plainmonthday_ctor), method_attr);
             tn.define("ZonedDateTime", Value::heap(zoneddatetime_ctor), method_attr);
             tn.define("Now", Value::heap(now_ns), method_attr);
+            // The Temporal namespace has @@toStringTag "Temporal" (so
+            // Object.prototype.toString.call(Temporal) === "[object Temporal]"),
+            // like the Now namespace above. { w:false, e:false, c:true }.
+            let temporal_tag = self.alloc_str("Temporal".to_string());
+            tn.define("@@toStringTag", temporal_tag, fn_attr);
             self.temporal_ns = self.heap.alloc(HeapObj::Object(tn));
             // Register each Temporal type's field getters as accessor properties on
             // its prototype (the value still resolves via get_member's fast path;
