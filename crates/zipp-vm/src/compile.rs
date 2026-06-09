@@ -5556,10 +5556,15 @@ impl<'a> FnCompiler<'a> {
                 let name = self.string_name(m.property.name.as_str());
                 let cur = self.temp();
                 self.emit(Instr::GetProp { dst: cur, obj, name });
+                // ToNumeric(old) ONCE (AddInt imm:0), derive the new value from it,
+                // and yield the COERCED old (postfix) — `x++` returns a number, not
+                // the raw operand. Single coercion = one valueOf for an object operand.
+                let oldnum = self.temp();
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
                 let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: cur, imm: delta });
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
                 self.emit(Instr::SetProp { obj, name, val: nw });
-                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { cur } });
+                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
                 return Ok(dst);
             }
             ox::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
@@ -5571,10 +5576,12 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
                 let cur = self.temp();
                 self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
+                let oldnum = self.temp();
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
                 let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: cur, imm: delta });
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
                 self.emit(Instr::SetIndex { obj, key: keyk, val: nw });
-                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { cur } });
+                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
                 return Ok(dst);
             }
             // `obj.#x++` — like a static member, keyed "#x".
@@ -5583,10 +5590,12 @@ impl<'a> FnCompiler<'a> {
                 let name = self.string_name(&private_key(&p.field.name));
                 let cur = self.temp();
                 self.emit(Instr::GetProp { dst: cur, obj, name });
+                let oldnum = self.temp();
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
                 let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: cur, imm: delta });
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
                 self.emit(Instr::SetProp { obj, name, val: nw });
-                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { cur } });
+                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
                 return Ok(dst);
             }
             _ => {}
@@ -5608,11 +5617,14 @@ impl<'a> FnCompiler<'a> {
                 self.store_with(&name, &with_objs, cur);
                 return Ok(dst); // dst holds the new value
             }
+            // Postfix: ToNumeric(old) in place (cur == dst), derive the new value,
+            // store it, return the COERCED old.
+            self.emit(Instr::AddInt { dst: cur, a: cur, imm: 0 });
             let tmp = self.temp();
             self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta });
             self.store_with(&name, &with_objs, tmp);
             self.next_reg -= 1; // reclaim tmp
-            return Ok(dst); // dst still holds the old value
+            return Ok(dst); // dst still holds the (coerced) old value
         }
         let binding = self.resolve(&name);
         if let Binding::Local(r) = binding {
@@ -5624,8 +5636,9 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::Move { dst, src: r });
                     }
                 } else {
-                    self.emit(Instr::Move { dst, src: r }); // yield old value
-                    self.emit(Instr::AddInt { dst: r, a: r, imm: delta });
+                    // Yield ToNumeric(old) (one coercion), then increment from it.
+                    self.emit(Instr::AddInt { dst, a: r, imm: 0 });
+                    self.emit(Instr::AddInt { dst: r, a: dst, imm: delta });
                 }
                 return Ok(dst);
             }
@@ -5638,12 +5651,14 @@ impl<'a> FnCompiler<'a> {
             self.store_binding(&binding, cur);
             Ok(dst) // dst holds the new value
         } else {
-            // Keep the old value in `dst`; compute the new value in a temp.
+            // Coerce the old value in place (cur == dst), compute the new value in a
+            // temp, store it, and return the COERCED old.
+            self.emit(Instr::AddInt { dst: cur, a: cur, imm: 0 });
             let tmp = self.temp();
             self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta });
             self.store_binding(&binding, tmp);
             self.next_reg -= 1; // reclaim tmp
-            Ok(dst) // dst still holds the old value
+            Ok(dst) // dst still holds the (coerced) old value
         }
     }
 
