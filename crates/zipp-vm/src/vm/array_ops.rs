@@ -1258,6 +1258,11 @@ impl<'p> Vm<'p> {
             "indexOf" => {
                 let snapshot = self.array_snapshot(idx);
                 let len = snapshot.len() as i64;
+                // len === 0 short-circuits to -1 BEFORE ToIntegerOrInfinity(fromIndex),
+                // so a throwing fromIndex.valueOf must not run (spec step 2).
+                if len == 0 {
+                    return Ok(Some(Value::int(-1)));
+                }
                 // Optional fromIndex (ToInteger; negative counts from the end).
                 let from = if args.len() >= 2 {
                     let f = self.to_integer_or_zero(args[1])?;
@@ -1271,6 +1276,11 @@ impl<'p> Vm<'p> {
             "includes" => {
                 let snapshot = self.array_snapshot(idx);
                 let len = snapshot.len() as i64;
+                // len === 0 short-circuits to false BEFORE ToIntegerOrInfinity(fromIndex),
+                // so a throwing fromIndex.valueOf must not run (spec step 2).
+                if len == 0 {
+                    return Ok(Some(Value::bool(false)));
+                }
                 // fromIndex (ToIntegerOrInfinity): negative counts from the end
                 // (clamped to 0); +Infinity → past the end (never found); -Infinity → 0.
                 let from = if args.len() >= 2 {
@@ -1294,6 +1304,11 @@ impl<'p> Vm<'p> {
             "lastIndexOf" => {
                 let snapshot = self.array_snapshot(idx);
                 let len = snapshot.len() as i64;
+                // len === 0 short-circuits to -1 BEFORE ToIntegerOrInfinity(fromIndex),
+                // so a throwing fromIndex.valueOf must not run (spec step 2).
+                if len == 0 {
+                    return Ok(Some(Value::int(-1)));
+                }
                 // fromIndex defaults to len-1 (search from the end); negative
                 // counts from the end. ToInteger.
                 let from = if args.len() >= 2 {
@@ -1352,7 +1367,9 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.array_from_species(this_val, out, 0)?))
             }
             "flat" => {
-                let depth = if args.is_empty() {
+                // An absent OR explicitly-`undefined` depth defaults to 1
+                // (ToIntegerOrInfinity is only applied to a provided depth).
+                let depth = if args.is_empty() || arg0 == Value::UNDEFINED {
                     1
                 } else {
                     // ToInteger (Infinity saturates to i64::MAX -> deep flatten).
@@ -1375,7 +1392,12 @@ impl<'p> Vm<'p> {
                     _ => 0,
                 };
                 let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
-                let e0 = if args.len() >= 3 { self.to_integer_or_zero(args[2])? } else { len as i64 };
+                // An absent OR explicitly-`undefined` end defaults to the length.
+                let e0 = if args.len() >= 3 && args[2] != Value::UNDEFINED {
+                    self.to_integer_or_zero(args[2])?
+                } else {
+                    len as i64
+                };
                 let start = norm_index(s0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
                 let end = norm_index(e0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
                 if let HeapObj::Array(items) = self.heap.get_mut(idx) {
@@ -1388,7 +1410,12 @@ impl<'p> Vm<'p> {
             }
             "slice" => {
                 let s0 = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)? };
-                let e0 = if args.len() < 2 { None } else { Some(self.to_integer_or_zero(args[1])?) };
+                // An absent OR explicitly-`undefined` end defaults to the length.
+                let e0 = if args.len() < 2 || args[1] == Value::UNDEFINED {
+                    None
+                } else {
+                    Some(self.to_integer_or_zero(args[1])?)
+                };
                 let snapshot = self.array_snapshot(idx);
                 let len = snapshot.len() as i32;
                 let start = norm_index(s0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
@@ -1902,7 +1929,12 @@ impl<'p> Vm<'p> {
                 let i32c = |n: i64| n.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                 let t0 = self.to_integer_or_zero(arg0)?;
                 let s0 = if args.len() >= 2 { self.to_integer_or_zero(args[1])? } else { 0 };
-                let e0 = if args.len() >= 3 { self.to_integer_or_zero(args[2])? } else { len as i64 };
+                // An absent OR explicitly-`undefined` end defaults to the length.
+                let e0 = if args.len() >= 3 && args[2] != Value::UNDEFINED {
+                    self.to_integer_or_zero(args[2])?
+                } else {
+                    len as i64
+                };
                 let target = norm_index(i32c(t0), len);
                 let start = norm_index(i32c(s0), len);
                 let end = norm_index(i32c(e0), len);
