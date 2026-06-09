@@ -1180,22 +1180,85 @@ pub(crate) fn parse_iso_date(s: &str) -> Option<(i64, i64, i64)> {
 /// ISO-8601 serialization of a Temporal.Duration (`P1Y2M3DT4H5.5S`). ms/us/ns
 /// fold into fractional seconds. All-zero → "PT0S".
 pub(crate) fn duration_to_string(f: &[i64; 10]) -> String {
-    duration_to_string_opts(f, -1, "trunc")
+    // The auto-precision path never rounds, so a duration that was valid at
+    // construction can never overflow here — fall back defensively to "PT0S".
+    duration_to_string_opts(f, -1, "trunc").unwrap_or_else(|| "PT0S".to_string())
 }
 
 /// Like `duration_to_string` but with a toString precision: `digits` = -1 (auto,
 /// trailing zeros trimmed) or 0..9 fixed fractional-second digits (the seconds
 /// component is then always shown), with `mode` rounding the sub-second part.
-pub(crate) fn duration_to_string_opts(f: &[i64; 10], digits: i32, mode: &str) -> String {
+///
+/// Mirrors TemporalDurationToString: the time portion is rounded to the
+/// precision increment and then balanced UP TO `DefaultTemporalLargestUnit`
+/// (the largest non-zero unit) — so a rounding carry can cross seconds→minutes→
+/// hours→days, and a day-carry is folded into the date `days` field, but units
+/// never balance past days into weeks/months/years. The balanced result is
+/// re-validated against IsValidDuration's `abs < 2^53 s` time bound; `None`
+/// signals the caller to throw a RangeError.
+pub(crate) fn duration_to_string_opts(f: &[i64; 10], digits: i32, mode: &str) -> Option<String> {
     let sign = f.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0);
     let a: Vec<i128> = f.iter().map(|x| (*x as i128).abs()).collect();
-    let (y, mo, w, d, h, mi) = (a[0], a[1], a[2], a[3], a[4], a[5]);
-    let mut total_ns = a[6] * 1_000_000_000 + a[7] * 1_000_000 + a[8] * 1_000 + a[9];
-    if digits >= 0 {
-        total_ns = round_increment(total_ns, 10i128.pow(9 - digits as u32), mode);
-    }
-    let whole_s = total_ns / 1_000_000_000;
-    let frac_ns = (total_ns % 1_000_000_000) as u64;
+    let (y, mo, w, mut d) = (a[0], a[1], a[2], a[3]);
+    // RoundTimeDuration + balancing run only when the precision actually rounds —
+    // i.e. precision.[[Unit]] ≠ "nanosecond" OR increment ≠ 1 ns, which is exactly
+    // `digits` in 0..=8. Auto (-1) and nanosecond (9) skip step 10 entirely and
+    // render the stored fields literally (sub-seconds still fold up into seconds).
+    let (hours, mins, sec_ns) = if (0..=8).contains(&digits) {
+        // DefaultTemporalLargestUnit: index of the largest non-zero unit
+        // (0=Y, 1=Mo, 2=W, 3=D, 4=H, 5=Mi, 6=S, 7=ms, 8=us, 9=ns; all-zero ⇒ ns).
+        let li = (0..10).find(|&i| a[i] != 0).unwrap_or(9);
+        // Full time-portion nanoseconds (hours down to nanoseconds), rounded.
+        let total_ns = round_increment(
+            a[4] * 3_600_000_000_000
+                + a[5] * 60_000_000_000
+                + a[6] * 1_000_000_000
+                + a[7] * 1_000_000
+                + a[8] * 1_000
+                + a[9],
+            10i128.pow(9 - digits as u32),
+            mode,
+        );
+        // CreateDurationRecord → IsValidDuration: the rounded time plus the
+        // (unbalanced) date days must keep abs(days×86400 + time-seconds) < 2^53 s,
+        // else RangeError (signalled to the caller as None).
+        const MAX_TIME_NS: i128 = 9_007_199_254_740_992 * 1_000_000_000; // 2^53 × 1e9
+        if d * 86_400_000_000_000 + total_ns >= MAX_TIME_NS {
+            return None;
+        }
+        // TemporalDurationFromInternal: distribute the rounded nanoseconds top-down
+        // into only the units at or below `largestUnit`; the highest allowed unit is
+        // uncapped, and a day-carry (largestUnit ≥ day) folds into the date days.
+        let mut rem = total_ns;
+        if li <= 3 {
+            d += rem / 86_400_000_000_000;
+            rem %= 86_400_000_000_000;
+        }
+        let hours = if li <= 4 {
+            let v = rem / 3_600_000_000_000;
+            rem %= 3_600_000_000_000;
+            v
+        } else {
+            0
+        };
+        let mins = if li <= 5 {
+            let v = rem / 60_000_000_000;
+            rem %= 60_000_000_000;
+            v
+        } else {
+            0
+        };
+        (hours, mins, rem)
+    } else {
+        // Literal: hours/minutes as stored; sub-seconds fold up into seconds only.
+        (
+            a[4],
+            a[5],
+            a[6] * 1_000_000_000 + a[7] * 1_000_000 + a[8] * 1_000 + a[9],
+        )
+    };
+    let whole_s = sec_ns / 1_000_000_000;
+    let frac_ns = (sec_ns % 1_000_000_000) as u64;
     let mut out = String::new();
     if sign < 0 {
         out.push('-');
@@ -1214,14 +1277,14 @@ pub(crate) fn duration_to_string_opts(f: &[i64; 10], digits: i32, mode: &str) ->
         out.push_str(&format!("{d}D"));
     }
     let show_seconds = whole_s != 0 || frac_ns != 0 || digits >= 0;
-    let has_time = h != 0 || mi != 0 || show_seconds;
+    let has_time = hours != 0 || mins != 0 || show_seconds;
     if has_time {
         out.push('T');
-        if h != 0 {
-            out.push_str(&format!("{h}H"));
+        if hours != 0 {
+            out.push_str(&format!("{hours}H"));
         }
-        if mi != 0 {
-            out.push_str(&format!("{mi}M"));
+        if mins != 0 {
+            out.push_str(&format!("{mins}M"));
         }
         if show_seconds {
             if digits > 0 {
@@ -1236,9 +1299,9 @@ pub(crate) fn duration_to_string_opts(f: &[i64; 10], digits: i32, mode: &str) ->
         }
     }
     if out == "P" || out == "-P" {
-        return "PT0S".to_string();
+        return Some("PT0S".to_string());
     }
-    out
+    Some(out)
 }
 
 /// Parse an ISO-8601 duration string into `[y,mo,w,d,h,mi,s,ms,us,ns]`. Handles

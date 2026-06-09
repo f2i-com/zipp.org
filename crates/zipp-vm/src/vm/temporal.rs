@@ -183,7 +183,12 @@ impl<'p> Vm<'p> {
                         "RangeError: smallestUnit 'minute' is not valid for Duration.toString".into(),
                     ));
                 }
-                Ok(Some(self.alloc_str(duration_to_string_opts(&f, digits, &mode))))
+                match duration_to_string_opts(&f, digits, &mode) {
+                    Some(s) => Ok(Some(self.alloc_str(s))),
+                    None => Err(Thrown(
+                        "RangeError: rounded duration is outside the representable range".into(),
+                    )),
+                }
             }
             "valueOf" => {
                 Err(Thrown("TypeError: Called Temporal.Duration.prototype.valueOf".into()))
