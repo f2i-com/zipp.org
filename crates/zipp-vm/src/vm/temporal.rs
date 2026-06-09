@@ -99,23 +99,27 @@ impl<'p> Vm<'p> {
         Ok(self.make_duration(f))
     }
 
-    /// ToTemporalDuration: a Duration clones; an object reads its duration fields;
-    /// a string parses an ISO-8601 duration.
-    pub(crate) fn to_duration(&mut self, v: Value) -> Result<[i64; 10], Thrown> {
+    /// ToTemporalDuration with the spec's EXACT field values: every field is a
+    /// float64-representable integer, untouched by i64 saturation (a bag's
+    /// microseconds of 4.5e21 stays 4.5e21). Consumers doing exact arithmetic
+    /// (Instant/Duration add+subtract) convert per-field via `as i128`, which
+    /// is exact on integer-valued f64s within i128 range.
+    pub(crate) fn to_duration_f64(&mut self, v: Value) -> Result<[f64; 10], Thrown> {
         if let Some(idx) = (v.is_heap()).then(|| v.heap_index()) {
             if let Some(f) = self.duration_fields(idx) {
-                return Ok(f);
+                return Ok(f.map(|x| x as f64));
             }
             if self.heap.is_str_like(idx) {
                 let s = self.heap.str_cow(idx).unwrap().into_owned();
                 let f = parse_iso_duration(&s)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid duration string '{s}'")))?;
+                let ff = f.map(|x| x as f64);
                 // A parsed duration must also be in range (e.g. a days/seconds value
                 // whose total exceeds 2^53 seconds is a RangeError).
-                if !is_valid_duration(&f.map(|x| x as f64)) {
+                if !is_valid_duration(&ff) {
                     return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
                 }
-                return Ok(f);
+                return Ok(ff);
             }
             if self.is_object_value(v) {
                 let mut ff = [0f64; 10];
@@ -137,12 +141,19 @@ impl<'p> Vm<'p> {
                 if !is_valid_duration(&ff) {
                     return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
                 }
-                let f = ff.map(Self::dur_to_i64);
-                self.validate_duration(&f)?;
-                return Ok(f);
+                return Ok(ff);
             }
         }
         Err(Thrown("TypeError: cannot convert value to a Temporal.Duration".into()))
+    }
+
+    /// ToTemporalDuration narrowed to the interim i64 record (saturating
+    /// symmetrically; see dur_to_i64) for consumers that haven't been widened.
+    pub(crate) fn to_duration(&mut self, v: Value) -> Result<[i64; 10], Thrown> {
+        let ff = self.to_duration_f64(v)?;
+        let f = ff.map(Self::dur_to_i64);
+        self.validate_duration(&f)?;
+        Ok(f)
     }
 
     pub(crate) fn duration_sign(f: &[i64; 10]) -> i64 {
@@ -426,23 +437,40 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.make_duration(balanced)))
             }
             "add" | "subtract" => {
-                let other = self.to_duration(a0)?;
+                // The other operand keeps the spec's EXACT f64 record (a bag's
+                // 4.5e21 microseconds must not saturate through i64); integer-
+                // valued f64 → i128 conversion is exact, so the i128 total is
+                // the true mathematical sum.
+                let other = self.to_duration_f64(a0)?;
                 let sign = if name == "add" { 1i64 } else { -1 };
-                if f[0] != 0 || f[1] != 0 || f[2] != 0 || other[0] != 0 || other[1] != 0 || other[2] != 0 {
+                if f[0] != 0
+                    || f[1] != 0
+                    || f[2] != 0
+                    || other[0] != 0.0
+                    || other[1] != 0.0
+                    || other[2] != 0.0
+                {
                     return Err(Thrown(
                         "RangeError: a relativeTo option is required for years, months, or weeks".into(),
                     ));
                 }
+                let o_ns = (other[3] as i128) * DAY_NS
+                    + (other[4] as i128) * 3_600_000_000_000
+                    + (other[5] as i128) * 60_000_000_000
+                    + (other[6] as i128) * 1_000_000_000
+                    + (other[7] as i128) * 1_000_000
+                    + (other[8] as i128) * 1_000
+                    + (other[9] as i128);
                 let total_ns = (f[3] as i128) * DAY_NS
                     + time_to_ns(&[f[4], f[5], f[6], f[7], f[8], f[9]])
-                    + sign as i128
-                        * ((other[3] as i128) * DAY_NS
-                            + time_to_ns(&[other[4], other[5], other[6], other[7], other[8], other[9]]));
+                    + sign as i128 * o_ns;
                 let existing =
                     |g: &[i64; 10]| (3..10).filter(|&i| g[i] != 0).map(|i| (i - 3) as i32).min().unwrap_or(6);
+                let existing_f =
+                    |g: &[f64; 10]| (3..10).filter(|&i| g[i] != 0.0).map(|i| (i - 3) as i32).min().unwrap_or(6);
                 let day_units =
                     ["day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
-                let largest = day_units[existing(&f).min(existing(&other)) as usize];
+                let largest = day_units[existing(&f).min(existing_f(&other)) as usize];
                 // BalanceDuration → the result must be a valid Duration (its total
                 // time, in seconds, below 2^53); balance_duration_ns enforces it.
                 let balanced = balance_duration_ns(total_ns, largest)?;
@@ -3064,8 +3092,12 @@ impl<'p> Vm<'p> {
                 Ok(Some(self.alloc_zdt(ns, offset, id)?))
             }
             "add" | "subtract" => {
-                let dur = self.to_duration(a0)?;
-                if dur[0] != 0 || dur[1] != 0 || dur[2] != 0 || dur[3] != 0 {
+                // The EXACT f64 record: a single huge sub-second field (e.g.
+                // nanoseconds 1.728e22, spanning min→max) is a valid duration
+                // that must not saturate through i64. Integer-valued f64 → i128
+                // conversion is exact.
+                let dur = self.to_duration_f64(a0)?;
+                if dur[0] != 0.0 || dur[1] != 0.0 || dur[2] != 0.0 || dur[3] != 0.0 {
                     return Err(Thrown(
                         "RangeError: Instant arithmetic does not accept calendar (date) units".into(),
                     ));

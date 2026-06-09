@@ -902,6 +902,22 @@ pub(crate) fn is_valid_duration(f: &[f64; 10]) -> bool {
     if f.iter().any(|v| !v.is_finite()) {
         return false;
     }
+    // Spec steps 1-2: every field must agree with the duration's overall sign
+    // (the first non-zero field) — mixed-sign durations are invalid. NOTE:
+    // f64::signum maps ±0.0 to ±1.0, so zeros must be classified explicitly.
+    let sgn = |v: f64| {
+        if v > 0.0 {
+            1
+        } else if v < 0.0 {
+            -1
+        } else {
+            0
+        }
+    };
+    let sign = f.iter().map(|&v| sgn(v)).find(|&s| s != 0).unwrap_or(0);
+    if f.iter().any(|&v| sgn(v) != 0 && sgn(v) != sign) {
+        return false;
+    }
     let two_pow_32 = 4_294_967_296.0_f64; // 2^32
     if f[0].abs() >= two_pow_32 || f[1].abs() >= two_pow_32 || f[2].abs() >= two_pow_32 {
         return false;
