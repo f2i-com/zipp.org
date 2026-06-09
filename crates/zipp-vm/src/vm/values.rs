@@ -291,17 +291,29 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Brand-aware private presence: `Some(true/false)` when the accessing class
-    /// body's brand chain is resolvable, `None` when not (the caller keeps its
-    /// textual check). With a lexical `depth` it checks the SPECIFIC declaring
-    /// class's brand (chain[depth]); without one it accepts ANY chain brand (the
-    /// pre-depth foundation behaviour).
-    pub(crate) fn private_brand_ok(&self, receiver: Value, depth: Option<usize>) -> Option<bool> {
+    /// Brand-aware private presence for accessing private name `key`:
+    /// `Some(true/false)` when the accessing class body's brand chain is
+    /// resolvable, `None` when not (the caller keeps its textual check).
+    ///
+    /// Resolution is name-precise: walk the lexical chain INNERMOST-first and, for
+    /// the first brand whose class actually DECLARES `key`, require the receiver to
+    /// carry THAT specific brand (so a `#x` declared in an enclosing/shadowing
+    /// class resolves to the right class, not merely "some class in scope"). If no
+    /// chain brand is known to declare `key` (e.g. the name set is incomplete),
+    /// fall back to the lenient any-brand check — never tighter than the chain, so
+    /// this can only ADD precision, never reject a previously-accepted access.
+    pub(crate) fn private_brand_ok(&self, receiver: Value, key: &str) -> Option<bool> {
         let chain = self.current_private_brands()?;
-        match depth {
-            Some(d) => chain.get(d).map(|&b| self.instance_has_brand(receiver, b)),
-            None => Some(chain.iter().any(|&b| self.instance_has_brand(receiver, b))),
+        for &b in chain.iter() {
+            if self
+                .brand_private_names
+                .get(&b)
+                .is_some_and(|names| names.iter().any(|n| n == key))
+            {
+                return Some(self.instance_has_brand(receiver, b));
+            }
         }
+        Some(chain.iter().any(|&b| self.instance_has_brand(receiver, b)))
     }
 
     /// Proxy-aware [[HasProperty]] (`in` / Reflect.has). Mirrors `has_property`

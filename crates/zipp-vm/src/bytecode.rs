@@ -1004,4 +1004,10 @@ pub struct ClassDef {
     /// Exact source text of the whole `class … { … }` (by the class node's span),
     /// returned by `Function.prototype.toString` on the class value.
     pub source: String,
+    /// Names of instance + static FIELDS declared in the class body, including
+    /// the "#" prefix for private fields. Used at `MakeClass` to register which
+    /// private names this class's brand declares (methods/accessors are already
+    /// in the lists above); lets a private access resolve to the precise
+    /// declaring class instead of accepting any brand in the lexical chain.
+    pub instance_field_names: Vec<String>,
 }

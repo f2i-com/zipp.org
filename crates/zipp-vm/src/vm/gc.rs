@@ -292,6 +292,18 @@ impl Vm<'_> {
         self.regexp_string_iters.retain(|&k, _| marks[k as usize]);
         self.method_brand.retain(|&k, _| marks[k as usize]);
         self.instance_brand.retain(|&k, _| marks[k as usize]);
+        // Keep declared-name records only for brands still referenced by a live
+        // lexical chain or instance brand (these maps were just pruned by marks).
+        if !self.brand_private_names.is_empty() {
+            let mut live_brands: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            for bs in self.method_brand.values() {
+                live_brands.extend(bs.iter().copied());
+            }
+            for bs in self.instance_brand.values() {
+                live_brands.extend(bs.iter().copied());
+            }
+            self.brand_private_names.retain(|b, _| live_brands.contains(b));
+        }
         self.shared_buffers.retain(|&k| marks[k as usize]);
         self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.error_data.retain(|&k| marks[k as usize]);

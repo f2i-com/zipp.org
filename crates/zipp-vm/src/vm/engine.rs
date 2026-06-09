@@ -96,6 +96,7 @@ impl<'p> Vm<'p> {
             next_private_brand: 1,
             method_brand: std::collections::HashMap::new(),
             instance_brand: std::collections::HashMap::new(),
+            brand_private_names: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),
             proto_of: std::collections::HashMap::new(),
             fn_props: std::collections::HashMap::new(),

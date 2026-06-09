@@ -2855,6 +2855,7 @@ impl<'a> FnCompiler<'a> {
             static_getters: Vec::new(),
             static_setters: Vec::new(),
             source: String::new(), // filled in below once the body is compiled
+            instance_field_names: Vec::new(),
         });
         self.cx.class_names.push((cname.clone(), class_id));
         // The methods/ctor/field-inits of this class close over the function that
@@ -3211,6 +3212,16 @@ impl<'a> FnCompiler<'a> {
             self.cx.functions.push(proto);
             static_block_fns.push(fid);
         }
+        // Field names declared in this class body (instance + static), with the
+        // "#" prefix preserved for private fields — fed to `MakeClass` so the
+        // brand knows which private names it declares.
+        let mut instance_field_names: Vec<String> = Vec::new();
+        for (n, _) in &fields {
+            instance_field_names.push(n.clone());
+        }
+        for (n, _) in &static_fields {
+            instance_field_names.push(n.clone());
+        }
         self.cx.classes[class_id as usize] = ClassDef {
             name: cname,
             ctor,
@@ -3222,6 +3233,7 @@ impl<'a> FnCompiler<'a> {
             static_getters: static_getter_defs,
             static_setters: static_setter_defs,
             source: self.cx.src_slice(class.span.start, class.span.end),
+            instance_field_names,
         };
         self.cx.class_enclosing = saved_enclosing;
         self.cx.class_derived = saved_derived;

@@ -997,6 +997,35 @@ impl<'p> Vm<'p> {
                         if let Some(e) = enclosing {
                             lex_brands.extend(e);
                         }
+                        // Record the private NAMES this class declares, keyed by its
+                        // brand, so a private access can resolve "#x" to the SPECIFIC
+                        // declaring class in the lexical chain (precise, shadow-aware)
+                        // instead of accepting any brand in the chain. Instance field
+                        // names come from cd.instance_field_names; methods/accessors
+                        // carry the "#" prefix already.
+                        let mut declared: Vec<String> = Vec::new();
+                        for list in [
+                            &cd.methods,
+                            &cd.getters,
+                            &cd.setters,
+                            &cd.statics,
+                            &cd.static_getters,
+                            &cd.static_setters,
+                        ] {
+                            for (n, _) in list {
+                                if n.starts_with('#') {
+                                    declared.push(n.clone());
+                                }
+                            }
+                        }
+                        for n in &cd.instance_field_names {
+                            if n.starts_with('#') {
+                                declared.push(n.clone());
+                            }
+                        }
+                        if !declared.is_empty() {
+                            self.brand_private_names.insert(private_brand, declared);
+                        }
                         for (_, mv) in methods.iter().chain(getters.iter()).chain(setters.iter()) {
                             if mv.is_heap() {
                                 self.method_brand.insert(mv.heap_index(), lex_brands.clone());
@@ -1724,7 +1753,7 @@ impl<'p> Vm<'p> {
                             // class's brand (textual fallback when none resolvable).
                             let key = self.key_of(k);
                             let textual = self.has_property_str(o, &key);
-                            match self.private_brand_ok(o, None) {
+                            match self.private_brand_ok(o, &key) {
                                 Some(b) => textual && b,
                                 None => textual,
                             }
@@ -2539,7 +2568,7 @@ impl<'p> Vm<'p> {
                         // same-named member of a DIFFERENT class evaluation.
                         if is_private_key(&key) {
                             let textual = self.has_property_str(o, &key);
-                            let present = match self.private_brand_ok(o, None) {
+                            let present = match self.private_brand_ok(o, &key) {
                                 Some(b) => textual && b,
                                 None => textual,
                             };
@@ -2574,7 +2603,7 @@ impl<'p> Vm<'p> {
                             .string_constants[name as usize]
                             .clone();
                         let textual = self.has_property_str(o, &key);
-                        let present = match self.private_brand_ok(o, None) {
+                        let present = match self.private_brand_ok(o, &key) {
                             Some(b) => textual && b,
                             None => textual,
                         };
@@ -2789,7 +2818,7 @@ impl<'p> Vm<'p> {
                         // leading-'#' test; textual fallback when no brand resolvable.
                         if is_private_key(key) {
                             let textual = self.has_property_str(recv, key);
-                            let present = match self.private_brand_ok(recv, None) {
+                            let present = match self.private_brand_ok(recv, key) {
                                 Some(b) => textual && b,
                                 None => textual,
                             };

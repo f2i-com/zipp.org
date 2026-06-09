@@ -252,6 +252,12 @@ pub struct Vm<'p> {
     /// receives a class's private fields/brand without becoming an instanceof that
     /// class. Checked by `instance_has_brand` alongside the class chain. Pruned by GC.
     instance_brand: std::collections::HashMap<u32, Vec<u64>>,
+    /// Private NAMES (with the "#" prefix) declared by the class owning each brand.
+    /// Lets a private access resolve "#x" to the innermost brand in the lexical
+    /// chain whose class actually declares it (precise + shadow-aware) instead of
+    /// accepting ANY chain brand. A name absent here falls back to the lenient
+    /// any-brand check. Keyed by brand; pruned by GC to brands still referenced.
+    brand_private_names: std::collections::HashMap<u64, Vec<String>>,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on
