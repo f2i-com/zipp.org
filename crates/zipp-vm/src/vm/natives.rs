@@ -1181,6 +1181,29 @@ impl<'p> Vm<'p> {
                                 syms.push(sym);
                             }
                         }
+                    } else {
+                        // Exotic heap kinds (TypedArray, DataView, Map, Date, ...)
+                        // keep their own props in the arr_props side table;
+                        // callables in fn_props.
+                        let table = if matches!(
+                            self.heap.get(a0.heap_index()),
+                            HeapObj::Func(_)
+                                | HeapObj::Closure { .. }
+                                | HeapObj::Bound { .. }
+                                | HeapObj::Native(_)
+                        ) {
+                            self.fn_props.get(&a0.heap_index())
+                        } else {
+                            self.arr_props.get(&a0.heap_index())
+                        };
+                        let keys: Vec<String> = table.map_or(Vec::new(), |m| {
+                            m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
+                        });
+                        for k in keys {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
                     }
                 }
                 Value::heap(self.heap.alloc(HeapObj::Array(syms)))
@@ -1534,6 +1557,14 @@ impl<'p> Vm<'p> {
                         {
                             return Ok(Value::bool(true));
                         }
+                    } else if self.is_canonical_numeric_index(&key)
+                        && !self.same_value(a0, receiver)
+                        && self.ta_valid_index(a0.heap_index(), &key).is_none()
+                    {
+                        // A canonical-but-invalid STRING index ("1.5", "-1", "-0")
+                        // with an altered Receiver: step ii.1 returns true with NO
+                        // value coercion (valueOf must not run).
+                        return Ok(Value::bool(true));
                     }
                 }
                 // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor

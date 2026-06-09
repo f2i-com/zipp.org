@@ -270,9 +270,12 @@ impl<'p> Vm<'p> {
                 return self.ta_element_set(idx, i, val);
             }
             // A CanonicalNumericIndexString that isn't a valid integer index
-            // (non-integer, "-0", out of range) is a silent no-op that NEVER
-            // reaches the prototype — IntegerIndexedExotic [[Set]] (10.4.5.5).
+            // (non-integer, "-0", out of range, or any key on a detached view)
+            // still runs the VALUE COERCION (observable; abrupt propagates),
+            // then drops the write without ever reaching the prototype —
+            // IntegerIndexedExotic [[Set]] (10.4.5.5) / TypedArraySetElement.
             if self.is_canonical_numeric_index(&k) {
+                self.ta_coerce_for_set(idx, val)?;
                 return Ok(());
             }
             return self.set_prop(obj, &k, val, strict);

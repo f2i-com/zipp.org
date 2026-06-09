@@ -253,6 +253,31 @@ impl<'p> Vm<'p> {
 
     /// Write `v` to element `i` of a TypedArray (ToNumber/ToBigInt then encode per
     /// the element kind). Out-of-bounds → silent no-op (after coercion).
+    /// TypedArraySetElement's COERCION only (ToBigInt / ToNumber of the value,
+    /// observable, abrupt propagates) for writes whose canonical-numeric key is
+    /// NOT a valid index: the spec coerces BEFORE the IsValidIntegerIndex check,
+    /// so a detached/out-of-bounds/non-integer-key write still runs valueOf.
+    pub(crate) fn ta_coerce_for_set(&mut self, ta_idx: u32, v: Value) -> Result<(), Thrown> {
+        let kind = match self.heap.get(ta_idx) {
+            HeapObj::TypedArray { kind, .. } => *kind,
+            _ => return Ok(()),
+        };
+        if native::TA_KINDS[kind as usize].2 {
+            if v.is_number() {
+                return Err(Thrown(
+                    "TypeError: cannot convert a Number to a BigInt typed-array element".into(),
+                ));
+            }
+            self.to_bigint(v)?;
+        } else {
+            if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
+                return Err(Thrown("TypeError: cannot convert a BigInt to a number".into()));
+            }
+            self.to_number_coerce(v)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ta_element_set(&mut self, ta_idx: u32, i: usize, v: Value) -> Result<(), Thrown> {
         let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
             HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
@@ -282,6 +307,11 @@ impl<'p> Vm<'p> {
                 o
             }
         } else {
+            // ToNumber(BigInt) throws in SetTypedArrayElement (the engine's
+            // to_number is deliberately lenient on BigInt for comparisons).
+            if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
+                return Err(Thrown("TypeError: cannot convert a BigInt to a number".into()));
+            }
             // ToNumber(value) per SetTypedArrayElement: an object element runs
             // valueOf/@@toPrimitive (which a test may use to resize/detach the buffer
             // — re-checked below) and a Symbol/abrupt completion propagates.

@@ -723,14 +723,16 @@ impl<'p> Vm<'p> {
         // species lookup) lives in the arr_props side table; a canonical numeric
         // index still writes to the buffer (or is ignored when out of bounds).
         if matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
-            if let Ok(n) = key.parse::<usize>() {
-                if n.to_string() == key {
-                    let (tlen, _) = self.ta_len_kind(idx);
-                    if n < tlen {
-                        self.ta_element_set(idx, n, val)?;
-                    }
-                    return Ok(());
+            // Any CanonicalNumericIndexString is absorbed by the integer-indexed
+            // exotic [[Set]]: a valid index writes the element; an invalid one
+            // (non-integer, "-0", out of range, detached view) still runs the
+            // value coercion then drops the write — it is NEVER a named prop.
+            if self.is_canonical_numeric_index(key) {
+                match self.ta_valid_index(idx, key) {
+                    Some(n) => self.ta_element_set(idx, n, val)?,
+                    None => self.ta_coerce_for_set(idx, val)?,
                 }
+                return Ok(());
             }
             // A NEW named own prop on a non-extensible TypedArray is rejected (its
             // integer indices are exotic and handled above, so this is named-only).

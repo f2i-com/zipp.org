@@ -1210,7 +1210,21 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) => {
                     m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
                 }
-                _ => Vec::new(),
+                // Callables keep their own props in fn_props; every other exotic
+                // heap kind (TypedArray, DataView, Map, Date, ...) keeps them in
+                // arr_props — surface their "@@" symbol keys too.
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => self
+                    .fn_props
+                    .get(&obj.heap_index())
+                    .map_or(Vec::new(), |m| {
+                        m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
+                    }),
+                _ => self
+                    .arr_props
+                    .get(&obj.heap_index())
+                    .map_or(Vec::new(), |m| {
+                        m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
+                    }),
             };
             for k in sym_keys {
                 if let Some(&sym) = self.symbol_keys.get(&k) {
@@ -2943,8 +2957,11 @@ impl<'p> Vm<'p> {
         if let HeapObj::TypedArray { buffer, kind, byte_offset, .. } = self.heap.get(obj.heap_index()) {
             let (buffer, kind, byte_offset) = (*buffer, *kind, *byte_offset);
             let size = native::TA_KINDS[kind as usize].1;
-            // A canonical numeric string index reads the element.
-            if let Ok(i) = key.parse::<usize>() {
+            // A CANONICAL numeric string index reads the element. usize's FromStr
+            // accepts a leading '+' ("+1" parses to 1), but "+1" is not a
+            // CanonicalNumericIndexString — it must be an ordinary (possibly
+            // inherited) property, so gate on the round-trip.
+            if let Some(i) = canonical_index_str(key) {
                 return Ok(self.ta_element_get(obj.heap_index(), i));
             }
             // Out of bounds (detached, or shrunk past this view) reports

@@ -396,7 +396,24 @@ impl<'p> Vm<'p> {
                 None => Ok(false),
             };
         }
-        // Other heap kinds (Array / Str / TypedArray / …) carry no Proxy in their
+        // A TypedArray with a USER prototype chain can have a Proxy in it whose
+        // 'has' trap must fire (the immutable walk below treats it as inert):
+        // absorb canonical numeric indices, check arr_props own props, then
+        // recurse dynamically up the chain.
+        if matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
+            let k = self.key_of(key);
+            if self.is_canonical_numeric_index(&k) {
+                return Ok(self.ta_valid_index(idx, &k).is_some());
+            }
+            if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                return Ok(true);
+            }
+            return match self.proto_of.get(&idx).copied().filter(|p| p.is_heap()) {
+                Some(p) => self.has_property_dyn(p, key),
+                None => Ok(false),
+            };
+        }
+        // Other heap kinds (Array / Str / …) carry no Proxy in their
         // built-in prototype chain, so the exact immutable walk suffices.
         Ok(self.has_property(obj, key))
     }
