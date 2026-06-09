@@ -1239,6 +1239,24 @@ impl<'p> Vm<'p> {
             }
             return Ok(true);
         }
+        // `class B extends ArrayBuffer`: materialize a REAL ArrayBuffer into the
+        // instance slot (so byteLength/slice's brand checks pass); the resizable
+        // max lives in the ab_max side table, keyed by the instance's heap index.
+        if cval.is_heap() && cval.heap_index() == self.arraybuffer_ctor && self.arraybuffer_ctor != 0
+        {
+            let (n, max) = self.validate_array_buffer_args(args)?;
+            if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
+                return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
+            }
+            *self.heap.get_mut(oidx) = HeapObj::ArrayBuffer { data: vec![0u8; n], detached: false };
+            if let Some(m) = max {
+                self.ab_max.insert(oidx, m);
+            }
+            if sub_proto.is_heap() {
+                self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
         // `class D extends DataView`: build a real DataView through the builtin
         // ctor and move it into the instance (the buffer heap index is shared
         // correctly by the clone; the dv_tracking side-set flag is carried like
