@@ -1284,6 +1284,9 @@ impl<'p> Vm<'p> {
                     if let Some(b) = self.proxy_is_extensible(o)? {
                         return Ok(Value::bool(b));
                     }
+                } else if o.is_heap() && self.proxy_parts(o.heap_index()).is_some() {
+                    // isFrozen/isSealed on a Proxy: TestIntegrityLevel via the traps.
+                    return Ok(Value::bool(self.proxy_test_integrity(o, id == OBJ_IS_FROZEN)?));
                 }
                 // A non-object (primitive, incl. heap string/symbol/bigint) is
                 // non-extensible and vacuously frozen/sealed. An exotic object's

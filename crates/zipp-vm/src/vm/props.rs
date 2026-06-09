@@ -1629,6 +1629,43 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// TestIntegrityLevel for a Proxy (`Object.isFrozen`/`isSealed`): an extensible
+    /// proxy is neither; otherwise [[OwnPropertyKeys]]() and check each present
+    /// property is non-configurable (and, for `freeze`, that a data property is
+    /// non-writable). Drives the isExtensible / ownKeys / getOwnPropertyDescriptor
+    /// traps via the existing helpers.
+    pub(crate) fn proxy_test_integrity(&mut self, proxy: Value, freeze: bool) -> Result<bool, Thrown> {
+        if self.proxy_is_extensible(proxy)? == Some(true) {
+            return Ok(false);
+        }
+        let _gc = self.gc_lock_guard();
+        let keys = match self.proxy_own_keys(proxy)? {
+            Some(k) => k,
+            None => return Ok(true),
+        };
+        for kv in keys {
+            let key = self.key_of(kv);
+            if let Some(desc) = self.proxy_gopd(proxy, &key)? {
+                if desc == Value::UNDEFINED {
+                    continue;
+                }
+                let cfg = self.get_prop(desc, "configurable")?;
+                if self.truthy(cfg) {
+                    return Ok(false);
+                }
+                if freeze {
+                    let is_data =
+                        self.has_own_property(desc, "value") || self.has_own_property(desc, "writable");
+                    let wr = self.get_prop(desc, "writable")?;
+                    if is_data && self.truthy(wr) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// `Object.defineProperty(obj, key, descriptor)` — define/redefine an own
     /// property with explicit attributes (unspecified attrs default to false on a
     /// new property; an existing non-configurable property rejects most changes).
