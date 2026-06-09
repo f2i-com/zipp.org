@@ -225,8 +225,13 @@ impl<'p> Vm<'p> {
             // `Function.prototype.toString`, which yields the real source text.
             if self.is_callable(f) {
                 let r = self.call_value(f, v, &[])?;
-                if !r.is_heap() || self.heap.is_str_like(r.heap_index()) {
-                    return Ok(self.display(r));
+                // ANY primitive result completes OrdinaryToPrimitive — recurse so a
+                // BigInt stringifies (via BigInt.prototype.toString) and a Symbol
+                // throws (ToString of a Symbol is a TypeError), not just strings /
+                // numbers. An object result means this method didn't yield a
+                // primitive, so fall through to the next.
+                if !self.is_object_value(r) {
+                    return self.to_js_string(r);
                 }
             }
         }
