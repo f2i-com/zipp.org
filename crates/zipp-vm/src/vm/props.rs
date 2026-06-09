@@ -3059,10 +3059,12 @@ impl<'p> Vm<'p> {
         if let HeapObj::Temporal { kind: 4, .. } = self.heap.get(obj.heap_index()) {
             let ns = self.instant_ns(obj.heap_index()).unwrap_or(0);
             return Ok(match key {
-                "epochMilliseconds" => Value::num((ns / 1_000_000) as f64),
+                // FLOOR division (toward −∞), not truncation toward zero, so a
+                // pre-epoch (negative) instant rounds down: ns=-…543211 → -…877 ms.
+                "epochMilliseconds" => Value::num(ns.div_euclid(1_000_000) as f64),
                 "epochNanoseconds" => self.make_bigint(ns),
-                "epochSeconds" => Value::num((ns / 1_000_000_000) as f64),
-                "epochMicroseconds" => self.make_bigint(ns / 1_000),
+                "epochSeconds" => Value::num(ns.div_euclid(1_000_000_000) as f64),
+                "epochMicroseconds" => self.make_bigint(ns.div_euclid(1_000)),
                 _ => self.proto_member(self.instant_proto, key),
             });
         }
@@ -3124,9 +3126,10 @@ impl<'p> Vm<'p> {
                 "monthCode" => self.alloc_str(format!("M{m:02}")),
                 "calendarId" => self.alloc_str("iso8601".to_string()),
                 "era" | "eraYear" => Value::UNDEFINED,
-                "epochSeconds" => Value::num((epoch / 1_000_000_000) as f64),
-                "epochMilliseconds" => Value::num((epoch / 1_000_000) as f64),
-                "epochMicroseconds" => self.make_bigint(epoch / 1_000),
+                // FLOOR division (toward −∞), not truncation, for negative epochs.
+                "epochSeconds" => Value::num(epoch.div_euclid(1_000_000_000) as f64),
+                "epochMilliseconds" => Value::num(epoch.div_euclid(1_000_000) as f64),
+                "epochMicroseconds" => self.make_bigint(epoch.div_euclid(1_000)),
                 "epochNanoseconds" => self.make_bigint(epoch),
                 "offsetNanoseconds" => Value::num(off as f64),
                 "offset" => {
