@@ -1217,13 +1217,24 @@ impl<'p> Vm<'p> {
             // Objects keep their own `extensible` flag; primitives are immutable.
             OBJ_FREEZE | OBJ_SEAL | OBJ_PREVENT_EXT => {
                 let o = args.first().copied().unwrap_or(Value::UNDEFINED);
-                if id == OBJ_PREVENT_EXT {
-                    if let Some(ok) = self.proxy_prevent_extensions(o)? {
-                        if !ok {
-                            return Err(Thrown(
-                                "TypeError: Object.preventExtensions 'preventExtensions' trap returned falsish".into(),
-                            ));
-                        }
+                // SetIntegrityLevel (freeze/seal) AND Object.preventExtensions all
+                // call O.[[PreventExtensions]](): for a Proxy this fires the trap and
+                // a falsish result is a TypeError (the abrupt path these tests
+                // exercise). The full per-key integrity walk on a Proxy is not yet
+                // modeled, so on a successful trap freeze/seal fall through to the
+                // local flag-set; preventExtensions is then complete.
+                if let Some(ok) = self.proxy_prevent_extensions(o)? {
+                    if !ok {
+                        let m = match id {
+                            OBJ_FREEZE => "Object.freeze",
+                            OBJ_SEAL => "Object.seal",
+                            _ => "Object.preventExtensions",
+                        };
+                        return Err(Thrown(format!(
+                            "TypeError: {m} 'preventExtensions' trap returned falsish"
+                        )));
+                    }
+                    if id == OBJ_PREVENT_EXT {
                         return Ok(o);
                     }
                 }
