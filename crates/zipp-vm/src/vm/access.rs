@@ -17,6 +17,10 @@ enum ProtoSet {
     /// A Proxy in the chain handled the write via its `set` trap (`true` = ok,
     /// `false` = trap returned falsish → no-op/throw).
     Proxy(bool),
+    /// A TypedArray in the chain ABSORBED a canonical-numeric key that is not a
+    /// valid index: its [[Set]] reports success with no write and no coercion
+    /// (the prototype beyond it is never consulted).
+    Absorbed,
     /// No accessor or proxy governs the write — write an own data property on the
     /// receiver (shadowing any inherited WRITABLE data property).
     DataWrite,
@@ -567,6 +571,7 @@ impl<'p> Vm<'p> {
                 }
                 ProtoSet::GetterOnly => return self.reject_write(key, strict),
                 ProtoSet::Proxy(true) => return Ok(()), // chain proxy's set trap handled it
+                ProtoSet::Absorbed => return Ok(()), // TA chain node absorbed the index
                 ProtoSet::Proxy(false) => return self.reject_write(key, strict),
                 ProtoSet::NonWritable => return self.reject_write(key, strict),
                 ProtoSet::DataWrite => {} // no inherited accessor/proxy ⇒ own-data write
@@ -832,6 +837,20 @@ impl<'p> Vm<'p> {
                         continue;
                     }
                 }
+            }
+            // A TypedArray chain node ABSORBS canonical numeric keys: its [[Set]]
+            // (with Receiver ≠ the TA) returns true for an invalid index — no
+            // write, no coercion, prototype beyond it never consulted — while a
+            // VALID index is a writable data prop, so OrdinarySet continues with
+            // an own write on the receiver.
+            if matches!(self.heap.get(cidx), HeapObj::TypedArray { .. })
+                && self.is_canonical_numeric_index(key)
+            {
+                return Ok(if self.ta_valid_index(cidx, key).is_some() {
+                    ProtoSet::DataWrite
+                } else {
+                    ProtoSet::Absorbed
+                });
             }
             if let HeapObj::Object(m) = self.heap.get(cidx) {
                 if let Some(i) = m.pos(key) {

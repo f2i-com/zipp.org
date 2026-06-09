@@ -2372,6 +2372,12 @@ impl<'p> Vm<'p> {
         while cur != 0 && guard < 64 {
             guard += 1;
             saw_obj_proto |= cur == self.obj_proto;
+            // A TypedArray chain node absorbs an INVALID index silently (report
+            // handled — no write, no coercion, no reject); a valid index is a
+            // plain writable data prop, so the caller writes the own element.
+            if matches!(self.heap.get(cur), HeapObj::TypedArray { .. }) {
+                return Ok(self.ta_valid_index(cur, &key).is_none());
+            }
             if let Some((attr, raw)) = self.own_member(cur, &key) {
                 return self.apply_proto_set(attr, raw, obj, &key, val, strict);
             }

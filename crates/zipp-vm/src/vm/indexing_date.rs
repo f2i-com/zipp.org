@@ -331,7 +331,10 @@ impl<'p> Vm<'p> {
         // array) and a non-writable prototype data prop rejects, INSTEAD of silently
         // creating an own element. Gated on `array_proto_has_index` so the common
         // case (no integer props on Array/Object.prototype) keeps the fast path.
-        if self.array_proto_has_index {
+        // Also taken when THIS array has a custom [[Prototype]] (proto_of entry):
+        // a TypedArray in its chain must absorb integer indices even though the
+        // global Array.prototype carries none (plain arrays skip the lookup).
+        if self.array_proto_has_index || self.proto_of.contains_key(&idx) {
             if let Some(i) = array_index(key) {
                 let absent = matches!(
                     self.heap.get(idx),
