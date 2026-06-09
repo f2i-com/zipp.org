@@ -218,6 +218,16 @@ impl<'p> Vm<'p> {
         if let HeapObj::Array(_) = self.heap.get(idx) {
             if let Ok(i) = key.parse::<usize>() {
                 if i.to_string() == key {
+                    // A sealed/frozen array's existing elements are non-configurable,
+                    // so an in-bounds index can't be deleted (an out-of-range index is
+                    // not an own property and deletes vacuously).
+                    let in_bounds =
+                        matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
+                    if in_bounds
+                        && self.arr_props.get(&idx).map_or(false, |m| m.sealed || m.frozen)
+                    {
+                        return Value::bool(false);
+                    }
                     if let Some((a, _)) = self.array_index_override(idx, i) {
                         if !a.configurable {
                             return Value::bool(false);

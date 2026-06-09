@@ -297,6 +297,16 @@ impl<'p> Vm<'p> {
         // so bracket and dot assignment agree. Numeric indices stay in the Vec.
         if matches!(self.heap.get(idx), HeapObj::Array(_)) && array_index(key).is_none() {
             let k = self.key_of(key);
+            // A canonical numeric index passed as a STRING key ("0") reaches here
+            // (array_index only matches numeric Value keys). A frozen array's
+            // elements are non-writable, so reject such a write the same as the
+            // numeric-key fast path below does (set_prop would otherwise overwrite
+            // the dense slot). Sealed arrays keep writable elements, so frozen only.
+            if canonical_index_str(&k).is_some()
+                && self.arr_props.get(&idx).map_or(false, |m| m.frozen)
+            {
+                return self.reject_write(&k, strict);
+            }
             return self.set_prop(obj, &k, val, strict);
         }
         // A defineProperty'd special index (accessor / non-writable / arr_props

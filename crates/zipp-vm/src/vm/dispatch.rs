@@ -3129,10 +3129,29 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Instr::SetRaw { arr, raw } => {
+                        // GetTemplateObject finalization: `.raw` is a frozen,
+                        // non-enumerable, non-writable, non-configurable own data
+                        // property of the cooked array, and BOTH the cooked and raw
+                        // arrays are frozen (their indices/length non-writable &
+                        // non-configurable). Define `.raw` before freezing the cooked
+                        // array (a frozen object rejects new properties).
                         let a = self.get(base, arr);
                         let r = self.get(base, raw);
-                        if a.is_heap() {
-                            self.template_raws.insert(a.heap_index(), r);
+                        if a.is_heap() && r.is_heap() {
+                            let cooked = a.heap_index();
+                            let raw_idx = r.heap_index();
+                            let attr = PropAttr {
+                                writable: false,
+                                enumerable: false,
+                                configurable: false,
+                                accessor: false,
+                                setter: Value::UNDEFINED,
+                            };
+                            self.arr_props.entry(cooked).or_insert_with(ObjMap::new).define("raw", r, attr);
+                            for idx in [raw_idx, cooked] {
+                                self.arr_props.entry(idx).or_insert_with(ObjMap::new).freeze();
+                                self.array_length_nonwritable.insert(idx);
+                            }
                         }
                         ip += 1;
                     }
