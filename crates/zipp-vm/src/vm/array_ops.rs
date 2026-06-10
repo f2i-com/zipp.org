@@ -262,7 +262,7 @@ impl<'p> Vm<'p> {
         // ArraySpeciesCreate step 1-2: if IsArray(originalArray) is false, return
         // ArrayCreate(length) — `constructor`/`@@species` are NOT consulted for a
         // non-array receiver (e.g. `Array.prototype.map.call(typedArray | plainObj)`).
-        if !self.value_is_array(original) {
+        if !self.value_is_array_throwing(original)? {
             return Ok(None);
         }
         let ctor = self.get_prop(original, "constructor")?;
@@ -1446,6 +1446,14 @@ impl<'p> Vm<'p> {
                         } else {
                             let len_v = self.get_prop(e, "length")?;
                             let len = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1);
+                            // Step 5.c.iii: n + len > 2^53-1 is a TypeError BEFORE
+                            // any element read (a MAX_SAFE_INTEGER-length spreadable
+                            // must not loop 9e15 Gets).
+                            if out.len() as i64 + len > (1i64 << 53) - 1 {
+                                return Err(Thrown(
+                                    "TypeError: concat result length exceeds 2**53 - 1".into(),
+                                ));
+                            }
                             for k in 0..len {
                                 let el = self.get_prop(e, &k.to_string())?;
                                 out.push(el);

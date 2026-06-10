@@ -2857,82 +2857,154 @@ impl<'p> Vm<'p> {
                 "TypeError: Array.from requires an array-like or iterable object".into(),
             ));
         }
-        // Classify the source under a short-lived borrow, then materialize its
-        // elements (the object/array-like path needs &mut self for get_prop).
-        enum Kind {
-            Iterable,
-            Obj,
-            Other,
+        // usingIterator = GetMethod(items, @@iterator): one observable Get; a
+        // non-callable non-nullish @@iterator is a TypeError.
+        let using_iter = self.get_prop(src, "@@iterator")?;
+        if !using_iter.is_nullish() && !self.is_callable(using_iter) {
+            return Err(Thrown("TypeError: @@iterator is not a function".into()));
         }
-        let mut elems: Vec<Value> = Vec::new();
-        let kind = if src.is_heap() {
-            match self.heap.get(src.heap_index()) {
-                HeapObj::Array(_)
-                | HeapObj::Str(_)
-                | HeapObj::Cons { .. }
-                | HeapObj::Set(_)
-                | HeapObj::Map { .. }
-                | HeapObj::TypedArray { .. }
-                | HeapObj::Generator { .. }
-                | HeapObj::Iterator { .. }
-                | HeapObj::IterHelper { .. } => Kind::Iterable,
-                HeapObj::Object(_) => Kind::Obj,
-                _ => Kind::Other,
-            }
-        } else {
-            Kind::Other
-        };
-        match kind {
-            Kind::Iterable => elems = self.iterate_to_vec(src)?,
-            Kind::Obj => {
-                // A custom iterable object (`@@iterator`) → iterate it; otherwise
-                // treat it as array-like (read `length`, then indices 0..length).
-                let it = self.get_prop(src, "@@iterator")?;
-                if self.is_callable(it) {
-                    elems = self.iterate_to_vec(src)?;
-                } else {
-                    let len = self.get_prop(src, "length")?;
-                    // ToLength: ToInteger(length) clamped to >= 0 (so a string/
-                    // boolean length like {length:"3"} is honoured).
-                    let n_i = self.to_integer_or_zero(len)?;
-                    let n = if n_i > 0 { n_i as usize } else { 0 };
-                    if n > crate::vm::MAX_DENSE_ARRAY_LEN {
-                        return Err(Thrown(
-                            "RangeError: array length exceeds the engine's dense-array limit".into(),
-                        ));
-                    }
-                    for i in 0..n {
-                        elems.push(self.get_index(src, Value::int(i as i32))?);
-                    }
-                }
-            }
-            Kind::Other => {}
-        }
-        // Apply the map callback, if given (validated callable above), with the
-        // supplied thisArg.
-        if mapfn != Value::UNDEFINED {
-            for (i, slot) in elems.iter_mut().enumerate() {
-                let args = [*slot, Value::int(i as i32)];
-                *slot = self.call_value(mapfn, this_arg, &args)?;
-            }
-        }
-        // When `Array.from` is called with a custom constructor as `this`
-        // (Array.from.call(C, …) / a subclass), build the result via
-        // Construct(C, «len») and define each element on it, rather than always
-        // returning a plain Array. The Array global itself keeps the fast path.
+        let mapping = mapfn != Value::UNDEFINED;
+        // The %Array% intrinsic (or a non-constructor receiver) builds a plain
+        // dense Array; any OTHER constructor receiver is constructed and
+        // receives its elements via CreateDataPropertyOrThrow.
         let is_array_global = this_ctor.is_heap()
             && matches!(self.heap.get(this_ctor.heap_index()), HeapObj::Object(m)
                 if m.get("prototype").is_some_and(|p| p.is_heap() && p.heap_index() == self.arr_proto));
-        if !is_array_global && self.is_constructor(this_ctor) {
-            let len = elems.len();
-            let a = self.construct(this_ctor, &[Value::num(len as f64)])?;
-            for (i, v) in elems.iter().enumerate() {
-                self.set_index(a, Value::num(i as f64), *v, false)?;
+        let custom_ctor = !is_array_global && self.is_constructor(this_ctor);
+        if self.is_callable(using_iter) {
+            // Iterator path, in spec order: A = Construct(C) — NO arguments —
+            // BEFORE the iterator is obtained; then drive next() manually with
+            // mapfn interleaved per element (its mutations of the source are
+            // observed) and IteratorClose on an abrupt mapfn/define.
+            let dest = if custom_ctor { Some(self.construct(this_ctor, &[])?) } else { None };
+            let iter = self.call_value(using_iter, src, &[])?;
+            if !self.is_object_value(iter) {
+                return Err(Thrown("TypeError: iterator is not an object".into()));
             }
-            self.set_prop(a, "length", Value::num(len as f64), false)?;
+            let next_fn = self.get_prop(iter, "next")?;
+            let mut out: Vec<Value> = Vec::new();
+            let mut k: usize = 0;
+            loop {
+                let result = self.call_value(next_fn, iter, &[])?;
+                if !self.is_object_value(result) {
+                    return Err(Thrown("TypeError: iterator result is not an object".into()));
+                }
+                let done = self.get_prop(result, "done")?;
+                if self.truthy(done) {
+                    break;
+                }
+                let k_value = self.get_prop(result, "value")?;
+                let mapped = if mapping {
+                    match self.call_value(mapfn, this_arg, &[k_value, Value::num(k as f64)]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // IteratorClose(iteratorRecord, error): the original
+                            // throw wins; a throwing return() is ignored.
+                            let _ = self.iterator_close(iter);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    k_value
+                };
+                match dest {
+                    Some(a) => {
+                        if let Err(e) = self.create_data_property_or_throw(a, k, mapped) {
+                            let _ = self.iterator_close(iter);
+                            return Err(e);
+                        }
+                    }
+                    None => {
+                        if out.len() >= crate::vm::MAX_DENSE_ARRAY_LEN {
+                            return Err(Thrown(
+                                "RangeError: iterator produced more values than the engine's limit"
+                                    .into(),
+                            ));
+                        }
+                        out.push(mapped);
+                    }
+                }
+                k += 1;
+            }
+            return match dest {
+                Some(a) => {
+                    self.set_prop(a, "length", Value::num(k as f64), true)?;
+                    Ok(a)
+                }
+                None => Ok(Value::heap(self.heap.alloc(HeapObj::Array(out)))),
+            };
+        }
+        // Natively-iterable kinds whose prototype carries no VISIBLE @@iterator
+        // in this engine keep the internal positional drain.
+        if src.is_heap()
+            && matches!(
+                self.heap.get(src.heap_index()),
+                HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+                    | HeapObj::Set(_)
+                    | HeapObj::Map { .. }
+                    | HeapObj::TypedArray { .. }
+                    | HeapObj::Generator { .. }
+                    | HeapObj::Iterator { .. }
+                    | HeapObj::IterHelper { .. }
+            )
+        {
+            let mut elems = self.iterate_to_vec(src)?;
+            if mapping {
+                for (i, slot) in elems.iter_mut().enumerate() {
+                    let args = [*slot, Value::int(i as i32)];
+                    *slot = self.call_value(mapfn, this_arg, &args)?;
+                }
+            }
+            if custom_ctor {
+                let len = elems.len();
+                let a = self.construct(this_ctor, &[Value::num(len as f64)])?;
+                for (i, v) in elems.iter().enumerate() {
+                    self.create_data_property_or_throw(a, i, *v)?;
+                }
+                self.set_prop(a, "length", Value::num(len as f64), true)?;
+                return Ok(a);
+            }
+            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))));
+        }
+        // Array-like path: arrayLike = ToObject(items); len = ToLength(Get(O,
+        // 'length')); elements are read live and DEFINED on the result
+        // (CreateDataPropertyOrThrow — a non-extensible receiver or a
+        // non-configurable index throws; a writable:false one is redefined).
+        let obj = self.to_object(src)?;
+        let len_v = self.get_prop(obj, "length")?;
+        let n_i = self.to_integer_or_zero(len_v)?;
+        let n = if n_i > 0 { (n_i as u64).min((1u64 << 53) - 1) as usize } else { 0 };
+        if custom_ctor {
+            let a = self.construct(this_ctor, &[Value::num(n as f64)])?;
+            for i in 0..n {
+                let v = self.get_index(obj, Value::num(i as f64))?;
+                let mapped = if mapping {
+                    self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
+                } else {
+                    v
+                };
+                self.create_data_property_or_throw(a, i, mapped)?;
+            }
+            self.set_prop(a, "length", Value::num(n as f64), true)?;
             return Ok(a);
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Array(elems))))
+        if n > crate::vm::MAX_DENSE_ARRAY_LEN {
+            return Err(Thrown(
+                "RangeError: array length exceeds the engine's dense-array limit".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(n.min(4096));
+        for i in 0..n {
+            let v = self.get_index(obj, Value::num(i as f64))?;
+            let mapped = if mapping {
+                self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
+            } else {
+                v
+            };
+            out.push(mapped);
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
     }
 
 }

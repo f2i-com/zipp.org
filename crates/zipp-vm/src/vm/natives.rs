@@ -1068,7 +1068,7 @@ impl<'p> Vm<'p> {
                 };
                 self.alloc_str(out)
             }
-            ARR_IS_ARRAY => Value::bool(self.value_is_array(a0)),
+            ARR_IS_ARRAY => Value::bool(self.value_is_array_throwing(a0)?),
             ARR_FROM => self.array_from(this, a0, a1, args.get(2).copied().unwrap_or(Value::UNDEFINED))?,
             ARR_FROM_ASYNC => {
                 // Delegate to a lazily-compiled JS polyfill (an async function),

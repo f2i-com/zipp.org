@@ -68,6 +68,35 @@ impl<'p> Vm<'p> {
     /// targets (a revoked or non-array proxy is not an array). Used by
     /// `Array.isArray` and the `IsArray` op so `Array.isArray(new Proxy([], …))`
     /// is true. (The revoked-proxy-throws nuance is approximated as `false`.)
+    /// IsArray(v) with the spec's revoked-proxy TypeError (used where the
+    /// abrupt completion is observable: Array.isArray, the IsArray op,
+    /// IsConcatSpreadable, ArraySpeciesCreate).
+    pub(crate) fn value_is_array_throwing(&self, v: Value) -> Result<bool, Thrown> {
+        if !v.is_heap() {
+            return Ok(false);
+        }
+        let mut idx = v.heap_index();
+        for _ in 0..1000 {
+            match self.heap.get(idx) {
+                HeapObj::Array(_) => return Ok(!self.arguments_objs.contains(&idx)),
+                HeapObj::Proxy { target, revoked, .. } => {
+                    if *revoked {
+                        return Err(Thrown(
+                            "TypeError: Cannot perform 'IsArray' on a proxy that has been revoked"
+                                .into(),
+                        ));
+                    }
+                    if !target.is_heap() {
+                        return Ok(false);
+                    }
+                    idx = target.heap_index();
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn value_is_array(&self, v: Value) -> bool {
         if !v.is_heap() {
             return false;
@@ -121,7 +150,9 @@ impl<'p> Vm<'p> {
         if flag != Value::UNDEFINED {
             return Ok(self.truthy(flag));
         }
-        Ok(matches!(self.heap.get(v.heap_index()), HeapObj::Array(_)))
+        // Step 4 is the REAL IsArray: it pierces Proxy targets (a proxy over an
+        // array IS spreadable) and throws on a revoked proxy.
+        self.value_is_array_throwing(v)
     }
 
     /// Recursively flatten nested arrays up to `depth` levels (for `Array.flat`).

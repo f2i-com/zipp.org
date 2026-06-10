@@ -803,7 +803,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::IsArray { dst, a } => {
                         let v = self.get(base, a);
-                        let is_arr = self.value_is_array(v);
+                        let is_arr = self.value_is_array_throwing(v)?;
                         self.set(base, dst, Value::bool(is_arr));
                         ip += 1;
                     }
