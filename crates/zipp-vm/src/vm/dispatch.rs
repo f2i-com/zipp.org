@@ -2944,7 +2944,7 @@ impl<'p> Vm<'p> {
                     // Direct eval from strict code: the evaluated string inherits
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
-                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj, var_env_is_global } => {
+                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
@@ -2996,6 +2996,52 @@ impl<'p> Vm<'p> {
                                 caller_nt,
                                 caller_home,
                                 var_env_is_global,
+                                {
+                                    // The site's visible caller bindings: their
+                                    // boxed cells become the eval closure's
+                                    // upvalues.
+                                    if site != u16::MAX {
+                                        let map = self.func(func_id as usize).eval_sites
+                                            [site as usize]
+                                            .clone();
+                                        let mut names = Vec::with_capacity(map.len());
+                                        let mut cells = Vec::with_capacity(map.len());
+                                        for (n, kind, idx) in map {
+                                            let cv = if kind == 0 {
+                                                self.get(base, idx)
+                                            } else {
+                                                // kind 1: this frame's closure
+                                                // upvalue cell (an eval root
+                                                // forwarding its caller scope).
+                                                let cl = self
+                                                    .frames
+                                                    .last()
+                                                    .map(|f| f.closure)
+                                                    .unwrap_or(NO_CLOSURE);
+                                                if cl != NO_CLOSURE {
+                                                    match self.heap.get(cl) {
+                                                        HeapObj::Closure { upvalues, .. } => {
+                                                            upvalues
+                                                                .get(idx as usize)
+                                                                .map(|&c| Value::heap(c))
+                                                                .unwrap_or(Value::UNDEFINED)
+                                                        }
+                                                        _ => Value::UNDEFINED,
+                                                    }
+                                                } else {
+                                                    Value::UNDEFINED
+                                                }
+                                            };
+                                            if cv.is_heap() {
+                                                names.push(n);
+                                                cells.push(cv);
+                                            }
+                                        }
+                                        Some((names, cells))
+                                    } else {
+                                        None
+                                    }
+                                },
                             )?
                         } else {
                             a0

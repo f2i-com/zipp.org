@@ -551,7 +551,7 @@ pub enum Instr {
     /// `home_class`/`super_static`: the CALLER's compile-time class home (so
     /// `super.x` inside the eval'd code resolves against the same class) —
     /// u32::MAX when the eval site has no class context.
-    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool },
+    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool, site: u16 },
 
     /// CreateDataPropertyOrThrow for a class FIELD initializer: an own
     /// {writable, enumerable, configurable} data property on the receiver —
@@ -751,6 +751,12 @@ pub struct FuncProto {
     /// frame finds the cell to capture: a local register holding a cell, or one
     /// of the defining frame's own upvalues (nested-of-nested capture).
     pub upvalues: Vec<UpvalSource>,
+    /// Per direct-eval CALL SITE in this function: the visible caller bindings
+    /// (name, kind, idx) — kind 0 = a boxed local CELL in register idx. The
+    /// eval program is built as a CLOSURE over these cells, so its code reads
+    /// and writes the caller's live bindings (and they outlive the frame).
+    /// Indexed by the DirectEval instr's `site` (u16::MAX = no map).
+    pub eval_sites: Vec<Vec<(String, u8, u16)>>,
     /// Exact source text of this function (sliced from the program source by the
     /// function node's span), used by `Function.prototype.toString`. Empty for
     /// the synthetic top-level script body and for placeholders, in which case

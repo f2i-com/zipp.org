@@ -925,6 +925,7 @@ impl<'p> Vm<'p> {
         caller_new_target: Value,
         caller_home_obj: Option<Value>,
         var_env_global: bool,
+        caller_scope: Option<(Vec<String>, Vec<Value>)>,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -982,6 +983,10 @@ impl<'p> Vm<'p> {
             visible,
             false,
             caller_home_obj.is_some(),
+            caller_scope
+                .as_ref()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default(),
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -995,6 +1000,7 @@ impl<'p> Vm<'p> {
             caller_new_target,
             caller_home_obj,
             var_env_global,
+            caller_scope.map(|(_, c)| c),
         )
         .map(|(v, _)| v)
     }
@@ -1043,7 +1049,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1067,7 +1073,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1100,7 +1106,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new()) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
@@ -1143,7 +1149,8 @@ impl<'p> Vm<'p> {
         // re-exports, then fill the namespace. The recursion carries only
         // (String, slot:u32) — no unrooted heap Value across a GC-triggering load.
         self.module_own.insert(path.clone(), own_map);
-        let exec = self.execute_eval_program(base_func, None, None, Value::UNDEFINED, None);
+        let exec =
+            self.execute_eval_program(base_func, None, None, Value::UNDEFINED, None, None);
         let linked = match exec {
             Ok(_) => self.link_module_reexports(full, &reexports, &star_reexports, dir.as_deref()),
             Err(e) => Err(e),
@@ -1580,8 +1587,21 @@ impl<'p> Vm<'p> {
         caller_chain: Option<Vec<u64>>,
         caller_new_target: Value,
         caller_home_obj: Option<Value>,
+        caller_cells: Option<Vec<Value>>,
     ) -> Result<Value, Thrown> {
-        let script = Value::heap(self.heap.alloc(HeapObj::Func(base_func)));
+        // With caller bindings, the eval script is a CLOSURE over their cells
+        // (UpvalGet/UpvalSet in the eval code address them directly).
+        let script = match caller_cells {
+            Some(cells) => {
+                let ups: Vec<u32> = cells.iter().map(|v| v.heap_index()).collect();
+                Value::heap(self.heap.alloc(HeapObj::Closure {
+                    func: base_func,
+                    upvalues: ups,
+                    this_val: Value::UNDEFINED,
+                }))
+            }
+            None => Value::heap(self.heap.alloc(HeapObj::Func(base_func))),
+        };
         // A direct eval's code resolves the CALLER's private brand chain
         // (frame.callee = this script value).
         if let Some(ch) = caller_chain {
@@ -1617,6 +1637,7 @@ impl<'p> Vm<'p> {
         caller_new_target: Value,
         caller_home_obj: Option<Value>,
         var_env_global: bool,
+        caller_cells: Option<Vec<Value>>,
     ) -> Result<(Value, Vec<u32>), Thrown> {
         let (gmap, base_func) =
             self.prepare_eval_program(eval_prog, module, caller_home, var_env_global)?;
@@ -1626,6 +1647,7 @@ impl<'p> Vm<'p> {
             caller_chain,
             caller_new_target,
             caller_home_obj,
+            caller_cells,
         )?;
         Ok((completion, gmap))
     }

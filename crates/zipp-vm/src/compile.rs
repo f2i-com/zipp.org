@@ -346,10 +346,12 @@ pub fn compile_eval(
     visible_privates: std::collections::HashSet<String>,
     is_module: bool,
     inherit_super_obj: bool,
+    caller_scope: Vec<String>,
 ) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
     c.eval_locals = !is_module;
+    c.eval_caller_scope = caller_scope;
     // A STRICT eval (strict caller or "use strict" source) gets its own
     // discarded variable environment: top-level var/function decls are frame
     // locals, never realm globals.
@@ -429,6 +431,10 @@ struct Compiler {
     /// Direct eval from an OBJECT-literal method/accessor: the eval top level
     /// (and arrows) resolve `super.x` via the caller's runtime [[HomeObject]].
     eval_inherit_super_obj: bool,
+    /// For a DIRECT eval program: the caller bindings (ordered) the runtime
+    /// supplies as the eval closure's upvalue cells. Free names in the eval
+    /// resolve to these as UpvalGet/UpvalSet before falling back to globals.
+    eval_caller_scope: Vec<String>,
     /// Force strict mode for the whole compilation, regardless of a `"use strict"`
     /// directive — set for a DIRECT eval invoked from strict-mode code (the
     /// evaluated string inherits the caller's strictness).
@@ -529,6 +535,7 @@ impl Compiler {
             eval_locals: false,
             script_binds_globals: true,
             eval_inherit_super_obj: false,
+            eval_caller_scope: Vec::new(),
             force_strict: false,
             force_new_target_ok: false,
             in_strict: false,
@@ -633,6 +640,11 @@ impl Compiler {
                 collect_hoisted_vars(s, &mut vars);
             }
             for name in vars {
+                // A name the CALLER binds is not a global var of the eval —
+                // the declaration is a no-op and assignments write the cell.
+                if self.eval_caller_scope.iter().any(|n| *n == name) {
+                    continue;
+                }
                 let slot = self.global_slot(&name) as u32;
                 if !self.hoisted_globals.contains(&slot) {
                     self.hoisted_globals.push(slot);
@@ -722,7 +734,32 @@ impl Compiler {
         // script top level (the eval inherits the caller's new.target validity).
         let parent_nt = self.new_target_ok;
         self.new_target_ok = !is_script || self.force_new_target_ok;
+        // A body that references `eval` may direct-eval: box EVERY param and
+        // function-scoped local so the eval program can close over the caller
+        // scope (cells outlive the frame for closures the eval creates).
+        let mut captured = captured;
+        let body_refs_eval = !is_script && capture::free_vars(&[], body).contains("eval");
+        if body_refs_eval {
+            let mut all: Vec<String> = params.to_vec();
+            if let Some(r) = rest {
+                all.push(r.to_string());
+            }
+            all.extend(hoisted_var_names(body));
+            captured.extend(all);
+        }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        if body_refs_eval {
+            fc.box_all_locals = true;
+        }
+        // The eval ROOT closes over the caller bindings: seed them as upvalues
+        // (the runtime hands the cells to the manually-built eval closure).
+        if is_script && !fc.cx.eval_caller_scope.is_empty() {
+            let seed = fc.cx.eval_caller_scope.clone();
+            let mut ups = fc.upvalues.borrow_mut();
+            for n in &seed {
+                ups.push((n.clone(), UpvalSource::ParentLocal(0)));
+            }
+        }
         fc.cx.in_strict = is_strict;
         fc.is_script = is_script;
         fc.in_generator = is_generator;
@@ -1056,6 +1093,7 @@ impl Compiler {
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
             upvalues,
+            eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by the caller from the function node's span
         })
     }
@@ -1091,7 +1129,11 @@ impl Compiler {
             names.extend(param_pattern_leaves(pa));
         }
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
-        let captured = capture::captured_locals(&names, body);
+        let mut captured = capture::captured_locals(&names, body);
+        let cls_body_refs_eval = capture::free_vars(&[], body).contains("eval");
+        if cls_body_refs_eval {
+            captured.extend(names.iter().cloned());
+        }
         // Class bodies are always strict, regardless of the enclosing scope.
         let parent_strict = self.in_strict;
         // A class method/ctor/field-init closes over the function that contains
@@ -1110,6 +1152,9 @@ impl Compiler {
         let saved_idc = self.in_derived_ctor;
         self.in_derived_ctor = is_ctor && self.class_derived;
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        if cls_body_refs_eval {
+            fc.box_all_locals = true;
+        }
         fc.in_derived_ctor = fc.cx.in_derived_ctor;
         fc.cx.in_strict = true;
         fc.super_class = super_class;
@@ -1225,6 +1270,7 @@ impl Compiler {
             string_constants: fc.string_constants,
             name_global: None,
             upvalues,
+            eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // class methods: caller may override from span
         })
     }
@@ -1313,6 +1359,7 @@ impl Compiler {
             string_constants: fc.string_constants,
             name_global: None,
             upvalues,
+            eval_sites: std::mem::take(&mut fc.eval_sites),
             source: String::new(), // set by compile_arrow from the arrow's span
         })
     }
@@ -1402,6 +1449,7 @@ fn placeholder(name: &str) -> FuncProto {
         string_constants: Vec::new(),
         name_global: None,
         upvalues: Vec::new(),
+        eval_sites: Vec::new(),
         source: String::new(),
     }
 }
@@ -1464,6 +1512,13 @@ struct FnCompiler<'a> {
     /// functions inside the heritage use the cx-level `heritage_classes`
     /// instead (after their own scopes, so their params still shadow).
     heritage_class: Option<(String, u32)>,
+    /// True when this function's body references `eval` (a possible direct
+    /// eval): EVERY local is boxed into a cell so the eval program can close
+    /// over the caller scope; DirectEval sites record the visible bindings.
+    box_all_locals: bool,
+    /// Scope maps for this function's DirectEval call sites (see
+    /// FuncProto::eval_sites).
+    eval_sites: Vec<Vec<(String, u8, u16)>>,
     /// When set, `this` resolves to this register instead of reg 0. Used while
     /// evaluating static field initializers inline at class-definition time,
     /// where `this` must be the class value (not the enclosing `this`) — without
@@ -1643,6 +1698,8 @@ impl<'a> FnCompiler<'a> {
             derived_class: false,
             in_derived_ctor: false,
             heritage_class: None,
+            box_all_locals: false,
+            eval_sites: Vec::new(),
             this_override: None,
             pattern_block_local: false,
             in_generator: false,
@@ -1780,8 +1837,9 @@ impl<'a> FnCompiler<'a> {
         let r = self.alloc_reg();
         self.scopes.last_mut().unwrap().push((name.to_string(), r));
         // Box the local into a cell if a nested function captures it, so the
-        // closure and this scope share one mutable slot.
-        if self.captured.contains(name) {
+        // closure and this scope share one mutable slot — or unconditionally in
+        // a function whose body may direct-eval (the eval closes over cells).
+        if self.box_all_locals || self.captured.contains(name) {
             self.emit(Instr::MakeCell { reg: r });
             self.cell_regs.insert(r);
         }
@@ -2348,6 +2406,25 @@ impl<'a> FnCompiler<'a> {
             // falls through to a block-local binding even at script level.
             let block_scoped_lexical =
                 d.kind.is_lexical() && (self.scopes.len() > 1 || self.cx.eval_locals);
+            // EVAL root: `var x` where x is a CALLER binding — the declaration
+            // is a no-op (the binding exists); an initializer assigns THROUGH
+            // the captured cell (sloppy direct eval's var env is the caller's).
+            if self.is_script
+                && !d.kind.is_lexical()
+                && self.scopes.len() == 1
+                && self.cx.eval_caller_scope.iter().any(|n| n == name)
+            {
+                if let Some(init) = &decl.init {
+                    let tmp = self.temp();
+                    let v = self.compile_named_init(tmp, init, name)?;
+                    let idx = self
+                        .resolve_upvalue(name)
+                        .ok_or("eval caller binding upvalue")?;
+                    self.emit(Instr::UpvalSet { idx, src: v });
+                    self.next_reg -= 1;
+                }
+                continue;
+            }
             if self.is_script && self.cx.script_binds_globals && !block_scoped_lexical {
                 let slot = self.cx.global_slot(name) as u32;
                 if is_const {
@@ -7615,6 +7692,41 @@ impl<'a> FnCompiler<'a> {
                 } else {
                     arg_base
                 };
+                // The visible caller bindings (boxed cells, innermost shadowing
+                // first) — the eval program closes over them. An EVAL ROOT also
+                // maps its own cell locals AND its seeded caller upvalues (kind
+                // 1), so nested evals keep reaching the original caller scope.
+                let eval_root = self.is_script && self.cx.eval_locals;
+                let site = if self.box_all_locals || eval_root {
+                    let mut map: Vec<(String, u8, u16)> = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for scope in self.scopes.iter().rev() {
+                        for (n, r) in scope.iter().rev() {
+                            if self.cell_regs.contains(r) && seen.insert(n.clone()) {
+                                map.push((n.clone(), 0u8, *r));
+                            }
+                        }
+                    }
+                    if let Some((n, r)) = self.self_name.clone() {
+                        if self.cell_regs.contains(&r) && seen.insert(n.clone()) {
+                            map.push((n, 0u8, r));
+                        }
+                    }
+                    if eval_root {
+                        let ups: Vec<String> =
+                            self.upvalues.borrow().iter().map(|(n, _)| n.clone()).collect();
+                        for (i, n) in ups.iter().enumerate() {
+                            if seen.insert(n.clone()) {
+                                map.push((n.clone(), 1u8, i as u16));
+                            }
+                        }
+                    }
+                    let s = self.eval_sites.len() as u16;
+                    self.eval_sites.push(map);
+                    s
+                } else {
+                    u16::MAX
+                };
                 // The effective `this` to inherit: a static field initializer holds
                 // it in `this_override`, otherwise it is reg 0.
                 let this_reg = self.this_override.unwrap_or(0);
@@ -7633,6 +7745,7 @@ impl<'a> FnCompiler<'a> {
                     // context keeps the old slot behavior until the dynamic
                     // caller-env lands).
                     var_env_is_global: self.is_script,
+                    site,
                 });
                 return Ok(dst);
             }
