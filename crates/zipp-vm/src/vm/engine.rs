@@ -898,6 +898,21 @@ impl<'p> Vm<'p> {
     /// never reaches this (calling `eval` previously threw ReferenceError), so it
     /// cannot regress non-eval programs. Classes inside eval are supported via the
     /// `eval_classes` runtime class table (class-id operands re-indexed like funcs).
+    /// The NAME behind a global slot: a main-program global, or an
+    /// EVAL_POOL slot recorded in eval_global_map.
+    pub(crate) fn global_slot_name(&self, idx: u32) -> Option<String> {
+        self.program
+            .global_names
+            .get(idx as usize)
+            .cloned()
+            .or_else(|| {
+                self.eval_global_map
+                    .iter()
+                    .find(|(_, &v)| v == idx)
+                    .map(|(k, _)| k.clone())
+            })
+    }
+
     pub(crate) fn do_eval(
         &mut self,
         code: &str,
@@ -909,6 +924,7 @@ impl<'p> Vm<'p> {
         direct: bool,
         caller_new_target: Value,
         caller_home_obj: Option<Value>,
+        var_env_global: bool,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -978,6 +994,7 @@ impl<'p> Vm<'p> {
             caller_chain,
             caller_new_target,
             caller_home_obj,
+            var_env_global,
         )
         .map(|(v, _)| v)
     }
@@ -1026,7 +1043,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1050,7 +1067,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1102,7 +1119,7 @@ impl<'p> Vm<'p> {
         // PREPARE the module's environment (declared globals → fresh per-module slots,
         // install funcs/classes, hoist) WITHOUT running the body yet. `gmap[i]` is the
         // live slot for compile-time global slot `i`.
-        let (gmap, base_func) = self.prepare_eval_program(prog, true, None)?;
+        let (gmap, base_func) = self.prepare_eval_program(prog, true, None, false)?;
         // OWN exports (exported name → live slot), in source order.
         let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
         let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -1255,6 +1272,7 @@ impl<'p> Vm<'p> {
         eval_prog: crate::bytecode::Program,
         module: bool,
         caller_home: Option<u32>,
+        var_env_global: bool,
     ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // Runtime base ids: eval functions and classes are appended past the
@@ -1371,23 +1389,130 @@ impl<'p> Vm<'p> {
         for r in new_funcs {
             self.eval_funcs.push(r);
         }
-        // 5. Hoist eval `var` names to undefined (only if still uninitialized).
+        // Validation pass FIRST: CanDeclareGlobalFunction for EVERY function
+        // name before ANY binding (var or function) is created — a later
+        // non-definable function must leave earlier vars/functions undeclared.
+        let count = self.eval_funcs.len();
+        let start = (base_func as usize) - self.main_func_count;
+        if var_env_global {
+            for local in start..count {
+                if let Some(slot) = self.eval_funcs[local].name_global {
+                    if (slot as usize) >= self.globals.len()
+                        || self.globals[slot as usize].bits() != Value::UNINITIALIZED.bits()
+                    {
+                        continue;
+                    }
+                    if let Some(name) = self.global_slot_name(slot as u32) {
+                        if matches!(name.as_str(), "NaN" | "Infinity" | "undefined") {
+                            return Err(Thrown(format!(
+                                "TypeError: cannot declare global function {name}"
+                            )));
+                        }
+                        if self.global_this != 0 {
+                            let pos_attrs = match self.heap.get(self.global_this) {
+                                HeapObj::Object(m) => m.pos(&name).map(|i| m.attrs[i]),
+                                _ => None,
+                            };
+                            if let Some(a) = pos_attrs {
+                                if !a.configurable
+                                    && (a.accessor || !a.writable || !a.enumerable)
+                                {
+                                    return Err(Thrown(format!(
+                                        "TypeError: cannot declare global function {name}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 5. CreateGlobalVarBinding for eval `var` names: an ABSENT binding
+        // becomes an own {writable, enumerable, CONFIGURABLE} property of the
+        // global object (eval-created bindings are deletable and reflectable);
+        // the slot stays UNINITIALIZED so reads/writes route through the own
+        // prop (the Load/StoreGlobal fallbacks). Existing bindings untouched.
         for &slot in &eval_prog.hoisted_globals {
             let rs = gmap[slot as usize] as usize;
             if self.globals[rs].bits() == Value::UNINITIALIZED.bits() {
-                self.globals[rs] = Value::UNDEFINED;
+                let mut own_backed = false;
+                if var_env_global {
+                    if let Some(name) = self.global_slot_name(rs as u32) {
+                        // A builtin binding of this name already exists — leave it.
+                        if self.global_by_name(&name).is_some() {
+                            continue;
+                        }
+                        if self.global_this != 0 {
+                            let gi = self.global_this;
+                            let has_own = matches!(
+                                self.heap.get(gi),
+                                HeapObj::Object(m) if m.pos(&name).is_some()
+                            );
+                            if has_own {
+                                own_backed = true;
+                            } else if let HeapObj::Object(m) = self.heap.get_mut(gi) {
+                                m.define(
+                                    &name,
+                                    Value::UNDEFINED,
+                                    crate::heap::PropAttr {
+                                        writable: true,
+                                        enumerable: true,
+                                        configurable: true,
+                                        accessor: false,
+                                        setter: Value::UNDEFINED,
+                                    },
+                                );
+                                own_backed = true;
+                            }
+                        }
+                    }
+                }
+                if !own_backed {
+                    self.globals[rs] = Value::UNDEFINED;
+                }
             }
         }
-        // 6. Hoist eval top-level function declarations into their global slots.
-        let count = self.eval_funcs.len();
-        let start = (base_func as usize) - self.main_func_count;
+        // 6. CreateGlobalFunctionBinding for eval top-level function decls:
+        // when the slot is uninitialized, the binding lives as a global-object
+        // own property — absent: define {w, e, configurable: true}; existing
+        // configurable: redefine to that shape with the new value; existing
+        // non-configurable: write the value, keep the attributes. An
+        // initialized slot (a main-program binding) is written directly.
         for local in start..count {
             let global_id = (self.main_func_count + local) as u32;
             if let Some(slot) = self.eval_funcs[local].name_global {
                 let v = Value::heap(self.heap.alloc(HeapObj::Func(global_id)));
-                if (slot as usize) < self.globals.len() {
-                    self.globals[slot as usize] = v;
+                if (slot as usize) >= self.globals.len() {
+                    continue;
                 }
+                if var_env_global
+                    && self.globals[slot as usize].bits() == Value::UNINITIALIZED.bits()
+                {
+                    if let Some(name) = self.global_slot_name(slot as u32) {
+                        if self.global_this != 0 {
+                            let gi = self.global_this;
+                            let attr = crate::heap::PropAttr {
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                                accessor: false,
+                                setter: Value::UNDEFINED,
+                            };
+                            if let HeapObj::Object(m) = self.heap.get_mut(gi) {
+                                if let Some(i) = m.pos(&name) {
+                                    if m.attrs[i].configurable {
+                                        m.attrs[i] = attr;
+                                    }
+                                    m.vals[i] = v;
+                                } else {
+                                    m.define(&name, v, attr);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                self.globals[slot as usize] = v;
             }
         }
         Ok((gmap, base_func))
@@ -1439,8 +1564,10 @@ impl<'p> Vm<'p> {
         caller_chain: Option<Vec<u64>>,
         caller_new_target: Value,
         caller_home_obj: Option<Value>,
+        var_env_global: bool,
     ) -> Result<(Value, Vec<u32>), Thrown> {
-        let (gmap, base_func) = self.prepare_eval_program(eval_prog, module, caller_home)?;
+        let (gmap, base_func) =
+            self.prepare_eval_program(eval_prog, module, caller_home, var_env_global)?;
         let completion = self.execute_eval_program(
             base_func,
             this_override,

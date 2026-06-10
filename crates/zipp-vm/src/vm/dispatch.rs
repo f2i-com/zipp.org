@@ -356,32 +356,59 @@ impl<'p> Vm<'p> {
                     }
                     Instr::LoadGlobalOrUndefined { dst, idx } => {
                         let v = self.globals[idx as usize];
-                        let v = if v.is_uninitialized() { Value::UNDEFINED } else { v };
+                        let v = if v.is_uninitialized() {
+                            // The binding may be own-prop-backed on the global
+                            // object (eval-created vars / `this.x = v`).
+                            match self.global_slot_name(idx) {
+                                Some(name)
+                                    if self.global_this != 0
+                                        && matches!(
+                                            self.heap.get(self.global_this),
+                                            HeapObj::Object(m) if m.pos(&name).is_some()
+                                        ) =>
+                                {
+                                    let gobj = Value::heap(self.global_this);
+                                    self.get_prop(gobj, &name)?
+                                }
+                                _ => Value::UNDEFINED,
+                            }
+                        } else {
+                            v
+                        };
                         self.set(base, dst, v);
                         ip += 1;
                     }
                     Instr::StoreGlobal { idx, src } => {
                         let v = self.get(base, src);
+                        if self.globals[idx as usize].is_uninitialized() {
+                            // An own-prop-backed binding (eval-created /
+                            // `this.x = v`) is the live binding: write through
+                            // it and leave the slot uninitialized.
+                            if let Some(name) = self.global_slot_name(idx) {
+                                let has_own = self.global_this != 0
+                                    && matches!(
+                                        self.heap.get(self.global_this),
+                                        HeapObj::Object(m) if m.pos(&name).is_some()
+                                    );
+                                if has_own {
+                                    let gobj = Value::heap(self.global_this);
+                                    self.set_prop(gobj, &name, v, false)?;
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
+                        }
                         self.globals[idx as usize] = v;
                         ip += 1;
                     }
                     Instr::StoreGlobalStrict { idx, src } => {
                         // Strict assignment to an unresolvable reference (a global slot
                         // never declared/initialized) is a ReferenceError, not a global
-                        // creation.
+                        // creation. (No own-prop fallback here: the reference's
+                        // unresolvable-ness was fixed when the LHS was evaluated —
+                        // a property the RHS created meanwhile must not resolve it.)
                         if self.globals[idx as usize].is_uninitialized() {
-                            let name = self
-                                .program
-                                .global_names
-                                .get(idx as usize)
-                                .map(|s| s.as_str())
-                                .or_else(|| {
-                                    self.eval_global_map
-                                        .iter()
-                                        .find(|(_, &v)| v == idx)
-                                        .map(|(k, _)| k.as_str())
-                                })
-                                .unwrap_or("?");
+                            let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
                             return Err(Thrown(format!("ReferenceError: {name} is not defined")));
                         }
                         let v = self.get(base, src);
@@ -2113,7 +2140,27 @@ impl<'p> Vm<'p> {
                                 ip = resume;
                                 continue;
                             }
-                            if self.jit.record_region(func_id, t as u32) {
+                            // A global op whose slot is still UNINITIALIZED may
+                            // be own-prop-backed (eval-created / `this.x` bindings):
+                            // raw JIT slot accesses would bypass the own property.
+                            // Don't record/compile yet — once the slot holds a real
+                            // value it can never go back, so a later attempt is safe.
+                            let region_globals_ok = {
+                                let proto = self.func(func_id as usize);
+                                let s = t as usize;
+                                let e = (ip as usize).min(proto.code.len() - 1);
+                                proto.code[s..=e].iter().all(|ins| {
+                                    let slot = match *ins {
+                                        Instr::LoadGlobal { idx, .. } => Some(idx),
+                                        Instr::LoadGlobalOrUndefined { idx, .. } => Some(idx),
+                                        Instr::StoreGlobal { idx, .. } => Some(idx),
+                                        Instr::StoreGlobalStrict { idx, .. } => Some(idx),
+                                        _ => None,
+                                    };
+                                    slot.map_or(true, |i| !self.globals[i as usize].is_uninitialized())
+                                })
+                            };
+                            if region_globals_ok && self.jit.record_region(func_id, t as u32) {
                                 let proto: *const crate::bytecode::FuncProto =
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
@@ -2897,7 +2944,7 @@ impl<'p> Vm<'p> {
                     // Direct eval from strict code: the evaluated string inherits
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
-                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj } => {
+                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj, var_env_is_global } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
@@ -2948,6 +2995,7 @@ impl<'p> Vm<'p> {
                                 true,
                                 caller_nt,
                                 caller_home,
+                                var_env_is_global,
                             )?
                         } else {
                             a0

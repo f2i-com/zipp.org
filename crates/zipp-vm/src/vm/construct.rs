@@ -47,7 +47,7 @@ impl<'p> Vm<'p> {
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.
         let source = format!("({prefix}anonymous({params}\n) {{\n{body}\n}})");
-        self.do_eval(&source, false, false, None, None, false, false, Value::UNDEFINED, None)
+        self.do_eval(&source, false, false, None, None, false, false, Value::UNDEFINED, None, false)
     }
 
     /// `ShadowRealm.prototype.evaluate` / `.importValue`. NOTE: not truly isolated
@@ -70,7 +70,7 @@ impl<'p> Vm<'p> {
                 let code = self.display(a0);
                 // An error thrown by the evaluated code can't cross the realm
                 // boundary, so it surfaces as a TypeError in the calling realm.
-                let result = match self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None) {
+                let result = match self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, false) {
                     Ok(r) => r,
                     Err(_) => {
                         return Err(Thrown(
@@ -2272,7 +2272,25 @@ impl<'p> Vm<'p> {
             return false;
         }
         match self.heap.get(obj.heap_index()) {
-            HeapObj::Object(m) => m.pos(key).map_or(false, |i| m.attrs[i].enumerable),
+            HeapObj::Object(m) => {
+                if let Some(i) = m.pos(key) {
+                    m.attrs[i].enumerable
+                } else if obj.heap_index() == self.global_this && self.global_this != 0 {
+                    // Slot-backed SCRIPT-declared var/function globals are
+                    // enumerable bindings of the global object.
+                    self.program
+                        .global_names
+                        .iter()
+                        .position(|n| n == key)
+                        .is_some_and(|i| {
+                            (self.program.hoisted_globals.contains(&(i as u32))
+                                || self.program.decl_globals.contains(&(i as u32)))
+                                && !self.globals[i].is_uninitialized()
+                        })
+                } else {
+                    false
+                }
+            }
             HeapObj::Array(items) => {
                 key.parse::<usize>().map_or(false, |i| i < items.len())
                     || self

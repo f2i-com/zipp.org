@@ -312,6 +312,7 @@ fn compile_program_inner(prog: &ox::Program, source: &str, module_mode: bool) ->
         classes: c.classes,
         global_names: c.globals,
         hoisted_globals: c.hoisted_globals,
+        decl_globals: c.decl_globals.iter().copied().collect(),
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
@@ -374,6 +375,7 @@ pub fn compile_eval(
         classes: c.classes,
         global_names: c.globals,
         hoisted_globals: c.hoisted_globals,
+        decl_globals: c.decl_globals.iter().copied().collect(),
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
@@ -7624,6 +7626,11 @@ impl<'a> FnCompiler<'a> {
                     ban_arguments: self.cx.in_field_init,
                     strict_caller: self.cx.in_strict,
                     super_home_obj: self.super_home_obj,
+                    // The eval's variable environment: GLOBAL only when the
+                    // call site is the script top level (a function/arrow/param
+                    // context keeps the old slot behavior until the dynamic
+                    // caller-env lands).
+                    var_env_is_global: self.is_script,
                 });
                 return Ok(dst);
             }

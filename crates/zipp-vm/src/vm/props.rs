@@ -486,17 +486,39 @@ impl<'p> Vm<'p> {
         // value, so it never triggers a getter.
         if obj.is_heap() {
             if let HeapObj::Object(m) = self.heap.get(obj.heap_index()) {
-                let names: Vec<String> = spec_key_order(&m.keys)
+                let mut names: Vec<String> = spec_key_order(&m.keys)
                     .into_iter()
                     .map(|i| m.keys[i].clone())
                     .filter(|k| !is_hidden_key(k))
                     .collect();
+                // The global object's SCRIPT-declared var/function bindings are
+                // enumerable slot-backed own properties (builtins stay
+                // non-enumerable and excluded).
+                let mut slot_names: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                if obj.heap_index() == self.global_this && self.global_this != 0 {
+                    for (i, n) in self.program.global_names.iter().enumerate() {
+                        let iu = i as u32;
+                        if (self.program.hoisted_globals.contains(&iu)
+                            || self.program.decl_globals.contains(&iu))
+                            && !self.globals[i].is_uninitialized()
+                            && m.pos(n).is_none()
+                            && !names.iter().any(|k| k == n)
+                        {
+                            names.push(n.clone());
+                            slot_names.insert(n.clone());
+                        }
+                    }
+                }
                 let mut out: Vec<Value> = Vec::with_capacity(names.len());
                 for k in names {
-                    let enumerable = match self.heap.get(obj.heap_index()) {
-                        HeapObj::Object(m) => m.pos(&k).map_or(false, |i| m.attrs[i].enumerable),
-                        _ => false,
-                    };
+                    let enumerable = slot_names.contains(&k)
+                        || match self.heap.get(obj.heap_index()) {
+                            HeapObj::Object(m) => {
+                                m.pos(&k).map_or(false, |i| m.attrs[i].enumerable)
+                            }
+                            _ => false,
+                        };
                     if !enumerable {
                         continue;
                     }
@@ -877,14 +899,25 @@ impl<'p> Vm<'p> {
                 if let Some(i) = m.pos(key) {
                     Some((m.attrs[i], m.vals[i]))
                 } else if idx == self.global_this && self.global_this != 0 {
-                    // globalThis own properties: built-in globals are
-                    // { writable, enumerable:false, configurable }; the value
-                    // globals NaN/Infinity/undefined are { false, false, false }.
+                    // globalThis own properties: SCRIPT-declared var/function
+                    // globals are { writable, ENUMERABLE, non-configurable }
+                    // bindings; built-ins are { writable, non-enumerable,
+                    // configurable }; NaN/Infinity/undefined are frozen.
                     if let Some(v) = self.global_by_name(key) {
+                        let script_decl = self
+                            .program
+                            .global_names
+                            .iter()
+                            .position(|n| n == key)
+                            .is_some_and(|i| {
+                                self.program.hoisted_globals.contains(&(i as u32))
+                                    || self.program.decl_globals.contains(&(i as u32))
+                            });
                         return match key {
                             "NaN" | "Infinity" | "undefined" => {
                                 self.make_data_descriptor(v, false, false, false)
                             }
+                            _ if script_decl => self.make_data_descriptor(v, true, true, false),
                             _ => self.make_data_descriptor(v, true, false, true),
                         };
                     }

@@ -148,6 +148,20 @@ impl<'p> Vm<'p> {
             if matches!(key, "NaN" | "Infinity" | "undefined") {
                 return Value::bool(false);
             }
+            // SCRIPT-declared var/function globals are non-configurable
+            // bindings — `delete` returns false and removes nothing.
+            if self
+                .program
+                .global_names
+                .iter()
+                .position(|n| n == key)
+                .is_some_and(|i| {
+                    self.program.hoisted_globals.contains(&(i as u32))
+                        || self.program.decl_globals.contains(&(i as u32))
+                })
+            {
+                return Value::bool(false);
+            }
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                 m.remove(key);
             }
