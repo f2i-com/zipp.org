@@ -368,6 +368,97 @@ pub fn compile_eval(
     caller_scope: Vec<String>,
     fn_var_env: bool,
 ) -> R<Program> {
+    // MODULE early errors (ModuleDeclarationInstantiation): duplicate
+    // LexicallyDeclaredNames (let/const/class AND top-level function — module
+    // top-level functions are LEXICAL), or a lexical name colliding with any
+    // VarDeclaredName (deep), is a SyntaxError before any evaluation.
+    if is_module {
+        let mut vars = std::collections::HashSet::new();
+        for s in &prog.body {
+            collect_hoisted_vars(s, &mut vars);
+        }
+        let mut lexical: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut add_lexical = |n: String,
+                               lexical: &mut std::collections::HashSet<String>|
+         -> Result<(), String> {
+            if !lexical.insert(n.clone()) || vars.contains(&n) {
+                return Err(format!("duplicate declaration of '{n}' in module code"));
+            }
+            Ok(())
+        };
+        let mut check_decl = |d: &ox::Declaration,
+                              lexical: &mut std::collections::HashSet<String>|
+         -> Result<(), String> {
+            match d {
+                ox::Declaration::VariableDeclaration(vd) if vd.kind.is_lexical() => {
+                    let mut names = std::collections::HashSet::new();
+                    for decl in &vd.declarations {
+                        capture::collect_pattern_names(&decl.id, &mut names);
+                    }
+                    for n in names {
+                        add_lexical(n, lexical)?;
+                    }
+                }
+                ox::Declaration::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        add_lexical(id.name.to_string(), lexical)?;
+                    }
+                }
+                ox::Declaration::ClassDeclaration(cd) => {
+                    if let Some(id) = &cd.id {
+                        add_lexical(id.name.to_string(), lexical)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+        for s in &prog.body {
+            match s {
+                ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                    let mut names = std::collections::HashSet::new();
+                    for decl in &d.declarations {
+                        capture::collect_pattern_names(&decl.id, &mut names);
+                    }
+                    for n in names {
+                        add_lexical(n, &mut lexical)?;
+                    }
+                }
+                ox::Statement::FunctionDeclaration(f) => {
+                    if let Some(id) = &f.id {
+                        add_lexical(id.name.to_string(), &mut lexical)?;
+                    }
+                }
+                ox::Statement::ClassDeclaration(cd) => {
+                    if let Some(id) = &cd.id {
+                        add_lexical(id.name.to_string(), &mut lexical)?;
+                    }
+                }
+                ox::Statement::ExportNamedDeclaration(e) => {
+                    if let Some(d) = &e.declaration {
+                        check_decl(d, &mut lexical)?;
+                    }
+                }
+                ox::Statement::ExportDefaultDeclaration(e) => {
+                    use ox::ExportDefaultDeclarationKind as K;
+                    match &e.declaration {
+                        K::FunctionDeclaration(f) => {
+                            if let Some(id) = &f.id {
+                                add_lexical(id.name.to_string(), &mut lexical)?;
+                            }
+                        }
+                        K::ClassDeclaration(cd) => {
+                            if let Some(id) = &cd.id {
+                                add_lexical(id.name.to_string(), &mut lexical)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
     c.eval_locals = !is_module;
