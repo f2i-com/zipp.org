@@ -387,7 +387,9 @@ impl<'p> Vm<'p> {
                 // f64 indices): store, growing with `undefined` holes past the end.
                 if let Some(i) = array_index(key) {
                     if i >= items.len() {
-                        items.resize(i + 1, Value::UNDEFINED);
+                        // Slots between the old length and the new index are
+                        // HOLES (absent), not present undefineds.
+                        items.resize(i + 1, Value::HOLE);
                     }
                     items[i] = val;
                 }

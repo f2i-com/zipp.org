@@ -1904,7 +1904,8 @@ impl<'p> Vm<'p> {
                         }
                         if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                             if i >= items.len() {
-                                items.resize(i + 1, Value::UNDEFINED);
+                                // Intervening slots are HOLES (absent), per spec.
+                                items.resize(i + 1, Value::HOLE);
                             }
                             items[i] = stored;
                         }
@@ -1913,7 +1914,10 @@ impl<'p> Vm<'p> {
                         // `length` counts the index.
                         if i >= dense_len {
                             if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                                items.resize(i + 1, Value::UNDEFINED);
+                                // Intervening slots are HOLES; the slot at `i`
+                                // itself is only a placeholder (presence comes
+                                // from the arr_props override entry).
+                                items.resize(i + 1, Value::HOLE);
                             }
                         }
                         self.arr_props
@@ -2008,7 +2012,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        items.resize(effective_len, Value::UNDEFINED);
+                        items.resize(effective_len, Value::HOLE);
                     }
                     self.heap.bump_version(idx);
                     if blocked {

@@ -374,6 +374,10 @@ impl<'p> Vm<'p> {
         if !obj.is_heap() {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
+        // A plain assignment can put an integer index on Array/Object.prototype
+        // just like defineProperty — flag it so index stores/mutators consult
+        // the prototype chain (two integer compares for ordinary receivers).
+        self.note_array_proto_index(obj.heap_index(), key);
         // Proxy `set` trap (or fall through to the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
             if revoked {
@@ -513,10 +517,39 @@ impl<'p> Vm<'p> {
                     "RangeError: array length exceeds the engine's dense-array limit".into(),
                 ));
             }
+            // Truncation deletes index properties >= newLen in DESCENDING
+            // order, stopping at the first NON-CONFIGURABLE one: it survives
+            // and the final length becomes thatIndex + 1 (ArraySetLength).
+            let mut final_len = n as usize;
+            if let Some(m) = self.arr_props.get(&idx) {
+                let highest_noncfg = m
+                    .keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, k)| {
+                        canonical_index_str(k)
+                            .filter(|ki| *ki >= n as usize && !m.attrs[i].configurable)
+                    })
+                    .max();
+                if let Some(ki) = highest_noncfg {
+                    final_len = ki + 1;
+                }
+            }
+            if let Some(m) = self.arr_props.get_mut(&idx) {
+                let doomed: Vec<String> = m
+                    .keys
+                    .iter()
+                    .filter(|k| canonical_index_str(k).is_some_and(|i| i >= final_len))
+                    .cloned()
+                    .collect();
+                for k in doomed {
+                    m.remove(&k);
+                }
+            }
             if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                 // Extending past the current length adds HOLES (absent elements),
                 // not present `undefined`s; truncating just drops the tail.
-                items.resize(n as usize, Value::HOLE);
+                items.resize(final_len, Value::HOLE);
             }
             self.heap.bump_version(idx);
             return Ok(());
@@ -734,7 +767,8 @@ impl<'p> Vm<'p> {
                     }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         if n >= items.len() {
-                            items.resize(n + 1, Value::UNDEFINED);
+                            // Intervening slots are HOLES (absent), per spec.
+                            items.resize(n + 1, Value::HOLE);
                         }
                         items[n] = val;
                     }

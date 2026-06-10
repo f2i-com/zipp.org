@@ -340,12 +340,32 @@ impl<'p> Vm<'p> {
         out: Vec<Value>,
         species_len: usize,
     ) -> Result<Value, Thrown> {
+        self.array_from_species_len(original, out, species_len, false)
+    }
+
+    /// `set_length`: slice/splice end with Set(A,'length',n,true) per spec;
+    /// map/filter/flat/flatMap only define elements.
+    pub(crate) fn array_from_species_len(
+        &mut self,
+        original: Value,
+        out: Vec<Value>,
+        species_len: usize,
+        set_length: bool,
+    ) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
         match self.array_species_create(original, species_len)? {
             None => Ok(Value::heap(self.heap.alloc(HeapObj::Array(out)))),
             Some(target) => {
+                let n = out.len();
                 for (i, v) in out.into_iter().enumerate() {
-                    self.create_data_property_or_throw(target, i, v)?;
+                    // A HOLE marks an ABSENT source index: it is skipped (not
+                    // defined as undefined) — the result keeps the gap.
+                    if !v.is_hole() {
+                        self.create_data_property_or_throw(target, i, v)?;
+                    }
+                }
+                if set_length {
+                    self.set_prop(target, "length", Value::num(n as f64), true)?;
                 }
                 Ok(target)
             }
@@ -934,7 +954,7 @@ impl<'p> Vm<'p> {
                 // splice does ArraySpeciesCreate(O, actualDeleteCount) for the
                 // returned removed-array.
                 let dl = deleted.len();
-                let a = self.array_from_species(this, deleted, dl)?;
+                let a = self.array_from_species_len(this, deleted, dl, true)?;
                 // Shift the tail to make room for the inserted items.
                 if insert_count < actual_delete {
                     let mut k = actual_start;
@@ -1250,6 +1270,18 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // shift/reverse mutate via the raw Vec — correct only when every slot is
+        // a plain own data element. A side table (accessor/attribute overrides),
+        // or holes that an inherited prototype index could cover, must run the
+        // spec HasProperty/Get/Set/Delete protocol (same gating as the callback
+        // and search families above).
+        if matches!(name, "shift" | "reverse")
+            && (self.arr_props.contains_key(&idx)
+                || (self.array_has_holes(idx)
+                    && (self.array_proto_has_index || self.proto_of.contains_key(&idx))))
+        {
+            return self.array_like_mutate(Value::heap(idx), name, args);
+        }
         // push/unshift Set a NEW index; when a prototype carries integer indices, that
         // Set may hit a prototype setter (OrdinarySet, handled by set_index via the
         // abstract al_set path). The fast Vec append below bypasses set_index, so route
@@ -1434,15 +1466,40 @@ impl<'p> Vm<'p> {
                 // with the flag cleared is added whole. Both `this` and the args
                 // are subject to the check.
                 let this_val = Value::heap(idx);
+                // ArraySpeciesCreate(O, 0) is step 2: its constructor/@@species
+                // Gets precede every @@isConcatSpreadable Get below.
+                let species_target = self.array_species_create(this_val, 0)?;
                 let mut out: Vec<Value> = Vec::new();
                 for e in std::iter::once(this_val).chain(args.iter().copied()) {
                     if self.is_concat_spreadable(e)? {
-                        // A real array spreads via its dense storage (fast); any
-                        // other spreadable (array-like) reads ToLength(length) and
-                        // each index — coercion/getters here may throw, per spec.
-                        if e.is_heap() && matches!(self.heap.get(e.heap_index()), HeapObj::Array(_)) {
-                            let snap = self.array_snapshot(e.heap_index());
-                            out.extend(snap);
+                        // A CLEAN real array spreads via its dense storage (fast).
+                        // One with a side table (accessors), an arguments object,
+                        // or holes runs the spec HasProperty+Get per index —
+                        // accessors fire and ABSENT indices stay absent (HOLE).
+                        let arr_n = if e.is_heap() {
+                            match self.heap.get(e.heap_index()) {
+                                HeapObj::Array(items) => Some(items.len()),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(n) = arr_n {
+                            let eidx = e.heap_index();
+                            if !self.arr_props.contains_key(&eidx)
+                                && !self.arguments_objs.contains(&eidx)
+                                && !self.array_has_holes(eidx)
+                            {
+                                let snap = self.array_snapshot(eidx);
+                                out.extend(snap);
+                            } else {
+                                for k in 0..n {
+                                    match self.array_iter_get(e, k)? {
+                                        Some(v) => out.push(v),
+                                        None => out.push(Value::HOLE),
+                                    }
+                                }
+                            }
                         } else {
                             let len_v = self.get_prop(e, "length")?;
                             let len = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1);
@@ -1463,8 +1520,19 @@ impl<'p> Vm<'p> {
                         out.push(e);
                     }
                 }
-                // concat does ArraySpeciesCreate(O, 0).
-                Ok(Some(self.array_from_species(this_val, out, 0)?))
+                match species_target {
+                    None => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out))))),
+                    Some(a) => {
+                        let n = out.len();
+                        for (i, v) in out.into_iter().enumerate() {
+                            if !v.is_hole() {
+                                self.create_data_property_or_throw(a, i, v)?;
+                            }
+                        }
+                        self.set_prop(a, "length", Value::num(n as f64), true)?;
+                        Ok(Some(a))
+                    }
+                }
             }
             "flat" => {
                 // An absent OR explicitly-`undefined` depth defaults to 1
@@ -1516,21 +1584,43 @@ impl<'p> Vm<'p> {
                 } else {
                     Some(self.to_integer_or_zero(args[1])?)
                 };
-                let snapshot = self.array_snapshot(idx);
-                let len = snapshot.len() as i32;
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len() as i32,
+                    _ => 0,
+                };
                 let start = norm_index(s0.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len);
                 let end = match e0 {
                     None => len,
                     Some(e) => norm_index(e.clamp(i32::MIN as i64, i32::MAX as i64) as i32, len),
                 };
+                let clean =
+                    !self.arr_props.contains_key(&idx) && !self.array_has_holes(idx);
                 let slice: Vec<Value> = if start < end {
-                    snapshot[start as usize..end as usize].to_vec()
+                    if clean {
+                        match self.heap.get(idx) {
+                            HeapObj::Array(items) => {
+                                items[start as usize..end as usize].to_vec()
+                            }
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        // Spec copy: HasProperty(k) (proto-aware, accessors fire)
+                        // then Get; an ABSENT index stays absent in the result.
+                        let mut v = Vec::with_capacity((end - start) as usize);
+                        for k in start..end {
+                            match self.array_iter_get(Value::heap(idx), k as usize)? {
+                                Some(x) => v.push(x),
+                                None => v.push(Value::HOLE),
+                            }
+                        }
+                        v
+                    }
                 } else {
                     Vec::new()
                 };
                 // slice does ArraySpeciesCreate(O, count) where count == slice.len().
                 let n = slice.len();
-                Ok(Some(self.array_from_species(Value::heap(idx), slice, n)?))
+                Ok(Some(self.array_from_species_len(Value::heap(idx), slice, n, true)?))
             }
             "map" => {
                 self.array_each(idx, arg0, EachMode::Map, args.get(1).copied().unwrap_or(Value::UNDEFINED))
@@ -1928,7 +2018,7 @@ impl<'p> Vm<'p> {
                 // splice returns the removed elements via
                 // ArraySpeciesCreate(O, actualDeleteCount).
                 let n = removed.len();
-                Ok(Some(self.array_from_species(Value::heap(idx), removed, n)?))
+                Ok(Some(self.array_from_species_len(Value::heap(idx), removed, n, true)?))
             }
             // Array iterators (real iterator objects with .next(), proto =
             // %ArrayIteratorPrototype%). values() is also the default @@iterator.
