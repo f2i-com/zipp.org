@@ -342,9 +342,11 @@ pub fn compile_eval(
     inherit_super: Option<bool>,
     ban_arguments: bool,
     visible_privates: std::collections::HashSet<String>,
+    is_module: bool,
 ) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
+    c.eval_locals = !is_module;
     c.force_strict = force_strict;
     c.force_new_target_ok = force_new_target_ok;
     // A direct eval from a class-member context inherits the caller's home
@@ -404,6 +406,11 @@ struct Compiler {
     /// the top-level body is an ASYNC context (top-level `await` is allowed), so
     /// func 0 is compiled with `in_async` and the VM runs it as an async activation.
     module_mode: bool,
+    /// True only for a REAL eval program (do_eval): top-level lexicals are
+    /// frame-locals (the spec's discarded eval lexEnv). False for modules,
+    /// which also compile through compile_eval but whose top-level lexicals
+    /// are live global-slot export bindings.
+    eval_locals: bool,
     /// Force strict mode for the whole compilation, regardless of a `"use strict"`
     /// directive — set for a DIRECT eval invoked from strict-mode code (the
     /// evaluated string inherits the caller's strictness).
@@ -501,6 +508,7 @@ impl Compiler {
             eval_inherit_super: None,
             in_field_init: false,
             module_mode: false,
+            eval_locals: false,
             force_strict: false,
             force_new_target_ok: false,
             in_strict: false,
@@ -847,7 +855,7 @@ impl Compiler {
         // even in sloppy mode — `for ([x] of [[]]) {} let x;`. Only DIRECT top-level
         // declarations bind to globals (block-scoped lexicals don't leak), so a
         // VariableDeclaration nested in a block is not registered.
-        if is_script {
+        if is_script && !fc.cx.eval_locals {
             for s in body {
                 if let ox::Statement::VariableDeclaration(d) = s {
                     if d.kind.is_lexical() {
@@ -858,6 +866,40 @@ impl Compiler {
                             }
                         }
                     }
+                }
+            }
+        }
+        // EVAL top level: lexical declarations live in the eval's own
+        // (discarded-on-return) lexical environment, never the realm's globals
+        // (spec PerformEval NewDeclarativeEnvironment). Pre-create a TDZ cell
+        // for EVERY top-level lexical name — EvalDeclarationInstantiation
+        // creates them uninitialized before the body runs, so
+        // `typeof x; let x;` throws ReferenceError. The textual declaration
+        // reuses the cell (entry_lexicals), ending the TDZ.
+        if is_script && fc.cx.eval_locals {
+            let mut lex = std::collections::HashSet::new();
+            for s in body {
+                match s {
+                    ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                        for decl in &d.declarations {
+                            capture::collect_pattern_names(&decl.id, &mut lex);
+                        }
+                    }
+                    ox::Statement::ClassDeclaration(c) => {
+                        if let Some(id) = &c.id {
+                            lex.insert(id.name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for name in &lex {
+                if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                    let r = fc.alloc_reg();
+                    fc.scopes[0].push((name.clone(), r));
+                    fc.emit(Instr::MakeCellTdz { reg: r });
+                    fc.cell_regs.insert(r);
+                    fc.entry_lexicals.insert(name.clone());
                 }
             }
         }
@@ -1842,6 +1884,16 @@ impl<'a> FnCompiler<'a> {
         if n < 2 {
             return false;
         }
+        // In an EVAL program, top-level lexicals are scope-[0] LOCALS (the
+        // discarded eval lexEnv), not globals — a same-named one is exactly
+        // the early-error case that skips the Annex B extension.
+        if self.is_script
+            && self.cx.eval_locals
+            && self.entry_lexicals.contains(name)
+            && self.scopes[0].iter().any(|(nm, _)| nm == name)
+        {
+            return true;
+        }
         self.scopes[1..n - 1]
             .iter()
             .any(|s| s.iter().any(|(nm, _)| nm == name))
@@ -2265,7 +2317,8 @@ impl<'a> FnCompiler<'a> {
             // inside a BLOCK is block-scoped and must NOT leak to the global
             // scope (`{ let x = 1; }` leaves `x` undeclared after the block) — it
             // falls through to a block-local binding even at script level.
-            let block_scoped_lexical = d.kind.is_lexical() && self.scopes.len() > 1;
+            let block_scoped_lexical =
+                d.kind.is_lexical() && (self.scopes.len() > 1 || self.cx.eval_locals);
             if self.is_script && !block_scoped_lexical {
                 let slot = self.cx.global_slot(name) as u32;
                 if is_const {
@@ -2798,7 +2851,7 @@ impl<'a> FnCompiler<'a> {
         let dest = match self.resolve_existing(&n) {
             Some(Binding::LocalCell(r)) => Dest::Cell(r, self.temp()),
             Some(Binding::Local(r)) => Dest::Reg(r),
-            _ if self.is_script => {
+            _ if self.is_script && !self.cx.eval_locals => {
                 let slot = self.cx.global_slot(&n) as u32;
                 Dest::Global(slot, self.temp())
             }

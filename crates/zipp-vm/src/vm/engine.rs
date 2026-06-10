@@ -915,6 +915,22 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
+        // Eval code is never module code: import/export declarations are a
+        // SyntaxError (spec PerformEval parses goal Script; oxc's script goal
+        // still produces the module-decl statement variants).
+        if ret.program.body.iter().any(|s| {
+            matches!(
+                s,
+                oxc_ast::ast::Statement::ImportDeclaration(_)
+                    | oxc_ast::ast::Statement::ExportNamedDeclaration(_)
+                    | oxc_ast::ast::Statement::ExportDefaultDeclaration(_)
+                    | oxc_ast::ast::Statement::ExportAllDeclaration(_)
+            )
+        }) {
+            return Err(Thrown(
+                "SyntaxError: import/export declarations may only appear in modules".into(),
+            ));
+        }
         // A DIRECT eval sees the caller's lexical private scope: the declared
         // NAMES gate the compile-time early error; the brand CHAIN drives the
         // runtime declaring-class resolution inside the eval'd code.
@@ -945,6 +961,7 @@ impl<'p> Vm<'p> {
             inherit_super.map(|(_, s)| s),
             ban_arguments,
             visible,
+            false,
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -1060,7 +1077,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new()) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
