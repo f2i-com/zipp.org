@@ -884,7 +884,7 @@ impl Compiler {
         // error (a formal parameter, or a lexical `let`/`const`/`class` in scope —
         // top-level OR an enclosing block/for-head/catch param) are skipped, as is
         // a top-level function name (already var-scoped).
-        if !is_script && !fc.cx.in_strict {
+        if !fc.cx.in_strict && (!is_script || fc.cx.script_binds_globals) {
             let mut blockers = std::collections::HashSet::new();
             // `protect`: params + lexical/class names a same-named block function
             // must NOT touch (B.3.3 skip). Existing FUNCTION names are blockers (no
@@ -918,19 +918,53 @@ impl Compiler {
             }
             fc.protect_names = protect;
             let mut b33 = std::collections::HashSet::new();
-            for s in body {
-                collect_b33_block_fns(s, false, &blockers, &mut b33);
-            }
-            for name in &b33 {
-                // CreateMutableBinding + InitializeBinding(undefined) at entry.
-                let reg = fc.declare_local(name);
-                if fc.cell_regs.contains(&reg) {
-                    let t = fc.temp();
-                    fc.emit(Instr::LoadUndefined { dst: t });
-                    fc.emit(Instr::CellSet { cell: reg, src: t });
-                    fc.next_reg -= 1;
-                } else {
-                    fc.emit(Instr::LoadUndefined { dst: reg });
+            if is_script {
+                // SCRIPT level: an existing top-level FUNCTION name is NOT a
+                // blocker — the block function UPDATES its global binding at
+                // declaration evaluation (B.3.3.3 SetMutableBinding; the
+                // binding already exists via name_global materialization).
+                let mut script_blockers = blockers.clone();
+                let mut fn_names = std::collections::HashSet::new();
+                for s in body {
+                    if let ox::Statement::FunctionDeclaration(f) = s {
+                        if let Some(id) = &f.id {
+                            script_blockers.remove(id.name.as_str());
+                            fn_names.insert(id.name.to_string());
+                        }
+                    }
+                }
+                for s in body {
+                    collect_b33_block_fns(s, false, &script_blockers, &mut b33);
+                }
+                for name in &b33 {
+                    // CreateGlobalVarBinding(undefined) at instantiation —
+                    // rides the hoisted-globals machinery (startup seed for
+                    // main scripts; the own-prop step for global-varEnv
+                    // evals). The function itself stays BLOCK-local;
+                    // func_decl copies the value out when the declaration
+                    // evaluates. An existing-function name keeps its binding.
+                    if !fn_names.contains(name) {
+                        let slot = fc.cx.global_slot(name) as u32;
+                        if !fc.cx.hoisted_globals.contains(&slot) {
+                            fc.cx.hoisted_globals.push(slot);
+                        }
+                    }
+                }
+            } else {
+                for s in body {
+                    collect_b33_block_fns(s, false, &blockers, &mut b33);
+                }
+                for name in &b33 {
+                    // CreateMutableBinding + InitializeBinding(undefined) at entry.
+                    let reg = fc.declare_local(name);
+                    if fc.cell_regs.contains(&reg) {
+                        let t = fc.temp();
+                        fc.emit(Instr::LoadUndefined { dst: t });
+                        fc.emit(Instr::CellSet { cell: reg, src: t });
+                        fc.next_reg -= 1;
+                    } else {
+                        fc.emit(Instr::LoadUndefined { dst: reg });
+                    }
                 }
             }
             fc.b33_names = b33;
@@ -2950,6 +2984,14 @@ impl<'a> FnCompiler<'a> {
                     .and_then(|s| s.iter().find(|(nm, _)| nm == n).map(|(_, r)| *r)),
                 _ => None,
             };
+            // SCRIPT-level B.3.3: the block function ALSO updates its global
+            // var binding when the declaration evaluates (SetMutableBinding).
+            let script_b33_slot = match name.as_deref() {
+                Some(n) if self.is_script && self.b33_names.contains(n) => {
+                    Some(self.cx.global_slot(n) as u32)
+                }
+                _ => None,
+            };
             match binding {
                 Some(Binding::Local(reg)) => {
                     self.emit_make_callable(reg, id, has_upvalues);
@@ -2962,6 +3004,9 @@ impl<'a> FnCompiler<'a> {
                             }
                         }
                     }
+                    if let Some(slot) = script_b33_slot {
+                        self.emit(Instr::StoreGlobal { idx: slot, src: reg });
+                    }
                 }
                 Some(Binding::LocalCell(cell)) => {
                     let tmp = self.temp();
@@ -2973,6 +3018,9 @@ impl<'a> FnCompiler<'a> {
                         } else {
                             self.emit(Instr::Move { dst: s0, src: tmp });
                         }
+                    }
+                    if let Some(slot) = script_b33_slot {
+                        self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
                     }
                     self.next_reg -= 1;
                 }
@@ -8421,7 +8469,9 @@ fn collect_b33_block_fns(
     };
     match s {
         S::FunctionDeclaration(f) => {
-            if nested {
+            // Annex B B.3.3 applies to PLAIN functions only — generator and
+            // async (generator) declarations stay purely block-scoped.
+            if nested && !f.generator && !f.r#async {
                 if let Some(id) = &f.id {
                     let n = id.name.as_str();
                     if !blockers.contains(n) {
