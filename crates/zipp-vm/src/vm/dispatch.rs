@@ -2768,10 +2768,37 @@ impl<'p> Vm<'p> {
                         };
                         match settle {
                             Ok(v) => {
+                                // A TLA module still evaluating published its
+                                // body promise: the import() promise settles
+                                // FROM it (fulfill → the namespace, reject →
+                                // the body's reason) instead of immediately.
+                                let body = self.pending_module_body.take();
                                 self.set(base, dst, v);
                                 let p = self.alloc_promise();
                                 let r = self.get(base, dst);
-                                self.resolve(p, r);
+                                match body {
+                                    Some(bp) if bp.is_heap() => {
+                                        let _gc = self.gc_lock_guard();
+                                        let ret_ns = Value::heap(self.heap.alloc(
+                                            HeapObj::Native(native::SPECIES_GET),
+                                        ));
+                                        // `this`-returning native bound to the
+                                        // namespace: the fulfill callback's
+                                        // return value settles the dependent.
+                                        let cb = Value::heap(self.heap.alloc(HeapObj::Bound {
+                                            target: ret_ns,
+                                            this: r,
+                                            args: Vec::new(),
+                                        }));
+                                        self.then_internal(
+                                            bp.heap_index(),
+                                            cb,
+                                            Value::UNDEFINED,
+                                            Some(p),
+                                        );
+                                    }
+                                    _ => self.resolve(p, r),
+                                }
                                 self.set(base, dst, Value::heap(p));
                             }
                             Err(e) => {

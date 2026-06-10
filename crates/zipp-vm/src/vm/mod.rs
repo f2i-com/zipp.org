@@ -518,6 +518,11 @@ pub struct Vm<'p> {
     /// AgentCanSuspend: false when launched with ZIPP_CAN_BLOCK=0 (the
     /// test262 CanBlockIsFalse harness mode) — Atomics.wait then throws.
     can_block: bool,
+    /// The body promise of the most recent `import_module` whose top-level
+    /// await SUSPENDED (still Pending on return). Taken by the dynamic-import
+    /// site (which settles its promise from it) or by a static importer
+    /// (which rejects — stage-1 TLA). GC ROOT while set.
+    pending_module_body: Option<Value>,
     /// Canonical paths of modules whose IMPORT RESOLUTION is in flight —
     /// guards static-import cycles (self-imports alias instead).
     module_loading: std::collections::HashSet<std::path::PathBuf>,

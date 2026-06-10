@@ -120,6 +120,7 @@ impl<'p> Vm<'p> {
             import_meta: 0,
             can_block: std::env::var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             module_loading: std::collections::HashSet::new(),
+            pending_module_body: None,
             module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
             obj_proto: 0,
@@ -614,8 +615,48 @@ impl<'p> Vm<'p> {
             self.set_gc_floor();
         }
         let r = self.import_module(path, None);
+        // An ENTRY whose top-level await suspended finishes through the
+        // microtask drain below; if its body promise then REJECTED, that
+        // rejection IS the program's error (the entry module failed).
+        let body = self.pending_module_body.take();
         self.drain_microtasks();
+        if let Some(bp) = body {
+            if bp.is_heap() {
+                let st = match self.heap.get(bp.heap_index()) {
+                    HeapObj::Promise { state, result, .. } => Some((*state, *result)),
+                    _ => None,
+                };
+                if let Some((crate::heap::PromiseState::Rejected, reason)) = st {
+                    if let HeapObj::Promise { handled, .. } =
+                        self.heap.get_mut(bp.heap_index())
+                    {
+                        *handled = true;
+                    }
+                    let msg = self.throw_message(reason);
+                    self.pending_throw = Some(reason);
+                    return Err(Thrown(msg));
+                }
+            }
+        }
         r.map(|_| Value::UNDEFINED)
+    }
+
+    /// `import_module` for a STATIC importer: a dependency that SUSPENDED at
+    /// top-level await cannot be awaited by a synchronous import chain yet
+    /// (stage-2 async module evaluation) — surface the host containment error
+    /// instead of running the importer against a half-evaluated dependency.
+    fn import_module_sync(
+        &mut self,
+        raw_path: &std::path::Path,
+        mtype: Option<&str>,
+    ) -> Result<Value, Thrown> {
+        let r = self.import_module(raw_path, mtype)?;
+        if self.pending_module_body.take().is_some() {
+            return Err(Thrown(
+                "TypeError: top-level await is not supported in imported modules yet".into(),
+            ));
+        }
+        Ok(r)
     }
 
     pub fn run_module(&mut self) -> Result<Value, Thrown> {
@@ -1376,7 +1417,7 @@ impl<'p> Vm<'p> {
                     }
                     IN::SideEffect => {
                         if !is_self && !in_flight {
-                            self.import_module(&dep_raw, None)?;
+                            self.import_module_sync(&dep_raw, None)?;
                         }
                     }
                     IN::Named(n) => {
@@ -1487,7 +1528,7 @@ impl<'p> Vm<'p> {
                             // after it exists.
                             self_ns_locals.push(e.local_slot);
                         } else {
-                            let ns = self.import_module(&dep_raw, None)?;
+                            let ns = self.import_module_sync(&dep_raw, None)?;
                             ns_writes.push((e.local_slot, ns));
                         }
                     }
@@ -1584,7 +1625,41 @@ impl<'p> Vm<'p> {
                         None,
                     );
                 match exec {
-                    Ok(_) => Ok((full2, ambiguous)),
+                    Ok(v) => {
+                        // The body is an ASYNC activation: the result is its
+                        // body promise. A no-await body settles synchronously;
+                        // a REJECTED body is the module's thrown error; a
+                        // PENDING one suspended at top-level await — the
+                        // namespace is linked, the promise is published for
+                        // the importer to settle from (stage-1 TLA).
+                        let st = if v.is_heap() {
+                            match self.heap.get(v.heap_index()) {
+                                HeapObj::Promise { state, result, .. } => {
+                                    Some((*state, *result))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        match st {
+                            Some((crate::heap::PromiseState::Rejected, r)) => {
+                                if let HeapObj::Promise { handled, .. } =
+                                    self.heap.get_mut(v.heap_index())
+                                {
+                                    *handled = true; // the loader consumes it
+                                }
+                                let msg = self.throw_message(r);
+                                self.pending_throw = Some(r);
+                                Err(Thrown(msg))
+                            }
+                            Some((crate::heap::PromiseState::Pending, _)) => {
+                                self.pending_module_body = Some(v);
+                                Ok((full2, ambiguous))
+                            }
+                            _ => Ok((full2, ambiguous)),
+                        }
+                    }
                     Err(e) => Err(e),
                 }
             }
@@ -1634,7 +1709,7 @@ impl<'p> Vm<'p> {
                 Some(d) => d.join(spec),
                 None => std::path::PathBuf::from(spec),
             };
-            let ns = self.import_module(&dep, None)?;
+            let ns = self.import_module_sync(&dep, None)?;
             self.globals.push(ns);
             let slot = (self.globals.len() - 1) as u32;
             full.push((exported.clone(), slot));
@@ -1724,7 +1799,7 @@ impl<'p> Vm<'p> {
         if let Some(m) = self.module_own.get(&dep) {
             return Ok(m.get(name).copied());
         }
-        let ns = self.import_module(&dep, None)?;
+        let ns = self.import_module_sync(&dep, None)?;
         ambiguous_check(self, ns.heap_index())?;
         Ok(self
             .module_namespaces
@@ -1853,7 +1928,7 @@ impl<'p> Vm<'p> {
         if let Some(m) = self.module_own.get(&dep) {
             return Ok(collect(m));
         }
-        let ns = self.import_module(&dep, None)?;
+        let ns = self.import_module_sync(&dep, None)?;
         Ok(self
             .module_namespaces
             .get(&ns.heap_index())

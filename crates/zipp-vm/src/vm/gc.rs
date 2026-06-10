@@ -125,6 +125,9 @@ impl Vm<'_> {
         for v in self.module_cache.values() {
             root_val!(*v);
         }
+        if let Some(v) = self.pending_module_body {
+            root_val!(v);
+        }
         for v in self.closure_home.values() {
             root_val!(*v);
         }

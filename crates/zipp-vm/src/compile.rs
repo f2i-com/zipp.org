@@ -464,6 +464,10 @@ pub fn compile_eval(
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
     c.eval_locals = !is_module;
+    // A module body is an ASYNC context: top-level `await` compiles and the
+    // activation returns its body promise (read by the loader). No-await
+    // bodies still complete synchronously.
+    c.module_mode = is_module;
     // A sloppy FUNCTION-context eval declares its var/function names into the
     // caller's dynamic EvalScope (never globals): record them so the var
     // hoist skips them and their accesses compile to the Dyn global ops.
