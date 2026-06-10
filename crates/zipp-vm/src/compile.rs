@@ -2755,7 +2755,13 @@ impl<'a> FnCompiler<'a> {
         // Evaluate the superclass value (`extends P`) into a temp the VM links in.
         let parent_reg = if let Some(sc) = &class.super_class {
             let t = self.temp();
-            let v = self.expr_into(sc, t)?;
+            // ClassHeritage evaluates in STRICT mode (the whole ClassTail is
+            // strict code), regardless of the enclosing scope.
+            let prev_strict = self.cx.in_strict;
+            self.cx.in_strict = true;
+            let r = self.expr_into(sc, t);
+            self.cx.in_strict = prev_strict;
+            let v = r?;
             if v != t {
                 self.emit(Instr::Move { dst: t, src: v });
             }
