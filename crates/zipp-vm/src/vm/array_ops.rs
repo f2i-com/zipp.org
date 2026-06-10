@@ -395,7 +395,8 @@ impl<'p> Vm<'p> {
             }
         }
         let kv = Value::num(k as f64);
-        if self.has_property(this, kv) {
+        // Proxy-aware HasProperty (a has trap must dispatch and may throw).
+        if self.has_property_dyn(this, kv)? {
             Ok(Some(self.get_index(this, kv)?))
         } else {
             Ok(None)
@@ -938,23 +939,57 @@ impl<'p> Vm<'p> {
                 if len - actual_delete + insert_count > MAX_SAFE {
                     return Err(Thrown("TypeError: Array length exceeds the maximum".into()));
                 }
-                // Build the deleted array (absent indices become undefined — zipp
-                // arrays are dense — so its length stays `actual_delete`).
-                let mut deleted: Vec<Value> = Vec::with_capacity(actual_delete.max(0) as usize);
-                let mut k = 0;
-                while k < actual_delete {
-                    let from = actual_start + k;
-                    deleted.push(if self.al_has(this, from)? {
-                        self.al_get(this, from)?
-                    } else {
-                        Value::UNDEFINED
-                    });
-                    k += 1;
+                // Step 9: ArraySpeciesCreate(O, actualDeleteCount) runs BEFORE any
+                // element read; the no-species ArrayCreate path rejects > 2^32-1
+                // immediately (a 2^32-length receiver must not loop 4e9 reads).
+                let species_target =
+                    self.array_species_create(this, actual_delete.max(0) as usize)?;
+                if species_target.is_none() && actual_delete > 4_294_967_295 {
+                    return Err(Thrown("RangeError: Invalid array length".into()));
                 }
-                // splice does ArraySpeciesCreate(O, actualDeleteCount) for the
-                // returned removed-array.
-                let dl = deleted.len();
-                let a = self.array_from_species_len(this, deleted, dl, true)?;
+                let a = match species_target {
+                    Some(a) => {
+                        // STREAM the deleted elements: Has/Get then DEFINE on A
+                        // per element (absent indices stay absent on A).
+                        let mut k = 0;
+                        while k < actual_delete {
+                            let from = actual_start + k;
+                            if self.al_has(this, from)? {
+                                let v = self.al_get(this, from)?;
+                                self.create_data_property_or_throw(a, k as usize, v)?;
+                            }
+                            k += 1;
+                        }
+                        self.set_prop(
+                            a,
+                            "length",
+                            Value::num(actual_delete.max(0) as f64),
+                            true,
+                        )?;
+                        a
+                    }
+                    None => {
+                        if actual_delete.max(0) as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
+                            return Err(Thrown(
+                                "RangeError: array length exceeds the engine's dense-array limit"
+                                    .into(),
+                            ));
+                        }
+                        let mut deleted: Vec<Value> =
+                            Vec::with_capacity((actual_delete.max(0) as usize).min(4096));
+                        let mut k = 0;
+                        while k < actual_delete {
+                            let from = actual_start + k;
+                            deleted.push(if self.al_has(this, from)? {
+                                self.al_get(this, from)?
+                            } else {
+                                Value::HOLE
+                            });
+                            k += 1;
+                        }
+                        Value::heap(self.heap.alloc(HeapObj::Array(deleted)))
+                    }
+                };
                 // Shift the tail to make room for the inserted items.
                 if insert_count < actual_delete {
                     let mut k = actual_start;
@@ -1158,6 +1193,13 @@ impl<'p> Vm<'p> {
                     };
                     let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
                     let new_len = len - del + insert.len() as i64;
+                    // Step 12: newLen > 2^53-1 is a TypeError; step 13 ArrayCreate
+                    // rejects > 2^32-1 with a RangeError.
+                    if new_len > 9_007_199_254_740_991 {
+                        return Err(Thrown(
+                            "TypeError: Array length exceeds the maximum".into(),
+                        ));
+                    }
                     if new_len > 4_294_967_295 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
@@ -1185,8 +1227,10 @@ impl<'p> Vm<'p> {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
                 }
-                // slice does ArraySpeciesCreate(O, count); the result `count` must be
-                // <= 2^32-1, validated (RangeError) BEFORE any element is read.
+                // slice runs the spec directly: length is read ONCE, start/end
+                // coerce ONCE, ArraySpeciesCreate(O, count) uses the ORIGINAL
+                // receiver (count <= 2^32-1 validated BEFORE any element read),
+                // then live per-index HasProperty+Get (proxy/TA-correct).
                 if name == "slice" {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
                     let lenf = self.to_number_coerce(lv)?;
@@ -1200,14 +1244,51 @@ impl<'p> Vm<'p> {
                     let toii = |raw: f64| if raw.is_nan() { 0.0 } else { raw.trunc() };
                     let s_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                     let rel_start = toii(self.to_number_coerce(s_arg)?);
-                    let k = if rel_start < 0.0 { (len + rel_start).max(0.0) } else { rel_start.min(len) };
+                    let k0 = if rel_start < 0.0 { (len + rel_start).max(0.0) } else { rel_start.min(len) };
                     let e_arg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                     let rel_end =
                         if e_arg == Value::UNDEFINED { len } else { toii(self.to_number_coerce(e_arg)?) };
                     let fin = if rel_end < 0.0 { (len + rel_end).max(0.0) } else { rel_end.min(len) };
-                    if (fin - k).max(0.0) > 4_294_967_295.0 {
+                    let count = (fin - k0).max(0.0);
+                    if count > 4_294_967_295.0 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
+                    let target = self.array_species_create(Value::heap(idx), count as usize)?;
+                    return match target {
+                        Some(a) => {
+                            let mut n = 0usize;
+                            let mut kf = k0;
+                            while kf < fin {
+                                if let Some(v) =
+                                    self.array_iter_get(Value::heap(idx), kf as usize)?
+                                {
+                                    self.create_data_property_or_throw(a, n, v)?;
+                                }
+                                n += 1;
+                                kf += 1.0;
+                            }
+                            self.set_prop(a, "length", Value::num(n as f64), true)?;
+                            Ok(Some(a))
+                        }
+                        None => {
+                            if count as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
+                                return Err(Thrown(
+                                    "RangeError: array length exceeds the engine's dense-array limit"
+                                        .into(),
+                                ));
+                            }
+                            let mut out = Vec::with_capacity((count as usize).min(4096));
+                            let mut kf = k0;
+                            while kf < fin {
+                                match self.array_iter_get(Value::heap(idx), kf as usize)? {
+                                    Some(v) => out.push(v),
+                                    None => out.push(Value::HOLE),
+                                }
+                                kf += 1.0;
+                            }
+                            Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
+                        }
+                    };
                 }
                 let elems = self.array_like_read(idx)?;
                 let tmp = self.heap.alloc(HeapObj::Array(elems));

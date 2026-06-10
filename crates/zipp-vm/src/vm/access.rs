@@ -364,6 +364,150 @@ impl<'p> Vm<'p> {
         Ok(Some(true))
     }
 
+    /// OrdinarySet(target, P, V, Receiver) where the receiver is a PROXY (the
+    /// no-set-trap forward): the governing descriptor comes from the TARGET,
+    /// but the write lands through the RECEIVER — its own descriptor is read
+    /// ([[GetOwnProperty]] → GOPD trap) and the value is defined on it
+    /// ([[DefineOwnProperty]] → defineProperty trap), per
+    /// OrdinarySetWithOwnDescriptor steps 2-3.
+    fn ordinary_set_with_proxy_receiver(
+        &mut self,
+        target: Value,
+        receiver: Value,
+        key: &str,
+        val: Value,
+        strict: bool,
+    ) -> Result<(), Thrown> {
+        // With NO observable trap on the receiver's handler (no set / gopd /
+        // defineProperty, and the handler isn't itself a proxy), the spec
+        // receiver-define sequence is indistinguishable from a direct forward
+        // — which also handles exotic targets (a function's `prototype`, a
+        // RegExp's `lastIndex`) whose writes aren't expressible as defines.
+        let observable = match self.proxy_parts(receiver.heap_index()) {
+            Some((_, h, _)) if h.is_heap() => match self.heap.get(h.heap_index()) {
+                HeapObj::Object(m) => {
+                    // An explicitly-undefined/null trap is "no trap" per spec.
+                    let live = |k: &str| m.get(k).is_some_and(|v| !v.is_nullish());
+                    live("set") || live("getOwnPropertyDescriptor") || live("defineProperty")
+                }
+                _ => true,
+            },
+            _ => true,
+        };
+        if !observable {
+            return self.set_prop(target, key, val, strict);
+        }
+        // The target may ITSELF be a proxy: [[Set]] forwards through its set
+        // trap (with the ORIGINAL receiver) or recurses to its target.
+        if let Some((t2, h2, revoked2)) = self.proxy_parts(target.heap_index()) {
+            if revoked2 {
+                return Err(Thrown("TypeError: Cannot perform 'set' on a revoked proxy".into()));
+            }
+            return match self.proxy_trap(h2, "set")? {
+                Some(trap) => {
+                    let kv = self.key_to_value(key);
+                    let r = self.call_value(trap, h2, &[t2, kv, val, receiver])?;
+                    if !self.truthy(r) && strict {
+                        return Err(Thrown(format!(
+                            "TypeError: 'set' on proxy: trap returned falsish for property '{key}'"
+                        )));
+                    }
+                    Ok(())
+                }
+                None => self.ordinary_set_with_proxy_receiver(t2, receiver, key, val, strict),
+            };
+        }
+        // Walk the TARGET's prototype chain for the governing descriptor
+        // (mirrors Reflect.set): ordinary Object links carry inline
+        // descriptors; a TypedArray in the chain ABSORBS canonical numeric
+        // keys (an invalid index returns true with NO receiver define).
+        let mut governing: Option<(bool, bool, Value)> = None;
+        let mut cur = target;
+        loop {
+            let cidx = cur.heap_index();
+            match self.heap.get(cidx) {
+                HeapObj::Object(m) => {
+                    if let Some(i) = m.pos(key) {
+                        governing = Some((
+                            m.attrs[i].accessor,
+                            m.attrs[i].writable,
+                            m.attrs[i].setter,
+                        ));
+                        break;
+                    }
+                    if m.class.is_some() {
+                        break;
+                    }
+                }
+                HeapObj::Array(_) if key == "length" => {
+                    governing = Some((
+                        false,
+                        !self.array_length_nonwritable.contains(&cidx),
+                        Value::UNDEFINED,
+                    ));
+                    break;
+                }
+                HeapObj::TypedArray { .. } if self.is_canonical_numeric_index(key) => {
+                    // TA [[Set]] step 1 with Receiver != O: an INVALID integer
+                    // index returns true — no coercion, no receiver define.
+                    if self.ta_valid_index(cidx, key).is_none() {
+                        return Ok(());
+                    }
+                    break;
+                }
+                _ => {
+                    governing = self.arr_props.get(&cidx).and_then(|m| {
+                        m.pos(key).map(|i| {
+                            (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter)
+                        })
+                    });
+                    break;
+                }
+            }
+            let p = self.object_get_prototype_of(cur);
+            if !p.is_heap() {
+                break;
+            }
+            cur = p;
+        }
+        match governing {
+            // A target accessor: its setter runs with the RECEIVER as `this`.
+            Some((true, _, setter)) => {
+                if setter == Value::UNDEFINED {
+                    return self.reject_write(key, strict);
+                }
+                self.call_value(setter, receiver, &[val])?;
+                Ok(())
+            }
+            Some((false, false, _)) => self.reject_write(key, strict),
+            // Writable data, or no own target descriptor: write through the
+            // receiver — same shape as Reflect.set's proxy-receiver path.
+            _ => {
+                let existing = self.proxy_gopd(receiver, key)?.unwrap_or(Value::UNDEFINED);
+                if self.is_object_value(existing) {
+                    let g = self.get_prop(existing, "get")?;
+                    let s = self.get_prop(existing, "set")?;
+                    let w = self.get_prop(existing, "writable")?;
+                    if g != Value::UNDEFINED || s != Value::UNDEFINED || !self.truthy(w) {
+                        return self.reject_write(key, strict);
+                    }
+                    let mut m = ObjMap::new();
+                    m.set("value", val);
+                    let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                    self.object_define_property(receiver, key, desc)
+                } else {
+                    let mut m = ObjMap::new();
+                    m.set("value", val);
+                    m.set("writable", Value::TRUE);
+                    m.set("enumerable", Value::TRUE);
+                    m.set("configurable", Value::TRUE);
+                    let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                    self.object_define_property(receiver, key, desc)
+                }
+            }
+        }
+    }
+
     pub(crate) fn set_prop(
         &mut self,
         obj: Value,
@@ -414,7 +558,11 @@ impl<'p> Vm<'p> {
                     }
                     Ok(())
                 }
-                None => self.set_prop(target, key, val, strict),
+                // No set trap: target.[[Set]](P, V, Receiver = THE PROXY).
+                // OrdinarySetWithOwnDescriptor consults the RECEIVER's own
+                // descriptor and defines through it, so the proxy's
+                // getOwnPropertyDescriptor and defineProperty traps fire.
+                None => self.ordinary_set_with_proxy_receiver(target, obj, key, val, strict),
             };
         }
         let idx = obj.heap_index();
