@@ -2183,6 +2183,7 @@ impl<'p> Vm<'p> {
         let is_nan_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_NAN));
         let is_finite_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_FINITE));
         let eval_fn = self.heap.alloc(HeapObj::Native(GLOBAL_EVAL));
+        self.eval_fn_idx = eval_fn;
         let encode_uri_fn = self.heap.alloc(HeapObj::Native(GLOBAL_ENCODE_URI));
         let encode_uri_component_fn =
             self.heap.alloc(HeapObj::Native(GLOBAL_ENCODE_URI_COMPONENT));

@@ -349,6 +349,9 @@ pub struct Vm<'p> {
     /// property enumeration by construction. Values are GC roots; entries
     /// pruned when the instance dies.
     private_fields: std::collections::HashMap<u32, std::collections::HashMap<(u64, String), Value>>,
+    /// Heap index of the canonical %eval% native — the DirectEval op's runtime
+    /// identity check (a REBOUND global `eval` gets an ordinary call).
+    eval_fn_idx: u32,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods

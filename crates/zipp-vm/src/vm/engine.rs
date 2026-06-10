@@ -113,6 +113,7 @@ impl<'p> Vm<'p> {
             this_tdz: std::collections::HashSet::new(),
             super_this: std::collections::HashMap::new(),
             private_fields: std::collections::HashMap::new(),
+            eval_fn_idx: 0,
             obj_proto: 0,
             fn_proto: 0,
             function_ctor: 0,

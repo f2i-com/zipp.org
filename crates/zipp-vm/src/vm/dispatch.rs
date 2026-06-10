@@ -2897,23 +2897,34 @@ impl<'p> Vm<'p> {
                     // Direct eval from strict code: the evaluated string inherits
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
-                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments } => {
+                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
                                 self.heap.get(a0.heap_index()),
                                 HeapObj::Str(_) | HeapObj::Cons { .. }
                             );
+                        // Runtime identity check: direct-eval semantics apply
+                        // only while the global `eval` binding still IS %eval%;
+                        // a rebound `eval` gets an ordinary call of that value.
+                        let live = self.global_by_name("eval").unwrap_or(Value::UNDEFINED);
+                        if !(live.is_heap() && live.heap_index() == self.eval_fn_idx) {
+                            let r = self.call_value(live, Value::UNDEFINED, &[a0])?;
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
                         let r = if is_str {
                             let code = self.display(a0);
                             // A direct eval inherits the caller's `this` (reg 0, or
-                            // the static-field-initializer's `this_reg`).
+                            // the static-field-initializer's `this_reg`) and the
+                            // caller's strictness.
                             let caller_this = self.get(base, this_reg);
                             let inherit =
                                 (home_class != u32::MAX).then_some((home_class, super_static));
                             self.do_eval(
                                 &code,
-                                true,
+                                strict_caller,
                                 new_target_ok,
                                 Some(caller_this),
                                 inherit,

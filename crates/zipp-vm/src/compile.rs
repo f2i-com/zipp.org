@@ -7565,16 +7565,18 @@ impl<'a> FnCompiler<'a> {
                 return self.build_error(kind, &c.arguments, dst);
             }
         }
-        // Direct `eval(code)` from STRICT-mode code: the evaluated string inherits
-        // strict mode (a direct eval shares the caller's strictness). Only fires for
-        // the unshadowed global `eval` — an enclosing user binding named `eval`
-        // (legal only in sloppy code, hence reachable here as an upvalue/local) is
-        // an ordinary call. Sloppy direct eval and indirect eval are untouched: they
-        // still route through the generic `Call` → `GLOBAL_EVAL` native (sloppy).
+        // Direct `eval(code)`: the evaluated string runs with the caller's
+        // strictness, `this`, new.target permission, home class and private
+        // scope. Fires only for the unshadowed global `eval` — an enclosing
+        // user binding named `eval` is an ordinary call, and inside a `with`
+        // whose object could shadow `eval` the generic dynamic path is kept.
+        // The DISPATCH arm re-checks at runtime that the live global `eval`
+        // still IS %eval% (a rebound `eval` gets an ordinary call). Indirect
+        // eval stays on the generic `Call` → `GLOBAL_EVAL` native.
         if let ox::Expression::Identifier(id) = &c.callee {
             if id.name == "eval"
-                && self.cx.in_strict
                 && matches!(self.resolve("eval"), Binding::Global(_))
+                && self.with_objs_for("eval").is_empty()
             {
                 let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
                 let arg = if argc == 0 {
@@ -7595,6 +7597,7 @@ impl<'a> FnCompiler<'a> {
                     home_class: self.super_class.unwrap_or(u32::MAX),
                     super_static: self.super_static,
                     ban_arguments: self.cx.in_field_init,
+                    strict_caller: self.cx.in_strict,
                 });
                 return Ok(dst);
             }
