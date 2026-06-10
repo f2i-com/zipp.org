@@ -2343,6 +2343,64 @@ impl<'p> Vm<'p> {
                         return Ok(Value::heap(self.heap.alloc(HeapObj::Object(m))));
                     }
                 }
+                // A live ARRAY-LIKE iterator (%ArrayIteratorPrototype% over an
+                // Array or generic object): the length is re-read EACH step, so
+                // mutations made during iteration (push/pop/length-set/element
+                // writes) are observed; exhaustion latches permanent-done per
+                // the spec generator (a later grow is NOT iterated).
+                if let Some((coll, kind)) = live {
+                    let it_proto = match self.heap.get(it_idx) {
+                        HeapObj::Iterator { proto, .. } => *proto,
+                        _ => 0,
+                    };
+                    if it_proto == self.array_iter_proto
+                        && !matches!(self.heap.get(coll), HeapObj::TypedArray { .. })
+                    {
+                        let result = if index == usize::MAX {
+                            (Value::UNDEFINED, true)
+                        } else {
+                            let n = match self.heap.get(coll) {
+                                HeapObj::Array(items) => items.len(),
+                                _ => {
+                                    let lv = self.get_prop(Value::heap(coll), "length")?;
+                                    let lf = self.to_number_coerce(lv)?;
+                                    if lf.is_nan() || lf <= 0.0 {
+                                        0
+                                    } else {
+                                        lf.trunc().min(9_007_199_254_740_991.0) as usize
+                                    }
+                                }
+                            };
+                            if index >= n {
+                                (Value::UNDEFINED, true)
+                            } else {
+                                let v = match kind {
+                                    0 => Value::num(index as f64),
+                                    1 => self
+                                        .get_index(Value::heap(coll), Value::num(index as f64))?,
+                                    _ => {
+                                        let e = self
+                                            .get_index(Value::heap(coll), Value::num(index as f64))?;
+                                        Value::heap(self.heap.alloc(HeapObj::Array(vec![
+                                            Value::num(index as f64),
+                                            e,
+                                        ])))
+                                    }
+                                };
+                                index += 1;
+                                (v, false)
+                            }
+                        };
+                        let store = if result.1 { usize::MAX } else { index };
+                        if let HeapObj::Iterator { index: i, .. } = self.heap.get_mut(it_idx) {
+                            *i = store;
+                        }
+                        let mut m = ObjMap::new();
+                        m.set("value", result.0);
+                        m.set("done", Value::bool(result.1));
+                        return Ok(Value::heap(self.heap.alloc(HeapObj::Object(m))));
+                    }
+                }
                 let (val, done) = if let Some((coll, kind)) = live {
                     // Live Map/Set iterator: step the backing collection, skipping
                     // tombstoned (deleted) slots; appends made after creation are seen.

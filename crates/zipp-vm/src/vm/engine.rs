@@ -1041,34 +1041,72 @@ impl<'p> Vm<'p> {
         if let Some(f) = self.from_async_fn {
             return Ok(f);
         }
+        // Drives iteration manually (it.next()/await) instead of `for await`, so
+        // the observable Get/Call sequence matches the proposal exactly: ONE
+        // GetMethod per iterator symbol, the async-from-sync VALUE await, and
+        // AsyncIteratorClose on exactly the abrupt completions the spec closes on
+        // (k-limit, sync-value await, mapfn, define) — never on next() itself.
         const SRC: &str = r#"(async function fromAsync(items, mapfn, thisArg) {
+  'use strict';
   var C = this;
   if (items === undefined || items === null)
     throw new TypeError('Array.fromAsync requires an array-like or iterable object');
-  if (mapfn !== undefined && typeof mapfn !== 'function')
+  var mapping = mapfn !== undefined;
+  if (mapping && typeof mapfn !== 'function')
     throw new TypeError('Array.fromAsync mapper is not a function');
-  var usingAsync = items[Symbol.asyncIterator];
-  var usingSync = (usingAsync === undefined || usingAsync === null) ? items[Symbol.iterator] : undefined;
-  if ((usingAsync !== undefined && usingAsync !== null) || (usingSync !== undefined && usingSync !== null)) {
+  var method = items[Symbol.asyncIterator];
+  if (method === undefined || method === null) method = undefined;
+  else if (typeof method !== 'function') throw new TypeError('@@asyncIterator is not a function');
+  var isSync = false;
+  if (method === undefined) {
+    var syncMethod = items[Symbol.iterator];
+    if (syncMethod === undefined || syncMethod === null) syncMethod = undefined;
+    else if (typeof syncMethod !== 'function') throw new TypeError('@@iterator is not a function');
+    if (syncMethod !== undefined) { method = syncMethod; isSync = true; }
+  }
+  if (method !== undefined) {
+    var it = method.call(items);
+    if (Object(it) !== it) throw new TypeError('iterator is not an object');
     var A = (typeof C === 'function') ? new C() : [];
     var k = 0;
-    for await (var v of items) {
-      if (k >= 9007199254740991) throw new TypeError('Array.fromAsync result exceeds the maximum length');
-      var mapped = (mapfn !== undefined) ? await mapfn.call(thisArg, v, k) : v;
-      Object.defineProperty(A, k, { value: mapped, writable: true, enumerable: true, configurable: true });
-      k = k + 1;
+    var closing = false;
+    try {
+      for (;;) {
+        closing = false;
+        if (k >= 9007199254740991) {
+          closing = true;
+          throw new TypeError('Array.fromAsync result exceeds the maximum length');
+        }
+        var res = await it.next();
+        if (Object(res) !== res) throw new TypeError('iterator result is not an object');
+        if (res.done) break;
+        var v = res.value;
+        closing = true;
+        if (isSync) v = await v;
+        var mapped = mapping ? await mapfn.call(thisArg, v, k) : v;
+        Object.defineProperty(A, k, { value: mapped, writable: true, enumerable: true, configurable: true });
+        k = k + 1;
+      }
+    } catch (e) {
+      if (closing) {
+        try {
+          var ret = it.return;
+          if (ret !== undefined && ret !== null) await ret.call(it);
+        } catch (_ignored) {}
+      }
+      throw e;
     }
     A.length = k;
     return A;
   } else {
     var arrayLike = Object(items);
-    var ln = Number(arrayLike.length);
-    var len = Number.isNaN(ln) ? 0 : Math.max(0, Math.min(Math.trunc(ln), 9007199254740991));
+    var ln = +arrayLike.length;
+    var len = ln !== ln ? 0 : Math.max(0, Math.min(Math.trunc(ln), 9007199254740991));
     var A = (typeof C === 'function') ? new C(len) : new Array(len);
     var k = 0;
     while (k < len) {
       var kValue = await arrayLike[k];
-      var mapped = (mapfn !== undefined) ? await mapfn.call(thisArg, kValue, k) : kValue;
+      var mapped = mapping ? await mapfn.call(thisArg, kValue, k) : kValue;
       Object.defineProperty(A, k, { value: mapped, writable: true, enumerable: true, configurable: true });
       k = k + 1;
     }

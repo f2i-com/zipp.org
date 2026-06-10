@@ -1038,11 +1038,23 @@ impl<'p> Vm<'p> {
             // temp array and run against that. (concat is NOT here: it must check
             // IsConcatSpreadable on the receiver itself — a non-array array-like is
             // appended WHOLE, not spread — so it runs on the object directly below.)
+            // keys/values/entries on ANY receiver return a LIVE iterator over
+            // the original object (the spec iterator re-reads length/elements
+            // per step; a TypedArray receiver hits the live-TA next() branch,
+            // which also throws its out-of-bounds TypeError per step).
+            if matches!(name, "keys" | "values" | "entries") {
+                let kind = match name {
+                    "keys" => 0u8,
+                    "values" => 1,
+                    _ => 2,
+                };
+                return Ok(Some(self.make_live_iterator(idx, kind, self.array_iter_proto)));
+            }
             if matches!(
                 name,
                 "join" | "toString" | "slice" | "at"
                     | "flat" | "flatMap" | "with" | "toReversed" | "toSorted"
-                    | "toSpliced" | "entries" | "keys" | "values" | "toLocaleString"
+                    | "toSpliced" | "toLocaleString"
             ) {
                 // toSorted: IsCallable(comparefn) precedes ANY length / element read
                 // (a non-callable comparator is a TypeError before the length getter).
@@ -1912,26 +1924,12 @@ impl<'p> Vm<'p> {
             }
             // Array iterators (real iterator objects with .next(), proto =
             // %ArrayIteratorPrototype%). values() is also the default @@iterator.
-            "values" => {
-                let items = self.array_snapshot(idx);
-                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
-            }
-            "keys" => {
-                let len = match self.heap.get(idx) {
-                    HeapObj::Array(items) => items.len(),
-                    _ => 0,
-                };
-                let items: Vec<Value> = (0..len).map(|i| Value::int(i as i32)).collect();
-                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
-            }
+            // LIVE: each next() re-reads the array, so mutations made during
+            // iteration are observed (the spec iterator is a generator over O).
+            "values" => Ok(Some(self.make_live_iterator(idx, 1, self.array_iter_proto))),
+            "keys" => Ok(Some(self.make_live_iterator(idx, 0, self.array_iter_proto))),
             "entries" => {
-                let snap = self.array_snapshot(idx);
-                let items: Vec<Value> = snap
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![Value::int(i as i32), v]))))
-                    .collect();
-                Ok(Some(self.make_iterator(items, self.array_iter_proto)))
+                Ok(Some(self.make_live_iterator(idx, 2, self.array_iter_proto)))
             }
             "toLocaleString" => {
                 // Join each element's own toLocaleString() with ","; nullish → "".
