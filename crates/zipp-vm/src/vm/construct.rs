@@ -1763,11 +1763,10 @@ impl<'p> Vm<'p> {
         // %Function.prototype% for a base class) — letting `super.x` reach inherited
         // STATIC members. An instance element's HomeObject is the class prototype.
         if is_static {
-            return match self.super_parent(home_class_id) {
-                Some(parent) => parent,
-                None if self.fn_proto != 0 => Value::heap(self.fn_proto),
-                None => Value::UNDEFINED,
-            };
+            // LIVE GetPrototypeOf(class): Object.setPrototypeOf(C, X) after the
+            // definition re-targets `super.x` in static members (a null proto
+            // then throws via the caller's RequireObjectCoercible).
+            return self.object_get_prototype_of(home);
         }
         let home_proto = match self.prototype_of(home) {
             Some(p) => p,
@@ -2569,7 +2568,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn get_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
-                HeapObj::Object(_) => {
+                HeapObj::Object(_) | HeapObj::Proxy { .. } => {
                     let m = self.get_prop(v, "@@iterator")?;
                     if self.is_callable(m) {
                         let it = self.call_value(m, v, &[])?;
@@ -2626,7 +2625,12 @@ impl<'p> Vm<'p> {
         {
             return Ok((v, false));
         }
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
+        if v.is_heap()
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Object(_) | HeapObj::Proxy { .. }
+            )
+        {
             // GetMethod(@@asyncIterator): undefined/null ⇒ absent (fall back to the
             // sync iterator); present-but-not-callable ⇒ TypeError (do NOT fall back —
             // reading @@iterator could run a getter the spec must not trigger). A
@@ -2958,7 +2962,7 @@ impl<'p> Vm<'p> {
         }
         // A user iterator object (one with a `next()` method) or a built-in
         // Iterator: drain it.
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
             let next = self.get_prop(v, "next")?;
             if self.is_callable(next) {
                 let mut out = Vec::new();

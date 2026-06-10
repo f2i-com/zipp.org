@@ -974,6 +974,16 @@ impl<'p> Vm<'p> {
                                     .map(|i| map.keys[i].clone())
                                     .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
+                                // A STRING source: its chars are own enumerable
+                                // index properties (CopyDataProperties copies them).
+                                HeapObj::Str(st) => (0..st.char_len)
+                                    .map(|i| i.to_string())
+                                    .filter(|k| !excluded.iter().any(|e| e == k))
+                                    .collect(),
+                                HeapObj::Cons { len, .. } => (0..*len)
+                                    .map(|i| i.to_string())
+                                    .filter(|k| !excluded.iter().any(|e| e == k))
+                                    .collect(),
                                 _ => Vec::new(),
                             }
                         } else {
@@ -1002,6 +1012,14 @@ impl<'p> Vm<'p> {
                                     .into_iter()
                                     .filter(|&i| map.attrs[i].enumerable)
                                     .map(|i| map.keys[i].clone())
+                                    .filter(|k| !excluded.iter().any(|e| e == k))
+                                    .collect(),
+                                HeapObj::Str(st) => (0..st.char_len)
+                                    .map(|i| i.to_string())
+                                    .filter(|k| !excluded.iter().any(|e| e == k))
+                                    .collect(),
+                                HeapObj::Cons { len, .. } => (0..*len)
+                                    .map(|i| i.to_string())
                                     .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
                                 _ => Vec::new(),
@@ -4236,7 +4254,7 @@ impl<'p> Vm<'p> {
                         // A user iterator object (`@@iterator` already resolved by
                         // GetIterator): pull the next result via `.next()`. Lazy â€”
                         // a `break` simply stops calling it.
-                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
+                        if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
                             let next = self.get_prop(it, "next")?;
                             if self.is_callable(next) {
                                 let res = self.call_value(next, it, &[])?;
@@ -4318,7 +4336,7 @@ impl<'p> Vm<'p> {
                                 .generator_method(it.heap_index(), "next", &[])?
                                 .unwrap_or(Value::UNDEFINED),
                             // A user iterator object (sync or async) with `.next()`.
-                            HeapObj::Object(_) => {
+                            HeapObj::Object(_) | HeapObj::Proxy { .. } => {
                                 let next = self.get_prop(it, "next")?;
                                 if self.is_callable(next) {
                                     self.call_value(next, it, &[])?

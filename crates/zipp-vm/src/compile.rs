@@ -2528,6 +2528,16 @@ impl<'a> FnCompiler<'a> {
                     Some(i) => i,
                     None => return Err("`break` target not found (outside a loop / unknown label)".into()),
                 };
+                // Iterators of for-of frames BETWEEN here and the target close
+                // (innermost first); the target loop's own exit path closes its.
+                let iters: Vec<Reg> = self.loop_ctx[idx + 1..]
+                    .iter()
+                    .rev()
+                    .filter_map(|c| c.iter_close)
+                    .collect();
+                for it in iters {
+                    self.emit(Instr::IterClose { iter: it });
+                }
                 self.emit_loop_jump(idx, true);
             }
             S::ContinueStatement(c) => {
@@ -2544,6 +2554,14 @@ impl<'a> FnCompiler<'a> {
                     Some(i) => i,
                     None => return Err("`continue` target not found (outside a loop / unknown label)".into()),
                 };
+                let iters: Vec<Reg> = self.loop_ctx[idx + 1..]
+                    .iter()
+                    .rev()
+                    .filter_map(|c| c.iter_close)
+                    .collect();
+                for it in iters {
+                    self.emit(Instr::IterClose { iter: it });
+                }
                 self.emit_loop_jump(idx, false);
             }
             S::LabeledStatement(l) => {
@@ -7718,8 +7736,14 @@ impl<'a> FnCompiler<'a> {
             }
             _ => {}
         }
-        let name = match &a.left {
-            ox::AssignmentTarget::AssignmentTargetIdentifier(id) => id.name.to_string(),
+        let (name, lhs_covered) = match &a.left {
+            ox::AssignmentTarget::AssignmentTargetIdentifier(id) => (
+                id.name.to_string(),
+                // oxc strips cover parens but keeps spans: a target starting
+                // AFTER the assignment expression was parenthesized — not an
+                // IdentifierRef, so NamedEvaluation does not apply.
+                id.span.start > a.span.start,
+            ),
             _ => return Err("assignment to non-identifier not in zipp-vm v1".into()),
         };
         // Strict mode: assignment to `eval`/`arguments` is an early SyntaxError.
@@ -7740,7 +7764,11 @@ impl<'a> FnCompiler<'a> {
                 if let Binding::Local(r) = binding {
                     if !self.const_regs.contains(&r) && !self.is_self_name_reg(r) {
                         // Plain mutable local: evaluate the RHS directly into its reg.
-                        let v = self.compile_named_init(r, &a.right, &name)?;
+                        let v = if lhs_covered {
+                            self.expr_into(&a.right, r)?
+                        } else {
+                            self.compile_named_init(r, &a.right, &name)?
+                        };
                         if v != r {
                             self.emit(Instr::Move { dst: r, src: v });
                         }
@@ -7751,7 +7779,11 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
                 // Cell / upvalue / global / const-local: evaluate into dst, store.
-                let v = self.compile_named_init(dst, &a.right, &name)?;
+                let v = if lhs_covered {
+                    self.expr_into(&a.right, dst)?
+                } else {
+                    self.compile_named_init(dst, &a.right, &name)?
+                };
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
