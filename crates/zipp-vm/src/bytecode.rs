@@ -970,6 +970,10 @@ pub struct Program {
     /// these are non-configurable, ENUMERABLE global bindings (vs the
     /// configurable, non-enumerable built-ins).
     pub decl_globals: Vec<u32>,
+    /// Slots of top-level LEXICAL (`let`/`const`) declarations: a sloppy eval
+    /// may not var/function-declare one of these names (SyntaxError per
+    /// EvalDeclarationInstantiation), and they are NOT global-object props.
+    pub lexical_globals: Vec<u32>,
     /// For a MODULE program (a fixture loaded by a dynamic `import()`): the
     /// (exported name, local name) pairs. The loader reads each local's top-level
     /// binding after the module runs to build the import's namespace. Empty for

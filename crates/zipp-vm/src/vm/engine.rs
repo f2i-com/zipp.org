@@ -1389,11 +1389,63 @@ impl<'p> Vm<'p> {
         for r in new_funcs {
             self.eval_funcs.push(r);
         }
-        // Validation pass FIRST: CanDeclareGlobalFunction for EVERY function
-        // name before ANY binding (var or function) is created — a later
-        // non-definable function must leave earlier vars/functions undeclared.
+        // EvalDeclarationInstantiation step 5.a: a sloppy eval may not
+        // var/function-declare a name that is a GLOBAL lexical (let/const) —
+        // SyntaxError BEFORE any binding is created.
         let count = self.eval_funcs.len();
         let start = (base_func as usize) - self.main_func_count;
+        if var_env_global {
+            let mut lex_clash: Option<String> = None;
+            for &slot in &eval_prog.hoisted_globals {
+                let rs = gmap[slot as usize];
+                if self.program.lexical_globals.contains(&rs) {
+                    lex_clash = self.global_slot_name(rs);
+                    break;
+                }
+            }
+            if lex_clash.is_none() {
+                for local in start..count {
+                    if let Some(slot) = self.eval_funcs[local].name_global {
+                        if self.program.lexical_globals.contains(&(slot as u32)) {
+                            lex_clash = self.global_slot_name(slot as u32);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(name) = lex_clash {
+                return Err(Thrown(format!(
+                    "SyntaxError: Identifier '{name}' has already been declared"
+                )));
+            }
+            // CanDeclareGlobalVar: an ABSENT binding can only be created while
+            // the global object is extensible — else TypeError (before any
+            // binding is created).
+            let global_extensible = self.global_this == 0
+                || matches!(self.heap.get(self.global_this), HeapObj::Object(m) if m.extensible);
+            if !global_extensible {
+                for &slot in &eval_prog.hoisted_globals {
+                    let rs = gmap[slot as usize];
+                    if self.globals[rs as usize].bits() != Value::UNINITIALIZED.bits() {
+                        continue;
+                    }
+                    if let Some(name) = self.global_slot_name(rs) {
+                        let has_own = matches!(
+                            self.heap.get(self.global_this),
+                            HeapObj::Object(m) if m.pos(&name).is_some()
+                        );
+                        if !has_own && self.global_by_name(&name).is_none() {
+                            return Err(Thrown(format!(
+                                "TypeError: cannot declare global variable {name}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        // Validation pass: CanDeclareGlobalFunction for EVERY function
+        // name before ANY binding (var or function) is created — a later
+        // non-definable function must leave earlier vars/functions undeclared.
         if var_env_global {
             for local in start..count {
                 if let Some(slot) = self.eval_funcs[local].name_global {
