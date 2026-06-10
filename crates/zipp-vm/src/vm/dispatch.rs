@@ -3484,10 +3484,11 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, it);
                         ip += 1;
                     }
-                    Instr::GetAsyncIterator { dst, src } => {
+                    Instr::GetAsyncIterator { dst, src, sync_dst } => {
                         let s = self.get(base, src);
-                        let it = self.get_async_iterator(s)?;
+                        let (it, is_sync) = self.get_async_iterator(s)?;
                         self.set(base, dst, it);
+                        self.set(base, sync_dst, Value::bool(is_sync));
                         ip += 1;
                     }
                     Instr::IterToArray { dst, src, count } => {

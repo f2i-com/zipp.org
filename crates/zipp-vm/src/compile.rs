@@ -4333,7 +4333,8 @@ impl<'a> FnCompiler<'a> {
         // → @@iterator fallback); plain `for of` uses @@iterator. Built-ins/async
         // generators pass through and are driven by IterNext / ForAwaitNext.
         if f.r#await {
-            self.emit(Instr::GetAsyncIterator { dst: iter_reg, src: iter_reg });
+            let sync_scratch = self.temp();
+            self.emit(Instr::GetAsyncIterator { dst: iter_reg, src: iter_reg, sync_dst: sync_scratch });
         } else {
             self.emit(Instr::GetIterator { dst: iter_reg, src: iter_reg });
         }
@@ -7021,7 +7022,11 @@ impl<'a> FnCompiler<'a> {
                 if v != iter {
                     self.emit(Instr::Move { dst: iter, src: v });
                 }
-                self.emit(Instr::GetAsyncIterator { dst: iter, src: iter });
+                // Whether the INNER iterator is a sync one (the @@iterator
+                // fallback / a raw array): its values get the AsyncFromSync
+                // await-unwrap before each yield.
+                let is_sync = self.alloc_reg();
+                self.emit(Instr::GetAsyncIterator { dst: iter, src: iter, sync_dst: is_sync });
                 let idx = self.alloc_reg();
                 self.emit(Instr::LoadInt { dst: idx, val: 0 });
                 // Cache the inner iterator's `next` ONCE (IteratorRecord.[[NextMethod]]),
@@ -7054,6 +7059,16 @@ impl<'a> FnCompiler<'a> {
                 let jdone = self.here();
                 self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → yield* value (r.value)
                 self.emit(Instr::GetProp { dst: value, obj: r, name: value_name });
+                // AsyncFromSyncIterator unwrap: a SYNC inner iterator's stepped
+                // value is AWAITED before the async-yield (a rejected promise
+                // throws HERE, closing the generator and rejecting the front
+                // promise); an ASYNC inner iterator's value is yielded as-is
+                // (yield-star-promise-not-unwrapped).
+                let jskip_aw = self.here();
+                self.emit(Instr::JumpIfFalse { cond: is_sync, target: 0 });
+                self.emit(Instr::Await { dst: value, val: value });
+                let after_aw = self.here();
+                self.patch_jump(jskip_aw, after_aw);
                 // --- (async-)yield the value, with a handler that delegates an outer
                 //     .throw() into the inner iterator's `throw` ---
                 let yield_pt = self.here();

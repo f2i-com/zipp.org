@@ -2403,7 +2403,10 @@ impl<'p> Vm<'p> {
     /// iterator; a plain object uses `@@asyncIterator` (an async iterable) or, as
     /// the spec's async-from-sync fallback, `@@iterator`; everything else (arrays,
     /// strings, Map/Set, sync generators) passes through (ForAwaitNext drives it).
-    pub(crate) fn get_async_iterator(&mut self, v: Value) -> Result<Value, Thrown> {
+    /// Returns the iterator and whether it is a SYNC one (the @@iterator
+    /// fallback or a raw array/string) — whose stepped VALUES get the
+    /// AsyncFromSyncIterator await-unwrap in async contexts.
+    pub(crate) fn get_async_iterator(&mut self, v: Value) -> Result<(Value, bool), Thrown> {
         if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
             // GetMethod(@@asyncIterator): undefined/null ⇒ absent (fall back to the
             // sync iterator); present-but-not-callable ⇒ TypeError (do NOT fall back —
@@ -2422,7 +2425,7 @@ impl<'p> Vm<'p> {
                         "TypeError: [Symbol.asyncIterator]() returned a non-object".into(),
                     ));
                 }
-                return Ok(it);
+                return Ok((it, false));
             }
             let sm = self.get_prop(v, "@@iterator")?;
             if !sm.is_nullish() {
@@ -2435,10 +2438,10 @@ impl<'p> Vm<'p> {
                         "TypeError: [Symbol.iterator]() returned a non-object".into(),
                     ));
                 }
-                return Ok(it);
+                return Ok((it, true));
             }
         }
-        Ok(v)
+        Ok((v, true))
     }
 
     /// Normalize a destructuring source to a positionally-indexable value: a

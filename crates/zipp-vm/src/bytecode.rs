@@ -243,7 +243,7 @@ pub enum Instr {
     /// Resolve `src`'s ASYNC iterator into `dst`: `src[@@asyncIterator]()` if
     /// present, else `src[@@iterator]()` (a sync iterable used by `for await`),
     /// else pass `src` through (async generators / built-ins iterate directly).
-    GetAsyncIterator { dst: Reg, src: Reg },
+    GetAsyncIterator { dst: Reg, src: Reg, sync_dst: Reg },
     /// `for await` step: writes the next RESULT to `dst` — a Promise (async
     /// iterator / async generator), or a `{value, done}` object (sync iterable,
     /// positional via the `idx` cursor). The loop then `await`s `dst`, so a sync
