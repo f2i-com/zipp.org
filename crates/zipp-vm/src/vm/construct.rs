@@ -47,7 +47,7 @@ impl<'p> Vm<'p> {
         // parameter; the wrapper parens make the body a function EXPRESSION whose
         // value (the function) becomes the eval completion value.
         let source = format!("({prefix}anonymous({params}\n) {{\n{body}\n}})");
-        self.do_eval(&source, false, false, None, None, false, false)
+        self.do_eval(&source, false, false, None, None, false, false, Value::UNDEFINED, None)
     }
 
     /// `ShadowRealm.prototype.evaluate` / `.importValue`. NOTE: not truly isolated
@@ -70,7 +70,7 @@ impl<'p> Vm<'p> {
                 let code = self.display(a0);
                 // An error thrown by the evaluated code can't cross the realm
                 // boundary, so it surfaces as a TypeError in the calling realm.
-                let result = match self.do_eval(&code, false, false, None, None, false, false) {
+                let result = match self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None) {
                     Ok(r) => r,
                     Err(_) => {
                         return Err(Thrown(

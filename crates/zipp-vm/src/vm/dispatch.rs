@@ -2897,7 +2897,7 @@ impl<'p> Vm<'p> {
                     // Direct eval from strict code: the evaluated string inherits
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
-                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller } => {
+                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
@@ -2922,6 +2922,22 @@ impl<'p> Vm<'p> {
                             let caller_this = self.get(base, this_reg);
                             let inherit =
                                 (home_class != u32::MAX).then_some((home_class, super_static));
+                            // The caller activation's new.target and (for an
+                            // object-literal method) its [[HomeObject]].
+                            let caller_nt = self
+                                .frames
+                                .last()
+                                .map(|f| f.new_target)
+                                .unwrap_or(Value::UNDEFINED);
+                            let caller_home = if super_home_obj {
+                                self.frames
+                                    .last()
+                                    .filter(|f| f.callee.is_heap())
+                                    .and_then(|f| self.closure_home.get(&f.callee.heap_index()))
+                                    .copied()
+                            } else {
+                                None
+                            };
                             self.do_eval(
                                 &code,
                                 strict_caller,
@@ -2930,6 +2946,8 @@ impl<'p> Vm<'p> {
                                 inherit,
                                 ban_arguments,
                                 true,
+                                caller_nt,
+                                caller_home,
                             )?
                         } else {
                             a0

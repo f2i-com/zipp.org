@@ -343,10 +343,17 @@ pub fn compile_eval(
     ban_arguments: bool,
     visible_privates: std::collections::HashSet<String>,
     is_module: bool,
+    inherit_super_obj: bool,
 ) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
     c.eval_locals = !is_module;
+    // A STRICT eval (strict caller or "use strict" source) gets its own
+    // discarded variable environment: top-level var/function decls are frame
+    // locals, never realm globals.
+    c.script_binds_globals =
+        !(c.eval_locals && (force_strict || has_use_strict(&prog.directives)));
+    c.eval_inherit_super_obj = inherit_super_obj;
     c.force_strict = force_strict;
     c.force_new_target_ok = force_new_target_ok;
     // A direct eval from a class-member context inherits the caller's home
@@ -411,6 +418,13 @@ struct Compiler {
     /// which also compile through compile_eval but whose top-level lexicals
     /// are live global-slot export bindings.
     eval_locals: bool,
+    /// False for a STRICT eval program: its top-level var/function declarations
+    /// live in the eval's own (discarded) variable environment — frame locals —
+    /// instead of the realm's globals. True everywhere else.
+    script_binds_globals: bool,
+    /// Direct eval from an OBJECT-literal method/accessor: the eval top level
+    /// (and arrows) resolve `super.x` via the caller's runtime [[HomeObject]].
+    eval_inherit_super_obj: bool,
     /// Force strict mode for the whole compilation, regardless of a `"use strict"`
     /// directive — set for a DIRECT eval invoked from strict-mode code (the
     /// evaluated string inherits the caller's strictness).
@@ -509,6 +523,8 @@ impl Compiler {
             in_field_init: false,
             module_mode: false,
             eval_locals: false,
+            script_binds_globals: true,
+            eval_inherit_super_obj: false,
             force_strict: false,
             force_new_target_ok: false,
             in_strict: false,
@@ -584,7 +600,9 @@ impl Compiler {
 
         // Pass 1: hoist top-level function (and class) declaration names to globals.
         // Record their slots as non-configurable bindings (for `delete <name>`).
-        for s in &prog.body {
+        // (A strict eval binds NOTHING globally — its declarations are locals.)
+        let binds_globals = self.script_binds_globals;
+        for s in prog.body.iter().filter(|_| binds_globals) {
             match s {
                 ox::Statement::FunctionDeclaration(f) => {
                     if let Some(id) = &f.id {
@@ -605,7 +623,7 @@ impl Compiler {
         // try/switch but not into nested functions). These slots are pre-set to
         // `undefined` at startup so `x; var x;` reads `undefined` rather than
         // throwing the never-declared ReferenceError.
-        {
+        if self.script_binds_globals {
             let mut vars = std::collections::HashSet::new();
             for s in &prog.body {
                 collect_hoisted_vars(s, &mut vars);
@@ -717,6 +735,13 @@ impl Compiler {
         // An object-literal concise method / accessor compiles with object-method
         // super (set transiently by the object-literal compiler just before this).
         fc.super_home_obj = std::mem::take(&mut fc.cx.obj_method_super);
+        // Direct eval inside an object-literal method: `super.x` in the eval
+        // resolves via the caller's runtime [[HomeObject]] (closure_home is
+        // stamped on the eval script value). After the take above, which is
+        // always false for an eval script.
+        if is_script && fc.cx.eval_inherit_super_obj {
+            fc.super_home_obj = true;
+        }
         // eval completion-value accumulator: a low, never-reclaimed register
         // (allocated right after `this`/params, below every statement's
         // save/restore high-water) seeded to `undefined`.
@@ -782,7 +807,7 @@ impl Compiler {
         for s in body {
             if let ox::Statement::FunctionDeclaration(f) = s {
                 if let Some(id) = &f.id {
-                    if is_script {
+                    if is_script && fc.cx.script_binds_globals {
                         fc.cx.global_slot(id.name.as_str());
                     } else {
                         fc.declare_local(id.name.as_str());
@@ -911,7 +936,7 @@ impl Compiler {
         // starts undefined, so the boxed cell holds undefined until the assignment.
         // (Lexical `let`/`const` are NOT pre-created — they have a TDZ and are bound
         // at their textual declaration.)
-        if !is_script {
+        if !is_script || !fc.cx.script_binds_globals {
             let mut hv = std::collections::HashSet::new();
             for s in body {
                 collect_hoisted_vars(s, &mut hv);
@@ -972,7 +997,7 @@ impl Compiler {
         // below (a function declaration has no textual side effects). Script-level
         // functions are materialised at VM startup, so this applies to nested
         // function bodies only.
-        if !is_script {
+        if !is_script || !fc.cx.script_binds_globals {
             for s in body {
                 if let ox::Statement::FunctionDeclaration(f) = s {
                     fc.func_decl(f)?;
@@ -987,7 +1012,7 @@ impl Compiler {
         } else {
             for s in body {
                 // Top-level function declarations were materialised at entry above.
-                if !is_script {
+                if !is_script || !fc.cx.script_binds_globals {
                     if let ox::Statement::FunctionDeclaration(_) = s {
                         continue;
                     }
@@ -2319,7 +2344,7 @@ impl<'a> FnCompiler<'a> {
             // falls through to a block-local binding even at script level.
             let block_scoped_lexical =
                 d.kind.is_lexical() && (self.scopes.len() > 1 || self.cx.eval_locals);
-            if self.is_script && !block_scoped_lexical {
+            if self.is_script && self.cx.script_binds_globals && !block_scoped_lexical {
                 let slot = self.cx.global_slot(name) as u32;
                 if is_const {
                     self.cx.const_globals.insert(slot);
@@ -2754,7 +2779,7 @@ impl<'a> FnCompiler<'a> {
         let binding = name.as_deref().map(|n| self.resolve(n));
         let is_block_local =
             matches!(binding, Some(Binding::Local(_)) | Some(Binding::LocalCell(_)));
-        if self.is_script && !is_block_local && !has_upvalues {
+        if self.is_script && self.cx.script_binds_globals && !is_block_local && !has_upvalues {
             // Top-level (or no-conflict block function) with no captures: bind the
             // name to a global; the VM materialises the function object at startup.
             if let Some(n) = &name {
@@ -2762,7 +2787,7 @@ impl<'a> FnCompiler<'a> {
                 proto.name_global = Some(slot);
             }
             self.cx.functions.push(proto);
-        } else if self.is_script && !is_block_local {
+        } else if self.is_script && self.cx.script_binds_globals && !is_block_local {
             // A script-level BLOCK function that captures enclosing block-locals
             // can't be a startup-materialised global Func — its captured cells
             // don't exist at startup, and its UpvalGet ops would run with no
@@ -7598,6 +7623,7 @@ impl<'a> FnCompiler<'a> {
                     super_static: self.super_static,
                     ban_arguments: self.cx.in_field_init,
                     strict_caller: self.cx.in_strict,
+                    super_home_obj: self.super_home_obj,
                 });
                 return Ok(dst);
             }

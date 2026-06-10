@@ -907,6 +907,8 @@ impl<'p> Vm<'p> {
         inherit_super: Option<(u32, bool)>,
         ban_arguments: bool,
         direct: bool,
+        caller_new_target: Value,
+        caller_home_obj: Option<Value>,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -963,6 +965,7 @@ impl<'p> Vm<'p> {
             ban_arguments,
             visible,
             false,
+            caller_home_obj.is_some(),
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -973,6 +976,8 @@ impl<'p> Vm<'p> {
             false,
             inherit_super.map(|(h, _)| h),
             caller_chain,
+            caller_new_target,
+            caller_home_obj,
         )
         .map(|(v, _)| v)
     }
@@ -1021,7 +1026,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1045,7 +1050,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1078,7 +1083,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
@@ -1121,7 +1126,7 @@ impl<'p> Vm<'p> {
         // re-exports, then fill the namespace. The recursion carries only
         // (String, slot:u32) — no unrooted heap Value across a GC-triggering load.
         self.module_own.insert(path.clone(), own_map);
-        let exec = self.execute_eval_program(base_func, None, None);
+        let exec = self.execute_eval_program(base_func, None, None, Value::UNDEFINED, None);
         let linked = match exec {
             Ok(_) => self.link_module_reexports(full, &reexports, &star_reexports, dir.as_deref()),
             Err(e) => Err(e),
@@ -1396,6 +1401,8 @@ impl<'p> Vm<'p> {
         base_func: u32,
         this_override: Option<Value>,
         caller_chain: Option<Vec<u64>>,
+        caller_new_target: Value,
+        caller_home_obj: Option<Value>,
     ) -> Result<Value, Thrown> {
         let script = Value::heap(self.heap.alloc(HeapObj::Func(base_func)));
         // A direct eval's code resolves the CALLER's private brand chain
@@ -1403,6 +1410,13 @@ impl<'p> Vm<'p> {
         if let Some(ch) = caller_chain {
             self.method_brand.insert(script.heap_index(), ch);
         }
+        // Object-method direct eval: super.x resolves via the caller's
+        // [[HomeObject]] (same stamp pattern as the brand chain above).
+        if let Some(home) = caller_home_obj {
+            self.closure_home.insert(script.heap_index(), home);
+        }
+        // The eval frame's new.target is the CALLER's (consumed at frame setup).
+        self.pending_new_target = caller_new_target;
         let this = this_override.unwrap_or_else(|| {
             if self.global_this != 0 {
                 Value::heap(self.global_this)
@@ -1423,9 +1437,17 @@ impl<'p> Vm<'p> {
         module: bool,
         caller_home: Option<u32>,
         caller_chain: Option<Vec<u64>>,
+        caller_new_target: Value,
+        caller_home_obj: Option<Value>,
     ) -> Result<(Value, Vec<u32>), Thrown> {
         let (gmap, base_func) = self.prepare_eval_program(eval_prog, module, caller_home)?;
-        let completion = self.execute_eval_program(base_func, this_override, caller_chain)?;
+        let completion = self.execute_eval_program(
+            base_func,
+            this_override,
+            caller_chain,
+            caller_new_target,
+            caller_home_obj,
+        )?;
         Ok((completion, gmap))
     }
 }

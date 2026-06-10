@@ -551,7 +551,7 @@ pub enum Instr {
     /// `home_class`/`super_static`: the CALLER's compile-time class home (so
     /// `super.x` inside the eval'd code resolves against the same class) —
     /// u32::MAX when the eval site has no class context.
-    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool, strict_caller: bool },
+    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool },
 
     /// CreateDataPropertyOrThrow for a class FIELD initializer: an own
     /// {writable, enumerable, configurable} data property on the receiver —
