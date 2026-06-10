@@ -314,6 +314,7 @@ fn compile_program_inner(prog: &ox::Program, source: &str, module_mode: bool) ->
         hoisted_globals: c.hoisted_globals,
         decl_globals: c.decl_globals.iter().copied().collect(),
         lexical_globals: c.lexical_globals.iter().copied().collect(),
+        eval_dynamic_names: c.eval_dynamic_names.iter().cloned().collect(),
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
@@ -365,10 +366,22 @@ pub fn compile_eval(
     is_module: bool,
     inherit_super_obj: bool,
     caller_scope: Vec<String>,
+    fn_var_env: bool,
 ) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
     c.eval_locals = !is_module;
+    // A sloppy FUNCTION-context eval declares its var/function names into the
+    // caller's dynamic EvalScope (never globals): record them so the var
+    // hoist skips them and their accesses compile to the Dyn global ops.
+    if fn_var_env && !(force_strict || has_use_strict(&prog.directives)) {
+        c.eval_fn_context = true;
+        for n in eval_var_and_fn_names(prog) {
+            if !caller_scope.iter().any(|c| *c == n) {
+                c.eval_dynamic_names.insert(n);
+            }
+        }
+    }
     c.eval_caller_scope = caller_scope;
     // A STRICT eval (strict caller or "use strict" source) gets its own
     // discarded variable environment: top-level var/function decls are frame
@@ -398,6 +411,7 @@ pub fn compile_eval(
         hoisted_globals: c.hoisted_globals,
         decl_globals: c.decl_globals.iter().copied().collect(),
         lexical_globals: c.lexical_globals.iter().copied().collect(),
+        eval_dynamic_names: c.eval_dynamic_names.iter().cloned().collect(),
         module_exports: std::mem::take(&mut c.module_exports),
         module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
@@ -453,6 +467,15 @@ struct Compiler {
     /// supplies as the eval closure's upvalue cells. Free names in the eval
     /// resolve to these as UpvalGet/UpvalSet before falling back to globals.
     eval_caller_scope: Vec<String>,
+    /// FUNCTION-context sloppy eval: the eval's own var/function names that
+    /// live in the caller's dynamic EvalScope (the Dyn global ops find them).
+    eval_dynamic_names: std::collections::HashSet<String>,
+    /// True for a sloppy FUNCTION-context eval program: its global accesses
+    /// must be dynamic-first (the caller activation may carry an EvalScope).
+    eval_fn_context: bool,
+    /// True while compiling code lexically inside a contains-direct-eval
+    /// function: global accesses at ANY nesting depth compile to the Dyn ops.
+    dyn_global_zone: bool,
     /// Force strict mode for the whole compilation, regardless of a `"use strict"`
     /// directive — set for a DIRECT eval invoked from strict-mode code (the
     /// evaluated string inherits the caller's strictness).
@@ -554,6 +577,9 @@ impl Compiler {
             script_binds_globals: true,
             eval_inherit_super_obj: false,
             eval_caller_scope: Vec::new(),
+            eval_dynamic_names: std::collections::HashSet::new(),
+            eval_fn_context: false,
+            dyn_global_zone: false,
             force_strict: false,
             force_new_target_ok: false,
             in_strict: false,
@@ -660,7 +686,10 @@ impl Compiler {
             for name in vars {
                 // A name the CALLER binds is not a global var of the eval —
                 // the declaration is a no-op and assignments write the cell.
-                if self.eval_caller_scope.iter().any(|n| *n == name) {
+                // A dynamic (EvalScope) name is never a global either.
+                if self.eval_caller_scope.iter().any(|n| *n == name)
+                    || self.eval_dynamic_names.contains(&name)
+                {
                     continue;
                 }
                 let slot = self.global_slot(&name) as u32;
@@ -759,6 +788,10 @@ impl Compiler {
         let body_refs_eval = !is_script
             && (capture::free_vars(&[], body).contains("eval")
                 || params_ast.is_some_and(|pa| capture::params_reference("eval", pa)));
+        let saved_dyn_zone = self.dyn_global_zone;
+        if body_refs_eval {
+            self.dyn_global_zone = true;
+        }
         if body_refs_eval {
             let mut all: Vec<String> = params.to_vec();
             if let Some(r) = rest {
@@ -769,6 +802,17 @@ impl Compiler {
         }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         if body_refs_eval {
+            fc.box_all_locals = true;
+        }
+        // An eval root with DYNAMIC (EvalScope) names compiles its global
+        // accesses through the Dyn ops (same gate as eval-containing callers).
+        if is_script && !fc.cx.eval_dynamic_names.is_empty() {
+            fc.box_all_locals = true;
+        }
+        // A FUNCTION-context eval root compiles its global accesses through
+        // the Dyn ops — the caller activation's EvalScope (from this or an
+        // earlier eval) may bind any name.
+        if is_script && fc.cx.eval_fn_context {
             fc.box_all_locals = true;
         }
         // The eval ROOT closes over the caller bindings: seed them as upvalues
@@ -1129,6 +1173,7 @@ impl Compiler {
             fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
+        fc.cx.dyn_global_zone = saved_dyn_zone;
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -1186,6 +1231,10 @@ impl Compiler {
         let mut captured = capture::captured_locals(&names, body);
         let cls_body_refs_eval = capture::free_vars(&[], body).contains("eval")
             || params_ast.is_some_and(|pa| capture::params_reference("eval", pa));
+        let saved_dyn_zone_cls = self.dyn_global_zone;
+        if cls_body_refs_eval {
+            self.dyn_global_zone = true;
+        }
         if cls_body_refs_eval {
             captured.extend(names.iter().cloned());
         }
@@ -1303,6 +1352,7 @@ impl Compiler {
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
+        fc.cx.dyn_global_zone = saved_dyn_zone_cls;
         Ok(FuncProto {
             name: name.to_string(),
             code: fc.code,
@@ -1355,6 +1405,10 @@ impl Compiler {
                 all.push(r.to_string());
             }
             captured.extend(all);
+        }
+        let saved_dyn_zone_arrow = self.dyn_global_zone;
+        if arrow_refs_eval {
+            self.dyn_global_zone = true;
         }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
         if arrow_refs_eval {
@@ -1409,6 +1463,7 @@ impl Compiler {
             fc.emit(Instr::ReturnUndefined);
         }
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
+        fc.cx.dyn_global_zone = saved_dyn_zone_arrow;
         let upvalues: Vec<UpvalSource> =
             fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         Ok(FuncProto {
@@ -2532,7 +2587,11 @@ impl<'a> FnCompiler<'a> {
                     Vec::new()
                 };
                 if with_objs.is_empty() {
-                    self.emit(Instr::StoreGlobal { idx: slot, src: v });
+                    if self.box_all_locals || self.cx.dyn_global_zone {
+                        self.emit(Instr::StoreGlobalDyn { idx: slot, src: v });
+                    } else {
+                        self.emit(Instr::StoreGlobal { idx: slot, src: v });
+                    }
                 } else {
                     self.store_with(name, &with_objs, v);
                 }
@@ -3005,7 +3064,11 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                     if let Some(slot) = script_b33_slot {
-                        self.emit(Instr::StoreGlobal { idx: slot, src: reg });
+                        if self.box_all_locals || self.cx.dyn_global_zone {
+                            self.emit(Instr::StoreGlobalDyn { idx: slot, src: reg });
+                        } else {
+                            self.emit(Instr::StoreGlobal { idx: slot, src: reg });
+                        }
                     }
                 }
                 Some(Binding::LocalCell(cell)) => {
@@ -3020,7 +3083,11 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                     if let Some(slot) = script_b33_slot {
-                        self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                        if self.box_all_locals || self.cx.dyn_global_zone {
+                            self.emit(Instr::StoreGlobalDyn { idx: slot, src: tmp });
+                        } else {
+                            self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                        }
                     }
                     self.next_reg -= 1;
                 }
@@ -5143,7 +5210,12 @@ impl<'a> FnCompiler<'a> {
                         Ok(dst)
                     }
                     Binding::Global(idx) => {
-                        self.emit(Instr::LoadGlobal { dst, idx });
+                        if self.box_all_locals || self.cx.dyn_global_zone {
+                            // A dynamic EvalScope binding may shadow the slot.
+                            self.emit(Instr::LoadGlobalDyn { dst, idx });
+                        } else {
+                            self.emit(Instr::LoadGlobal { dst, idx });
+                        }
                         Ok(dst)
                     }
                     Binding::ClassName(class_id) => {
@@ -6041,7 +6113,11 @@ impl<'a> FnCompiler<'a> {
                 if let ox::Expression::Identifier(id) = arg {
                     if !matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
                         if let Binding::Global(idx) = self.resolve(id.name.as_str()) {
-                            self.emit(Instr::LoadGlobalOrUndefined { dst, idx });
+                            if self.box_all_locals || self.cx.dyn_global_zone {
+                                self.emit(Instr::LoadGlobalOrUndefinedDyn { dst, idx });
+                            } else {
+                                self.emit(Instr::LoadGlobalOrUndefined { dst, idx });
+                            }
                             self.emit(Instr::TypeOf { dst, a: dst });
                             return Ok(dst);
                         }
@@ -6421,7 +6497,11 @@ impl<'a> FnCompiler<'a> {
                 dst
             }
             Binding::Global(idx) => {
-                self.emit(Instr::LoadGlobal { dst, idx: *idx });
+                if self.box_all_locals || self.cx.dyn_global_zone {
+                    self.emit(Instr::LoadGlobalDyn { dst, idx: *idx });
+                } else {
+                    self.emit(Instr::LoadGlobal { dst, idx: *idx });
+                }
                 dst
             }
             Binding::ClassName(class_id) => {
@@ -6486,6 +6566,8 @@ impl<'a> FnCompiler<'a> {
                 // store while it is still in its TDZ (UNINITIALIZED) is a ReferenceError.
                 if self.cx.in_strict || self.cx.lexical_globals.contains(idx) {
                     self.emit(Instr::StoreGlobalStrict { idx: *idx, src });
+                } else if self.box_all_locals || self.cx.dyn_global_zone {
+                    self.emit(Instr::StoreGlobalDyn { idx: *idx, src });
                 } else {
                     self.emit(Instr::StoreGlobal { idx: *idx, src });
                 }

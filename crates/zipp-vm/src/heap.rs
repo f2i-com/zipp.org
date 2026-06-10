@@ -369,6 +369,11 @@ pub enum HeapObj {
     Closure { func: u32, upvalues: Vec<u32>, this_val: Value },
     /// A boxed mutable variable cell (an upvalue's storage).
     Cell(Value),
+    /// A sloppy direct eval's DYNAMIC variable environment for a FUNCTION
+    /// context: name -> value bindings the eval's var/function declarations
+    /// created in the caller activation (spec: the caller's varEnv). Reached
+    /// via Frame.eval_scope / the closure_eval_scope stamps.
+    EvalScope(std::collections::HashMap<String, Value>),
     /// A bound function (`fn.bind(thisArg, ...boundArgs)`): calling it invokes
     /// `target` with `this` fixed to `this` and `args` prepended to the call args.
     Bound { target: Value, this: Value, args: Vec<Value> },

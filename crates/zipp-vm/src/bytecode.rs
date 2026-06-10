@@ -60,6 +60,12 @@ pub enum Instr {
     /// instead of throwing. Emitted for `typeof <ident>`, where an unbound name
     /// must yield "undefined" rather than a ReferenceError.
     LoadGlobalOrUndefined { dst: Reg, idx: u32 },
+    /// Dynamic-first variants for code in a contains-direct-eval function (or
+    /// an eval program): consult the activation's EvalScope (frame field or
+    /// closure stamp) for the slot's NAME before the ordinary global slot.
+    LoadGlobalDyn { dst: Reg, idx: u32 },
+    LoadGlobalOrUndefinedDyn { dst: Reg, idx: u32 },
+    StoreGlobalDyn { idx: u32, src: Reg },
     /// `globals[idx] = src`
     StoreGlobal { idx: u32, src: Reg },
     /// `globals[idx] = src`, but in STRICT mode: assignment to an unresolvable
@@ -983,6 +989,9 @@ pub struct Program {
     /// may not var/function-declare one of these names (SyntaxError per
     /// EvalDeclarationInstantiation), and they are NOT global-object props.
     pub lexical_globals: Vec<u32>,
+    /// For a sloppy FUNCTION-context eval program: the var/function names the
+    /// eval declares into the caller's dynamic EvalScope (instead of globals).
+    pub eval_dynamic_names: Vec<String>,
     /// For a MODULE program (a fixture loaded by a dynamic `import()`): the
     /// (exported name, local name) pairs. The loader reads each local's top-level
     /// binding after the module runs to build the import's namespace. Empty for

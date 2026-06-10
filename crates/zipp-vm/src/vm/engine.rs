@@ -87,6 +87,7 @@ impl<'p> Vm<'p> {
             pending_new_target: Value::UNDEFINED,
             pending_yield: None,
             pending_yield_handlers: Vec::new(),
+            pending_yield_eval_scope: u32::MAX,
             pending_await: None,
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),
@@ -114,6 +115,8 @@ impl<'p> Vm<'p> {
             super_this: std::collections::HashMap::new(),
             private_fields: std::collections::HashMap::new(),
             eval_fn_idx: 0,
+            closure_eval_scope: std::collections::HashMap::new(),
+            sloppy_eval_memo: Vec::new(),
             obj_proto: 0,
             fn_proto: 0,
             function_ctor: 0,
@@ -359,7 +362,7 @@ impl<'p> Vm<'p> {
             // The native callee bailed mid-body: finish this activation on the
             // interpreter over the SAME window via a transient frame. The frame
             // base is `new_base` into self.regs (stable — reserved capacity).
-            self.frames.push(Frame { super_done: false,
+            self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
                 func: func_id,
                 base: new_base,
                 ip: bail as usize,
@@ -478,7 +481,7 @@ impl<'p> Vm<'p> {
         // and the recursion can't re-enter native → no livelock; frames grow to
         // MAX_FRAMES → RangeError on runaway.
         self.jit_recurse_depth += 1;
-        self.frames.push(Frame { super_done: false,
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -574,7 +577,7 @@ impl<'p> Vm<'p> {
         // only the top frame so the reservation math is relative to a known base.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.reserve_jit_regs();
-        self.frames.push(Frame { super_done: false, func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX, func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
         // Everything allocated so far (interned strings, all built-ins, hoisted
         // top-level functions) is pinned: the GC never collects below this floor.
         self.set_gc_floor();
@@ -843,7 +846,7 @@ impl<'p> Vm<'p> {
 
         let stop_depth = self.frames.len();
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { super_done: false, func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX, func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
         self.run_loop(stop_depth)
     }
 
@@ -927,6 +930,7 @@ impl<'p> Vm<'p> {
         var_env_global: bool,
         param_collisions: Option<Vec<String>>,
         caller_scope: Option<(Vec<String>, Vec<Value>)>,
+        eval_scope_idx: Option<u32>,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -1008,6 +1012,7 @@ impl<'p> Vm<'p> {
                 .as_ref()
                 .map(|(n, _)| n.clone())
                 .unwrap_or_default(),
+            eval_scope_idx.is_some(),
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -1022,6 +1027,7 @@ impl<'p> Vm<'p> {
             caller_home_obj,
             var_env_global,
             caller_scope.map(|(_, c)| c),
+            eval_scope_idx,
         )
         .map(|(v, _)| v)
     }
@@ -1070,7 +1076,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None, None)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1094,7 +1100,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None, None)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1127,7 +1133,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new()) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
@@ -1146,7 +1152,7 @@ impl<'p> Vm<'p> {
         // PREPARE the module's environment (declared globals → fresh per-module slots,
         // install funcs/classes, hoist) WITHOUT running the body yet. `gmap[i]` is the
         // live slot for compile-time global slot `i`.
-        let (gmap, base_func) = self.prepare_eval_program(prog, true, None, false)?;
+        let (gmap, base_func) = self.prepare_eval_program(prog, true, None, false, None)?;
         // OWN exports (exported name → live slot), in source order.
         let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
         let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -1171,7 +1177,7 @@ impl<'p> Vm<'p> {
         // (String, slot:u32) — no unrooted heap Value across a GC-triggering load.
         self.module_own.insert(path.clone(), own_map);
         let exec =
-            self.execute_eval_program(base_func, None, None, Value::UNDEFINED, None, None);
+            self.execute_eval_program(base_func, None, None, Value::UNDEFINED, None, None, None);
         let linked = match exec {
             Ok(_) => self.link_module_reexports(full, &reexports, &star_reexports, dir.as_deref()),
             Err(e) => Err(e),
@@ -1301,6 +1307,7 @@ impl<'p> Vm<'p> {
         module: bool,
         caller_home: Option<u32>,
         var_env_global: bool,
+        eval_scope_idx: Option<u32>,
     ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // Runtime base ids: eval functions and classes are appended past the
@@ -1372,7 +1379,10 @@ impl<'p> Vm<'p> {
                     Instr::LoadGlobal { idx, .. }
                     | Instr::LoadGlobalOrUndefined { idx, .. }
                     | Instr::StoreGlobal { idx, .. }
-                    | Instr::StoreGlobalStrict { idx, .. } => {
+                    | Instr::StoreGlobalStrict { idx, .. }
+                    | Instr::LoadGlobalDyn { idx, .. }
+                    | Instr::LoadGlobalOrUndefinedDyn { idx, .. }
+                    | Instr::StoreGlobalDyn { idx, .. } => {
                         *idx = gmap[*idx as usize];
                     }
                     // Class-id operands: the class itself, and every `super`
@@ -1512,6 +1522,16 @@ impl<'p> Vm<'p> {
         // global object (eval-created bindings are deletable and reflectable);
         // the slot stays UNINITIALIZED so reads/writes route through the own
         // prop (the Load/StoreGlobal fallbacks). Existing bindings untouched.
+        // FUNCTION-context dynamic names: CreateMutableBinding(undefined) in
+        // the caller's EvalScope (functions get their values in step 6).
+        if let Some(sc) = eval_scope_idx {
+            let names: Vec<String> = eval_prog.eval_dynamic_names.clone();
+            if let HeapObj::EvalScope(m) = self.heap.get_mut(sc) {
+                for n in names {
+                    m.entry(n).or_insert(Value::UNDEFINED);
+                }
+            }
+        }
         for &slot in &eval_prog.hoisted_globals {
             let rs = gmap[slot as usize] as usize;
             if self.globals[rs].bits() == Value::UNINITIALIZED.bits() {
@@ -1565,6 +1585,19 @@ impl<'p> Vm<'p> {
                 if (slot as usize) >= self.globals.len() {
                     continue;
                 }
+                // A dynamic (EvalScope) function: bind in the caller's scope,
+                // stamp the scope on the value so its body resolves siblings.
+                if let Some(sc) = eval_scope_idx {
+                    if let Some(name) = self.global_slot_name(slot as u32) {
+                        if eval_prog.eval_dynamic_names.iter().any(|n| *n == name) {
+                            self.closure_eval_scope.insert(v.heap_index(), sc);
+                            if let HeapObj::EvalScope(m) = self.heap.get_mut(sc) {
+                                m.insert(name, v);
+                            }
+                            continue;
+                        }
+                    }
+                }
                 if var_env_global
                     && self.globals[slot as usize].bits() == Value::UNINITIALIZED.bits()
                 {
@@ -1609,6 +1642,7 @@ impl<'p> Vm<'p> {
         caller_new_target: Value,
         caller_home_obj: Option<Value>,
         caller_cells: Option<Vec<Value>>,
+        eval_scope_idx: Option<u32>,
     ) -> Result<Value, Thrown> {
         // With caller bindings, the eval script is a CLOSURE over their cells
         // (UpvalGet/UpvalSet in the eval code address them directly).
@@ -1632,6 +1666,11 @@ impl<'p> Vm<'p> {
         // [[HomeObject]] (same stamp pattern as the brand chain above).
         if let Some(home) = caller_home_obj {
             self.closure_home.insert(script.heap_index(), home);
+        }
+        // The eval frame resolves the caller's dynamic EvalScope through
+        // the same stamp the Dyn ops use for closures.
+        if let Some(sc) = eval_scope_idx {
+            self.closure_eval_scope.insert(script.heap_index(), sc);
         }
         // The eval frame's new.target is the CALLER's (consumed at frame setup).
         self.pending_new_target = caller_new_target;
@@ -1659,9 +1698,10 @@ impl<'p> Vm<'p> {
         caller_home_obj: Option<Value>,
         var_env_global: bool,
         caller_cells: Option<Vec<Value>>,
+        eval_scope_idx: Option<u32>,
     ) -> Result<(Value, Vec<u32>), Thrown> {
         let (gmap, base_func) =
-            self.prepare_eval_program(eval_prog, module, caller_home, var_env_global)?;
+            self.prepare_eval_program(eval_prog, module, caller_home, var_env_global, eval_scope_idx)?;
         let completion = self.execute_eval_program(
             base_func,
             this_override,
@@ -1669,6 +1709,7 @@ impl<'p> Vm<'p> {
             caller_new_target,
             caller_home_obj,
             caller_cells,
+            eval_scope_idx,
         )?;
         Ok((completion, gmap))
     }

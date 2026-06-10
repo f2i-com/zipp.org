@@ -89,6 +89,10 @@ struct Frame {
     /// call, `.call`/`.apply`, a method, a tagged template, …). Read by the
     /// `LoadNewTarget` op; consumed from `pending_new_target` at frame setup.
     new_target: Value,
+    /// A sloppy direct eval's dynamic variable environment for this
+    /// activation (heap index of a HeapObj::EvalScope), or u32::MAX. Created
+    /// lazily by the DirectEval op for function-context evals.
+    eval_scope: u32,
     /// Whether a `super(...)` has completed in THIS activation. A second
     /// `super()` in the same constructor frame throws a ReferenceError (after
     /// running the parent ctor — spec evaluates the SuperCall fully, then
@@ -216,6 +220,10 @@ pub struct Vm<'p> {
     /// to land in an enclosing `try`/`catch`). The ASYNC `drive_async_gen`
     /// consumer ignores this — async-gen suspension semantics are unchanged.
     pending_yield_handlers: Vec<Handler>,
+    /// The suspending frame's dynamic EvalScope (or u32::MAX), captured with
+    /// `pending_yield`; the parker stamps it on the generator so a resume can
+    /// restore it (param-prologue evals outlive the GenStart suspension).
+    pending_yield_eval_scope: u32,
     /// Set by an `Await` op (the awaited value + the Await's ip + the activation's
     /// live `try` handlers); `drive_async` `.take()`s it to suspend the async
     /// activation, mirroring `pending_yield`. Unlike generators, async activations
@@ -352,6 +360,15 @@ pub struct Vm<'p> {
     /// Heap index of the canonical %eval% native — the DirectEval op's runtime
     /// identity check (a REBOUND global `eval` gets an ordinary call).
     eval_fn_idx: u32,
+    /// EvalScope stamps for closures created in frames that carry one (so
+    /// arrows/functions made during or after the eval still see its
+    /// bindings). Keyed by the closure value's heap index; pruned at GC.
+    closure_eval_scope: std::collections::HashMap<u32, u32>,
+    /// Memo per func id: 0 unknown, 1 no, 2 yes — "code contains a sloppy
+    /// function-context DirectEval". Drives EAGER EvalScope creation at
+    /// closure-stamp time, so closures made before the eval call share the
+    /// scope the eval later populates.
+    sloppy_eval_memo: Vec<u8>,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods

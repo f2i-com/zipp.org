@@ -137,6 +137,9 @@ impl Vm<'_> {
         if let Some((v, _)) = self.pending_yield {
             root_val!(v);
         }
+        if self.pending_yield_eval_scope != u32::MAX {
+            root_idx!(self.pending_yield_eval_scope);
+        }
         if let Some((v, _, _)) = &self.pending_await {
             root_val!(*v);
         }
@@ -168,6 +171,13 @@ impl Vm<'_> {
             root_idx!(f.closure);
             root_val!(f.new_target);
             root_val!(f.callee);
+            if f.eval_scope != u32::MAX {
+                root_idx!(f.eval_scope);
+            }
+        }
+        // Eval scopes stamped on closures (created in frames that had one).
+        for &s in self.closure_eval_scope.values() {
+            root_idx!(s);
         }
         // Realm registry ($262.createRealm): keep every realm constructor /
         // prototype / object reachable so the `obj_realm` and `realms` heap-index
@@ -305,6 +315,7 @@ impl Vm<'_> {
         self.method_brand.retain(|&k, _| marks[k as usize]);
         self.instance_brand.retain(|&k, _| marks[k as usize]);
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
+        self.closure_eval_scope.retain(|&k, _| marks[k as usize]);
         self.private_fields.retain(|&k, _| marks[k as usize]);
         // Keep declared-name records only for brands still referenced by a live
         // lexical chain or instance brand (these maps were just pruned by marks).
@@ -392,6 +403,11 @@ impl Vm<'_> {
                 m_val!(*this_val);
             }
             HeapObj::Cell(v) => m_val!(*v),
+            HeapObj::EvalScope(m) => {
+                for v in m.values() {
+                    m_val!(*v);
+                }
+            }
             HeapObj::Bound { target, this, args } => {
                 m_val!(*target);
                 m_val!(*this);

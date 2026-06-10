@@ -45,8 +45,48 @@ pub fn params_reference(name: &str, params: &ox::FormalParameters) -> bool {
         if let Some(init) = &item.initializer {
             expr_refs(init, &mut refs);
         }
+        pattern_init_refs(&item.pattern, &mut refs);
+    }
+    if let Some(r) = &params.rest {
+        pattern_init_refs(&r.rest.argument, &mut refs);
     }
     refs.contains(name)
+}
+
+/// Collect every name referenced by a DEFAULT-VALUE expression nested anywhere
+/// inside a binding pattern (array/object destructuring element defaults).
+fn pattern_init_refs(pat: &ox::BindingPattern, out: &mut HashSet<String>) {
+    use ox::BindingPattern as P;
+    match pat {
+        P::BindingIdentifier(_) => {}
+        P::AssignmentPattern(ap) => {
+            expr_refs(&ap.right, out);
+            pattern_init_refs(&ap.left, out);
+        }
+        P::ObjectPattern(op) => {
+            for prop in &op.properties {
+                // A computed key `{[expr]: v}` evaluates in the param scope —
+                // an eval there introduces vars like an element default does.
+                if prop.computed {
+                    if let Some(ke) = prop.key.as_expression() {
+                        expr_refs(ke, out);
+                    }
+                }
+                pattern_init_refs(&prop.value, out);
+            }
+            if let Some(rest) = &op.rest {
+                pattern_init_refs(&rest.argument, out);
+            }
+        }
+        P::ArrayPattern(arr) => {
+            for el in arr.elements.iter().flatten() {
+                pattern_init_refs(el, out);
+            }
+            if let Some(rest) = &arr.rest {
+                pattern_init_refs(&rest.argument, out);
+            }
+        }
+    }
 }
 
 /// The function's own bindings that some directly-nested function captures.

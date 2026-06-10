@@ -378,6 +378,86 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::LoadGlobalDyn { dst, idx } => {
+                        // Dynamic-first: the activation's EvalScope may bind
+                        // this slot's NAME (a sloppy fn-context eval var).
+                        if let Some(v) = self.eval_scope_lookup(idx) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
+                        let v = self.globals[idx as usize];
+                        if v.is_uninitialized() {
+                            let name = self.global_slot_name(idx).unwrap_or_default();
+                            let has_own = self.global_this != 0
+                                && matches!(
+                                    self.heap.get(self.global_this),
+                                    HeapObj::Object(m) if m.pos(&name).is_some()
+                                );
+                            if !has_own {
+                                return Err(Thrown(format!(
+                                    "ReferenceError: {name} is not defined"
+                                )));
+                            }
+                            let gobj = Value::heap(self.global_this);
+                            let val = self.get_prop(gobj, &name)?;
+                            self.set(base, dst, val);
+                        } else {
+                            self.set(base, dst, v);
+                        }
+                        ip += 1;
+                    }
+                    Instr::LoadGlobalOrUndefinedDyn { dst, idx } => {
+                        if let Some(v) = self.eval_scope_lookup(idx) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
+                        let v = self.globals[idx as usize];
+                        let v = if v.is_uninitialized() {
+                            match self.global_slot_name(idx) {
+                                Some(name)
+                                    if self.global_this != 0
+                                        && matches!(
+                                            self.heap.get(self.global_this),
+                                            HeapObj::Object(m) if m.pos(&name).is_some()
+                                        ) =>
+                                {
+                                    let gobj = Value::heap(self.global_this);
+                                    self.get_prop(gobj, &name)?
+                                }
+                                _ => Value::UNDEFINED,
+                            }
+                        } else {
+                            v
+                        };
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::StoreGlobalDyn { idx, src } => {
+                        let v = self.get(base, src);
+                        if self.eval_scope_store(idx, v) {
+                            ip += 1;
+                            continue;
+                        }
+                        if self.globals[idx as usize].is_uninitialized() {
+                            if let Some(name) = self.global_slot_name(idx) {
+                                let has_own = self.global_this != 0
+                                    && matches!(
+                                        self.heap.get(self.global_this),
+                                        HeapObj::Object(m) if m.pos(&name).is_some()
+                                    );
+                                if has_own {
+                                    let gobj = Value::heap(self.global_this);
+                                    self.set_prop(gobj, &name, v, false)?;
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        self.globals[idx as usize] = v;
+                        ip += 1;
+                    }
                     Instr::StoreGlobal { idx, src } => {
                         let v = self.get(base, src);
                         if self.globals[idx as usize].is_uninitialized() {
@@ -2244,6 +2324,11 @@ impl<'p> Vm<'p> {
 
                     Instr::MakeFunc { dst, func_id } => {
                         let v = Value::heap(self.heap.alloc(HeapObj::Func(func_id)));
+                        // A function created under a dynamic EvalScope keeps
+                        // resolving its bindings (Dyn global ops consult it).
+                        if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
+                            self.closure_eval_scope.insert(v.heap_index(), sc);
+                        }
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2329,6 +2414,9 @@ impl<'p> Vm<'p> {
                         let v = Value::heap(
                             self.heap.alloc(HeapObj::Closure { func: func_id, upvalues: cells, this_val: Value::UNDEFINED }),
                         );
+                        if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
+                            self.closure_eval_scope.insert(v.heap_index(), sc);
+                        }
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2358,6 +2446,10 @@ impl<'p> Vm<'p> {
                             if let Some(&home) = self.closure_home.get(&callee.heap_index()) {
                                 self.closure_home.insert(v.heap_index(), home);
                             }
+                        }
+                        // ... and any dynamic EvalScope of the defining frame.
+                        if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
+                            self.closure_eval_scope.insert(v.heap_index(), sc);
                         }
                         self.set(base, dst, v);
                         ip += 1;
@@ -2985,6 +3077,21 @@ impl<'p> Vm<'p> {
                             } else {
                                 None
                             };
+                            // Sloppy FUNCTION-context eval: its var/function
+                            // declarations live in this activation's dynamic
+                            // EvalScope (created lazily here).
+                            let eval_scope_idx = if !var_env_is_global && !strict_caller {
+                                let fi = self.frames.len() - 1;
+                                if self.frames[fi].eval_scope == u32::MAX {
+                                    let s = self.heap.alloc(HeapObj::EvalScope(
+                                        std::collections::HashMap::new(),
+                                    ));
+                                    self.frames[fi].eval_scope = s;
+                                }
+                                Some(self.frames[fi].eval_scope)
+                            } else {
+                                None
+                            };
                             self.do_eval(
                                 &code,
                                 strict_caller,
@@ -3049,6 +3156,7 @@ impl<'p> Vm<'p> {
                                         None
                                     }
                                 },
+                                eval_scope_idx,
                             )?
                         } else {
                             a0
@@ -3785,6 +3893,7 @@ impl<'p> Vm<'p> {
                         // park them and `gen.throw(e)`/`gen.return(v)` resume into the
                         // body's try/catch/finally. (drive_async_gen ignores this.)
                         let f = self.frames.pop().unwrap();
+                        self.pending_yield_eval_scope = f.eval_scope;
                         self.pending_yield_handlers = f.handlers;
                         self.pending_yield = Some((v, ip));
                         return Ok(v);
@@ -3796,6 +3905,7 @@ impl<'p> Vm<'p> {
                         // here we only suspend.
                         let v = self.get(base, val);
                         let f = self.frames.pop().unwrap();
+                        self.pending_yield_eval_scope = f.eval_scope;
                         self.pending_yield_handlers = f.handlers;
                         self.pending_yield = Some((v, ip));
                         return Ok(v);
@@ -3807,6 +3917,7 @@ impl<'p> Vm<'p> {
                         // suspension for `.throw()`/`.return()` handling.
                         let v = self.get(base, val);
                         let f = self.frames.pop().unwrap();
+                        self.pending_yield_eval_scope = f.eval_scope;
                         self.pending_yield_handlers = f.handlers;
                         self.pending_yield = Some((v, ip));
                         return Ok(v);
@@ -3932,6 +4043,7 @@ impl<'p> Vm<'p> {
                         // `.next()` resumes just past it (the resume path delivers no
                         // sent value here because this is not a `Yield`).
                         let f = self.frames.pop().unwrap();
+                        self.pending_yield_eval_scope = f.eval_scope;
                         self.pending_yield_handlers = f.handlers; // empty at GenStart
                         self.pending_yield = Some((Value::UNDEFINED, ip));
                         return Ok(Value::UNDEFINED);
@@ -4406,7 +4518,7 @@ impl<'p> Vm<'p> {
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { super_done: false, func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX, func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
         Ok(())
     }
 

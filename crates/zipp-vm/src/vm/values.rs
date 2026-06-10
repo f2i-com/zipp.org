@@ -345,6 +345,95 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// The activation's EvalScope, CREATING it on the frame when the running
+    /// function contains a sloppy function-context direct eval: closures made
+    /// BEFORE the eval call must share the scope the eval later populates.
+    pub(crate) fn ensure_frame_eval_scope(&mut self, frame_idx: usize) -> Option<u32> {
+        if let Some(sc) = self.frame_eval_scope(frame_idx) {
+            return Some(sc);
+        }
+        if self.func_has_sloppy_eval(self.frames[frame_idx].func as usize) {
+            let s = self
+                .heap
+                .alloc(HeapObj::EvalScope(std::collections::HashMap::new()));
+            self.frames[frame_idx].eval_scope = s;
+            return Some(s);
+        }
+        None
+    }
+
+    /// Memoised: does this function's code contain a DirectEval whose var
+    /// environment is a FUNCTION activation (sloppy, non-global var env)?
+    fn func_has_sloppy_eval(&mut self, func_id: usize) -> bool {
+        if func_id >= self.sloppy_eval_memo.len() {
+            self.sloppy_eval_memo.resize(func_id + 1, 0);
+        }
+        match self.sloppy_eval_memo[func_id] {
+            1 => false,
+            2 => true,
+            _ => {
+                let has = self.func(func_id).code.iter().any(|i| {
+                    matches!(
+                        i,
+                        crate::bytecode::Instr::DirectEval {
+                            var_env_is_global: false,
+                            strict_caller: false,
+                            ..
+                        }
+                    )
+                });
+                self.sloppy_eval_memo[func_id] = if has { 2 } else { 1 };
+                has
+            }
+        }
+    }
+
+    /// The running activation's dynamic EvalScope: the frame's own, or the
+    /// one stamped on its callee (closures created under an eval scope).
+    pub(crate) fn frame_eval_scope(&self, frame_idx: usize) -> Option<u32> {
+        let f = &self.frames[frame_idx];
+        if f.eval_scope != u32::MAX {
+            return Some(f.eval_scope);
+        }
+        if f.callee.is_heap() {
+            return self.closure_eval_scope.get(&f.callee.heap_index()).copied();
+        }
+        None
+    }
+
+    /// Dynamic-first lookup for the LoadGlobalDyn family: the current
+    /// activation's EvalScope binding for the slot's NAME, if any.
+    pub(crate) fn eval_scope_lookup(&self, idx: u32) -> Option<Value> {
+        let fi = self.frames.len().checked_sub(1)?;
+        let sc = self.frame_eval_scope(fi)?;
+        let name = self.global_slot_name(idx)?;
+        match self.heap.get(sc) {
+            HeapObj::EvalScope(m) => m.get(&name).copied(),
+            _ => None,
+        }
+    }
+
+    /// Dynamic-first store: write an EXISTING EvalScope binding; false = fall
+    /// back to the ordinary global store.
+    pub(crate) fn eval_scope_store(&mut self, idx: u32, v: Value) -> bool {
+        let Some(fi) = self.frames.len().checked_sub(1) else {
+            return false;
+        };
+        let Some(sc) = self.frame_eval_scope(fi) else {
+            return false;
+        };
+        let Some(name) = self.global_slot_name(idx) else {
+            return false;
+        };
+        if let HeapObj::EvalScope(m) = self.heap.get_mut(sc) {
+            if let Some(slot) = m.get_mut(&name) {
+                *slot = v;
+                return true;
+            }
+        }
+        false
+    }
+
     /// PrivateFieldFind: the field's value for the EXACT (instance, brand,
     /// name), or None (spec: empty -> TypeError at the access site).
     pub(crate) fn private_field_get(&self, inst: Value, brand: u64, key: &str) -> Option<Value> {

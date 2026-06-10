@@ -63,7 +63,7 @@ impl<'p> Vm<'p> {
             self.regs_hw = new_base + reg_count;
         }
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false,
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -78,13 +78,20 @@ impl<'p> Vm<'p> {
             // Suspended at `GenStart`: the post-prologue window is live at the top.
             let back = self.regs.split_off(new_base);
             let handlers = std::mem::take(&mut self.pending_yield_handlers);
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Generator {
+            let esc = std::mem::replace(&mut self.pending_yield_eval_scope, u32::MAX);
+            let g = self.heap.alloc(HeapObj::Generator {
                 func: func_id,
                 closure,
                 state: GenState::Suspended(genstart_ip),
                 regs: back,
                 handlers,
-            })));
+            });
+            // A param-prologue direct eval created a dynamic EvalScope on the
+            // (now-parked) frame: keep it resolvable across suspensions.
+            if esc != u32::MAX {
+                self.closure_eval_scope.insert(g, esc);
+            }
+            return Ok(Value::heap(g));
         }
         // No marker was reached — either the prologue threw (propagate at the call
         // site) or, defensively (a proto with no `GenStart`), the body ran to
@@ -179,7 +186,7 @@ impl<'p> Vm<'p> {
             self.regs_hw = new_base + reg_count;
         }
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false,
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
             func: fid,
             base: new_base,
             ip: 0, // set below per resume kind
@@ -189,6 +196,11 @@ impl<'p> Vm<'p> {
             new_target: Value::UNDEFINED,
             callee: Value::UNDEFINED,
         });
+        // Restore the activation's dynamic EvalScope (created by a direct eval
+        // in the param prologue or an earlier resume), parked on the generator.
+        if let Some(&sc) = self.closure_eval_scope.get(&idx) {
+            self.frames[stop].eval_scope = sc;
+        }
         // A `yield*` suspension point (YieldDelegate) consumes ALL three resume
         // modes by DELIVERING (mode-code, value) into the loop's registers — the
         // loop then forwards next/throw/return to the inner iterator. This must NOT
@@ -274,6 +286,10 @@ impl<'p> Vm<'p> {
             // Re-suspended at another yield: park the window AND the live handlers.
             let back = self.regs.split_off(new_base);
             let parked = std::mem::take(&mut self.pending_yield_handlers);
+            let esc = std::mem::replace(&mut self.pending_yield_eval_scope, u32::MAX);
+            if esc != u32::MAX {
+                self.closure_eval_scope.insert(idx, esc);
+            }
             if let HeapObj::Generator { state, regs, handlers, .. } = self.heap.get_mut(idx) {
                 *state = GenState::Suspended(yield_ip);
                 *regs = back;
@@ -643,7 +659,7 @@ impl<'p> Vm<'p> {
             self.regs_hw = new_base + reg_count;
         }
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false,
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -654,6 +670,7 @@ impl<'p> Vm<'p> {
             callee: Value::UNDEFINED,
         });
         let outcome = self.run_loop(stop);
+        self.pending_yield_eval_scope = u32::MAX;
         let (state, regs) = if let Some((_v, genstart_ip)) = self.pending_yield.take() {
             // Suspended at `GenStart`: park at the marker, body runs on first next().
             (GenState::Suspended(genstart_ip), self.regs.split_off(new_base))
@@ -841,7 +858,7 @@ impl<'p> Vm<'p> {
             self.regs_hw = new_base + reg_count;
         }
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false,
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
             func: fid,
             base: new_base,
             ip: 0,
@@ -915,6 +932,7 @@ impl<'p> Vm<'p> {
             // them on resume — the await path already does this; the yield path used
             // to drop them.
             let handlers = std::mem::take(&mut self.pending_yield_handlers);
+            self.pending_yield_eval_scope = u32::MAX;
             let back = self.regs.split_off(new_base);
             let front = match self.heap.get_mut(idx) {
                 HeapObj::AsyncGenerator(g) => {
@@ -1548,7 +1566,7 @@ impl<'p> Vm<'p> {
             self.regs_hw = new_base + reg_count;
         }
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false,
+        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
             func: fid,
             base: new_base,
             ip: 0,

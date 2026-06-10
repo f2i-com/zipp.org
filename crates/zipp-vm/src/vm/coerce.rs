@@ -1166,6 +1166,7 @@ impl<'p> Vm<'p> {
                     "function".into()
                 }
                 HeapObj::Cell(inner) => self.display(*inner),
+                HeapObj::EvalScope(_) => "[object EvalScope]".into(),
                 HeapObj::Array(items) => items
                     .iter()
                     .map(|e| if e.is_nullish() { String::new() } else { self.display(*e) })
@@ -1327,6 +1328,7 @@ impl<'p> Vm<'p> {
             HeapObj::Bound { .. } => "[Function: bound]".into(),
             HeapObj::Native(_) => "[Function (native)]".into(),
             HeapObj::Cell(inner) => self.inspect_nested(*inner),
+            HeapObj::EvalScope(_) => "[object EvalScope]".into(),
             HeapObj::Array(items) => {
                 if items.is_empty() {
                     return "[]".into();
