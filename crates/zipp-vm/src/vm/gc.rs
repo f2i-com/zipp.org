@@ -135,6 +135,12 @@ impl Vm<'_> {
             root_idx!(cap);
             root_idx!(st.ns_idx);
         }
+        for v in self.deferred_ns_cache.values() {
+            root_val!(*v);
+        }
+        for v in self.module_errors.values() {
+            root_val!(*v);
+        }
         for v in self.closure_home.values() {
             root_val!(*v);
         }

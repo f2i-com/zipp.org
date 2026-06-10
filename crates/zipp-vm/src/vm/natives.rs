@@ -1371,6 +1371,8 @@ impl<'p> Vm<'p> {
                 o
             }
             OBJ_GET_OWN_SYMBOLS => {
+                let _a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.defer_check_all(_a0)?;
                 self.require_object_coercible(a0)?; // ToObject(O): null/undefined throw
                 // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
                 // back to their Symbol values via the prop_key registry.

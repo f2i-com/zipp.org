@@ -84,6 +84,7 @@ impl<'p> Vm<'p> {
     /// `delete obj[key]` honoring a Proxy `deleteProperty` trap (Result-returning
     /// so the trap can throw); else delegates to `delete_prop`.
     pub(crate) fn delete_property(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
+        self.defer_check(obj, key)?;
         if obj.is_heap()
             && key == "length"
             && self.arr_proto != 0

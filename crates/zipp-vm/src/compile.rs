@@ -1145,16 +1145,39 @@ impl Compiler {
             for s in body {
                 match s {
                     ox::Statement::ImportDeclaration(d) => {
-                        // Phase imports (`import source`/`import defer`) are
-                        // unmodelled proposals: their request is still LOADED
-                        // (host resolution failures must surface) but the
-                        // binding never links.
+                        // `import defer * as ns` binds the module's DEFERRED
+                        // namespace; `import source` (and other phase forms)
+                        // stay load-only.
                         if !matches!(d.phase, None) {
-                            fc.cx.module_imports.push(ImportEntry {
-                                local_slot: u32::MAX,
-                                import: ImportName::LoadOnly,
-                                specifier: d.source.value.to_string(),
-                            });
+                            let defer_ns_local = if matches!(d.phase, Some(ox::ImportPhase::Defer))
+                            {
+                                d.specifiers.as_ref().and_then(|specs| {
+                                    specs.iter().find_map(|sp| match sp {
+                                        ox::ImportDeclarationSpecifier::ImportNamespaceSpecifier(
+                                            i,
+                                        ) => Some(i.local.name.to_string()),
+                                        _ => None,
+                                    })
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(local) = defer_ns_local {
+                                let slot = fc.cx.global_slot(&local) as u32;
+                                fc.cx.decl_globals.insert(slot);
+                                fc.cx.const_globals.insert(slot);
+                                fc.cx.module_imports.push(ImportEntry {
+                                    local_slot: slot,
+                                    import: ImportName::DeferNamespace,
+                                    specifier: d.source.value.to_string(),
+                                });
+                            } else {
+                                fc.cx.module_imports.push(ImportEntry {
+                                    local_slot: u32::MAX,
+                                    import: ImportName::LoadOnly,
+                                    specifier: d.source.value.to_string(),
+                                });
+                            }
                             continue;
                         }
                         let spec = d.source.value.to_string();

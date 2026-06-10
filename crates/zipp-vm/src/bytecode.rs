@@ -721,6 +721,10 @@ pub enum ImportName {
     /// A phase import (`import source x from`): the request is LOADED (an
     /// unresolvable specifier is a host error) but never linked/evaluated.
     LoadOnly,
+    /// `import defer * as ns from` — the local binds the module's DEFERRED
+    /// namespace: the graph loads at link time but evaluates on first
+    /// (triggering) namespace access.
+    DeferNamespace,
 }
 
 /// One static import binding (or side-effect import) of a module.

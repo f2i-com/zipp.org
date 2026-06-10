@@ -537,6 +537,20 @@ pub struct Vm<'p> {
     /// top-level await, collected during the CURRENT import_module's link
     /// (mark/split_off discipline keeps nested links separate). GC ROOTS.
     link_pending_deps: Vec<Value>,
+    /// Canonical paths of modules whose BODY is currently executing — a
+    /// deferred-namespace trigger targeting one is a TypeError (you cannot
+    /// synchronously evaluate a module that is already mid-evaluation).
+    executing_modules: std::collections::HashSet<std::path::PathBuf>,
+    /// Modules whose evaluation completed ABRUPTLY: the thrown error is
+    /// permanent — every later import re-throws it without re-running the
+    /// body. Values are GC ROOTS.
+    module_errors: std::collections::HashMap<std::path::PathBuf, Value>,
+    /// Per-module DEFERRED namespace singleton (`import defer * as ns`):
+    /// canonical path → the deferred namespace object. Values are GC ROOTS.
+    deferred_ns_cache: std::collections::HashMap<std::path::PathBuf, Value>,
+    /// Deferred namespaces NOT YET evaluated: object idx → module path.
+    /// Removed when a triggering access evaluates the module.
+    deferred_ns_state: std::collections::HashMap<u32, std::path::PathBuf>,
     /// Async modules waiting on pending dependencies: capability-promise
     /// index → the state needed to run the body once the last dependency
     /// settles. Keys are GC roots (the capability promise must survive).

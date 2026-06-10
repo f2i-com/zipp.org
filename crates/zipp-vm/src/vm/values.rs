@@ -622,6 +622,12 @@ impl<'p> Vm<'p> {
             return Ok(false);
         }
         let idx = obj.heap_index();
+        if !self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx) {
+            let ks = self.key_of(key);
+            if Self::defer_key_triggers(&ks) {
+                self.defer_ns_trigger(idx)?;
+            }
+        }
         // A Proxy: dispatch the `has` trap (with the post-trap invariant), or
         // forward to the target's [[HasProperty]] when there is no trap.
         if let Some((target, handler, revoked)) = self.proxy_parts(idx) {

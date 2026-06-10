@@ -2172,6 +2172,7 @@ impl<'p> Vm<'p> {
                                 let o = self.to_object(a0)?;
                                 let key =
                                     self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                                self.defer_check(o, &key)?;
                                 self.ns_tdz_check(o, &key)?; // uninit export throws
                                 match self.proxy_gopd(o, &key)? {
                                     Some(d) => d,
@@ -2745,6 +2746,54 @@ impl<'p> Vm<'p> {
                                     Err(e) // bad options / import attributes
                                 } else if phase == 2 {
                                     Err(self.make_error(3, None)) // SyntaxError: source phase
+                                } else if phase == 1 {
+                                    // import.defer(): the DEFERRED namespace —
+                                    // loaded, not evaluated. An ASYNC target
+                                    // (top-level await) is the exception: the
+                                    // proposal evaluates a deferred graph's
+                                    // async modules EAGERLY, with the returned
+                                    // promise waiting on them.
+                                    match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
+                                        None => Err(self.make_error(1, None)),
+                                        Some(p) => match self.deferred_namespace_for(&p) {
+                                            Ok(ns) => {
+                                                let canon = std::fs::canonicalize(&p)
+                                                    .unwrap_or(p);
+                                                if ns.is_heap()
+                                                    && self
+                                                        .deferred_ns_state
+                                                        .contains_key(&ns.heap_index())
+                                                    && self.module_has_tla(&canon)
+                                                {
+                                                    match self.import_module(&canon, None) {
+                                                        Ok(real) => {
+                                                            // pending_module_body
+                                                            // (if TLA suspended)
+                                                            // flows to the
+                                                            // promise wiring.
+                                                            self.defer_ns_adopt(
+                                                                ns.heap_index(),
+                                                                real,
+                                                            );
+                                                            Ok(ns)
+                                                        }
+                                                        Err(Thrown(msg)) => Err(self
+                                                            .pending_throw
+                                                            .take()
+                                                            .unwrap_or_else(|| {
+                                                                self.error_from_thrown(&msg)
+                                                            })),
+                                                    }
+                                                } else {
+                                                    Ok(ns)
+                                                }
+                                            }
+                                            Err(Thrown(msg)) => Err(self
+                                                .pending_throw
+                                                .take()
+                                                .unwrap_or_else(|| self.error_from_thrown(&msg))),
+                                        },
+                                    }
                                 } else {
                                     match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
                                         None => Err(self.make_error(1, None)),

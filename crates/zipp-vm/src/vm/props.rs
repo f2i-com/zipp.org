@@ -306,6 +306,7 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
+        self.defer_check_all(obj)?;
         // A namespace with a still-uninitialized export throws from the per-key
         // [[GetOwnProperty]] walk (Object.keys/values/entries + for-in).
         self.ns_tdz_check_all(obj)?;
@@ -1042,6 +1043,7 @@ impl<'p> Vm<'p> {
 
     /// `Object.getOwnPropertyNames(obj)` — all own string keys (enumerable or not).
     pub(crate) fn object_own_property_names(&mut self, obj: Value) -> Result<Value, Thrown> {
+        self.defer_check_all(obj)?;
         // A Proxy reports its keys via the ownKeys trap; getOwnPropertyNames keeps
         // the STRING keys.
         if let Some(keys) = self.proxy_own_keys(obj)? {
@@ -1750,6 +1752,7 @@ impl<'p> Vm<'p> {
         key: &str,
         value: Value,
     ) -> Result<(), Thrown> {
+        self.defer_check(target, key)?; // CreateDataProperty = [[DefineOwnProperty]]
         let mut m = ObjMap::new();
         m.set("value", value);
         m.set("writable", Value::TRUE);
@@ -1763,6 +1766,7 @@ impl<'p> Vm<'p> {
     /// property with explicit attributes (unspecified attrs default to false on a
     /// new property; an existing non-configurable property rejects most changes).
     pub(crate) fn object_define_property(&mut self, obj: Value, key: &str, desc: Value) -> Result<(), Thrown> {
+        self.defer_check(obj, key)?;
         if !obj.is_heap() {
             return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
         }
@@ -2993,6 +2997,7 @@ impl<'p> Vm<'p> {
     /// delegation `obj` advances up the chain while `receiver` stays the original,
     /// so an INHERITED accessor's getter is invoked with the correct `this`.
     pub(crate) fn get_member(&mut self, obj: Value, key: &str, receiver: Value) -> Result<Value, Thrown> {
+        self.defer_check(obj, key)?; // a deferred-namespace Get may evaluate
         // Proxy `get` trap (or fall through to the target).
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {

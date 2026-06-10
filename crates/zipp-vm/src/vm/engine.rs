@@ -122,6 +122,10 @@ impl<'p> Vm<'p> {
             module_loading: std::collections::HashSet::new(),
             pending_module_body: None,
             link_pending_deps: Vec::new(),
+            deferred_ns_cache: std::collections::HashMap::new(),
+            deferred_ns_state: std::collections::HashMap::new(),
+            executing_modules: std::collections::HashSet::new(),
+            module_errors: std::collections::HashMap::new(),
             deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
@@ -1310,6 +1314,13 @@ impl<'p> Vm<'p> {
         if let Some(&ns) = self.module_cache.get(&path) {
             return Ok(ns);
         }
+        // A module that already FAILED evaluation re-throws the SAME error on
+        // every later import (its abrupt completion is permanent).
+        if let Some(&e) = self.module_errors.get(&path) {
+            let msg = self.throw_message(e);
+            self.pending_throw = Some(e);
+            return Err(Thrown(msg));
+        }
         // A typed import ({type:'json'|'text'}) builds a synthetic namespace
         // with a single `default` export; unknown types reject.
         if let Some(t) = mtype {
@@ -1474,6 +1485,10 @@ impl<'p> Vm<'p> {
                             let mut seen = std::collections::HashSet::new();
                             self.prescan_module_requests(&dep_canon, &mut seen)?;
                         }
+                    }
+                    IN::DeferNamespace => {
+                        let ns = self.deferred_namespace_for(&dep_raw)?;
+                        ns_writes.push((e.local_slot, ns));
                     }
                     IN::SideEffect => {
                         if !is_self && !in_flight {
@@ -1715,6 +1730,7 @@ impl<'p> Vm<'p> {
                         Ok(Value::heap(ns_idx))
                     };
                 }
+                self.executing_modules.insert(path.clone());
                 let exec = self
                     .execute_eval_program(
                         base_func,
@@ -1727,6 +1743,7 @@ impl<'p> Vm<'p> {
                         None,
                         None,
                     );
+                self.executing_modules.remove(&path);
                 match exec {
                     Ok(v) => {
                         // The body is an ASYNC activation: the result is its
@@ -1753,6 +1770,7 @@ impl<'p> Vm<'p> {
                                     *handled = true; // the loader consumes it
                                 }
                                 let msg = self.throw_message(r);
+                                self.module_errors.insert(path.clone(), r);
                                 self.pending_throw = Some(r);
                                 Err(Thrown(msg))
                             }
@@ -1908,6 +1926,181 @@ impl<'p> Vm<'p> {
             .module_namespaces
             .get(&ns.heap_index())
             .and_then(|m| m.get(name).copied()))
+    }
+
+    /// The DEFERRED namespace singleton for the module at `raw_path`
+    /// (`import defer * as ns` / `import.defer()`): the module's graph LOADS
+    /// now (resolution/parse failures surface at link time) but evaluation
+    /// waits for the first triggering access. The object starts as a sealed
+    /// null-proto carrier of just @@toStringTag = "Deferred Module"; a
+    /// trigger evaluates the module and copies the real namespace's bindings
+    /// into it (the spec's [[Deferred]] namespace is a distinct object from
+    /// the eager one, with its own tag).
+    pub(crate) fn deferred_namespace_for(
+        &mut self,
+        raw_path: &std::path::Path,
+    ) -> Result<Value, Thrown> {
+        let path = std::fs::canonicalize(raw_path).map_err(|_| {
+            Thrown(format!(
+                "TypeError: Failed to resolve module specifier '{}'",
+                raw_path.display()
+            ))
+        })?;
+        if let Some(&ns) = self.deferred_ns_cache.get(&path) {
+            return Ok(ns);
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.prescan_module_requests(&path, &mut seen)?;
+        let _gc = self.gc_lock_guard();
+        let tag = self.alloc_str("Deferred Module".to_string());
+        let mut m = crate::heap::ObjMap::new();
+        m.define(
+            "@@toStringTag",
+            tag,
+            crate::heap::PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: false,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
+        );
+        m.extensible = false;
+        let idx = self.heap.alloc(HeapObj::Object(m));
+        self.proto_of.insert(idx, Value::NULL);
+        self.deferred_ns_cache.insert(path.clone(), Value::heap(idx));
+        self.deferred_ns_state.insert(idx, path);
+        Ok(Value::heap(idx))
+    }
+
+    /// A TRIGGERING access on a deferred namespace: evaluate the module (and
+    /// its eager dependencies) now, then graft the real namespace's live-slot
+    /// map and snapshot keys onto the deferred object — keeping ITS
+    /// @@toStringTag. No-op for anything that is not an unevaluated deferred
+    /// namespace. Call sites gate on `deferred_ns_state` being non-empty.
+    pub(crate) fn defer_ns_trigger(&mut self, idx: u32) -> Result<(), Thrown> {
+        let Some(path) = self.deferred_ns_state.get(&idx).cloned() else {
+            return Ok(());
+        };
+        // The target module is ALREADY mid-evaluation (its own body, or a
+        // trigger that recursed back into it): a synchronous trigger cannot
+        // complete it — TypeError per the proposal.
+        if self.executing_modules.contains(&path) || self.module_loading.contains(&path) {
+            return Err(Thrown(
+                "TypeError: Cannot synchronously evaluate a deferred module that is currently evaluating"
+                    .into(),
+            ));
+        }
+        let real = self.import_module(&path, None)?;
+        // A TLA module's body may still be pending; its bindings update
+        // through the shared live slots as it completes.
+        self.pending_module_body = None;
+        self.defer_ns_adopt(idx, real);
+        Ok(())
+    }
+
+    /// Graft the REAL namespace's bindings onto deferred namespace `idx`
+    /// (live-slot map + snapshot keys), keeping the DEFERRED tag, and mark it
+    /// evaluated.
+    pub(crate) fn defer_ns_adopt(&mut self, idx: u32, real: Value) {
+        self.deferred_ns_state.remove(&idx);
+        if real.is_heap() {
+            let rid = real.heap_index();
+            if let Some(map) = self.module_namespaces.get(&rid).cloned() {
+                self.module_namespaces.insert(idx, map);
+            }
+            if let Some(amb) = self.module_ambiguous.get(&rid).cloned() {
+                self.module_ambiguous.insert(idx, amb);
+            }
+            // Copy the snapshot ObjMap (export keys for reflection), then
+            // restore the DEFERRED tag.
+            let real_map = match self.heap.get(rid) {
+                HeapObj::Object(m) => Some(m.clone()),
+                _ => None,
+            };
+            if let Some(mut m) = real_map {
+                let _gc = self.gc_lock_guard();
+                let tag = self.alloc_str("Deferred Module".to_string());
+                m.define(
+                    "@@toStringTag",
+                    tag,
+                    crate::heap::PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    },
+                );
+                m.extensible = false;
+                if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
+                    *slot = m;
+                }
+            }
+        }
+    }
+
+    /// Whether the module at canonical `path` uses TOP-LEVEL await (its body
+    /// compiles to an activation containing Await ops). Used by import.defer:
+    /// the proposal evaluates a deferred graph's ASYNC modules eagerly.
+    pub(crate) fn module_has_tla(&mut self, path: &std::path::Path) -> bool {
+        let Ok(code) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        let allocator = oxc_allocator::Allocator::default();
+        let ret =
+            oxc_parser::Parser::new(&allocator, &code, oxc_span::SourceType::mjs()).parse();
+        if !ret.errors.is_empty() {
+            return false;
+        }
+        let Ok(prog) = crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false) else {
+            return false;
+        };
+        prog.functions
+            .first()
+            .map(|f| {
+                f.code.iter().any(|i| {
+                    matches!(
+                        i,
+                        crate::bytecode::Instr::Await { .. }
+                            | crate::bytecode::Instr::ForAwaitNext { .. }
+                    )
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether a [[Get]]/[[Has]]/[[Delete]]/[[DefineOwnProperty]] key
+    /// TRIGGERS deferred evaluation: every STRING key except "then" (symbol
+    /// keys — "@@"-encoded — and "then" never trigger).
+    pub(crate) fn defer_key_triggers(key: &str) -> bool {
+        key != "then" && !key.starts_with("@@")
+    }
+
+    /// Trigger hook for KEYED operations on a possibly-deferred namespace.
+    /// Zero-cost when no unevaluated deferred namespace exists.
+    #[inline]
+    pub(crate) fn defer_check(&mut self, obj: Value, key: &str) -> Result<(), Thrown> {
+        if !self.deferred_ns_state.is_empty()
+            && obj.is_heap()
+            && Self::defer_key_triggers(key)
+            && self.deferred_ns_state.contains_key(&obj.heap_index())
+        {
+            self.defer_ns_trigger(obj.heap_index())?;
+        }
+        Ok(())
+    }
+
+    /// Trigger hook for [[OwnPropertyKeys]]-class operations (always trigger).
+    #[inline]
+    pub(crate) fn defer_check_all(&mut self, obj: Value) -> Result<(), Thrown> {
+        if !self.deferred_ns_state.is_empty()
+            && obj.is_heap()
+            && self.deferred_ns_state.contains_key(&obj.heap_index())
+        {
+            self.defer_ns_trigger(obj.heap_index())?;
+        }
+        Ok(())
     }
 
     /// The spec's LOADING phase for a module that is never evaluated (a phase

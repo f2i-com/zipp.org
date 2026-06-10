@@ -1795,7 +1795,9 @@ impl<'p> Vm<'p> {
             // class methods, which are always strict — so a failed [[Set]] (e.g. a
             // frozen receiver) is a TypeError, not a silent no-op.
             // OrdinarySetWithOwnDescriptor consults Receiver.[[GetOwnProperty]]
-            // FIRST: a namespace receiver's uninit export throws ReferenceError.
+            // FIRST: a deferred-namespace receiver triggers evaluation, and a
+            // namespace receiver's uninit export throws ReferenceError.
+            self.defer_check(this, key)?;
             self.ns_tdz_check(this, key)?;
             self.set_prop(this, key, v, true)?;
         }
@@ -1834,6 +1836,7 @@ impl<'p> Vm<'p> {
         if self.is_callable(setter) {
             self.call_value(setter, this, &[v])?;
         } else {
+            self.defer_check(this, key)?; // receiver [[GetOwnProperty]] may trigger
             self.ns_tdz_check(this, key)?; // receiver [[GetOwnProperty]] (TDZ)
             self.set_prop(this, key, v, true)?;
         }
@@ -2431,6 +2434,7 @@ impl<'p> Vm<'p> {
     /// `getOwnPropertyDescriptor` trap (or its target) rather than reporting `false`.
     /// Non-proxies fall back to the ordinary own-property check.
     pub(crate) fn has_own_property_dyn(&mut self, obj: Value, key: &str) -> Result<bool, Thrown> {
+        self.defer_check(obj, key)?;
         // HasOwnProperty is [[GetOwnProperty]]-based: an uninitialized
         // namespace export throws (unlike the `in` operator's [[HasProperty]]).
         self.ns_tdz_check(obj, key)?;
