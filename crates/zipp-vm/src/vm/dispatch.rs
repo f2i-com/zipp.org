@@ -2831,6 +2831,7 @@ impl<'p> Vm<'p> {
                                 Some(caller_this),
                                 inherit,
                                 ban_arguments,
+                                true,
                             )?
                         } else {
                             a0

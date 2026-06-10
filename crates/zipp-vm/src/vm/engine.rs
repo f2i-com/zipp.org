@@ -904,6 +904,7 @@ impl<'p> Vm<'p> {
         this_override: Option<Value>,
         inherit_super: Option<(u32, bool)>,
         ban_arguments: bool,
+        direct: bool,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -913,6 +914,27 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
+        // A DIRECT eval sees the caller's lexical private scope: the declared
+        // NAMES gate the compile-time early error; the brand CHAIN drives the
+        // runtime declaring-class resolution inside the eval'd code.
+        let (visible, caller_chain) = if direct {
+            match self.current_private_brands() {
+                Some(ch) => {
+                    let mut s = std::collections::HashSet::new();
+                    for b in ch {
+                        if let Some(names) = self.brand_private_names.get(b) {
+                            for (n, _) in names {
+                                s.insert(n.clone());
+                            }
+                        }
+                    }
+                    (s, Some(ch.clone()))
+                }
+                None => (std::collections::HashSet::new(), None),
+            }
+        } else {
+            (std::collections::HashSet::new(), None)
+        };
         // 2. Compile in eval mode (top-level returns its completion value).
         let eval_prog = match crate::compile::compile_eval(
             &ret.program,
@@ -921,12 +943,19 @@ impl<'p> Vm<'p> {
             force_new_target_ok,
             inherit_super.map(|(_, s)| s),
             ban_arguments,
+            visible,
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
-        self.run_eval_program(eval_prog, this_override, false, inherit_super.map(|(h, _)| h))
-            .map(|(v, _)| v)
+        self.run_eval_program(
+            eval_prog,
+            this_override,
+            false,
+            inherit_super.map(|(h, _)| h),
+            caller_chain,
+        )
+        .map(|(v, _)| v)
     }
 
     /// The `Array.fromAsync` implementation, as a lazily-compiled JS polyfill
@@ -973,7 +1002,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -997,7 +1026,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1030,7 +1059,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new()) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
@@ -1073,7 +1102,7 @@ impl<'p> Vm<'p> {
         // re-exports, then fill the namespace. The recursion carries only
         // (String, slot:u32) — no unrooted heap Value across a GC-triggering load.
         self.module_own.insert(path.clone(), own_map);
-        let exec = self.execute_eval_program(base_func, None);
+        let exec = self.execute_eval_program(base_func, None, None);
         let linked = match exec {
             Ok(_) => self.link_module_reexports(full, &reexports, &star_reexports, dir.as_deref()),
             Err(e) => Err(e),
@@ -1347,8 +1376,14 @@ impl<'p> Vm<'p> {
         &mut self,
         base_func: u32,
         this_override: Option<Value>,
+        caller_chain: Option<Vec<u64>>,
     ) -> Result<Value, Thrown> {
         let script = Value::heap(self.heap.alloc(HeapObj::Func(base_func)));
+        // A direct eval's code resolves the CALLER's private brand chain
+        // (frame.callee = this script value).
+        if let Some(ch) = caller_chain {
+            self.method_brand.insert(script.heap_index(), ch);
+        }
         let this = this_override.unwrap_or_else(|| {
             if self.global_this != 0 {
                 Value::heap(self.global_this)
@@ -1368,9 +1403,10 @@ impl<'p> Vm<'p> {
         this_override: Option<Value>,
         module: bool,
         caller_home: Option<u32>,
+        caller_chain: Option<Vec<u64>>,
     ) -> Result<(Value, Vec<u32>), Thrown> {
         let (gmap, base_func) = self.prepare_eval_program(eval_prog, module, caller_home)?;
-        let completion = self.execute_eval_program(base_func, this_override)?;
+        let completion = self.execute_eval_program(base_func, this_override, caller_chain)?;
         Ok((completion, gmap))
     }
 }

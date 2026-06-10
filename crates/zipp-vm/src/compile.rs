@@ -325,6 +325,15 @@ fn compile_program_inner(prog: &ox::Program, source: &str, module_mode: bool) ->
 /// evaluated expression statement) — what `eval("1 + 1")` must yield. The VM
 /// installs the resulting functions into its runtime function table and remaps
 /// the program's independently-numbered global slots onto the live globals.
+impl Compiler {
+    /// Whether `#name` (full key, '#'-prefixed) is declared by an enclosing
+    /// class body or visible to this direct eval.
+    fn private_name_declared(&self, key: &str) -> bool {
+        self.private_names_stack.iter().any(|v| v.iter().any(|n| n == key))
+            || self.eval_visible_privates.contains(key)
+    }
+}
+
 pub fn compile_eval(
     prog: &ox::Program,
     source: &str,
@@ -332,6 +341,7 @@ pub fn compile_eval(
     force_new_target_ok: bool,
     inherit_super: Option<bool>,
     ban_arguments: bool,
+    visible_privates: std::collections::HashSet<String>,
 ) -> R<Program> {
     let mut c = Compiler::new(source.to_string());
     c.eval_mode = true;
@@ -343,6 +353,7 @@ pub fn compile_eval(
     // caller's runtime class id. Plain nested functions still reset it.
     c.eval_inherit_super = inherit_super;
     c.in_field_init = ban_arguments;
+    c.eval_visible_privates = visible_privates;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);
@@ -422,6 +433,13 @@ struct Compiler {
     /// call only (consumed at its entry), so the ctor body — and nothing else —
     /// gets derived-ctor this-TDZ checks.
     compiling_ctor: bool,
+    /// Private names declared by each enclosing class body (innermost last),
+    /// pushed by compile_class / popped by build_class_into. A private access
+    /// whose name no enclosing class declares is an early SyntaxError.
+    private_names_stack: Vec<Vec<String>>,
+    /// For DIRECT eval programs: private names lexically visible at the eval
+    /// call site (the caller's brand-chain names). Empty otherwise.
+    eval_visible_privates: std::collections::HashSet<String>,
     /// True while compiling a derived class's constructor BODY (and read by
     /// arrows lexically inside it). Gates `ThisCheck` emission on `this` reads
     /// and super-property references.
@@ -485,6 +503,8 @@ impl Compiler {
             class_enclosing: Vec::new(),
             class_derived: false,
             compiling_ctor: false,
+            private_names_stack: Vec::new(),
+            eval_visible_privates: std::collections::HashSet::new(),
             in_derived_ctor: false,
             const_globals: HashSet::new(),
             lexical_globals: HashSet::new(),
@@ -2924,6 +2944,7 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
+        self.cx.private_names_stack.pop();
         Ok(())
     }
 
@@ -3117,6 +3138,30 @@ impl<'a> FnCompiler<'a> {
                 _ => return Err("unsupported class member in the zipp-vm subset".into()),
             }
         }
+        // The class's private names are lexically visible to everything
+        // compiled within its body (heritage, methods, field inits, static
+        // blocks, nested evals). Pushed here; build_class_into pops when the
+        // class-creation emission (incl. static-element phases) completes.
+        let mut declared_privates: Vec<String> = Vec::new();
+        for n in fields.iter().map(|(n, _)| n).chain(static_fields.iter().map(|(n, _)| n)) {
+            if n.starts_with('#') {
+                declared_privates.push(n.clone());
+            }
+        }
+        for n in methods
+            .iter()
+            .map(|(n, _)| n)
+            .chain(getters.iter().map(|(n, _)| n))
+            .chain(setters.iter().map(|(n, _)| n))
+            .chain(statics.iter().map(|(n, _)| n))
+            .chain(static_getters.iter().map(|(n, _)| n))
+            .chain(static_setters.iter().map(|(n, _)| n))
+        {
+            if n.starts_with('#') {
+                declared_privates.push(n.clone());
+            }
+        }
+        self.cx.private_names_stack.push(declared_privates);
         // Method protos.
         let mut method_defs: Vec<(String, u32)> = Vec::new();
         for (mname, func) in &methods {
@@ -3495,6 +3540,20 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::MakeClosure { dst, func_id: id });
         } else {
             self.emit(Instr::MakeFunc { dst, func_id: id });
+        }
+    }
+
+    /// Early SyntaxError (spec: AllPrivateIdentifiersValid) for a private
+    /// access whose name no enclosing class declares (and, in a direct eval,
+    /// is not visible from the call site).
+    fn check_private_declared(&self, raw: &str) -> R<()> {
+        let key = private_key(raw);
+        if self.cx.private_name_declared(&key) {
+            Ok(())
+        } else {
+            Err(format!(
+                "SyntaxError: Private field '{key}' must be declared in an enclosing class"
+            ))
         }
     }
 
@@ -4962,6 +5021,7 @@ impl<'a> FnCompiler<'a> {
             E::ComputedMemberExpression(m) => self.computed_member(m, dst),
             E::PrivateFieldExpression(p) => {
                 // `obj.#field` → read the reserved "#field" property.
+                self.check_private_declared(&p.field.name)?;
                 let obj = self.expr(&p.object)?;
                 if p.optional {
                     self.emit_optional_check(obj);
@@ -4973,6 +5033,7 @@ impl<'a> FnCompiler<'a> {
             // `#field in obj` — private brand check (private fields are stored as
             // the reserved "#field" property, so this is a HasProp on that key).
             E::PrivateInExpression(p) => {
+                self.check_private_declared(&p.left.name)?;
                 let kr = self.temp();
                 let idx = self.add_string_const(&private_key(&p.left.name));
                 self.emit(Instr::LoadConst { dst: kr, idx });
@@ -5132,6 +5193,7 @@ impl<'a> FnCompiler<'a> {
             // `o?.#field` (and nested `?.` links inside the object register
             // their own bails): the GetProp private path handles brand checks.
             ox::ChainElement::PrivateFieldExpression(p) => {
+                self.check_private_declared(&p.field.name)?;
                 let obj = self.expr(&p.object)?;
                 if p.optional {
                     self.emit_optional_check(obj);
@@ -5820,6 +5882,7 @@ impl<'a> FnCompiler<'a> {
             }
             // `obj.#x++` — like a static member, keyed "#x".
             ox::SimpleAssignmentTarget::PrivateFieldExpression(p) => {
+                self.check_private_declared(&p.field.name)?;
                 let obj = self.expr(&p.object)?;
                 let name = self.string_name(&private_key(&p.field.name));
                 let cur = self.temp();
@@ -6240,6 +6303,7 @@ impl<'a> FnCompiler<'a> {
                 // `[this.#x] = arr` / `({a: this.#x} = o)`: a private field as a
                 // destructuring target — brand-checked PrivateSet (the target
                 // reference is taken before the value per the destructuring driver).
+                self.check_private_declared(&m.field.name)?;
                 let save = self.next_reg;
                 let obj = self.expr(&m.object)?;
                 let name = self.string_name(&private_key(&m.field.name));
@@ -6292,6 +6356,7 @@ impl<'a> FnCompiler<'a> {
                 Ok(())
             }
             M::PrivateFieldExpression(m) => {
+                self.check_private_declared(&m.field.name)?;
                 let save = self.next_reg;
                 let obj = self.expr(&m.object)?;
                 let name = self.string_name(&private_key(&m.field.name));
@@ -6578,6 +6643,7 @@ impl<'a> FnCompiler<'a> {
             }
             // `obj.#x = v` / `obj.#x op= v` — same as a static member, keyed "#x".
             ox::AssignmentTarget::PrivateFieldExpression(p) => {
+                self.check_private_declared(&p.field.name)?;
                 let obj = self.expr(&p.object)?;
                 let name = self.string_name(&private_key(&p.field.name));
                 if is_logical {
@@ -7680,6 +7746,7 @@ impl<'a> FnCompiler<'a> {
         }
         // Private method call `obj.#m(args…)` → CallMethod on the "#m" key.
         if let ox::Expression::PrivateFieldExpression(p) = &c.callee {
+            self.check_private_declared(&p.field.name)?;
             let obj = self.expr(&p.object)?;
             let name = self.string_name(&private_key(&p.field.name));
             let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
