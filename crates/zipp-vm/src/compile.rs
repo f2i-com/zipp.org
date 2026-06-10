@@ -478,6 +478,34 @@ pub fn compile_eval(
                 c.eval_dynamic_names.insert(n);
             }
         }
+        // Annex B.3.3: a BLOCK-level function declaration in this sloppy eval
+        // also creates a function-scoped binding — in the CALLER's EvalScope,
+        // exactly like the eval's top-level vars (never a realm global).
+        let mut blockers = std::collections::HashSet::new();
+        for s in &prog.body {
+            match s {
+                ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                    for decl in &d.declarations {
+                        capture::collect_pattern_names(&decl.id, &mut blockers);
+                    }
+                }
+                ox::Statement::ClassDeclaration(cd) => {
+                    if let Some(id) = &cd.id {
+                        blockers.insert(id.name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut b33 = std::collections::HashSet::new();
+        for s in &prog.body {
+            collect_b33_block_fns(s, false, &blockers, &mut b33);
+        }
+        for n in b33 {
+            if !caller_scope.iter().any(|c| *c == n) {
+                c.eval_dynamic_names.insert(n);
+            }
+        }
     }
     c.eval_caller_scope = caller_scope;
     // A STRICT eval (strict caller or "use strict" source) gets its own
@@ -1101,6 +1129,14 @@ impl Compiler {
                     // evals). The function itself stays BLOCK-local;
                     // func_decl copies the value out when the declaration
                     // evaluates. An existing-function name keeps its binding.
+                    // A sloppy fn-context eval binds these in the CALLER's
+                    // EvalScope (or updates a caller binding) instead — no
+                    // realm global is created.
+                    if fc.cx.eval_dynamic_names.contains(name)
+                        || fc.cx.eval_caller_scope.iter().any(|n| n == name)
+                    {
+                        continue;
+                    }
                     if !fn_names.contains(name) {
                         let slot = fc.cx.global_slot(name) as u32;
                         if !fc.cx.hoisted_globals.contains(&slot) {
@@ -3330,10 +3366,28 @@ impl<'a> FnCompiler<'a> {
                     .and_then(|s| s.iter().find(|(nm, _)| nm == n).map(|(_, r)| *r)),
                 _ => None,
             };
-            // SCRIPT-level B.3.3: the block function ALSO updates its global
-            // var binding when the declaration evaluates (SetMutableBinding).
+            // SCRIPT-level B.3.3: the block function ALSO updates its
+            // function-scoped binding when the declaration evaluates
+            // (SetMutableBinding): the global var slot normally, the CALLER
+            // BINDING (an upvalue the eval root seeded) when this is a sloppy
+            // fn-context eval whose caller declares the same name.
+            let caller_b33_upval = match name.as_deref() {
+                Some(n)
+                    if self.is_script
+                        && self.b33_names.contains(n)
+                        && self.cx.eval_fn_context
+                        && self.cx.eval_caller_scope.iter().any(|c| c == n) =>
+                {
+                    self.resolve_upvalue(n)
+                }
+                _ => None,
+            };
             let script_b33_slot = match name.as_deref() {
-                Some(n) if self.is_script && self.b33_names.contains(n) => {
+                Some(n)
+                    if self.is_script
+                        && self.b33_names.contains(n)
+                        && caller_b33_upval.is_none() =>
+                {
                     Some(self.cx.global_slot(n) as u32)
                 }
                 _ => None,
@@ -3357,6 +3411,9 @@ impl<'a> FnCompiler<'a> {
                             self.emit(Instr::StoreGlobal { idx: slot, src: reg });
                         }
                     }
+                    if let Some(ui) = caller_b33_upval {
+                        self.emit(Instr::UpvalSet { idx: ui, src: reg });
+                    }
                 }
                 Some(Binding::LocalCell(cell)) => {
                     let tmp = self.temp();
@@ -3375,6 +3432,9 @@ impl<'a> FnCompiler<'a> {
                         } else {
                             self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
                         }
+                    }
+                    if let Some(ui) = caller_b33_upval {
+                        self.emit(Instr::UpvalSet { idx: ui, src: tmp });
                     }
                     self.next_reg -= 1;
                 }
