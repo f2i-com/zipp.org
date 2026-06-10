@@ -392,6 +392,10 @@ pub struct Vm<'p> {
     asyncgen_fn_ctor: u32,
     asyncgen_fn_proto: u32,
     arr_proto: u32,
+    /// %Array.prototype%'s own `length` (it is an Array EXOTIC object):
+    /// tracks integer-index definitions on it; writable, non-enumerable,
+    /// non-configurable.
+    arr_proto_len: u32,
     /// The `Array` constructor (the `%Array%` intrinsic). 0 until setup. Used by
     /// ArraySpeciesCreate to take the fast dense path when the resolved species is
     /// just `%Array%` itself.

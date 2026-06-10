@@ -2182,6 +2182,10 @@ impl<'p> Vm<'p> {
         if !obj.is_heap() {
             return false;
         }
+        // %Array.prototype%'s exotic own length.
+        if key == "length" && self.arr_proto != 0 && obj.heap_index() == self.arr_proto {
+            return true;
+        }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Object(m) => {
                 m.pos(key).is_some()

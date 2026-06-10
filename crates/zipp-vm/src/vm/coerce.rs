@@ -75,6 +75,10 @@ impl<'p> Vm<'p> {
         if !v.is_heap() {
             return Ok(false);
         }
+        // %Array.prototype% is itself an Array exotic object.
+        if self.arr_proto != 0 && v.heap_index() == self.arr_proto {
+            return Ok(true);
+        }
         let mut idx = v.heap_index();
         for _ in 0..1000 {
             match self.heap.get(idx) {
@@ -100,6 +104,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn value_is_array(&self, v: Value) -> bool {
         if !v.is_heap() {
             return false;
+        }
+        // %Array.prototype% is itself an Array exotic object.
+        if self.arr_proto != 0 && v.heap_index() == self.arr_proto {
+            return true;
         }
         let mut idx = v.heap_index();
         for _ in 0..1000 {

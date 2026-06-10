@@ -249,7 +249,27 @@ impl<'p> Vm<'p> {
         // A callable object that isn't one of the explicit function heap variants —
         // notably a built-in constructor global (Array/Map/Temporal.PlainDate/…),
         // which zipp stores as an `is_ctor` HeapObj::Object — is still "Function".
-        let callable = this.is_heap() && self.is_callable(this);
+        // [[Call]] pierces a proxy chain (a proxy over a callable IS callable);
+        // the builtinTag then flows through the @@toStringTag override below,
+        // so a proxied ASYNC function still tags "AsyncFunction" via the Get.
+        let callable = this.is_heap()
+            && (self.is_callable(this) || {
+                let mut t = this;
+                while t.is_heap() {
+                    match self.proxy_parts(t.heap_index()) {
+                        Some((t2, _, _)) => t = t2,
+                        None => break,
+                    }
+                }
+                t.is_heap() && t != this && self.is_callable(t)
+            });
+        // Step 4 IsArray(O) pierces proxy targets (revoked throws) — "Array".
+        if this.is_heap()
+            && self.proxy_parts(this.heap_index()).is_some()
+            && self.value_is_array_throwing(this)?
+        {
+            return Ok("Array".to_string());
+        }
         let builtin = if this.is_heap() {
             match self.heap.get(this.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "String",

@@ -3946,6 +3946,20 @@ impl<'p> Vm<'p> {
                         ));
                     }
                 }
+                // Array.prototype.toString: func = Get(array, "join"), Call it
+                // when callable, else the %Object.prototype.toString% intrinsic
+                // (NOT a Get of "toString" — the test deletes it) — 23.1.3.36.
+                if kind == 0 && m == "toString" {
+                    self.require_object_coercible(this)?;
+                    let recv = self.to_object(this)?;
+                    let f = self.get_prop(recv, "join")?;
+                    return Ok(if self.is_callable(f) {
+                        self.call_value(f, recv, &[])?
+                    } else {
+                        let tag = self.object_to_string_tag(recv)?;
+                        self.alloc_str(format!("[object {tag}]"))
+                    });
+                }
                 // Number/Boolean receivers are primitive values; the rest are heap.
                 if kind == 2 {
                     self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)

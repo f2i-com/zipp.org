@@ -83,6 +83,14 @@ impl<'p> Vm<'p> {
     /// `delete obj[key]` honoring a Proxy `deleteProperty` trap (Result-returning
     /// so the trap can throw); else delegates to `delete_prop`.
     pub(crate) fn delete_property(&mut self, obj: Value, key: &str) -> Result<Value, Thrown> {
+        if obj.is_heap()
+            && key == "length"
+            && self.arr_proto != 0
+            && obj.heap_index() == self.arr_proto
+        {
+            // %Array.prototype%'s exotic `length` is non-configurable.
+            return Ok(Value::bool(false));
+        }
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
                 if revoked {
@@ -522,6 +530,31 @@ impl<'p> Vm<'p> {
         // just like defineProperty — flag it so index stores/mutators consult
         // the prototype chain (two integer compares for ordinary receivers).
         self.note_array_proto_index(obj.heap_index(), key);
+        // %Array.prototype%.length = n: ArraySetLength on the exotic prototype
+        // (double coercion, RangeError on non-uint32, truncation deletes its
+        // own integer-index properties >= n).
+        if key == "length" && obj.heap_index() == self.arr_proto && self.arr_proto != 0 {
+            let nu = self.to_number_coerce(val)?;
+            let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
+            let number_len = self.to_number_coerce(val)?;
+            if u != number_len {
+                return Err(Thrown("RangeError: Invalid array length".into()));
+            }
+            let n = u as u32;
+            if let HeapObj::Object(m) = self.heap.get_mut(self.arr_proto) {
+                let doomed: Vec<String> = m
+                    .keys
+                    .iter()
+                    .filter(|k| canonical_index_str(k).is_some_and(|i| i >= n as usize))
+                    .cloned()
+                    .collect();
+                for k in doomed {
+                    m.remove(&k);
+                }
+            }
+            self.arr_proto_len = n;
+            return Ok(());
+        }
         // Proxy `set` trap (or fall through to the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
             if revoked {

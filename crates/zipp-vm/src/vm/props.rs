@@ -842,6 +842,11 @@ impl<'p> Vm<'p> {
             return Value::UNDEFINED;
         }
         let idx = obj.heap_index();
+        // %Array.prototype%'s exotic own `length`.
+        if idx == self.arr_proto && key == "length" {
+            let v = Value::num(self.arr_proto_len as f64);
+            return self.make_data_descriptor(v, true, false, false);
+        }
         // A callable's `name`/`length`: non-writable, non-enumerable, configurable.
         if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
             if let Some(v) = self.callable_intrinsic_value(obj, key) {
@@ -2412,6 +2417,16 @@ impl<'p> Vm<'p> {
             && canonical_index_str(key).is_some()
         {
             self.array_proto_has_index = true;
+            // %Array.prototype% is an Array exotic: an index definition on it
+            // grows its own `length` (ArraySetLength step for index defines).
+            if obj_idx == self.arr_proto {
+                if let Some(i) = canonical_index_str(key) {
+                    let want = (i as u64 + 1).min(u32::MAX as u64) as u32;
+                    if want > self.arr_proto_len {
+                        self.arr_proto_len = want;
+                    }
+                }
+            }
         }
     }
 
@@ -3438,6 +3453,11 @@ impl<'p> Vm<'p> {
             HeapObj::Object(map) => {
                 if let Some(v) = map.get(key) {
                     return Ok(v);
+                }
+                // %Array.prototype% is an Array exotic object with an own
+                // `length` (tracks its integer-index definitions).
+                if obj.heap_index() == self.arr_proto && key == "length" {
+                    return Ok(Value::num(self.arr_proto_len as f64));
                 }
                 // `globalThis.X` → the reserved global slot named X.
                 if obj.heap_index() == self.global_this && self.global_this != 0 {
