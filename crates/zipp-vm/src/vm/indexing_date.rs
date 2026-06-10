@@ -381,6 +381,20 @@ impl<'p> Vm<'p> {
                 return self.reject_write(&self.key_of(key), strict);
             }
         }
+        // An ARGUMENTS object's `length` is a fixed own data property (argc):
+        // an index store past the dense window creates an ordinary named own
+        // property in the side table instead of growing the Vec (which would
+        // grow `length`).
+        if let Some(i) = array_index(key) {
+            if self.arguments_objs.contains(&idx)
+                && matches!(self.heap.get(idx), HeapObj::Array(items) if i >= items.len())
+            {
+                let k = self.key_of(key);
+                self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(&k, val);
+                self.heap.bump_version(idx);
+                return Ok(());
+            }
+        }
         match self.heap.get_mut(idx) {
             HeapObj::Array(items) => {
                 // Numeric key (incl. an integral double — the JIT region produces

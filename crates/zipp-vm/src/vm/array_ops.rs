@@ -1162,6 +1162,45 @@ impl<'p> Vm<'p> {
                     let v = self.get_index(Value::heap(idx), Value::num(k))?;
                     return Ok(Some(v));
                 }
+                // join/toString/toLocaleString run LIVE against the receiver:
+                // len = ToLength(Get(O,'length')) FIRST, then (join) the
+                // separator coerces, then ONE Get per index — a separator
+                // toString or an element toLocaleString that resizes the
+                // receiver (resizable-buffer TA) is observed per element.
+                if matches!(name, "join" | "toString" | "toLocaleString") {
+                    let lv = self.get_prop(Value::heap(idx), "length")?;
+                    let lenf = self.to_number_coerce(lv)?;
+                    let len = if lenf.is_nan() || lenf <= 0.0 {
+                        0usize
+                    } else {
+                        (lenf.trunc().min(9_007_199_254_740_991.0) as usize)
+                            .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                    };
+                    let sep = if name == "join" && arg0 != Value::UNDEFINED {
+                        self.to_js_string(arg0)?
+                    } else {
+                        ",".to_string()
+                    };
+                    let mut parts: Vec<String> = Vec::with_capacity(len.min(4096));
+                    for k in 0..len {
+                        let v = self.get_index(Value::heap(idx), Value::num(k as f64))?;
+                        if v.is_nullish() {
+                            parts.push(String::new());
+                        } else if name == "toLocaleString" {
+                            let f = self.get_prop(v, "toLocaleString")?;
+                            let s = if self.is_callable(f) {
+                                let r = self.call_value(f, v, &[])?;
+                                self.display(r)
+                            } else {
+                                self.display(v)
+                            };
+                            parts.push(s);
+                        } else {
+                            parts.push(self.to_js_string(v)?);
+                        }
+                    }
+                    return Ok(Some(self.alloc_str(parts.join(&sep))));
+                }
                 // toSpliced runs the spec copy loops directly: a DISCARDED element
                 // (actualStart..actualStart+actualDeleteCount) is never read — the
                 // snapshot path would invoke its getter.
@@ -1431,7 +1470,14 @@ impl<'p> Vm<'p> {
                 } else {
                     self.to_js_string(arg0)?
                 };
-                let snapshot = self.array_snapshot(idx);
+                // Non-clean (side table / holes): per-index proto-aware Get —
+                // an inherited Array.prototype[k] at a hole joins its VALUE.
+                let snapshot = if self.arr_props.contains_key(&idx) || self.array_has_holes(idx)
+                {
+                    self.array_snapshot_get(idx)?
+                } else {
+                    self.array_snapshot(idx)
+                };
                 let mut parts: Vec<String> = Vec::with_capacity(snapshot.len());
                 for v in snapshot {
                     parts.push(if v.is_nullish() { String::new() } else { self.to_js_string(v)? });
@@ -2112,7 +2158,12 @@ impl<'p> Vm<'p> {
             }
             "toLocaleString" => {
                 // Join each element's own toLocaleString() with ","; nullish → "".
-                let snapshot = self.array_snapshot(idx);
+                let snapshot = if self.arr_props.contains_key(&idx) || self.array_has_holes(idx)
+                {
+                    self.array_snapshot_get(idx)?
+                } else {
+                    self.array_snapshot(idx)
+                };
                 let mut parts: Vec<String> = Vec::with_capacity(snapshot.len());
                 for v in snapshot {
                     if v.is_nullish() {

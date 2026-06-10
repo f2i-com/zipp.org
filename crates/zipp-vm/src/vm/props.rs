@@ -1897,7 +1897,11 @@ impl<'p> Vm<'p> {
                         && attr.writable
                         && attr.enumerable
                         && attr.configurable;
-                    if is_default_data {
+                    // An ARGUMENTS object: an index define past the dense
+                    // window is an ordinary named own property — `length`
+                    // (items.len()) must stay argc, so never grow the Vec.
+                    let args_past = i >= dense_len && self.arguments_objs.contains(&idx);
+                    if is_default_data && !args_past {
                         // Lives in the dense Vec; drop any stale special override.
                         if let Some(m) = self.arr_props.get_mut(&idx) {
                             m.remove(&key_i);
@@ -1911,8 +1915,8 @@ impl<'p> Vm<'p> {
                         }
                     } else {
                         // Special: store in arr_props and keep a dense placeholder so
-                        // `length` counts the index.
-                        if i >= dense_len {
+                        // `length` counts the index (NOT for arguments — see above).
+                        if i >= dense_len && !args_past {
                             if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                                 // Intervening slots are HOLES; the slot at `i`
                                 // itself is only a placeholder (presence comes
