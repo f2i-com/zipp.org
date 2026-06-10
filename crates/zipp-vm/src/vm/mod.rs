@@ -262,7 +262,13 @@ pub struct Vm<'p> {
     /// chain whose class actually declares it (precise + shadow-aware) instead of
     /// accepting ANY chain brand. A name absent here falls back to the lenient
     /// any-brand check. Keyed by brand; pruned by GC to brands still referenced.
-    brand_private_names: std::collections::HashMap<u64, Vec<String>>,
+    brand_private_names: std::collections::HashMap<u64, Vec<(String, u8)>>,
+    /// Brand -> heap index of the class VALUE that minted it (the DECLARING
+    /// class), so a private access resolves members from the declaring class
+    /// rather than the receiver's chain (kind-aware: shadowed/missing
+    /// getter/setter errors). NOT a GC root: pruned when the class dies (no
+    /// live accessor can then need it).
+    brand_owner: std::collections::HashMap<u64, u32>,
     /// Lazily-created `.prototype` object for a function/class value, keyed by the
     /// callable's heap index. `Fn.prototype` / `Class.prototype` must return a
     /// stable object (identity: `C.prototype === C.prototype`), so it is built on

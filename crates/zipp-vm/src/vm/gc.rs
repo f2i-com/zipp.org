@@ -297,6 +297,7 @@ impl Vm<'_> {
         self.regexp_string_iters.retain(|&k, _| marks[k as usize]);
         self.method_brand.retain(|&k, _| marks[k as usize]);
         self.instance_brand.retain(|&k, _| marks[k as usize]);
+        self.brand_owner.retain(|_, &mut c| marks[c as usize]);
         // Keep declared-name records only for brands still referenced by a live
         // lexical chain or instance brand (these maps were just pruned by marks).
         if !self.brand_private_names.is_empty() {

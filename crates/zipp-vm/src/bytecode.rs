@@ -1029,4 +1029,8 @@ pub struct ClassDef {
     /// in the lists above); lets a private access resolve to the precise
     /// declaring class instead of accepting any brand in the lexical chain.
     pub instance_field_names: Vec<String>,
+    /// Names of STATIC fields (incl. "#" private ones) — separate from the
+    /// instance list because a static private's brand lives on the class
+    /// VALUE, not on instances (kind bit 8 at MakeClass registration).
+    pub static_field_names: Vec<String>,
 }

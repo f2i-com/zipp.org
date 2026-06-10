@@ -2978,6 +2978,7 @@ impl<'a> FnCompiler<'a> {
             static_setters: Vec::new(),
             source: String::new(), // filled in below once the body is compiled
             instance_field_names: Vec::new(),
+            static_field_names: Vec::new(),
         });
         self.cx.class_names.push((cname.clone(), class_id));
         // The methods/ctor/field-inits of this class close over the function that
@@ -3387,8 +3388,9 @@ impl<'a> FnCompiler<'a> {
         for (n, _) in &fields {
             instance_field_names.push(n.clone());
         }
+        let mut static_field_names: Vec<String> = Vec::new();
         for (n, _) in &static_fields {
-            instance_field_names.push(n.clone());
+            static_field_names.push(n.clone());
         }
         self.cx.classes[class_id as usize] = ClassDef {
             name: cname,
@@ -3403,6 +3405,7 @@ impl<'a> FnCompiler<'a> {
             static_setters: static_setter_defs,
             source: self.cx.src_slice(class.span.start, class.span.end),
             instance_field_names,
+            static_field_names,
         };
         self.cx.class_enclosing = saved_enclosing;
         self.cx.class_derived = saved_derived;

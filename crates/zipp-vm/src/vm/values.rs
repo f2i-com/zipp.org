@@ -313,7 +313,11 @@ impl<'p> Vm<'p> {
             Some(&b) => b,
             None => return Ok(()),
         };
-        if self.brand_private_names.contains_key(&own) {
+        let has_instance_privates = self
+            .brand_private_names
+            .get(&own)
+            .is_some_and(|ns| ns.iter().any(|(_, k)| k & 8 == 0));
+        if has_instance_privates {
             if is_override && self.instance_has_brand(inst, own) {
                 return Err(Thrown(
                     "TypeError: cannot initialize the same private elements twice on an object"
@@ -333,6 +337,73 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// Declaring-class private resolution (kind-aware): walk the ACCESSING
+    /// code's lexical brand chain innermost-first; for the first brand that
+    /// DECLARES `key`, return (brand, kind, declaring-class heap idx). `None`
+    /// when the chain is unresolvable, the name is foreign to the chain, or
+    /// the declaring class value is unknown — the caller keeps its textual
+    /// path. kind bits: 1 = method, 2 = getter, 4 = setter; 0 = field.
+    pub(crate) fn resolve_private(&self, key: &str) -> Option<(u64, u8, u32)> {
+        let chain = self.current_private_brands()?;
+        for &b in chain.iter() {
+            if let Some(names) = self.brand_private_names.get(&b) {
+                if let Some(kind) = names.iter().find(|(n, _)| n == key).map(|&(_, k)| k) {
+                    let owner = *self.brand_owner.get(&b)?;
+                    return Some((b, kind, owner));
+                }
+            }
+        }
+        None
+    }
+
+    /// A private member's VALUE from its DECLARING class. `want`: 1 = method,
+    /// 2 = getter, 4 = setter (each searches the instance + static lists; a
+    /// class cannot declare the same private name twice, so order is moot).
+    pub(crate) fn private_member_from_owner(&self, owner: u32, key: &str, want: u8) -> Option<Value> {
+        let HeapObj::Class(c) = self.heap.get(owner) else {
+            return None;
+        };
+        let from = |list: &[(String, Value)]| {
+            list.iter().find(|(n, _)| n == key).map(|&(_, v)| v)
+        };
+        let is_static = want & 8 != 0;
+        match want & 7 {
+            1 => {
+                if is_static {
+                    c.statics.get(key)
+                } else {
+                    from(&c.methods)
+                }
+            }
+            2 => from(if is_static { &c.static_getters } else { &c.getters }),
+            4 => from(if is_static { &c.static_setters } else { &c.setters }),
+            _ => None,
+        }
+    }
+
+    /// Spec-side brand check for a RESOLVED private member: a STATIC member's
+    /// brand lives on the declaring class VALUE itself (PrivateBrandAdd(F, F) —
+    /// not on subclasses, not on instances); an INSTANCE member's brand lives
+    /// on constructed instances (map.class chain or return-override extras) —
+    /// never on the class value.
+    pub(crate) fn private_receiver_ok(&self, recv: Value, b: u64, kind: u8, owner: u32) -> bool {
+        if !recv.is_heap() {
+            return false;
+        }
+        if kind & 8 != 0 {
+            return recv.heap_index() == owner;
+        }
+        if matches!(self.heap.get(recv.heap_index()), HeapObj::Class(_)) {
+            // A class value reads an INSTANCE private only if it was itself
+            // branded as a return-override instance.
+            return self
+                .instance_brand
+                .get(&recv.heap_index())
+                .is_some_and(|bs| bs.contains(&b));
+        }
+        self.instance_has_brand(recv, b)
+    }
+
     /// Brand-aware private presence for accessing private name `key`:
     /// `Some(true/false)` when the accessing class body's brand chain is
     /// resolvable, `None` when not (the caller keeps its textual check).
@@ -350,7 +421,7 @@ impl<'p> Vm<'p> {
             if self
                 .brand_private_names
                 .get(&b)
-                .is_some_and(|names| names.iter().any(|n| n == key))
+                .is_some_and(|names| names.iter().any(|(n, _)| n == key))
         {
                 return Some(self.instance_has_brand(receiver, b));
             }
@@ -364,7 +435,7 @@ impl<'p> Vm<'p> {
         if !chain.iter().any(|&b| {
             self.brand_private_names.get(&b).is_some_and(|names| !names.is_empty())
         }) || chain.iter().all(|&b| {
-            self.brand_private_names.get(&b).map_or(true, |names| !names.iter().any(|n| n == key))
+            self.brand_private_names.get(&b).map_or(true, |names| !names.iter().any(|(n, _)| n == key))
         }) {
             return None;
         }
