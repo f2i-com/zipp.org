@@ -72,10 +72,17 @@ impl<'p> Vm<'p> {
                 // boundary, so it surfaces as a TypeError in the calling realm.
                 let result = match self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None, None) {
                     Ok(r) => r,
-                    Err(_) => {
+                    Err(Thrown(msg)) => {
+                        // PerformShadowRealmEval step 3: a PARSE failure throws
+                        // a SyntaxError in the CALLER realm; a runtime throw
+                        // (pending_throw set) wraps as the boundary TypeError.
+                        let runtime_throw = self.pending_throw.take().is_some();
+                        if !runtime_throw && msg.starts_with("SyntaxError") {
+                            return Err(Thrown(msg));
+                        }
                         return Err(Thrown(
                             "TypeError: ShadowRealm evaluate threw (error wrapped at the realm boundary)".into(),
-                        ))
+                        ));
                     }
                 };
                 // Only primitives and callables may cross the boundary.
@@ -96,6 +103,22 @@ impl<'p> Vm<'p> {
                 Ok(result)
             }
             native::SHADOWREALM_IMPORTVALUE => {
+                // Steps 3-4 run SYNCHRONOUSLY before any promise is built:
+                // ToString(specifier) (a poisoned valueOf throws here), and the
+                // exportName must already BE a String (no coercion).
+                let _spec = self.to_js_string(a0)?;
+                let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let name_is_str = a1.is_heap()
+                    && matches!(
+                        self.heap.get(a1.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. }
+                    );
+                if !name_is_str {
+                    return Err(Thrown(
+                        "TypeError: ShadowRealm.prototype.importValue exportName must be a string"
+                            .into(),
+                    ));
+                }
                 // Module loading is unsupported; return a rejected promise.
                 let p = self.alloc_promise();
                 let e = self.alloc_error_from_message(
