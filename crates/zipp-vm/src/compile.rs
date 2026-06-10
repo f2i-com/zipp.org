@@ -2052,6 +2052,13 @@ struct LoopCtx {
     iter_close: Option<Reg>,
 }
 
+/// A pre-evaluated destructuring member-target key (see `pre_member_ref`).
+enum PreKey {
+    Static(u32),
+    Computed(Reg),
+    Private(u32),
+}
+
 /// One active `with` scope (see `FnCompiler::with_stack`).
 struct WithScope {
     /// Register holding the ToObject'd with-object, kept live across the body
@@ -7315,6 +7322,90 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// A destructuring MEMBER target's reference, evaluated BEFORE the source
+    /// property read (KeyedDestructuringAssignmentEvaluation: the
+    /// DestructuringAssignmentTarget reference comes first, then GetV).
+    fn pre_member_ref(
+        &mut self,
+        m: &ox::AssignmentTargetMaybeDefault,
+    ) -> R<Option<(Reg, PreKey)>> {
+        use ox::AssignmentTargetMaybeDefault as M;
+        // Unwrap a `target = default` to its inner target.
+        let inner: &ox::AssignmentTarget = match m {
+            M::AssignmentTargetWithDefault(d) => &d.binding,
+            // The flattened member variants reuse the same node types — handle
+            // them via a reconstructed reference below.
+            M::StaticMemberExpression(sm) => {
+                let r = self.pin_expr(&sm.object)?;
+                let name = self.string_name(sm.property.name.as_str());
+                return Ok(Some((r, PreKey::Static(name))));
+            }
+            M::ComputedMemberExpression(cm) => {
+                let r = self.pin_expr(&cm.object)?;
+                let k = self.pin_expr(&cm.expression)?;
+                return Ok(Some((r, PreKey::Computed(k))));
+            }
+            M::PrivateFieldExpression(pm) => {
+                self.check_private_declared(&pm.field.name)?;
+                let r = self.pin_expr(&pm.object)?;
+                let name = self.string_name(&private_key(&pm.field.name));
+                return Ok(Some((r, PreKey::Private(name))));
+            }
+            _ => return Ok(None),
+        };
+        use ox::AssignmentTarget as T;
+        match inner {
+            T::StaticMemberExpression(sm) => {
+                let r = self.pin_expr(&sm.object)?;
+                let name = self.string_name(sm.property.name.as_str());
+                Ok(Some((r, PreKey::Static(name))))
+            }
+            T::ComputedMemberExpression(cm) => {
+                let r = self.pin_expr(&cm.object)?;
+                let k = self.pin_expr(&cm.expression)?;
+                Ok(Some((r, PreKey::Computed(k))))
+            }
+            T::PrivateFieldExpression(pm) => {
+                self.check_private_declared(&pm.field.name)?;
+                let r = self.pin_expr(&pm.object)?;
+                let name = self.string_name(&private_key(&pm.field.name));
+                Ok(Some((r, PreKey::Private(name))))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Evaluate `e` into a PINNED register (survives later evaluation; the
+    /// caller's next_reg reset reclaims it).
+    fn pin_expr(&mut self, e: &ox::Expression) -> R<Reg> {
+        let r = self.alloc_reg();
+        let v = self.expr_into(e, r)?;
+        if v != r {
+            self.emit(Instr::Move { dst: r, src: v });
+        }
+        Ok(r)
+    }
+
+    /// Store through a reference produced by `pre_member_ref`, applying any
+    /// `= default` of `m` first (no NamedEvaluation — the target is a member).
+    fn store_pre_ref(
+        &mut self,
+        m: &ox::AssignmentTargetMaybeDefault,
+        obj: Reg,
+        key: &PreKey,
+        val: Reg,
+    ) -> R<()> {
+        if let ox::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) = m {
+            self.apply_default_in_place_named(val, &d.init, None)?;
+        }
+        match *key {
+            PreKey::Static(name) => self.emit(Instr::SetProp { obj, name, val }),
+            PreKey::Computed(k) => self.emit(Instr::SetIndex { obj, key: k, val }),
+            PreKey::Private(name) => self.emit(Instr::SetPrivate { obj, name, val }),
+        }
+        Ok(())
+    }
+
     /// One element of a destructuring assignment, applying its `= default` first.
     fn assign_maybe_default(
         &mut self,
@@ -7486,10 +7577,55 @@ impl<'a> FnCompiler<'a> {
                     self.store_binding(&b, val);
                 }
                 ox::AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
-                    // `({key: target} = o)`.
-                    let val = self.alloc_reg();
-                    self.extract_member(src, &p.name, p.computed, val)?;
-                    self.assign_maybe_default(&p.binding, val)?;
+                    // `({key: target} = o)`. For a MEMBER target the spec
+                    // order is: PropertyName (incl. ToPropertyKey) -> target
+                    // REFERENCE (object + uncoerced key exprs) -> GetV ->
+                    // default -> PutValue (target-key coercion at store).
+                    let is_member_target = matches!(
+                        &p.binding,
+                        ox::AssignmentTargetMaybeDefault::StaticMemberExpression(_)
+                            | ox::AssignmentTargetMaybeDefault::ComputedMemberExpression(_)
+                            | ox::AssignmentTargetMaybeDefault::PrivateFieldExpression(_)
+                    ) || matches!(
+                        &p.binding,
+                        ox::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d)
+                            if matches!(
+                                &d.binding,
+                                ox::AssignmentTarget::StaticMemberExpression(_)
+                                    | ox::AssignmentTarget::ComputedMemberExpression(_)
+                                    | ox::AssignmentTarget::PrivateFieldExpression(_)
+                            )
+                    );
+                    if is_member_target {
+                        let skey: Option<Reg> = if p.computed {
+                            let e = p
+                                .name
+                                .as_expression()
+                                .ok_or("unsupported computed destructuring key")?;
+                            let raw = self.pin_expr(e)?;
+                            let k = self.alloc_reg();
+                            self.emit(Instr::ToPropKey { dst: k, obj: src, src: raw });
+                            Some(k)
+                        } else {
+                            None
+                        };
+                        let pre = self.pre_member_ref(&p.binding)?;
+                        let val = self.alloc_reg();
+                        match skey {
+                            Some(k) => self.emit(Instr::GetIndex { dst: val, obj: src, key: k }),
+                            None => {
+                                let name = class_key_name(&p.name)?;
+                                let nidx = self.string_name(&name);
+                                self.emit(Instr::GetProp { dst: val, obj: src, name: nidx });
+                            }
+                        }
+                        let (obj, key) = pre.expect("member target shape checked above");
+                        self.store_pre_ref(&p.binding, obj, &key, val)?;
+                    } else {
+                        let val = self.alloc_reg();
+                        self.extract_member(src, &p.name, p.computed, val)?;
+                        self.assign_maybe_default(&p.binding, val)?;
+                    }
                 }
             }
             self.next_reg = save;
