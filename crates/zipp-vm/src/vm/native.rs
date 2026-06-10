@@ -232,6 +232,10 @@ pub const ASYNC_DISPOSABLE_MOVE: u16 = 896;
 /// reactions on the module's pending DEPENDENCY promises.
 pub const MODULE_DEP_OK: u16 = 897;
 pub const MODULE_DEP_FAIL: u16 = 898;
+/// `$262.agent.monotonicNow()` / `$262.agent.setTimeout(fn, ms)` — the
+/// single-agent slice of the test262 agent API (no worker agents).
+pub const AGENT_MONOTONIC_NOW: u16 = 899;
+pub const AGENT_SET_TIMEOUT: u16 = 900;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

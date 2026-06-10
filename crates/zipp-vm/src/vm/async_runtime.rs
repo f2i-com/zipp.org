@@ -1766,6 +1766,62 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The full event loop: drain microtasks, then — while `$262.agent`
+    /// timers or FINITE-deadline waitAsync waiters remain — sleep to the
+    /// earliest due time, fire it (timer callback / "timed-out" resolution),
+    /// and drain again. Infinite-deadline waiters do NOT keep the loop alive.
+    pub(crate) fn run_event_loop(&mut self) {
+        loop {
+            self.drain_microtasks();
+            let now = std::time::Instant::now();
+            let next_timer = self.timer_queue.iter().map(|(d, _)| *d).min();
+            let next_wait = self
+                .async_waiters
+                .iter()
+                .filter_map(|(_, _, _, d)| *d)
+                .min();
+            let due = match (next_timer, next_wait) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let Some(due) = due else { break };
+            if due > now {
+                std::thread::sleep(due - now);
+            }
+            let now = std::time::Instant::now();
+            // Fire due timers (FIFO among due ones by due-time order).
+            let mut due_timers: Vec<usize> = (0..self.timer_queue.len())
+                .filter(|&i| self.timer_queue[i].0 <= now)
+                .collect();
+            due_timers.sort_by_key(|&i| self.timer_queue[i].0);
+            // Remove from the back so earlier indices stay valid.
+            let mut fired: Vec<Value> = Vec::new();
+            for &i in due_timers.iter().rev() {
+                fired.push(self.timer_queue.remove(i).1);
+            }
+            fired.reverse();
+            for cb in fired {
+                let _gc = self.gc_lock_guard();
+                let _ = self.call_value(cb, Value::UNDEFINED, &[]);
+            }
+            // Resolve due waitAsync waiters "timed-out".
+            let mut due_waiters: Vec<u32> = Vec::new();
+            self.async_waiters.retain(|&(_, _, p, d)| {
+                if d.is_some_and(|d| d <= now) {
+                    due_waiters.push(p);
+                    false
+                } else {
+                    true
+                }
+            });
+            for p in due_waiters {
+                let _gc = self.gc_lock_guard();
+                let v = self.alloc_str("timed-out".to_string());
+                self.resolve(p, v);
+            }
+        }
+    }
+
     // ── property / index access ──
 
 }

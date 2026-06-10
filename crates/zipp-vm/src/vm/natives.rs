@@ -1294,6 +1294,21 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            AGENT_MONOTONIC_NOW => {
+                Value::num(self.vm_start.elapsed().as_secs_f64() * 1000.0)
+            }
+            AGENT_SET_TIMEOUT => {
+                let cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let ms = self
+                    .to_number_coerce(args.get(1).copied().unwrap_or(Value::UNDEFINED))?
+                    .max(0.0);
+                if self.is_callable(cb) {
+                    let due = std::time::Instant::now()
+                        + std::time::Duration::from_secs_f64(ms / 1000.0);
+                    self.timer_queue.push((due, cb));
+                }
+                Value::UNDEFINED
+            }
             MODULE_DEP_FAIL => {
                 let cap = this.as_f64() as u32;
                 if self.deferred_mods.remove(&cap).is_some() {

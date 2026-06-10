@@ -2205,7 +2205,16 @@ impl<'p> Vm<'p> {
         // falsy, callable→undefined).
         let d262_htmldda = self.heap.alloc(HeapObj::Object(ObjMap::new()));
         self.is_htmldda.insert(d262_htmldda);
+        // `$262.agent` single-agent slice: monotonicNow + setTimeout (no
+        // worker agents — agent.start tests stay unsupported).
+        let ag_now = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_MONOTONIC_NOW)));
+        let ag_st = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_SET_TIMEOUT)));
+        let mut agent = ObjMap::new();
+        agent.define("monotonicNow", ag_now, method_attr);
+        agent.define("setTimeout", ag_st, method_attr);
+        let agent_obj = Value::heap(self.heap.alloc(HeapObj::Object(agent)));
         let mut d262 = ObjMap::new();
+        d262.define("agent", agent_obj, method_attr);
         d262.define("global", Value::heap(global_this), method_attr);
         d262.define("detachArrayBuffer", d262_detach, method_attr);
         d262.define("gc", d262_gc, method_attr);

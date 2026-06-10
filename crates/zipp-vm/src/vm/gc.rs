@@ -141,6 +141,13 @@ impl Vm<'_> {
         for v in self.module_errors.values() {
             root_val!(*v);
         }
+        for &(buf, _, p, _) in &self.async_waiters {
+            root_idx!(buf);
+            root_idx!(p);
+        }
+        for (_, cb) in &self.timer_queue {
+            root_val!(*cb);
+        }
         for v in self.closure_home.values() {
             root_val!(*v);
         }

@@ -537,6 +537,16 @@ pub struct Vm<'p> {
     /// top-level await, collected during the CURRENT import_module's link
     /// (mark/split_off discipline keeps nested links separate). GC ROOTS.
     link_pending_deps: Vec<Value>,
+    /// Registered Atomics.waitAsync waiters: (buffer heap idx, byte address,
+    /// pending promise idx, optional deadline). `notify` resolves matching
+    /// entries "ok" FIFO; a due deadline resolves "timed-out" in the event
+    /// loop. Promise indices are GC ROOTS.
+    async_waiters: Vec<(u32, usize, u32, Option<std::time::Instant>)>,
+    /// `$262.agent.setTimeout` macrotasks: (due, callback). Callback Values
+    /// are GC ROOTS.
+    timer_queue: Vec<(std::time::Instant, Value)>,
+    /// VM construction time — the `$262.agent.monotonicNow()` epoch.
+    vm_start: std::time::Instant,
     /// The ShadowRealm whose code is CURRENTLY evaluating (heap index of the
     /// realm object), if any — global-name resolution inside `evaluate` binds
     /// non-builtin names to that realm's own slot table.

@@ -128,6 +128,9 @@ impl<'p> Vm<'p> {
             module_errors: std::collections::HashMap::new(),
             active_realm: None,
             realm_globals: std::collections::HashMap::new(),
+            async_waiters: Vec::new(),
+            timer_queue: Vec::new(),
+            vm_start: std::time::Instant::now(),
             deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
@@ -601,7 +604,7 @@ impl<'p> Vm<'p> {
         // resumes) to empty. Drains even on a main throw (matches node ordering),
         // then returns the original result.
         let main = self.run_loop(0);
-        self.drain_microtasks();
+        self.run_event_loop();
         main
     }
 
@@ -627,7 +630,7 @@ impl<'p> Vm<'p> {
         // microtask drain below; if its body promise then REJECTED, that
         // rejection IS the program's error (the entry module failed).
         let body = self.pending_module_body.take();
-        self.drain_microtasks();
+        self.run_event_loop();
         if let Some(bp) = body {
             if bp.is_heap() {
                 let st = match self.heap.get(bp.heap_index()) {
@@ -730,7 +733,7 @@ impl<'p> Vm<'p> {
         // Module top-level `this` is undefined. alloc_async builds + drives the
         // activation to its first await; drain_microtasks runs it to completion.
         let p = self.alloc_async(0, NO_CLOSURE, Value::UNDEFINED, &[]);
-        self.drain_microtasks();
+        self.run_event_loop();
         if p.is_heap() {
             if let HeapObj::Promise { state: PromiseState::Rejected, result, .. } =
                 self.heap.get(p.heap_index())

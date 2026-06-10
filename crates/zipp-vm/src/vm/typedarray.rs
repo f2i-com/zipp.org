@@ -503,6 +503,18 @@ impl<'p> Vm<'p> {
         Ok((ti, i, kind))
     }
 
+    /// The (buffer heap idx, byte address) a wait/notify on `(ta, index)`
+    /// keys its waiter-list entry by.
+    fn ta_wait_addr(&self, ti: u32, i: usize) -> (u32, usize) {
+        match self.heap.get(ti) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => {
+                let size = native::TA_KINDS[*kind as usize].1 as usize;
+                (*buffer, byte_offset + i * size)
+            }
+            _ => (ti, i),
+        }
+    }
+
     /// Execute an `Atomics.<op>` call. Single-threaded, so read-modify-write ops
     /// are plain (non-contended); `wait` never blocks (no notifier → "timed-out")
     /// and `notify` reports 0 woken.
@@ -564,9 +576,20 @@ impl<'p> Vm<'p> {
             } else if timeout == 0.0 {
                 (false, self.alloc_str("timed-out".to_string()))
             } else {
-                // Would block; no notifier in a single agent, so the promise stays
-                // pending (a real engine resolves it on notify or timeout).
-                (true, Value::heap(self.alloc_promise()))
+                // Would block: register a WAITER — notify resolves it "ok",
+                // a finite timeout resolves it "timed-out" in the event loop.
+                let p = self.alloc_promise();
+                let (buf, addr) = self.ta_wait_addr(ti, i);
+                let deadline = if timeout.is_finite() {
+                    Some(
+                        std::time::Instant::now()
+                            + std::time::Duration::from_secs_f64(timeout / 1000.0),
+                    )
+                } else {
+                    None
+                };
+                self.async_waiters.push((buf, addr, p, deadline));
+                (true, Value::heap(p))
             };
             let mut m = crate::heap::ObjMap::new();
             let attr = crate::heap::PropAttr {
@@ -611,12 +634,32 @@ impl<'p> Vm<'p> {
                 return Ok(self.alloc_str(if eq { "timed-out" } else { "not-equal" }.to_string()));
             }
             // notify(ta, index, count): ToIntegerOrInfinity(count) runs (so a Symbol /
-            // throwing valueOf is observed, after the index coercion) even though a
-            // single agent wakes 0 waiters. An immutable / non-shared buffer is fine.
-            if a2 != Value::UNDEFINED {
-                let _ = self.to_number_strict(a2)?;
+            // throwing valueOf is observed, after the index coercion). Wake up to
+            // `count` waitAsync waiters registered on this (buffer, address) FIFO,
+            // resolving each promise "ok".
+            let count = if a2 == Value::UNDEFINED {
+                f64::INFINITY
+            } else {
+                let n = self.to_number_strict(a2)?;
+                if n.is_nan() { 0.0 } else { n.trunc().max(0.0) }
+            };
+            let (buf, addr) = self.ta_wait_addr(ti, i);
+            let mut woken = 0.0;
+            let mut to_wake: Vec<u32> = Vec::new();
+            self.async_waiters.retain(|&(b, a, p, _)| {
+                if woken < count && b == buf && a == addr {
+                    to_wake.push(p);
+                    woken += 1.0;
+                    false
+                } else {
+                    true
+                }
+            });
+            for p in to_wake {
+                let v = self.alloc_str("ok".to_string());
+                self.resolve(p, v);
             }
-            return Ok(Value::num(0.0));
+            return Ok(Value::num(woken));
         }
         // load / store / read-modify-write. (Immutable-buffer writes already threw in
         // atomic_validate, before any coercion.)
