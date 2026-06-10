@@ -932,12 +932,28 @@ impl<'p> Vm<'p> {
         } else {
             Value::UNDEFINED
         };
+        let argc = args.len();
         let idx = self.heap.alloc(HeapObj::Array(args));
         self.arguments_objs.insert(idx); // [[ParameterMap]] marker (toString tag)
         if obj_proto != 0 {
             self.proto_of.insert(idx, Value::heap(obj_proto));
         }
         let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+        // `length` is an ORDINARY data property of an arguments object
+        // (writable, non-enumerable, configurable — it can hold any value and
+        // be deleted), not the Array exotic length. Every Array-length special
+        // case is guarded with !arguments_objs.contains.
+        m.define(
+            "length",
+            Value::num(argc as f64),
+            PropAttr {
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            },
+        );
         m.define(
             "@@iterator",
             array_values,

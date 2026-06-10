@@ -174,7 +174,7 @@ impl<'p> Vm<'p> {
                 // Non-int key on an array: "length", else resolve via the prototype
                 // (a computed method name / `@@iterator`, mirroring dot access).
                 let k = self.key_of(key);
-                if k == "length" {
+                if k == "length" && !self.arguments_objs.contains(&aidx) {
                     if let HeapObj::Array(items) = self.heap.get(aidx) {
                         return Ok(len_value(items.len()));
                     }

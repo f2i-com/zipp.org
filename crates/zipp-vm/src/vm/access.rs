@@ -449,7 +449,9 @@ impl<'p> Vm<'p> {
                         break;
                     }
                 }
-                HeapObj::Array(_) if key == "length" => {
+                HeapObj::Array(_)
+                    if key == "length" && !self.arguments_objs.contains(&cidx) =>
+                {
                     governing = Some((
                         false,
                         !self.array_length_nonwritable.contains(&cidx),
@@ -684,10 +686,70 @@ impl<'p> Vm<'p> {
             }
             return Ok(());
         }
+        if key == "length"
+            && matches!(self.heap.get(idx), HeapObj::Array(_))
+            && self.arguments_objs.contains(&idx)
+        {
+            // An ARGUMENTS object's `length` is an ordinary own data prop in
+            // arr_props (any value, deletable). The write respects the stored
+            // attributes; a PLAIN NUMERIC length additionally resizes the
+            // dense backing store so iteration/concat (which read it) follow
+            // the new length — with no observable coercion.
+            let attr = self
+                .arr_props
+                .get(&idx)
+                .and_then(|m| m.pos("length").map(|i| m.attrs[i]));
+            if let Some(a) = attr {
+                if a.accessor {
+                    if a.setter != Value::UNDEFINED {
+                        self.call_value(a.setter, obj, &[val])?;
+                        return Ok(());
+                    }
+                    return self.reject_write("length", strict);
+                }
+                if !a.writable {
+                    return self.reject_write("length", strict);
+                }
+            }
+            let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+            if attr.is_some() {
+                m.set("length", val);
+            } else {
+                // Re-created after a delete: ordinary CreateDataProperty
+                // attributes (writable, ENUMERABLE, configurable).
+                m.define(
+                    "length",
+                    val,
+                    PropAttr {
+                        writable: true,
+                        enumerable: true,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    },
+                );
+            }
+            if val.is_number() {
+                let n = val.as_f64();
+                if n >= 0.0
+                    && n.fract() == 0.0
+                    && (n as usize) <= crate::vm::MAX_DENSE_ARRAY_LEN
+                {
+                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                        items.resize(n as usize, Value::HOLE);
+                    }
+                }
+            }
+            self.heap.bump_version(idx);
+            return Ok(());
+        }
         // `arr.length = n` truncates (n < len) or extends-with-holes (n > len) a
         // dense array — a very common idiom (`arr.length = 0` clears it). Per JS,
         // n must be a non-negative integer < 2^32, else a RangeError.
-        if key == "length" && matches!(self.heap.get(idx), HeapObj::Array(_)) {
+        if key == "length"
+            && matches!(self.heap.get(idx), HeapObj::Array(_))
+            && !self.arguments_objs.contains(&idx)
+        {
             // ArraySetLength steps 2-5: newLen = ToUint32(value) AND
             // numberLen = ToNumber(value) are BOTH computed (valueOf runs
             // TWICE), and newLen != numberLen (a non-uint32 length like -1 /

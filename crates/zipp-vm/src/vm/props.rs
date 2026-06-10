@@ -949,7 +949,7 @@ impl<'p> Vm<'p> {
                 }
             }
             HeapObj::Array(items) => {
-                if key == "length" {
+                if key == "length" && !self.arguments_objs.contains(&idx) {
                     let len = len_value(items.len());
                     let writable = !self.array_length_nonwritable.contains(&idx);
                     return self.make_data_descriptor(len, writable, false, false);
@@ -2010,7 +2010,64 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
-            if key == "length" {
+            if key == "length" && self.arguments_objs.contains(&idx) {
+                // An ARGUMENTS object's `length`: ORDINARY define on the
+                // arr_props prop; a plain numeric [[Value]] also resizes the
+                // dense store so iteration/concat (which read it) follow.
+                let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
+                let cur = self
+                    .arr_props
+                    .get(&idx)
+                    .and_then(|m| m.pos("length").map(|i| (m.attrs[i], m.vals[i])));
+                if let Some((a, curv)) = cur {
+                    if !a.configurable {
+                        let changes = d_cf == Some(true)
+                            || d_en.is_some_and(|e| e != a.enumerable)
+                            || get.is_some()
+                            || set.is_some()
+                            || (!a.writable
+                                && (d_wr == Some(true)
+                                    || value.is_some_and(|v| !self.same_value(v, curv))));
+                        if changes {
+                            return Err(Thrown(
+                                "TypeError: Cannot redefine property: length".into(),
+                            ));
+                        }
+                    }
+                }
+                let new_attr = PropAttr {
+                    writable: d_wr.unwrap_or(cur.map_or(false, |(a, _)| a.writable)),
+                    enumerable: d_en.unwrap_or(cur.map_or(false, |(a, _)| a.enumerable)),
+                    configurable: d_cf.unwrap_or(cur.map_or(false, |(a, _)| a.configurable)),
+                    accessor: get.is_some() || set.is_some(),
+                    setter: set.unwrap_or(Value::UNDEFINED),
+                };
+                let stored = if new_attr.accessor {
+                    get.unwrap_or(Value::UNDEFINED)
+                } else {
+                    value.unwrap_or(cur.map_or(Value::UNDEFINED, |(_, v)| v))
+                };
+                let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
+                m.define("length", stored, new_attr);
+                if !new_attr.accessor {
+                    if let Some(v) = value {
+                        if v.is_number() {
+                            let n = v.as_f64();
+                            if n >= 0.0
+                                && n.fract() == 0.0
+                                && (n as usize) <= crate::vm::MAX_DENSE_ARRAY_LEN
+                            {
+                                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                                    items.resize(n as usize, Value::HOLE);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.heap.bump_version(idx);
+                return Ok(());
+            }
+            if key == "length" && !self.arguments_objs.contains(&idx) {
                 // `length` is a non-configurable, non-enumerable data property
                 // (ArraySetLength, 15.4.5.1) — writable by default.
                 let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
@@ -3542,7 +3599,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Array(items) => {
-                if key == "length" {
+                if key == "length" && !self.arguments_objs.contains(&obj.heap_index()) {
                     Ok(len_value(items.len()))
                 } else if let Some(i) = key.parse::<u32>().ok().filter(|i| i.to_string() == key) {
                     // Element access via a canonical numeric STRING key (`arr["0"]`,

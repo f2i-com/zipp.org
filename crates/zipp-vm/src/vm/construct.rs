@@ -2361,7 +2361,9 @@ impl<'p> Vm<'p> {
                         && self.global_by_name(key).is_some())
             }
             HeapObj::Array(items) => {
-                key == "length"
+                // An ARGUMENTS object's `length` is an ordinary (deletable)
+                // arr_props prop — covered by the arr_props clause below.
+                (key == "length" && !self.arguments_objs.contains(&obj.heap_index()))
                     // A hole is an absent element — not an own property.
                     || key.parse::<usize>().map_or(false, |i| i < items.len() && !items[i].is_hole())
                     || self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())

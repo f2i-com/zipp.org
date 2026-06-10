@@ -359,7 +359,14 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         // entry stays unset, so this site simply misses (helper call) each time —
         // cheap, and it lets a `for (i < a.length) a[i]` loop run as a region
         // instead of bailing on the first `.length` access.
-        HeapObj::Array(items) if key == "length" => return len_value(items.len()).bits(),
+        HeapObj::Array(items) if key == "length" => {
+            // An arguments object's `length` is an ORDINARY (writable) prop in
+            // arr_props — defer to the interpreter.
+            if vm.arguments_objs.contains(&idx) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            return len_value(items.len()).bits();
+        }
         HeapObj::Str(s) if key == "length" => return len_value(s.char_len).bits(),
         HeapObj::Cons { len, .. } if key == "length" => return len_value(*len).bits(),
         _ => return crate::codegen::SELF_CALL_DEOPT, // other array/string props → interpreter
