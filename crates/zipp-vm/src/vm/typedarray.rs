@@ -408,6 +408,7 @@ impl<'p> Vm<'p> {
         waitable: bool,
         needs_shared: bool,
         is_write: bool,
+        revalidate: bool,
     ) -> Result<(u32, usize, u8), Thrown> {
         let ti = match ta.is_heap().then(|| self.heap.get(ta.heap_index())) {
             Some(HeapObj::TypedArray { kind, .. }) => {
@@ -431,11 +432,27 @@ impl<'p> Vm<'p> {
                 ))
             }
         };
+        // ValidateTypedArray: a DETACHED backing buffer is a TypeError, raised
+        // BEFORE any index/value coercion (their valueOf must not run).
+        {
+            let buffer = match self.heap.get(ti) {
+                HeapObj::TypedArray { buffer, .. } => *buffer,
+                _ => 0,
+            };
+            if matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. }) {
+                return Err(Thrown(
+                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer"
+                        .into(),
+                ));
+            }
+        }
         if needs_shared {
             let shared = matches!(self.heap.get(ti),
                 HeapObj::TypedArray { buffer, .. } if self.shared_buffers.contains(buffer));
             if !shared {
-                return Err(Thrown("TypeError: Atomics.wait requires a SharedArrayBuffer".into()));
+                return Err(Thrown(
+                    "TypeError: Atomics.wait/waitAsync requires a SharedArrayBuffer".into(),
+                ));
             }
         }
         // ValidateTypedArray step 4: a ~write~ access on an immutable-buffer-backed
@@ -455,12 +472,33 @@ impl<'p> Vm<'p> {
             HeapObj::TypedArray { kind, .. } => *kind,
             _ => 0,
         };
-        // ToIndex(requestIndex): RangeError on a negative index, TypeError on a
-        // Symbol/BigInt — coerced AFTER the type/buffer checks above.
-        let i = self.to_index(idx)?;
+        // ValidateAtomicAccess: the length is snapshotted BEFORE
+        // ToIndex(requestIndex) — the index coercion may grow/shrink/detach a
+        // resizable buffer, and the bounds check uses the PRE-coercion length.
         let len = self.ta_effective_len(ti).unwrap_or(0);
+        // ToIndex: RangeError on a negative index, TypeError on Symbol/BigInt.
+        let i = self.to_index(idx)?;
         if i >= len {
             return Err(Thrown("RangeError: Atomics index out of bounds".into()));
+        }
+        // RevalidateAtomicAccess (DATA ops only — wait/waitAsync/notify never
+        // touch the buffer afterward): a coercion side effect that detached
+        // the buffer or shrank it below the index aborts the access.
+        if revalidate {
+            let buffer = match self.heap.get(ti) {
+                HeapObj::TypedArray { buffer, .. } => *buffer,
+                _ => 0,
+            };
+            if matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. }) {
+                return Err(Thrown(
+                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer"
+                        .into(),
+                ));
+            }
+            let cur = self.ta_effective_len(ti).unwrap_or(0);
+            if i >= cur {
+                return Err(Thrown("RangeError: Atomics index out of bounds".into()));
+            }
         }
         Ok((ti, i, kind))
     }
@@ -478,15 +516,29 @@ impl<'p> Vm<'p> {
             return Ok(Value::bool(matches!(n, 1 | 2 | 4 | 8)));
         }
         if op == "pause" {
+            // iterationNumber must be undefined or an INTEGRAL Number.
+            if a0 != Value::UNDEFINED {
+                let bad = !a0.is_number() || {
+                    let f = a0.as_f64();
+                    f.is_nan() || f.is_infinite() || f.fract() != 0.0
+                };
+                if bad {
+                    return Err(Thrown(
+                        "TypeError: Atomics.pause iterationNumber must be an integral Number"
+                            .into(),
+                    ));
+                }
+            }
             return Ok(Value::UNDEFINED);
         }
         let waitable = matches!(op, "wait" | "waitAsync" | "notify");
-        let needs_shared = op == "wait";
+        let needs_shared = matches!(op, "wait" | "waitAsync");
         let is_write = matches!(
             op,
             "store" | "add" | "sub" | "and" | "or" | "xor" | "exchange" | "compareExchange"
         );
-        let (ti, i, kind) = self.atomic_validate(a0, a1, waitable, needs_shared, is_write)?;
+        let (ti, i, kind) =
+            self.atomic_validate(a0, a1, waitable, needs_shared, is_write, !waitable)?;
         let is_bigint = native::TA_KINDS[kind as usize].2;
         // waitAsync(ta, index, value, timeout) -> { async, value }. Single agent:
         // never truly blocks. value differs -> {async:false, value:"not-equal"};
@@ -543,6 +595,11 @@ impl<'p> Vm<'p> {
                 } else {
                     self.to_integer_or_zero(a2)? == (cur.as_f64() as i64)
                 };
+                // ToNumber(timeout) runs (DoWait step 6) even though a single
+                // agent never blocks — a Symbol is a TypeError, a poisoned
+                // valueOf throws.
+                let _t = self
+                    .to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
                 // Equal value would block; with no notifier this returns "timed-out".
                 return Ok(self.alloc_str(if eq { "timed-out" } else { "not-equal" }.to_string()));
             }
@@ -569,7 +626,14 @@ impl<'p> Vm<'p> {
                 }
                 "compareExchange" => {
                     let repl = self.to_bigint(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
-                    if old == v_in {
+                    // NumericToRawBytes: the EXPECTED value compares as the
+                    // element type (BigInt64 wraps to i64, BigUint64 to u64).
+                    let expected = if kind == 9 {
+                        (v_in as i64) as i128
+                    } else {
+                        (v_in as u64) as i128
+                    };
+                    if old == expected {
                         let nv = self.make_bigint(repl);
                         self.ta_element_set(ti, i, nv)?;
                     }
@@ -603,7 +667,19 @@ impl<'p> Vm<'p> {
                 "compareExchange" => {
                     let repl =
                         self.to_integer_or_zero(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
-                    if old_i == v_in {
+                    // NumericToRawBytes: the EXPECTED value wraps to the
+                    // element type before comparing (123456789 on an
+                    // Int16Array compares as -13035).
+                    let expected = match kind {
+                        0 => v_in as i8 as i64,
+                        1 | 2 => v_in as u8 as i64,
+                        3 => v_in as i16 as i64,
+                        4 => v_in as u16 as i64,
+                        5 => v_in as i32 as i64,
+                        6 => v_in as u32 as i64,
+                        _ => v_in,
+                    };
+                    if old_i == expected {
                         self.ta_element_set(ti, i, Value::num(repl as f64))?;
                     }
                     Ok(cur)
