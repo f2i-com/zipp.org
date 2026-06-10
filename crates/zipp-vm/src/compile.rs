@@ -5102,7 +5102,24 @@ impl<'a> FnCompiler<'a> {
             }
             _ => Vec::new(),
         };
+        // A RUNTIME TDZ scope over the head expression too: a CLOSURE created
+        // in `f.right` captures an uninitialized cell for each head name and
+        // throws ReferenceError when it later reads it (the head env binding
+        // is never initialized), instead of capturing the outer binding.
+        let head_tdz_scope = !tdz_added.is_empty();
+        if head_tdz_scope {
+            self.push_scope();
+            for n in &tdz_added {
+                let r = self.alloc_reg();
+                self.scopes.last_mut().unwrap().push((n.clone(), r));
+                self.emit(Instr::MakeCellTdz { reg: r });
+                self.cell_regs.insert(r);
+            }
+        }
         let v = self.expr_into(&f.right, iter_reg)?;
+        if head_tdz_scope {
+            self.pop_scope();
+        }
         for n in &tdz_added {
             self.param_tdz.remove(n);
         }
@@ -5397,7 +5414,24 @@ impl<'a> FnCompiler<'a> {
             }
             _ => Vec::new(),
         };
+        // A RUNTIME TDZ scope over the head expression too: a CLOSURE created
+        // in `f.right` captures an uninitialized cell for each head name and
+        // throws ReferenceError when it later reads it (the head env binding
+        // is never initialized), instead of capturing the outer binding.
+        let head_tdz_scope = !tdz_added.is_empty();
+        if head_tdz_scope {
+            self.push_scope();
+            for n in &tdz_added {
+                let r = self.alloc_reg();
+                self.scopes.last_mut().unwrap().push((n.clone(), r));
+                self.emit(Instr::MakeCellTdz { reg: r });
+                self.cell_regs.insert(r);
+            }
+        }
         let v = self.expr_into(&f.right, obj_reg)?;
+        if head_tdz_scope {
+            self.pop_scope();
+        }
         for n in &tdz_added {
             self.param_tdz.remove(n);
         }
