@@ -2168,8 +2168,10 @@ impl<'p> Vm<'p> {
     /// `obj.hasOwnProperty(key)` — own data/accessor property, array index/length,
     /// or string index/length.
     pub(crate) fn has_own_property(&self, obj: Value, key: &str) -> bool {
-        if !obj.is_heap() || is_private_key(key) {
-            return false; // private names aren't reflectable own properties
+        // (Real private fields live in the side table and are invisible here;
+        // a PUBLIC computed "#..." string key is an ordinary reflectable prop.)
+        if !obj.is_heap() {
+            return false;
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Object(m) => {
@@ -2194,11 +2196,14 @@ impl<'p> Vm<'p> {
             // A class value: own statics (data + `static get`/`set`) + name/length
             // + the synthesized `prototype` (a class always has one).
             HeapObj::Class(c) => {
-                c.statics.pos(key).is_some()
-                    || c.static_getters.iter().any(|(n, _)| n == key)
-                    || c.static_setters.iter().any(|(n, _)| n == key)
-                    || self.callable_has_intrinsic(obj, key)
-                    || (key == "prototype" && self.callable_has_prototype(obj))
+                // Private STATICS live textually in the statics map but are
+                // not reflectable own properties.
+                !is_private_key(key)
+                    && (c.statics.pos(key).is_some()
+                        || c.static_getters.iter().any(|(n, _)| n == key)
+                        || c.static_setters.iter().any(|(n, _)| n == key)
+                        || self.callable_has_intrinsic(obj, key)
+                        || (key == "prototype" && self.callable_has_prototype(obj)))
             }
             // Functions/closures + the native resolve/reject + combinator element
             // functions: assigned own props (`fn.x`) + the synthesized name/length.
@@ -2263,7 +2268,7 @@ impl<'p> Vm<'p> {
     /// `obj.propertyIsEnumerable(key)` — true if `key` is an own enumerable
     /// property. Array indices are enumerable; `length` is not.
     pub(crate) fn own_is_enumerable(&self, obj: Value, key: &str) -> bool {
-        if !obj.is_heap() || is_private_key(key) {
+        if !obj.is_heap() {
             return false;
         }
         match self.heap.get(obj.heap_index()) {
@@ -2296,7 +2301,10 @@ impl<'p> Vm<'p> {
                 .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
                 .unwrap_or(false),
             // A class's own (static) properties live in `ClassData.statics`.
-            HeapObj::Class(c) => c.statics.pos(key).map_or(false, |i| c.statics.attrs[i].enumerable),
+            HeapObj::Class(c) => {
+                !is_private_key(key)
+                    && c.statics.pos(key).map_or(false, |i| c.statics.attrs[i].enumerable)
+            }
             // A String wrapper's char indices are own ENUMERABLE props; `length` is
             // non-enumerable; an assigned own prop lives in the arr_props side table.
             HeapObj::Boxed { kind: 0, .. } => {

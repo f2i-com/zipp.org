@@ -3138,6 +3138,23 @@ impl<'a> FnCompiler<'a> {
                 }
                 ox::ClassElement::PropertyDefinition(p) => {
                     match class_key_name(&p.key) {
+                        // A COMPUTED key whose literal folds to a "#..." STRING
+                        // is a PUBLIC property that merely looks private — route it
+                        // through the computed path (define_field → an ordinary,
+                        // visible own prop) so it never collides with the class's
+                        // real same-named private element.
+                        Ok(name) if p.computed && name.starts_with('#') => {
+                            let key = p
+                                .key
+                                .as_expression()
+                                .ok_or("unsupported computed class field key")?;
+                            computed_fields_ordered.push((key, p.value.as_ref(), p.r#static));
+                            if p.r#static {
+                                static_order.push((1, computed_fields_ordered.len() - 1));
+                            } else {
+                                instance_computed_inits.push(p.value.as_ref());
+                            }
+                        }
                         // A COMPUTED static key whose literal folds to "prototype" is
                         // a runtime TypeError (not the named-`static prototype`
                         // early SyntaxError) — route it through the computed path so

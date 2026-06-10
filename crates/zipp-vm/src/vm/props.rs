@@ -607,7 +607,11 @@ impl<'p> Vm<'p> {
                 // assignments are enumerable).
                 HeapObj::Class(c) => spec_key_order(&c.statics.keys)
                     .into_iter()
-                    .filter(|&i| c.statics.attrs[i].enumerable && !is_hidden_key(&c.statics.keys[i]))
+                    .filter(|&i| {
+                        c.statics.attrs[i].enumerable
+                            && !is_hidden_key(&c.statics.keys[i])
+                            && !c.statics.keys[i].starts_with('#')
+                    })
                     .map(|i| (c.statics.keys[i].clone(), c.statics.vals[i]))
                     .collect(),
                 _ => Vec::new(),
@@ -812,8 +816,8 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn object_get_own_property_descriptor(&mut self, obj: Value, key: &str) -> Value {
-        if !obj.is_heap() || is_private_key(key) {
-            return Value::UNDEFINED; // private names aren't reflectable
+        if !obj.is_heap() {
+            return Value::UNDEFINED;
         }
         let idx = obj.heap_index();
         // A callable's `name`/`length`: non-writable, non-enumerable, configurable.
@@ -923,6 +927,7 @@ impl<'p> Vm<'p> {
             }
             // Class static members: data props, plus `static get`/`set` rendered
             // as an accessor descriptor (raw = getter, attr.setter = setter).
+            HeapObj::Class(c) if is_private_key(key) => None,
             HeapObj::Class(c) => {
                 if let Some(i) = c.statics.pos(key) {
                     Some((c.statics.attrs[i], c.statics.vals[i]))
@@ -1061,9 +1066,10 @@ impl<'p> Vm<'p> {
                     // a generator, OR a get/set accessor) overrides the intrinsic but
                     // keeps its position — check all three stores.
                     let static_has = |k: &str| {
-                        c.statics.pos(k).is_some()
-                            || c.static_getters.iter().any(|(n, _)| n == k)
-                            || c.static_setters.iter().any(|(n, _)| n == k)
+                        !is_private_key(k)
+                            && (c.statics.pos(k).is_some()
+                                || c.static_getters.iter().any(|(n, _)| n == k)
+                                || c.static_setters.iter().any(|(n, _)| n == k))
                     };
                     if has_length || static_has("length") {
                         keys.push("length".to_string());

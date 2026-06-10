@@ -1903,12 +1903,7 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: Reflect.has called on non-object".into()));
                 }
                 let kv = self.coerce_index_key(a1)?;
-                // A private name (`#x`) is not a string property key — absent.
-                if is_private_key(&self.key_of(kv)) {
-                    Value::bool(false)
-                } else {
-                    Value::bool(self.has_property_dyn(a0, kv)?)
-                }
+                Value::bool(self.has_property_dyn(a0, kv)?)
             }
             REFLECT_DELETE => {
                 if !self.is_object_value(a0) {
@@ -2495,14 +2490,9 @@ impl<'p> Vm<'p> {
                 // receiver throws without ever coercing the key.
                 self.require_object_coercible(this)?;
                 let key = self.to_property_key(a0)?;
-                // A private name (`#x`) is not reflectable: report no accessor.
-                if is_private_key(&key) {
-                    Value::UNDEFINED
-                } else {
-                    // The chain walk uses Proxy-trap-aware [[GetOwnProperty]] /
-                    // [[GetPrototypeOf]] so a throwing trap propagates.
-                    self.lookup_accessor_checked(this, &key, id == OBJPROTO_LOOKUP_SETTER)?
-                }
+                // The chain walk uses Proxy-trap-aware [[GetOwnProperty]] /
+                // [[GetPrototypeOf]] so a throwing trap propagates.
+                self.lookup_accessor_checked(this, &key, id == OBJPROTO_LOOKUP_SETTER)?
             }
             OBJPROTO_PROTO_GET => {
                 // `get __proto__`: RequireObjectCoercible(this) before ToObject.

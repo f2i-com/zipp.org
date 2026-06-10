@@ -211,6 +211,13 @@ impl Vm<'_> {
         for v in self.super_this.values() {
             root_val!(*v);
         }
+        // Private field values: an entry keyed by a live instance must keep its
+        // payload alive (over-approximate; dead-instance entries pruned below).
+        for m in self.private_fields.values() {
+            for v in m.values() {
+                root_val!(*v);
+            }
+        }
         for &p in self.prototypes.values() {
             root_idx!(p);
         }
@@ -298,6 +305,7 @@ impl Vm<'_> {
         self.method_brand.retain(|&k, _| marks[k as usize]);
         self.instance_brand.retain(|&k, _| marks[k as usize]);
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
+        self.private_fields.retain(|&k, _| marks[k as usize]);
         // Keep declared-name records only for brands still referenced by a live
         // lexical chain or instance brand (these maps were just pruned by marks).
         if !self.brand_private_names.is_empty() {

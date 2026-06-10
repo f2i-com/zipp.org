@@ -1807,18 +1807,30 @@ impl<'p> Vm<'p> {
                         // ergonomic brand check `#x in obj` sets `brand` and skips
                         // this filter so it still observes the private element.
                         let r = if brand {
-                            // `#x in obj` ergonomic brand check: present iff the element
-                            // exists textually AND the receiver carries the accessing
-                            // class's brand (textual fallback when none resolvable).
+                            // `#x in obj` ergonomic brand check: a FIELD is
+                            // present iff the side table has the entry; a
+                            // method/accessor iff the receiver carries the
+                            // declaring brand (textual fallback when none
+                            // resolvable).
                             let key = self.key_of(k);
-                            let textual = self.has_property_str(o, &key);
-                            match self.private_brand_ok(o, &key) {
-                                Some(b) => textual && b,
-                                None => textual,
+                            if let Some((b2, kind, owner)) = self.resolve_private(&key) {
+                                if kind & 7 == 0 {
+                                    self.private_field_get(o, b2, &key).is_some()
+                                } else {
+                                    self.private_receiver_ok(o, b2, kind, owner)
+                                }
+                            } else {
+                                let textual = self.has_property_str(o, &key)
+                                    || self.private_field_scan_has(o, &key);
+                                match self.private_brand_ok(o, &key) {
+                                    Some(b) => textual && b,
+                                    None => textual,
+                                }
                             }
-                        } else if is_private_key(&self.key_of(k)) {
-                            false
                         } else {
+                            // (Real private fields live in the side table, so an
+                            // ordinary `in` never sees them; a PUBLIC "#..."
+                            // string key is an ordinary property.)
                             // Proxy-aware [[HasProperty]]: dispatches a `has` trap
                             // when the proxy is the receiver OR is in the proto chain.
                             self.has_property_dyn(o, k)?
@@ -2654,16 +2666,23 @@ impl<'p> Vm<'p> {
                                     ip += 1;
                                     continue;
                                 }
-                                // Private FIELD: brand verified; the value lives
-                                // as a textual own property (read below) and must
-                                // EXIST (PrivateFieldFind empty -> TypeError).
-                                if !self.has_property_str(o, &key) {
-                                    return Err(Thrown(format!(
-                                        "TypeError: Cannot read private member {key} from an object whose class did not declare it"
-                                    )));
+                                // Private FIELD: PrivateFieldFind in the
+                                // side table (empty -> TypeError).
+                                match self.private_field_get(o, b, &key) {
+                                    Some(v) => {
+                                        self.set(base, dst, v);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                    None => {
+                                        return Err(Thrown(format!(
+                                            "TypeError: Cannot read private member {key} from an object whose class did not declare it"
+                                        )));
+                                    }
                                 }
                             } else {
-                                let textual = self.has_property_str(o, &key);
+                                let textual = self.has_property_str(o, &key)
+                                    || self.private_field_scan_has(o, &key);
                                 let present = match self.private_brand_ok(o, &key) {
                                     Some(b) => textual && b,
                                     None => textual,
@@ -2672,6 +2691,11 @@ impl<'p> Vm<'p> {
                                     return Err(Thrown(format!(
                                         "TypeError: Cannot read private member {key} from an object whose class did not declare it"
                                     )));
+                                }
+                                if let Some(vv) = self.private_field_scan(o, &key) {
+                                    self.set(base, dst, vv);
+                                    ip += 1;
+                                    continue;
                                 }
                             }
                         }
@@ -2694,6 +2718,68 @@ impl<'p> Vm<'p> {
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
+                        // Private stores route to the side table / accessors
+                        // (field-init emission, compound/update writes). One
+                        // byte-compare on the hot path.
+                        if key.as_bytes().first() == Some(&b'#') {
+                            if let Some((b2, kind, owner)) = self.resolve_private(&key) {
+                                if !self.private_receiver_ok(o, b2, kind, owner) {
+                                    return Err(Thrown(format!(
+                                        "TypeError: Cannot write private member {key} to an object whose class did not declare it"
+                                    )));
+                                }
+                                if kind & 7 == 0 {
+                                    // PrivateFieldAdd/Set: upsert (the add case
+                                    // is the field initializer's first store).
+                                    self.private_field_set(o, b2, &key, v, true);
+                                } else if kind & 4 != 0 {
+                                    let s = self
+                                        .private_member_from_owner(owner, &key, (kind & 8) | 4)
+                                        .unwrap_or(Value::UNDEFINED);
+                                    self.call_value(s, o, &[v])?;
+                                } else if kind & 2 != 0 {
+                                    return Err(Thrown(format!(
+                                        "TypeError: '{key}' was defined without a setter"
+                                    )));
+                                } else {
+                                    return Err(Thrown(format!(
+                                        "TypeError: Cannot assign to private method {key}"
+                                    )));
+                                }
+                                ip += 1;
+                                continue;
+                            }
+                            // A STATIC private field initializer runs inline
+                            // in the DEFINING frame (this_override), so the chain
+                            // is unresolvable there — derive the brand from the
+                            // receiver class itself.
+                            if o.is_heap()
+                                && matches!(self.heap.get(o.heap_index()), HeapObj::Class(_))
+                            {
+                                if let Some(own) = self
+                                    .method_brand
+                                    .get(&o.heap_index())
+                                    .and_then(|c| c.first())
+                                    .copied()
+                                {
+                                    let declares = self
+                                        .brand_private_names
+                                        .get(&own)
+                                        .is_some_and(|ns| ns.iter().any(|(n, k)| n == &key && *k == 8));
+                                    if declares {
+                                        self.private_field_set(o, own, &key, v, true);
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Unresolvable chain: write an EXISTING table entry
+                            // (any brand) before falling back to a textual prop.
+                            if self.private_field_scan_set(o, &key, v) {
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         let strict = self.func(func_id as usize).is_strict;
                         self.set_prop(o, &key, v, strict)?;
                         ip += 1;
@@ -2717,14 +2803,12 @@ impl<'p> Vm<'p> {
                                 )));
                             }
                             if kind & 7 == 0 {
-                                // Field write: the entry must EXIST
-                                // (PrivateFieldFind empty -> TypeError).
-                                if !self.has_property_str(o, &key) {
+                                // PrivateFieldSet: the entry must EXIST.
+                                if !self.private_field_set(o, b, &key, v, false) {
                                     return Err(Thrown(format!(
                                         "TypeError: Cannot write private member {key} to an object whose class did not declare it"
                                     )));
                                 }
-                                self.set_prop(o, &key, v, true)?;
                             } else if kind & 4 != 0 {
                                 let s = self
                                     .private_member_from_owner(owner, &key, (kind & 8) | 4)
@@ -2742,7 +2826,8 @@ impl<'p> Vm<'p> {
                                 )));
                             }
                         } else {
-                            let textual = self.has_property_str(o, &key);
+                            let textual = self.has_property_str(o, &key)
+                                || self.private_field_scan_has(o, &key);
                             let present = match self.private_brand_ok(o, &key) {
                                 Some(b) => textual && b,
                                 None => textual,
@@ -2752,7 +2837,9 @@ impl<'p> Vm<'p> {
                                     "TypeError: Cannot write private member {key} to an object whose class did not declare it"
                                 )));
                             }
-                            self.set_prop(o, &key, v, true)?;
+                            if !self.private_field_scan_set(o, &key, v) {
+                                self.set_prop(o, &key, v, true)?;
+                            }
                         }
                         ip += 1;
                     }
@@ -2989,16 +3076,19 @@ impl<'p> Vm<'p> {
                                         "TypeError: '{key}' was defined without a getter"
                                     )));
                                 } else {
-                                    if !self.has_property_str(recv, key) {
-                                        return Err(Thrown(format!(
-                                            "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
-                                        )));
+                                    match self.private_field_get(recv, b, key) {
+                                        Some(v) => v,
+                                        None => {
+                                            return Err(Thrown(format!(
+                                                "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
+                                            )));
+                                        }
                                     }
-                                    self.get_prop(recv, key)?
                                 };
                                 private_callee = Some(f);
                             } else {
-                                let textual = self.has_property_str(recv, key);
+                                let textual = self.has_property_str(recv, key)
+                                    || self.private_field_scan_has(recv, key);
                                 let present = match self.private_brand_ok(recv, key) {
                                     Some(b) => textual && b,
                                     None => textual,
@@ -3008,6 +3098,7 @@ impl<'p> Vm<'p> {
                                         "TypeError: Cannot invoke private method {key} on an object whose class did not declare it"
                                     )));
                                 }
+                                private_callee = self.private_field_scan(recv, key);
                             }
                         }
                         // Hot fast path: `arr.push(x)` â€” the most common

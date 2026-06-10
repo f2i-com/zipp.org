@@ -345,6 +345,67 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// PrivateFieldFind: the field's value for the EXACT (instance, brand,
+    /// name), or None (spec: empty -> TypeError at the access site).
+    pub(crate) fn private_field_get(&self, inst: Value, brand: u64, key: &str) -> Option<Value> {
+        if !inst.is_heap() {
+            return None;
+        }
+        self.private_fields.get(&inst.heap_index())?.get(&(brand, key.to_string())).copied()
+    }
+
+    /// PrivateFieldAdd (`add=true`: upsert — field-init stores) or
+    /// PrivateFieldSet (`add=false`: only an EXISTING entry). Returns whether
+    /// the write happened.
+    pub(crate) fn private_field_set(
+        &mut self,
+        inst: Value,
+        brand: u64,
+        key: &str,
+        v: Value,
+        add: bool,
+    ) -> bool {
+        if !inst.is_heap() {
+            return false;
+        }
+        let m = self.private_fields.entry(inst.heap_index()).or_default();
+        let k = (brand, key.to_string());
+        if !add && !m.contains_key(&k) {
+            return false;
+        }
+        m.insert(k, v);
+        true
+    }
+
+    /// Lenient any-brand lookup for the textual-fallback paths (the accessing
+    /// chain was unresolvable — e.g. a class defined in a static initializer).
+    pub(crate) fn private_field_scan(&self, inst: Value, key: &str) -> Option<Value> {
+        if !inst.is_heap() {
+            return None;
+        }
+        let m = self.private_fields.get(&inst.heap_index())?;
+        m.iter().find(|((_, n), _)| n == key).map(|(_, &v)| v)
+    }
+
+    pub(crate) fn private_field_scan_has(&self, inst: Value, key: &str) -> bool {
+        self.private_field_scan(inst, key).is_some()
+    }
+
+    /// Any-brand write-if-present for the textual-fallback paths.
+    pub(crate) fn private_field_scan_set(&mut self, inst: Value, key: &str, v: Value) -> bool {
+        if !inst.is_heap() {
+            return false;
+        }
+        let Some(m) = self.private_fields.get_mut(&inst.heap_index()) else {
+            return false;
+        };
+        let Some(k) = m.keys().find(|(_, n)| n == key).cloned() else {
+            return false;
+        };
+        m.insert(k, v);
+        true
+    }
+
     /// Declaring-class private resolution (kind-aware): walk the ACCESSING
     /// code's lexical brand chain innermost-first; for the first brand that
     /// DECLARES `key`, return (brand, kind, declaring-class heap idx). `None`
@@ -502,12 +563,18 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) => m.class,
                 _ => None,
             };
+            // PRIVATE members are not observable via the ordinary
+            // [[HasProperty]] (`in` / Reflect.has): skip the class-member
+            // extension for "#..." keys. (has_property_str keeps it — the
+            // legacy textual private brand checks rely on it.)
+            let skip_members = k.starts_with('#');
             while let Some(cidx) = cur {
                 let step = match self.heap.get(cidx) {
                     HeapObj::Class(c) => Some((
-                        c.methods.iter().any(|(n, _)| *n == k)
-                            || c.getters.iter().any(|(n, _)| *n == k)
-                            || c.setters.iter().any(|(n, _)| *n == k),
+                        !skip_members
+                            && (c.methods.iter().any(|(n, _)| *n == k)
+                                || c.getters.iter().any(|(n, _)| *n == k)
+                                || c.setters.iter().any(|(n, _)| *n == k)),
                         c.parent,
                     )),
                     _ => None,

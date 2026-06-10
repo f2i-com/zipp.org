@@ -121,11 +121,12 @@ pub(crate) fn bigint_as_intn(bits: u32, x: i128) -> i128 {
 
 #[inline]
 /// A key hidden from STRING enumeration (for-in, Object.keys/values/entries,
-/// getOwnPropertyNames, JSON): a private name (`#name`) or a symbol's internal
-/// key (`@@iterator`, `@@sym:N`). Symbol keys are still reachable by
-/// getOwnPropertyDescriptor and surfaced by getOwnPropertySymbols.
+/// getOwnPropertyNames, JSON): a symbol's internal key (`@@iterator`,
+/// `@@sym:N`) — still reachable by getOwnPropertyDescriptor and surfaced by
+/// getOwnPropertySymbols. Real private FIELDS live in the side table (never
+/// own props), so a "#..." STRING key is an ordinary enumerable property.
 pub(crate) fn is_hidden_key(k: &str) -> bool {
-    k.starts_with('#') || k.starts_with("@@")
+    k.starts_with("@@")
 }
 
 pub(crate) fn len_value(n: usize) -> Value {

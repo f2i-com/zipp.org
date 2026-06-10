@@ -112,6 +112,7 @@ impl<'p> Vm<'p> {
             super_called: std::collections::HashSet::new(),
             this_tdz: std::collections::HashSet::new(),
             super_this: std::collections::HashMap::new(),
+            private_fields: std::collections::HashMap::new(),
             obj_proto: 0,
             fn_proto: 0,
             function_ctor: 0,

@@ -342,6 +342,13 @@ pub struct Vm<'p> {
     /// instance is what `construct` holds). Read+cleared by `construct` /
     /// `run_class_ctor`; transient like `super_called`.
     super_this: std::collections::HashMap<u32, Value>,
+    /// Private FIELD storage — spec [[PrivateElements]] of kind "field":
+    /// instance heap idx -> ((brand, name) -> value). Keyed by the
+    /// per-evaluation brand so same-named fields of sibling classes or other
+    /// evaluations never collide; invisible to reflection, proxy traps and
+    /// property enumeration by construction. Values are GC roots; entries
+    /// pruned when the instance dies.
+    private_fields: std::collections::HashMap<u32, std::collections::HashMap<(u64, String), Value>>,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods

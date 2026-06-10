@@ -84,6 +84,10 @@ impl<'p> Vm<'p> {
             map.define("constructor", obj, nonenum);
         }
         for (k, v) in &methods {
+            // Private methods are not prototype properties.
+            if k.starts_with('#') {
+                continue;
+            }
             map.define(k, *v, nonenum);
         }
         // Accessors become real accessor properties (getter in `vals`, setter in
@@ -93,9 +97,15 @@ impl<'p> Vm<'p> {
         let acc_attr =
             PropAttr { writable: false, enumerable: false, configurable: true, accessor: true, setter: Value::UNDEFINED };
         for (k, g) in &getters {
+            if k.starts_with('#') {
+                continue;
+            }
             map.define(k, *g, acc_attr);
         }
         for (k, s) in &setters {
+            if k.starts_with('#') {
+                continue;
+            }
             if let Some(i) = map.pos(k) {
                 map.attrs[i].accessor = true;
                 map.attrs[i].setter = *s;
