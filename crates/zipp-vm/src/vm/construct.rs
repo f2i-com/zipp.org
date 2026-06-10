@@ -594,7 +594,13 @@ impl<'p> Vm<'p> {
         // realm) is still a Proxy: its [[Construct]] must run the construct trap
         // below, not this generic realm-ctor path — so exclude proxies here.
         let cr = self.get_function_realm(cv);
-        if cr != 0 && self.proxy_parts(cv.heap_index()).is_none() {
+        if cr != 0
+            && self.proxy_parts(cv.heap_index()).is_none()
+            && !matches!(
+                self.heap.get(cv.heap_index()),
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
+            )
+        {
             // If we know the MAIN-realm constructor it mirrors, build a REAL instance
             // by delegating to it with `cv` as newTarget (so the instance's
             // [[Prototype]] is the realm's `X.prototype`), then tag it with the realm.
@@ -1074,7 +1080,15 @@ impl<'p> Vm<'p> {
             // The instance's [[Prototype]] is newTarget.prototype (OrdinaryCreate
             // FromConstructor); for the common `new F()` case this is F.prototype.
             let default = self.prototype_of(cv).unwrap_or(Value::UNDEFINED);
-            let proto = self.newtarget_proto(new_target, cv, default)?;
+            let mut proto = self.newtarget_proto(new_target, cv, default)?;
+            // GetPrototypeFromConstructor: a non-object prototype falls back
+            // to %Object.prototype% — from the CONSTRUCTOR's realm when it is
+            // realm-tagged (a real function made by new other.Function()).
+            if !self.is_object_value(proto) {
+                if let Some(rp) = self.realm_proto_fallback(cv, self.obj_proto) {
+                    proto = Value::heap(rp);
+                }
+            }
             let obj = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
             if proto.is_heap() {
                 self.proto_of.insert(obj.heap_index(), proto);

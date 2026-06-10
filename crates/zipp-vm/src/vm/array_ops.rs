@@ -508,9 +508,15 @@ impl<'p> Vm<'p> {
         let lv = self.get_prop(this, "length")?;
         let lenf = self.to_number_coerce(lv)?;
         // ToLength: a positive length (incl. +Infinity / "Infinity" / a huge finite)
-        // clamps to MAX_DENSE_ARRAY_LEN; NaN and ≤0 (incl. -Infinity) → 0.
+        // clamps to MAX_DENSE_ARRAY_LEN for the ascending probe loops; the
+        // descending/own-keys arms below use the FULL spec ToLength (2^53-1).
         let len: usize = if lenf > 0.0 {
             (lenf as usize).min(crate::vm::MAX_DENSE_ARRAY_LEN)
+        } else {
+            0
+        };
+        let full_len: u64 = if lenf > 0.0 {
+            lenf.trunc().min(9_007_199_254_740_991.0) as u64
         } else {
             0
         };
@@ -588,9 +594,10 @@ impl<'p> Vm<'p> {
                 // throwing index getter on an array-like propagates and an absent index is
                 // undefined. find/findIndex go forward; findLast/findLastIndex backward.
                 let backward = name == "findLast" || name == "findLastIndex";
-                let order: Vec<usize> =
-                    if backward { (0..len).rev().collect() } else { (0..len).collect() };
-                for k in order {
+                let total: u64 = if backward { full_len } else { len as u64 };
+                let mut i: u64 = 0;
+                while i < total {
+                    let k = if backward { (total - 1 - i) as usize } else { i as usize };
                     let val = self.array_iter_get(this, k)?.unwrap_or(Value::UNDEFINED);
                     let r = self.call_value(cb, this_arg, &[val, idxv(k), this])?;
                     if self.truthy(r) {
@@ -599,6 +606,7 @@ impl<'p> Vm<'p> {
                             _ => idxv(k),
                         }));
                     }
+                    i += 1;
                 }
                 Ok(Some(match name {
                     "find" | "findLast" => Value::UNDEFINED,
@@ -607,6 +615,45 @@ impl<'p> Vm<'p> {
             }
             "reduce" | "reduceRight" => {
                 let right = name == "reduceRight";
+                if full_len > crate::vm::MAX_DENSE_ARRAY_LEN as u64
+                    && matches!(self.heap.get(this.heap_index()), HeapObj::Object(_))
+                {
+                    let mut keys: Vec<u64> = match self.heap.get(this.heap_index()) {
+                        HeapObj::Object(m) => m
+                            .keys
+                            .iter()
+                            .filter_map(|k| {
+                                k.parse::<u64>()
+                                    .ok()
+                                    .filter(|n| n.to_string() == *k && *n < full_len)
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    keys.sort_unstable();
+                    if right {
+                        keys.reverse();
+                    }
+                    let mut acc = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                    let mut started = args.len() >= 2;
+                    for k in keys {
+                        let kv = Value::num(k as f64);
+                        let val = self.get_index(this, kv)?;
+                        if !started {
+                            acc = val;
+                            started = true;
+                        } else {
+                            acc =
+                                self.call_value(cb, Value::UNDEFINED, &[acc, val, kv, this])?;
+                        }
+                    }
+                    if !started {
+                        return Err(Thrown(
+                            "TypeError: Reduce of empty array with no initial value".into(),
+                        ));
+                    }
+                    return Ok(Some(acc));
+                }
                 let order: Vec<usize> =
                     if right { (0..len).rev().collect() } else { (0..len).collect() };
                 let mut acc = args.get(1).copied().unwrap_or(Value::UNDEFINED);
