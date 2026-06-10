@@ -2758,7 +2758,7 @@ impl<'a> FnCompiler<'a> {
     /// `cls`: evaluate `extends`, `MakeClass`, then install static fields and
     /// computed-key members. Shared by class declarations and class expressions.
     fn build_class_into(&mut self, class: &ox::Class, cls: Reg, name: Option<&str>) -> R<()> {
-        let (class_id, static_fields, computed, computed_fields, static_block_fns) =
+        let (class_id, static_fields, computed, computed_fields, static_block_fns, static_order) =
             self.compile_class(class, name)?;
         // Evaluate the superclass value (`extends P`) into a temp the VM links in.
         let parent_reg = if let Some(sc) = &class.super_class {
@@ -2781,100 +2781,120 @@ impl<'a> FnCompiler<'a> {
         if parent_reg.is_some() {
             self.next_reg -= 1; // reclaim the parent temp
         }
-        // Static fields are own properties of the class value, initialized here
-        // (in the enclosing scope) right after the class is created.
-        for (fname, finit) in &static_fields {
-            let save = self.next_reg;
-            // A static field initializer evaluates with `this` = the class, and (like
-            // all class-body code) in STRICT mode. `super.x` inside it (typically via
-            // an arrow) resolves against the class's [[Prototype]] (the parent class),
-            // so thread the home class id + static-ness like a static method body.
-            self.this_override = Some(cls);
-            let prev_strict = self.cx.in_strict;
-            self.cx.in_strict = true;
-            let (prev_sc, prev_ss) = (self.super_class, self.super_static);
-            self.super_class = Some(class_id);
-            self.super_static = true;
-            let v = match finit {
-                Some(e) => self.expr(e)?,
-                None => {
-                    let t = self.temp();
-                    self.emit(Instr::LoadUndefined { dst: t });
-                    t
-                }
-            };
-            self.super_class = prev_sc;
-            self.super_static = prev_ss;
-            self.cx.in_strict = prev_strict;
-            self.this_override = None;
-            // NamedEvaluation: an anonymous fn/arrow/class initializer takes the
-            // field name (including the literal "#field" for private fields).
-            if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
-                let kr = self.temp();
-                let idx = self.add_string_const(fname);
-                self.emit(Instr::LoadConst { dst: kr, idx });
-                self.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
-            }
-            let name_idx = self.string_name(fname);
-            self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
-            self.next_reg = save;
-        }
-        // Computed-key methods: evaluate each key now and install it on the class.
+        // PHASE 1 — evaluate every ClassElementName in source position: computed
+        // member keys install the members; computed FIELD keys evaluate ONCE
+        // (an instance key parks on the class for the ctor's FieldInit; a
+        // static key parks in a register that phase 2 consumes).
         for (key, func, kind) in &computed {
             let save = self.next_reg;
             let kr = self.expr(key)?;
             self.emit(Instr::ClassAddMember { class: cls, key: kr, func: *func, kind: *kind });
             self.next_reg = save;
         }
-        // Computed-key fields: evaluate each KEY now (once, in source order). A
-        // static field also assigns its value on the class here; an instance
-        // field's key is parked on the class for the ctor's per-instance FieldInit.
-        for (key, init, is_static) in &computed_fields {
-            let save = self.next_reg;
-            let kr = self.expr(key)?; // key evaluates with the enclosing `this`
+        let mut parked: Vec<Option<Reg>> = Vec::with_capacity(computed_fields.len());
+        for (key, _init, is_static) in &computed_fields {
             if *is_static {
-                // …but the value initializer evaluates with `this` = the class, in
-                // STRICT mode (the computed KEY above used the enclosing context).
-                // `super.x` resolves against the parent class (as for static fields).
-                self.this_override = Some(cls);
-                let prev_strict = self.cx.in_strict;
-                self.cx.in_strict = true;
-                let (prev_sc, prev_ss) = (self.super_class, self.super_static);
-                self.super_class = Some(class_id);
-                self.super_static = true;
-                let vr = match init {
-                    Some(e) => self.expr(e)?,
-                    None => {
-                        let t = self.temp();
-                        self.emit(Instr::LoadUndefined { dst: t });
-                        t
-                    }
-                };
-                self.super_class = prev_sc;
-                self.super_static = prev_ss;
-                self.cx.in_strict = prev_strict;
-                self.this_override = None;
-                // A static field may not be named `prototype` (TypeError); the op
-                // ToPropertyKeys the (already-evaluated) key once and checks it.
-                self.emit(Instr::ClassStaticField { class: cls, key: kr, val: vr });
+                // Survives until phase 2 (not reclaimed).
+                let kr = self.temp();
+                let v = self.expr_into(key, kr)?;
+                if v != kr {
+                    self.emit(Instr::Move { dst: kr, src: v });
+                }
+                parked.push(Some(kr));
             } else {
+                let save = self.next_reg;
+                let kr = self.expr(key)?;
                 self.emit(Instr::PushFieldKey { class: cls, key: kr });
+                self.next_reg = save;
+                parked.push(None);
             }
-            self.next_reg = save;
         }
-        // `static { … }` blocks: run each thunk with `this` = the class, in source
-        // order, after the static fields. Invoked as `thunk.call(cls)` so the
-        // existing call machinery binds `this` — no new opcode needed.
-        for &fid in &static_block_fns {
-            let save = self.next_reg;
-            let f = self.temp();
-            self.emit(Instr::MakeFunc { dst: f, func_id: fid });
-            let argb = self.temp();
-            self.emit(Instr::Move { dst: argb, src: cls });
-            let trash = self.temp();
-            let call_idx = self.string_name("call");
-            self.emit(Instr::CallMethod { dst: trash, obj: f, name: call_idx, arg_base: argb, argc: 1 });
-            self.next_reg = save;
+        // PHASE 2 — run the STATIC field initializers and `static {}` blocks in
+        // SOURCE order (spec ClassDefinitionEvaluation: one interleaved list; an
+        // abrupt completion aborts the remaining elements). Initializers run
+        // with `this` = the class, in strict mode, with the class's static
+        // super base.
+        for &(elem_kind, idx) in &static_order {
+            match elem_kind {
+                0 => {
+                    let (fname, finit) = &static_fields[idx];
+                    let save = self.next_reg;
+                    self.this_override = Some(cls);
+                    let prev_strict = self.cx.in_strict;
+                    self.cx.in_strict = true;
+                    let (prev_sc, prev_ss) = (self.super_class, self.super_static);
+                    self.super_class = Some(class_id);
+                    self.super_static = true;
+                    let v = match finit {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            let t = self.temp();
+                            self.emit(Instr::LoadUndefined { dst: t });
+                            t
+                        }
+                    };
+                    self.super_class = prev_sc;
+                    self.super_static = prev_ss;
+                    self.cx.in_strict = prev_strict;
+                    self.this_override = None;
+                    // NamedEvaluation: an anonymous fn/arrow/class initializer takes
+                    // the field name (incl. the literal "#field" for privates).
+                    if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
+                        let kr = self.temp();
+                        let cidx = self.add_string_const(fname);
+                        self.emit(Instr::LoadConst { dst: kr, idx: cidx });
+                        self.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
+                    }
+                    let name_idx = self.string_name(fname);
+                    self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
+                    self.next_reg = save;
+                }
+                1 => {
+                    let Some(kr) = parked[idx] else { continue };
+                    let (_key, init, _is_static) = &computed_fields[idx];
+                    let save = self.next_reg;
+                    self.this_override = Some(cls);
+                    let prev_strict = self.cx.in_strict;
+                    self.cx.in_strict = true;
+                    let (prev_sc, prev_ss) = (self.super_class, self.super_static);
+                    self.super_class = Some(class_id);
+                    self.super_static = true;
+                    let vr = match init {
+                        Some(e) => self.expr(e)?,
+                        None => {
+                            let t = self.temp();
+                            self.emit(Instr::LoadUndefined { dst: t });
+                            t
+                        }
+                    };
+                    self.super_class = prev_sc;
+                    self.super_static = prev_ss;
+                    self.cx.in_strict = prev_strict;
+                    self.this_override = None;
+                    // A static field may not be named `prototype` (TypeError); the
+                    // op ToPropertyKeys the (already-evaluated) key and checks it.
+                    self.emit(Instr::ClassStaticField { class: cls, key: kr, val: vr });
+                    self.next_reg = save;
+                }
+                _ => {
+                    let fid = static_block_fns[idx];
+                    let save = self.next_reg;
+                    let f = self.temp();
+                    self.emit(Instr::MakeFunc { dst: f, func_id: fid });
+                    let argb = self.temp();
+                    self.emit(Instr::Move { dst: argb, src: cls });
+                    let trash = self.temp();
+                    let call_idx = self.string_name("call");
+                    self.emit(Instr::CallMethod {
+                        dst: trash,
+                        obj: f,
+                        name: call_idx,
+                        arg_base: argb,
+                        argc: 1,
+                    });
+                    self.next_reg = save;
+                }
+            }
         }
         Ok(())
     }
@@ -2903,6 +2923,7 @@ impl<'a> FnCompiler<'a> {
         Vec<(&'b ox::Expression<'b>, u32, u8)>,
         Vec<(&'b ox::Expression<'b>, Option<&'b ox::Expression<'b>>, bool)>,
         Vec<u32>,
+        Vec<(u8, usize)>,
     )> {
         // A named class expression keeps its own name; an anonymous one inherits
         // the binding it's assigned to (NamedEvaluation), else the "<class>" stub.
@@ -2976,6 +2997,9 @@ impl<'a> FnCompiler<'a> {
             Option<&'b ox::Expression<'b>>,
             bool,
         )> = Vec::new();
+        // Source order of STATIC elements: (0=named field, 1=computed field,
+        // 2=static block) -> index into its vec; drives phase-2 evaluation.
+        let mut static_order: Vec<(u8, usize)> = Vec::new();
         let mut instance_computed_inits: Vec<Option<&'b ox::Expression<'b>>> = Vec::new();
         // Members with a runtime-computed key (`[expr]() {}`) — the key is
         // evaluated and the member installed at class-creation time (see
@@ -3035,16 +3059,22 @@ impl<'a> FnCompiler<'a> {
                                 .as_expression()
                                 .ok_or("unsupported computed class field key")?;
                             computed_fields_ordered.push((key, p.value.as_ref(), true));
+                            static_order.push((1, computed_fields_ordered.len() - 1));
                         }
                         // Static string key.
-                        Ok(name) if p.r#static => static_fields.push((name, p.value.as_ref())),
+                        Ok(name) if p.r#static => {
+                            static_fields.push((name, p.value.as_ref()));
+                            static_order.push((0, static_fields.len() - 1));
+                        }
                         // Instance string key.
                         Ok(name) => fields.push((name, p.value.as_ref())),
                         // Computed key `[expr] = v` — evaluated once at class def.
                         Err(e) => {
                             let key = p.key.as_expression().ok_or(e)?;
                             computed_fields_ordered.push((key, p.value.as_ref(), p.r#static));
-                            if !p.r#static {
+                            if p.r#static {
+                                static_order.push((1, computed_fields_ordered.len() - 1));
+                            } else {
                                 instance_computed_inits.push(p.value.as_ref());
                             }
                         }
@@ -3052,6 +3082,7 @@ impl<'a> FnCompiler<'a> {
                 }
                 ox::ClassElement::StaticBlock(b) => {
                     static_blocks.push(&b.body);
+                    static_order.push((2, static_blocks.len() - 1));
                 }
                 _ => return Err("unsupported class member in the zipp-vm subset".into()),
             }
@@ -3309,7 +3340,7 @@ impl<'a> FnCompiler<'a> {
         };
         self.cx.class_enclosing = saved_enclosing;
         self.cx.class_derived = saved_derived;
-        Ok((class_id, static_fields, computed_defs, computed_fields_ordered, static_block_fns))
+        Ok((class_id, static_fields, computed_defs, computed_fields_ordered, static_block_fns, static_order))
     }
 
     /// The enclosing-function chain to hand a function nested in THIS one: our
