@@ -1035,6 +1035,13 @@ impl Compiler {
                     t
                 }
             };
+            // NamedEvaluation for anonymous initializers (incl. "#field" names).
+            if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
+                let kr = fc.temp();
+                let idx = fc.add_string_const(fname);
+                fc.emit(Instr::LoadConst { dst: kr, idx });
+                fc.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
+            }
             let name_idx = fc.string_name(fname);
             fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v });
             fc.next_reg = save;
@@ -2786,6 +2793,14 @@ impl<'a> FnCompiler<'a> {
             self.super_static = prev_ss;
             self.cx.in_strict = prev_strict;
             self.this_override = None;
+            // NamedEvaluation: an anonymous fn/arrow/class initializer takes the
+            // field name (including the literal "#field" for private fields).
+            if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
+                let kr = self.temp();
+                let idx = self.add_string_const(fname);
+                self.emit(Instr::LoadConst { dst: kr, idx });
+                self.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
+            }
             let name_idx = self.string_name(fname);
             self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v });
             self.next_reg = save;

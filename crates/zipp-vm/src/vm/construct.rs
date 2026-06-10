@@ -1207,6 +1207,18 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<bool, Thrown> {
         let oidx = obj.heap_index();
+        // `class S extends Symbol/BigInt`: super() must throw — neither is a
+        // constructor ([[Construct]] is absent). Checked FIRST: these ctors have
+        // no .prototype mapping, so the pidx lookup below would bail before it.
+        if cval.is_heap() {
+            let ci = cval.heap_index();
+            if ci != 0 && ci == self.symbol_ctor {
+                return Err(Thrown("TypeError: Symbol is not a constructor".into()));
+            }
+            if ci != 0 && ci == self.bigint_ctor {
+                return Err(Thrown("TypeError: BigInt is not a constructor".into()));
+            }
+        }
         // Only re-brand a class instance that is still a plain Object (not already a
         // builtin variant from a deeper super() in the chain).
         if !matches!(self.heap.get(oidx), HeapObj::Object(_)) {
@@ -1218,17 +1230,6 @@ impl<'p> Vm<'p> {
         };
         // Capture the subclass prototype before re-branding loses the map.class link.
         let sub_proto = self.object_get_prototype_of(obj);
-        // `class S extends Symbol/BigInt`: super() must throw — neither is a
-        // constructor (their call forms exist but [[Construct]] does not).
-        if cval.is_heap() {
-            let ci = cval.heap_index();
-            if ci != 0 && ci == self.symbol_ctor {
-                return Err(Thrown("TypeError: Symbol is not a constructor".into()));
-            }
-            if ci != 0 && ci == self.bigint_ctor {
-                return Err(Thrown("TypeError: BigInt is not a constructor".into()));
-            }
-        }
         // `class T extends Uint8Array` (or any TypedArray kind): build a real typed
         // array through the builtin ctor (handling every arg form — length, array,
         // (buffer, byteOffset, length) on a fixed/resizable buffer) and move it into

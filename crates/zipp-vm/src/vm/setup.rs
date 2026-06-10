@@ -69,11 +69,20 @@ impl<'p> Vm<'p> {
         // test262's verifyProperty checks.
         let nonenum =
             PropAttr { writable: true, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
+        // A generator / async-generator function's prototype object owns NO
+        // `constructor` property (MakeMethod-less ordinary object per spec).
+        let is_gen_fn = match self.heap.get(idx) {
+            HeapObj::Func(id) => self.func(*id as usize).is_generator,
+            HeapObj::Closure { func, .. } => self.func(*func as usize).is_generator,
+            _ => false,
+        };
         let mut map = ObjMap::new();
         // `constructor` is installed at prototype creation (before user methods), so
         // it is the FIRST string key — getOwnPropertyNames lists it after any integer
         // keys but before the declared methods (e.g. ['1','2','constructor','a','c']).
-        map.define("constructor", obj, nonenum);
+        if !is_gen_fn {
+            map.define("constructor", obj, nonenum);
+        }
         for (k, v) in &methods {
             map.define(k, *v, nonenum);
         }

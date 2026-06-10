@@ -663,7 +663,17 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
                 Some(None) => return self.reject_write(key, strict), // getter-only
-                None => {}                    // fall through to a data write
+                None => {
+                    // Restricted properties: with no OWN static accessor of that
+                    // name (a class may legitimately declare `static set caller`),
+                    // assignment to caller/arguments hits the inherited
+                    // %ThrowTypeError% setter — classes are strict functions.
+                    if key == "caller" || key == "arguments" {
+                        return Err(Thrown(format!(
+                            "TypeError: '{key}' may not be assigned on a class constructor"
+                        )));
+                    }
+                }
             }
         }
         // An Array's named (non-index) own property — `arr.foo = 1`, a match
