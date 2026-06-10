@@ -434,6 +434,20 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::EvalScopeHas { dst, idx } => {
+                        let has = self.eval_scope_lookup(idx).is_some();
+                        self.set(base, dst, Value::bool(has));
+                        ip += 1;
+                    }
+                    Instr::EvalScopeSet { idx, src } => {
+                        let v = self.get(base, src);
+                        if !self.eval_scope_store(idx, v) {
+                            // The probed binding vanished (cannot normally
+                            // happen): fall back to the global slot.
+                            self.globals[idx as usize] = v;
+                        }
+                        ip += 1;
+                    }
                     Instr::StoreGlobalDyn { idx, src } => {
                         let v = self.get(base, src);
                         if self.eval_scope_store(idx, v) {
@@ -2595,6 +2609,35 @@ impl<'p> Vm<'p> {
                     Instr::UpvalSet { idx, src } => {
                         let cell = self.closure_upvalue(cur_closure, idx);
                         let v = self.get(base, src);
+                        self.heap.cell_set(cell, v);
+                        ip += 1;
+                    }
+                    Instr::LoadUpvalDyn { dst, idx, name } => {
+                        // A sloppy direct eval may have shadowed the captured
+                        // name with a function-scoped binding — it wins.
+                        if let Some(v) = self.eval_scope_lookup(name) {
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
+                        let cell = self.closure_upvalue(cur_closure, idx);
+                        let v = self.heap.cell_get(cell);
+                        if v.is_uninitialized() {
+                            return Err(Thrown(
+                                "ReferenceError: cannot access a lexical binding before initialization"
+                                    .to_string(),
+                            ));
+                        }
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
+                    Instr::StoreUpvalDyn { idx, src, name } => {
+                        let v = self.get(base, src);
+                        if self.eval_scope_store(name, v) {
+                            ip += 1;
+                            continue;
+                        }
+                        let cell = self.closure_upvalue(cur_closure, idx);
                         self.heap.cell_set(cell, v);
                         ip += 1;
                     }

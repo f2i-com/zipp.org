@@ -66,6 +66,15 @@ pub enum Instr {
     LoadGlobalDyn { dst: Reg, idx: u32 },
     LoadGlobalOrUndefinedDyn { dst: Reg, idx: u32 },
     StoreGlobalDyn { idx: u32, src: Reg },
+    /// Does the activation's EvalScope bind this slot's NAME right now?
+    /// An assignment in a sloppy direct-eval zone snapshots its target
+    /// reference with this BEFORE the RHS runs: a `var` the RHS's eval
+    /// introduces is what later READS see, but not what this assignment
+    /// writes (PutValue uses the already-resolved reference).
+    EvalScopeHas { dst: Reg, idx: u32 },
+    /// Write the activation's EXISTING EvalScope binding for the slot's name
+    /// (the EvalScopeHas-true arm; falls back to the global slot if gone).
+    EvalScopeSet { idx: u32, src: Reg },
     /// `globals[idx] = src`
     StoreGlobal { idx: u32, src: Reg },
     /// `globals[idx] = src`, but in STRICT mode: assignment to an unresolvable
@@ -451,6 +460,12 @@ pub enum Instr {
     UpvalGet { dst: Reg, idx: u16 },
     /// `*<upvalue[idx]> = src` — write one of this closure's captured cells.
     UpvalSet { idx: u16, src: Reg },
+    /// EvalScope-first upvalue access for a sloppy contains-direct-eval
+    /// function: the eval may have introduced a function-scoped `var`
+    /// SHADOWING the captured name — that binding (looked up via the `name`
+    /// global-slot handle) wins over the captured cell.
+    LoadUpvalDyn { dst: Reg, idx: u16, name: u32 },
+    StoreUpvalDyn { idx: u16, src: Reg, name: u32 },
     /// `dst = [reg[arg_base], …, reg[arg_base+argc-1]]` — array literal.
     NewArray { dst: Reg, arg_base: Reg, argc: u16 },
     /// `dst = {}` — empty object (populated by following SetProp/SetIndex).

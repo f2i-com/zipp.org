@@ -5719,7 +5719,16 @@ impl<'a> FnCompiler<'a> {
                         Ok(dst)
                     }
                     Binding::Upvalue(idx) => {
-                        self.emit(Instr::UpvalGet { dst, idx });
+                        // A sloppy contains-direct-eval function: an eval-
+                        // introduced function-scoped `var` shadows the
+                        // captured name for READS.
+                        if !self.cx.in_strict && self.box_all_locals {
+                            let name = self.upvalues.borrow()[idx as usize].0.clone();
+                            let slot = self.cx.global_slot(&name) as u32;
+                            self.emit(Instr::LoadUpvalDyn { dst, idx, name: slot });
+                        } else {
+                            self.emit(Instr::UpvalGet { dst, idx });
+                        }
                         Ok(dst)
                     }
                     Binding::Global(idx) => {
@@ -7099,7 +7108,15 @@ impl<'a> FnCompiler<'a> {
                 dst
             }
             Binding::Upvalue(idx) => {
-                self.emit(Instr::UpvalGet { dst, idx: *idx });
+                // A sloppy contains-direct-eval function: an eval-introduced
+                // function-scoped `var` shadows the captured name for READS.
+                if !self.cx.in_strict && self.box_all_locals {
+                    let name = self.upvalues.borrow()[*idx as usize].0.clone();
+                    let slot = self.cx.global_slot(&name) as u32;
+                    self.emit(Instr::LoadUpvalDyn { dst, idx: *idx, name: slot });
+                } else {
+                    self.emit(Instr::UpvalGet { dst, idx: *idx });
+                }
                 dst
             }
             Binding::Global(idx) => {
@@ -7164,7 +7181,17 @@ impl<'a> FnCompiler<'a> {
                 }
             }
             Binding::LocalCell(cell) => self.emit(Instr::CellSet { cell: *cell, src }),
-            Binding::Upvalue(idx) => self.emit(Instr::UpvalSet { idx: *idx, src }),
+            Binding::Upvalue(idx) => {
+                // A sloppy contains-direct-eval function: SetMutableBinding
+                // resolves at store time — an eval-introduced shadow wins.
+                if !self.cx.in_strict && self.box_all_locals {
+                    let name = self.upvalues.borrow()[*idx as usize].0.clone();
+                    let slot = self.cx.global_slot(&name) as u32;
+                    self.emit(Instr::StoreUpvalDyn { idx: *idx, src, name: slot });
+                } else {
+                    self.emit(Instr::UpvalSet { idx: *idx, src });
+                }
+            }
             Binding::Global(idx) => {
                 // In strict mode, assigning to an unresolvable (never-declared) global
                 // is a ReferenceError, not a silent global creation. A top-level
@@ -7181,6 +7208,62 @@ impl<'a> FnCompiler<'a> {
             // Unreachable: the inner class binding is const (is_const above threw).
             Binding::ClassName(_) => {}
         }
+    }
+
+    /// Assignment-reference SNAPSHOT for a sloppy direct-eval zone: PutValue
+    /// writes the reference resolved BEFORE the RHS ran, so a `var` binding a
+    /// direct eval in the RHS introduces is visible to later reads but NOT to
+    /// the in-flight assignment. Emits an `EvalScopeHas` probe (None when the
+    /// target isn't a dyn-zone sloppy global — then `store_binding` is exact).
+    fn eval_snap_probe(&mut self, binding: &Binding) -> Option<Reg> {
+        match binding {
+            Binding::Global(idx)
+                if !self.cx.in_strict
+                    && !self.cx.lexical_globals.contains(idx)
+                    && (self.box_all_locals || self.cx.dyn_global_zone) =>
+            {
+                let p = self.alloc_reg();
+                self.emit(Instr::EvalScopeHas { dst: p, idx: *idx });
+                Some(p)
+            }
+            Binding::Upvalue(idx) if !self.cx.in_strict && self.box_all_locals => {
+                let name = self.upvalues.borrow()[*idx as usize].0.clone();
+                let slot = self.cx.global_slot(&name) as u32;
+                let p = self.alloc_reg();
+                self.emit(Instr::EvalScopeHas { dst: p, idx: slot });
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+
+    /// Store through a reference snapshotted by `eval_snap_probe`: the probed
+    /// state (not the store-time state) picks EvalScope vs the static target.
+    fn store_binding_snapped(&mut self, b: &Binding, src: Reg, snap: Option<Reg>) {
+        let (p, name_slot, static_store): (Reg, u32, Instr) = match (snap, b) {
+            (Some(p), Binding::Global(idx)) => {
+                (p, *idx, Instr::StoreGlobal { idx: *idx, src })
+            }
+            (Some(p), Binding::Upvalue(uidx)) => {
+                let name = self.upvalues.borrow()[*uidx as usize].0.clone();
+                let slot = self.cx.global_slot(&name) as u32;
+                (p, slot, Instr::UpvalSet { idx: *uidx, src })
+            }
+            _ => {
+                self.store_binding(b, src);
+                return;
+            }
+        };
+        let j_scope = self.here();
+        self.emit(Instr::JumpIfTrue { cond: p, target: 0 });
+        self.emit(static_store);
+        let j_end = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let at_scope = self.here();
+        self.patch_jump(j_scope, at_scope);
+        self.emit(Instr::EvalScopeSet { idx: name_slot, src });
+        let end = self.here();
+        self.patch_jump(j_end, end);
     }
 
     /// Bind all parameters at function entry, strictly LEFT-TO-RIGHT, applying each
@@ -8061,6 +8144,10 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
                 // Cell / upvalue / global / const-local: evaluate into dst, store.
+                // The target reference resolves BEFORE the RHS (a direct eval
+                // there may introduce a shadowing `var` — snapshot first).
+                let save_p = self.next_reg;
+                let snap = self.eval_snap_probe(&binding);
                 let v = if lhs_covered {
                     self.expr_into(&a.right, dst)?
                 } else {
@@ -8069,13 +8156,16 @@ impl<'a> FnCompiler<'a> {
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
-                self.store_binding(&binding, dst);
+                self.store_binding_snapped(&binding, dst, snap);
+                self.next_reg = save_p;
                 Ok(dst)
             }
             // Logical assignment: `x ||= y` / `x &&= y` / `x ??= y` only assign
             // `y` when the short-circuit condition holds (truthy-skip for ||=,
             // falsy-skip for &&=, non-nullish-skip for ??=).
             Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish => {
+                let save_p = self.next_reg;
+                let snap = self.eval_snap_probe(&binding);
                 let cur = self.load_binding(&binding, dst);
                 if cur != dst {
                     self.emit(Instr::Move { dst, src: cur });
@@ -8089,9 +8179,10 @@ impl<'a> FnCompiler<'a> {
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
-                self.store_binding(&binding, dst);
+                self.store_binding_snapped(&binding, dst, snap);
                 let end = self.here();
                 self.patch_jump(j, end);
+                self.next_reg = save_p;
                 Ok(dst)
             }
             // Arithmetic / bitwise compound assignment (`+= -= *= /= %= **= <<=
@@ -8112,13 +8203,17 @@ impl<'a> FnCompiler<'a> {
                 }
                 // Cell / upvalue / global / const-local: load current → dst, compute
                 // → dst, store back through the binding (store_binding throws for a
-                // const, after the RHS + arithmetic side effects).
+                // const, after the RHS + arithmetic side effects). The reference
+                // is resolved (snapshotted) before the RHS, like plain `=`.
+                let save_p = self.next_reg;
+                let snap = self.eval_snap_probe(&binding);
                 let cur = self.load_binding(&binding, dst); // == dst
                 let rhs = self.expr(&a.right)?;
                 let instr = compound_assign_instr(other, dst, cur, rhs)
                     .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                 self.emit(instr);
-                self.store_binding(&binding, dst);
+                self.store_binding_snapped(&binding, dst, snap);
+                self.next_reg = save_p;
                 Ok(dst)
             }
         }

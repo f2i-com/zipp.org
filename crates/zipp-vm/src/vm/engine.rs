@@ -2397,8 +2397,15 @@ impl<'p> Vm<'p> {
                     | Instr::StoreGlobalStrict { idx, .. }
                     | Instr::LoadGlobalDyn { idx, .. }
                     | Instr::LoadGlobalOrUndefinedDyn { idx, .. }
-                    | Instr::StoreGlobalDyn { idx, .. } => {
+                    | Instr::StoreGlobalDyn { idx, .. }
+                    | Instr::EvalScopeHas { idx, .. }
+                    | Instr::EvalScopeSet { idx, .. } => {
                         *idx = gmap[*idx as usize];
+                    }
+                    // The upvalue index is the eval closure's own; only the
+                    // NAME handle is a global slot.
+                    Instr::LoadUpvalDyn { name, .. } | Instr::StoreUpvalDyn { name, .. } => {
+                        *name = gmap[*name as usize];
                     }
                     // Class-id operands: the class itself, and every `super`
                     // reference (which names its home class).
