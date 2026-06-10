@@ -1043,7 +1043,15 @@ impl Compiler {
                 fc.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
             }
             let name_idx = fc.string_name(fname);
-            fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v });
+            // DefineField (CreateDataPropertyOrThrow) for PUBLIC fields — never
+            // a [[Set]] (an inherited setter must not run; a Proxy receiver's
+            // defineProperty trap must). Private "#fields" keep the plain store
+            // (private semantics bypass proxies entirely).
+            if fname.starts_with('#') {
+                fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v });
+            } else {
+                fc.emit(Instr::DefineField { obj: 0, name: name_idx, val: v });
+            }
             fc.next_reg = save;
         }
         // Computed instance fields (`[k] = v`): the key was evaluated at class

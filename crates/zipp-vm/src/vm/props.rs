@@ -1680,6 +1680,25 @@ impl<'p> Vm<'p> {
         Ok(true)
     }
 
+    /// CreateDataPropertyOrThrow for a class FIELD: an own {value,
+    /// writable:true, enumerable:true, configurable:true} data property on the
+    /// receiver, never consulting prototype setters; a Proxy receiver's
+    /// defineProperty trap fires (and its throw propagates).
+    pub(crate) fn define_field(
+        &mut self,
+        target: Value,
+        key: &str,
+        value: Value,
+    ) -> Result<(), Thrown> {
+        let mut m = ObjMap::new();
+        m.set("value", value);
+        m.set("writable", Value::TRUE);
+        m.set("enumerable", Value::TRUE);
+        m.set("configurable", Value::TRUE);
+        let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+        self.object_define_property(target, key, desc)
+    }
+
     /// `Object.defineProperty(obj, key, descriptor)` — define/redefine an own
     /// property with explicit attributes (unspecified attrs default to false on a
     /// new property; an existing non-configurable property rejects most changes).

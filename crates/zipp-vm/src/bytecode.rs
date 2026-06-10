@@ -548,6 +548,12 @@ pub enum Instr {
     /// u32::MAX when the eval site has no class context.
     DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool },
 
+    /// CreateDataPropertyOrThrow for a class FIELD initializer: an own
+    /// {writable, enumerable, configurable} data property on the receiver —
+    /// never consults prototype setters; a Proxy receiver's defineProperty
+    /// trap fires.
+    DefineField { obj: Reg, name: u32, val: Reg },
+
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
     CallMethod { dst: Reg, obj: Reg, name: u32, arg_base: Reg, argc: u16 },

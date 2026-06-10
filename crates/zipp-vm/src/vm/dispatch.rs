@@ -1205,7 +1205,10 @@ impl<'p> Vm<'p> {
                             _ => None,
                         };
                         if let Some(key) = key {
-                            self.set_index(this, key, v, false)?;
+                            // CreateDataPropertyOrThrow (an own define, prototype
+                            // setters never consulted; Proxy defineProperty fires).
+                            let ks = self.key_of(key);
+                            self.define_field(this, &ks, v)?;
                         }
                         ip += 1;
                     }
@@ -2604,6 +2607,15 @@ impl<'p> Vm<'p> {
                         }
                         let r = self.get_prop(o, &key)?;
                         self.set(base, dst, r);
+                        ip += 1;
+                    }
+                    Instr::DefineField { obj, name, val } => {
+                        let o = self.get(base, obj);
+                        let v = self.get(base, val);
+                        let key = self.func(func_id as usize)
+                            .string_constants[name as usize]
+                            .clone();
+                        self.define_field(o, &key, v)?;
                         ip += 1;
                     }
                     Instr::SetProp { obj, name, val } => {
