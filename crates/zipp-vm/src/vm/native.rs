@@ -236,6 +236,11 @@ pub const MODULE_DEP_FAIL: u16 = 898;
 /// single-agent slice of the test262 agent API (no worker agents).
 pub const AGENT_MONOTONIC_NOW: u16 = 899;
 pub const AGENT_SET_TIMEOUT: u16 = 900;
+/// `$262.evalScript(src)` — run `src` as a SCRIPT in the current realm
+/// (GlobalDeclarationInstantiation: vars/functions AND top-level lexicals
+/// become persistent realm bindings, unlike indirect eval's discarded
+/// lexical environment).
+pub const DOLLAR262_EVAL_SCRIPT: u16 = 901;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

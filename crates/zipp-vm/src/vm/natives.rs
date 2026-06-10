@@ -2649,6 +2649,11 @@ impl<'p> Vm<'p> {
                 Value::NULL
             }
             DOLLAR262_GC => Value::UNDEFINED,
+            DOLLAR262_EVAL_SCRIPT => {
+                let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let code = self.to_js_string(a0)?;
+                self.eval_script(&code)?
+            }
             DOLLAR262_CREATE_REALM => self.create_realm(),
             // Object.prototype Annex-B accessor helpers.
             OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {

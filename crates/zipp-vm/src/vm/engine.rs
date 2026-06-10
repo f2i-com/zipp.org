@@ -2507,6 +2507,18 @@ impl<'p> Vm<'p> {
                                         "TypeError: cannot declare global function {name}"
                                     )));
                                 }
+                            } else if self.global_by_name(&name).is_none()
+                                && !matches!(
+                                    self.heap.get(self.global_this),
+                                    HeapObj::Object(m) if m.extensible
+                                )
+                            {
+                                // CanDeclareGlobalFunction step 5: an ABSENT name
+                                // is only definable while the global object is
+                                // extensible.
+                                return Err(Thrown(format!(
+                                    "TypeError: cannot declare global function {name}"
+                                )));
                             }
                         }
                     }
@@ -2683,6 +2695,35 @@ impl<'p> Vm<'p> {
     /// Install a compiled eval/module program and run its top-level body, returning
     /// `(completion, gmap)`. (prepare + execute; modules that need namespace
     /// pre-registration call the two halves directly — see `import_module`.)
+    /// `$262.evalScript`: parse + compile `code` as a SCRIPT and run it in
+    /// the current realm. Every top-level declaration — var, function, AND
+    /// `let`/`const`/`class` — binds a persistent realm global (the eval
+    /// pipeline's name-mapped slots), matching script
+    /// GlobalDeclarationInstantiation rather than eval semantics.
+    pub(crate) fn eval_script(&mut self, code: &str) -> Result<Value, Thrown> {
+        let allocator = oxc_allocator::Allocator::default();
+        let ret =
+            oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::default()).parse();
+        if !ret.errors.is_empty() {
+            return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
+        }
+        let prog = crate::compile::compile_program(&ret.program, code)
+            .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
+        let (completion, _gmap) = self.run_eval_program(
+            prog,
+            None,
+            false,
+            None,
+            None,
+            Value::UNDEFINED,
+            None,
+            true,
+            None,
+            None,
+        )?;
+        Ok(completion)
+    }
+
     fn run_eval_program(
         &mut self,
         eval_prog: crate::bytecode::Program,
