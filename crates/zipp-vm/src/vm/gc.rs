@@ -140,6 +140,9 @@ impl Vm<'_> {
         if self.pending_yield_eval_scope != u32::MAX {
             root_idx!(self.pending_yield_eval_scope);
         }
+        if self.import_meta != 0 {
+            root_idx!(self.import_meta);
+        }
         if let Some((v, _, _)) = &self.pending_await {
             root_val!(*v);
         }

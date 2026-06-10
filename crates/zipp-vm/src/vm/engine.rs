@@ -117,6 +117,7 @@ impl<'p> Vm<'p> {
             eval_fn_idx: 0,
             closure_eval_scope: std::collections::HashMap::new(),
             module_ambiguous: std::collections::HashMap::new(),
+            import_meta: 0,
             sloppy_eval_memo: Vec::new(),
             obj_proto: 0,
             fn_proto: 0,

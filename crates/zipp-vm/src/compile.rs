@@ -4827,12 +4827,16 @@ impl<'a> FnCompiler<'a> {
         // Resolve the iterator. `for await` uses the ASYNC iterator (@@asyncIterator
         // → @@iterator fallback); plain `for of` uses @@iterator. Built-ins/async
         // generators pass through and are driven by IterNext / ForAwaitNext.
-        if f.r#await {
-            let sync_scratch = self.temp();
-            self.emit(Instr::GetAsyncIterator { dst: iter_reg, src: iter_reg, sync_dst: sync_scratch });
+        let sync_reg = if f.r#await {
+            // The sync flag must survive the whole loop (read each iteration
+            // for the AsyncFromSyncIteratorContinuation value-await below).
+            let s = self.declare_local("<forof.sync>");
+            self.emit(Instr::GetAsyncIterator { dst: iter_reg, src: iter_reg, sync_dst: s });
+            Some(s)
         } else {
             self.emit(Instr::GetIterator { dst: iter_reg, src: iter_reg });
-        }
+            None
+        };
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
         // Close-on-throw (sync for-of only): if the element binding or the body
@@ -4905,6 +4909,16 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
             let value_name = self.string_name("value");
             self.emit(Instr::GetProp { dst: elem, obj: r, name: value_name });
+            // AsyncFromSyncIteratorContinuation: a SYNC source's yielded value
+            // is itself resolved and awaited — an array of promises iterates
+            // their settled values, and a rejected element throws into the loop.
+            if let Some(s) = sync_reg {
+                let jskip = self.here();
+                self.emit(Instr::JumpIfFalse { cond: s, target: 0 });
+                self.emit(Instr::Await { dst: elem, val: elem });
+                let after = self.here();
+                self.patch_jump(jskip, after);
+            }
             j
         } else {
             self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter: iter_reg, idx: idx_reg });
@@ -5585,6 +5599,19 @@ impl<'a> FnCompiler<'a> {
                 };
                 self.emit(Instr::ImportCall { dst, spec, phase, opts });
                 Ok(dst)
+            }
+            ox::Expression::MetaProperty(m) => {
+                // `import.meta` — module code only (a SyntaxError in scripts);
+                // `new.target` is handled by the dedicated lowering elsewhere.
+                if m.meta.name == "import" && m.property.name == "meta" {
+                    if !self.cx.module_mode {
+                        return Err("SyntaxError: import.meta is only valid in modules".into());
+                    }
+                    let dst = self.temp();
+                    self.emit(Instr::ImportMeta { dst });
+                    return Ok(dst);
+                }
+                Err("unsupported meta property".into())
             }
             _ => Err("unsupported expression (not in the zipp-vm v1 subset yet)".into()),
         }

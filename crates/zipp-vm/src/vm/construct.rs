@@ -2460,6 +2460,14 @@ impl<'p> Vm<'p> {
     /// fallback or a raw array/string) — whose stepped VALUES get the
     /// AsyncFromSyncIterator await-unwrap in async contexts.
     pub(crate) fn get_async_iterator(&mut self, v: Value) -> Result<(Value, bool), Thrown> {
+        // An async generator is its OWN async iterator: its yielded values are
+        // already settled by the generator machinery — NOT sync (no extra
+        // value-await, which would shift promise interleaving by a tick).
+        if v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::AsyncGenerator(_))
+        {
+            return Ok((v, false));
+        }
         if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_)) {
             // GetMethod(@@asyncIterator): undefined/null ⇒ absent (fall back to the
             // sync iterator); present-but-not-callable ⇒ TypeError (do NOT fall back —

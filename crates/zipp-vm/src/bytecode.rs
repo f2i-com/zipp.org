@@ -557,6 +557,10 @@ pub enum Instr {
     /// `home_class`/`super_static`: the CALLER's compile-time class home (so
     /// `super.x` inside the eval'd code resolves against the same class) —
     /// u32::MAX when the eval site has no class context.
+    /// `import.meta` (module code): the per-program host meta object,
+    /// lazily allocated by the VM (ordinary, extensible, null prototype).
+    ImportMeta { dst: Reg },
+
     DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool, site: u16 },
 
     /// CreateDataPropertyOrThrow for a class FIELD initializer: an own

@@ -512,6 +512,9 @@ pub struct Vm<'p> {
     /// `export *` sources): excluded from the namespace; resolving one by name
     /// through `export {x} from` / `import {x}` is a SyntaxError.
     module_ambiguous: std::collections::HashMap<u32, std::collections::HashSet<String>>,
+    /// The lazily-created `import.meta` object (one per Vm; host-defined,
+    /// ordinary extensible null-proto). 0 = not yet allocated.
+    import_meta: u32,
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined
     /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class

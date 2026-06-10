@@ -3040,6 +3040,15 @@ impl<'p> Vm<'p> {
                     // Direct eval from strict code: the evaluated string inherits
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
+                    Instr::ImportMeta { dst } => {
+                        if self.import_meta == 0 {
+                            let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                            self.proto_of.insert(idx, Value::NULL);
+                            self.import_meta = idx;
+                        }
+                        self.set(base, dst, Value::heap(self.import_meta));
+                        ip += 1;
+                    }
                     Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
