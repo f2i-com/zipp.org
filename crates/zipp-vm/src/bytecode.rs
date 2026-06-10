@@ -1041,6 +1041,10 @@ pub struct Program {
     /// may not var/function-declare one of these names (SyntaxError per
     /// EvalDeclarationInstantiation), and they are NOT global-object props.
     pub lexical_globals: Vec<u32>,
+    /// The `const` subset of `lexical_globals` (plus module import locals):
+    /// `$262.evalScript` registers these as realm consts so a LATER script's
+    /// assignment throws TypeError (same-program writes are compile errors).
+    pub const_globals: Vec<u32>,
     /// For a sloppy FUNCTION-context eval program: the var/function names the
     /// eval declares into the caller's dynamic EvalScope (instead of globals).
     pub eval_dynamic_names: Vec<String>,

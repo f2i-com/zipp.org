@@ -517,6 +517,23 @@ pub struct Vm<'p> {
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep.
     error_data: std::collections::HashSet<u32>,
+    /// `$262.evalScript` flag: the NEXT eval-program instantiation uses SCRIPT
+    /// GlobalDeclarationInstantiation semantics (non-configurable brandNew
+    /// bindings, lexical-collision SyntaxErrors, realm-persistent lexicals)
+    /// instead of EvalDeclarationInstantiation. Consumed (mem::take) by
+    /// prepare_eval_program.
+    eval_script_gdi: bool,
+    /// Realm slots bound as LEXICALS (let/const/class) by `$262.evalScript`
+    /// scripts: collision SyntaxErrors + invisible to global-object property
+    /// reflection (the main program's own lexicals live in
+    /// program.lexical_globals).
+    eval_lexical_globals: std::collections::HashSet<u32>,
+    /// The `const` subset of eval_lexical_globals: a write to an INITIALIZED
+    /// one throws TypeError (the initializing write sees UNINITIALIZED).
+    eval_const_globals: std::collections::HashSet<u32>,
+    /// Realm slots declared var/function by `$262.evalScript` scripts —
+    /// HasVarDeclaration for later scripts' lexical-collision checks.
+    eval_var_globals: std::collections::HashSet<u32>,
     /// `arguments` exotic objects (Array-backed): heap index → the live
     /// [[ParameterMap]] for a MAPPED one (sloppy + simple params), or `None`
     /// for an unmapped one (strict / non-simple). Presence alone drives the

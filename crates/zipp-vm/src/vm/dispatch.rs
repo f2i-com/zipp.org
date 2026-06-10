@@ -440,6 +440,16 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
+                        // A $262.evalScript `const`: writes after the
+                        // initializing one (which sees UNINITIALIZED) throw.
+                        if !self.eval_const_globals.is_empty()
+                            && self.eval_const_globals.contains(&idx)
+                            && !self.globals[idx as usize].is_uninitialized()
+                        {
+                            return Err(Thrown(
+                                "TypeError: Assignment to constant variable.".into(),
+                            ));
+                        }
                         if self.globals[idx as usize].is_uninitialized() {
                             if let Some(name) = self.global_slot_name(idx) {
                                 let has_own = self.global_this != 0
@@ -459,6 +469,16 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::StoreGlobal { idx, src } => {
+                        // A $262.evalScript `const`: writes after the
+                        // initializing one (which sees UNINITIALIZED) throw.
+                        if !self.eval_const_globals.is_empty()
+                            && self.eval_const_globals.contains(&idx)
+                            && !self.globals[idx as usize].is_uninitialized()
+                        {
+                            return Err(Thrown(
+                                "TypeError: Assignment to constant variable.".into(),
+                            ));
+                        }
                         let v = self.get(base, src);
                         if self.globals[idx as usize].is_uninitialized() {
                             // An own-prop-backed binding (eval-created /
@@ -490,6 +510,14 @@ impl<'p> Vm<'p> {
                         if self.globals[idx as usize].is_uninitialized() {
                             let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
                             return Err(Thrown(format!("ReferenceError: {name} is not defined")));
+                        }
+                        // A $262.evalScript `const` is immutable once initialized.
+                        if !self.eval_const_globals.is_empty()
+                            && self.eval_const_globals.contains(&idx)
+                        {
+                            return Err(Thrown(
+                                "TypeError: Assignment to constant variable.".into(),
+                            ));
                         }
                         let v = self.get(base, src);
                         self.globals[idx as usize] = v;

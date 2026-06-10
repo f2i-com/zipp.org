@@ -179,6 +179,10 @@ impl<'p> Vm<'p> {
             shared_buffers: std::collections::HashSet::new(),
             immutable_buffers: std::collections::HashSet::new(),
             error_data: std::collections::HashSet::new(),
+            eval_script_gdi: false,
+            eval_lexical_globals: std::collections::HashSet::new(),
+            eval_const_globals: std::collections::HashSet::new(),
+            eval_var_globals: std::collections::HashSet::new(),
             arguments_objs: std::collections::HashMap::new(),
             module_base_dir: None,
             module_cache: std::collections::HashMap::new(),
@@ -2297,6 +2301,10 @@ impl<'p> Vm<'p> {
         prealloc: Option<&std::collections::HashMap<u32, u32>>,
     ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
+        // A $262.evalScript: SCRIPT GlobalDeclarationInstantiation semantics
+        // for THIS program only (lexical-collision SyntaxErrors, realm-
+        // persistent lexicals, non-configurable brandNew var/fn bindings).
+        let script_gdi = std::mem::take(&mut self.eval_script_gdi);
         // Runtime base ids: eval functions and classes are appended past the
         // compile-time tables (parallel to global slots).
         let base_func = (self.main_func_count + self.eval_funcs.len()) as u32;
@@ -2440,10 +2448,39 @@ impl<'p> Vm<'p> {
         let count = self.eval_funcs.len();
         let start = (base_func as usize) - self.main_func_count;
         if var_env_global {
+            // SCRIPT GDI steps 3-4: every lexically-declared name of THIS
+            // script must collide with NEITHER an existing var/function
+            // declaration NOR an existing lexical NOR a non-configurable
+            // global-object property — SyntaxError BEFORE any binding
+            // (including this script's own vars) is created.
+            if script_gdi {
+                for &slot in &eval_prog.lexical_globals {
+                    let rs = gmap[slot as usize];
+                    let name = self.global_slot_name(rs).unwrap_or_default();
+                    let has_var = self.program.hoisted_globals.contains(&rs)
+                        || self.program.decl_globals.contains(&rs)
+                        || self.eval_var_globals.contains(&rs);
+                    let has_lex = self.program.lexical_globals.contains(&rs)
+                        || self.eval_lexical_globals.contains(&rs);
+                    let restricted = self.global_this != 0
+                        && matches!(
+                            self.heap.get(self.global_this),
+                            HeapObj::Object(m)
+                                if m.pos(&name).map_or(false, |i| !m.attrs[i].configurable)
+                        );
+                    if has_var || has_lex || restricted {
+                        return Err(Thrown(format!(
+                            "SyntaxError: Identifier '{name}' has already been declared"
+                        )));
+                    }
+                }
+            }
             let mut lex_clash: Option<String> = None;
             for &slot in &eval_prog.hoisted_globals {
                 let rs = gmap[slot as usize];
-                if self.program.lexical_globals.contains(&rs) {
+                if self.program.lexical_globals.contains(&rs)
+                    || self.eval_lexical_globals.contains(&rs)
+                {
                     lex_clash = self.global_slot_name(rs);
                     break;
                 }
@@ -2451,7 +2488,9 @@ impl<'p> Vm<'p> {
             if lex_clash.is_none() {
                 for local in start..count {
                     if let Some(slot) = self.eval_funcs[local].name_global {
-                        if self.program.lexical_globals.contains(&(slot as u32)) {
+                        if self.program.lexical_globals.contains(&(slot as u32))
+                            || self.eval_lexical_globals.contains(&(slot as u32))
+                        {
                             lex_clash = self.global_slot_name(slot as u32);
                             break;
                         }
@@ -2536,9 +2575,31 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // SCRIPT GDI bookkeeping: record this script's bindings in the realm
+        // registries — later scripts' collision checks, const enforcement
+        // (StoreGlobal* throw on a write to an INITIALIZED const slot), and
+        // lexical invisibility to global-object property reflection.
+        if script_gdi && var_env_global {
+            for &slot in &eval_prog.lexical_globals {
+                self.eval_lexical_globals.insert(gmap[slot as usize]);
+            }
+            for &slot in &eval_prog.const_globals {
+                self.eval_const_globals.insert(gmap[slot as usize]);
+            }
+            for &slot in &eval_prog.hoisted_globals {
+                self.eval_var_globals.insert(gmap[slot as usize]);
+            }
+            for local in start..count {
+                if let Some(slot) = self.eval_funcs[local].name_global {
+                    self.eval_var_globals.insert(slot as u32);
+                }
+            }
+        }
         // 5. CreateGlobalVarBinding for eval `var` names: an ABSENT binding
         // becomes an own {writable, enumerable, CONFIGURABLE} property of the
-        // global object (eval-created bindings are deletable and reflectable);
+        // global object (eval-created bindings are deletable and reflectable;
+        // a $262.evalScript's are NON-configurable — script
+        // GlobalDeclarationInstantiation passes deletable=false);
         // the slot stays UNINITIALIZED so reads/writes route through the own
         // prop (the Load/StoreGlobal fallbacks). Existing bindings untouched.
         // FUNCTION-context dynamic names: CreateMutableBinding(undefined) in
@@ -2576,7 +2637,7 @@ impl<'p> Vm<'p> {
                                     crate::heap::PropAttr {
                                         writable: true,
                                         enumerable: true,
-                                        configurable: true,
+                                        configurable: !script_gdi,
                                         accessor: false,
                                         setter: Value::UNDEFINED,
                                     },
@@ -2626,7 +2687,7 @@ impl<'p> Vm<'p> {
                             let attr = crate::heap::PropAttr {
                                 writable: true,
                                 enumerable: true,
-                                configurable: true,
+                                configurable: !script_gdi,
                                 accessor: false,
                                 setter: Value::UNDEFINED,
                             };
@@ -2733,6 +2794,9 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // Script GlobalDeclarationInstantiation (not eval semantics) for this
+        // program: prepare_eval_program consumes the flag.
+        self.eval_script_gdi = true;
         let (completion, _gmap) = self.run_eval_program(
             prog,
             None,

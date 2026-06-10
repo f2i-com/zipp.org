@@ -2542,10 +2542,33 @@ impl<'p> Vm<'p> {
     /// proto name (`<arrow>`, `<script>`, …) reads as the empty string (anonymous).
     /// `globalThis.<name>`: the value of the reserved global slot named `name`
     /// (or None if there is no such global). Backs property access on globalThis.
+    /// True when `name` is a top-level LEXICAL binding (let/const/class) of
+    /// the main script or a $262.evalScript: a realm binding readable as a
+    /// bare identifier, but NOT a global-object property.
+    pub(crate) fn global_name_is_lexical(&self, name: &str) -> bool {
+        if self.program.lexical_globals.is_empty() && self.eval_lexical_globals.is_empty() {
+            return false;
+        }
+        let slot = if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
+            i as u32
+        } else if let Some(&s) = self.eval_global_map.get(name) {
+            s
+        } else {
+            return false;
+        };
+        self.program.lexical_globals.contains(&slot) || self.eval_lexical_globals.contains(&slot)
+    }
+
     pub(crate) fn global_by_name(&self, name: &str) -> Option<Value> {
         // A built-in global removed via `delete globalThis.X` reads as absent
         // everywhere (get / has-own / descriptor all consult this).
         if self.deleted_globals.contains(name) {
+            return None;
+        }
+        // A global LEXICAL is not a global-object property: invisible to
+        // property reflection (gopd / hasOwnProperty / `globalThis.x` reads),
+        // though the bare identifier still reads its slot.
+        if self.global_name_is_lexical(name) {
             return None;
         }
         if let Some(slot) = self.program.global_names.iter().position(|n| n == name) {
