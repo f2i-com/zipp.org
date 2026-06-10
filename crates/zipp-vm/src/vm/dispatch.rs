@@ -2704,10 +2704,14 @@ impl<'p> Vm<'p> {
                                         // IS the fully-linked namespace.
                                         Some(p) => match self.import_module(&p) {
                                             Ok(ns) => Ok(ns),
-                                            Err(_) => Err(self
+                                            // A loader Thrown carries its error type in
+                                            // the message prefix ("SyntaxError: …") —
+                                            // reject with the MATCHING error object, not
+                                            // an empty TypeError.
+                                            Err(Thrown(msg)) => Err(self
                                                 .pending_throw
                                                 .take()
-                                                .unwrap_or_else(|| self.make_error(1, None))),
+                                                .unwrap_or_else(|| self.error_from_thrown(&msg))),
                                         },
                                     }
                                 }

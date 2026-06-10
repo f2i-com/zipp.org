@@ -116,6 +116,7 @@ impl<'p> Vm<'p> {
             private_fields: std::collections::HashMap::new(),
             eval_fn_idx: 0,
             closure_eval_scope: std::collections::HashMap::new(),
+            module_ambiguous: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
             obj_proto: 0,
             fn_proto: 0,
@@ -1174,6 +1175,14 @@ impl<'p> Vm<'p> {
         }
         let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false) {
             Ok(p) => p,
+            // Top-level await in an IMPORTED module needs the async-module
+            // evaluation pipeline (not built yet): surface a host TypeError —
+            // a SyntaxError would misreport a spec-VALID module as malformed.
+            Err(e) if e.contains("only valid inside an async function") => {
+                return Err(Thrown(
+                    "TypeError: top-level await is not supported in imported modules yet".into(),
+                ));
+            }
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
         // A real `import` declaration / `export * as ns from` needs linking we don't
@@ -1223,8 +1232,11 @@ impl<'p> Vm<'p> {
         };
         self.module_own.remove(&path);
         match linked {
-            Ok(full) => {
+            Ok((full, ambiguous)) => {
                 self.populate_module_namespace(ns_idx, &full);
+                if !ambiguous.is_empty() {
+                    self.module_ambiguous.insert(ns_idx, ambiguous);
+                }
                 Ok(Value::heap(ns_idx))
             }
             Err(e) => {
@@ -1239,17 +1251,18 @@ impl<'p> Vm<'p> {
 
     /// Resolve a module's re-exports into `full` (the export name→slot list). Split out
     /// of `import_module` so the in-progress (`module_own`) marker is cleaned up by the
-    /// caller on every exit path. A name a `export {x} from` dependency doesn't export
-    /// is OMITTED (the namespace lacks that key) — spec says reject (SyntaxError), but
-    /// omission is the safe contained-slice choice and doesn't affect well-formed
-    /// modules. `export *` copies all of the dependency's exports except `default`.
+    /// caller on every exit path. A name an `export {x} from` dependency doesn't export
+    /// (incl. a circular chain that never grounds) is a link-time SyntaxError per
+    /// ResolveExport. `export *` copies the dependency's exports except `default`; a
+    /// name supplied by TWO different star sources is AMBIGUOUS — excluded from the
+    /// namespace and a SyntaxError to resolve by name (the second tuple element).
     fn link_module_reexports(
         &mut self,
         mut full: Vec<(String, u32)>,
         reexports: &[(String, String, String)],
         star_reexports: &[String],
         dir: Option<&std::path::Path>,
-    ) -> Result<Vec<(String, u32)>, Thrown> {
+    ) -> Result<(Vec<(String, u32)>, std::collections::HashSet<String>), Thrown> {
         for (exported, imported, spec) in reexports {
             let dep = match dir {
                 Some(d) => d.join(spec),
@@ -1257,18 +1270,42 @@ impl<'p> Vm<'p> {
             };
             if let Some(slot) = self.resolve_export(&dep, imported)? {
                 full.push((exported.clone(), slot));
+            } else {
+                return Err(Thrown(format!(
+                    "SyntaxError: The requested module '{spec}' does not provide an export named '{imported}'"
+                )));
             }
         }
+        let own: std::collections::HashSet<String> =
+            full.iter().map(|(n, _)| n.clone()).collect();
+        let mut star_seen: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
         for spec in star_reexports {
             let dep = match dir {
                 Some(d) => d.join(spec),
                 None => std::path::PathBuf::from(spec),
             };
             for (name, slot) in self.all_exports(&dep)? {
-                full.push((name, slot));
+                if own.contains(&name) {
+                    continue; // a local/indirect export shadows star names
+                }
+                match star_seen.get(&name) {
+                    Some(&prev) if prev != slot => {
+                        ambiguous.insert(name);
+                    }
+                    Some(_) => {}
+                    None => {
+                        star_seen.insert(name.clone(), slot);
+                        full.push((name, slot));
+                    }
+                }
             }
         }
-        Ok(full)
+        if !ambiguous.is_empty() {
+            full.retain(|(n, _)| !ambiguous.contains(n));
+        }
+        Ok((full, ambiguous))
     }
 
     /// Resolve a single exported `name` from the module at `raw_path` to its live
@@ -1282,7 +1319,16 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<u32>, Thrown> {
         let dep = std::fs::canonicalize(raw_path)
             .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        let ambiguous_check = |vm: &Self, ns_idx: u32| -> Result<(), Thrown> {
+            if vm.module_ambiguous.get(&ns_idx).is_some_and(|s| s.contains(name)) {
+                return Err(Thrown(format!(
+                    "SyntaxError: The requested module contains conflicting star exports for name '{name}'"
+                )));
+            }
+            Ok(())
+        };
         if let Some(&ns) = self.module_cache.get(&dep) {
+            ambiguous_check(self, ns.heap_index())?;
             return Ok(self
                 .module_namespaces
                 .get(&ns.heap_index())
@@ -1292,6 +1338,7 @@ impl<'p> Vm<'p> {
             return Ok(m.get(name).copied());
         }
         let ns = self.import_module(&dep)?;
+        ambiguous_check(self, ns.heap_index())?;
         Ok(self
             .module_namespaces
             .get(&ns.heap_index())

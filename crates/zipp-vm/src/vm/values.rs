@@ -819,6 +819,29 @@ impl<'p> Vm<'p> {
     /// path keeps working); `message` is set own only when supplied and not
     /// `undefined` (else inherited as "" from the prototype). The prototype link
     /// gives `.constructor`, `.toString`, and value-`instanceof` resolution.
+    /// Map a Thrown message ("SyntaxError: …") to a REAL error object of the
+    /// matching constructor, preserving the message text (used where a Thrown
+    /// must surface as a rejection value, e.g. import()).
+    pub(crate) fn error_from_thrown(&mut self, msg: &str) -> Value {
+        let (kind, text) = match msg.split_once(": ") {
+            Some((n, rest)) => {
+                let k: u8 = match n {
+                    "TypeError" => 1,
+                    "RangeError" => 2,
+                    "SyntaxError" => 3,
+                    "ReferenceError" => 4,
+                    "EvalError" => 5,
+                    "URIError" => 6,
+                    _ => 0,
+                };
+                (k, rest.to_string())
+            }
+            None => (0u8, msg.to_string()),
+        };
+        let m = self.alloc_str(text);
+        self.make_error(kind, Some(m))
+    }
+
     pub(crate) fn make_error(&mut self, kind: u8, msg: Option<Value>) -> Value {
         let k = (kind as usize).min(7);
         let name_v = self.alloc_str(native::ERROR_NAMES[k].to_string());

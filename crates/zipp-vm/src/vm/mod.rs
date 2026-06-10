@@ -508,6 +508,10 @@ pub struct Vm<'p> {
     /// cycle) resolves against this own-exports snapshot instead of recursing. Holds
     /// only slot indices into `globals` (a GC root), so it needs no separate rooting.
     module_own: std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, u32>>,
+    /// Per-namespace AMBIGUOUS export names (a name supplied by two different
+    /// `export *` sources): excluded from the namespace; resolving one by name
+    /// through `export {x} from` / `import {x}` is a SyntaxError.
+    module_ambiguous: std::collections::HashMap<u32, std::collections::HashSet<String>>,
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined
     /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class
