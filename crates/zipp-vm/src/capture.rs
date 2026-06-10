@@ -306,8 +306,23 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
         }
         E::UnaryExpression(u) => expr_refs(&u.argument, out),
         E::UpdateExpression(u) => {
-            if let ox::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &u.argument {
-                out.insert(id.name.to_string());
+            match &u.argument {
+                ox::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                    out.insert(id.name.to_string());
+                }
+                // `o.x++` / `o.#x++` / `o[k]++`: the OBJECT (and key) are reads
+                // an enclosing arrow/function must capture.
+                ox::SimpleAssignmentTarget::StaticMemberExpression(m) => {
+                    expr_refs(&m.object, out)
+                }
+                ox::SimpleAssignmentTarget::ComputedMemberExpression(m) => {
+                    expr_refs(&m.object, out);
+                    expr_refs(&m.expression, out);
+                }
+                ox::SimpleAssignmentTarget::PrivateFieldExpression(p) => {
+                    expr_refs(&p.object, out)
+                }
+                _ => {}
             }
         }
         E::AssignmentExpression(a) => {
@@ -319,6 +334,10 @@ fn expr_refs(e: &ox::Expression, out: &mut HashSet<String>) {
                 ox::AssignmentTarget::ComputedMemberExpression(m) => {
                     expr_refs(&m.object, out);
                     expr_refs(&m.expression, out);
+                }
+                // `o.#x = v`: the object is a read to capture.
+                ox::AssignmentTarget::PrivateFieldExpression(p) => {
+                    expr_refs(&p.object, out)
                 }
                 _ => {}
             }

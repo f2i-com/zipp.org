@@ -4983,6 +4983,17 @@ impl<'a> FnCompiler<'a> {
             ox::ChainElement::StaticMemberExpression(m) => self.static_member(m, dst),
             ox::ChainElement::ComputedMemberExpression(m) => self.computed_member(m, dst),
             ox::ChainElement::CallExpression(c) => self.call(c, dst),
+            // `o?.#field` (and nested `?.` links inside the object register
+            // their own bails): the GetProp private path handles brand checks.
+            ox::ChainElement::PrivateFieldExpression(p) => {
+                let obj = self.expr(&p.object)?;
+                if p.optional {
+                    self.emit_optional_check(obj);
+                }
+                let name = self.string_name(&private_key(&p.field.name));
+                self.emit(Instr::GetProp { dst, obj, name });
+                Ok(dst)
+            }
             _ => Err("this optional-chain form is not in the zipp-vm subset yet".into()),
         };
         let bails = self.chain_bails.pop().unwrap();
