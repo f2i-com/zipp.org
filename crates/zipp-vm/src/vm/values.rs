@@ -89,7 +89,14 @@ impl<'p> Vm<'p> {
                     if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
                         return true;
                     }
-                    return self.arr_proto != 0 && self.has_property(Value::heap(self.arr_proto), key);
+                    // Walk the ACTUAL [[Prototype]] (a setPrototypeOf custom proto
+                    // carries inherited indices), else %Array.prototype%.
+                    let proto = match self.proto_of.get(&idx) {
+                        Some(&p) => p,
+                        None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                        None => Value::NULL,
+                    };
+                    return proto.is_heap() && self.has_property(proto, key);
                 }
                 let k = self.key_of(key);
                 if k == "length" {
@@ -98,8 +105,14 @@ impl<'p> Vm<'p> {
                 if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
                     return true;
                 }
-                // Inherited: Array.prototype (push/map/…) then Object.prototype.
-                self.arr_proto != 0 && self.has_property(Value::heap(self.arr_proto), key)
+                // Inherited: the actual [[Prototype]] (custom via setPrototypeOf),
+                // else Array.prototype (push/map/…) then Object.prototype.
+                let proto = match self.proto_of.get(&idx) {
+                    Some(&p) => p,
+                    None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                    None => Value::NULL,
+                };
+                proto.is_heap() && self.has_property(proto, key)
             }
             HeapObj::Str(s) => match array_index(key) {
                 Some(i) => i < s.char_len,

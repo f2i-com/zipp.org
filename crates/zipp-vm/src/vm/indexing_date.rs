@@ -157,11 +157,16 @@ impl<'p> Vm<'p> {
                         }
                     }
                     // Out of range OR a hole → not an own element; [[Get]] continues up
-                    // the prototype chain, so an index inherited from `Array.prototype[k]`
-                    // (or a prototype accessor) is visited rather than read as undefined.
+                    // the ACTUAL prototype chain (a setPrototypeOf custom proto can
+                    // carry inherited indices/accessors), else %Array.prototype%.
                     let k = self.key_of(key);
-                    if self.arr_proto != 0 {
-                        return self.get_member(Value::heap(self.arr_proto), &k, obj);
+                    let proto = match self.proto_of.get(&aidx) {
+                        Some(&p) => p,
+                        None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                        None => Value::NULL,
+                    };
+                    if proto.is_heap() {
+                        return self.get_member(proto, &k, obj);
                     }
                     return Ok(Value::UNDEFINED);
                 }

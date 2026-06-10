@@ -372,6 +372,52 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// FlattenIntoArray (23.1.3.13.1): walk `source` per index with the spec
+    /// HasProperty+Get protocol, applying `mapper` at the TOP level only
+    /// (flatMap), spreading array elements (proxy-piercing IsArray) up to
+    /// `depth` levels. Absent indices are SKIPPED (the mapper never runs on a
+    /// hole and nothing is appended for it).
+    fn flatten_into_array(
+        &mut self,
+        out: &mut Vec<Value>,
+        source: Value,
+        source_len: usize,
+        depth: i64,
+        mapper: Option<(Value, Value)>,
+    ) -> Result<(), Thrown> {
+        for k in 0..source_len {
+            let Some(got) = self.array_iter_get(source, k)? else {
+                continue;
+            };
+            let v = match mapper {
+                Some((cb, ta)) => {
+                    self.call_value(cb, ta, &[got, Value::num(k as f64), source])?
+                }
+                None => got,
+            };
+            if depth > 0 && self.value_is_array_throwing(v)? {
+                let lv = self.get_prop(v, "length")?;
+                let lf = self.to_number_coerce(lv)?;
+                let n = if lf.is_nan() || lf <= 0.0 {
+                    0usize
+                } else {
+                    (lf.trunc().min(9_007_199_254_740_991.0) as usize)
+                        .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                };
+                self.flatten_into_array(out, v, n, depth - 1, None)?;
+            } else {
+                if out.len() >= crate::vm::MAX_DENSE_ARRAY_LEN {
+                    return Err(Thrown(
+                        "RangeError: array length exceeds the engine's dense-array limit"
+                            .into(),
+                    ));
+                }
+                out.push(v);
+            }
+        }
+        Ok(())
+    }
+
     /// Live read of index `k` for the iteration protocol: `Some(value)` if the
     /// index is PRESENT (HasProperty), `None` if absent (a hole / out of range).
     /// Re-reads the receiver each call so a mutation during a callback (a deleted
@@ -1161,6 +1207,52 @@ impl<'p> Vm<'p> {
                     }
                     let v = self.get_index(Value::heap(idx), Value::num(k))?;
                     return Ok(Some(v));
+                }
+                // flat/flatMap run FlattenIntoArray against the ORIGINAL
+                // receiver in spec order: length Get, (flatMap) mapper
+                // IsCallable, (flat) depth coercion, ArraySpeciesCreate(O, 0)
+                // — its constructor Get is observable — then the HasProperty+
+                // Get walk (absent indices skipped; the mapper never runs on
+                // a hole).
+                if matches!(name, "flat" | "flatMap") {
+                    let lv = self.get_prop(Value::heap(idx), "length")?;
+                    let lf = self.to_number_coerce(lv)?;
+                    let source_len = if lf.is_nan() || lf <= 0.0 {
+                        0usize
+                    } else {
+                        (lf.trunc().min(9_007_199_254_740_991.0) as usize)
+                            .min(crate::vm::MAX_DENSE_ARRAY_LEN)
+                    };
+                    let (depth, mapper) = if name == "flatMap" {
+                        if !self.is_callable(arg0) {
+                            return Err(Thrown(
+                                "TypeError: flatMap mapper is not a function".into(),
+                            ));
+                        }
+                        (1i64, Some((arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED))))
+                    } else if args.is_empty() || arg0 == Value::UNDEFINED {
+                        (1i64, None)
+                    } else {
+                        (self.to_integer_or_zero(arg0)?.max(0), None)
+                    };
+                    let target = self.array_species_create(Value::heap(idx), 0)?;
+                    let mut out = Vec::new();
+                    self.flatten_into_array(
+                        &mut out,
+                        Value::heap(idx),
+                        source_len,
+                        depth,
+                        mapper,
+                    )?;
+                    return match target {
+                        Some(a) => {
+                            for (i, v) in out.into_iter().enumerate() {
+                                self.create_data_property_or_throw(a, i, v)?;
+                            }
+                            Ok(Some(a))
+                        }
+                        None => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out))))),
+                    };
                 }
                 // join/toString/toLocaleString run LIVE against the receiver:
                 // len = ToLength(Get(O,'length')) FIRST, then (join) the
@@ -2231,9 +2323,18 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))))
             }
             "copyWithin" => {
+                // A prototype index / accessor side table makes the per-index
+                // Has/Get/Set/Delete protocol observable — route abstract.
+                if self.arr_props.contains_key(&idx)
+                    || self.array_proto_has_index
+                    || self.proto_of.contains_key(&idx)
+                {
+                    return self.array_like_copy_within(Value::heap(idx), args);
+                }
                 // copyWithin(target, start, end?): copy the [start,end) slice over the
-                // run beginning at target, in place. Reads from a snapshot so
-                // overlapping ranges behave as if copied from the original.
+                // run beginning at target, in place. Reads from a raw snapshot
+                // (HOLEs preserved) so overlapping ranges behave as if copied
+                // from the original; a hole copies as a hole (delete).
                 let len = match self.heap.get(idx) {
                     HeapObj::Array(items) => items.len() as i32,
                     _ => 0,
@@ -2253,16 +2354,26 @@ impl<'p> Vm<'p> {
                 let count = (end - start).min(len - target).max(0);
                 if count > 0 {
                     // A coerced arg's valueOf may have resized the array between
-                    // capturing `len` and here, so guard every index against the
-                    // CURRENT length (don't panic on a shrunk array).
-                    let snapshot = self.array_snapshot(idx);
-                    let snap_len = snapshot.len();
+                    // capturing `len` and here: guard targets against the CURRENT
+                    // length, and a now-out-of-range SOURCE deletes its target
+                    // (HasProperty false → DeletePropertyOrThrow, = HOLE here).
+                    let raw: Vec<Value> = match self.heap.get(idx) {
+                        HeapObj::Array(items) => items.clone(),
+                        _ => Vec::new(),
+                    };
+                    let snap_len = raw.len();
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        let cur = items.len();
                         for k in 0..count {
                             let (ti, si) = ((target + k) as usize, (start + k) as usize);
-                            if ti < cur && si < snap_len {
-                                items[ti] = snapshot[si];
+                            if si < snap_len {
+                                // Set(O, to, v): grows past a shrunk length.
+                                if ti >= items.len() {
+                                    items.resize(ti + 1, Value::HOLE);
+                                }
+                                items[ti] = raw[si];
+                            } else if ti < items.len() {
+                                // Absent source → DeletePropertyOrThrow(to).
+                                items[ti] = Value::HOLE;
                             }
                         }
                     }
