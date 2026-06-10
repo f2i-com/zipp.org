@@ -70,7 +70,11 @@ impl<'p> Vm<'p> {
                 let code = self.display(a0);
                 // An error thrown by the evaluated code can't cross the realm
                 // boundary, so it surfaces as a TypeError in the calling realm.
-                let result = match self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None, None) {
+                let prev_realm = self.active_realm;
+                self.active_realm = Some(this.heap_index());
+                let evaled = self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None, None);
+                self.active_realm = prev_realm;
+                let result = match evaled {
                     Ok(r) => r,
                     Err(Thrown(msg)) => {
                         // PerformShadowRealmEval step 3: a PARSE failure throws

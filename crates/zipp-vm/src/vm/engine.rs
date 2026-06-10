@@ -126,6 +126,8 @@ impl<'p> Vm<'p> {
             deferred_ns_state: std::collections::HashMap::new(),
             executing_modules: std::collections::HashSet::new(),
             module_errors: std::collections::HashMap::new(),
+            active_realm: None,
+            realm_globals: std::collections::HashMap::new(),
             deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
@@ -1019,7 +1021,35 @@ impl<'p> Vm<'p> {
     /// names (sloppy `x = 1`, `var x`, hoisted fns, or builtins the program never
     /// named) draw a fresh EVAL_POOL slot, seeded UNINITIALIZED so a read before a
     /// write is a ReferenceError (matching sloppy global-scope semantics).
+    /// Get-or-create the live global slot for `name` in ShadowRealm `rid`'s
+    /// own binding table (fresh slots start UNINITIALIZED).
+    pub(crate) fn realm_global_slot(&mut self, rid: u32, name: &str) -> Result<u32, Thrown> {
+        if let Some(&s) = self.realm_globals.get(&rid).and_then(|m| m.get(name)) {
+            return Ok(s);
+        }
+        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
+        if self.eval_global_next >= cap {
+            return Err(Thrown(
+                "EvalError: too many distinct globals introduced by eval".into(),
+            ));
+        }
+        let s = self.eval_global_next;
+        self.eval_global_next += 1;
+        self.globals[s as usize] = Value::UNINITIALIZED;
+        self.realm_globals.entry(rid).or_default().insert(name.to_string(), s);
+        Ok(s)
+    }
+
     pub(crate) fn eval_global_slot(&mut self, name: &str) -> Result<u32, Thrown> {
+        // Code evaluating inside a ShadowRealm binds NON-BUILTIN names to the
+        // realm's OWN slot table — its `var x` never collides with (or sees)
+        // the incubating realm's `x`. Builtins stay shared (single-intrinsics
+        // model; per-realm intrinsics are a separate feature).
+        if let Some(rid) = self.active_realm {
+            if !self.builtin_globals.contains_key(name) {
+                return self.realm_global_slot(rid, name);
+            }
+        }
         if let Some(i) = self.program.global_names.iter().position(|n| n == name) {
             return Ok(i as u32);
         }

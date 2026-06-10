@@ -537,6 +537,14 @@ pub struct Vm<'p> {
     /// top-level await, collected during the CURRENT import_module's link
     /// (mark/split_off discipline keeps nested links separate). GC ROOTS.
     link_pending_deps: Vec<Value>,
+    /// The ShadowRealm whose code is CURRENTLY evaluating (heap index of the
+    /// realm object), if any — global-name resolution inside `evaluate` binds
+    /// non-builtin names to that realm's own slot table.
+    active_realm: Option<u32>,
+    /// Per-ShadowRealm global bindings: realm object idx → name → live global
+    /// slot. Slot values live in `globals` (rooted wholesale); the map is
+    /// pruned when its realm object dies.
+    realm_globals: std::collections::HashMap<u32, std::collections::HashMap<String, u32>>,
     /// Canonical paths of modules whose BODY is currently executing — a
     /// deferred-namespace trigger targeting one is a TypeError (you cannot
     /// synchronously evaluate a module that is already mid-evaluation).

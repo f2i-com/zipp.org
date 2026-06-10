@@ -2998,6 +2998,20 @@ impl<'p> Vm<'p> {
     /// so an INHERITED accessor's getter is invoked with the correct `this`.
     pub(crate) fn get_member(&mut self, obj: Value, key: &str, receiver: Value) -> Result<Value, Thrown> {
         self.defer_check(obj, key)?; // a deferred-namespace Get may evaluate
+        // Inside a ShadowRealm's evaluate, `globalThis.x` reads the REALM's
+        // own binding for x when one exists (bare `x` and `globalThis.x`
+        // alias the same realm slot).
+        if let Some(rid) = self.active_realm {
+            if obj.is_heap()
+                && self.global_this != 0
+                && obj.heap_index() == self.global_this
+            {
+                if let Some(&s) = self.realm_globals.get(&rid).and_then(|m| m.get(key)) {
+                    let v = self.globals.get(s as usize).copied().unwrap_or(Value::UNDEFINED);
+                    return Ok(if v.is_uninitialized() { Value::UNDEFINED } else { v });
+                }
+            }
+        }
         // Proxy `get` trap (or fall through to the target).
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {

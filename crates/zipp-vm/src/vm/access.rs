@@ -528,6 +528,18 @@ impl<'p> Vm<'p> {
         if !obj.is_heap() {
             return Err(Thrown("TypeError: cannot set property of non-object".into()));
         }
+        // ShadowRealm evaluate: `globalThis.x = v` binds the REALM's x (the
+        // same slot a bare `x` resolves to inside the realm).
+        if let Some(rid) = self.active_realm {
+            if self.global_this != 0
+                && obj.heap_index() == self.global_this
+                && !key.starts_with("@@")
+            {
+                let s = self.realm_global_slot(rid, key)?;
+                self.globals[s as usize] = val;
+                return Ok(());
+            }
+        }
         // A plain assignment can put an integer index on Array/Object.prototype
         // just like defineProperty — flag it so index stores/mutators consult
         // the prototype chain (two integer compares for ordinary receivers).
