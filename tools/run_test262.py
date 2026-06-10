@@ -83,8 +83,10 @@ def run_one(args, get_harness, path):
     meta = parse_frontmatter(src)
     flags = meta["flags"]
     is_module = "module" in flags
-    if "CanBlockIsFalse" in flags or "CanBlockIsTrue" in flags:
-        return ("SKIP", "agent", path)
+    # CanBlockIsTrue runs normally (the default agent can block);
+    # CanBlockIsFalse launches the engine with ZIPP_CAN_BLOCK=0 so
+    # Atomics.wait throws TypeError per AgentCanSuspend.
+    cannot_block = "CanBlockIsFalse" in flags
     # Assemble.
     parts = []
     strict = "onlyStrict" in flags
@@ -113,8 +115,13 @@ def run_one(args, get_harness, path):
             # A `flags:[module]` test runs as an ES module (top-level await,
             # module scope); the assembled harness + test is one module.
             subcmd = "mjs" if is_module else "js"
+            env = None
+            if cannot_block:
+                env = dict(os.environ)
+                env["ZIPP_CAN_BLOCK"] = "0"
             p = subprocess.run([args.zipp, subcmd, tmp], capture_output=True,
-                               encoding="utf-8", errors="replace", timeout=args.timeout)
+                               encoding="utf-8", errors="replace", timeout=args.timeout,
+                               env=env)
             verdict, sig = classify(meta, p.returncode, p.stdout or "", p.stderr or "")
         except subprocess.TimeoutExpired:
             verdict, sig = ("FAIL", "timeout")

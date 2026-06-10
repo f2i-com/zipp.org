@@ -118,6 +118,7 @@ impl<'p> Vm<'p> {
             closure_eval_scope: std::collections::HashMap::new(),
             module_ambiguous: std::collections::HashMap::new(),
             import_meta: 0,
+            can_block: std::env::var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             sloppy_eval_memo: Vec::new(),
             obj_proto: 0,
             fn_proto: 0,

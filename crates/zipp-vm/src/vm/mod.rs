@@ -515,6 +515,9 @@ pub struct Vm<'p> {
     /// The lazily-created `import.meta` object (one per Vm; host-defined,
     /// ordinary extensible null-proto). 0 = not yet allocated.
     import_meta: u32,
+    /// AgentCanSuspend: false when launched with ZIPP_CAN_BLOCK=0 (the
+    /// test262 CanBlockIsFalse harness mode) — Atomics.wait then throws.
+    can_block: bool,
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined
     /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class

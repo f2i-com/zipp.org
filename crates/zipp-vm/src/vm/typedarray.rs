@@ -600,6 +600,13 @@ impl<'p> Vm<'p> {
                 // valueOf throws.
                 let _t = self
                     .to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+                // DoWait step: a sync wait in an agent that cannot suspend is a
+                // TypeError — AFTER the value/timeout coercions, per spec order.
+                if !self.can_block {
+                    return Err(Thrown(
+                        "TypeError: Atomics.wait cannot suspend in this agent".into(),
+                    ));
+                }
                 // Equal value would block; with no notifier this returns "timed-out".
                 return Ok(self.alloc_str(if eq { "timed-out" } else { "not-equal" }.to_string()));
             }
