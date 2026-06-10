@@ -1137,6 +1137,11 @@ impl<'p> Vm<'p> {
                         self.method_brand.insert(f.heap_index(), brands);
                     }
                 }
+                // A BASE class's InitializeInstanceElements runs at
+                // [[Construct]] entry (a DERIVED class's at super() completion).
+                if parent.is_none() && !extends_null {
+                    self.brand_instance(obj, cv);
+                }
                 // A DERIVED ctor's `this` is in TDZ until its `super(...)`
                 // completes (the SuperCtor ops remove the mark).
                 if parent.is_some() || extends_null {
@@ -1202,6 +1207,14 @@ impl<'p> Vm<'p> {
                 self.super_this.remove(&obj.heap_index());
                 inst = r?;
             }
+            // PrivateBrandAdd + the double-init / non-extensible checks run
+            // BEFORE the field initializers (spec InitializeInstanceElements
+            // order — an initializer may call this class's own privates).
+            let r = self.private_init_checked(inst, cv, inst != obj);
+            // Clear any super() mark a nested parent ctor left on this instance
+            // (even when the checked init throws).
+            self.super_called.remove(&inst.heap_index());
+            r?;
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
                 if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
@@ -1211,14 +1224,6 @@ impl<'p> Vm<'p> {
                 }
                 self.call_value(f, inst, &[])?;
             }
-            // This class's field initializers ran on `inst` — brand it (covers a
-            // return-override instance from the parent chain), with the checked
-            // double-init / non-extensible TypeErrors.
-            let r = self.private_init_checked(inst, cv, inst != obj);
-            // Clear any super() mark a nested parent ctor left on this instance
-            // (even when the checked init throws).
-            self.super_called.remove(&inst.heap_index());
-            r?;
             return Ok(inst);
         }
         Ok(obj)
@@ -1894,6 +1899,10 @@ impl<'p> Vm<'p> {
                         self.method_brand.insert(f.heap_index(), brands);
                     }
                 }
+                // A BASE parent's InitializeInstanceElements runs at entry.
+                if parent.is_none() && !extends_null {
+                    self.brand_instance(obj, cval);
+                }
                 // A derived parent ctor begins with `this` back in TDZ (until
                 // ITS OWN super() completes). No removal here: if the parent
                 // throws pre-super, the caller's binding is still uninitialized
@@ -1927,6 +1936,8 @@ impl<'p> Vm<'p> {
             if let Some(pidx) = parent {
                 eff = self.run_class_ctor(Value::heap(pidx), eff, args, new_target)?;
             }
+            // PrivateBrandAdd before this class's field initializers run.
+            self.brand_instance(eff, cval);
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
                 if let Some(brands) = self.method_brand.get(&cval.heap_index()).cloned() {
@@ -1940,9 +1951,6 @@ impl<'p> Vm<'p> {
                     eff = r;
                 }
             }
-            // This class's field initializers ran on `eff` — brand it (covers a
-            // return-override instance produced by the parent chain).
-            self.brand_instance(eff, cval);
             Ok(eff)
         }
     }

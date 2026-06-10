@@ -254,39 +254,47 @@ impl<'p> Vm<'p> {
         if !receiver.is_heap() {
             return false;
         }
-        let mut cur = match self.heap.get(receiver.heap_index()) {
-            HeapObj::Object(m) => m.class,
-            // A static private member's receiver IS the class value itself.
-            HeapObj::Class(_) => Some(receiver.heap_index()),
-            _ => None,
-        };
-        while let Some(cidx) = cur {
-            match self.heap.get(cidx) {
-                HeapObj::Class(c) => {
-                    if c.private_brand == brand {
-                        return true;
+        // A static private member's receiver IS the class value: walk its own
+        // chain (the lenient textual paths accept ancestors; the precise
+        // static check is private_receiver_ok's receiver==owner).
+        if matches!(self.heap.get(receiver.heap_index()), HeapObj::Class(_)) {
+            let mut cur = Some(receiver.heap_index());
+            while let Some(cidx) = cur {
+                match self.heap.get(cidx) {
+                    HeapObj::Class(c) => {
+                        if c.private_brand == brand {
+                            return true;
+                        }
+                        cur = c.parent;
                     }
-                    cur = c.parent;
+                    _ => break,
                 }
-                _ => break,
             }
         }
-        // Extra brands installed on a return-override instance (not covered by its
-        // class chain).
+        // An INSTANCE carries exactly the brands explicitly installed on it —
+        // each class in the construction chain installs its own at ITS
+        // InitializeInstanceElements point (base: ctor entry; derived: its
+        // super() completion). Before that point the class's privates are NOT
+        // yet on the instance (prod-private-*-before-super-return), even
+        // though map.class already links to the class.
         self.instance_brand.get(&receiver.heap_index()).is_some_and(|bs| bs.contains(&brand))
     }
 
-    /// Install a class's own private brand on a constructor RETURN-OVERRIDE instance
-    /// — one whose `map.class` chain does not already carry the brand (a normal
-    /// instance is branded via its class link, so this is a no-op for it).
+    /// PrivateBrandAdd: install a class's own private brand on an instance at
+    /// its InitializeInstanceElements point. Only classes that DECLARE private
+    /// members brand (keeps the side map empty on the hot path).
     pub(crate) fn brand_instance(&mut self, inst: Value, classval: Value) {
         if !inst.is_heap() || !classval.is_heap() {
             return;
         }
         let own = self.method_brand.get(&classval.heap_index()).and_then(|c| c.first()).copied();
         if let Some(own) = own {
-            if !self.instance_has_brand(inst, own) {
-                self.instance_brand.entry(inst.heap_index()).or_default().push(own);
+            if !self.brand_private_names.contains_key(&own) {
+                return;
+            }
+            let e = self.instance_brand.entry(inst.heap_index()).or_default();
+            if !e.contains(&own) {
+                e.push(own);
             }
         }
     }
