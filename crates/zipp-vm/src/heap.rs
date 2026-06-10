@@ -286,6 +286,9 @@ pub struct ClassData {
     /// Heap index of the superclass value (`class C extends P`), for
     /// inherited method/getter lookup and `instanceof` up the chain.
     pub parent: Option<u32>,
+    /// `class C extends null {}`: derived-class semantics (super required in
+    /// an explicit ctor; implicit super throws) with a null prototype parent.
+    pub extends_null: bool,
     /// Computed instance-field keys (`[expr] = v`), evaluated ONCE at class
     /// definition (in source order) and read per-instance by the `FieldInit` op
     /// during construction. Empty for classes with no computed instance fields.

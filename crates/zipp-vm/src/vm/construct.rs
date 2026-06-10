@@ -1103,8 +1103,10 @@ impl<'p> Vm<'p> {
             let nt = if new_target == cv { target } else { new_target };
             return self.construct_with_newtarget(target, &combined, nt);
         }
-        let (ctor, ctor_ups, has_explicit, parent) = match self.heap.get(cv.heap_index()) {
-            HeapObj::Class(c) => (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent),
+        let (ctor, ctor_ups, has_explicit, parent, extends_null) = match self.heap.get(cv.heap_index()) {
+            HeapObj::Class(c) => {
+                (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent, c.extends_null)
+            }
             _ => return Err(Thrown("TypeError: value is not a constructor".into())),
         };
         // The instance links to its class for method lookup + instanceof; its own
@@ -1149,7 +1151,7 @@ impl<'p> Vm<'p> {
                     self.brand_instance(ret, cv);
                     return Ok(ret);
                 }
-                if parent.is_some() {
+                if parent.is_some() || extends_null {
                     // A DERIVED class constructor may only return an object or
                     // undefined — any other value throws (a base class silently
                     // ignores a primitive return and yields `this`).
@@ -1171,6 +1173,13 @@ impl<'p> Vm<'p> {
             // threading its PRODUCED `this` (a base ctor's object-return becomes the
             // instance), then this class's field initializers on it.
             let mut inst = obj;
+            // `class C extends null {}` with no own ctor: the implicit
+            // super(...args) calls a null parent — TypeError per spec.
+            if extends_null {
+                return Err(Thrown(
+                    "TypeError: Super constructor null of anonymous class is not a constructor".into(),
+                ));
+            }
             if let Some(pidx) = parent {
                 inst = self.run_class_ctor(Value::heap(pidx), inst, args, new_target)?;
             }

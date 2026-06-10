@@ -107,6 +107,11 @@ impl<'p> Vm<'p> {
         }
         let p = self.heap.alloc(HeapObj::Object(map));
         self.prototypes.insert(idx, p);
+        // `class C extends null {}`: the prototype object's [[Prototype]] is
+        // null (chain walks stop on the non-heap entry).
+        if matches!(self.heap.get(idx), HeapObj::Class(c) if c.extends_null) {
+            self.proto_of.insert(p, Value::NULL);
+        }
         // A generator / async-generator FUNCTION's `.prototype` object chains to
         // %GeneratorPrototype% / %AsyncGeneratorPrototype% (whose own [[Prototype]]
         // is %IteratorPrototype% / %AsyncIteratorPrototype%), so

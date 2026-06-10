@@ -932,6 +932,7 @@ impl<'p> Vm<'p> {
                         // parent null) or a constructor â€” anything else (a plain
                         // object, a number, â€¦) is a TypeError per ClassDefinition-
                         // Evaluation, thrown here at class creation.
+                        let mut extends_null = false;
                         let parent_idx = match parent {
                             Some(p) => {
                                 let pv = self.get(base, p);
@@ -944,6 +945,7 @@ impl<'p> Vm<'p> {
                                         && (pv.heap_index() == self.symbol_ctor
                                             || pv.heap_index() == self.bigint_ctor));
                                 if pv == Value::NULL {
+                                    extends_null = true;
                                     None
                                 } else if !ctor_like {
                                     return Err(Thrown(
@@ -1082,6 +1084,7 @@ impl<'p> Vm<'p> {
                             static_getters,
                             static_setters,
                             parent: parent_idx,
+                            extends_null,
                             computed_field_keys: Vec::new(),
                             source: cd.source,
                             ctor_upvalues,
