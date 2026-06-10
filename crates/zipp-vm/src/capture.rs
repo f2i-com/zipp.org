@@ -37,6 +37,18 @@ pub fn free_vars(params: &[String], body: &[ox::Statement]) -> HashSet<String> {
     refs
 }
 
+/// Whether any parameter DEFAULT expression references `name` (free) — used
+/// to detect a possible direct eval in the parameter scope.
+pub fn params_reference(name: &str, params: &ox::FormalParameters) -> bool {
+    let mut refs = HashSet::new();
+    for item in &params.items {
+        if let Some(init) = &item.initializer {
+            expr_refs(init, &mut refs);
+        }
+    }
+    refs.contains(name)
+}
+
 /// The function's own bindings that some directly-nested function captures.
 pub fn captured_locals(params: &[String], body: &[ox::Statement]) -> HashSet<String> {
     let mut bound: HashSet<String> = params.iter().cloned().collect();

@@ -925,6 +925,7 @@ impl<'p> Vm<'p> {
         caller_new_target: Value,
         caller_home_obj: Option<Value>,
         var_env_global: bool,
+        param_collisions: Option<Vec<String>>,
         caller_scope: Option<(Vec<String>, Vec<Value>)>,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
@@ -934,6 +935,26 @@ impl<'p> Vm<'p> {
         let ret = oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::script()).parse();
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
+        }
+        // A direct eval in a PARAMETER DEFAULT: its sloppy var/function names
+        // may not collide with the param-scope bindings (params + implicit
+        // `arguments`) — SyntaxError BEFORE anything runs or is declared.
+        if let Some(cols) = &param_collisions {
+            let src_strict = force_strict
+                || ret
+                    .program
+                    .directives
+                    .iter()
+                    .any(|d| d.directive.as_str() == "use strict");
+            if !src_strict {
+                for n in crate::compile::eval_var_and_fn_names(&ret.program) {
+                    if cols.iter().any(|c| *c == n) {
+                        return Err(Thrown(format!(
+                            "SyntaxError: Identifier '{n}' has already been declared"
+                        )));
+                    }
+                }
+            }
         }
         // Eval code is never module code: import/export declarations are a
         // SyntaxError (spec PerformEval parses goal Script; oxc's script goal
@@ -1049,7 +1070,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1073,7 +1094,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }

@@ -2996,12 +2996,19 @@ impl<'p> Vm<'p> {
                                 caller_nt,
                                 caller_home,
                                 var_env_is_global,
+                                if site != u16::MAX {
+                                    self.func(func_id as usize).eval_sites[site as usize]
+                                        .1
+                                        .clone()
+                                } else {
+                                    None
+                                },
                                 {
                                     // The site's visible caller bindings: their
                                     // boxed cells become the eval closure's
                                     // upvalues.
                                     if site != u16::MAX {
-                                        let map = self.func(func_id as usize).eval_sites
+                                        let (map, _) = self.func(func_id as usize).eval_sites
                                             [site as usize]
                                             .clone();
                                         let mut names = Vec::with_capacity(map.len());

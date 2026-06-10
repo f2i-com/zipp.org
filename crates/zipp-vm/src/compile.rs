@@ -336,6 +336,24 @@ impl Compiler {
     }
 }
 
+/// The top-level var + function declared names of a parsed eval body —
+/// EvalDeclarationInstantiation's varNames/functionNames for collision checks.
+pub fn eval_var_and_fn_names(prog: &ox::Program) -> Vec<String> {
+    let mut vars = std::collections::HashSet::new();
+    for s in &prog.body {
+        collect_hoisted_vars(s, &mut vars);
+    }
+    let mut out: Vec<String> = vars.into_iter().collect();
+    for s in &prog.body {
+        if let ox::Statement::FunctionDeclaration(f) = s {
+            if let Some(id) = &f.id {
+                out.push(id.name.to_string());
+            }
+        }
+    }
+    out
+}
+
 pub fn compile_eval(
     prog: &ox::Program,
     source: &str,
@@ -738,7 +756,9 @@ impl Compiler {
         // function-scoped local so the eval program can close over the caller
         // scope (cells outlive the frame for closures the eval creates).
         let mut captured = captured;
-        let body_refs_eval = !is_script && capture::free_vars(&[], body).contains("eval");
+        let body_refs_eval = !is_script
+            && (capture::free_vars(&[], body).contains("eval")
+                || params_ast.is_some_and(|pa| capture::params_reference("eval", pa)));
         if body_refs_eval {
             let mut all: Vec<String> = params.to_vec();
             if let Some(r) = rest {
@@ -1130,7 +1150,8 @@ impl Compiler {
         }
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
         let mut captured = capture::captured_locals(&names, body);
-        let cls_body_refs_eval = capture::free_vars(&[], body).contains("eval");
+        let cls_body_refs_eval = capture::free_vars(&[], body).contains("eval")
+            || params_ast.is_some_and(|pa| capture::params_reference("eval", pa));
         if cls_body_refs_eval {
             captured.extend(names.iter().cloned());
         }
@@ -1289,7 +1310,22 @@ impl Compiler {
     ) -> R<FuncProto> {
         let parent_strict = self.in_strict;
         let is_strict = parent_strict || has_use_strict(&a.body.directives);
+        // An arrow that references `eval` (incl. in its parameter defaults)
+        // boxes its locals and records DirectEval sites like a function.
+        let mut captured = captured;
+        let arrow_refs_eval = capture::free_vars(&[], &a.body.statements).contains("eval")
+            || capture::params_reference("eval", &a.params);
+        if arrow_refs_eval {
+            let mut all: Vec<String> = params.to_vec();
+            if let Some(r) = rest {
+                all.push(r.to_string());
+            }
+            captured.extend(all);
+        }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        if arrow_refs_eval {
+            fc.box_all_locals = true;
+        }
         fc.cx.in_strict = is_strict;
         // An arrow has no `super` binding of its own: `super.x` / `super.m()` inside
         // it resolves LEXICALLY to the enclosing non-arrow method's home class. The
@@ -1518,7 +1554,13 @@ struct FnCompiler<'a> {
     box_all_locals: bool,
     /// Scope maps for this function's DirectEval call sites (see
     /// FuncProto::eval_sites).
-    eval_sites: Vec<Vec<(String, u8, u16)>>,
+    eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>)>,
+    /// True while this function's parameter defaults compile: a direct eval
+    /// there sits in the PARAM scope (its sloppy var/function declarations
+    /// collide with parameter names / the implicit `arguments`).
+    in_param_init: bool,
+    /// This function's parameter names (incl. rest) for that collision check.
+    param_names: Vec<String>,
     /// When set, `this` resolves to this register instead of reg 0. Used while
     /// evaluating static field initializers inline at class-definition time,
     /// where `this` must be the class value (not the enclosing `this`) — without
@@ -1700,6 +1742,14 @@ impl<'a> FnCompiler<'a> {
             heritage_class: None,
             box_all_locals: false,
             eval_sites: Vec::new(),
+            in_param_init: false,
+            param_names: {
+                let mut v: Vec<String> = params.to_vec();
+                if let Some(r) = rest {
+                    v.push(r.to_string());
+                }
+                v
+            },
             this_override: None,
             pattern_block_local: false,
             in_generator: false,
@@ -6405,6 +6455,15 @@ impl<'a> FnCompiler<'a> {
     /// when it evaluates `z`. (A two-pass "all defaults, then all destructuring"
     /// order would read those names before the pattern extracted them.)
     fn bind_params(&mut self, params: &ox::FormalParameters) -> R<()> {
+        // Parameter defaults compile inside this call — a direct eval there is
+        // in the PARAM scope (see FnCompiler::in_param_init).
+        self.in_param_init = true;
+        let r = self.bind_params_inner(params);
+        self.in_param_init = false;
+        r
+    }
+
+    fn bind_params_inner(&mut self, params: &ox::FormalParameters) -> R<()> {
         // Ordered identifier-parameter names, for Temporal-Dead-Zone tracking of a
         // default initializer that references the parameter itself or a later one.
         let param_names: Vec<Option<String>> = params
@@ -7721,8 +7780,22 @@ impl<'a> FnCompiler<'a> {
                             }
                         }
                     }
+                    // In a parameter default, the eval's sloppy var/function
+                    // names may not collide with the PARAM scope (the params
+                    // and, for non-arrows, the implicit `arguments`).
+                    let param_collisions = if self.in_param_init {
+                        let mut names = self.param_names.clone();
+                        if self.arguments_reg.is_some()
+                            && !names.iter().any(|n| n == "arguments")
+                        {
+                            names.push("arguments".to_string());
+                        }
+                        Some(names)
+                    } else {
+                        None
+                    };
                     let s = self.eval_sites.len() as u16;
-                    self.eval_sites.push(map);
+                    self.eval_sites.push((map, param_collisions));
                     s
                 } else {
                     u16::MAX

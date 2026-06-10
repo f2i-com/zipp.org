@@ -752,11 +752,14 @@ pub struct FuncProto {
     /// of the defining frame's own upvalues (nested-of-nested capture).
     pub upvalues: Vec<UpvalSource>,
     /// Per direct-eval CALL SITE in this function: the visible caller bindings
-    /// (name, kind, idx) — kind 0 = a boxed local CELL in register idx. The
-    /// eval program is built as a CLOSURE over these cells, so its code reads
-    /// and writes the caller's live bindings (and they outlive the frame).
+    /// (name, kind, idx) — kind 0 = a boxed local CELL in register idx, kind 1
+    /// = an eval root's own upvalue (forwarded caller scope). The eval program
+    /// is built as a CLOSURE over these cells. The second tuple element is the
+    /// PARAM-SCOPE collision list when the site sits in a parameter default
+    /// (EvalDeclarationInstantiation: a sloppy eval declaring one of these
+    /// names — the parameters or the implicit `arguments` — is a SyntaxError).
     /// Indexed by the DirectEval instr's `site` (u16::MAX = no map).
-    pub eval_sites: Vec<Vec<(String, u8, u16)>>,
+    pub eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>)>,
     /// Exact source text of this function (sliced from the program source by the
     /// function node's span), used by `Function.prototype.toString`. Empty for
     /// the synthetic top-level script body and for placeholders, in which case
