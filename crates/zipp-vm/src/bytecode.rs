@@ -385,6 +385,15 @@ pub enum Instr {
     /// resolution: a true result routes the read/write to `obj`, false falls
     /// back to the next with-object or the lexical/global binding.
     WithHas { dst: Reg, obj: Reg, name: u32 },
+    /// GetBindingValue for a `with` binding AFTER `WithHas` reported it: the
+    /// read RE-checks [[HasProperty]] (the WithHas @@unscopables getter may
+    /// have DELETED the property) — a miss yields undefined for a sloppy
+    /// reference site and a ReferenceError for a strict one (8.1.1.2.6).
+    WithGet { dst: Reg, obj: Reg, name: u32, strict: bool },
+    /// SetMutableBinding counterpart of `WithGet`: re-HasProperty, a strict
+    /// reference site throws on a vanished binding, a sloppy one re-creates
+    /// the property via the ordinary [[Set]].
+    WithSet { obj: Reg, name: u32, val: Reg, strict: bool },
 
     // ── control flow (targets are instruction indices) ──
     Jump { target: u32 },

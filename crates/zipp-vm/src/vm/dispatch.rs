@@ -1972,6 +1972,43 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(found));
                         ip += 1;
                     }
+                    Instr::WithGet { dst, obj, name, strict } => {
+                        let o = self.get(base, obj);
+                        let key = self.func(func_id as usize)
+                            .string_constants[name as usize]
+                            .clone();
+                        // GetBindingValue: HasProperty AGAIN (the WithHas
+                        // @@unscopables getter may have deleted the binding).
+                        let kv = self.key_to_value(&key);
+                        if !(self.is_object_value(o) && self.has_property_dyn(o, kv)?) {
+                            if strict {
+                                return Err(Thrown(format!(
+                                    "ReferenceError: {key} is not defined"
+                                )));
+                            }
+                            self.set(base, dst, Value::UNDEFINED);
+                        } else {
+                            let v = self.get_prop(o, &key)?;
+                            self.set(base, dst, v);
+                        }
+                        ip += 1;
+                    }
+                    Instr::WithSet { obj, name, val, strict } => {
+                        let o = self.get(base, obj);
+                        let key = self.func(func_id as usize)
+                            .string_constants[name as usize]
+                            .clone();
+                        let kv = self.key_to_value(&key);
+                        if strict && !(self.is_object_value(o) && self.has_property_dyn(o, kv)?)
+                        {
+                            return Err(Thrown(format!(
+                                "ReferenceError: {key} is not defined"
+                            )));
+                        }
+                        let v = self.get(base, val);
+                        self.set_prop(o, &key, v, strict)?;
+                        ip += 1;
+                    }
                     Instr::InstanceOfDyn { dst, val, ctor } => {
                         let v = self.get(base, val);
                         let c = self.get(base, ctor);

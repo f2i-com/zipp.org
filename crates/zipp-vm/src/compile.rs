@@ -1210,8 +1210,20 @@ impl Compiler {
             }
         }
         if is_script && !fc.cx.eval_locals {
+            // (An `export let x` / `export class C` wraps the declaration in an
+            // ExportNamedDeclaration — same lexical binding, same TDZ.)
             for s in body {
-                if let ox::Statement::VariableDeclaration(d) = s {
+                let (var_decl, class_decl) = match s {
+                    ox::Statement::VariableDeclaration(d) => (Some(d), None),
+                    ox::Statement::ClassDeclaration(c) => (None, Some(c)),
+                    ox::Statement::ExportNamedDeclaration(e) => match &e.declaration {
+                        Some(ox::Declaration::VariableDeclaration(d)) => (Some(d), None),
+                        Some(ox::Declaration::ClassDeclaration(c)) => (None, Some(c)),
+                        _ => (None, None),
+                    },
+                    _ => (None, None),
+                };
+                if let Some(d) = var_decl {
                     if d.kind.is_lexical() {
                         for decl in &d.declarations {
                             if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
@@ -1223,7 +1235,7 @@ impl Compiler {
                 }
                 // A top-level CLASS declaration is a lexical binding with the
                 // same TDZ (typeof C before it runs is a ReferenceError).
-                if let ox::Statement::ClassDeclaration(c) = s {
+                if let Some(c) = class_decl {
                     if let Some(id) = &c.id {
                         let slot = fc.cx.global_slot(id.name.as_str()) as u32;
                         fc.cx.lexical_globals.insert(slot);
@@ -2646,9 +2658,20 @@ impl<'a> FnCompiler<'a> {
                             return Ok(());
                         }
                         // An ANONYMOUS default-exported function/generator is named
-                        // "default" (NamedEvaluation).
+                        // "default" (NamedEvaluation) and HOISTS like any other
+                        // function declaration — `f()` before this statement works
+                        // through an `import f from './self'` alias.
                         let (id, has_up) =
                             self.compile_func_expr(Some("default".to_string()), f)?;
+                        if self.is_script && self.cx.script_binds_globals && !has_up {
+                            self.cx.functions[id as usize].name_global = Some(slot as u16);
+                            self.cx.decl_globals.insert(slot);
+                            self.next_reg -= 1;
+                            self.cx
+                                .module_exports
+                                .push(("default".to_string(), "*default*".to_string()));
+                            return Ok(());
+                        }
                         self.emit_make_callable(tmp, id, has_up);
                         bind_name = None;
                     }
@@ -6757,7 +6780,10 @@ impl<'a> FnCompiler<'a> {
             let jf = self.here();
             self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
             self.next_reg -= 1; // reclaim the flag temp (dead after the branch)
-            self.emit(Instr::GetProp { dst, obj, name: nidx });
+            // GetBindingValue re-checks HasProperty (the WithHas @@unscopables
+            // getter may delete the binding); strictness is the REFERENCE
+            // site's, not the with statement's.
+            self.emit(Instr::WithGet { dst, obj, name: nidx, strict: self.cx.in_strict });
             let je = self.here();
             self.emit(Instr::Jump { target: 0 });
             end_jumps.push(je);
@@ -6798,7 +6824,7 @@ impl<'a> FnCompiler<'a> {
             let jf = self.here();
             self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
             self.next_reg -= 1;
-            self.emit(Instr::SetProp { obj, name: nidx, val: src });
+            self.emit(Instr::WithSet { obj, name: nidx, val: src, strict: self.cx.in_strict });
             let je = self.here();
             self.emit(Instr::Jump { target: 0 });
             end_jumps.push(je);
