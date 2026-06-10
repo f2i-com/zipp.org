@@ -7763,11 +7763,15 @@ impl<'a> FnCompiler<'a> {
         use ox::AssignmentOperator as Op;
         match a.operator {
             Op::Assign => {
+                // The REFERENCE resolves before the RHS runs (which with-object,
+                // if any, holds the binding); PutValue writes through that
+                // snapshot even if the RHS deletes the with-object property.
+                let (found, tgt) = self.emit_with_probe(name, objs);
                 let v = self.compile_named_init(dst, &a.right, name)?;
                 if v != dst {
                     self.emit(Instr::Move { dst, src: v });
                 }
-                self.store_with(name, objs, dst);
+                self.emit_with_rmw_write(name, found, tgt, dst);
                 Ok(dst)
             }
             Op::LogicalOr | Op::LogicalAnd | Op::LogicalNullish => {
@@ -7863,7 +7867,10 @@ impl<'a> FnCompiler<'a> {
         let nidx = self.string_name(name);
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond: found, target: 0 }); // → static write
-        self.emit(Instr::SetProp { obj: tgt, name: nidx, val: src });
+        // SetMutableBinding re-checks HasProperty (the binding may have been
+        // DELETED since the reference resolved): strict throws, sloppy does
+        // not silently recreate the property on the with-object.
+        self.emit(Instr::WithSet { obj: tgt, name: nidx, val: src, strict: self.cx.in_strict });
         let je = self.here();
         self.emit(Instr::Jump { target: 0 });
         let stat = self.here();
