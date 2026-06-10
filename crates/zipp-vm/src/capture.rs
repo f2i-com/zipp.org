@@ -197,6 +197,8 @@ fn collect_bound_stmt(s: &ox::Statement, out: &mut HashSet<String>) {
             }
         }
         S::LabeledStatement(l) => collect_bound_stmt(&l.body, out),
+        // `var` declarations inside a `with` body hoist to the enclosing fn.
+        S::WithStatement(w) => collect_bound_stmt(&w.body, out),
         _ => {}
     }
 }
@@ -236,6 +238,12 @@ fn stmt_refs(s: &ox::Statement, out: &mut HashSet<String>) {
     use ox::Statement as S;
     match s {
         S::ExpressionStatement(e) => expr_refs(&e.expression, out),
+        // The with OBJECT expression and every reference in the body count
+        // (an outer local referenced only inside a with body must be captured).
+        S::WithStatement(w) => {
+            expr_refs(&w.object, out);
+            stmt_refs(&w.body, out);
+        }
         S::VariableDeclaration(d) => {
             for decl in &d.declarations {
                 if let Some(init) = &decl.init {

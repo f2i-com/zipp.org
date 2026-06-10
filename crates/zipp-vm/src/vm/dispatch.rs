@@ -1955,7 +1955,11 @@ impl<'p> Vm<'p> {
                         // `@@unscopables` object whose `key` entry is truthy hides the
                         // binding (so e.g. `with([]) { values }` reaches the outer
                         // binding, not Array.prototype.values).
-                        let mut found = self.is_object_value(o) && self.has_property_str(o, &key);
+                        // [[HasProperty]] must dispatch a Proxy `has` trap
+                        // (and propagate its abrupt completion).
+                        let kv = self.key_to_value(&key);
+                        let mut found =
+                            self.is_object_value(o) && self.has_property_dyn(o, kv)?;
                         if found {
                             let unsc = self.get_prop(o, "@@unscopables")?;
                             if self.is_object_value(unsc) {

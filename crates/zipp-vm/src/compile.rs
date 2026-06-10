@@ -2428,6 +2428,9 @@ impl<'a> FnCompiler<'a> {
                 if self.cx.in_strict {
                     return Err("SyntaxError: 'with' statements are not allowed in strict mode".into());
                 }
+                // Completion: UpdateEmpty(C, undefined) — an empty/abrupt body
+                // yields undefined for eval, not the previous statement's value.
+                self.reset_loop_completion();
                 // ToObject(GetValue(object)) becomes the with-environment's binding
                 // object. Held in a hidden scope-local so it survives the whole body
                 // (per-statement temp resets allocate above it).
@@ -6448,18 +6451,21 @@ impl<'a> FnCompiler<'a> {
         // with-object (innermost first): read → increment → write through it.
         let with_objs = self.with_objs_for(&name);
         if !with_objs.is_empty() {
-            let cur = self.load_with(&name, &with_objs, dst); // == dst
+            // Resolve the Reference ONCE (one HasBinding — the @@unscopables
+            // getter runs once), then read and write through that target.
+            let (found, tgt) = self.emit_with_probe(&name, &with_objs);
+            self.emit_with_rmw_read(&name, found, tgt, dst);
             if u.prefix {
-                self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta });
-                self.store_with(&name, &with_objs, cur);
+                self.emit(Instr::AddInt { dst, a: dst, imm: delta });
+                self.emit_with_rmw_write(&name, found, tgt, dst);
                 return Ok(dst); // dst holds the new value
             }
-            // Postfix: ToNumeric(old) in place (cur == dst), derive the new value,
-            // store it, return the COERCED old.
-            self.emit(Instr::AddInt { dst: cur, a: cur, imm: 0 });
+            // Postfix: ToNumeric(old) in place, derive the new value, store it,
+            // return the COERCED old.
+            self.emit(Instr::AddInt { dst, a: dst, imm: 0 });
             let tmp = self.temp();
-            self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta });
-            self.store_with(&name, &with_objs, tmp);
+            self.emit(Instr::AddInt { dst: tmp, a: dst, imm: delta });
+            self.emit_with_rmw_write(&name, found, tgt, tmp);
             self.next_reg -= 1; // reclaim tmp
             return Ok(dst); // dst still holds the (coerced) old value
         }
