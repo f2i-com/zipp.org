@@ -1753,6 +1753,25 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                // `class X extends f` where f is a PLAIN user function: super(...)
+                // must actually INVOKE the parent with this = the instance and the
+                // subclass new.target (a non-constructor parent is a TypeError; an
+                // object return is the return-override instance).
+                if matches!(
+                    self.heap.get(cval.heap_index()),
+                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
+                ) {
+                    if !self.is_constructor(cval) {
+                        return Err(Thrown(
+                            "TypeError: the superclass is not a constructor".into(),
+                        ));
+                    }
+                    self.pending_new_target = new_target;
+                    let r = self.call_value(cval, obj, args)?;
+                    if self.is_object_value(r) {
+                        return Ok(r);
+                    }
+                }
                 return Ok(obj);
             }
         };
