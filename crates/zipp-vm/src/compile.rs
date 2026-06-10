@@ -437,6 +437,11 @@ struct Compiler {
     /// pushed by compile_class / popped by build_class_into. A private access
     /// whose name no enclosing class declares is an early SyntaxError.
     private_names_stack: Vec<Vec<String>>,
+    /// Class names whose HERITAGE expression is currently compiling (innermost
+    /// last): the spec classScope makes a named class's own binding visible
+    /// (in TDZ, immutable) throughout `extends ...`, including functions
+    /// created inside it.
+    heritage_classes: Vec<(String, u32)>,
     /// For DIRECT eval programs: private names lexically visible at the eval
     /// call site (the caller's brand-chain names). Empty otherwise.
     eval_visible_privates: std::collections::HashSet<String>,
@@ -504,6 +509,7 @@ impl Compiler {
             class_derived: false,
             compiling_ctor: false,
             private_names_stack: Vec::new(),
+            heritage_classes: Vec::new(),
             eval_visible_privates: std::collections::HashSet::new(),
             in_derived_ctor: false,
             const_globals: HashSet::new(),
@@ -1381,6 +1387,12 @@ struct FnCompiler<'a> {
     /// lexically inside it): `this` reads and super-property references emit a
     /// `ThisCheck` (ReferenceError until `super()` has completed).
     in_derived_ctor: bool,
+    /// Set while THIS FnCompiler compiles a named class's heritage expression:
+    /// the inner class binding shadows even this function's locals/params for
+    /// the duration (classScope nests inside the function scope). Nested
+    /// functions inside the heritage use the cx-level `heritage_classes`
+    /// instead (after their own scopes, so their params still shadow).
+    heritage_class: Option<(String, u32)>,
     /// When set, `this` resolves to this register instead of reg 0. Used while
     /// evaluating static field initializers inline at class-definition time,
     /// where `this` must be the class value (not the enclosing `this`) — without
@@ -1559,6 +1571,7 @@ impl<'a> FnCompiler<'a> {
             super_static: false,
             derived_class: false,
             in_derived_ctor: false,
+            heritage_class: None,
             this_override: None,
             pattern_block_local: false,
             in_generator: false,
@@ -1716,6 +1729,13 @@ impl<'a> FnCompiler<'a> {
     /// Resolve a name to a local register (plain or cell-backed), an upvalue, or
     /// a global slot. Upvalue resolution lazily threads captures up the chain.
     fn resolve(&mut self, name: &str) -> Binding {
+        // While compiling a named class's HERITAGE in this very function, the
+        // inner class binding shadows even this function's locals/params.
+        if let Some((n, cid)) = &self.heritage_class {
+            if n == name {
+                return Binding::ClassName(*cid);
+            }
+        }
         if name == "arguments" {
             self.uses_arguments = true; // request the call-time `arguments` array
         }
@@ -1751,6 +1771,14 @@ impl<'a> FnCompiler<'a> {
             if self.cx.class_names.iter().any(|(n, id)| *id == cid && n == name) {
                 return Binding::ClassName(cid);
             }
+        }
+        // The inner class-name binding is ALSO visible throughout the class's
+        // HERITAGE expression (classScope encloses ClassHeritage; the binding
+        // is in TDZ until the class value exists, so LoadClassValue throws a
+        // ReferenceError for `class x extends x`) — including functions
+        // created inside the heritage expression.
+        if let Some((_, cid)) = self.cx.heritage_classes.iter().rev().find(|(n, _)| n == name) {
+            return Binding::ClassName(*cid);
         }
         // A free variable that resolves in an enclosing function is an upvalue.
         if let Some(idx) = self.resolve_upvalue(name) {
@@ -2815,7 +2843,18 @@ impl<'a> FnCompiler<'a> {
             // strict code), regardless of the enclosing scope.
             let prev_strict = self.cx.in_strict;
             self.cx.in_strict = true;
+            // A NAMED class's own binding is in scope for the heritage.
+            let heritage_named = class.id.as_ref().map(|id| id.name.to_string());
+            let saved_hc = self.heritage_class.take();
+            if let Some(n) = &heritage_named {
+                self.cx.heritage_classes.push((n.clone(), class_id));
+                self.heritage_class = Some((n.clone(), class_id));
+            }
             let r = self.expr_into(sc, t);
+            if heritage_named.is_some() {
+                self.cx.heritage_classes.pop();
+            }
+            self.heritage_class = saved_hc;
             self.cx.in_strict = prev_strict;
             let v = r?;
             if v != t {
