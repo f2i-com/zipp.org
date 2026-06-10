@@ -2713,13 +2713,26 @@ impl<'p> Vm<'p> {
     /// GlobalDeclarationInstantiation rather than eval semantics.
     pub(crate) fn eval_script(&mut self, code: &str) -> Result<Value, Thrown> {
         let allocator = oxc_allocator::Allocator::default();
+        // SCRIPT goal, not the oxc default (mjs): module mode would make the
+        // whole program strict and silently disable Annex B.3.3 hoisting,
+        // sloppy semantics, and HTML comments.
         let ret =
-            oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::default()).parse();
+            oxc_parser::Parser::new(&allocator, code, oxc_span::SourceType::cjs()).parse();
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
         let prog = crate::compile::compile_program(&ret.program, code)
             .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
+        // Dev aid (same flag as the main-program dump in lib.rs).
+        if std::env::var_os("ZIPP_VM_DUMP").is_some() {
+            eprintln!("── evalScript program (hoisted={:?}) ──", prog.hoisted_globals);
+            for (fid, f) in prog.functions.iter().enumerate() {
+                eprintln!("── eval fn {fid} (regs={}, params={}) ──", f.reg_count, f.param_count);
+                for (ip, instr) in f.code.iter().enumerate() {
+                    eprintln!("  {ip:4}  {instr:?}");
+                }
+            }
+        }
         let (completion, _gmap) = self.run_eval_program(
             prog,
             None,
