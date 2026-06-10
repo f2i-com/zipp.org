@@ -599,6 +599,11 @@ impl<'p> Vm<'p> {
             };
         }
         let idx = obj.heap_index();
+        // A Module Namespace exotic: [[Set]] ALWAYS returns false — strict
+        // assignment TypeError, sloppy no-op, even for the SAME value.
+        if self.module_namespaces.contains_key(&idx) {
+            return self.reject_write(key, strict);
+        }
         // A Symbol PRIMITIVE receiver: PutValue boxes it, but [[Set]]'s receiver is
         // the primitive itself, so the write can't create a property — a strict
         // TypeError, a sloppy no-op. (A boxed wrapper Object(sym) is a real object

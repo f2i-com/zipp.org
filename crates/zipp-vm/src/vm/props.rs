@@ -842,6 +842,13 @@ impl<'p> Vm<'p> {
             return Value::UNDEFINED;
         }
         let idx = obj.heap_index();
+        // Module Namespace exotic [[GetOwnProperty]]: the descriptor's value is
+        // the LIVE binding (the ObjMap snapshot may be stale).
+        if let Some(slot) = self.module_namespaces.get(&idx).and_then(|m| m.get(key)).copied()
+        {
+            let live = self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+            return self.make_data_descriptor(live, true, true, false);
+        }
         // %Array.prototype%'s exotic own `length`.
         if idx == self.arr_proto && key == "length" {
             let v = Value::num(self.arr_proto_len as f64);
@@ -1751,6 +1758,58 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
         }
         self.note_array_proto_index(obj.heap_index(), key);
+        // Module Namespace exotic [[DefineOwnProperty]]: true ONLY when the
+        // descriptor is compatible with the live binding ({value: current,
+        // writable:true, enumerable:true, configurable:false}, data); any
+        // change request is rejected (Object.defineProperty throws;
+        // Reflect.defineProperty maps the throw to false).
+        if self.module_namespaces.contains_key(&obj.heap_index()) {
+            let nsidx = obj.heap_index();
+            let (value, get, set, wr, en, cf) = self.read_descriptor(desc)?;
+            let reject = |k: &str| -> Result<(), Thrown> {
+                Err(Thrown(format!(
+                    "TypeError: Cannot redefine property: '{k}' of a module namespace"
+                )))
+            };
+            if get.is_some() || set.is_some() || cf == Some(true) {
+                return reject(key);
+            }
+            if key == "@@toStringTag" {
+                // Own {value:"Module", writable:false, enumerable:false,
+                // configurable:false}: only matching/absent fields pass.
+                if wr == Some(true) || en == Some(true) {
+                    return reject(key);
+                }
+                if let Some(v) = value {
+                    let cur = match self.heap.get(nsidx) {
+                        HeapObj::Object(m) => m.get("@@toStringTag").unwrap_or(Value::UNDEFINED),
+                        _ => Value::UNDEFINED,
+                    };
+                    if !self.same_value(v, cur) {
+                        return reject(key);
+                    }
+                }
+                return Ok(());
+            }
+            // An exported string key: {live value, writable:true,
+            // enumerable:true, configurable:false}; anything absent rejects.
+            let key_slot =
+                self.module_namespaces.get(&nsidx).and_then(|m| m.get(key)).copied();
+            let Some(slot) = key_slot else {
+                return reject(key);
+            };
+            if wr == Some(false) || en == Some(false) {
+                return reject(key);
+            }
+            if let Some(v) = value {
+                let live =
+                    self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+                if !self.same_value(v, live) {
+                    return reject(key);
+                }
+            }
+            return Ok(());
+        }
         // Proxy defineProperty trap: pass the trap a FromPropertyDescriptor of the
         // attributes (only the specified fields); a falsy result means the define
         // failed (Object.defineProperty throws, Reflect.defineProperty -> false).

@@ -1010,6 +1010,9 @@ pub struct Program {
     /// `export * from 'spec'` star re-exports, as the specifier. The loader copies
     /// every export of `spec` (except `default`) into this module's namespace.
     pub module_star_reexports: Vec<String>,
+    /// `export * as name from './m'` entries: (exported name, specifier). The
+    /// loader imports the dependency and exports its NAMESPACE object.
+    pub module_ns_reexports: Vec<(String, String)>,
     /// Compile-time global slots DECLARED by a module's top level (var/let/const/
     /// function/class + the synthetic `*default*`). When loading a module these are
     /// remapped to PER-MODULE FRESH slots (not the realm's shared by-name slots) so

@@ -1196,6 +1196,7 @@ impl<'p> Vm<'p> {
         let names = prog.global_names.clone();
         let reexports = prog.module_reexports.clone();
         let star_reexports = prog.module_star_reexports.clone();
+        let ns_reexports = prog.module_ns_reexports.clone();
         let dir = path.parent().map(|p| p.to_path_buf());
         // PREPARE the module's environment (declared globals → fresh per-module slots,
         // install funcs/classes, hoist) WITHOUT running the body yet. `gmap[i]` is the
@@ -1227,7 +1228,13 @@ impl<'p> Vm<'p> {
         let exec =
             self.execute_eval_program(base_func, None, None, Value::UNDEFINED, None, None, None);
         let linked = match exec {
-            Ok(_) => self.link_module_reexports(full, &reexports, &star_reexports, dir.as_deref()),
+            Ok(_) => self.link_module_reexports(
+                full,
+                &reexports,
+                &star_reexports,
+                &ns_reexports,
+                dir.as_deref(),
+            ),
             Err(e) => Err(e),
         };
         self.module_own.remove(&path);
@@ -1261,8 +1268,23 @@ impl<'p> Vm<'p> {
         mut full: Vec<(String, u32)>,
         reexports: &[(String, String, String)],
         star_reexports: &[String],
+        ns_reexports: &[(String, String)],
         dir: Option<&std::path::Path>,
     ) -> Result<(Vec<(String, u32)>, std::collections::HashSet<String>), Thrown> {
+        // `export * as name from`: import the dependency and export its
+        // NAMESPACE object under `name` (a fresh runtime global slot holds the
+        // value; `self.globals` is a GC root). Cycles resolve through the
+        // loader's pre-registered cache entry.
+        for (exported, spec) in ns_reexports {
+            let dep = match dir {
+                Some(d) => d.join(spec),
+                None => std::path::PathBuf::from(spec),
+            };
+            let ns = self.import_module(&dep)?;
+            self.globals.push(ns);
+            let slot = (self.globals.len() - 1) as u32;
+            full.push((exported.clone(), slot));
+        }
         for (exported, imported, spec) in reexports {
             let dep = match dir {
                 Some(d) => d.join(spec),

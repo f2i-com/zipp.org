@@ -1730,6 +1730,10 @@ impl<'p> Vm<'p> {
                 let receiver = args.get(3).copied().unwrap_or(a0);
                 let kv = self.coerce_index_key(a1)?;
                 let key = self.key_of(kv);
+                // Module Namespace exotic [[Set]]: always false.
+                if self.module_namespaces.contains_key(&a0.heap_index()) {
+                    return Ok(Value::bool(false));
+                }
                 // A Proxy's [[Set]] is its `set` trap: Reflect.set reports the trap's
                 // boolean (an assignment swallows a falsish result). No trap → fall
                 // through to the OrdinarySet/forward path below.

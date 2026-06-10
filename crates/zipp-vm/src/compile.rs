@@ -319,6 +319,7 @@ fn compile_program_inner(prog: &ox::Program, source: &str, module_mode: bool) ->
         module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
         module_star_reexports: std::mem::take(&mut c.module_star_reexports),
+        module_ns_reexports: std::mem::take(&mut c.module_ns_reexports),
         module_decl_globals,
     })
 }
@@ -507,6 +508,7 @@ pub fn compile_eval(
         module_has_imports: c.module_has_imports,
         module_reexports: std::mem::take(&mut c.module_reexports),
         module_star_reexports: std::mem::take(&mut c.module_star_reexports),
+        module_ns_reexports: std::mem::take(&mut c.module_ns_reexports),
         module_decl_globals,
     })
 }
@@ -644,6 +646,7 @@ struct Compiler {
     module_reexports: Vec<(String, String, String)>,
     /// `export * from 'spec'` star re-exports: the specifier string.
     module_star_reexports: Vec<String>,
+    module_ns_reexports: Vec<(String, String)>,
     /// Transient: set by the object-literal compiler right before compiling a concise
     /// method / get-set accessor value, so that function's body compiles with
     /// `super_home_obj = true` (object-method super). Consumed (taken) when the
@@ -689,6 +692,7 @@ impl Compiler {
             module_has_imports: false,
             module_reexports: Vec::new(),
             module_star_reexports: Vec::new(),
+            module_ns_reexports: Vec::new(),
             obj_method_super: false,
         }
     }
@@ -2565,10 +2569,12 @@ impl<'a> FnCompiler<'a> {
                     .push(("default".to_string(), "*default*".to_string()));
             }
             S::ExportAllDeclaration(e) => {
-                if e.exported.is_some() {
-                    // `export * as ns from './m'` creates a namespace-object export —
-                    // needs a nested namespace exotic; gate for now.
-                    self.cx.module_has_imports = true;
+                if let Some(exported) = &e.exported {
+                    // `export * as ns from './m'` exports the dependency's
+                    // NAMESPACE object under `ns` (linked by the loader).
+                    self.cx
+                        .module_ns_reexports
+                        .push((module_export_name(exported), e.source.value.to_string()));
                 } else {
                     // `export * from './m'` — copy all of the dependency's exports
                     // (except default) into this module's namespace at link time.
