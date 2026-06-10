@@ -1793,6 +1793,9 @@ impl<'p> Vm<'p> {
             // `super.x = v` PutValue sets on the receiver. `super` only appears in
             // class methods, which are always strict — so a failed [[Set]] (e.g. a
             // frozen receiver) is a TypeError, not a silent no-op.
+            // OrdinarySetWithOwnDescriptor consults Receiver.[[GetOwnProperty]]
+            // FIRST: a namespace receiver's uninit export throws ReferenceError.
+            self.ns_tdz_check(this, key)?;
             self.set_prop(this, key, v, true)?;
         }
         Ok(())
@@ -1830,6 +1833,7 @@ impl<'p> Vm<'p> {
         if self.is_callable(setter) {
             self.call_value(setter, this, &[v])?;
         } else {
+            self.ns_tdz_check(this, key)?; // receiver [[GetOwnProperty]] (TDZ)
             self.set_prop(this, key, v, true)?;
         }
         Ok(())
@@ -2351,6 +2355,9 @@ impl<'p> Vm<'p> {
     /// `getOwnPropertyDescriptor` trap (or its target) rather than reporting `false`.
     /// Non-proxies fall back to the ordinary own-property check.
     pub(crate) fn has_own_property_dyn(&mut self, obj: Value, key: &str) -> Result<bool, Thrown> {
+        // HasOwnProperty is [[GetOwnProperty]]-based: an uninitialized
+        // namespace export throws (unlike the `in` operator's [[HasProperty]]).
+        self.ns_tdz_check(obj, key)?;
         if obj.is_heap() {
             if let Some(desc) = self.proxy_gopd(obj, key)? {
                 return Ok(desc != Value::UNDEFINED);

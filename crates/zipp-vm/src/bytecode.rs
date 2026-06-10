@@ -698,6 +698,31 @@ pub enum Instr {
 
 /// A compiled function: its code, register-file size, parameter count, and the
 /// constant pool it references.
+/// What a static `import` binds locally.
+#[derive(Clone, Debug)]
+pub enum ImportName {
+    /// `import { x } from` / `import { x as y } from` — the EXPORTED name.
+    Named(String),
+    /// `import d from`.
+    Default,
+    /// `import * as ns from`.
+    Namespace,
+    /// `import './m'` — evaluate for side effects only.
+    SideEffect,
+    /// A phase import (`import source x from`): the request is LOADED (an
+    /// unresolvable specifier is a host error) but never linked/evaluated.
+    LoadOnly,
+}
+
+/// One static import binding (or side-effect import) of a module.
+#[derive(Clone, Debug)]
+pub struct ImportEntry {
+    /// Compile-time global slot of the LOCAL binding (u32::MAX for SideEffect).
+    pub local_slot: u32,
+    pub import: ImportName,
+    pub specifier: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct FuncProto {
     pub name: String,
@@ -1017,6 +1042,11 @@ pub struct Program {
     /// `export * as name from './m'` entries: (exported name, specifier). The
     /// loader imports the dependency and exports its NAMESPACE object.
     pub module_ns_reexports: Vec<(String, String)>,
+    /// Static `import` declarations, in source order. The loader resolves each
+    /// BEFORE the body runs: Named/Default locals ALIAS the dependency's live
+    /// export slot (live bindings); Namespace locals receive the namespace
+    /// value; SideEffect just evaluates the dependency.
+    pub module_imports: Vec<ImportEntry>,
     /// Compile-time global slots DECLARED by a module's top level (var/let/const/
     /// function/class + the synthetic `*default*`). When loading a module these are
     /// remapped to PER-MODULE FRESH slots (not the realm's shared by-name slots) so

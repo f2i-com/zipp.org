@@ -87,6 +87,94 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
 /// `await`), declarations are module-scoped, and the event loop drains to
 /// completion. `base_dir` resolves relative imports. Like [`run_with_base`] but
 /// for `flags:[module]` test262 tests and `.mjs` entry points.
+/// Run the module FILE at `path`: an entry with STATIC imports routes through
+/// the module loader (dependencies link before evaluation); one without keeps
+/// the async-capable direct path (top-level await works there).
+pub fn run_module_file(
+    path: &std::path::Path,
+    harness_path: Option<&str>,
+) -> Result<Outcome, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
+    let base_dir = path.parent().map(|p| p.to_path_buf());
+    let harness = match harness_path {
+        Some(h) => Some(std::fs::read_to_string(h).map_err(|e| format!("read error: {e}"))?),
+        None => None,
+    };
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, &src, SourceType::mjs()).parse();
+    if !ret.errors.is_empty() {
+        return Err(format!("SyntaxError: {}", ret.errors[0]));
+    }
+    compile::compile_module(&ret.program, &src)?;
+    // The harness (if any) runs as a realm SCRIPT — its vars become realm
+    // globals every module can reference — then the entry loads through the
+    // module loader: imports link before evaluation and the module's own
+    // declarations stay MODULE-scoped (never globalThis properties). An entry
+    // using top-level await falls back to the direct async-capable path (the
+    // loader's eval pipeline can't suspend yet); nothing of the entry has run
+    // when that compile-time rejection surfaces.
+    let host_src = harness.clone().unwrap_or_default();
+    let host_alloc = Allocator::default();
+    let host_ret = Parser::new(&host_alloc, &host_src, SourceType::default()).parse();
+    if !host_ret.errors.is_empty() {
+        return Err(format!("SyntaxError: {}", host_ret.errors[0]));
+    }
+    let host = compile::compile_program(&host_ret.program, &host_src)?;
+    let mut vm = vm::Vm::new(&host);
+    vm.set_module_base_dir(base_dir.clone());
+    if let Err(thrown) = vm.run() {
+        return Ok(Outcome {
+            output: std::mem::take(&mut vm.output),
+            errput: std::mem::take(&mut vm.errput),
+            error: Some(thrown.0),
+        });
+    }
+    match vm.run_module_entry(path) {
+        Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+        Err(thrown) if thrown.0.contains("top-level await is not supported") => {
+            // ENTRY top-level await: rerun on a fresh Vm via the direct
+            // async-capable module path, with the harness prepended (the
+            // single-module concatenation).
+            let combined;
+            let text: &str = match &harness {
+                Some(h) => {
+                    // A hashbang is only valid at position 0 — strip it (it is
+                    // a comment) before prepending the harness.
+                    let body = if src.starts_with("#!") {
+                        src.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
+                    } else {
+                        src.as_str()
+                    };
+                    combined = format!("{h}\n{body}");
+                    combined.as_str()
+                }
+                None => src.as_str(),
+            };
+            let alloc2 = Allocator::default();
+            let ret2 = Parser::new(&alloc2, text, SourceType::mjs()).parse();
+            if !ret2.errors.is_empty() {
+                return Err(format!("SyntaxError: {}", ret2.errors[0]));
+            }
+            let program2 = compile::compile_module(&ret2.program, text)?;
+            let mut vm = vm::Vm::new(&program2);
+            vm.set_module_base_dir(base_dir);
+            match vm.run_module() {
+                Ok(_) => Ok(Outcome { output: vm.output, errput: vm.errput, error: None }),
+                Err(thrown) => Ok(Outcome {
+                    output: std::mem::take(&mut vm.output),
+                    errput: std::mem::take(&mut vm.errput),
+                    error: Some(thrown.0),
+                }),
+            }
+        }
+        Err(thrown) => Ok(Outcome {
+            output: std::mem::take(&mut vm.output),
+            errput: std::mem::take(&mut vm.errput),
+            error: Some(thrown.0),
+        }),
+    }
+}
+
 pub fn run_module_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, src, SourceType::mjs()).parse();

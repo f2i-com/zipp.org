@@ -2135,6 +2135,7 @@ impl<'p> Vm<'p> {
                                 let o = self.to_object(a0)?;
                                 let key =
                                     self.to_property_key(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                                self.ns_tdz_check(o, &key)?; // uninit export throws
                                 match self.proxy_gopd(o, &key)? {
                                     Some(d) => d,
                                     None => self.object_get_own_property_descriptor(o, &key),

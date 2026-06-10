@@ -89,12 +89,11 @@ fn run(args: &[String]) -> Result<(), String> {
             // declarations; the event loop drains to completion). Used for
             // `flags:[module]` test262 tests and `.mjs` entry points.
             let path = it.next().ok_or("usage: zipp mjs <file.mjs>")?;
-            let src =
-                std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
-            let base_dir = std::path::Path::new(path)
-                .parent()
-                .map(|p| if p.as_os_str().is_empty() { std::path::Path::new(".").to_path_buf() } else { p.to_path_buf() });
-            let outcome = zipp_vm::run_module_with_base(&src, base_dir)?;
+            let harness = it.next();
+            let outcome = zipp_vm::run_module_file(
+                std::path::Path::new(&path),
+                harness.as_ref().map(|s| s.as_str()),
+            )?;
             for line in &outcome.output {
                 println!("{line}");
             }

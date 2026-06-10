@@ -348,6 +348,7 @@ impl<'p> Vm<'p> {
                 let key = self.to_property_key(a1)?;
                 self.require_object_coercible(a0)?; // ToObject(O)
                 let o = self.to_object(a0)?;
+                self.ns_tdz_check(o, &key)?;
                 match self.proxy_gopd(o, &key)? {
                     Some(d) => d,
                     None => self.object_get_own_property_descriptor(o, &key),
@@ -403,6 +404,7 @@ impl<'p> Vm<'p> {
             PROTO_PROP_ENUM => {
                 let k = self.to_property_key(a0)?;
                 self.require_object_coercible(this)?; // ToObject(this)
+                self.ns_tdz_check(this, &k)?; // [[GetOwnProperty]] of uninit throws
                 // On a Proxy, [[GetOwnProperty]] runs the gopd trap (user JS), so
                 // own_is_enumerable (&self) can't reach it — consult proxy_gopd.
                 if this.is_heap() && self.proxy_parts(this.heap_index()).is_some() {
@@ -1470,6 +1472,24 @@ impl<'p> Vm<'p> {
                 }
                 if o.is_heap() {
                     let idx = o.heap_index();
+                    // SetIntegrityLevel on a module namespace: "frozen" first runs
+                    // the [[GetOwnProperty]] walk (an uninit export throws), then
+                    // defines {writable:false} per export — which the namespace
+                    // [[DefineOwnProperty]] rejects (TypeError). "sealed" defines
+                    // only {configurable:false}, which matches every export's
+                    // actual descriptor — a no-op that SUCCEEDS.
+                    if id == OBJ_FREEZE {
+                        if let Some(m) = self.module_namespaces.get(&idx) {
+                            let has_exports = !m.is_empty();
+                            self.ns_tdz_check_all(o)?;
+                            if has_exports {
+                                return Err(Thrown(
+                                    "TypeError: Cannot freeze a module namespace object with exports"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                     match self.heap.get(idx) {
                         // Heap-but-primitive (string/symbol/bigint): a no-op.
                         HeapObj::Str(_)
@@ -2033,6 +2053,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let key = self.to_property_key(a1)?;
+                self.ns_tdz_check(a0, &key)?;
                 match self.proxy_gopd(a0, &key)? {
                     Some(d) => d,
                     None => self.object_get_own_property_descriptor(a0, &key),

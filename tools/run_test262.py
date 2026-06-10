@@ -102,12 +102,22 @@ def run_one(args, get_harness, path):
                 parts.append(get_harness(inc))
             except Exception:
                 return ("SKIP", f"missing-include {inc}", path)
-    parts.append(src)
-    assembled = "\n".join(parts)
+    if is_module:
+        # The harness runs as a realm SCRIPT (its vars become realm globals,
+        # visible to every module -- real-engine harness semantics); the TEST
+        # text alone is the module entry, so its decls stay module-scoped and
+        # a self-import of the on-disk file links cleanly.
+        harness_src = "\n".join(parts)
+        assembled = src
+    else:
+        parts.append(src)
+        assembled = "\n".join(parts)
+        harness_src = None
     # Create the temp script IN THE TEST'S OWN DIRECTORY so a relative dynamic
     # `import('./x_FIXTURE.js')` resolves against the fixtures beside the test
     # (zipp resolves import() relative to the running script's directory).
     fd, tmp = tempfile.mkstemp(suffix=".js", dir=os.path.dirname(path))
+    hf = None
     try:
         os.write(fd, assembled.encode("utf-8"))
         os.close(fd)
@@ -119,7 +129,16 @@ def run_one(args, get_harness, path):
             if cannot_block:
                 env = dict(os.environ)
                 env["ZIPP_CAN_BLOCK"] = "0"
-            p = subprocess.run([args.zipp, subcmd, tmp], capture_output=True,
+            # Module tests run the ORIGINAL file (self-imports resolve to the
+            # same module record); scripts run the assembled tmp.
+            entry = path if is_module else tmp
+            cmd = [args.zipp, subcmd, entry]
+            if harness_src is not None:
+                hfd, hf = tempfile.mkstemp(suffix=".js", dir=os.path.dirname(path))
+                os.write(hfd, harness_src.encode("utf-8"))
+                os.close(hfd)
+                cmd.append(hf)
+            p = subprocess.run(cmd, capture_output=True,
                                encoding="utf-8", errors="replace", timeout=args.timeout,
                                env=env)
             verdict, sig = classify(meta, p.returncode, p.stdout or "", p.stderr or "")
@@ -127,6 +146,9 @@ def run_one(args, get_harness, path):
             verdict, sig = ("FAIL", "timeout")
     finally:
         try: os.remove(tmp)
+        except OSError: pass
+        try:
+            if hf: os.remove(hf)
         except OSError: pass
     return (verdict, sig, path)
 

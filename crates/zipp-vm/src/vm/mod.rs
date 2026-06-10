@@ -518,6 +518,17 @@ pub struct Vm<'p> {
     /// AgentCanSuspend: false when launched with ZIPP_CAN_BLOCK=0 (the
     /// test262 CanBlockIsFalse harness mode) — Atomics.wait then throws.
     can_block: bool,
+    /// Canonical paths of modules whose IMPORT RESOLUTION is in flight —
+    /// guards static-import cycles (self-imports alias instead).
+    module_loading: std::collections::HashSet<std::path::PathBuf>,
+    /// Static `export … from` (exported, imported, specifier) + `export *`
+    /// specifiers + base dir of modules whose LINK is in flight: a cyclic
+    /// resolve_export back into one walks these statically (spec
+    /// ResolveExport through a cycle) instead of failing or re-evaluating.
+    module_pending_reexports: std::collections::HashMap<
+        std::path::PathBuf,
+        (Vec<(String, String, String)>, Vec<String>, Option<std::path::PathBuf>),
+    >,
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined
     /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class

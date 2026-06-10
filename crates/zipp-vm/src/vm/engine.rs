@@ -119,6 +119,8 @@ impl<'p> Vm<'p> {
             module_ambiguous: std::collections::HashMap::new(),
             import_meta: 0,
             can_block: std::env::var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
+            module_loading: std::collections::HashSet::new(),
+            module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
             obj_proto: 0,
             fn_proto: 0,
@@ -598,6 +600,24 @@ impl<'p> Vm<'p> {
     /// activation so top-level `await` works; the event loop then drains to
     /// completion (settling promises, running queued async tests). An uncaught
     /// top-level rejection is surfaced as the program error.
+    /// Run an ENTRY module that contains STATIC IMPORTS through the module
+    /// loader: dependencies link before the body evaluates. The loader path
+    /// is synchronous, so a top-level await in such an entry surfaces the
+    /// explicit not-yet-supported TypeError (B15 lifts that).
+    pub fn run_module_entry(&mut self, path: &std::path::Path) -> Result<Value, Thrown> {
+        // The host (harness) script may have already run on this Vm — do NOT
+        // re-setup (re-hoisting would re-materialize host functions, losing
+        // properties assigned to them, e.g. assert.sameValue).
+        if self.global_this == 0 {
+            self.setup_globals();
+            self.hoist_functions();
+            self.set_gc_floor();
+        }
+        let r = self.import_module(path, None);
+        self.drain_microtasks();
+        r.map(|_| Value::UNDEFINED)
+    }
+
     pub fn run_module(&mut self) -> Result<Value, Thrown> {
         use crate::heap::PromiseState;
         self.setup_globals();
@@ -1202,30 +1222,291 @@ impl<'p> Vm<'p> {
             // Top-level await in an IMPORTED module needs the async-module
             // evaluation pipeline (not built yet): surface a host TypeError —
             // a SyntaxError would misreport a spec-VALID module as malformed.
-            Err(e) if e.contains("only valid inside an async function") => {
+            Err(e) if e.contains("only valid inside an async function")
+                || e.contains("only valid in an async function") => {
                 return Err(Thrown(
                     "TypeError: top-level await is not supported in imported modules yet".into(),
                 ));
             }
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
         };
-        // A real `import` declaration / `export * as ns from` needs linking we don't
-        // model; reject (Err without pending_throw → the caller rejects with a host
-        // TypeError, as the spec's HostResolveImportedModule would). Re-exports are
-        // modelled below.
-        if prog.module_has_imports {
-            return Err(Thrown("TypeError: module dependencies are not supported".into()));
-        }
         let exports = prog.module_exports.clone();
         let names = prog.global_names.clone();
         let reexports = prog.module_reexports.clone();
         let star_reexports = prog.module_star_reexports.clone();
         let ns_reexports = prog.module_ns_reexports.clone();
+        let imports = prog.module_imports.clone();
         let dir = path.parent().map(|p| p.to_path_buf());
+        // STATIC imports resolve BEFORE this module's body prepares/runs
+        // (dependencies instantiate + evaluate first, per the link order):
+        // Named/Default locals alias the dependency's live export slot;
+        // Namespace locals get the namespace value written post-prepare;
+        // SideEffect just evaluates the dependency. Resolution failures are
+        // link-time SyntaxErrors. A SELF-import (the dominant test262 cycle)
+        // aliases the module's OWN exported local by COMPILE slot — resolved
+        // to the live slot inside prepare's second pass. Other in-flight
+        // cycles are guarded (no recursion blowup).
+        let mut import_aliases: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
+        let mut self_aliases: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut ns_writes: Vec<(u32, Value)> = Vec::new();
+        let mut self_ns_locals: Vec<u32> = Vec::new();
+        // Own (exported name -> compile slot), for self-import aliasing.
+        let own_cslot = |name: &str| -> Option<u32> {
+            prog.module_exports.iter().find(|(e, _)| e == name).and_then(|(_, local)| {
+                prog.global_names
+                    .iter()
+                    .position(|n| n == local)
+                    .map(|i| i as u32)
+            })
+        };
+        // PRE-REGISTER this module BEFORE any dependency loads: live slots for
+        // its declared exports are PRE-ALLOCATED (prepare reuses them), so a
+        // CYCLIC re-export back into this module (a dependency doing
+        // `export { x } from './me'` while we are mid-load) resolves to the
+        // real binding instead of re-evaluating this module as a second
+        // instance. An export whose local is itself an IMPORT binding resolves
+        // through its dependency; its map entry is patched after prepare.
+        let import_locals: std::collections::HashSet<u32> = imports
+            .iter()
+            .filter(|e| e.local_slot != u32::MAX)
+            .map(|e| e.local_slot)
+            .collect();
+        let decl_set: std::collections::HashSet<u32> =
+            prog.module_decl_globals.iter().copied().collect();
+        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
+        let mut prealloc: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
+        let mut own_pre: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for (exported, local) in &exports {
+            if let Some(i) = names.iter().position(|n| n == local) {
+                let c = i as u32;
+                if import_locals.contains(&c) || !decl_set.contains(&c) {
+                    continue;
+                }
+                if let Some(&live) = prealloc.get(&c) {
+                    own_pre.insert(exported.clone(), live);
+                    continue;
+                }
+                if self.eval_global_next >= cap {
+                    return Err(Thrown(
+                        "EvalError: too many distinct globals introduced by eval".into(),
+                    ));
+                }
+                let live = self.eval_global_next;
+                self.eval_global_next += 1;
+                self.globals[live as usize] = Value::UNINITIALIZED;
+                prealloc.insert(c, live);
+                own_pre.insert(exported.clone(), live);
+            }
+        }
+        let ns_idx = self.alloc_empty_namespace();
+        self.module_namespaces.insert(ns_idx, own_pre.clone());
+        self.module_cache.insert(path.clone(), Value::heap(ns_idx));
+        self.module_own.insert(path.clone(), own_pre);
+        self.module_pending_reexports.insert(
+            path.clone(),
+            (reexports.clone(), star_reexports.clone(), dir.clone()),
+        );
+        self.module_loading.insert(path.clone());
+        let import_res = (|| -> Result<(), Thrown> {
+            // LOADING phase: every requested module (including phase-import
+            // requests) must resolve to a readable file BEFORE linking starts.
+            // A failure here is a HOST error (TypeError) — it takes precedence
+            // over any link-time SyntaxError a sibling request would raise.
+            for e in &imports {
+                let dep_raw = match dir.as_deref() {
+                    Some(d) => d.join(&e.specifier),
+                    None => std::path::PathBuf::from(&e.specifier),
+                };
+                let dep_canon = std::fs::canonicalize(&dep_raw).unwrap_or_else(|_| dep_raw.clone());
+                if dep_canon == path {
+                    continue; // self-reference: already loaded
+                }
+                if std::fs::metadata(&dep_raw).is_err() {
+                    return Err(Thrown(format!(
+                        "TypeError: Failed to resolve module specifier '{}'",
+                        e.specifier
+                    )));
+                }
+            }
+            for e in &imports {
+                let dep_raw = match dir.as_deref() {
+                    Some(d) => d.join(&e.specifier),
+                    None => std::path::PathBuf::from(&e.specifier),
+                };
+                let dep_canon = std::fs::canonicalize(&dep_raw).unwrap_or_else(|_| dep_raw.clone());
+                let is_self = dep_canon == path;
+                let in_flight = !is_self && self.module_loading.contains(&dep_canon);
+                use crate::bytecode::ImportName as IN;
+                match &e.import {
+                    IN::LoadOnly => {
+                        // A phase import's dep is LOADED (recursively — its own
+                        // requests resolve eagerly per LoadRequestedModules)
+                        // but never linked or evaluated.
+                        if !is_self && !in_flight {
+                            let mut seen = std::collections::HashSet::new();
+                            self.prescan_module_requests(&dep_canon, &mut seen)?;
+                        }
+                    }
+                    IN::SideEffect => {
+                        if !is_self && !in_flight {
+                            self.import_module(&dep_raw, None)?;
+                        }
+                    }
+                    IN::Named(n) => {
+                        if is_self {
+                            match own_cslot(n) {
+                                Some(c) => {
+                                    self_aliases.insert(e.local_slot, c);
+                                }
+                                None => {
+                                    // Not an own local: an INDIRECT export of
+                                    // ourselves (`export {x as n} from dep`) —
+                                    // walk the pending re-export chain.
+                                    let mut seen = std::collections::HashSet::new();
+                                    match self.resolve_pending_export(&path, n, &mut seen)? {
+                                        Some(slot) => {
+                                            import_aliases.insert(e.local_slot, slot);
+                                        }
+                                        None => {
+                                            return Err(Thrown(format!(
+                                                "SyntaxError: The requested module '{}' does not provide an export named '{n}'",
+                                                e.specifier
+                                            )))
+                                        }
+                                    }
+                                }
+                            }
+                        } else if in_flight {
+                            // The dependency is mid-load (a cycle): resolve
+                            // through its registered bindings + pending
+                            // re-exports instead of evaluating it again.
+                            let mut seen = std::collections::HashSet::new();
+                            match self.resolve_pending_export(&dep_canon, n, &mut seen)? {
+                                Some(slot) => {
+                                    import_aliases.insert(e.local_slot, slot);
+                                }
+                                None => {
+                                    return Err(Thrown(format!(
+                                        "SyntaxError: The requested module '{}' does not provide an export named '{n}'",
+                                        e.specifier
+                                    )))
+                                }
+                            }
+                        } else {
+                            match self.resolve_export(&dep_raw, n)? {
+                                Some(slot) => {
+                                    import_aliases.insert(e.local_slot, slot);
+                                }
+                                None => {
+                                    return Err(Thrown(format!(
+                                        "SyntaxError: The requested module '{}' does not provide an export named '{n}'",
+                                        e.specifier
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    IN::Default => {
+                        if is_self {
+                            match own_cslot("default") {
+                                Some(c) => {
+                                    self_aliases.insert(e.local_slot, c);
+                                }
+                                None => {
+                                    let mut seen = std::collections::HashSet::new();
+                                    match self.resolve_pending_export(&path, "default", &mut seen)? {
+                                        Some(slot) => {
+                                            import_aliases.insert(e.local_slot, slot);
+                                        }
+                                        None => {
+                                            return Err(Thrown(format!(
+                                                "SyntaxError: The requested module '{}' does not provide an export named 'default'",
+                                                e.specifier
+                                            )))
+                                        }
+                                    }
+                                }
+                            }
+                        } else if in_flight {
+                            let mut seen = std::collections::HashSet::new();
+                            match self.resolve_pending_export(&dep_canon, "default", &mut seen)? {
+                                Some(slot) => {
+                                    import_aliases.insert(e.local_slot, slot);
+                                }
+                                None => {
+                                    return Err(Thrown(format!(
+                                        "SyntaxError: The requested module '{}' does not provide an export named 'default'",
+                                        e.specifier
+                                    )))
+                                }
+                            }
+                        } else {
+                            match self.resolve_export(&dep_raw, "default")? {
+                                Some(slot) => {
+                                    import_aliases.insert(e.local_slot, slot);
+                                }
+                                None => {
+                                    return Err(Thrown(format!(
+                                        "SyntaxError: The requested module '{}' does not provide an export named 'default'",
+                                        e.specifier
+                                    )))
+                                }
+                            }
+                        }
+                    }
+                    IN::Namespace => {
+                        if is_self || in_flight {
+                            // Our own namespace: pre-registered below; written
+                            // after it exists.
+                            self_ns_locals.push(e.local_slot);
+                        } else {
+                            let ns = self.import_module(&dep_raw, None)?;
+                            ns_writes.push((e.local_slot, ns));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.module_loading.remove(&path);
+        let cleanup_on_err = |vm: &mut Self| {
+            vm.module_cache.remove(&path);
+            vm.module_namespaces.remove(&ns_idx);
+            vm.module_own.remove(&path);
+            vm.module_pending_reexports.remove(&path);
+        };
+        if let Err(e) = import_res {
+            cleanup_on_err(self);
+            return Err(e);
+        }
         // PREPARE the module's environment (declared globals → fresh per-module slots,
         // install funcs/classes, hoist) WITHOUT running the body yet. `gmap[i]` is the
         // live slot for compile-time global slot `i`.
-        let (gmap, base_func) = self.prepare_eval_program(prog, true, None, false, None)?;
+        let prepared = self.prepare_eval_program(
+            prog,
+            true,
+            None,
+            false,
+            None,
+            if import_aliases.is_empty() { None } else { Some(&import_aliases) },
+            if self_aliases.is_empty() { None } else { Some(&self_aliases) },
+            if prealloc.is_empty() { None } else { Some(&prealloc) },
+        );
+        let (gmap, base_func) = match prepared {
+            Ok(p) => p,
+            Err(e) => {
+                cleanup_on_err(self);
+                return Err(e);
+            }
+        };
+        // Namespace import locals are initialized PRIOR to evaluation.
+        for (cslot, ns) in ns_writes {
+            let live = gmap[cslot as usize] as usize;
+            self.globals[live] = ns;
+        }
         // OWN exports (exported name → live slot), in source order.
         let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
         let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -1235,33 +1516,58 @@ impl<'p> Vm<'p> {
                 own_map.insert(exported, gmap[i]);
             }
         }
-        // PRE-REGISTER the namespace (with the OWN-export live slot map already set) in
-        // the loader cache BEFORE running the body — so a self/cyclic dynamic
-        // `import('./this')` during evaluation returns this SAME object with live
-        // bindings, instead of re-evaluating the module (which recurses forever). The
-        // ObjMap keys (for reflection/descriptors) are filled AFTER the body runs, so
-        // their snapshot values are correct.
-        let ns_idx = self.alloc_empty_namespace();
+        // REFRESH the pre-registered maps with the final own exports (an export
+        // whose local is an import binding now has its real aliased slot; the
+        // namespace itself was registered before the dependency loop, so cyclic
+        // re-exports already resolved against the pre-allocated slots).
         self.module_namespaces.insert(ns_idx, own_map.clone());
-        self.module_cache.insert(path.clone(), Value::heap(ns_idx));
-        // Mark in-progress for re-export cycle resolution (resolve_export/all_exports
-        // consult `module_own`). Run the body, then resolve `export … from`/`export *`
-        // re-exports, then fill the namespace. The recursion carries only
-        // (String, slot:u32) — no unrooted heap Value across a GC-triggering load.
+        // A self-imported `import * as ns from './me'` local gets OUR OWN
+        // pre-registered namespace object.
+        for cslot in &self_ns_locals {
+            let live = gmap[*cslot as usize] as usize;
+            self.globals[live] = Value::heap(ns_idx);
+        }
         self.module_own.insert(path.clone(), own_map);
-        let exec =
-            self.execute_eval_program(base_func, None, None, Value::UNDEFINED, None, None, None);
-        let linked = match exec {
-            Ok(_) => self.link_module_reexports(
-                full,
-                &reexports,
-                &star_reexports,
-                &ns_reexports,
-                dir.as_deref(),
-            ),
+        // Re-exports LINK (and their dependencies evaluate) BEFORE this body
+        // runs — the namespace must be complete at evaluation start (a TDZ
+        // read of an indirect export during the body must find its binding).
+        let linked = self.link_module_reexports(
+            full,
+            &reexports,
+            &star_reexports,
+            &ns_reexports,
+            dir.as_deref(),
+        );
+        let linked = match linked {
+            Ok((full2, ambiguous)) => {
+                // EARLY ObjMap fill: reflection DURING the body (Object.keys,
+                // defineProperty of @@toStringTag, descriptors) sees the real
+                // key set + tag; snapshot values refresh after execution.
+                self.populate_module_namespace(ns_idx, &full2);
+                if !ambiguous.is_empty() {
+                    self.module_ambiguous.insert(ns_idx, ambiguous.clone());
+                }
+                let exec = self
+                    .execute_eval_program(
+                        base_func,
+                        // Module code's top-level `this` is UNDEFINED (never
+                        // the global object).
+                        Some(Value::UNDEFINED),
+                        None,
+                        Value::UNDEFINED,
+                        None,
+                        None,
+                        None,
+                    );
+                match exec {
+                    Ok(_) => Ok((full2, ambiguous)),
+                    Err(e) => Err(e),
+                }
+            }
             Err(e) => Err(e),
         };
         self.module_own.remove(&path);
+        self.module_pending_reexports.remove(&path);
         match linked {
             Ok((full, ambiguous)) => {
                 self.populate_module_namespace(ns_idx, &full);
@@ -1375,10 +1681,21 @@ impl<'p> Vm<'p> {
         };
         if let Some(&ns) = self.module_cache.get(&dep) {
             ambiguous_check(self, ns.heap_index())?;
-            return Ok(self
-                .module_namespaces
-                .get(&ns.heap_index())
-                .and_then(|m| m.get(name).copied()));
+            if let Some(slot) =
+                self.module_namespaces.get(&ns.heap_index()).and_then(|m| m.get(name).copied())
+            {
+                return Ok(Some(slot));
+            }
+            // IN-FLIGHT module (pre-registered, link incomplete): its
+            // `export … from` entries haven't resolved into the namespace —
+            // walk them statically (spec ResolveExport through a cycle; a
+            // chain that never grounds yields None → the requester's
+            // SyntaxError).
+            if self.module_pending_reexports.contains_key(&dep) {
+                let mut seen = std::collections::HashSet::new();
+                return self.resolve_pending_export(&dep, name, &mut seen);
+            }
+            return Ok(None);
         }
         if let Some(m) = self.module_own.get(&dep) {
             return Ok(m.get(name).copied());
@@ -1389,6 +1706,102 @@ impl<'p> Vm<'p> {
             .module_namespaces
             .get(&ns.heap_index())
             .and_then(|m| m.get(name).copied()))
+    }
+
+    /// The spec's LOADING phase for a module that is never evaluated (a phase
+    /// import's target): read + parse it and resolve its requested specifiers
+    /// recursively — an unreadable file is a host TypeError, a parse failure a
+    /// SyntaxError. Already-cached / already-seen modules are done.
+    fn prescan_module_requests(
+        &mut self,
+        path: &std::path::PathBuf,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> Result<(), Thrown> {
+        if !seen.insert(path.clone()) || self.module_cache.contains_key(path) {
+            return Ok(());
+        }
+        let code = std::fs::read_to_string(path).map_err(|_| {
+            Thrown(format!(
+                "TypeError: Failed to resolve module specifier '{}'",
+                path.display()
+            ))
+        })?;
+        let allocator = oxc_allocator::Allocator::default();
+        let ret =
+            oxc_parser::Parser::new(&allocator, &code, oxc_span::SourceType::mjs()).parse();
+        if !ret.errors.is_empty() {
+            return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
+        }
+        let dir = path.parent().map(|p| p.to_path_buf());
+        for s in &ret.program.body {
+            use oxc_ast::ast::Statement as S;
+            let spec: Option<String> = match s {
+                S::ImportDeclaration(d) => Some(d.source.value.to_string()),
+                S::ExportNamedDeclaration(e) => {
+                    e.source.as_ref().map(|src| src.value.to_string())
+                }
+                S::ExportAllDeclaration(e) => Some(e.source.value.to_string()),
+                _ => None,
+            };
+            if let Some(spec) = spec {
+                let raw = match dir.as_deref() {
+                    Some(d) => d.join(&spec),
+                    None => std::path::PathBuf::from(&spec),
+                };
+                if std::fs::metadata(&raw).is_err() {
+                    return Err(Thrown(format!(
+                        "TypeError: Failed to resolve module specifier '{spec}'"
+                    )));
+                }
+                let canon = std::fs::canonicalize(&raw).unwrap_or(raw);
+                self.prescan_module_requests(&canon, seen)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// ResolveExport through modules whose link is IN FLIGHT: own bindings
+    /// resolve directly; `export {x as y} from` / `export *` entries recurse.
+    /// `seen` is the spec's resolveSet — a repeated (module, name) request is
+    /// a circular chain that never grounds → None.
+    fn resolve_pending_export(
+        &mut self,
+        dep: &std::path::PathBuf,
+        name: &str,
+        seen: &mut std::collections::HashSet<(std::path::PathBuf, String)>,
+    ) -> Result<Option<u32>, Thrown> {
+        if !seen.insert((dep.clone(), name.to_string())) {
+            return Ok(None);
+        }
+        if let Some(slot) = self.module_own.get(dep).and_then(|m| m.get(name).copied()) {
+            return Ok(Some(slot));
+        }
+        let Some((reex, stars, pdir)) = self.module_pending_reexports.get(dep).cloned() else {
+            // Completed (or never in-flight): normal resolution.
+            return self.resolve_export(dep, name);
+        };
+        let join = |pdir: Option<&std::path::Path>, spec: &str| -> std::path::PathBuf {
+            let raw = match pdir {
+                Some(d) => d.join(spec),
+                None => std::path::PathBuf::from(spec),
+            };
+            std::fs::canonicalize(&raw).unwrap_or(raw)
+        };
+        for (exported, imported, spec) in &reex {
+            if exported == name {
+                let target = join(pdir.as_deref(), spec);
+                return self.resolve_pending_export(&target, imported, seen);
+            }
+        }
+        if name != "default" {
+            for spec in &stars {
+                let target = join(pdir.as_deref(), spec);
+                if let Some(slot) = self.resolve_pending_export(&target, name, seen)? {
+                    return Ok(Some(slot));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Enumerate all exports of the module at `raw_path` (excluding `default`) as
@@ -1440,6 +1853,9 @@ impl<'p> Vm<'p> {
         caller_home: Option<u32>,
         var_env_global: bool,
         eval_scope_idx: Option<u32>,
+        import_aliases: Option<&std::collections::HashMap<u32, u32>>,
+        self_aliases: Option<&std::collections::HashMap<u32, u32>>,
+        prealloc: Option<&std::collections::HashMap<u32, u32>>,
     ) -> Result<(Vec<u32>, u32), Thrown> {
         use crate::bytecode::{FuncProto, Instr};
         // Runtime base ids: eval functions and classes are appended past the
@@ -1459,7 +1875,19 @@ impl<'p> Vm<'p> {
         let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
         let mut gmap: Vec<u32> = Vec::with_capacity(eval_prog.global_names.len());
         for (i, name) in eval_prog.global_names.iter().enumerate() {
+            // A static-import LOCAL aliases the dependency's resolved live
+            // export slot — sharing one flat slot IS the live binding.
+            if let Some(&alias) = import_aliases.and_then(|m| m.get(&(i as u32))) {
+                gmap.push(alias);
+                continue;
+            }
             if module && decl.contains(&(i as u32)) {
+                // A slot the module loader PRE-ALLOCATED (for cyclic re-export
+                // resolution) is reused — it is already UNINITIALIZED.
+                if let Some(&pre) = prealloc.and_then(|m| m.get(&(i as u32))) {
+                    gmap.push(pre);
+                    continue;
+                }
                 if self.eval_global_next >= cap {
                     return Err(Thrown(
                         "EvalError: too many distinct globals introduced by eval".into(),
@@ -1471,6 +1899,14 @@ impl<'p> Vm<'p> {
                 gmap.push(s);
             } else {
                 gmap.push(self.eval_global_slot(name)?);
+            }
+        }
+        // Second pass: a SELF-import local aliases the module's own exported
+        // local — both compile slots map to ONE live slot (live binding).
+        if let Some(sa) = self_aliases {
+            for (&import_local, &target) in sa {
+                let live = gmap[target as usize];
+                gmap[import_local as usize] = live;
             }
         }
         // 4. Install eval classes: re-index their member func ids (which point into
@@ -1833,7 +2269,16 @@ impl<'p> Vm<'p> {
         eval_scope_idx: Option<u32>,
     ) -> Result<(Value, Vec<u32>), Thrown> {
         let (gmap, base_func) =
-            self.prepare_eval_program(eval_prog, module, caller_home, var_env_global, eval_scope_idx)?;
+            self.prepare_eval_program(
+                eval_prog,
+                module,
+                caller_home,
+                var_env_global,
+                eval_scope_idx,
+                None,
+                None,
+                None,
+            )?;
         let completion = self.execute_eval_program(
             base_func,
             this_override,

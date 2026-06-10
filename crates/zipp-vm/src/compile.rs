@@ -320,6 +320,7 @@ fn compile_program_inner(prog: &ox::Program, source: &str, module_mode: bool) ->
         module_reexports: std::mem::take(&mut c.module_reexports),
         module_star_reexports: std::mem::take(&mut c.module_star_reexports),
         module_ns_reexports: std::mem::take(&mut c.module_ns_reexports),
+        module_imports: std::mem::take(&mut c.module_imports),
         module_decl_globals,
     })
 }
@@ -509,6 +510,7 @@ pub fn compile_eval(
         module_reexports: std::mem::take(&mut c.module_reexports),
         module_star_reexports: std::mem::take(&mut c.module_star_reexports),
         module_ns_reexports: std::mem::take(&mut c.module_ns_reexports),
+        module_imports: std::mem::take(&mut c.module_imports),
         module_decl_globals,
     })
 }
@@ -647,6 +649,7 @@ struct Compiler {
     /// `export * from 'spec'` star re-exports: the specifier string.
     module_star_reexports: Vec<String>,
     module_ns_reexports: Vec<(String, String)>,
+    module_imports: Vec<crate::bytecode::ImportEntry>,
     /// Transient: set by the object-literal compiler right before compiling a concise
     /// method / get-set accessor value, so that function's body compiles with
     /// `super_home_obj = true` (object-method super). Consumed (taken) when the
@@ -693,6 +696,7 @@ impl Compiler {
             module_reexports: Vec::new(),
             module_star_reexports: Vec::new(),
             module_ns_reexports: Vec::new(),
+            module_imports: Vec::new(),
             obj_method_super: false,
         }
     }
@@ -1114,6 +1118,86 @@ impl Compiler {
         // even in sloppy mode — `for ([x] of [[]]) {} let x;`. Only DIRECT top-level
         // declarations bind to globals (block-scoped lexicals don't leak), so a
         // VariableDeclaration nested in a block is not registered.
+        // MODULE import pre-pass: bindings created by `import` declarations
+        // HOIST (exist before any statement runs), are immutable, and module-
+        // scoped. `export … from` specifiers are recorded as SideEffect loads
+        // so dependencies evaluate in SOURCE order.
+        // (Modules reach here through TWO pipelines: compile_module for the
+        // entry — module_mode — and compile_eval(is_module) from the engine's
+        // loader — eval_mode with module-style globals.)
+        if is_script && (fc.cx.module_mode || (fc.cx.eval_mode && !fc.cx.eval_locals)) {
+            use crate::bytecode::{ImportEntry, ImportName};
+            for s in body {
+                match s {
+                    ox::Statement::ImportDeclaration(d) => {
+                        // Phase imports (`import source`/`import defer`) are
+                        // unmodelled proposals: their request is still LOADED
+                        // (host resolution failures must surface) but the
+                        // binding never links.
+                        if !matches!(d.phase, None) {
+                            fc.cx.module_imports.push(ImportEntry {
+                                local_slot: u32::MAX,
+                                import: ImportName::LoadOnly,
+                                specifier: d.source.value.to_string(),
+                            });
+                            continue;
+                        }
+                        let spec = d.source.value.to_string();
+                        match &d.specifiers {
+                            Some(specs) if !specs.is_empty() => {
+                                for sp in specs {
+                                    use ox::ImportDeclarationSpecifier as IS;
+                                    let (local, import) = match sp {
+                                        IS::ImportSpecifier(i) => (
+                                            i.local.name.to_string(),
+                                            ImportName::Named(module_export_name(&i.imported)),
+                                        ),
+                                        IS::ImportDefaultSpecifier(i) => {
+                                            (i.local.name.to_string(), ImportName::Default)
+                                        }
+                                        IS::ImportNamespaceSpecifier(i) => {
+                                            (i.local.name.to_string(), ImportName::Namespace)
+                                        }
+                                    };
+                                    let slot = fc.cx.global_slot(&local) as u32;
+                                    fc.cx.decl_globals.insert(slot);
+                                    fc.cx.const_globals.insert(slot);
+                                    fc.cx.module_imports.push(ImportEntry {
+                                        local_slot: slot,
+                                        import,
+                                        specifier: spec.clone(),
+                                    });
+                                }
+                            }
+                            _ => {
+                                fc.cx.module_imports.push(ImportEntry {
+                                    local_slot: u32::MAX,
+                                    import: ImportName::SideEffect,
+                                    specifier: spec.clone(),
+                                });
+                            }
+                        }
+                    }
+                    ox::Statement::ExportNamedDeclaration(e) => {
+                        if let Some(srcspec) = &e.source {
+                            fc.cx.module_imports.push(ImportEntry {
+                                local_slot: u32::MAX,
+                                import: ImportName::SideEffect,
+                                specifier: srcspec.value.to_string(),
+                            });
+                        }
+                    }
+                    ox::Statement::ExportAllDeclaration(e) => {
+                        fc.cx.module_imports.push(ImportEntry {
+                            local_slot: u32::MAX,
+                            import: ImportName::SideEffect,
+                            specifier: e.source.value.to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
         if is_script && !fc.cx.eval_locals {
             for s in body {
                 if let ox::Statement::VariableDeclaration(d) = s {
@@ -2451,10 +2535,8 @@ impl<'a> FnCompiler<'a> {
             // ── ES module declarations (only reached for SourceType::module, i.e.
             // a fixture loaded by a dynamic `import()`; a script never parses these).
             S::ImportDeclaration(_) => {
-                // A module that imports another module needs linking, which the
-                // loader does not do yet — mark it so the dynamic import rejects
-                // rather than resolving an unlinked namespace.
-                self.cx.module_has_imports = true;
+                // Handled by the MODULE PRE-PASS (import bindings hoist: a
+                // reference or assignment may precede the declaration).
             }
             S::ExportNamedDeclaration(e) => {
                 // `export {imported as exported} from './m'` (re-export): record the
@@ -2817,6 +2899,13 @@ impl<'a> FnCompiler<'a> {
                 ox::VariableDeclarationKind::AwaitUsing => Some(true),
                 _ => None,
             };
+            // `await using` is only legal where `await` is (async function /
+            // module top level). Erroring here (instead of mis-compiling a
+            // sync disposal) also routes a loader-compiled module entry onto
+            // the direct async path via the TLA containment.
+            if using_async == Some(true) && !self.in_async {
+                return Err("`await` is only valid inside an async function".into());
+            }
             if let (Some(is_async_using), Some(scope_reg)) = (using_async, self.using_scope_reg) {
                 let src = if is_cell {
                     let t = self.temp();
@@ -5607,7 +5696,12 @@ impl<'a> FnCompiler<'a> {
                 // `import.meta` — module code only (a SyntaxError in scripts);
                 // `new.target` is handled by the dedicated lowering elsewhere.
                 if m.meta.name == "import" && m.property.name == "meta" {
-                    if !self.cx.module_mode {
+                    // (Both module pipelines: compile_module entry and the
+                    // loader's compile_eval(is_module) — see the import
+                    // pre-pass gate.)
+                    let in_module =
+                        self.cx.module_mode || (self.cx.eval_mode && !self.cx.eval_locals);
+                    if !in_module {
                         return Err("SyntaxError: import.meta is only valid in modules".into());
                     }
                     let dst = self.temp();

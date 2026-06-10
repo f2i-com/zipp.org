@@ -306,6 +306,9 @@ impl<'p> Vm<'p> {
     }
 
     pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
+        // A namespace with a still-uninitialized export throws from the per-key
+        // [[GetOwnProperty]] walk (Object.keys/values/entries + for-in).
+        self.ns_tdz_check_all(obj)?;
         // A Proxy enumerates via its ownKeys trap, keeping the STRING keys whose
         // [[GetOwnProperty]] (the gopd trap) reports enumerable.
         if let Some(keys) = self.proxy_own_keys(obj)? {
@@ -847,6 +850,12 @@ impl<'p> Vm<'p> {
         if let Some(slot) = self.module_namespaces.get(&idx).and_then(|m| m.get(key)).copied()
         {
             let live = self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+            // A TDZ binding: this infallible path reports absent; the fallible
+            // reflective entry points (Object/Reflect.getOwnPropertyDescriptor)
+            // throw ReferenceError via ns_tdz_check BEFORE calling here.
+            if live.is_uninitialized() {
+                return Value::UNDEFINED;
+            }
             return self.make_data_descriptor(live, true, true, false);
         }
         // %Array.prototype%'s exotic own `length`.
@@ -2471,6 +2480,48 @@ impl<'p> Vm<'p> {
     /// Flag that `Array.prototype` / `Object.prototype` now carries an integer
     /// index, so array index assignment must consult the prototype chain (the
     /// `array_proto_has_index` perf guard, read by `set_index`).
+    /// A module-namespace TDZ guard for FALLIBLE reflective entry points:
+    /// reading the descriptor/value of an UNINITIALIZED export throws.
+    pub(crate) fn ns_tdz_check(&self, obj: Value, key: &str) -> Result<(), Thrown> {
+        if !obj.is_heap() {
+            return Ok(());
+        }
+        if let Some(slot) =
+            self.module_namespaces.get(&obj.heap_index()).and_then(|m| m.get(key)).copied()
+        {
+            let live = self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+            if live.is_uninitialized() {
+                return Err(Thrown(format!(
+                    "ReferenceError: Cannot access '{key}' before initialization"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// EnumerableOwnProperties / EnumerateObjectProperties over a namespace
+    /// call [[GetOwnProperty]] per key — the FIRST uninitialized export (in
+    /// sorted ownKeys order) throws.
+    pub(crate) fn ns_tdz_check_all(&self, obj: Value) -> Result<(), Thrown> {
+        if !obj.is_heap() {
+            return Ok(());
+        }
+        if let Some(m) = self.module_namespaces.get(&obj.heap_index()) {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            for k in keys {
+                let live =
+                    self.globals.get(m[k] as usize).copied().unwrap_or(Value::UNDEFINED);
+                if live.is_uninitialized() {
+                    return Err(Thrown(format!(
+                        "ReferenceError: Cannot access '{k}' before initialization"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn note_array_proto_index(&mut self, obj_idx: u32, key: &str) {
         if (obj_idx == self.arr_proto || obj_idx == self.obj_proto)
             && canonical_index_str(key).is_some()
@@ -2974,11 +3025,19 @@ impl<'p> Vm<'p> {
             // fall through to the ordinary lookup below.
             if let Some(slot_map) = self.module_namespaces.get(&obj.heap_index()) {
                 if let Some(&slot) = slot_map.get(key) {
-                    return Ok(self
+                    let v = self
                         .globals
                         .get(slot as usize)
                         .copied()
-                        .unwrap_or(Value::UNDEFINED));
+                        .unwrap_or(Value::UNDEFINED);
+                    // A TDZ (uninitialized let/const/class) binding read
+                    // through the namespace throws ReferenceError.
+                    if v.is_uninitialized() {
+                        return Err(Thrown(format!(
+                            "ReferenceError: Cannot access '{key}' before initialization"
+                        )));
+                    }
+                    return Ok(v);
                 }
             }
         }
