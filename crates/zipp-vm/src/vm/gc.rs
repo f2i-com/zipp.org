@@ -206,6 +206,11 @@ impl Vm<'_> {
         for v in self.proto_of.values() {
             root_val!(*v);
         }
+        // In-flight super() return-override instances (held across the rest of
+        // the derived ctor body until construct() consumes them).
+        for v in self.super_this.values() {
+            root_val!(*v);
+        }
         for &p in self.prototypes.values() {
             root_idx!(p);
         }

@@ -109,6 +109,8 @@ impl<'p> Vm<'p> {
             array_length_nonwritable: std::collections::HashSet::new(),
             array_proto_has_index: false,
             super_called: std::collections::HashSet::new(),
+            this_tdz: std::collections::HashSet::new(),
+            super_this: std::collections::HashMap::new(),
             obj_proto: 0,
             fn_proto: 0,
             function_ctor: 0,
@@ -354,7 +356,7 @@ impl<'p> Vm<'p> {
             // The native callee bailed mid-body: finish this activation on the
             // interpreter over the SAME window via a transient frame. The frame
             // base is `new_base` into self.regs (stable — reserved capacity).
-            self.frames.push(Frame {
+            self.frames.push(Frame { super_done: false,
                 func: func_id,
                 base: new_base,
                 ip: bail as usize,
@@ -473,7 +475,7 @@ impl<'p> Vm<'p> {
         // and the recursion can't re-enter native → no livelock; frames grow to
         // MAX_FRAMES → RangeError on runaway.
         self.jit_recurse_depth += 1;
-        self.frames.push(Frame {
+        self.frames.push(Frame { super_done: false,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -569,7 +571,7 @@ impl<'p> Vm<'p> {
         // only the top frame so the reservation math is relative to a known base.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.reserve_jit_regs();
-        self.frames.push(Frame { func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
+        self.frames.push(Frame { super_done: false, func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
         // Everything allocated so far (interned strings, all built-ins, hoisted
         // top-level functions) is pinned: the GC never collects below this floor.
         self.set_gc_floor();
@@ -838,7 +840,7 @@ impl<'p> Vm<'p> {
 
         let stop_depth = self.frames.len();
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
+        self.frames.push(Frame { super_done: false, func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
         self.run_loop(stop_depth)
     }
 

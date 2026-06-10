@@ -1137,6 +1137,11 @@ impl<'p> Vm<'p> {
                         self.method_brand.insert(f.heap_index(), brands);
                     }
                 }
+                // A DERIVED ctor's `this` is in TDZ until its `super(...)`
+                // completes (the SuperCtor ops remove the mark).
+                if parent.is_some() || extends_null {
+                    self.this_tdz.insert(obj.heap_index());
+                }
                 // `new.target` for the class constructor body (the next frame entered).
                 self.pending_new_target = new_target;
                 let result = self.call_value(f, obj, args);
@@ -1144,6 +1149,8 @@ impl<'p> Vm<'p> {
                 // so a constructor that threw never leaves a stale entry (the heap
                 // index could later be reused by another instance).
                 let super_called = self.super_called.remove(&obj.heap_index());
+                self.this_tdz.remove(&obj.heap_index());
+                let super_this = self.super_this.remove(&obj.heap_index());
                 let ret = result?;
                 // Any object return replaces the new instance.
                 if self.is_object_value(ret) {
@@ -1166,6 +1173,12 @@ impl<'p> Vm<'p> {
                             "ReferenceError: Must call super constructor in derived class before returning from derived constructor".into(),
                         ));
                     }
+                    // `super()` produced a return-override instance and the ctor
+                    // returned undefined: that instance IS the result.
+                    if let Some(st) = super_this {
+                        self.brand_instance(st, cv);
+                        return Ok(st);
+                    }
                 }
             }
         } else {
@@ -1181,7 +1194,13 @@ impl<'p> Vm<'p> {
                 ));
             }
             if let Some(pidx) = parent {
-                inst = self.run_class_ctor(Value::heap(pidx), inst, args, new_target)?;
+                let r = self.run_class_ctor(Value::heap(pidx), inst, args, new_target);
+                // An explicit DERIVED parent in the chain may have left a this-TDZ
+                // mark (it threw pre-super) or a banked return-override (it
+                // object-returned past it) on the threaded instance — clear both.
+                self.this_tdz.remove(&obj.heap_index());
+                self.super_this.remove(&obj.heap_index());
+                inst = r?;
             }
             if let Some(fid) = ctor {
                 let f = self.ctor_value(fid, &ctor_ups);
@@ -1721,12 +1740,84 @@ impl<'p> Vm<'p> {
     /// Run a class's constructor contribution on an existing instance `obj` —
     /// for `super(...)` and the implicit-super chain. An explicit ctor runs its
     /// own `super`; an implicit one runs the parent chain then its fields.
+    /// Completion of a `super(...)` call (the SuperCtor/SuperCtorSpread ops),
+    /// AFTER the parent ctor ran (spec evaluates the SuperCall fully; only
+    /// BindThisValue then throws on re-initialization): enforce the
+    /// once-per-activation rule, rebind reg 0 to the produced `this`
+    /// (return-override), lift the this-TDZ, mark super-called, and run the
+    /// home class's deferred instance-field initializers on the result.
+    pub(crate) fn super_ctor_complete(
+        &mut self,
+        base: usize,
+        this: Value,
+        produced: Value,
+        home_class_id: u32,
+    ) -> Result<(), Thrown> {
+        let in_arrow = self
+            .frames
+            .last()
+            .map(|f| self.func(f.func as usize).lexical_this)
+            .unwrap_or(false);
+        let already = if in_arrow {
+            // An arrow frame has no super state of its own: the lexical ctor
+            // activation already initialized `this` iff it left the TDZ.
+            this.is_heap() && !self.this_tdz.contains(&this.heap_index())
+        } else {
+            self.frames.last().map(|f| f.super_done).unwrap_or(false)
+        };
+        if already {
+            return Err(Thrown(
+                "ReferenceError: super constructor may only be called once".into(),
+            ));
+        }
+        if produced.is_heap() {
+            self.set(base, 0, produced);
+            // A parent RETURN-OVERRIDE must become the construction result even
+            // when the derived ctor later returns `undefined` (reg 0 alone
+            // doesn't reach construct()) — bank it keyed by the original this.
+            if produced != this && this.is_heap() {
+                self.super_this.insert(this.heap_index(), produced);
+            }
+        }
+        if let Some(f) = self.frames.last_mut() {
+            f.super_done = true;
+        }
+        if this.is_heap() {
+            self.this_tdz.remove(&this.heap_index());
+            self.super_called.insert(this.heap_index());
+        }
+        // InitializeInstanceElements: this class's field initializers run NOW
+        // (not at ctor entry), on the produced instance, with no new.target.
+        let cls_v = self.class_values.get(home_class_id as usize).copied().flatten();
+        if let Some(cv) = cls_v {
+            let (tfid, tups) = match self.heap.get(cv.heap_index()) {
+                HeapObj::Class(c) => (c.field_thunk, c.field_thunk_upvalues.clone()),
+                _ => (None, Vec::new()),
+            };
+            if let Some(fid) = tfid {
+                let f = self.ctor_value(fid, &tups);
+                // The thunk runs in the class body's private scope (same brand
+                // chain handed to the ctor in `construct`).
+                if let Some(brands) = self.method_brand.get(&cv.heap_index()).cloned() {
+                    if f.is_heap() {
+                        self.method_brand.insert(f.heap_index(), brands);
+                    }
+                }
+                let inst = if produced.is_heap() { produced } else { this };
+                self.call_value(f, inst, &[])?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn run_class_ctor(&mut self, cval: Value, obj: Value, args: &[Value], new_target: Value) -> Result<Value, Thrown> {
         if !cval.is_heap() {
             return Ok(obj);
         }
-        let (ctor, ctor_ups, has_explicit, parent) = match self.heap.get(cval.heap_index()) {
-            HeapObj::Class(c) => (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent),
+        let (ctor, ctor_ups, has_explicit, parent, extends_null) = match self.heap.get(cval.heap_index()) {
+            HeapObj::Class(c) => {
+                (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent, c.extends_null)
+            }
             // `super(...)` to a BUILT-IN parent (`class X extends Error`). We model
             // the Error family: set `message` on the instance from the argument
             // (AggregateError takes it as the 2nd arg). The instance's prototype
@@ -1794,10 +1885,27 @@ impl<'p> Vm<'p> {
                         self.method_brand.insert(f.heap_index(), brands);
                     }
                 }
+                // A derived parent ctor begins with `this` back in TDZ (until
+                // ITS OWN super() completes). No removal here: if the parent
+                // throws pre-super, the caller's binding is still uninitialized
+                // (a catching outer ctor may legitimately retry super()); the
+                // outermost construct() clears the mark on every exit.
+                if parent.is_some() || extends_null {
+                    self.this_tdz.insert(obj.heap_index());
+                }
                 // `new.target` propagates unchanged through super() to the parent ctor.
                 self.pending_new_target = new_target;
                 let r = self.call_value(f, obj, args)?;
-                let result = if self.is_object_value(r) { r } else { obj };
+                // An undefined return yields super()'s produced this (a parent
+                // return-override banked by super_ctor_complete), else obj.
+                let result = if self.is_object_value(r) {
+                    self.super_this.remove(&obj.heap_index());
+                    r
+                } else if let Some(st) = self.super_this.remove(&obj.heap_index()) {
+                    st
+                } else {
+                    obj
+                };
                 // A return-override result receives this class's private brand.
                 self.brand_instance(result, cval);
                 return Ok(result);

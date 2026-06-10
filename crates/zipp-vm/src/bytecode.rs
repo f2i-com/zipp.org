@@ -166,6 +166,11 @@ pub enum Instr {
     /// `parent` is the register holding the superclass value (`extends P`), or
     /// `None`; the new class links to it for inherited lookup + instanceof.
     MakeClass { dst: Reg, class_id: u32, parent: Option<Reg> },
+    /// Throw a ReferenceError if the value in `src` is a derived-class instance
+    /// whose `this` is still in the constructor TDZ (its `super()` has not yet
+    /// completed). Emitted before `this` reads and super-property references in
+    /// a derived class constructor (and in arrows lexically inside one).
+    ThisCheck { src: Reg },
     /// `dst = yield val` — suspend the current generator, handing `val` out as
     /// the yielded value. On resume the value passed to `.next(v)` lands in `dst`.
     Yield { dst: Reg, val: Reg },
@@ -999,6 +1004,11 @@ pub struct ClassDef {
     /// Whether the class declared its own `constructor`. When false, `new` runs
     /// the parent ctor (implicit `super(...args)`) before this class's fields.
     pub has_explicit_ctor: bool,
+    /// For a DERIVED class with an explicit ctor: a separate fields-only thunk
+    /// (instance field initializers), run by the SuperCtor ops right after
+    /// `super()` completes (spec InitializeInstanceElements timing). `None`
+    /// when there are no instance fields or the ctor carries entry inits.
+    pub field_thunk: Option<u32>,
     pub methods: Vec<(String, u32)>,
     /// `get name()` accessors: invoked (with `this` = instance) on property read.
     pub getters: Vec<(String, u32)>,

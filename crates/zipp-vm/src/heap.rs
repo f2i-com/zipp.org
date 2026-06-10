@@ -300,6 +300,14 @@ pub struct ClassData {
     /// ctor. Empty unless the class is nested in a function and its ctor/fields
     /// close over a local of that function.
     pub ctor_upvalues: Vec<u32>,
+    /// Fields-initializer thunk for a DERIVED class with an explicit ctor: run
+    /// by the SuperCtor ops on `this` right after `super()` completes (spec
+    /// InitializeInstanceElements timing). `None` when the ctor layout carries
+    /// entry inits (base/implicit classes) or there are no instance fields.
+    pub field_thunk: Option<u32>,
+    /// Upvalue cells for `field_thunk`, captured at MakeClass like
+    /// `ctor_upvalues` (field initializers may close over enclosing locals).
+    pub field_thunk_upvalues: Vec<u32>,
     /// A fresh per-EVALUATION private brand id, minted at MakeClass, giving each
     /// class evaluation a distinct private-name identity (so two classes that both
     /// declare `#m` don't collide). 0 = unbranded.

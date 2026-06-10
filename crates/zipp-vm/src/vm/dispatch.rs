@@ -1073,6 +1073,15 @@ impl<'p> Vm<'p> {
                             }
                             None => Vec::new(),
                         };
+                        // The deferred fields thunk (derived + explicit ctor)
+                        // captures the same defining frame.
+                        let field_thunk_upvalues = match cd.field_thunk {
+                            Some(fid) => {
+                                let sources = self.func(fid as usize).upvalues.clone();
+                                self.capture_upvalue_cells(&sources, base, cur_closure)
+                            }
+                            None => Vec::new(),
+                        };
                         let v = Value::heap(self.heap.alloc(HeapObj::Class(Box::new(ClassData {
                             name: cd.name,
                             ctor: cd.ctor,
@@ -1088,6 +1097,8 @@ impl<'p> Vm<'p> {
                             computed_field_keys: Vec::new(),
                             source: cd.source,
                             ctor_upvalues,
+                            field_thunk: cd.field_thunk,
+                            field_thunk_upvalues,
                             private_brand,
                         }))));
                         // Remember it so `super` in a derived class can reach it.
@@ -1215,6 +1226,15 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    Instr::ThisCheck { src } => {
+                        let v = self.get(base, src);
+                        if v.is_heap() && self.this_tdz.contains(&v.heap_index()) {
+                            return Err(Thrown(
+                                "ReferenceError: must call super constructor before accessing 'this' in a derived class constructor".into(),
+                            ));
+                        }
+                        ip += 1;
+                    }
                     Instr::SuperCtor { home_class_id, arg_base, argc } => {
                         let parent = self.super_parent(home_class_id)
                             .ok_or_else(|| Thrown("TypeError: superclass is not a constructor".into()))?;
@@ -1225,18 +1245,11 @@ impl<'p> Vm<'p> {
                         }
                         // `super(...)` keeps the derived activation's new.target.
                         let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
-                        // super() PRODUCES `this`: if the parent ctor object-returns a
-                        // different instance (return-override), rebind reg 0 so the rest
-                        // of the derived ctor body operates on it. (super_called stays
-                        // keyed on the original pre-allocated `this`, which construct()
-                        // uses for the missing-super check.)
+                        // super() PRODUCES `this`; completion enforces the once-only
+                        // rule, rebinds reg 0 (return-override), lifts the this-TDZ
+                        // and runs this class's deferred field initializers.
                         let produced = self.run_class_ctor(parent, this, &args, nt)?;
-                        if produced.is_heap() {
-                            self.set(base, 0, produced);
-                        }
-                        if this.is_heap() {
-                            self.super_called.insert(this.heap_index());
-                        }
+                        self.super_ctor_complete(base, this, produced, home_class_id)?;
                         ip += 1;
                     }
                     Instr::SuperCtorSpread { home_class_id, args } => {
@@ -1247,12 +1260,7 @@ impl<'p> Vm<'p> {
                         let arg_vec = self.array_snapshot(args_v.heap_index());
                         let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
                         let produced = self.run_class_ctor(parent, this, &arg_vec, nt)?;
-                        if produced.is_heap() {
-                            self.set(base, 0, produced);
-                        }
-                        if this.is_heap() {
-                            self.super_called.insert(this.heap_index());
-                        }
+                        self.super_ctor_complete(base, this, produced, home_class_id)?;
                         ip += 1;
                     }
                     Instr::SuperMethod { dst, home_class_id, name, arg_base, argc } => {
@@ -4047,7 +4055,7 @@ impl<'p> Vm<'p> {
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
+        self.frames.push(Frame { super_done: false, func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
         Ok(())
     }
 

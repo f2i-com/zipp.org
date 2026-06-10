@@ -89,6 +89,11 @@ struct Frame {
     /// call, `.call`/`.apply`, a method, a tagged template, …). Read by the
     /// `LoadNewTarget` op; consumed from `pending_new_target` at frame setup.
     new_target: Value,
+    /// Whether a `super(...)` has completed in THIS activation. A second
+    /// `super()` in the same constructor frame throws a ReferenceError (after
+    /// running the parent ctor — spec evaluates the SuperCall fully, then
+    /// BindThisValue throws on re-initialization).
+    super_done: bool,
 }
 
 /// Which array higher-order method `array_each` is driving (callback args are
@@ -318,6 +323,19 @@ pub struct Vm<'p> {
     /// throws a ReferenceError. Transient — entries live only across one
     /// in-flight `construct`.
     super_called: std::collections::HashSet<u32>,
+    /// Heap indices of derived-class instances whose `this` is still in the
+    /// constructor TDZ (between derived-ctor entry and its `super()`
+    /// completing). The `ThisCheck` op throws a ReferenceError while the
+    /// instance is here. Transient — inserted by `construct`/`run_class_ctor`,
+    /// removed on `super()` completion and cleared on every `construct` exit.
+    this_tdz: std::collections::HashSet<u32>,
+    /// The produced `this` of a completed `super(...)` whose parent ctor
+    /// RETURN-OVERRODE the instance, keyed by the pre-allocated instance's heap
+    /// index. A derived ctor that then returns `undefined` must yield THIS
+    /// value as the construction result (reg 0 was rebound, but the original
+    /// instance is what `construct` holds). Read+cleared by `construct` /
+    /// `run_class_ctor`; transient like `super_called`.
+    super_this: std::collections::HashMap<u32, Value>,
     /// Heap indices of the built-in prototype objects (`Object.prototype`,
     /// `Function.prototype`, `Array.prototype`), built by `setup_globals`. Used as
     /// the [[Prototype]] for plain objects / functions / arrays so their methods

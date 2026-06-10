@@ -418,6 +418,14 @@ struct Compiler {
     /// SyntaxError). `super.x` property access is allowed in ANY class method, so it
     /// uses the per-method home-class id instead. Saved/restored around each class.
     class_derived: bool,
+    /// Set by the class compiler around the CONSTRUCTOR's `compile_class_fn`
+    /// call only (consumed at its entry), so the ctor body — and nothing else —
+    /// gets derived-ctor this-TDZ checks.
+    compiling_ctor: bool,
+    /// True while compiling a derived class's constructor BODY (and read by
+    /// arrows lexically inside it). Gates `ThisCheck` emission on `this` reads
+    /// and super-property references.
+    in_derived_ctor: bool,
     /// Global slots bound by a top-level `const` (immutable): assignment to one
     /// is a runtime TypeError.
     const_globals: HashSet<u32>,
@@ -476,6 +484,8 @@ impl Compiler {
             new_target_ok: false,
             class_enclosing: Vec::new(),
             class_derived: false,
+            compiling_ctor: false,
+            in_derived_ctor: false,
             const_globals: HashSet::new(),
             lexical_globals: HashSet::new(),
             decl_globals: HashSet::new(),
@@ -624,6 +634,9 @@ impl Compiler {
         let saved_field_init = if is_script { self.in_field_init } else {
             std::mem::replace(&mut self.in_field_init, false)
         };
+        // A (non-arrow) function body has its own `this` — leave any enclosing
+        // derived-constructor TDZ context (arrows keep it).
+        let saved_idc = std::mem::replace(&mut self.in_derived_ctor, false);
         // Strict if the enclosing scope is strict OR this body opens with a
         // `"use strict"` directive. Propagate it to `cx` for the duration of the
         // body so nested functions/arrows inherit it; restore the parent's after.
@@ -927,6 +940,7 @@ impl Compiler {
         let upvalues: Vec<UpvalSource> =
             fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
+        fc.cx.in_derived_ctor = saved_idc;
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
             code: fc.code,
@@ -992,7 +1006,14 @@ impl Compiler {
         let parent_nt = self.new_target_ok;
         self.new_target_ok = true;
         let saved_field_init = std::mem::replace(&mut self.in_field_init, false);
+        // Consumed flag: set by the ctor call site just before this call. Only a
+        // DERIVED class's constructor body (and arrows inside it) checks the
+        // this-TDZ on `this` reads / super-property references.
+        let is_ctor = std::mem::replace(&mut self.compiling_ctor, false);
+        let saved_idc = self.in_derived_ctor;
+        self.in_derived_ctor = is_ctor && self.class_derived;
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
+        fc.in_derived_ctor = fc.cx.in_derived_ctor;
         fc.cx.in_strict = true;
         fc.super_class = super_class;
         fc.super_static = super_static;
@@ -1084,6 +1105,7 @@ impl Compiler {
         fc.emit(Instr::ReturnUndefined);
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
+        fc.cx.in_derived_ctor = saved_idc;
         Ok(FuncProto {
             name: name.to_string(),
             code: fc.code,
@@ -1143,6 +1165,7 @@ impl Compiler {
         // arrow inside a derived constructor is allowed). `cx.class_derived` still
         // reflects the enclosing class while its method bodies (and their arrows) compile.
         fc.derived_class = fc.cx.class_derived;
+        fc.in_derived_ctor = fc.cx.in_derived_ctor;
         fc.in_async = a.r#async;
         fc.bind_params(&a.params)?;
         if a.expression {
@@ -1334,6 +1357,10 @@ struct FnCompiler<'a> {
     /// True only inside a DERIVED class's methods — gates `super(...)` (calling it in
     /// a base class constructor is an early SyntaxError). `super.x` is not gated.
     derived_class: bool,
+    /// True only inside a derived class's CONSTRUCTOR body (and arrows
+    /// lexically inside it): `this` reads and super-property references emit a
+    /// `ThisCheck` (ReferenceError until `super()` has completed).
+    in_derived_ctor: bool,
     /// When set, `this` resolves to this register instead of reg 0. Used while
     /// evaluating static field initializers inline at class-definition time,
     /// where `this` must be the class value (not the enclosing `this`) — without
@@ -1511,6 +1538,7 @@ impl<'a> FnCompiler<'a> {
             super_home_obj: false,
             super_static: false,
             derived_class: false,
+            in_derived_ctor: false,
             this_override: None,
             pattern_block_local: false,
             in_generator: false,
@@ -2941,6 +2969,7 @@ impl<'a> FnCompiler<'a> {
             name: cname.clone(),
             ctor: None,
             has_explicit_ctor: false,
+            field_thunk: None,
             methods: Vec::new(),
             getters: Vec::new(),
             setters: Vec::new(),
@@ -3237,19 +3266,33 @@ impl<'a> FnCompiler<'a> {
         // fields-only proto (the `new` path runs the parent ctor first). Neither:
         // None.
         let has_explicit_ctor = ctor_fn.is_some();
+        // A DERIVED class's EXPLICIT ctor defers its instance-field
+        // initializers to a separate thunk run by the SuperCtor ops right
+        // after super() completes (spec BindThisValue →
+        // InitializeInstanceElements); its body carries no entry inits.
+        // Base classes and implicit (fields-only) ctors keep the entry layout.
+        let defer_fields = has_explicit_ctor && self.cx.class_derived;
+        let empty_fields = Vec::new();
+        let empty_cinits = Vec::new();
+        let (ctor_fields, ctor_cinits) = if defer_fields {
+            (&empty_fields, &empty_cinits)
+        } else {
+            (&fields, &instance_computed_inits)
+        };
         let ctor = if has_explicit_ctor || !fields.is_empty() || !instance_computed_inits.is_empty() {
             let (params, rest, body) = match ctor_fn {
                 Some(f) => function_parts(f)?,
                 None => (Vec::new(), None, &[][..]),
             };
             let params_ast = ctor_fn.map(|f| &*f.params);
+            self.cx.compiling_ctor = true;
             let mut proto = self.cx.compile_class_fn(
                 &format!("{cname}.constructor"),
                 &params,
                 rest.as_deref(),
                 params_ast,
-                &fields,
-                &instance_computed_inits,
+                ctor_fields,
+                ctor_cinits,
                 body,
                 super_class_id,
                 false, // a constructor's super is the instance prototype chain
@@ -3261,6 +3304,28 @@ impl<'a> FnCompiler<'a> {
                     proto.source = self.cx.src_slice(s, e);
                 }
             }
+            let fid = self.cx.functions.len() as u32;
+            self.cx.functions.push(proto);
+            Some(fid)
+        } else {
+            None
+        };
+        let field_thunk = if defer_fields
+            && (!fields.is_empty() || !instance_computed_inits.is_empty())
+        {
+            let proto = self.cx.compile_class_fn(
+                &format!("{cname}.<instance_fields>"),
+                &[],
+                None,
+                None,
+                &fields,
+                &instance_computed_inits,
+                &[],
+                super_class_id,
+                false, // instance fields: super via the instance prototype chain
+                false,
+                false,
+            )?;
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             Some(fid)
@@ -3329,6 +3394,7 @@ impl<'a> FnCompiler<'a> {
             name: cname,
             ctor,
             has_explicit_ctor,
+            field_thunk,
             methods: method_defs,
             getters: getter_defs,
             setters: setter_defs,
@@ -3426,6 +3492,16 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::MakeClosure { dst, func_id: id });
         } else {
             self.emit(Instr::MakeFunc { dst, func_id: id });
+        }
+    }
+
+    /// In a derived class constructor (or an arrow lexically inside one),
+    /// `this` (reg 0) is in TDZ until `super()` completes: emit the runtime
+    /// check before any `this` read or super-property reference. `this_override`
+    /// (static-initializer context) has an initialized `this` — no check.
+    fn this_check(&mut self) {
+        if self.in_derived_ctor && self.this_override.is_none() {
+            self.emit(Instr::ThisCheck { src: 0 });
         }
     }
 
@@ -4703,6 +4779,8 @@ impl<'a> FnCompiler<'a> {
             E::ThisExpression(_) => {
                 // `this` lives in register 0 of the current function, unless a
                 // static field initializer has redirected it to the class value.
+                // In a derived ctor it is in TDZ until super() completes.
+                self.this_check();
                 Ok(self.this_override.unwrap_or(0))
             }
             E::ParenthesizedExpression(p) => self.expr_into(&p.expression, dst),
@@ -4974,6 +5052,9 @@ impl<'a> FnCompiler<'a> {
         // `super.name` — read an inherited property through the lexical home: a class
         // method via its home class, an object method via its runtime [[HomeObject]].
         if matches!(&m.object, ox::Expression::Super(_)) {
+            // MakeSuperPropertyReference: GetThisBinding() throws FIRST in a
+            // derived ctor pre-super.
+            self.this_check();
             let name = self.string_name(m.property.name.as_str());
             if let Some(pid) = self.super_class {
                 self.emit(Instr::SuperGet { dst, home_class_id: pid, name });
@@ -4996,6 +5077,8 @@ impl<'a> FnCompiler<'a> {
     fn computed_member(&mut self, m: &ox::ComputedMemberExpression, dst: Reg) -> R<Reg> {
         // `super[expr]` — computed inherited-property read.
         if matches!(&m.object, ox::Expression::Super(_)) {
+            // GetThisBinding() throws BEFORE the key expression is evaluated.
+            self.this_check();
             if let Some(pid) = self.super_class {
                 let key = self.expr(&m.expression)?;
                 self.emit(Instr::SuperGetComputed { dst, home_class_id: pid, key });
@@ -6419,6 +6502,7 @@ impl<'a> FnCompiler<'a> {
                 if pid.is_none() && !self.super_home_obj {
                     return Err("`super.x = …` is only valid in a method".into());
                 }
+                self.this_check();
                 let name = self.string_name(m.property.name.as_str());
                 // A super GET/SET routes to the class op (home_class_id) or the
                 // object-method op ([[HomeObject]]), depending on the lexical context.
@@ -6528,6 +6612,7 @@ impl<'a> FnCompiler<'a> {
                 if pid.is_none() && !self.super_home_obj {
                     return Err("`super[k] = …` is only valid in a method".into());
                 }
+                self.this_check();
                 let key = self.expr(&m.expression)?;
                 let key_reg = self.alloc_reg();
                 if key != key_reg {
@@ -7213,6 +7298,7 @@ impl<'a> FnCompiler<'a> {
                     let pid = self
                         .super_class
                         .ok_or("`super.method(...)` is only valid in a derived class")?;
+                    self.this_check();
                     let name = self.string_name(m.property.name.as_str());
                     let args_arr = self.build_spread_args(&c.arguments)?;
                     self.emit(Instr::SuperMethodSpread { dst, home_class_id: pid, name, args: args_arr });
@@ -7266,6 +7352,7 @@ impl<'a> FnCompiler<'a> {
         // `super.method(args)` — call an inherited method with the current `this`.
         if let ox::Expression::StaticMemberExpression(m) = &c.callee {
             if matches!(&m.object, ox::Expression::Super(_)) {
+                self.this_check();
                 let name = self.string_name(m.property.name.as_str());
                 let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
                 if let Some(pid) = self.super_class {
@@ -7605,6 +7692,7 @@ impl<'a> FnCompiler<'a> {
                 if is_class.is_none() && !self.super_home_obj {
                     return Err("`super[x](...)` is only valid in a method".into());
                 }
+                self.this_check();
                 let key = self.expr(&m.expression)?;
                 let key_reg = self.alloc_reg();
                 if key != key_reg {
