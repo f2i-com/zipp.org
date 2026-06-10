@@ -595,6 +595,10 @@ fn collect_nested_free(s: &ox::Statement, out: &mut HashSet<String>) {
             collect_nested_free_expr(&w.test, out);
             collect_nested_free(&w.body, out);
         }
+        S::WithStatement(w) => {
+            collect_nested_free_expr(&w.object, out);
+            collect_nested_free(&w.body, out);
+        }
         S::DoWhileStatement(d) => {
             collect_nested_free(&d.body, out);
             collect_nested_free_expr(&d.test, out);
