@@ -4849,8 +4849,13 @@ impl<'a> FnCompiler<'a> {
             *catch_reg = e_reg;
         }
         if let Some(pat) = pattern {
-            self.declare_pattern(pat)?;
-            self.extract_pattern(pat, e_reg)?;
+            // Catch-parameter leaves are CATCH-SCOPE locals (never script
+            // globals): a destructured name must not leak past the catch nor
+            // hoist a same-named block function to a global (B.3.5 skip).
+            self.pattern_block_local = true;
+            let r = self.declare_pattern(pat).and_then(|_| self.extract_pattern(pat, e_reg));
+            self.pattern_block_local = false;
+            r?;
         }
         if let Some(n) = &e_name {
             if self.captured.contains(n) {
@@ -5053,9 +5058,16 @@ impl<'a> FnCompiler<'a> {
 
         // The loop binding: a destructuring pattern's leaves, an assignment to an
         // existing target, or a single (possibly cell-boxed) declared variable.
+        let head_lexical = matches!(&f.left,
+            ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical());
         let (var_reg, var_is_cell) = match (pattern, assign_tgt) {
             (Some(p), _) => {
-                self.declare_pattern(p)?;
+                // A `let`/`const` head pattern binds HEAD-SCOPE locals (a
+                // script-level `var` pattern still binds globals).
+                self.pattern_block_local = head_lexical;
+                let r = self.declare_pattern(p);
+                self.pattern_block_local = false;
+                r?;
                 (0, false)
             }
             (None, Some(_)) => (0, false), // assignment target: nothing to declare
@@ -5147,6 +5159,28 @@ impl<'a> FnCompiler<'a> {
             None
         };
         if let Some(p) = pattern {
+            // Per-iteration bindings: captured LEXICAL leaves get a FRESH cell
+            // each iteration (LoadUndefined resets the reg so MakeCell boxes a
+            // new cell rather than nesting the old one), then the extraction
+            // CellSets this iteration's values into it.
+            if head_lexical {
+                let mut names = std::collections::HashSet::new();
+                capture::collect_pattern_names(p, &mut names);
+                for n in &names {
+                    let found = self
+                        .scopes
+                        .iter()
+                        .flatten()
+                        .find(|(nm, _)| nm == n)
+                        .map(|(_, r)| *r);
+                    if let Some(r) = found {
+                        if self.cell_regs.contains(&r) {
+                            self.emit(Instr::LoadUndefined { dst: r });
+                            self.emit(Instr::MakeCell { reg: r });
+                        }
+                    }
+                }
+            }
             self.extract_pattern(p, elem)?;
         } else if let Some(tgt) = assign_tgt {
             self.assign_target(tgt, elem)?;
@@ -5299,9 +5333,14 @@ impl<'a> FnCompiler<'a> {
         let idx_reg = self.declare_local("<forin.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
 
+        let head_lexical = matches!(&f.left,
+            ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical());
         let (var_reg, var_is_cell) = match (pattern, assign_tgt) {
             (Some(p), _) => {
-                self.declare_pattern(p)?;
+                self.pattern_block_local = head_lexical;
+                let r = self.declare_pattern(p);
+                self.pattern_block_local = false;
+                r?;
                 (0, false)
             }
             (None, Some(_)) => (0, false),
@@ -5329,6 +5368,24 @@ impl<'a> FnCompiler<'a> {
         };
         self.emit(Instr::GetIndex { dst: key_dst, obj: keys_reg, key: idx_reg });
         if let Some(p) = pattern {
+            if head_lexical {
+                let mut names = std::collections::HashSet::new();
+                capture::collect_pattern_names(p, &mut names);
+                for n in &names {
+                    let found = self
+                        .scopes
+                        .iter()
+                        .flatten()
+                        .find(|(nm, _)| nm == n)
+                        .map(|(_, r)| *r);
+                    if let Some(r) = found {
+                        if self.cell_regs.contains(&r) {
+                            self.emit(Instr::LoadUndefined { dst: r });
+                            self.emit(Instr::MakeCell { reg: r });
+                        }
+                    }
+                }
+            }
             self.extract_pattern(p, key_dst)?;
         } else if let Some(tgt) = assign_tgt {
             self.assign_target(tgt, key_dst)?;
