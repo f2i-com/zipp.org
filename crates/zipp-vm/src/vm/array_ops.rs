@@ -764,8 +764,9 @@ impl<'p> Vm<'p> {
     fn al_set_len(&mut self, this: Value, n: i64) -> Result<(), Thrown> {
         self.set_prop(this, "length", Value::num(n as f64), true)
     }
-    fn al_has(&self, this: Value, i: i64) -> bool {
-        self.has_property(this, Value::num(i as f64))
+    /// HasProperty(O, i) — proxy-aware (dispatches a Proxy `has` trap).
+    fn al_has(&mut self, this: Value, i: i64) -> Result<bool, Thrown> {
+        self.has_property_dyn(this, Value::num(i as f64))
     }
     fn al_get(&mut self, this: Value, i: i64) -> Result<Value, Thrown> {
         self.get_index(this, Value::num(i as f64))
@@ -827,7 +828,7 @@ impl<'p> Vm<'p> {
                     let first = self.al_get(this, 0)?;
                     let mut k = 1;
                     while k < len {
-                        if self.al_has(this, k) {
+                        if self.al_has(this, k)? {
                             let v = self.al_get(this, k)?;
                             self.al_set(this, k - 1, v)?;
                         } else {
@@ -850,7 +851,7 @@ impl<'p> Vm<'p> {
                     while k > 0 {
                         let from = k - 1;
                         let to = k + argc - 1;
-                        if self.al_has(this, from) {
+                        if self.al_has(this, from)? {
                             let v = self.al_get(this, from)?;
                             self.al_set(this, to, v)?;
                         } else {
@@ -873,10 +874,10 @@ impl<'p> Vm<'p> {
                 let mut lower = 0;
                 while lower != middle {
                     let upper = len - lower - 1;
-                    let lower_exists = self.al_has(this, lower);
+                    let lower_exists = self.al_has(this, lower)?;
                     let lower_val =
                         if lower_exists { self.al_get(this, lower)? } else { Value::UNDEFINED };
-                    let upper_exists = self.al_has(this, upper);
+                    let upper_exists = self.al_has(this, upper)?;
                     let upper_val =
                         if upper_exists { self.al_get(this, upper)? } else { Value::UNDEFINED };
                     match (lower_exists, upper_exists) {
@@ -923,7 +924,7 @@ impl<'p> Vm<'p> {
                 let mut k = 0;
                 while k < actual_delete {
                     let from = actual_start + k;
-                    deleted.push(if self.al_has(this, from) {
+                    deleted.push(if self.al_has(this, from)? {
                         self.al_get(this, from)?
                     } else {
                         Value::UNDEFINED
@@ -940,7 +941,7 @@ impl<'p> Vm<'p> {
                     while k < len - actual_delete {
                         let from = k + actual_delete;
                         let to = k + insert_count;
-                        if self.al_has(this, from) {
+                        if self.al_has(this, from)? {
                             let v = self.al_get(this, from)?;
                             self.al_set(this, to, v)?;
                         } else {
@@ -958,7 +959,7 @@ impl<'p> Vm<'p> {
                     while k > actual_start {
                         let from = k + actual_delete - 1;
                         let to = k + insert_count - 1;
-                        if self.al_has(this, from) {
+                        if self.al_has(this, from)? {
                             let v = self.al_get(this, from)?;
                             self.al_set(this, to, v)?;
                         } else {
@@ -1073,10 +1074,77 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))));
                 }
-                // with/toSorted/toSpliced build a result of the source length via
+                // at: length is read ONCE, THEN the index argument is coerced (its
+                // valueOf may mutate the receiver, e.g. shrink a resizable buffer),
+                // then a single LIVE Get — never a snapshot of stale elements.
+                if name == "at" {
+                    let lv = self.get_prop(Value::heap(idx), "length")?;
+                    let lenf = self.to_number_coerce(lv)?;
+                    let len = if lenf.is_nan() || lenf <= 0.0 {
+                        0.0
+                    } else {
+                        lenf.trunc().min(9_007_199_254_740_991.0)
+                    };
+                    let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let rel = self.to_number_coerce(a0)?;
+                    let rel = if rel.is_nan() { 0.0 } else { rel.trunc() };
+                    let k = if rel >= 0.0 { rel } else { len + rel };
+                    if k < 0.0 || k >= len {
+                        return Ok(Some(Value::UNDEFINED));
+                    }
+                    let v = self.get_index(Value::heap(idx), Value::num(k))?;
+                    return Ok(Some(v));
+                }
+                // toSpliced runs the spec copy loops directly: a DISCARDED element
+                // (actualStart..actualStart+actualDeleteCount) is never read — the
+                // snapshot path would invoke its getter.
+                if name == "toSpliced" {
+                    let lv = self.get_prop(Value::heap(idx), "length")?;
+                    let lenf = self.to_number_coerce(lv)?;
+                    let len = if lenf.is_nan() || lenf <= 0.0 {
+                        0i64
+                    } else {
+                        lenf.trunc().min(9_007_199_254_740_991.0) as i64
+                    };
+                    let toii = |v: f64| if v.is_nan() { 0.0 } else { v.trunc() };
+                    let (start, del) = if args.is_empty() {
+                        (0i64, 0i64)
+                    } else {
+                        let s_raw = toii(self.to_number_coerce(args[0])?);
+                        let s = if s_raw < 0.0 {
+                            ((len as f64) + s_raw).max(0.0)
+                        } else {
+                            s_raw.min(len as f64)
+                        } as i64;
+                        let d = if args.len() < 2 {
+                            len - s
+                        } else {
+                            let d_raw = toii(self.to_number_coerce(args[1])?);
+                            (d_raw.max(0.0) as i64).min(len - s)
+                        };
+                        (s, d)
+                    };
+                    let insert: Vec<Value> = args.get(2..).unwrap_or(&[]).to_vec();
+                    let new_len = len - del + insert.len() as i64;
+                    if new_len > 4_294_967_295 {
+                        return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                    let mut out = Vec::with_capacity((new_len.max(0) as usize).min(4096));
+                    for k in 0..start {
+                        out.push(self.get_index(Value::heap(idx), Value::num(k as f64))?);
+                    }
+                    out.extend(insert);
+                    let mut r = start + del;
+                    while (out.len() as i64) < new_len {
+                        out.push(self.get_index(Value::heap(idx), Value::num(r as f64))?);
+                        r += 1;
+                    }
+                    return Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out)))));
+                }
+                // with/toSorted build a result of the source length via
                 // ArrayCreate(len), which throws RangeError for len > 2^32-1 — BEFORE
                 // reading any element (a throwing index getter must not run first).
-                if matches!(name, "with" | "toSorted" | "toSpliced") {
+                if matches!(name, "with" | "toSorted") {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
                     let n = self.to_number_coerce(lv)?;
                     // ArrayCreate(len) requires len <= 2^32-1; a larger finite length OR
@@ -1144,12 +1212,13 @@ impl<'p> Vm<'p> {
         {
             return self.array_like_search(Value::heap(idx), name, args);
         }
-        // push/pop/shift/unshift end with Set(O,"length",…,true); on a FROZEN array
-        // `length` is non-writable, so they throw a TypeError — even when no element
-        // changes (pop/shift on an empty array, push/unshift with no args still set
-        // `length`). (A SEALED-but-not-frozen array keeps `length` writable, so it is
-        // not gated here; its add/delete failures are a separate concern.)
-        if matches!(name, "push" | "pop" | "shift" | "unshift")
+        // push/pop/shift/unshift/splice end with Set(O,"length",…,true); on a FROZEN
+        // array `length` is non-writable, so they throw a TypeError — even when no
+        // element changes (pop/shift on an empty array, push/unshift with no args,
+        // splice() with no args still set `length`). (A SEALED-but-not-frozen array
+        // keeps `length` writable, so it is not gated here; its add/delete failures
+        // are a separate concern.)
+        if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice")
             && (self.arr_props.get(&idx).map_or(false, |m| m.is_frozen())
                 || self.array_length_nonwritable.contains(&idx))
         {
@@ -1919,7 +1988,11 @@ impl<'p> Vm<'p> {
                 let len = out.len();
                 let s = if arg0.is_number() { arg0.as_f64() as i64 } else { 0 };
                 let start = if s < 0 { (len as i64 + s).max(0) as usize } else { (s as usize).min(len) };
-                let del = if args.len() < 2 {
+                let del = if args.is_empty() {
+                    // No start argument: skipCount/actualSkipCount are 0 — the
+                    // result is an unchanged copy, NOT a delete-everything.
+                    0
+                } else if args.len() < 2 {
                     len - start
                 } else {
                     let d = if args[1].is_number() { args[1].as_f64() as i64 } else { 0 };

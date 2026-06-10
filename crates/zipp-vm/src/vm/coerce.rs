@@ -35,7 +35,9 @@ impl<'p> Vm<'p> {
         };
         let mut out = Vec::with_capacity(len.min(4096));
         for i in 0..len {
-            out.push(self.get_index(this, Value::int(i as i32)).unwrap_or(Value::UNDEFINED));
+            // An index getter that throws must propagate (ReturnIfAbrupt) — absent
+            // properties already come back Ok(undefined) from get_index.
+            out.push(self.get_index(this, Value::int(i as i32))?);
         }
         Ok(out)
     }

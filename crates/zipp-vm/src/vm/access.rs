@@ -484,10 +484,18 @@ impl<'p> Vm<'p> {
         // dense array — a very common idiom (`arr.length = 0` clears it). Per JS,
         // n must be a non-negative integer < 2^32, else a RangeError.
         if key == "length" && matches!(self.heap.get(idx), HeapObj::Array(_)) {
-            let n = self.to_number_coerce(val)?;
-            if !(n >= 0.0 && n.fract() == 0.0 && n < 4_294_967_296.0) {
+            // ArraySetLength steps 2-5: newLen = ToUint32(value) AND
+            // numberLen = ToNumber(value) are BOTH computed (valueOf runs
+            // TWICE), and newLen != numberLen (a non-uint32 length like -1 /
+            // NaN / 1.5 / 2^32) is a RangeError — same model as the
+            // defineProperty path in props.rs.
+            let nu = self.to_number_coerce(val)?; // ToNumber inside ToUint32
+            let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
+            let number_len = self.to_number_coerce(val)?; // numberLen
+            if u != number_len {
                 return Err(Thrown("RangeError: Invalid array length".into()));
             }
+            let n = u;
             // A `defineProperty`'d non-writable `length`, or a frozen array (freeze
             // makes `length` non-writable), rejects assignment (sloppy no-op / strict
             // TypeError) — the ToNumber/RangeError coercion above still runs first,

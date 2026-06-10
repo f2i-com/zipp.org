@@ -1570,7 +1570,16 @@ impl<'p> Vm<'p> {
     /// (unlike the operator's cached-prototype fast path).
     pub(crate) fn ordinary_has_instance(&mut self, c: Value, v: Value) -> Result<bool, Thrown> {
         if !self.is_callable(c) {
-            return Ok(false);
+            // Symbol/BigInt are callable globals (typeof "function") that
+            // is_callable reports false for (no user-invocable [[Construct]]);
+            // as `instanceof` right operands they still take the ordinary
+            // prototype-chain path (`Object(Symbol()) instanceof Symbol`).
+            let special = c.is_heap()
+                && ((self.symbol_ctor != 0 && c.heap_index() == self.symbol_ctor)
+                    || (self.bigint_ctor != 0 && c.heap_index() == self.bigint_ctor));
+            if !special {
+                return Ok(false);
+            }
         }
         // A bound function uses its [[BoundTargetFunction]] (recursively).
         if let Some(HeapObj::Bound { target, .. }) =

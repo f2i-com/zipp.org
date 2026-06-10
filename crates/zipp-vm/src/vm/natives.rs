@@ -1758,6 +1758,34 @@ impl<'p> Vm<'p> {
                     let b = self.reflect_set_on_receiver(receiver, kv, value)?;
                     return Ok(Value::bool(b));
                 }
+                // ArraySetLength via Reflect.set: ToUint32 + ToNumber BOTH run
+                // (valueOf twice), non-uint32 is a RangeError, and a non-writable
+                // `length` (made so even DURING the coercion) reports FALSE — the
+                // ordinary assignment path can only no-op or throw.
+                if key == "length" && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_)) {
+                    let nu = self.to_number_coerce(value)?;
+                    let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
+                    let number_len = self.to_number_coerce(value)?;
+                    if u != number_len {
+                        return Err(Thrown("RangeError: Invalid array length".into()));
+                    }
+                    let aidx = a0.heap_index();
+                    if self.array_length_nonwritable.contains(&aidx)
+                        || self.arr_props.get(&aidx).is_some_and(|m| m.frozen)
+                    {
+                        return Ok(Value::bool(false));
+                    }
+                    if u as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
+                        return Err(Thrown(
+                            "RangeError: array length exceeds the engine's dense-array limit".into(),
+                        ));
+                    }
+                    if let HeapObj::Array(items) = self.heap.get_mut(aidx) {
+                        items.resize(u as usize, Value::HOLE);
+                    }
+                    self.heap.bump_version(aidx);
+                    return Ok(Value::bool(true));
+                }
                 // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
                 // (target's own, then up the prototype chain). Only ordinary Object
                 // links carry inline descriptors here; a class-instance/exotic link
@@ -1877,6 +1905,41 @@ impl<'p> Vm<'p> {
                         _ => {
                             if !self.is_object_value(receiver) {
                                 false
+                            } else if self.proxy_parts(receiver.heap_index()).is_some() {
+                                // OrdinarySetWithOwnDescriptor on a Proxy receiver:
+                                // read its own descriptor ([[GetOwnProperty]] → GOPD
+                                // trap), then define ([[DefineOwnProperty]] →
+                                // defineProperty trap) — NEVER its set trap (a trap
+                                // calling Reflect.set(t,k,v,proxy) would recurse).
+                                let existing =
+                                    self.proxy_gopd(receiver, &key)?.unwrap_or(Value::UNDEFINED);
+                                if self.is_object_value(existing) {
+                                    let g = self.get_prop(existing, "get")?;
+                                    let s = self.get_prop(existing, "set")?;
+                                    let w = self.get_prop(existing, "writable")?;
+                                    if g != Value::UNDEFINED || s != Value::UNDEFINED || !self.truthy(w)
+                                    {
+                                        false
+                                    } else {
+                                        // valueDesc = { [[Value]]: V } only.
+                                        let mut m = crate::heap::ObjMap::new();
+                                        m.set("value", value);
+                                        let desc =
+                                            Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                                        self.object_define_property(receiver, &key, desc)?;
+                                        true
+                                    }
+                                } else {
+                                    // CreateDataProperty(Receiver, P, V).
+                                    let mut m = crate::heap::ObjMap::new();
+                                    m.set("value", value);
+                                    m.set("writable", Value::TRUE);
+                                    m.set("enumerable", Value::TRUE);
+                                    m.set("configurable", Value::TRUE);
+                                    let desc = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                                    self.object_define_property(receiver, &key, desc)?;
+                                    true
+                                }
                             } else {
                                 let rown = match self.heap.get(receiver.heap_index()) {
                                     HeapObj::Object(m) => {
@@ -3885,7 +3948,15 @@ impl<'p> Vm<'p> {
                     }
                 } else {
                     let r = match kind {
-                        0 => self.array_method(this.heap_index(), m, args)?,
+                        // ToObject(this): a heap-allocated PRIMITIVE receiver
+                        // (string/symbol/bigint) boxes to its wrapper — generic
+                        // methods that return `this` (sort) must return the
+                        // wrapper, never the bare primitive. Real objects pass
+                        // through to_object unchanged.
+                        0 => {
+                            let recv = self.to_object(this)?;
+                            self.array_method(recv.heap_index(), m, args)?
+                        }
                         1 => self.string_method(this.heap_index(), m, args)?,
                         3 => self.set_method(this.heap_index(), m, args)?,
                         4 => self.map_method(this.heap_index(), m, args)?,

@@ -2910,12 +2910,14 @@ impl<'p> Vm<'p> {
                 )));
             }
             // A number/boolean PRIMITIVE delegates method-as-value access to
-            // Number/Boolean.prototype (`(5).toFixed`, `true.valueOf`).
+            // Number/Boolean.prototype (`(5).toFixed`, `true.valueOf`) — through
+            // the accessor-AWARE walk, so a defineProperty'd getter on the
+            // prototype is invoked with the primitive as receiver.
             if obj.is_number() {
-                return Ok(self.proto_member(self.num_proto, key));
+                return self.proto_member_get(self.num_proto, key, obj);
             }
             if obj.is_bool() {
-                return Ok(self.proto_member(self.bool_proto, key));
+                return self.proto_member_get(self.bool_proto, key, obj);
             }
             return Ok(Value::UNDEFINED);
         }
@@ -3415,14 +3417,14 @@ impl<'p> Vm<'p> {
                 if key == "length" {
                     Ok(len_value(s.char_len))
                 } else {
-                    Ok(self.proto_member(self.str_proto, key))
+                    self.proto_member_get(self.str_proto, key, obj)
                 }
             }
             HeapObj::Cons { len, .. } => {
                 if key == "length" {
                     Ok(len_value(*len))
                 } else {
-                    Ok(self.proto_member(self.str_proto, key))
+                    self.proto_member_get(self.str_proto, key, obj)
                 }
             }
             HeapObj::Object(map) => {
@@ -3594,10 +3596,10 @@ impl<'p> Vm<'p> {
                 if key == "description" {
                     return Ok(*desc);
                 }
-                Ok(self.proto_member(self.symbol_proto, key))
+                self.proto_member_get(self.symbol_proto, key, obj)
             }
             // A BigInt: methods (toString/valueOf/constructor) via BigInt.prototype.
-            HeapObj::BigInt(_) => Ok(self.proto_member(self.bigint_proto, key)),
+            HeapObj::BigInt(_) => self.proto_member_get(self.bigint_proto, key, obj),
             // Functions / natives / bound functions: own props set on them
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
             _ if matches!(

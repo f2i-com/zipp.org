@@ -247,6 +247,12 @@ impl<'p> Vm<'p> {
         if !ups.is_empty() {
             return None;
         }
+        // A callback that materialises `arguments` needs the interpreter's call
+        // setup (the JIT window never builds the arguments object) — same guard
+        // as the fused-kernel paths.
+        if self.func(fid as usize).arguments_reg.is_some() {
+            return None;
+        }
         if self.jit.get(fid).is_none() {
             let proto: *const crate::bytecode::FuncProto =
                 self.func(fid as usize);
