@@ -1160,11 +1160,33 @@ impl<'p> Vm<'p> {
     pub(crate) fn import_module(
         &mut self,
         raw_path: &std::path::Path,
+        mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
         let path = std::fs::canonicalize(raw_path)
             .map_err(|_| Thrown("TypeError: module not found".into()))?;
         if let Some(&ns) = self.module_cache.get(&path) {
             return Ok(ns);
+        }
+        // A typed import ({type:'json'|'text'}) builds a synthetic namespace
+        // with a single `default` export; unknown types reject.
+        if let Some(t) = mtype {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|_| Thrown("TypeError: module not found".into()))?;
+            let val = match t {
+                "json" => self.json_parse(&text)?,
+                "text" => self.alloc_str(text),
+                _ => {
+                    return Err(Thrown(format!(
+                        "TypeError: unsupported module type '{t}'"
+                    )))
+                }
+            };
+            self.globals.push(val);
+            let slot = (self.globals.len() - 1) as u32;
+            let ns_idx = self.alloc_empty_namespace();
+            self.populate_module_namespace(ns_idx, &[("default".to_string(), slot)]);
+            self.module_cache.insert(path.clone(), Value::heap(ns_idx));
+            return Ok(Value::heap(ns_idx));
         }
         let code = std::fs::read_to_string(&path)
             .map_err(|_| Thrown("TypeError: module not found".into()))?;
@@ -1281,7 +1303,7 @@ impl<'p> Vm<'p> {
                 Some(d) => d.join(spec),
                 None => std::path::PathBuf::from(spec),
             };
-            let ns = self.import_module(&dep)?;
+            let ns = self.import_module(&dep, None)?;
             self.globals.push(ns);
             let slot = (self.globals.len() - 1) as u32;
             full.push((exported.clone(), slot));
@@ -1360,7 +1382,7 @@ impl<'p> Vm<'p> {
         if let Some(m) = self.module_own.get(&dep) {
             return Ok(m.get(name).copied());
         }
-        let ns = self.import_module(&dep)?;
+        let ns = self.import_module(&dep, None)?;
         ambiguous_check(self, ns.heap_index())?;
         Ok(self
             .module_namespaces
@@ -1393,7 +1415,7 @@ impl<'p> Vm<'p> {
         if let Some(m) = self.module_own.get(&dep) {
             return Ok(collect(m));
         }
-        let ns = self.import_module(&dep)?;
+        let ns = self.import_module(&dep, None)?;
         Ok(self
             .module_namespaces
             .get(&ns.heap_index())

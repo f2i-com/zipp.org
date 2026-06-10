@@ -2681,13 +2681,20 @@ impl<'p> Vm<'p> {
                                 .take()
                                 .unwrap_or_else(|| self.make_error(1, None))),
                             Ok(spec_str) => {
+                                let mut mtype: Option<String> = None;
                                 let opt_err: Option<Value> = match opts {
                                     Some(r) => {
                                         let ov = self.get(base, r);
                                         if ov == Value::UNDEFINED {
                                             None
                                         } else {
-                                            self.validate_import_options(ov).err()
+                                            match self.validate_import_options(ov) {
+                                                Ok(t) => {
+                                                    mtype = t;
+                                                    None
+                                                }
+                                                Err(e) => Some(e),
+                                            }
                                         }
                                     }
                                     None => None,
@@ -2702,7 +2709,7 @@ impl<'p> Vm<'p> {
                                         // import_module canonicalizes, caches, runs, and
                                         // recursively links re-exports; the returned value
                                         // IS the fully-linked namespace.
-                                        Some(p) => match self.import_module(&p) {
+                                        Some(p) => match self.import_module(&p, mtype.as_deref()) {
                                             Ok(ns) => Ok(ns),
                                             // A loader Thrown carries its error type in
                                             // the message prefix ("SyntaxError: …") —

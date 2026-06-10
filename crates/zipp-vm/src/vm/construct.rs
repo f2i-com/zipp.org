@@ -210,11 +210,16 @@ impl<'p> Vm<'p> {
     /// import-attributes (if present) must each be an Object whose own enumerable
     /// values are all Strings. Returns `Err(reason)` (a value to reject the import
     /// promise with) on any violation or a throwing getter; `Ok(())` if valid.
-    pub(crate) fn validate_import_options(&mut self, ov: Value) -> Result<(), Value> {
+    /// Validate import() options per EnumerableOwnPropertyNames: Symbol keys
+    /// are SKIPPED, each string key's descriptor is consulted (proxy GOPD trap
+    /// fires), and [[Get]] runs ONLY for present ENUMERABLE keys. Returns the
+    /// validated `type` attribute, if any.
+    pub(crate) fn validate_import_options(&mut self, ov: Value) -> Result<Option<String>, Value> {
         let _gc = self.gc_lock_guard();
         if !self.is_object_value(ov) {
             return Err(self.make_error(1, None)); // TypeError: options not an object
         }
+        let mut mtype: Option<String> = None;
         for key in ["with", "assert"] {
             let attrs = match self.get_prop(ov, key) {
                 Ok(v) => v,
@@ -236,7 +241,43 @@ impl<'p> Vm<'p> {
             };
             let names = self.array_snapshot(names_v.heap_index());
             for nv in names {
+                // EnumerableOwnPropertyNames operates on STRING keys only.
+                if nv.is_heap()
+                    && matches!(self.heap.get(nv.heap_index()), HeapObj::Symbol { .. })
+                {
+                    continue;
+                }
                 let ks = self.display(nv);
+                if ks.starts_with("@@") {
+                    continue; // engine-encoded symbol key
+                }
+                // [[GetOwnProperty]] (proxy trap fires): absent or
+                // non-enumerable keys are skipped WITHOUT a [[Get]].
+                let desc = match self.proxy_gopd(attrs, &ks) {
+                    Ok(Some(d)) => d,
+                    Ok(None) => self.object_get_own_property_descriptor(attrs, &ks),
+                    Err(_) => {
+                        return Err(self
+                            .pending_throw
+                            .take()
+                            .unwrap_or_else(|| self.make_error(1, None)))
+                    }
+                };
+                if !self.is_object_value(desc) {
+                    continue;
+                }
+                let en = match self.get_prop(desc, "enumerable") {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(self
+                            .pending_throw
+                            .take()
+                            .unwrap_or_else(|| self.make_error(1, None)))
+                    }
+                };
+                if !self.truthy(en) {
+                    continue;
+                }
                 let val = match self.get_prop(attrs, &ks) {
                     Ok(v) => v,
                     Err(_) => {
@@ -249,9 +290,12 @@ impl<'p> Vm<'p> {
                 if !(val.is_heap() && self.heap.is_str_like(val.heap_index())) {
                     return Err(self.make_error(1, None)); // TypeError: attribute value not a string
                 }
+                if ks == "type" {
+                    mtype = Some(self.display(val));
+                }
             }
         }
-        Ok(())
+        Ok(mtype)
     }
 
     /// Build a Module Namespace exotic object from the module's exports, where each
