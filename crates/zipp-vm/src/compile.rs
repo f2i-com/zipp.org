@@ -7460,36 +7460,142 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn assign_array_target(&mut self, arr: &ox::ArrayAssignmentTarget, src_in: Reg) -> R<()> {
-        // Array assignment destructuring uses the iterator protocol (like the
-        // binding form): normalize the source into an array, pulling only the
-        // needed elements (unbounded with `...rest`). IterToArray drives a custom
-        // iterable's next()/return() — so a non-array source yields the right
-        // values AND the iterator is closed when not fully consumed. A plain array
-        // takes IterToArray's no-op fast path, so indexed reads are unchanged.
+        // Array assignment destructuring: the SPEC's stepwise iterator driver.
+        // Per element: evaluate a member target's REFERENCE first, then
+        // IteratorStep (no step once exhausted), then the default, then store
+        // through the saved reference. An abrupt completion anywhere closes a
+        // non-exhausted iterator QUIETLY (the original throw wins); a normal
+        // completion closes STRICTLY (a throwing/non-object return() result
+        // propagates).
         let save_top = self.next_reg;
-        let count = if arr.rest.is_some() { u32::MAX } else { arr.elements.len() as u32 };
-        let src = self.alloc_reg();
-        self.emit(Instr::IterToArray { dst: src, src: src_in, count });
-        for (i, el) in arr.elements.iter().enumerate() {
+        let iter_reg = self.alloc_reg();
+        self.emit(Instr::CheckIterable { src: src_in });
+        self.emit(Instr::GetIterator { dst: iter_reg, src: src_in });
+        let idx_reg = self.alloc_reg();
+        self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
+        let done = self.alloc_reg();
+        self.emit(Instr::LoadBool { dst: done, val: false });
+        let exc = self.alloc_reg();
+        let push_at = self.here();
+        self.emit(Instr::PushHandler { catch_target: 0, catch_reg: exc });
+        self.handler_depth += 1;
+        for el in &arr.elements {
+            let save = self.next_reg;
+            let pre = match el {
+                Some(maybe) => self.pre_member_ref(maybe)?,
+                None => None,
+            };
+            let val = self.alloc_reg();
+            let dflag = self.alloc_reg();
+            // Step (skipped once exhausted): done elements read undefined.
+            // `done` is PRE-SET before the step — an abrupt completion FROM
+            // the iterator itself (next()/done-getter/value-getter throw)
+            // leaves it true, so the catch path skips IteratorClose (the
+            // spec marks [[Done]] before propagating); a successful value
+            // clears it.
+            let jdone = self.here();
+            self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+            self.emit(Instr::LoadBool { dst: done, val: true });
+            self.emit(Instr::IterNext { value_dst: val, done_dst: dflag, iter: iter_reg, idx: idx_reg });
+            let jexh = self.here();
+            self.emit(Instr::JumpIfTrue { cond: dflag, target: 0 });
+            self.emit(Instr::LoadBool { dst: done, val: false });
+            let jgot = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            let at_undef = self.here();
+            self.patch_jump(jdone, at_undef);
+            self.patch_jump(jexh, at_undef);
+            self.emit(Instr::LoadUndefined { dst: val });
+            let got = self.here();
+            self.patch_jump(jgot, got);
             if let Some(maybe) = el {
-                let save = self.next_reg;
-                let val = self.alloc_reg();
-                let idx = self.alloc_reg();
-                self.emit(Instr::LoadInt { dst: idx, val: i as i32 });
-                self.emit(Instr::GetIndex { dst: val, obj: src, key: idx });
-                self.assign_maybe_default(maybe, val)?;
-                self.next_reg = save;
+                match pre {
+                    Some((obj, key)) => self.store_pre_ref(maybe, obj, &key, val)?,
+                    None => self.assign_maybe_default(maybe, val)?,
+                }
             }
+            self.next_reg = save;
         }
         if let Some(rest) = &arr.rest {
             let save = self.next_reg;
-            let val = self.alloc_reg();
-            self.emit(Instr::ArrayRest { dst: val, src, start: arr.elements.len() as u32 });
-            self.assign_target(&rest.target, val)?;
+            let pre = self.pre_rest_ref(&rest.target)?;
+            let out = self.alloc_reg();
+            self.emit(Instr::ArrayCtor { dst: out, arg_base: 0, argc: 0 });
+            let v = self.alloc_reg();
+            let dflag = self.alloc_reg();
+            let loop_top = self.here();
+            let jrest_done = self.here();
+            self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+            self.emit(Instr::LoadBool { dst: done, val: true });
+            self.emit(Instr::IterNext { value_dst: v, done_dst: dflag, iter: iter_reg, idx: idx_reg });
+            let jout = self.here();
+            self.emit(Instr::JumpIfTrue { cond: dflag, target: 0 });
+            self.emit(Instr::LoadBool { dst: done, val: false });
+            self.emit(Instr::ArrayAppend { arr: out, val: v, spread: false });
+            self.emit(Instr::Jump { target: loop_top });
+            let rest_done = self.here();
+            self.patch_jump(jrest_done, rest_done);
+            self.patch_jump(jout, rest_done);
+            match pre {
+                Some((obj, key)) => {
+                    match key {
+                        PreKey::Static(name) => self.emit(Instr::SetProp { obj, name, val: out }),
+                        PreKey::Computed(k) => self.emit(Instr::SetIndex { obj, key: k, val: out }),
+                        PreKey::Private(name) => self.emit(Instr::SetPrivate { obj, name, val: out }),
+                    }
+                }
+                None => self.assign_target(&rest.target, out)?,
+            }
             self.next_reg = save;
         }
+        self.emit(Instr::PopHandler);
+        self.handler_depth -= 1;
+        // Normal completion: close iff not exhausted (strict result checks).
+        let jskip = self.here();
+        self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+        self.emit(Instr::IterClose { iter: iter_reg });
+        let jend = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        // Abrupt: close quietly (the original throw is preserved), re-raise.
+        let catch_start = self.here();
+        if let Instr::PushHandler { catch_target, .. } = &mut self.code[push_at as usize] {
+            *catch_target = catch_start;
+        }
+        let jskip2 = self.here();
+        self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+        self.emit(Instr::IterCloseQuiet { iter: iter_reg });
+        let rethrow = self.here();
+        self.patch_jump(jskip2, rethrow);
+        self.emit(Instr::Throw { src: exc });
+        let end = self.here();
+        self.patch_jump(jskip, end);
+        self.patch_jump(jend, end);
         self.next_reg = save_top;
         Ok(())
+    }
+
+    /// `pre_member_ref` for a REST target (a plain AssignmentTarget).
+    fn pre_rest_ref(&mut self, t: &ox::AssignmentTarget) -> R<Option<(Reg, PreKey)>> {
+        use ox::AssignmentTarget as T;
+        match t {
+            T::StaticMemberExpression(sm) => {
+                let r = self.pin_expr(&sm.object)?;
+                let name = self.string_name(sm.property.name.as_str());
+                Ok(Some((r, PreKey::Static(name))))
+            }
+            T::ComputedMemberExpression(cm) => {
+                let r = self.pin_expr(&cm.object)?;
+                let k = self.pin_expr(&cm.expression)?;
+                Ok(Some((r, PreKey::Computed(k))))
+            }
+            T::PrivateFieldExpression(pm) => {
+                self.check_private_declared(&pm.field.name)?;
+                let r = self.pin_expr(&pm.object)?;
+                let name = self.string_name(&private_key(&pm.field.name));
+                Ok(Some((r, PreKey::Private(name))))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn assign_object_target(&mut self, o: &ox::ObjectAssignmentTarget, src: Reg) -> R<()> {

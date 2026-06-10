@@ -4224,6 +4224,16 @@ impl<'p> Vm<'p> {
                         self.iterator_close(it)?;
                         ip += 1;
                     }
+                    Instr::CheckIterable { src } => {
+                        let v = self.get(base, src);
+                        if !self.value_is_iterable(v)? {
+                            return Err(Thrown(format!(
+                                "TypeError: {} is not iterable",
+                                self.display(v)
+                            )));
+                        }
+                        ip += 1;
+                    }
                     Instr::IterCloseQuiet { iter } => {
                         // Error-context close: a throwing/non-object return() is
                         // ignored so the original abrupt completion is preserved.

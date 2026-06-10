@@ -241,6 +241,11 @@ pub enum Instr {
     /// IteratorClose: invoke `iter`'s `return()` (if present) — emitted on the
     /// abrupt `break` exit of a `for-of` so a not-yet-exhausted iterator is closed.
     IterClose { iter: Reg },
+    /// GetIterator's type check, split out for destructuring: TypeError when
+    /// `src` has no usable iterator (primitives without @@iterator, plain
+    /// objects whose @@iterator is not callable). Built-ins with positional
+    /// iteration (Array/String/Map/Set/TypedArray/arguments) pass.
+    CheckIterable { src: Reg },
     /// IteratorClose in an ERROR context: invoke `iter`'s `return()` (if present)
     /// but SWALLOW any error it throws and skip the result-is-object check, so a
     /// throw/return out of a `for-of` body closes the iterator while preserving the

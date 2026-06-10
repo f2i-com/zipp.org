@@ -2781,6 +2781,32 @@ impl<'p> Vm<'p> {
         self.call_value(m, iterable, &[])
     }
 
+    /// Whether `v` can begin iterator-protocol iteration: a built-in with
+    /// positional iteration, or any object whose @@iterator resolves to a
+    /// callable (the Get may run a getter / throw — propagated).
+    pub(crate) fn value_is_iterable(&mut self, v: Value) -> Result<bool, Thrown> {
+        if !v.is_heap() {
+            return Ok(false);
+        }
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Str(_)
+            | HeapObj::Cons { .. }
+            | HeapObj::Array(_)
+            | HeapObj::TypedArray { .. }
+            | HeapObj::Map { .. }
+            | HeapObj::Set(_)
+            | HeapObj::Generator { .. }
+            | HeapObj::AsyncGenerator(_)
+            | HeapObj::Iterator { .. }
+            | HeapObj::IterHelper { .. } => Ok(true),
+            HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Boxed { .. } => {
+                let m = self.get_prop(v, "@@iterator")?;
+                Ok(self.is_callable(m))
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(crate) fn iterator_close(&mut self, iter: Value) -> Result<(), Thrown> {
         self.iterator_close_inner(iter, true)
     }
