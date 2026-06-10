@@ -1280,6 +1280,28 @@ impl<'p> Vm<'p> {
             }
             // `get [Symbol.species]` — returns the receiver constructor unchanged.
             SPECIES_GET => this,
+            // Async-module plumbing: `this` carries the deferred module's
+            // capability-promise index. OK decrements the pending-dependency
+            // count and runs the body on zero; FAIL rejects the capability.
+            MODULE_DEP_OK => {
+                let cap = this.as_f64() as u32;
+                if let Some(st) = self.deferred_mods.get_mut(&cap) {
+                    st.remaining = st.remaining.saturating_sub(1);
+                    if st.remaining == 0 {
+                        let st = self.deferred_mods.remove(&cap).unwrap();
+                        self.run_deferred_module(cap, st);
+                    }
+                }
+                Value::UNDEFINED
+            }
+            MODULE_DEP_FAIL => {
+                let cap = this.as_f64() as u32;
+                if self.deferred_mods.remove(&cap).is_some() {
+                    let reason = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    self.reject(cap, reason);
+                }
+                Value::UNDEFINED
+            }
             TA_GET_TOSTRINGTAG => {
                 match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::TypedArray { kind, .. }) => {

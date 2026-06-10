@@ -121,6 +121,8 @@ impl<'p> Vm<'p> {
             can_block: std::env::var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             module_loading: std::collections::HashSet::new(),
             pending_module_body: None,
+            link_pending_deps: Vec::new(),
+            deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),
             obj_proto: 0,
@@ -641,22 +643,77 @@ impl<'p> Vm<'p> {
         r.map(|_| Value::UNDEFINED)
     }
 
-    /// `import_module` for a STATIC importer: a dependency that SUSPENDED at
-    /// top-level await cannot be awaited by a synchronous import chain yet
-    /// (stage-2 async module evaluation) — surface the host containment error
-    /// instead of running the importer against a half-evaluated dependency.
+    /// `import_module` for a STATIC link site: a dependency that SUSPENDED at
+    /// top-level await is COLLECTED (the importer defers its own body until
+    /// every pending dependency settles — async module evaluation). Bindings
+    /// are already linked; the values arrive through the shared live slots.
     fn import_module_sync(
         &mut self,
         raw_path: &std::path::Path,
         mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
         let r = self.import_module(raw_path, mtype)?;
-        if self.pending_module_body.take().is_some() {
-            return Err(Thrown(
-                "TypeError: top-level await is not supported in imported modules yet".into(),
-            ));
+        if let Some(bp) = self.pending_module_body.take() {
+            self.link_pending_deps.push(bp);
         }
         Ok(r)
+    }
+
+    /// Execute a module body whose dependencies have all settled, and settle
+    /// its capability promise: a fulfilled body refreshes the namespace
+    /// snapshot and resolves; a rejected/thrown body rejects; a body that
+    /// itself suspends at top-level await is ADOPTED (pass-through reactions).
+    pub(crate) fn run_deferred_module(&mut self, cap: u32, st: DeferredModuleExec) {
+        let exec = self.execute_eval_program(
+            st.base_func,
+            Some(Value::UNDEFINED),
+            None,
+            Value::UNDEFINED,
+            None,
+            None,
+            None,
+        );
+        match exec {
+            Ok(v) => {
+                let state = if v.is_heap() {
+                    match self.heap.get(v.heap_index()) {
+                        HeapObj::Promise { state, result, .. } => Some((*state, *result)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                match state {
+                    Some((crate::heap::PromiseState::Rejected, r)) => {
+                        if let HeapObj::Promise { handled, .. } =
+                            self.heap.get_mut(v.heap_index())
+                        {
+                            *handled = true;
+                        }
+                        self.reject(cap, r);
+                    }
+                    Some((crate::heap::PromiseState::Pending, _)) => {
+                        self.then_internal(
+                            v.heap_index(),
+                            Value::UNDEFINED,
+                            Value::UNDEFINED,
+                            Some(cap),
+                        );
+                    }
+                    _ => {
+                        self.populate_module_namespace(st.ns_idx, &st.full2);
+                        self.resolve(cap, Value::UNDEFINED);
+                    }
+                }
+            }
+            Err(Thrown(msg)) => {
+                let reason = self
+                    .pending_throw
+                    .take()
+                    .unwrap_or_else(|| self.error_from_thrown(&msg));
+                self.reject(cap, reason);
+            }
+        }
     }
 
     pub fn run_module(&mut self) -> Result<Value, Thrown> {
@@ -1374,6 +1431,9 @@ impl<'p> Vm<'p> {
             path.clone(),
             (reexports.clone(), star_reexports.clone(), dir.clone()),
         );
+        // Dependencies that suspend at top-level await get collected past this
+        // mark (nested links use their own marks via the same discipline).
+        let lp_mark = self.link_pending_deps.len();
         self.module_loading.insert(path.clone());
         let import_res = (|| -> Result<(), Thrown> {
             // LOADING phase: every requested module (including phase-import
@@ -1542,6 +1602,7 @@ impl<'p> Vm<'p> {
             vm.module_namespaces.remove(&ns_idx);
             vm.module_own.remove(&path);
             vm.module_pending_reexports.remove(&path);
+            vm.link_pending_deps.truncate(lp_mark);
         };
         if let Err(e) = import_res {
             cleanup_on_err(self);
@@ -1611,6 +1672,48 @@ impl<'p> Vm<'p> {
                 self.populate_module_namespace(ns_idx, &full2);
                 if !ambiguous.is_empty() {
                     self.module_ambiguous.insert(ns_idx, ambiguous.clone());
+                }
+                // Dependencies that SUSPENDED at top-level await: defer this
+                // body until every one settles (spec AsyncEvaluating). The
+                // capability promise stands in as OUR body promise — importers
+                // up the chain wait on it transitively.
+                let pending_deps: Vec<Value> = self.link_pending_deps.split_off(lp_mark);
+                if !pending_deps.is_empty() {
+                    let cap = self.alloc_promise();
+                    self.deferred_mods.insert(
+                        cap,
+                        DeferredModuleExec {
+                            remaining: pending_deps.len(),
+                            base_func,
+                            ns_idx,
+                            full2: full2.clone(),
+                        },
+                    );
+                    for bp in pending_deps {
+                        let _gc = self.gc_lock_guard();
+                        let ok_t =
+                            Value::heap(self.heap.alloc(HeapObj::Native(native::MODULE_DEP_OK)));
+                        let on_ok = Value::heap(self.heap.alloc(HeapObj::Bound {
+                            target: ok_t,
+                            this: Value::num(cap as f64),
+                            args: Vec::new(),
+                        }));
+                        let fail_t = Value::heap(
+                            self.heap.alloc(HeapObj::Native(native::MODULE_DEP_FAIL)),
+                        );
+                        let on_fail = Value::heap(self.heap.alloc(HeapObj::Bound {
+                            target: fail_t,
+                            this: Value::num(cap as f64),
+                            args: Vec::new(),
+                        }));
+                        self.then_internal(bp.heap_index(), on_ok, on_fail, None);
+                    }
+                    self.pending_module_body = Some(Value::heap(cap));
+                    return {
+                        self.module_own.remove(&path);
+                        self.module_pending_reexports.remove(&path);
+                        Ok(Value::heap(ns_idx))
+                    };
                 }
                 let exec = self
                     .execute_eval_program(

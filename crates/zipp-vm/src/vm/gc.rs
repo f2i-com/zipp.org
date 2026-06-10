@@ -128,6 +128,13 @@ impl Vm<'_> {
         if let Some(v) = self.pending_module_body {
             root_val!(v);
         }
+        for &v in &self.link_pending_deps {
+            root_val!(v);
+        }
+        for (&cap, st) in &self.deferred_mods {
+            root_idx!(cap);
+            root_idx!(st.ns_idx);
+        }
         for v in self.closure_home.values() {
             root_val!(*v);
         }

@@ -151,6 +151,16 @@ pub(crate) enum EnumWhat {
     Entries,
 }
 
+/// A module whose dependencies are still evaluating (top-level await):
+/// everything needed to execute its body once they settle. Holds NO heap
+/// Values (slots/ids only) — the namespace itself is rooted via module_cache.
+pub(crate) struct DeferredModuleExec {
+    pub remaining: usize,
+    pub base_func: u32,
+    pub ns_idx: u32,
+    pub full2: Vec<(String, u32)>,
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
@@ -523,6 +533,14 @@ pub struct Vm<'p> {
     /// site (which settles its promise from it) or by a static importer
     /// (which rejects — stage-1 TLA). GC ROOT while set.
     pending_module_body: Option<Value>,
+    /// Body/capability promises of STATIC dependencies that suspended at
+    /// top-level await, collected during the CURRENT import_module's link
+    /// (mark/split_off discipline keeps nested links separate). GC ROOTS.
+    link_pending_deps: Vec<Value>,
+    /// Async modules waiting on pending dependencies: capability-promise
+    /// index → the state needed to run the body once the last dependency
+    /// settles. Keys are GC roots (the capability promise must survive).
+    deferred_mods: std::collections::HashMap<u32, DeferredModuleExec>,
     /// Canonical paths of modules whose IMPORT RESOLUTION is in flight —
     /// guards static-import cycles (self-imports alias instead).
     module_loading: std::collections::HashSet<std::path::PathBuf>,

@@ -227,6 +227,11 @@ pub const ASYNC_DISPOSABLE_USE: u16 = 893;
 pub const ASYNC_DISPOSABLE_ADOPT: u16 = 894;
 pub const ASYNC_DISPOSABLE_DEFER: u16 = 895;
 pub const ASYNC_DISPOSABLE_MOVE: u16 = 896;
+/// Internal async-module plumbing (never user-visible): a Bound carrying the
+/// deferred module's capability-promise index as `this` — fulfil/reject
+/// reactions on the module's pending DEPENDENCY promises.
+pub const MODULE_DEP_OK: u16 = 897;
+pub const MODULE_DEP_FAIL: u16 = 898;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
