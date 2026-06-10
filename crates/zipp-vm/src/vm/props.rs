@@ -949,24 +949,31 @@ impl<'p> Vm<'p> {
                 }
             }
             HeapObj::Array(items) => {
-                if key == "length" && !self.arguments_objs.contains(&idx) {
+                if key == "length" && !self.arguments_objs.contains_key(&idx) {
                     let len = len_value(items.len());
                     let writable = !self.array_length_nonwritable.contains(&idx);
                     return self.make_data_descriptor(len, writable, false, false);
                 }
                 let dense_len = items.len();
+                // A LIVE-mapped arguments index reports the formal's register
+                // as the descriptor's [[Value]] (with the stored attributes).
+                let mapped_v = key
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|i| i.to_string() == key)
+                    .and_then(|i| self.args_mapped_get(idx, i));
                 // A special index override (defineProperty'd attrs/accessor) OR a
                 // named own property in arr_props wins; else a dense in-range index
                 // is a default { writable, enumerable, configurable } data property.
                 let ovr =
                     self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|p| (m.attrs[p], m.vals[p])));
                 if ovr.is_some() {
-                    ovr
+                    ovr.map(|(a, v)| (a, mapped_v.unwrap_or(v)))
                 } else {
                     match key.parse::<usize>() {
                         // A hole has no own property descriptor (falls to undefined).
                         Ok(i) if i.to_string() == key && i < dense_len && !items[i].is_hole() => {
-                            let v = items[i];
+                            let v = mapped_v.unwrap_or(items[i]);
                             // A frozen array's elements are non-writable AND
                             // non-configurable; a sealed (not frozen) array's are
                             // non-configurable but still writable.
@@ -1966,10 +1973,50 @@ impl<'p> Vm<'p> {
                     let existing = self
                         .array_index_override(idx, i)
                         .or_else(|| dense_val.map(|v| (plain, v)));
+                    // ArgumentsObject [[DefineOwnProperty]] on a LIVE-mapped
+                    // index: the formal's register is the property's CURRENT
+                    // value (validation against a non-configurable existing
+                    // must compare against it), and a data redefine to
+                    // writable:false with NO [[Value]] freezes AT that live
+                    // value (newArgDesc.[[Value]] = map.Get(P)).
+                    let mapped_v = self.args_mapped_get(idx, i);
+                    let existing = match (existing, mapped_v) {
+                        (Some((a, _)), Some(mv)) => Some((a, mv)),
+                        (e, _) => e,
+                    };
+                    let desc_value = value;
+                    let value = if mapped_v.is_some()
+                        && get.is_none()
+                        && set.is_none()
+                        && value.is_none()
+                        && d_wr == Some(false)
+                    {
+                        mapped_v
+                    } else {
+                        value
+                    };
                     let extensible = self.arr_props.get(&idx).map_or(true, |m| m.extensible);
                     let (attr, stored) = self.merge_property_descriptor(
                         &key_i, existing, extensible, value, get, set, d_wr, d_en, d_cf,
                     )?;
+                    if mapped_v.is_some() {
+                        if get.is_some() || set.is_some() {
+                            // An accessor redefine severs the alias (no flush —
+                            // the accessor replaces the data value entirely).
+                            self.args_unmap(idx, i, false);
+                        } else {
+                            // map.Set BEFORE a writable:false sever, so the
+                            // formal observes the final defined value.
+                            if let Some(v) = desc_value {
+                                self.args_mapped_set(idx, i, v);
+                            }
+                            if d_wr == Some(false) {
+                                // `stored` (merged above) already carries the
+                                // correct frozen value into the ordinary store.
+                                self.args_unmap(idx, i, false);
+                            }
+                        }
+                    }
                     let is_default_data = !attr.accessor
                         && attr.writable
                         && attr.enumerable
@@ -1977,7 +2024,7 @@ impl<'p> Vm<'p> {
                     // An ARGUMENTS object: an index define past the dense
                     // window is an ordinary named own property — `length`
                     // (items.len()) must stay argc, so never grow the Vec.
-                    let args_past = i >= dense_len && self.arguments_objs.contains(&idx);
+                    let args_past = i >= dense_len && self.arguments_objs.contains_key(&idx);
                     if is_default_data && !args_past {
                         // Lives in the dense Vec; drop any stale special override.
                         if let Some(m) = self.arr_props.get_mut(&idx) {
@@ -2010,7 +2057,7 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
             }
-            if key == "length" && self.arguments_objs.contains(&idx) {
+            if key == "length" && self.arguments_objs.contains_key(&idx) {
                 // An ARGUMENTS object's `length`: ORDINARY define on the
                 // arr_props prop; a plain numeric [[Value]] also resizes the
                 // dense store so iteration/concat (which read it) follow.
@@ -2067,7 +2114,7 @@ impl<'p> Vm<'p> {
                 self.heap.bump_version(idx);
                 return Ok(());
             }
-            if key == "length" && !self.arguments_objs.contains(&idx) {
+            if key == "length" && !self.arguments_objs.contains_key(&idx) {
                 // `length` is a non-configurable, non-enumerable data property
                 // (ArraySetLength, 15.4.5.1) — writable by default.
                 let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
@@ -3237,6 +3284,14 @@ impl<'p> Vm<'p> {
                     self.call_value(raw, receiver, &[])
                 };
             }
+            // A LIVE-mapped arguments index whose attrs were tweaked (e.g.
+            // configurable:false) still reads the formal's register — the
+            // arr_props value is only the escape store.
+            if let Some(i) = canonical_index_str(key) {
+                if let Some(v) = self.args_mapped_get(obj.heap_index(), i) {
+                    return Ok(v);
+                }
+            }
             return Ok(raw);
         }
         // TypedArray / ArrayBuffer / DataView instance properties.
@@ -3599,7 +3654,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(obj.heap_index()) {
             HeapObj::Array(items) => {
-                if key == "length" && !self.arguments_objs.contains(&obj.heap_index()) {
+                if key == "length" && !self.arguments_objs.contains_key(&obj.heap_index()) {
                     Ok(len_value(items.len()))
                 } else if let Some(i) = key.parse::<u32>().ok().filter(|i| i.to_string() == key) {
                     // Element access via a canonical numeric STRING key (`arr["0"]`,
@@ -3611,6 +3666,10 @@ impl<'p> Vm<'p> {
                     let present = matches!(items.get(i as usize), Some(v) if !v.is_hole());
                     let own = items.get(i as usize).copied();
                     if present {
+                        // A LIVE-mapped arguments index reads the formal's register.
+                        if let Some(v) = self.args_mapped_get(obj.heap_index(), i as usize) {
+                            return Ok(v);
+                        }
                         Ok(own.unwrap())
                     } else {
                         // Not an own element → [[Get]] continues up the prototype chain.

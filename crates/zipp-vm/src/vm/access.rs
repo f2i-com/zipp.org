@@ -221,7 +221,7 @@ impl<'p> Vm<'p> {
         // Array-backed but its `length` IS configurable, so exclude it.
         if key == "length"
             && matches!(self.heap.get(idx), HeapObj::Array(_))
-            && !self.arguments_objs.contains(&idx)
+            && !self.arguments_objs.contains_key(&idx)
         {
             return Value::bool(false);
         }
@@ -264,6 +264,9 @@ impl<'p> Vm<'p> {
                             m.remove(key);
                         }
                     }
+                    // A deleted mapped-arguments index severs its alias
+                    // (map.Delete — permanent, even if the index is re-created).
+                    self.args_unmap(idx, i, false);
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         if i < items.len() {
                             items[i] = Value::HOLE;
@@ -450,7 +453,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 HeapObj::Array(_)
-                    if key == "length" && !self.arguments_objs.contains(&cidx) =>
+                    if key == "length" && !self.arguments_objs.contains_key(&cidx) =>
                 {
                     governing = Some((
                         false,
@@ -688,7 +691,7 @@ impl<'p> Vm<'p> {
         }
         if key == "length"
             && matches!(self.heap.get(idx), HeapObj::Array(_))
-            && self.arguments_objs.contains(&idx)
+            && self.arguments_objs.contains_key(&idx)
         {
             // An ARGUMENTS object's `length` is an ordinary own data prop in
             // arr_props (any value, deletable). The write respects the stored
@@ -748,7 +751,7 @@ impl<'p> Vm<'p> {
         // n must be a non-negative integer < 2^32, else a RangeError.
         if key == "length"
             && matches!(self.heap.get(idx), HeapObj::Array(_))
-            && !self.arguments_objs.contains(&idx)
+            && !self.arguments_objs.contains_key(&idx)
         {
             // ArraySetLength steps 2-5: newLen = ToUint32(value) AND
             // numberLen = ToNumber(value) are BOTH computed (valueOf runs
@@ -1003,6 +1006,10 @@ impl<'p> Vm<'p> {
             // through to the arr_props side table as a named property.)
             if let Ok(n) = key.parse::<usize>() {
                 if n.to_string() == key && n < crate::vm::MAX_DENSE_ARRAY_LEN {
+                    // A LIVE-mapped arguments index also writes the formal's
+                    // register ([[ParameterMap]] [[Set]] companion); the
+                    // ordinary store below remains the escape store.
+                    self.args_mapped_set(idx, n, val);
                     // A special (defineProperty'd) index lives in arr_props and
                     // overrides the dense slot. Its accessor / non-writable cases
                     // were already handled by the own_attr block above, so only a

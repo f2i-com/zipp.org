@@ -82,7 +82,7 @@ impl<'p> Vm<'p> {
         let mut idx = v.heap_index();
         for _ in 0..1000 {
             match self.heap.get(idx) {
-                HeapObj::Array(_) => return Ok(!self.arguments_objs.contains(&idx)),
+                HeapObj::Array(_) => return Ok(!self.arguments_objs.contains_key(&idx)),
                 HeapObj::Proxy { target, revoked, .. } => {
                     if *revoked {
                         return Err(Thrown(
@@ -114,7 +114,7 @@ impl<'p> Vm<'p> {
             match self.heap.get(idx) {
                 // An `arguments` exotic is Array-backed internally but is an ordinary
                 // object ([[ParameterMap]]), NOT an Array exotic — IsArray is false.
-                HeapObj::Array(_) => return !self.arguments_objs.contains(&idx),
+                HeapObj::Array(_) => return !self.arguments_objs.contains_key(&idx),
                 HeapObj::Proxy { target, revoked, .. } if !*revoked && target.is_heap() => {
                     idx = target.heap_index();
                 }
@@ -135,7 +135,12 @@ impl<'p> Vm<'p> {
             ));
         }
         if let HeapObj::Array(items) = self.heap.get(obj.heap_index()) {
-            return Ok(items.clone()); // dense fast path
+            // An arguments object takes the generic route below: its `length`
+            // is an ordinary (mutable, even deletable) property and a LIVE-
+            // mapped index must read the formal's register, not the snapshot.
+            if !self.arguments_objs.contains_key(&obj.heap_index()) {
+                return Ok(items.clone()); // dense fast path
+            }
         }
         let len_v = self.get_prop(obj, "length")?;
         let len = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1) as usize;

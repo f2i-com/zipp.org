@@ -1753,7 +1753,7 @@ impl<'p> Vm<'p> {
                         if let Some(n) = arr_n {
                             let eidx = e.heap_index();
                             if !self.arr_props.contains_key(&eidx)
-                                && !self.arguments_objs.contains(&eidx)
+                                && !self.arguments_objs.contains_key(&eidx)
                                 && !self.array_has_holes(eidx)
                             {
                                 let snap = self.array_snapshot(eidx);

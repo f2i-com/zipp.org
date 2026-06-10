@@ -142,6 +142,12 @@ impl<'p> Vm<'p> {
                 // or non-default-attribute data) in arr_props overrides the dense
                 // slot; else direct element access, else undefined.
                 if let Some(i) = array_index(key) {
+                    // A LIVE-mapped arguments index reads the formal's register
+                    // (a still-mapped index is always a plain data property, so
+                    // this wins over any attribute-only override).
+                    if let Some(v) = self.args_mapped_get(aidx, i) {
+                        return Ok(v);
+                    }
                     if let Some((a, v)) = self.array_index_override(aidx, i) {
                         if a.accessor {
                             return if v == Value::UNDEFINED {
@@ -174,7 +180,7 @@ impl<'p> Vm<'p> {
                 // Non-int key on an array: "length", else resolve via the prototype
                 // (a computed method name / `@@iterator`, mirroring dot access).
                 let k = self.key_of(key);
-                if k == "length" && !self.arguments_objs.contains(&aidx) {
+                if k == "length" && !self.arguments_objs.contains_key(&aidx) {
                     if let HeapObj::Array(items) = self.heap.get(aidx) {
                         return Ok(len_value(items.len()));
                     }
@@ -393,13 +399,21 @@ impl<'p> Vm<'p> {
         // property in the side table instead of growing the Vec (which would
         // grow `length`).
         if let Some(i) = array_index(key) {
-            if self.arguments_objs.contains(&idx)
+            if self.arguments_objs.contains_key(&idx)
                 && matches!(self.heap.get(idx), HeapObj::Array(items) if i >= items.len())
             {
                 let k = self.key_of(key);
                 self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(&k, val);
                 self.heap.bump_version(idx);
                 return Ok(());
+            }
+        }
+        // A LIVE-mapped arguments index also writes the formal's register
+        // ([[ParameterMap]] [[Set]] companion); the dense store below stays in
+        // sync as the escape/descriptor store.
+        if let Some(i) = array_index(key) {
+            if matches!(self.heap.get(idx), HeapObj::Array(_)) {
+                self.args_mapped_set(idx, i, val);
             }
         }
         match self.heap.get_mut(idx) {

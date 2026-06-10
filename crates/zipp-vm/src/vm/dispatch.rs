@@ -845,6 +845,12 @@ impl<'p> Vm<'p> {
                         let aidx = self.get(base, arr).heap_index();
                         let vv = self.get(base, val);
                         if spread {
+                            // Spreading a LIVE-mapped arguments object: refresh
+                            // its dense slots from the formals first (the array
+                            // fast path below clones the dense store directly).
+                            if vv.is_heap() {
+                                self.args_sync_dense(vv.heap_index());
+                            }
                             // An array whose Array.prototype[Symbol.iterator] was
                             // replaced spreads via the iterator protocol (the inline
                             // fast path below assumes the default iterator).
@@ -3978,6 +3984,11 @@ impl<'p> Vm<'p> {
                     }
                     Instr::IterToArray { dst, src, count } => {
                         let s = self.get(base, src);
+                        // A LIVE-mapped arguments source: refresh its dense
+                        // slots first (the array fast path reads them directly).
+                        if s.is_heap() {
+                            self.args_sync_dense(s.heap_index());
+                        }
                         let a = self.iter_to_array(s, count)?;
                         self.set(base, dst, a);
                         ip += 1;
@@ -4672,19 +4683,30 @@ impl<'p> Vm<'p> {
             self.regs[new_base + rreg as usize] = arr;
         }
         // `arguments`: an array of ALL actual args (a function that references it).
+        let mut args_obj = u32::MAX;
         if let Some(areg) = self.func(func_id as usize).arguments_reg {
             let argsv: Vec<Value> = (0..argc as usize)
                 .map(|i| self.regs[caller_base + arg_base as usize + i])
                 .collect();
-            let is_strict = self.func(func_id as usize).is_strict;
-            let arr = self.build_arguments_object(argsv, callee_val, is_strict);
+            let (is_strict, simple) = {
+                let p = self.func(func_id as usize);
+                (p.is_strict, p.simple_params)
+            };
+            // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
+            // the frame about to be pushed (frames.len() is its index).
+            let mapinfo =
+                (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
+            let arr = self.build_arguments_object(argsv, callee_val, is_strict, mapinfo);
             self.regs[new_base + areg as usize] = arr;
+            if mapinfo.is_some() {
+                args_obj = arr.heap_index();
+            }
         }
 
         let last = self.frames.len() - 1;
         self.frames[last].ip = caller_ip_next;
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX, func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
+        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, func: func_id, base: new_base, ip: 0, ret_dst: dst, closure, handlers: Vec::new(), new_target, callee: callee_val });
         Ok(())
     }
 

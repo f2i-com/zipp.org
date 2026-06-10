@@ -98,6 +98,30 @@ struct Frame {
     /// running the parent ctor — spec evaluates the SuperCall fully, then
     /// BindThisValue throws on re-initialization).
     super_done: bool,
+    /// Heap index of THIS activation's `arguments` object, or u32::MAX. A
+    /// MAPPED arguments object's [[ParameterMap]] (see `ArgsMap`) aliases the
+    /// param registers only while `frames[frame_idx].args_obj` still equals
+    /// its own heap index — the liveness proof (each activation allocates a
+    /// fresh object, so a recycled frame slot can never spoof it).
+    args_obj: u32,
+}
+
+/// [[ParameterMap]] bookkeeping for a MAPPED arguments object (sloppy callee
+/// with a simple parameter list). While the creating frame is live, a still-
+/// mapped index i reads/writes the formal's register `regs[base + 1 + i]`
+/// (through its cell when the param is captured); the dense element store
+/// remains the descriptor/escape store. `None` in `arguments_objs` = an
+/// UNMAPPED arguments object (strict, or non-simple params): pure snapshot.
+pub(crate) struct ArgsMap {
+    /// Expected position of the creating activation in `frames`.
+    frame_idx: usize,
+    /// The creating frame's register-window base (revalidated with args_obj).
+    base: usize,
+    /// Indices `0..mapped_count` started mapped: min(param_count, argc).
+    mapped_count: usize,
+    /// Bit i set = formal i SEVERED from the map (delete / accessor redefine /
+    /// writable:false redefine) — permanently back to ordinary semantics.
+    unmapped: u64,
 }
 
 /// Which array higher-order method `array_each` is driving (callback args are
@@ -493,10 +517,12 @@ pub struct Vm<'p> {
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep.
     error_data: std::collections::HashSet<u32>,
-    /// Heap indices of `arguments` exotic objects (they are Array-backed but carry a
-    /// [[ParameterMap]]), so `Object.prototype.toString` tags them `[object
-    /// Arguments]` rather than `[object Array]`. Pruned on GC sweep.
-    arguments_objs: std::collections::HashSet<u32>,
+    /// `arguments` exotic objects (Array-backed): heap index → the live
+    /// [[ParameterMap]] for a MAPPED one (sloppy + simple params), or `None`
+    /// for an unmapped one (strict / non-simple). Presence alone drives the
+    /// `[object Arguments]` toString tag and the Array-exotic carve-outs
+    /// (ordinary `length`, no Vec growth). Pruned on GC sweep.
+    arguments_objs: std::collections::HashMap<u32, Option<ArgsMap>>,
     /// Directory the running script was loaded from, used to resolve a dynamic
     /// `import(specifier)` against the filesystem (relative + bare specifiers).
     /// `None` when running from a string (eval/embedding) — then `import()` has no

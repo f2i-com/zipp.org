@@ -1461,6 +1461,7 @@ impl Compiler {
             lexical_this: false,
             super_static: false, // a plain function is not a static class element
             is_strict,
+            simple_params: params_ast.map(params_are_simple).unwrap_or(false),
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None, // set by the caller for top-level declarations
@@ -1644,6 +1645,7 @@ impl Compiler {
             lexical_this: false, // a concise method gets its own `this`, not lexical
             super_static, // true for static methods/getters/setters/blocks
             is_strict: true,
+            simple_params: false, // strict (class body) — never mapped anyway
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -1753,6 +1755,7 @@ impl Compiler {
             lexical_this: true, // arrows capture `this` lexically (see FuncProto)
             super_static, // inherited from the enclosing method/block
             is_strict,
+            simple_params: false, // an arrow has no own `arguments`
             constants: fc.constants,
             string_constants: fc.string_constants,
             name_global: None,
@@ -1843,6 +1846,7 @@ fn placeholder(name: &str) -> FuncProto {
         lexical_this: false,
         super_static: false,
         is_strict: false,
+        simple_params: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
         name_global: None,
@@ -9736,6 +9740,16 @@ fn expected_arg_count(params: &ox::FormalParameters) -> u16 {
         n += 1;
     }
     n
+}
+
+/// IsSimpleParameterList: every parameter a plain identifier with no default,
+/// and no rest. (A mapped arguments object requires this in sloppy mode.)
+fn params_are_simple(params: &ox::FormalParameters) -> bool {
+    params.rest.is_none()
+        && params.items.iter().all(|item| {
+            item.initializer.is_none()
+                && matches!(&item.pattern, ox::BindingPattern::BindingIdentifier(_))
+        })
 }
 
 fn param_slot_names(params: &ox::FormalParameters) -> R<Vec<String>> {

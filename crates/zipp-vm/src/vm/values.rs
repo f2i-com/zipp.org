@@ -913,11 +913,16 @@ impl<'p> Vm<'p> {
     ///     { w:t, e:f, c:t }; a strict function gets the %ThrowTypeError% poison-pill
     ///     accessor { e:f, c:f } (the unmapped-arguments callee).
     /// (The exotic-vs-ordinary `length` distinction is left as-is for now.)
+    /// `mapinfo` = `Some((frame_idx, base, param_count))` for a MAPPED
+    /// arguments object (sloppy callee, simple parameter list): the upcoming
+    /// frame's position/window, recorded so `arguments[i]` aliases the formal
+    /// registers while that frame is live. `None` = unmapped (snapshot).
     pub(crate) fn build_arguments_object(
         &mut self,
         args: Vec<Value>,
         callee: Value,
         is_strict: bool,
+        mapinfo: Option<(usize, usize, usize)>,
     ) -> Value {
         let obj_proto = self.obj_proto;
         let array_values = self.default_array_iter;
@@ -934,7 +939,13 @@ impl<'p> Vm<'p> {
         };
         let argc = args.len();
         let idx = self.heap.alloc(HeapObj::Array(args));
-        self.arguments_objs.insert(idx); // [[ParameterMap]] marker (toString tag)
+        let map = mapinfo.map(|(frame_idx, base, param_count)| crate::vm::ArgsMap {
+            frame_idx,
+            base,
+            mapped_count: param_count.min(argc),
+            unmapped: 0,
+        });
+        self.arguments_objs.insert(idx, map);
         if obj_proto != 0 {
             self.proto_of.insert(idx, Value::heap(obj_proto));
         }
@@ -991,6 +1002,98 @@ impl<'p> Vm<'p> {
             );
         }
         Value::heap(idx)
+    }
+
+    /// Mapped-arguments [[Get]]: if `idx` is a LIVE mapped arguments object
+    /// and `i` a still-mapped formal index, the formal's register (through
+    /// its cell when captured) IS the current value. `None` = not mapped /
+    /// severed / frame dead → ordinary (dense-store) semantics apply.
+    pub(crate) fn args_mapped_get(&self, idx: u32, i: usize) -> Option<Value> {
+        let m = self.arguments_objs.get(&idx)?.as_ref()?;
+        if i >= m.mapped_count || i >= 64 || (m.unmapped >> i) & 1 == 1 {
+            return None;
+        }
+        let f = self.frames.get(m.frame_idx)?;
+        if f.args_obj != idx || f.base != m.base {
+            return None;
+        }
+        let v = self.regs[m.base + 1 + i];
+        if v.is_heap() {
+            if let HeapObj::Cell(inner) = self.heap.get(v.heap_index()) {
+                return Some(*inner);
+            }
+        }
+        Some(v)
+    }
+
+    /// Mapped-arguments [[Set]] companion: write the formal's register
+    /// (through its cell) when `idx`/`i` is live-mapped. The caller still
+    /// performs the ordinary store into the dense slot / side table, keeping
+    /// the escape store in sync. Returns whether the alias write happened.
+    pub(crate) fn args_mapped_set(&mut self, idx: u32, i: usize, val: Value) -> bool {
+        let Some(Some(m)) = self.arguments_objs.get(&idx) else { return false };
+        if i >= m.mapped_count || i >= 64 || (m.unmapped >> i) & 1 == 1 {
+            return false;
+        }
+        let (frame_idx, base) = (m.frame_idx, m.base);
+        let live = self
+            .frames
+            .get(frame_idx)
+            .map_or(false, |f| f.args_obj == idx && f.base == base);
+        if !live {
+            return false;
+        }
+        let slot = base + 1 + i;
+        let cur = self.regs[slot];
+        if cur.is_heap() {
+            if let HeapObj::Cell(inner) = self.heap.get_mut(cur.heap_index()) {
+                *inner = val;
+                return true;
+            }
+        }
+        self.regs[slot] = val;
+        true
+    }
+
+    /// Sever formal `i` from `idx`'s [[ParameterMap]] (map.Delete: a deleted
+    /// index, an accessor redefine, or a writable:false redefine) — reads and
+    /// writes permanently revert to the ordinary property. When `flush`, the
+    /// live formal value is copied into the dense slot first so the ordinary
+    /// property keeps the latest aliased value.
+    pub(crate) fn args_unmap(&mut self, idx: u32, i: usize, flush: bool) {
+        let cur = if flush { self.args_mapped_get(idx, i) } else { None };
+        if let Some(Some(m)) = self.arguments_objs.get_mut(&idx) {
+            if i < 64 {
+                m.unmapped |= 1 << i;
+            }
+        }
+        if let Some(v) = cur {
+            if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                if i < items.len() {
+                    items[i] = v;
+                }
+            }
+        }
+    }
+
+    /// Refresh a LIVE-mapped arguments object's dense slots from the formal
+    /// registers (still-mapped indices only). Called before BULK dense reads
+    /// (spread / IterToArray fast paths) that bypass the per-index mapped
+    /// [[Get]] hooks; a no-op for everything else.
+    pub(crate) fn args_sync_dense(&mut self, idx: u32) {
+        let count = match self.arguments_objs.get(&idx) {
+            Some(Some(m)) => m.mapped_count.min(64),
+            _ => return,
+        };
+        for i in 0..count {
+            if let Some(v) = self.args_mapped_get(idx, i) {
+                if let HeapObj::Array(items) = self.heap.get_mut(idx) {
+                    if i < items.len() {
+                        items[i] = v;
+                    }
+                }
+            }
+        }
     }
 
     /// Allocate a fresh unique `Symbol` with description `desc` (a string Value or

@@ -362,7 +362,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         HeapObj::Array(items) if key == "length" => {
             // An arguments object's `length` is an ORDINARY (writable) prop in
             // arr_props — defer to the interpreter.
-            if vm.arguments_objs.contains(&idx) {
+            if vm.arguments_objs.contains_key(&idx) {
                 return crate::codegen::SELF_CALL_DEOPT;
             }
             return len_value(items.len()).bits();

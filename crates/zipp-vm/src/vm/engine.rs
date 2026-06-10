@@ -179,7 +179,7 @@ impl<'p> Vm<'p> {
             shared_buffers: std::collections::HashSet::new(),
             immutable_buffers: std::collections::HashSet::new(),
             error_data: std::collections::HashSet::new(),
-            arguments_objs: std::collections::HashSet::new(),
+            arguments_objs: std::collections::HashMap::new(),
             module_base_dir: None,
             module_cache: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
@@ -380,7 +380,7 @@ impl<'p> Vm<'p> {
             // The native callee bailed mid-body: finish this activation on the
             // interpreter over the SAME window via a transient frame. The frame
             // base is `new_base` into self.regs (stable — reserved capacity).
-            self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
+            self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
                 func: func_id,
                 base: new_base,
                 ip: bail as usize,
@@ -499,7 +499,7 @@ impl<'p> Vm<'p> {
         // and the recursion can't re-enter native → no livelock; frames grow to
         // MAX_FRAMES → RangeError on runaway.
         self.jit_recurse_depth += 1;
-        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX,
+        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -595,7 +595,7 @@ impl<'p> Vm<'p> {
         // only the top frame so the reservation math is relative to a known base.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.reserve_jit_regs();
-        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX, func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
+        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
         // Everything allocated so far (interned strings, all built-ins, hoisted
         // top-level functions) is pinned: the GC never collects below this floor.
         self.set_gc_floor();
@@ -993,15 +993,26 @@ impl<'p> Vm<'p> {
         // `arguments`: ALL actual args (not just the declared params), so a
         // callback invoked here (e.g. an array-method callback that reads
         // `arguments[2]`) sees every argument — matching the direct Call op.
+        let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let is_strict = self.func(func_id as usize).is_strict;
-            let arr = self.build_arguments_object(args.to_vec(), callee, is_strict);
+            let (is_strict, simple) = {
+                let p = self.func(func_id as usize);
+                (p.is_strict, p.simple_params)
+            };
+            // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
+            // the frame about to be pushed (frames.len() is its index).
+            let mapinfo =
+                (!is_strict && simple).then(|| (self.frames.len(), new_base, callee_params));
+            let arr = self.build_arguments_object(args.to_vec(), callee, is_strict, mapinfo);
             self.regs[new_base + areg as usize] = arr;
+            if mapinfo.is_some() {
+                args_obj = arr.heap_index();
+            }
         }
 
         let stop_depth = self.frames.len();
         let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
-        self.frames.push(Frame { super_done: false, eval_scope: u32::MAX, func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
+        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
         self.run_loop(stop_depth)
     }
 

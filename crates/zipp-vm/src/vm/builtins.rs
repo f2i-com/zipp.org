@@ -275,7 +275,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => "String",
                 // An `arguments` exotic ([[ParameterMap]]) tags "Arguments" even
                 // though it is Array-backed internally.
-                HeapObj::Array(_) if self.arguments_objs.contains(&this.heap_index()) => "Arguments",
+                HeapObj::Array(_) if self.arguments_objs.contains_key(&this.heap_index()) => "Arguments",
                 HeapObj::Array(_) => "Array",
                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Native(_) | HeapObj::Bound { .. } => {
                     "Function"

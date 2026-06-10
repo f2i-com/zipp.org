@@ -792,6 +792,11 @@ pub struct FuncProto {
     /// receive `this` exactly as passed; sloppy functions called with a nullish
     /// `this` substitute the global object (OrdinaryCallBindThis, ThisMode global).
     pub is_strict: bool,
+    /// True when the formal parameter list is SIMPLE — every parameter a plain
+    /// identifier, no defaults, no rest, no destructuring. A SLOPPY function
+    /// with simple parameters gets a MAPPED arguments object ([[ParameterMap]]
+    /// aliasing between `arguments[i]` and the formal parameters).
+    pub simple_params: bool,
     pub constants: Vec<Value>,
     /// Heap-string constants referenced by `LoadConst` need their text; this
     /// parallels `constants` for the string case (resolved at load time).
