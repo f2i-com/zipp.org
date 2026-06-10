@@ -3232,7 +3232,7 @@ impl<'p> Vm<'p> {
                             // "not a function". %Function.prototype% is also a callable.
                             if matches!(
                                 self.heap.get(callee_v.heap_index()),
-                                HeapObj::Bound { .. } | HeapObj::Native(_) | HeapObj::CombinatorResolver { .. }
+                                HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::CombinatorResolver { .. }
                             ) || (self.fn_proto != 0 && callee_v.heap_index() == self.fn_proto)
                             {
                                 let argv: Vec<Value> =

@@ -377,6 +377,12 @@ pub enum HeapObj {
     /// A bound function (`fn.bind(thisArg, ...boundArgs)`): calling it invokes
     /// `target` with `this` fixed to `this` and `args` prepended to the call args.
     Bound { target: Value, this: Value, args: Vec<Value> },
+    /// A ShadowRealm WrappedFunction exotic: a fresh wrapper created each time
+    /// a callable crosses the realm boundary. Calling it wraps the arguments,
+    /// calls `target` with `this` = undefined, and wraps the result; any abrupt
+    /// target completion surfaces as a caller-realm TypeError. `name`/`length`
+    /// are the CopyNameAndLength snapshot taken at wrap time.
+    Wrapped { target: Value, name: String, length: f64 },
     /// A built-in (native) function value, identified by a small id (see the
     /// `native` ids in vm.rs). Callable as a first-class value — this is what backs
     /// `Object.defineProperty`, `Array.isArray`, `Object.prototype.hasOwnProperty`,

@@ -1014,7 +1014,7 @@ impl<'p> Vm<'p> {
                 }
             }
             // A function's assigned own properties (`fn.x = y`).
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                 self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
             }
             // A TypedArray's integer-indexed element: a data descriptor
@@ -1273,7 +1273,7 @@ impl<'p> Vm<'p> {
                 // Callables keep their own props in fn_props; every other exotic
                 // heap kind (TypedArray, DataView, Map, Date, ...) keeps them in
                 // arr_props — surface their "@@" symbol keys too.
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => self
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => self
                     .fn_props
                     .get(&obj.heap_index())
                     .map_or(Vec::new(), |m| {
@@ -2150,7 +2150,7 @@ impl<'p> Vm<'p> {
         let target = match self.heap.get(idx) {
             HeapObj::Object(_) => 0u8,
             HeapObj::Class(_) => 1,
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => 2,
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => 2,
             HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) => {
                 return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
             }
@@ -2404,7 +2404,7 @@ impl<'p> Vm<'p> {
         // object (arr_props) — not only a plain Object.
         let keys: Vec<String> = match self.heap.get(pidx) {
             HeapObj::Object(m) => enum_keys(m),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                 self.fn_props.get(&pidx).map(enum_keys).unwrap_or_default()
             }
             // A boxed String (e.g. `Object.create(O, "abc")` → ToObject) exposes its
@@ -2695,6 +2695,9 @@ impl<'p> Vm<'p> {
                 let p = self.func(*func as usize);
                 Some((clean(&p.name), p.length as f64))
             }
+            // A WrappedFunction reports the CopyNameAndLength snapshot taken
+            // when it crossed the realm boundary (never the live target's).
+            HeapObj::Wrapped { name, length, .. } => Some((name.clone(), *length)),
             // The resolve/reject functions of `new Promise(executor)`, and the
             // Promise.all/allSettled/any resolve/reject ELEMENT functions: anonymous
             // (name ""), length 1, with %Function.prototype% as [[Prototype]].
@@ -2818,7 +2821,7 @@ impl<'p> Vm<'p> {
         let is_class = matches!(self.heap.get(fi), HeapObj::Class(_));
         let is_callable = matches!(
             self.heap.get(fi),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
         );
         if !is_class && !is_callable {
             return;
@@ -2890,7 +2893,7 @@ impl<'p> Vm<'p> {
                     || c.static_getters.iter().any(|(k, _)| k == key)
                     || c.static_setters.iter().any(|(k, _)| k == key)
             }
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                 self.fn_props.get(&idx).is_some_and(|m| m.pos(key).is_some())
             }
             _ => false,
@@ -3750,7 +3753,7 @@ impl<'p> Vm<'p> {
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
             _ if matches!(
                 self.heap.get(obj.heap_index()),
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
             ) =>
             {
                 // An own property in the fn_props bag (incl. an explicitly defined

@@ -311,6 +311,12 @@ impl Vm<'_> {
         self.fn_props.retain(|&k, _| marks[k as usize]);
         self.arr_props.retain(|&k, _| marks[k as usize]);
         self.zdt_tz.retain(|&k, _| marks[k as usize]);
+        // Idx-keyed FLAG sets must drop dead keys too, or a recycled slot
+        // inherits the previous occupant's state (a fresh function would
+        // report its name/length intrinsic deleted; a fresh array a frozen
+        // length).
+        self.deleted_callable_intrinsics.retain(|&(k, _)| marks[k as usize]);
+        self.array_length_nonwritable.retain(|&k| marks[k as usize]);
         self.ab_max.retain(|&k, _| marks[k as usize]);
         self.ta_tracking.retain(|&k| marks[k as usize]);
         self.dv_tracking.retain(|&k| marks[k as usize]);
@@ -418,6 +424,7 @@ impl Vm<'_> {
                     m_val!(a);
                 }
             }
+            HeapObj::Wrapped { target, .. } => m_val!(*target),
             HeapObj::Array(items) => {
                 for &v in items {
                     m_val!(v);

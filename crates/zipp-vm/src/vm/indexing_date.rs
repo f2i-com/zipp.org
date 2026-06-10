@@ -109,6 +109,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Closure { .. }
                 | HeapObj::Class(_)
                 | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. }
                 | HeapObj::Native(_)
@@ -294,6 +295,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Closure { .. }
                 | HeapObj::Class(_)
                 | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
                 | HeapObj::Native(_)
                 | HeapObj::Proxy { .. }
         ) {

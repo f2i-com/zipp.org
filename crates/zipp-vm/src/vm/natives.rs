@@ -100,7 +100,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
             }
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                 self.fn_props
                     .get(&ridx)
                     .and_then(|m| m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable)))
@@ -1042,7 +1042,7 @@ impl<'p> Vm<'p> {
                     }
                     // A class value renders as its whole `class … { … }` source.
                     HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
-                    HeapObj::Native(_) | HeapObj::Bound { .. } => None,
+                    HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } => None,
                     // A constructor global (Array, Date, Temporal.Instant, …) is stored
                     // as an is_ctor Object — it is callable and `typeof` "function", so it
                     // renders in the `[native code]` form rather than throwing.

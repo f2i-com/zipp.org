@@ -55,6 +55,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::Class(_)
                 | HeapObj::Native(_)
                 | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. } => "function",
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
@@ -299,7 +300,7 @@ impl<'p> Vm<'p> {
                 removed
             }
             // A function's assigned own property (`delete fn.x`).
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                 self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key))
             }
             // Every other exotic heap kind (TypedArray, DataView, ArrayBuffer,
@@ -752,7 +753,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
             // An Array's named props — and an exotic object's defineProperty'd own
             // props (Map/Set/Date/Promise/…) — live in the arr_props side table.
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) | HeapObj::Class(_) => None,
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::Class(_) => None,
             _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attrs[i])),
         };
         if let Some(a) = own_attr {
@@ -802,7 +803,7 @@ impl<'p> Vm<'p> {
         // function props live in fn_props, so check via has_own_property).
         || (matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
         ) && !self.has_own_property(obj, key));
         if needs_proto_walk {
             match self.proto_chain_set(idx, key, val, obj)? {
@@ -846,7 +847,7 @@ impl<'p> Vm<'p> {
         // lives in a side table (functions carry no inline property map).
         if matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
         ) {
             // `caller`/`arguments` on a STRICT or BOUND function are the inherited
             // %ThrowTypeError% accessors — assigning either throws, mirroring the

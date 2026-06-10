@@ -181,7 +181,7 @@ impl<'p> Vm<'p> {
                 // Function-object descriptor).
                 if matches!(
                     self.heap.get(idx),
-                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_)
+                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
                 ) && self.fn_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
                 {
                     return true;

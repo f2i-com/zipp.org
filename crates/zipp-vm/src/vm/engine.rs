@@ -710,6 +710,30 @@ impl<'p> Vm<'p> {
                 };
             }
         }
+        // A ShadowRealm WrappedFunction: wrap each argument across the
+        // boundary (a non-primitive non-callable argument is a TypeError),
+        // call the target with `this` = undefined, wrap the result, and map
+        // ANY abrupt target completion to a caller-realm TypeError.
+        if callee.is_heap() {
+            if let HeapObj::Wrapped { target, .. } = self.heap.get(callee.heap_index()) {
+                let t = *target;
+                let _gc = self.gc_lock_guard(); // wargs held across allocating calls
+                let mut wargs = Vec::with_capacity(args.len());
+                for &a in args {
+                    wargs.push(self.wrap_realm_value(a)?);
+                }
+                return match self.call_value(t, Value::UNDEFINED, &wargs) {
+                    Ok(v) => self.wrap_realm_value(v),
+                    Err(_) => {
+                        self.pending_throw.take();
+                        Err(Thrown(
+                            "TypeError: WrappedFunction call threw (error wrapped at the realm boundary)"
+                                .into(),
+                        ))
+                    }
+                };
+            }
+        }
         // A bound function: invoke its target with the fixed `this` and the bound
         // arguments prepended (handles bind-of-bind by recursing).
         if callee.is_heap() {

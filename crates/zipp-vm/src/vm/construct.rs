@@ -85,10 +85,11 @@ impl<'p> Vm<'p> {
                         ));
                     }
                 };
-                // Only primitives and callables may cross the boundary.
+                // Only primitives and callables may cross the boundary; a
+                // callable crosses as a fresh WrappedFunction exotic.
                 if result.is_heap() {
                     if self.is_callable(result) {
-                        return Ok(result); // v1: returned unwrapped (WrappedFunction TBD)
+                        return self.wrapped_function_create(result);
                     }
                     if matches!(
                         self.heap.get(result.heap_index()),
@@ -2230,6 +2231,76 @@ impl<'p> Vm<'p> {
         Err(Thrown(format!("TypeError: constructor {name} requires 'new'")))
     }
 
+    /// GetWrappedValue: a primitive crosses the realm boundary as-is, a
+    /// callable crosses as a FRESH WrappedFunction (no identity or property
+    /// sharing), anything else is a TypeError.
+    pub(crate) fn wrap_realm_value(&mut self, v: Value) -> Result<Value, Thrown> {
+        if !v.is_heap() {
+            return Ok(v);
+        }
+        if matches!(
+            self.heap.get(v.heap_index()),
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+        ) {
+            return Ok(v);
+        }
+        if self.is_callable(v) {
+            return self.wrapped_function_create(v);
+        }
+        Err(Thrown(
+            "TypeError: value crossing the ShadowRealm boundary is not a primitive or callable"
+                .into(),
+        ))
+    }
+
+    /// WrappedFunctionCreate + CopyNameAndLength: snapshot the target's
+    /// `length` (own-property check, then Get; only a Number counts) and
+    /// `name` (Get; only a String counts) — ANY abrupt completion during the
+    /// copy (revoked-proxy HasProperty, throwing getter) is a TypeError. The
+    /// wrapper's prototype is the caller realm's %Function.prototype%.
+    pub(crate) fn wrapped_function_create(&mut self, target: Value) -> Result<Value, Thrown> {
+        // `target` lives only in this Rust frame while the CopyNameAndLength
+        // Gets below may run USER GETTERS (arbitrary allocating JS): suspend
+        // GC for the whole create so it cannot be collected mid-flight.
+        let _gc = self.gc_lock_guard();
+        // ANY abrupt completion (throwing getter, revoked-proxy probe) maps to
+        // a caller-realm TypeError — incl. dropping the realm-side pending
+        // error OBJECT, which must not cross the boundary.
+        macro_rules! copy_step {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.pending_throw.take();
+                        return Err(Thrown(
+                            "TypeError: WrappedFunction: copying target name/length failed"
+                                .into(),
+                        ));
+                    }
+                }
+            };
+        }
+        let mut length = 0.0;
+        let has_len = copy_step!(self.has_own_property_dyn(target, "length"));
+        if has_len {
+            let lv = copy_step!(self.get_prop(target, "length"));
+            if lv.is_number() {
+                let n = lv.as_f64();
+                // max(ToIntegerOrInfinity(targetLen), 0); +Inf stays.
+                length = if n.is_nan() { 0.0 } else { n.trunc().max(0.0) };
+            }
+        }
+        let nv = copy_step!(self.get_prop(target, "name"));
+        let name = if nv.is_heap() && self.heap.is_str_like(nv.heap_index()) {
+            self.display(nv)
+        } else {
+            String::new()
+        };
+        let idx = self.heap.alloc(HeapObj::Wrapped { target, name, length });
+        self.proto_of.insert(idx, Value::heap(self.fn_proto));
+        Ok(Value::heap(idx))
+    }
+
     pub(crate) fn is_callable(&self, v: Value) -> bool {
         // An [[IsHTMLDDA]] exotic (`document.all`) is callable (returns undefined).
         if v.is_heap() && !self.is_htmldda.is_empty() && self.is_htmldda.contains(&v.heap_index()) {
@@ -2237,7 +2308,7 @@ impl<'p> Vm<'p> {
         }
         v.is_heap()
             && match self.heap.get(v.heap_index()) {
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                     true
                 }
                 // The native resolve/reject functions (new Promise executor args,
@@ -2255,6 +2326,10 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) => {
                     m.is_ctor || (self.fn_proto != 0 && v.heap_index() == self.fn_proto)
                 }
+                // A Proxy is callable iff its target is — the [[Call]] slot is
+                // fixed at creation, and REVOCATION does not change callability
+                // (the target field survives revocation behind the flag).
+                HeapObj::Proxy { target, .. } => self.is_callable(*target),
                 _ => false,
             }
     }
@@ -2308,6 +2383,7 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
             | HeapObj::Native(_)
             | HeapObj::BoundResolver { .. }
             | HeapObj::CombinatorResolver { .. } => {

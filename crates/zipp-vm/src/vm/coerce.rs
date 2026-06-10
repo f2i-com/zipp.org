@@ -1203,7 +1203,7 @@ impl<'p> Vm<'p> {
                     self.heap.write_str(v.heap_index(), &mut out);
                     out
                 }
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Native(_) => {
+                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                     "function".into()
                 }
                 HeapObj::Cell(inner) => self.display(*inner),
@@ -1367,6 +1367,13 @@ impl<'p> Vm<'p> {
             HeapObj::Func(id) => self.func_label(*id),
             HeapObj::Closure { func, .. } => self.func_label(*func),
             HeapObj::Bound { .. } => "[Function: bound]".into(),
+            HeapObj::Wrapped { name, .. } => {
+                if name.is_empty() {
+                    "[Function (anonymous)]".into()
+                } else {
+                    format!("[Function: {name}]")
+                }
+            }
             HeapObj::Native(_) => "[Function (native)]".into(),
             HeapObj::Cell(inner) => self.inspect_nested(*inner),
             HeapObj::EvalScope(_) => "[object EvalScope]".into(),
