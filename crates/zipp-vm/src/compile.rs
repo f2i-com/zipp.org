@@ -1031,6 +1031,14 @@ impl Compiler {
                         }
                     }
                 }
+                // A top-level CLASS declaration is a lexical binding with the
+                // same TDZ (typeof C before it runs is a ReferenceError).
+                if let ox::Statement::ClassDeclaration(c) = s {
+                    if let Some(id) = &c.id {
+                        let slot = fc.cx.global_slot(id.name.as_str()) as u32;
+                        fc.cx.lexical_globals.insert(slot);
+                    }
+                }
             }
         }
         // EVAL top level: lexical declarations live in the eval's own
@@ -2414,16 +2422,26 @@ impl<'a> FnCompiler<'a> {
                 let mut bind_name: Option<String> = None;
                 match &e.declaration {
                     K::FunctionDeclaration(f) => {
+                        // A NAMED default hoistable declaration is an ordinary
+                        // MUTABLE module binding (`fn = 2` inside the body works,
+                        // unlike a function EXPRESSION self-name) and the export
+                        // entry LocalName is the NAME — ns.default tracks the
+                        // LIVE binding, not a *default* snapshot.
+                        if let Some(id) = &f.id {
+                            let n = id.name.to_string();
+                            self.func_decl(f)?;
+                            let nslot = self.cx.global_slot(&n) as u32;
+                            self.cx.decl_globals.insert(nslot);
+                            self.cx.module_exports.push(("default".to_string(), n));
+                            self.next_reg -= 1;
+                            return Ok(());
+                        }
                         // An ANONYMOUS default-exported function/generator is named
-                        // "default" (NamedEvaluation); a named one keeps its name.
-                        let fname = f
-                            .id
-                            .as_ref()
-                            .map(|i| i.name.to_string())
-                            .unwrap_or_else(|| "default".to_string());
-                        let (id, has_up) = self.compile_func_expr(Some(fname), f)?;
+                        // "default" (NamedEvaluation).
+                        let (id, has_up) =
+                            self.compile_func_expr(Some("default".to_string()), f)?;
                         self.emit_make_callable(tmp, id, has_up);
-                        bind_name = f.id.as_ref().map(|i| i.name.to_string());
+                        bind_name = None;
                     }
                     K::ClassDeclaration(c) => {
                         // An ANONYMOUS default-exported class is named "default".
@@ -6113,7 +6131,15 @@ impl<'a> FnCompiler<'a> {
                 if let ox::Expression::Identifier(id) = arg {
                     if !matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
                         if let Binding::Global(idx) = self.resolve(id.name.as_str()) {
-                            if self.box_all_locals || self.cx.dyn_global_zone {
+                            // A DECLARED top-level lexical still observes its
+                            // TDZ through typeof (a ReferenceError) — only a
+                            // name the compiler never saw declared degrades to
+                            // "undefined" via the non-throwing load.
+                            let declared_lexical = self.cx.lexical_globals.contains(&(idx as u32))
+                                || self.cx.const_globals.contains(&(idx as u32));
+                            if declared_lexical {
+                                self.emit(Instr::LoadGlobal { dst, idx });
+                            } else if self.box_all_locals || self.cx.dyn_global_zone {
                                 self.emit(Instr::LoadGlobalOrUndefinedDyn { dst, idx });
                             } else {
                                 self.emit(Instr::LoadGlobalOrUndefined { dst, idx });
@@ -8663,6 +8689,17 @@ fn collect_hoisted_vars(s: &ox::Statement, out: &mut std::collections::HashSet<S
         S::VariableDeclaration(d) if d.kind == ox::VariableDeclarationKind::Var => {
             for decl in &d.declarations {
                 capture::collect_pattern_names(&decl.id, out);
+            }
+        }
+        // `export var x` / `export var {x} = ...`: the declared names hoist
+        // exactly like an unexported top-level var.
+        S::ExportNamedDeclaration(e) => {
+            if let Some(ox::Declaration::VariableDeclaration(d)) = &e.declaration {
+                if d.kind == ox::VariableDeclarationKind::Var {
+                    for decl in &d.declarations {
+                        capture::collect_pattern_names(&decl.id, out);
+                    }
+                }
             }
         }
         S::BlockStatement(b) => {

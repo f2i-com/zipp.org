@@ -740,11 +740,12 @@ impl<'p> Vm<'p> {
             C::Function => {
                 self.fn_proto != 0 && self.is_prototype_of(Value::heap(self.fn_proto), val)
             }
-            // Every non-primitive (array, object, function, error) is an Object.
-            C::Object => matches!(
-                self.heap.get(idx),
-                HeapObj::Array(_) | HeapObj::Object(_) | HeapObj::Func(_) | HeapObj::Closure { .. }
-            ),
+            // OrdinaryHasInstance: %Object.prototype% must be IN the value's
+            // prototype chain — a null-proto object / module namespace is NOT
+            // an instanceof Object.
+            C::Object => {
+                self.obj_proto != 0 && self.is_prototype_of(Value::heap(self.obj_proto), val)
+            }
             // An error ctor: a canonical-named error instance (internal throw /
             // `new TypeError`) OR — for `class X extends TypeError` / `Object.
             // create(TypeError.prototype)` — the matching error prototype is in
