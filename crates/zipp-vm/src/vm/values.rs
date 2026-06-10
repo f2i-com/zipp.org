@@ -291,6 +291,48 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Checked InitializeInstanceElements / PrivateBrandAdd / PrivateFieldAdd
+    /// entry: adding `classval`'s private elements to `inst` (when the class
+    /// declares any) throws TypeError if `inst` ALREADY carries this class's
+    /// own brand (double initialization via return-override — spec
+    /// PrivateMethodOrAccessorAdd/PrivateFieldAdd step "entry is not empty"),
+    /// or if `inst` is non-extensible (nonextensible-applies-to-private).
+    /// `is_override` gates the duplicate check: a NORMAL instance's map.class
+    /// chain carries the constructing class's brand by construction (that is
+    /// the pending initialization, not a completed one).
+    pub(crate) fn private_init_checked(
+        &mut self,
+        inst: Value,
+        classval: Value,
+        is_override: bool,
+    ) -> Result<(), Thrown> {
+        if !inst.is_heap() || !classval.is_heap() {
+            return Ok(());
+        }
+        let own = match self.method_brand.get(&classval.heap_index()).and_then(|c| c.first()) {
+            Some(&b) => b,
+            None => return Ok(()),
+        };
+        if self.brand_private_names.contains_key(&own) {
+            if is_override && self.instance_has_brand(inst, own) {
+                return Err(Thrown(
+                    "TypeError: cannot initialize the same private elements twice on an object"
+                        .into(),
+                ));
+            }
+            if let HeapObj::Object(m) = self.heap.get(inst.heap_index()) {
+                if !m.extensible {
+                    return Err(Thrown(
+                        "TypeError: cannot define private elements on a non-extensible object"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        self.brand_instance(inst, classval);
+        Ok(())
+    }
+
     /// Brand-aware private presence for accessing private name `key`:
     /// `Some(true/false)` when the accessing class body's brand chain is
     /// resolvable, `None` when not (the caller keeps its textual check).

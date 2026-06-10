@@ -1212,10 +1212,13 @@ impl<'p> Vm<'p> {
                 self.call_value(f, inst, &[])?;
             }
             // This class's field initializers ran on `inst` — brand it (covers a
-            // return-override instance from the parent chain).
-            self.brand_instance(inst, cv);
-            // Clear any super() mark a nested parent ctor left on this instance.
+            // return-override instance from the parent chain), with the checked
+            // double-init / non-extensible TypeErrors.
+            let r = self.private_init_checked(inst, cv, inst != obj);
+            // Clear any super() mark a nested parent ctor left on this instance
+            // (even when the checked init throws).
             self.super_called.remove(&inst.heap_index());
+            r?;
             return Ok(inst);
         }
         Ok(obj)
@@ -1790,6 +1793,12 @@ impl<'p> Vm<'p> {
         // (not at ctor entry), on the produced instance, with no new.target.
         let cls_v = self.class_values.get(home_class_id as usize).copied().flatten();
         if let Some(cv) = cls_v {
+            // Checked PrivateBrandAdd: a return-override that already carries
+            // this class's private elements, or a non-extensible instance,
+            // throws TypeError BEFORE the field initializers run.
+            let inst = if produced.is_heap() { produced } else { this };
+            let is_override = produced.is_heap() && produced != this;
+            self.private_init_checked(inst, cv, is_override)?;
             let (tfid, tups) = match self.heap.get(cv.heap_index()) {
                 HeapObj::Class(c) => (c.field_thunk, c.field_thunk_upvalues.clone()),
                 _ => (None, Vec::new()),
