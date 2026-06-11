@@ -3431,6 +3431,12 @@ impl<'p> Vm<'p> {
                         }
                         let r = if is_str {
                             let code = self.display(a0);
+                            // EXACT WTF-8 bytes when the code string holds lone
+                            // surrogates: the lossy `code` aligns with them
+                            // byte-for-byte (U+FFFD and a WTF-8 surrogate are both
+                            // 3 bytes), letting regex literals recover their exact
+                            // pattern text. None (O(1)) for well-formed sources.
+                            let exact = self.heap.str_exact_if_not_wellformed(a0.heap_index());
                             // A direct eval inherits the caller's `this` (reg 0, or
                             // the static-field-initializer's `this_reg`) and the
                             // caller's strictness.
@@ -3543,6 +3549,7 @@ impl<'p> Vm<'p> {
                                     }
                                 },
                                 eval_scope_idx,
+                                exact.as_deref(),
                             )?
                         } else {
                             a0

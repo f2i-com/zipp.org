@@ -199,6 +199,54 @@ impl<'p> Vm<'p> {
         out
     }
 
+    /// WTF-8 twin of [`escaped_source`], for a pattern holding lone surrogates
+    /// (`regexp_exact_source` side table): operates on code points over the
+    /// exact bytes — same escapes (`/`, line terminators, `\x` pairs verbatim,
+    /// empty → `(?:)`) — and returns WTF-8 bytes for the WTF-8 string
+    /// constructor. A lone surrogate passes through as itself (the spec's
+    /// EscapeRegExpPattern leaves it untouched), which `escaped_source` could
+    /// never produce from its lossy `&str` view.
+    pub(crate) fn escaped_source_wtf8(&self, bytes: &[u8]) -> Vec<u8> {
+        if bytes.is_empty() {
+            return b"(?:)".to_vec();
+        }
+        let cps: Vec<u32> = crate::heap::wtf8_code_points(bytes).collect();
+        let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 4);
+        let mut i = 0;
+        while i < cps.len() {
+            let c = cps[i];
+            if c == u32::from('\\') && i + 1 < cps.len() {
+                crate::heap::wtf8_push_cp(&mut out, c);
+                crate::heap::wtf8_push_cp(&mut out, cps[i + 1]);
+                i += 2;
+                continue;
+            }
+            match c {
+                0x2F => out.extend_from_slice(b"\\/"),
+                0x0A => out.extend_from_slice(b"\\n"),
+                0x0D => out.extend_from_slice(b"\\r"),
+                0x2028 => out.extend_from_slice(b"\\u2028"),
+                0x2029 => out.extend_from_slice(b"\\u2029"),
+                _ => crate::heap::wtf8_push_cp(&mut out, c),
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The `source` string Value for the RegExp at `idx` whose lossy escaped
+    /// source is `src`: exact-WTF-8 when the side table has the pattern's
+    /// exact bytes (lone surrogates round-trip), else the plain lossy string.
+    pub(crate) fn regexp_source_value(&mut self, idx: u32, src: &str) -> Value {
+        if let Some(b) = self.regexp_exact_source.get(&idx) {
+            let esc = self.escaped_source_wtf8(b);
+            let js = crate::heap::JsStr::from_wtf8(esc);
+            return Value::heap(self.heap.alloc_js(js));
+        }
+        let s = self.escaped_source(src);
+        self.alloc_str(s)
+    }
+
     /// RegExp.prototype[Symbol.search] core: reset lastIndex to 0, exec, restore
     /// lastIndex, return the match index or -1. Shared by String.prototype.search.
     pub(crate) fn regexp_search_impl(&mut self, rx: Value, input: Value) -> Result<Value, Thrown> {
@@ -584,6 +632,7 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn regexp_get_prop(
         &mut self,
+        idx: u32,
         source: &str,
         flags: &str,
         last_index: Value,
@@ -592,10 +641,9 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         Ok(match key {
             "lastIndex" => last_index,
-            "source" => {
-                let s = self.escaped_source(source);
-                self.alloc_str(s)
-            }
+            // Exact-WTF-8 when the side table has the pattern's exact bytes
+            // (lone surrogates round-trip), else the lossy escaped source.
+            "source" => self.regexp_source_value(idx, source),
             "flags" => {
                 let s = canonical_flags(flags);
                 self.alloc_str(s)

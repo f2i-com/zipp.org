@@ -387,6 +387,7 @@ pub fn compile_eval(
     inherit_super_obj: bool,
     caller_scope: Vec<String>,
     fn_var_env: bool,
+    exact_src: Option<&[u8]>,
 ) -> R<Program> {
     // MODULE early errors (ModuleDeclarationInstantiation): duplicate
     // LexicallyDeclaredNames (let/const/class AND top-level function — module
@@ -480,6 +481,10 @@ pub fn compile_eval(
         }
     }
     let mut c = Compiler::new(source.to_string());
+    // EXACT WTF-8 source bytes (eval of a string holding lone surrogates):
+    // lets regex literals recover their exact pattern text. None (free) for
+    // well-formed sources.
+    c.exact_src = exact_src.map(<[u8]>::to_vec);
     c.eval_mode = true;
     c.eval_locals = !is_module;
     // A module body is an ASYNC context: top-level `await` compiles and the
@@ -581,6 +586,13 @@ struct Compiler {
     /// The full program source, kept so each function can record its exact
     /// source slice (by oxc span) for `Function.prototype.toString`.
     source: String,
+    /// EXACT WTF-8 bytes of the source, present only when an eval'd code
+    /// string held lone surrogates (`source` is then the LOSSY view — U+FFFD
+    /// per surrogate; both encodings are 3 bytes, so byte offsets/oxc spans
+    /// in `source` index `exact_src` identically). Lets a regex literal
+    /// recover its exact pattern bytes. None for well-formed sources (the
+    /// overwhelmingly common case) — zero cost there.
+    exact_src: Option<Vec<u8>>,
     /// True when compiling an `eval` code string: the top-level script returns
     /// its *completion value* (the value of the last evaluated expression
     /// statement) instead of `undefined`.
@@ -726,6 +738,7 @@ impl Compiler {
             class_names: Vec::new(),
             hoisted_globals: Vec::new(),
             source,
+            exact_src: None,
             eval_mode: false,
             eval_inherit_super: None,
             in_field_init: false,
@@ -5762,7 +5775,38 @@ impl<'a> FnCompiler<'a> {
             E::RegExpLiteral(r) => {
                 // `/pat/flags` → NewRegExp (compiles via the `regress` engine at
                 // runtime). pattern.text is the source; flags as the JS flag string.
-                let pat = self.add_string_const(r.regex.pattern.text.as_str());
+                //
+                // EXACT-source recovery: when this program is an eval of a string
+                // holding lone surrogates (`exact_src` is Some), the parser saw the
+                // LOSSY view — a lone surrogate in the pattern reads U+FFFD. Both
+                // encodings are 3 bytes, so the pattern's byte range in the lossy
+                // source indexes the exact WTF-8 bytes identically: slice it and,
+                // if it differs from the lossy text, store the pattern constant in
+                // the oxc MARKER form (decoded to real WTF-8 at intern time), so
+                // the runtime compiles + stores the exact surrogate.
+                let text = r.regex.pattern.text.as_str();
+                let pat = 'pat: {
+                    if text.contains('\u{FFFD}') {
+                        if let Some(exact) = &self.cx.exact_src {
+                            // Pattern bytes start right after the opening `/`
+                            // (r.span covers the whole `/pat/flags` literal).
+                            let start = r.span.start as usize + 1;
+                            let end = start + text.len();
+                            // Guard: the range must reproduce the parser's pattern
+                            // text on the lossy source (validates the span math).
+                            if self.cx.source.as_bytes().get(start..end) == Some(text.as_bytes()) {
+                                if let Some(b) = exact.get(start..end) {
+                                    if b != text.as_bytes() {
+                                        let marked =
+                                            crate::heap::encode_lone_surrogate_markers(b);
+                                        break 'pat self.add_string_const_wtf8(&marked);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.add_string_const(text)
+                };
                 let flags_s = r.regex.flags.to_inline_string();
                 let flg = self.add_string_const(&flags_s);
                 let pt = self.temp();

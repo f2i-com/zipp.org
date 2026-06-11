@@ -94,6 +94,7 @@ impl<'p> Vm<'p> {
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
             regexp_string_iters: std::collections::HashMap::new(),
+            regexp_exact_source: std::collections::HashMap::new(),
             next_private_brand: 1,
             method_brand: std::collections::HashMap::new(),
             instance_brand: std::collections::HashMap::new(),
@@ -1145,6 +1146,7 @@ impl<'p> Vm<'p> {
         lexical_collisions: Vec<String>,
         caller_scope: Option<(Vec<String>, Vec<Value>)>,
         eval_scope_idx: Option<u32>,
+        exact_src: Option<&[u8]>,
     ) -> Result<Value, Thrown> {
         // 1. Parse.
         let allocator = oxc_allocator::Allocator::default();
@@ -1248,6 +1250,7 @@ impl<'p> Vm<'p> {
                 .map(|(n, _)| n.clone())
                 .unwrap_or_default(),
             eval_scope_idx.is_some(),
+            exact_src,
         ) {
             Ok(p) => p,
             Err(e) => return Err(Thrown(format!("SyntaxError: {e}"))),
@@ -1349,7 +1352,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1373,7 +1376,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1517,7 +1520,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
-        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false) {
+        let prog = match crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
             // evaluation pipeline (not built yet): surface a host TypeError —
@@ -2276,7 +2279,7 @@ impl<'p> Vm<'p> {
         if !ret.errors.is_empty() {
             return false;
         }
-        let Ok(prog) = crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false) else {
+        let Ok(prog) = crate::compile::compile_eval(&ret.program, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), false, None) else {
             return false;
         };
         prog.functions

@@ -3362,7 +3362,7 @@ impl<'p> Vm<'p> {
                 .get(&obj.heap_index())
                 .and_then(|p| p.is_heap().then(|| p.heap_index()))
                 .unwrap_or(self.regexp_proto);
-            return self.regexp_get_prop(&s, &f, li, key, eff);
+            return self.regexp_get_prop(obj.heap_index(), &s, &f, li, key, eff);
         }
         // An Array's named (non-index) own properties (arr.foo, and a match
         // result's index/input/groups) live in arr_props and shadow the prototype.

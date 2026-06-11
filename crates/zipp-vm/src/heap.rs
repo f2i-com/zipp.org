@@ -458,6 +458,30 @@ pub fn decode_lone_surrogate_markers(s: &str) -> Vec<u8> {
     out
 }
 
+/// Inverse of [`decode_lone_surrogate_markers`]: encode WTF-8 bytes into the
+/// oxc lone-surrogate MARKER form — each lone surrogate becomes the 5-char
+/// marker `\u{FFFD}XXXX` (4 lowercase hex = the code unit) and a LITERAL
+/// U+FFFD becomes `\u{FFFD}fffd` (so an unmarked U+FFFD can never be
+/// mistaken for a marker). Used when the compiler recovers exact pattern
+/// bytes for a regex literal whose lossy parse text contained U+FFFD: the
+/// result feeds `add_string_const_wtf8`, and `resolve_const`'s decode
+/// round-trips it back to these exact bytes.
+pub fn encode_lone_surrogate_markers(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len() + 8);
+    for cp in wtf8_code_points(b) {
+        match char::from_u32(cp) {
+            // A lone surrogate (no `char` exists for it) → marker.
+            None => {
+                out.push('\u{FFFD}');
+                out.push_str(&format!("{cp:04x}"));
+            }
+            Some('\u{FFFD}') => out.push_str("\u{FFFD}fffd"),
+            Some(c) => out.push(c),
+        }
+    }
+    out
+}
+
 /// Consuming form of [`wtf8_to_lossy_string`] (patches the buffer in place).
 pub fn wtf8_into_lossy_string(mut v: Vec<u8>) -> String {
     let mut i = 0;
@@ -1520,6 +1544,39 @@ impl Heap {
             }
             _ => None,
         }
+    }
+
+    /// Whether every flat leaf under a string-like object is well-formed —
+    /// from the cached `JsStr` flags only, no flattening or byte scan. All
+    /// leaves well-formed ⇒ the concatenation holds no surrogate bytes at
+    /// all ⇒ well-formed. (The converse may not hold — a surrogate pair
+    /// joining at a rope seam canonicalizes away on flatten — so a `false`
+    /// here is only a conservative "may hold lone surrogates".)
+    fn str_leaves_wellformed(&self, idx: u32) -> bool {
+        match self.get(idx) {
+            HeapObj::Str(s) => s.is_wellformed(),
+            HeapObj::Cons { left, right, .. } => {
+                self.str_leaves_wellformed(*left) && self.str_leaves_wellformed(*right)
+            }
+            _ => true,
+        }
+    }
+
+    /// EXACT WTF-8 bytes of a string-like object, but ONLY when it is NOT
+    /// well-formed (holds lone surrogates) — `None` for a well-formed string
+    /// or a non-string. Rejection reads cached flags (O(1) flat, O(leaves)
+    /// rope) — no flattening or byte scan on the well-formed path. The side
+    /// channel for paths whose lossy `String` view would decay surrogates to
+    /// U+FFFD (eval source capture, RegExp pattern/source exactness).
+    pub fn str_exact_if_not_wellformed(&self, idx: u32) -> Option<Vec<u8>> {
+        if !self.is_str_like(idx) || self.str_leaves_wellformed(idx) {
+            return None;
+        }
+        // Flatten and re-check: a rope seam can canonicalize a high+low pair
+        // into an astral scalar, leaving the WHOLE string well-formed even
+        // though a leaf was not.
+        let b = self.str_wtf8_cow(idx)?;
+        (!wtf8_is_wellformed(&b)).then(|| b.into_owned())
     }
 
     /// Content equality of two string-like objects. Fast (no allocation) when

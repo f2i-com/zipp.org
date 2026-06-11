@@ -1256,14 +1256,12 @@ impl<'p> Vm<'p> {
         // holding lone surrogates: `new RegExp('\uD800')` must compile the
         // surrogate itself (ToString below is LOSSY — it would compile U+FFFD).
         // `regress::Regex::from_unicode` accepts the pattern characters directly.
+        // A RegExp pattern with an exact-source side entry contributes its
+        // exact bytes the same way (`new RegExp(re)` round-trips them).
         let exact_bytes: Option<Vec<u8>> = if p.is_heap() && self.heap.is_str_like(p.heap_index()) {
-            self.heap.str_wtf8_cow(p.heap_index()).and_then(|b| {
-                if crate::heap::wtf8_is_wellformed(&b) {
-                    None
-                } else {
-                    Some(b.into_owned())
-                }
-            })
+            self.heap.str_exact_if_not_wellformed(p.heap_index())
+        } else if real_regexp.is_some() {
+            self.regexp_exact_source.get(&p.heap_index()).cloned()
         } else {
             None
         };
@@ -1344,6 +1342,13 @@ impl<'p> Vm<'p> {
         let idx = self
             .heap
             .alloc(HeapObj::RegExp { regex: Box::new(regex), source, flags, last_index: Value::int(0) });
+        // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
+        // the side table (the struct's `source: String` is lossy) so the
+        // `source` getter / `toString` round-trip the surrogates. The heap
+        // slot is fresh — no stale entry to clear on the None path.
+        if let Some(b) = exact_bytes {
+            self.regexp_exact_source.insert(idx, b);
+        }
         if self.regexp_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.regexp_proto));
         }

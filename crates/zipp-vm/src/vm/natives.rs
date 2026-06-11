@@ -749,6 +749,10 @@ impl<'p> Vm<'p> {
                     HeapObj::RegExp { source, flags, .. } => (source.clone(), flags.clone()),
                     _ => unreachable!(),
                 };
+                // EXACT pattern bytes (lone surrogates): `build_regexp` recorded
+                // them for the throwaway `built` — take the entry so it can move
+                // to the receiver below (the struct's `source` is lossy).
+                let exact = self.regexp_exact_source.remove(&built.heap_index());
                 // Rebuild the matcher from the validated source/flags. Pass `u`
                 // (Unicode) and `v` (UnicodeSets) through verbatim — `regress` reads
                 // them as distinct grammars (kept in sync with `build_regexp`).
@@ -762,13 +766,18 @@ impl<'p> Vm<'p> {
                 // Pattern characters: code points in `u`/`v` mode, UTF-16 code
                 // units otherwise (an astral literal is its two surrogate
                 // halves; group names recombine pairs) — kept in sync with
-                // `build_regexp`.
-                let compile_cps: Vec<u32> = if flags.contains('u') || flags.contains('v') {
-                    source.chars().map(u32::from).collect()
-                } else {
-                    super::proxy_regexp::nonunicode_pattern_chars(
+                // `build_regexp`, including the exact-bytes (lone-surrogate)
+                // form, which feeds the surrogates verbatim.
+                let unicode_mode = flags.contains('u') || flags.contains('v');
+                let compile_cps: Vec<u32> = match (&exact, unicode_mode) {
+                    (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
+                    (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
+                        &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
+                    ),
+                    (None, true) => source.chars().map(u32::from).collect(),
+                    (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
                         &source.encode_utf16().collect::<Vec<u16>>(),
-                    )
+                    ),
                 };
                 let regex = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
                     .map_err(|e| {
@@ -780,6 +789,16 @@ impl<'p> Vm<'p> {
                     *r = Box::new(regex);
                     *s = source;
                     *fl = flags;
+                }
+                // Move the exact-source entry onto the receiver — or clear a
+                // stale one when the new pattern is well-formed.
+                match exact {
+                    Some(b) => {
+                        self.regexp_exact_source.insert(this.heap_index(), b);
+                    }
+                    None => {
+                        self.regexp_exact_source.remove(&this.heap_index());
+                    }
                 }
                 // RegExpInitialize step 12: Set(obj, "lastIndex", 0, true) AFTER
                 // the slots update — a non-writable lastIndex throws TypeError
@@ -867,6 +886,19 @@ impl<'p> Vm<'p> {
                         // canonical `dgimsuvy` order regardless of storage order.
                         let (s, f) =
                             (source.clone(), super::proxy_regexp::canonical_flags(flags));
+                        // Lone-surrogate pattern (exact-source side table):
+                        // assemble `/src/flags` over the exact WTF-8 bytes so
+                        // toString round-trips the surrogates too.
+                        if let Some(b) = self.regexp_exact_source.get(&this.heap_index()) {
+                            let esc = self.escaped_source_wtf8(b);
+                            let mut out = Vec::with_capacity(esc.len() + f.len() + 2);
+                            out.push(b'/');
+                            out.extend_from_slice(&esc);
+                            out.push(b'/');
+                            out.extend_from_slice(f.as_bytes());
+                            let js = crate::heap::JsStr::from_wtf8(out);
+                            return Ok(Value::heap(self.heap.alloc_js(js)));
+                        }
                         (self.escaped_source(&s), f)
                     }
                     _ => {
@@ -888,8 +920,9 @@ impl<'p> Vm<'p> {
                     self.alloc_str("(?:)".to_string())
                 } else if let HeapObj::RegExp { source, .. } = self.heap.get(idx) {
                     let s = source.clone();
-                    let esc = self.escaped_source(&s);
-                    self.alloc_str(esc)
+                    // Exact-WTF-8 when the side table has the pattern's exact
+                    // bytes (lone surrogates round-trip), else lossy.
+                    self.regexp_source_value(idx, &s)
                 } else {
                     return Err(Thrown(
                         "TypeError: get source called on a non-RegExp object".into(),
@@ -3240,7 +3273,13 @@ impl<'p> Vm<'p> {
                     a0
                 } else {
                     let code = self.display(a0);
-                    return self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, true, None, Vec::new(), None, None);
+                    // EXACT WTF-8 bytes when the code string holds lone
+                    // surrogates: the lossy `code` aligns with them
+                    // byte-for-byte (U+FFFD and a WTF-8 surrogate are both
+                    // 3 bytes), letting regex literals recover their exact
+                    // pattern text. None (O(1)) for well-formed sources.
+                    let exact = self.heap.str_exact_if_not_wellformed(a0.heap_index());
+                    return self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, true, None, Vec::new(), None, None, exact.as_deref());
                 }
             }
             // String static methods.

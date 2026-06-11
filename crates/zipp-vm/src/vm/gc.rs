@@ -397,6 +397,9 @@ impl Vm<'_> {
         self.module_namespaces.retain(|&k, _| marks[k as usize]);
         self.closure_home.retain(|&k, _| marks[k as usize]);
         self.dispose_stacks.retain(|&k, _| marks[k as usize]);
+        // Pure-bytes side table (no Values to trace): hygiene-retain only, so a
+        // recycled RegExp slot can't inherit a dead pattern's exact source.
+        self.regexp_exact_source.retain(|&k, _| marks[k as usize]);
         self.async_stacks.retain(|&k| marks[k as usize]);
         self.shadow_realms.retain(|&k| marks[k as usize]);
         self.realm_globals.retain(|&k, _| marks[k as usize]);

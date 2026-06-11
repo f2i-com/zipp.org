@@ -303,6 +303,13 @@ pub struct Vm<'p> {
     /// match at a time, rather than matchAll eagerly collecting every match up
     /// front.
     regexp_string_iters: std::collections::HashMap<u32, (u32, Value, u8, bool)>,
+    /// RegExp heap idx → EXACT WTF-8 bytes of its [[OriginalSource]], present
+    /// ONLY when the pattern holds lone surrogates (the struct's `source:
+    /// String` field is the LOSSY view — U+FFFD per surrogate). The `source`
+    /// getter / `toString` / re-compile paths check this first so a
+    /// lone-surrogate pattern round-trips exactly. Holds no `Value`s (pure
+    /// bytes, idx-keyed): GC only needs the sweep-time retain in gc.rs.
+    regexp_exact_source: std::collections::HashMap<u32, Vec<u8>>,
     /// Monotone counter minting a fresh private brand per class evaluation (1 = first;
     /// 0 = unbranded).
     next_private_brand: u64,
