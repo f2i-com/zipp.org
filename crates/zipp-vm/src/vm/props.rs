@@ -2876,6 +2876,16 @@ impl<'p> Vm<'p> {
                             return Some((String::new(), 1.0));
                         }
                         native::INTL_COLLATOR_COMPARE => return Some((String::new(), 2.0)),
+                        // Anonymous internal closures (spec name ""): the
+                        // Proxy.revocable revoker and the finally wrappers
+                        // (ThenFinally/CatchFinally have length 1).
+                        native::PROXY_REVOKE => return Some((String::new(), 0.0)),
+                        native::FINALLY_THEN | native::FINALLY_CATCH => {
+                            return Some((String::new(), 1.0));
+                        }
+                        native::FINALLY_VALUE_THUNK | native::FINALLY_THROWER => {
+                            return Some((String::new(), 0.0));
+                        }
                         _ => {}
                     }
                 }

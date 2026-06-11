@@ -235,10 +235,28 @@ impl<'p> Vm<'p> {
         }
         // A callable's `name`/`length` are configurable: record the deletion so
         // the synthesized property stops appearing (own-property queries + reads).
-        if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
-            self.deleted_callable_intrinsics
-                .insert((idx, if key == "name" { 0 } else { 1 }));
-            return Value::bool(true);
+        // An fn_props OVERRIDE (defineProperty'd or a setup-time SetFunctionName)
+        // must be removed AND tombstoned together — removing only the override
+        // would let the synthesized intrinsic resurface after `delete`.
+        if (key == "name" || key == "length") && self.is_callable(obj) {
+            let ovr_attr = self
+                .fn_props
+                .get(&idx)
+                .and_then(|m| m.pos(key).map(|i| m.attrs[i].configurable));
+            if ovr_attr == Some(false) {
+                return Value::bool(false);
+            }
+            if ovr_attr.is_some() || self.callable_has_intrinsic(obj, key) {
+                if ovr_attr.is_some() {
+                    if let Some(m) = self.fn_props.get_mut(&idx) {
+                        m.remove(key);
+                    }
+                    self.heap.bump_version(idx);
+                }
+                self.deleted_callable_intrinsics
+                    .insert((idx, if key == "name" { 0 } else { 1 }));
+                return Value::bool(true);
+            }
         }
         // Deleting a canonical array index: a non-configurable special override
         // (defineProperty'd) refuses deletion; otherwise drop the override (if any)
@@ -391,6 +409,20 @@ impl<'p> Vm<'p> {
         val: Value,
         strict: bool,
     ) -> Result<(), Thrown> {
+        // `proxy.__proto__ = v`: the inherited Object.prototype.__proto__
+        // setter runs with this = the RECEIVER, so [[SetPrototypeOf]] (and a
+        // setPrototypeOf trap) applies to the PROXY — a plain forward would
+        // silently mutate the target instead.
+        if key == "__proto__" {
+            if (self.is_object_value(val) || val == Value::NULL)
+                && !self.ordinary_set_prototype_of(receiver, val)?
+            {
+                return Err(Thrown(
+                    "TypeError: cannot set prototype (target is non-extensible, the change is cyclic, or it has an immutable prototype)".into(),
+                ));
+            }
+            return Ok(());
+        }
         // With NO observable trap on the receiver's handler (no set / gopd /
         // defineProperty, and the handler isn't itself a proxy), the spec
         // receiver-define sequence is indistinguishable from a direct forward

@@ -741,6 +741,29 @@ impl<'p> Vm<'p> {
             None,
         );
         self.proto_of.insert(async_iter_root, Value::heap(obj_proto));
+        // SetFunctionName: this @@asyncIterator function is named
+        // "[Symbol.asyncIterator]" (ITER_SELF's intrinsic name belongs to the
+        // @@iterator slot, so override THIS object's name via fn_props).
+        {
+            let f = match self.heap.get(async_iter_root) {
+                HeapObj::Object(m) => m.get("@@asyncIterator"),
+                _ => None,
+            };
+            if let Some(f) = f.filter(|f| f.is_heap()) {
+                let nv = self.alloc_str("[Symbol.asyncIterator]".to_string());
+                let name_attr = PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                };
+                self.fn_props
+                    .entry(f.heap_index())
+                    .or_default()
+                    .define("name", nv, name_attr);
+            }
+        }
         let asyncgen_proto = build(
             self,
             &[

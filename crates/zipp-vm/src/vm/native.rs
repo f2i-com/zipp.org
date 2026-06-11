@@ -767,6 +767,10 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     match id {
         FINALLY_THEN | FINALLY_CATCH => return Some(("", 3)),
         FINALLY_VALUE_THUNK | FINALLY_THROWER => return Some(("", 0)),
+        // Accessor functions are named "get/set <prop>" (SetFunctionName
+        // with a getter/setter prefix).
+        OBJPROTO_PROTO_GET => return Some(("get __proto__", 0)),
+        OBJPROTO_PROTO_SET => return Some(("set __proto__", 1)),
         _ => {}
     }
     // Atomics.* methods.
