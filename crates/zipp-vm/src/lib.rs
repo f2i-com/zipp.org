@@ -1068,12 +1068,27 @@ mod tests {
     }
 
     #[test]
-    fn nonascii_length_and_index_scalar_count() {
-        // Non-ASCII falls back to chars().nth (scalar indexing); .length is the
-        // cached scalar count. 'café' is 4 scalars; index 3 is 'é'.
+    fn nonascii_length_and_index_unit_count() {
+        // Non-ASCII decodes per UTF-16 unit; .length is the cached unit count.
+        // 'café' is 4 units (all BMP); index 3 is 'é'.
         assert_eq!(
             run_ok("let s='caf\u{00e9}'; console.log(s.length, s[3], s.charAt(3), (s+s).length)"),
             vec!["4 \u{00e9} \u{00e9} 8"],
+        );
+    }
+
+    #[test]
+    fn astral_utf16_unit_semantics() {
+        // An astral char ('𠮷' U+20BB7) is TWO UTF-16 units: .length counts
+        // units, charCodeAt yields the surrogate halves, codePointAt the full
+        // code point, while for-of/spread still iterate CODE POINTS (one step).
+        assert_eq!(
+            run_ok("let s='\u{20BB7}a'; console.log(s.length, s.charCodeAt(0), s.charCodeAt(1), s.charCodeAt(2), s.codePointAt(0), s.charAt(2), [...s].length, s.slice(2), s.indexOf('a'))"),
+            vec!["3 55362 57271 97 134071 a 2 a 2"],
+        );
+        assert_eq!(
+            run_ok("console.log(String.fromCharCode(0xD842, 0xDFB7) === '\u{20BB7}', '\u{20BB7}'.padStart(4, 'x'))"),
+            vec!["true xx\u{20BB7}"],
         );
     }
 

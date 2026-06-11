@@ -97,34 +97,40 @@ impl<'p> Vm<'p> {
         Ok(self.string_method(s_idx, name, args)?.unwrap_or(Value::UNDEFINED))
     }
 
-    /// The i-th char of a flat string by heap index, WITHOUT cloning the string —
-    /// O(1) for ASCII (i-th byte), else an O(i) scalar scan. `None` if out of range
-    /// or not a flat string. (A full-string clone here would make `charCodeAt(i)`
-    /// in a loop O(n²) in the string length — the real cost of these methods.)
-    pub(crate) fn heap_char_at(&self, idx: u32, i: usize) -> Option<char> {
+    /// UTF-16 unit length (JS `.length`) of a flat string by heap index — O(1).
+    pub(crate) fn heap_str_units(&self, idx: u32) -> usize {
         match self.heap.get(idx) {
-            HeapObj::Str(js) => {
-                if js.ascii {
-                    js.bytes.as_bytes().get(i).map(|&b| b as char)
-                } else {
-                    js.bytes.chars().nth(i)
-                }
-            }
+            HeapObj::Str(js) => js.units(),
+            _ => 0,
+        }
+    }
+
+    /// The UTF-16 code unit at unit position `i` (`charCodeAt`) — O(1) for
+    /// ASCII (i-th byte), else an O(i) decode. `None` if out of range or not a
+    /// flat string.
+    pub(crate) fn heap_unit_at(&self, idx: u32, i: usize) -> Option<u16> {
+        match self.heap.get(idx) {
+            HeapObj::Str(js) => js.unit_at(i),
             _ => None,
         }
     }
 
-    /// Char length of a flat string by heap index — O(1) for ASCII.
-    pub(crate) fn heap_char_len(&self, idx: u32) -> usize {
+    /// CodePointAt(unit position) per spec: the FULL code point at a lead
+    /// unit, the trail surrogate's value in the middle of a pair.
+    pub(crate) fn heap_code_point_at(&self, idx: u32, i: usize) -> Option<u32> {
         match self.heap.get(idx) {
-            HeapObj::Str(js) => {
-                if js.ascii {
-                    js.bytes.len()
-                } else {
-                    js.bytes.chars().count()
-                }
-            }
-            _ => 0,
+            HeapObj::Str(js) => js.code_point_at(i),
+            _ => None,
+        }
+    }
+
+    /// The 1-unit string content at unit position `i` (`charAt`/`at`/bracket
+    /// index): the BMP scalar, or U+FFFD for a surrogate half (not yet
+    /// representable alone — exact once strings are WTF-8).
+    pub(crate) fn heap_unit_char(&self, idx: u32, i: usize) -> Option<char> {
+        match self.heap.get(idx) {
+            HeapObj::Str(js) => js.unit_char(i),
+            _ => None,
         }
     }
 
@@ -137,30 +143,30 @@ impl<'p> Vm<'p> {
         match name {
             "charCodeAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
-                return Ok(Some(match c {
-                    Some(c) => Value::int(c as i32),
+                let u = if i >= 0 { self.heap_unit_at(idx, i as usize) } else { None };
+                return Ok(Some(match u {
+                    Some(u) => Value::int(u as i32),
                     None => Value::num(f64::NAN),
                 }));
             }
             "codePointAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
+                let c = if i >= 0 { self.heap_code_point_at(idx, i as usize) } else { None };
                 return Ok(Some(match c {
-                    Some(c) => Value::int(c as i32),
+                    Some(cp) => Value::int(cp as i32),
                     None => Value::UNDEFINED,
                 }));
             }
             "charAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
+                let c = if i >= 0 { self.heap_unit_char(idx, i as usize) } else { None };
                 return Ok(Some(self.alloc_str(c.map(|c| c.to_string()).unwrap_or_default())));
             }
             "at" => {
-                let len = self.heap_char_len(idx) as i64;
+                let len = self.heap_str_units(idx) as i64;
                 let i = self.to_integer_strict(arg0)?;
                 let abs = if i < 0 { i + len } else { i };
-                let c = if abs >= 0 && abs < len { self.heap_char_at(idx, abs as usize) } else { None };
+                let c = if abs >= 0 && abs < len { self.heap_unit_char(idx, abs as usize) } else { None };
                 return Ok(Some(match c {
                     Some(c) => self.alloc_str(c.to_string()),
                     None => Value::UNDEFINED,
@@ -170,14 +176,46 @@ impl<'p> Vm<'p> {
         }
         // Other methods need an owned String (slice/replace/split/…).
         let (s, ascii) = match self.heap.get(idx) {
-            HeapObj::Str(js) => (js.bytes.clone(), js.ascii),
+            HeapObj::Str(js) => (js.as_str().to_string(), js.is_ascii()),
             _ => return Ok(None),
         };
-        let char_len = |s: &str| -> usize {
+        // JS positions/lengths are UTF-16 code units; `ascii` short-circuits the
+        // walks (unit == byte). All three closures take the RECEIVER `s` only.
+        let unit_len = |s: &str| -> usize {
             if ascii {
                 s.len()
             } else {
-                s.chars().count()
+                crate::heap::str_units(s)
+            }
+        };
+        // Byte offset of a SEARCH-START unit position (mid-pair rounds up — exact
+        // for searches; anchored uses go through `unit_byte_bounds`).
+        let u2b = |s: &str, u: usize| -> usize {
+            if ascii {
+                u.min(s.len())
+            } else {
+                crate::heap::unit_to_byte(s, u)
+            }
+        };
+        // Unit position of a result byte offset (always a scalar boundary).
+        let b2u = |s: &str, b: usize| -> usize {
+            if ascii {
+                b
+            } else {
+                crate::heap::byte_to_units(s, b)
+            }
+        };
+        // Substring by unit positions [a, b).
+        let subu = |s: &str, a: usize, b: usize| -> String {
+            if ascii {
+                let (a, b) = (a.min(s.len()), b.min(s.len()));
+                if a >= b {
+                    String::new()
+                } else {
+                    s[a..b].to_string()
+                }
+            } else {
+                crate::heap::slice_units_str(s, a, b)
             }
         };
         match name {
@@ -185,16 +223,16 @@ impl<'p> Vm<'p> {
                 // ToString(searchString) (honours @@toPrimitive/toString/valueOf,
                 // throws on a Symbol) BEFORE ToInteger(position) — spec arg order.
                 let needle = self.to_js_string(arg0)?;
-                // Optional fromIndex (ToInteger, a char position) to start at.
+                // Optional fromIndex (ToInteger, a unit position) to start at.
                 let from = if args.len() >= 2 {
                     self.to_integer_strict(args[1])?.max(0) as usize
                 } else {
                     0
                 };
-                let byte_from = s.char_indices().nth(from).map(|(b, _)| b).unwrap_or(s.len());
+                let byte_from = u2b(&s, from);
                 let pos = s[byte_from..]
                     .find(&needle)
-                    .map(|b| s[..byte_from + b].chars().count() as i32)
+                    .map(|b| b2u(&s, byte_from + b) as i32)
                     .unwrap_or(-1);
                 Ok(Some(Value::int(pos)))
             }
@@ -205,13 +243,13 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let needle = self.to_js_string(arg0)?;
-                let len = char_len(&s) as i64;
+                let len = unit_len(&s) as i64;
                 let pos = if args.len() >= 2 {
                     self.to_integer_strict(args[1])?.clamp(0, len)
                 } else {
                     0
                 } as usize;
-                let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
+                let byte = u2b(&s, pos);
                 Ok(Some(Value::bool(s[byte..].contains(&needle))))
             }
             "toUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
@@ -220,7 +258,7 @@ impl<'p> Vm<'p> {
                 // Negative indices count from the end; computed in i64 so a
                 // saturated ±Infinity (i64::MIN/MAX) clamps correctly (an `as i32`
                 // would wrap Infinity to -1).
-                let len = char_len(&s) as i64;
+                let len = unit_len(&s) as i64;
                 let norm = |i: i64| if i < 0 { len.saturating_add(i).max(0) } else { i.min(len) };
                 let start = if args.is_empty() { 0 } else { norm(self.to_integer_strict(arg0)?) };
                 // An absent OR explicitly-`undefined` end defaults to the string
@@ -230,17 +268,13 @@ impl<'p> Vm<'p> {
                 } else {
                     norm(self.to_integer_strict(args[1])?)
                 };
-                let out: String = if start < end {
-                    s.chars().skip(start as usize).take((end - start) as usize).collect()
-                } else {
-                    String::new()
-                };
+                let out = subu(&s, start as usize, end as usize);
                 Ok(Some(self.alloc_str(out)))
             }
             "substring" => {
                 // Each index clamps to [0,len] (negatives -> 0), then start/end swap
                 // so start <= end (distinct from slice's negative-from-end mapping).
-                let len = char_len(&s) as i64;
+                let len = unit_len(&s) as i64;
                 let s0 = if args.is_empty() { 0 } else { self.to_integer_strict(arg0)?.clamp(0, len) };
                 // An absent OR explicitly-`undefined` end defaults to the length.
                 let e0 = if args.len() < 2 || args[1] == Value::UNDEFINED {
@@ -249,7 +283,7 @@ impl<'p> Vm<'p> {
                     self.to_integer_strict(args[1])?.clamp(0, len)
                 };
                 let (from, to) = if s0 <= e0 { (s0, e0) } else { (e0, s0) };
-                let out: String = s.chars().skip(from as usize).take((to - from) as usize).collect();
+                let out = subu(&s, from as usize, to as usize);
                 Ok(Some(self.alloc_str(out)))
             }
             "repeat" => {
@@ -384,7 +418,13 @@ impl<'p> Vm<'p> {
                     if lim == 0 {
                         Vec::new()
                     } else if sep.is_empty() {
-                        s.chars().take(lim).map(|c| self.alloc_str(c.to_string())).collect()
+                        // Split into 1-UNIT pieces (spec: code units). An astral
+                        // scalar's halves degrade to U+FFFD until the WTF-8 stage.
+                        crate::heap::unit_chars(&s)
+                            .into_iter()
+                            .take(lim)
+                            .map(|c| self.alloc_str(c.to_string()))
+                            .collect()
                     } else {
                         s.split(&sep).take(lim).map(|p| self.alloc_str(p.to_string())).collect()
                     }
@@ -412,12 +452,20 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let needle = self.to_js_string(arg0)?;
-                let len = char_len(&s) as i64;
+                let len = unit_len(&s) as i64;
                 let pos =
                     if args.len() >= 2 { self.to_integer_strict(args[1])?.clamp(0, len) } else { 0 }
                         as usize;
-                let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
-                Ok(Some(Value::bool(s[byte..].starts_with(&needle))))
+                // An ANCHORED position: a start in the middle of a surrogate pair
+                // makes the spec substring begin with a trail surrogate, which a
+                // well-formed needle can never match (only the empty one).
+                let r = if ascii {
+                    s[pos.min(s.len())..].starts_with(&needle)
+                } else {
+                    let (lo, hi) = crate::heap::unit_byte_bounds(&s, pos);
+                    if lo != hi { needle.is_empty() } else { s[lo..].starts_with(&needle) }
+                };
+                Ok(Some(Value::bool(r)))
             }
             "endsWith" => {
                 if self.is_regexp(arg0)? {
@@ -426,14 +474,21 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let needle = self.to_js_string(arg0)?;
-                let len = char_len(&s) as i64;
+                let len = unit_len(&s) as i64;
                 let end = if args.len() >= 2 && args[1] != Value::UNDEFINED {
                     self.to_integer_strict(args[1])?.clamp(0, len)
                 } else {
                     len
                 } as usize;
-                let byte = s.char_indices().nth(end).map(|(b, _)| b).unwrap_or(s.len());
-                Ok(Some(Value::bool(s[..byte].ends_with(&needle))))
+                // ANCHORED end position: an end mid-pair leaves the spec substring
+                // ending in a lead surrogate — only an empty needle can match.
+                let r = if ascii {
+                    s[..end.min(s.len())].ends_with(&needle)
+                } else {
+                    let (lo, hi) = crate::heap::unit_byte_bounds(&s, end);
+                    if lo != hi { needle.is_empty() } else { s[..lo].ends_with(&needle) }
+                };
+                Ok(Some(Value::bool(r)))
             }
             "concat" => {
                 // Each argument is ToString-coerced (honours @@toPrimitive/toString/
@@ -447,21 +502,20 @@ impl<'p> Vm<'p> {
             }
             "substr" => {
                 // Legacy substr(start, length); negative start counts from the end.
-                let chars: Vec<char> = s.chars().collect();
-                let len = chars.len() as i64;
+                let len = unit_len(&s) as i64;
                 let mut start = if args.is_empty() { 0 } else { self.to_integer_strict(arg0)? };
                 if start < 0 {
                     start = (len + start).max(0);
                 }
                 let start = start.min(len) as usize;
-                let avail = chars.len() - start;
+                let avail = len as usize - start;
                 let count = if args.len() < 2 || args[1] == Value::UNDEFINED {
                     avail
                 } else {
                     let c = self.to_integer_strict(args[1])?;
                     if c < 0 { 0 } else { (c as usize).min(avail) }
                 };
-                let sub: String = chars[start..start + count].iter().collect();
+                let sub = subu(&s, start, start + count);
                 Ok(Some(self.alloc_str(sub)))
             }
             "localeCompare" => {
@@ -512,7 +566,7 @@ impl<'p> Vm<'p> {
             // (used by a boxed String's valueOf/toString after unwrapping).
             "valueOf" | "toString" => Ok(Some(Value::heap(idx))),
             "padStart" | "padEnd" => {
-                let cur = char_len(&s);
+                let cur = unit_len(&s);
                 let t = self.to_integer_strict(arg0)?;
                 let target = if t > 0 { t as usize } else { 0 };
                 if target as u64 > (1u64 << 28) {
@@ -528,13 +582,24 @@ impl<'p> Vm<'p> {
                 } else {
                     " ".to_string()
                 };
-                let padchars: Vec<char> = pad.chars().collect();
-                if padchars.is_empty() {
+                if pad.is_empty() {
                     return Ok(Some(self.alloc_str(s.clone())));
                 }
+                // StringPad truncates the repeated filler to (target - cur) UNITS;
+                // a truncation that splits an astral filler char keeps U+FFFD for
+                // the lead half (a lone surrogate isn't representable yet).
                 let mut padding = String::new();
-                for k in 0..(target - cur) {
-                    padding.push(padchars[k % padchars.len()]);
+                let mut need = target - cur;
+                let mut fill = pad.chars().cycle();
+                while need > 0 {
+                    let c = fill.next().unwrap(); // non-empty: cycle never ends
+                    let n = crate::heap::char_units(c);
+                    if n > need {
+                        padding.push('\u{FFFD}');
+                        break;
+                    }
+                    padding.push(c);
+                    need -= n;
                 }
                 let out = if name == "padStart" {
                     format!("{padding}{s}")
@@ -557,11 +622,9 @@ impl<'p> Vm<'p> {
             "lastIndexOf" => {
                 // ToString(searchString) before the position coercion (spec order).
                 let needle = self.to_js_string(arg0)?;
-                let sc: Vec<char> = s.chars().collect();
-                let nc: Vec<char> = needle.chars().collect();
-                let len = sc.len();
+                let len = unit_len(&s);
                 // position: ToNumber, then NaN -> search the whole string (per
-                // lastIndexOf), else ToInteger clamped to [0, len].
+                // lastIndexOf), else ToInteger clamped to [0, len]. A unit cap.
                 let cap = if args.len() >= 2 && args[1] != Value::UNDEFINED {
                     let np = self.to_number_coerce(args[1])?;
                     if np.is_nan() {
@@ -572,18 +635,26 @@ impl<'p> Vm<'p> {
                 } else {
                     len
                 };
-                let mut result: i64 = -1;
-                if nc.is_empty() {
-                    result = cap.min(len) as i64;
-                } else if nc.len() <= len {
-                    let max_start = (len - nc.len()).min(cap);
-                    for start in (0..=max_start).rev() {
-                        if sc[start..start + nc.len()] == nc[..] {
-                            result = start as i64;
+                let result: i64 = if needle.is_empty() {
+                    cap as i64
+                } else {
+                    // Last OVERLAPPING byte match whose start is ≤ the cap. A cap
+                    // that lands mid-pair floors to the pair's start (a match can
+                    // begin at the pair's lead unit, never at its trail).
+                    let cap_byte = crate::heap::unit_byte_bounds(&s, cap).0;
+                    let mut best: Option<usize> = None;
+                    let mut from = 0usize;
+                    while let Some(p) = s[from..].find(&needle) {
+                        let b = from + p;
+                        if b > cap_byte {
                             break;
                         }
+                        best = Some(b);
+                        // Restart one scalar later so overlapping matches are seen.
+                        from = b + s[b..].chars().next().map_or(1, |c| c.len_utf8());
                     }
-                }
+                    best.map_or(-1, |b| b2u(&s, b) as i64)
+                };
                 Ok(Some(Value::num(result as f64)))
             }
             // Annex B HTML wrapper methods (B.2.3): wrap the string in a tag, with
@@ -617,6 +688,37 @@ impl<'p> Vm<'p> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// `String.fromCharCode(...codes)`: each arg is ToUint16(ToNumber) — strict
+    /// ToNumber (ToPrimitive-aware, BigInt/Symbol → TypeError, a throwing valueOf
+    /// propagates), coerced in argument order. ADJACENT (high, low) surrogate
+    /// halves combine into the astral scalar they encode — this is how astral
+    /// chars enter via fromCharCode. A LONE surrogate half degrades to U+FFFD
+    /// (not representable until strings are WTF-8 — documented stage-1 limit).
+    pub(crate) fn string_from_char_codes(&mut self, args: &[Value]) -> Result<String, Thrown> {
+        let mut s = String::new();
+        let mut pending: Option<u16> = None; // a high half awaiting its low
+        for &v in args {
+            let u = crate::vm::helpers_num2::to_uint32(self.to_number_strict(v)?) as u16;
+            if let Some(h) = pending.take() {
+                if (0xDC00..=0xDFFF).contains(&u) {
+                    let cp = 0x10000 + (((h as u32) - 0xD800) << 10) + ((u as u32) - 0xDC00);
+                    s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                    continue;
+                }
+                s.push('\u{FFFD}'); // the high half stayed lone
+            }
+            match u {
+                0xD800..=0xDBFF => pending = Some(u),
+                0xDC00..=0xDFFF => s.push('\u{FFFD}'), // lone low half
+                _ => s.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}')),
+            }
+        }
+        if pending.is_some() {
+            s.push('\u{FFFD}'); // trailing lone high half
+        }
+        Ok(s)
     }
 
     /// String.prototype.replace / replaceAll with a NON-regexp searchValue.
@@ -676,6 +778,9 @@ impl<'p> Vm<'p> {
         let repl_str = if functional { String::new() } else { self.to_js_string(repl_v)? };
         // Match byte offsets (non-overlapping). An empty searchValue matches at
         // every char boundary including the end (replaceAll), or just position 0.
+        // (Spec: every UNIT boundary — the position between a surrogate pair's
+        // halves is skipped here since the splice can't represent the halves;
+        // exact once strings are WTF-8.)
         let positions: Vec<usize> = if search.is_empty() {
             if all {
                 let mut v: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
@@ -695,7 +800,8 @@ impl<'p> Vm<'p> {
             out.push_str(&s[last..pos]);
             if functional {
                 let m = self.alloc_str(search.clone());
-                let off = Value::num(byte_to_char(s, pos) as f64);
+                // The replacer's position argument is a UNIT position.
+                let off = Value::num(crate::heap::byte_to_units(s, pos) as f64);
                 let sv = self.alloc_str(s.to_string());
                 let r = self.call_value(repl_v, Value::UNDEFINED, &[m, off, sv])?;
                 let rs = self.to_js_string(r)?;

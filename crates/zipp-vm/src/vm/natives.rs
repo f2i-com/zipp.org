@@ -3186,13 +3186,9 @@ impl<'p> Vm<'p> {
             }
             // String static methods.
             STR_FROM_CHAR_CODE => {
-                let mut s = String::new();
-                for &v in args {
-                    // ToUint16(ToNumber(v)) — strict ToNumber (ToPrimitive-aware,
-                    // BigInt/Symbol → TypeError, a throwing valueOf propagates).
-                    let u = to_uint32(self.to_number_strict(v)?) as u16;
-                    s.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}'));
-                }
+                // ToUint16 per arg; adjacent surrogate halves combine — see
+                // `string_from_char_codes`.
+                let s = self.string_from_char_codes(args)?;
                 self.alloc_str(s)
             }
             STR_FROM_CODE_POINT => {

@@ -115,7 +115,7 @@ impl<'p> Vm<'p> {
                 proto.is_heap() && self.has_property(proto, key)
             }
             HeapObj::Str(s) => match array_index(key) {
-                Some(i) => i < s.char_len,
+                Some(i) => i < s.units(),
                 None => self.display(key) == "length",
             },
             HeapObj::Cons { len, .. } => match array_index(key) {
@@ -196,7 +196,7 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Boxed { kind: 0, value } = self.heap.get(idx) {
                     let v = *value;
                     let clen = match self.heap.get(v.heap_index()) {
-                        HeapObj::Str(s) => Some(s.char_len),
+                        HeapObj::Str(s) => Some(s.units()),
                         HeapObj::Cons { len, .. } => Some(*len),
                         _ => None,
                     };

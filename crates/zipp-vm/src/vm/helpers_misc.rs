@@ -139,16 +139,16 @@ pub(crate) extern "win64" fn jit_get_index(
             _ => Value::UNDEFINED.bits(),
         },
         // Flat ASCII string `s[i]`: mirror the interpreter's get_index Str path
-        // EXACTLY (vm.rs `get_index`, the `js.ascii` branch). The i-th char is
-        // the i-th byte, and a single ASCII char is interned at heap index ==
-        // its byte (Heap::new), so the result is that interned slot. In range →
+        // EXACTLY (the ASCII branch). The i-th unit is the i-th byte, and a
+        // single ASCII char is interned at heap index == its byte (Heap::new),
+        // so the result is that interned slot. In range →
         // that slot; out of range → undefined. Only the O(1)-and-identical
-        // flat-ASCII case is handled; a non-ASCII string (char-walk) or a rope
+        // flat-ASCII case is handled; a non-ASCII string (unit-walk) or a rope
         // `Cons` (must flatten first, a &mut op) deopts to the interpreter. A
         // negative/fractional/non-integer key (`array_index` → None) also defers
         // (the interpreter handles `s["length"]`, methods, etc.).
-        HeapObj::Str(s) if s.ascii => match array_index(key) {
-            Some(i) => match s.bytes.as_bytes().get(i) {
+        HeapObj::Str(s) if s.is_ascii() => match array_index(key) {
+            Some(i) => match s.as_bytes().get(i) {
                 Some(&b) => Value::heap(b as u32).bits(),
                 None => Value::UNDEFINED.bits(),
             },
@@ -240,8 +240,8 @@ pub(crate) extern "win64" fn jit_array_push(
     }
 }
 
-/// Win64 helper for a JIT'd `str.charCodeAt(i)` in a region. Returns the UTF
-/// scalar value (Int bits), NaN bits for an out-of-range index, or
+/// Win64 helper for a JIT'd `str.charCodeAt(i)` in a region. Returns the
+/// UTF-16 code unit at `i` (Int bits), NaN bits for an out-of-range index, or
 /// `SELF_CALL_DEOPT` for a non-int index / non-flat-string receiver (a rope or
 /// non-string → the interpreter, which flattens). O(1) for ASCII.
 ///
@@ -265,17 +265,12 @@ pub(crate) extern "win64" fn jit_char_code_at(
     // SAFETY: read-only view; the running region holds no conflicting borrow.
     let vm = unsafe { &*(vm as *const Vm) };
     match vm.heap.get(sv.heap_index()) {
-        HeapObj::Str(js) => {
-            let ch = if js.ascii {
-                js.bytes.as_bytes().get(i).map(|&b| b as char)
-            } else {
-                js.bytes.chars().nth(i)
-            };
-            match ch {
-                Some(c) => Value::int(c as i32).bits(),
-                None => Value::num(f64::NAN).bits(),
-            }
-        }
+        // The UTF-16 unit at `i` (O(1) ASCII byte fast path inside `unit_at`),
+        // matching the interpreter's `charCodeAt`.
+        HeapObj::Str(js) => match js.unit_at(i) {
+            Some(u) => Value::int(u as i32).bits(),
+            None => Value::num(f64::NAN).bits(),
+        },
         _ => crate::codegen::SELF_CALL_DEOPT, // rope/non-string → interpreter
     }
 }
@@ -367,7 +362,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             }
             return len_value(items.len()).bits();
         }
-        HeapObj::Str(s) if key == "length" => return len_value(s.char_len).bits(),
+        HeapObj::Str(s) if key == "length" => return len_value(s.units()).bits(),
         HeapObj::Cons { len, .. } if key == "length" => return len_value(*len).bits(),
         _ => return crate::codegen::SELF_CALL_DEOPT, // other array/string props → interpreter
     };

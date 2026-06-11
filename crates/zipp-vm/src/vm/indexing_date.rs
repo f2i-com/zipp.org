@@ -204,15 +204,16 @@ impl<'p> Vm<'p> {
                     // A single ASCII char is interned at heap index == its byte
                     // (see Heap::new), so return that slot DIRECTLY — no temporary
                     // 1-char String + re-intern per access (that alloc dominated
-                    // `s[i]` scans). O(1) for ASCII (i-th char == i-th byte); a
-                    // multi-byte string walks scalars (O(i), correct).
-                    if s.ascii {
-                        return Ok(match s.bytes.as_bytes().get(i) {
+                    // `s[i]` scans). O(1) for ASCII (i-th unit == i-th byte); a
+                    // multi-byte string decodes the UTF-16 unit at `i` (O(i)) —
+                    // a surrogate half reads as U+FFFD until strings are WTF-8.
+                    if s.is_ascii() {
+                        return Ok(match s.as_bytes().get(i) {
                             Some(&b) => Value::heap(b as u32),
                             None => Value::UNDEFINED,
                         });
                     }
-                    match s.bytes.chars().nth(i) {
+                    match s.unit_char(i) {
                         Some(ch) if (ch as u32) < 128 => return Ok(Value::heap(ch as u32)),
                         Some(ch) => {
                             let cs = ch.to_string();
@@ -223,10 +224,10 @@ impl<'p> Vm<'p> {
                 }
                 // Non-index key: `s["length"]`, else resolve via String.prototype
                 // (a computed method name / `@@iterator`), mirroring dot access.
-                let char_len = s.char_len;
+                let units = s.units();
                 let k = self.key_of(key);
                 if k == "length" {
-                    return Ok(len_value(char_len));
+                    return Ok(len_value(units));
                 }
                 self.get_prop(obj, &k)
             }

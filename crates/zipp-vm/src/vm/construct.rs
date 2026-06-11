@@ -2266,10 +2266,11 @@ impl<'p> Vm<'p> {
                 continue;
             }
             // Gather (key, val) pairs under the immutable borrow, then write.
-            // (A string source spreads as index→char, like an array.)
+            // (A string source spreads as index→1-UNIT string, like an array —
+            // the String exotic's own keys are unit positions.)
             let str_chars: Option<Vec<char>> = match self.heap.get(src.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                    Some(self.heap.str_cow(src.heap_index()).unwrap().chars().collect())
+                    Some(crate::heap::unit_chars(&self.heap.str_cow(src.heap_index()).unwrap()))
                 }
                 _ => None,
             };
@@ -2318,7 +2319,7 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Boxed { kind: 0, value } = self.heap.get(tidx) {
                     // A String wrapper's canonical index properties (and "length")
                     // are read-only.
-                    let slen = self.heap_char_len(value.heap_index());
+                    let slen = self.heap_str_units(value.heap_index());
                     let readonly = k == "length"
                         || k.parse::<usize>().ok().filter(|n| n.to_string() == k).map_or(false, |n| n < slen);
                     if readonly {
@@ -2350,10 +2351,10 @@ impl<'p> Vm<'p> {
         if !src.is_heap() {
             return Ok(m);
         }
-        // A string source spreads as index → char.
+        // A string source spreads as index → 1-UNIT string (unit-position keys).
         if matches!(self.heap.get(src.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
             let chars: Vec<char> =
-                self.heap.str_cow(src.heap_index()).unwrap().chars().collect();
+                crate::heap::unit_chars(&self.heap.str_cow(src.heap_index()).unwrap());
             for (i, c) in chars.into_iter().enumerate() {
                 let k = i.to_string();
                 if excluded.iter().any(|e| *e == k) {
@@ -2635,7 +2636,7 @@ impl<'p> Vm<'p> {
                     || self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
             }
             HeapObj::Str(s) => {
-                key == "length" || key.parse::<usize>().map_or(false, |i| i < s.char_len)
+                key == "length" || key.parse::<usize>().map_or(false, |i| i < s.units())
             }
             HeapObj::Cons { len, .. } => {
                 key == "length" || key.parse::<usize>().map_or(false, |i| i < *len)
@@ -2680,7 +2681,7 @@ impl<'p> Vm<'p> {
                 }
                 if let HeapObj::Boxed { kind: 0, value } = self.heap.get(obj.heap_index()) {
                     let clen = match self.heap.get(value.heap_index()) {
-                        HeapObj::Str(s) => Some(s.char_len),
+                        HeapObj::Str(s) => Some(s.units()),
                         HeapObj::Cons { len, .. } => Some(*len),
                         _ => None,
                     };

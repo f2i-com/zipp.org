@@ -1045,9 +1045,9 @@ impl<'p> Vm<'p> {
                                     .map(|i| map.keys[i].clone())
                                     .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
-                                // A STRING source: its chars are own enumerable
+                                // A STRING source: its UNITS are own enumerable
                                 // index properties (CopyDataProperties copies them).
-                                HeapObj::Str(st) => (0..st.char_len)
+                                HeapObj::Str(st) => (0..st.units())
                                     .map(|i| i.to_string())
                                     .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
@@ -1093,7 +1093,7 @@ impl<'p> Vm<'p> {
                                     .map(|i| map.keys[i].clone())
                                     .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
-                                HeapObj::Str(st) => (0..st.char_len)
+                                HeapObj::Str(st) => (0..st.units())
                                     .map(|i| i.to_string())
                                     .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
@@ -2258,15 +2258,10 @@ impl<'p> Vm<'p> {
                             S::NumberIsFinite => Value::bool(num_is_finite(a0)),
                             S::NumberIsSafeInteger => Value::bool(num_is_safe_integer(a0)),
                             S::StringFromCharCode => {
-                                // ToUint16(ToNumber(v)) per arg â€” strict ToNumber
-                                // (ToPrimitive-aware, BigInt/Symbol â†’ TypeError, a
-                                // throwing valueOf propagates rather than being
-                                // swallowed to 0).
-                                let mut s = String::new();
-                                for &v in &args {
-                                    let u = to_uint32(self.to_number_strict(v)?) as u16;
-                                    s.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}'));
-                                }
+                                // ToUint16(ToNumber(v)) per arg, in argument order;
+                                // adjacent (high, low) surrogate halves combine into
+                                // the astral scalar â€” see `string_from_char_codes`.
+                                let s = self.string_from_char_codes(&args)?;
                                 self.alloc_str(s)
                             }
                             S::ObjectAssign => self.object_assign(&args)?,
@@ -2572,7 +2567,7 @@ impl<'p> Vm<'p> {
                         let v = if o.is_heap() {
                             match self.heap.get(o.heap_index()) {
                                 HeapObj::Array(items) => len_value(items.len()),
-                                HeapObj::Str(s) => len_value(s.char_len),
+                                HeapObj::Str(s) => len_value(s.units()),
                                 HeapObj::Cons { len, .. } => len_value(*len),
                                 // for-of over a Map/Set iterates `size` slots (a
                                 // tombstoned/deleted entry doesn't count).
@@ -4467,25 +4462,42 @@ impl<'p> Vm<'p> {
                                 } {
                                     cursor += 1;
                                 }
-                                let len = match self.heap.get(it.heap_index()) {
-                                    HeapObj::Array(items) => items.len(),
-                                    HeapObj::Set(items) => items.len(),
-                                    HeapObj::Str(s) => s.char_len,
-                                    HeapObj::Cons { len, .. } => *len,
-                                    HeapObj::Map { keys, .. } => keys.len(),
-                                    _ => {
-                                        return Err(Thrown(format!(
-                                            "TypeError: {} is not iterable",
-                                            self.display(it)
-                                        )))
-                                    }
+                                // A STRING iterates by CODE POINT (one step per
+                                // scalar) while the cursor advances in UTF-16
+                                // units; flatten a rope first (no-op otherwise).
+                                self.heap.flatten(it.heap_index());
+                                let str_step = match self.heap.get(it.heap_index()) {
+                                    HeapObj::Str(s) => Some(s.cp_step(cursor)),
+                                    _ => None,
                                 };
-                                if cursor < len {
-                                    let val = self.get_index(it, Value::int(cursor as i32))?;
-                                    self.set(base, idx, Value::int((cursor + 1) as i32));
-                                    self.iter_result(val, false)
+                                if let Some(step) = str_step {
+                                    match step {
+                                        Some((c, next)) => {
+                                            let val = self.alloc_str(c.to_string());
+                                            self.set(base, idx, Value::int(next as i32));
+                                            self.iter_result(val, false)
+                                        }
+                                        None => self.iter_result(Value::UNDEFINED, true),
+                                    }
                                 } else {
-                                    self.iter_result(Value::UNDEFINED, true)
+                                    let len = match self.heap.get(it.heap_index()) {
+                                        HeapObj::Array(items) => items.len(),
+                                        HeapObj::Set(items) => items.len(),
+                                        HeapObj::Map { keys, .. } => keys.len(),
+                                        _ => {
+                                            return Err(Thrown(format!(
+                                                "TypeError: {} is not iterable",
+                                                self.display(it)
+                                            )))
+                                        }
+                                    };
+                                    if cursor < len {
+                                        let val = self.get_index(it, Value::int(cursor as i32))?;
+                                        self.set(base, idx, Value::int((cursor + 1) as i32));
+                                        self.iter_result(val, false)
+                                    } else {
+                                        self.iter_result(Value::UNDEFINED, true)
+                                    }
                                 }
                             }
                         };
@@ -4735,10 +4747,32 @@ impl<'p> Vm<'p> {
                         } {
                             cursor += 1;
                         }
+                        // A STRING iterates by CODE POINT (one step per scalar; an
+                        // astral char is ONE step) while the cursor advances in
+                        // UTF-16 units (matching `.length`). Flatten a rope first
+                        // (no-op tag check for everything else).
+                        self.heap.flatten(it.heap_index());
+                        let str_step = match self.heap.get(it.heap_index()) {
+                            HeapObj::Str(s) => Some(s.cp_step(cursor)),
+                            _ => None,
+                        };
+                        if let Some(step) = str_step {
+                            match step {
+                                Some((c, next)) => {
+                                    let val = self.alloc_str(c.to_string());
+                                    self.set(base, value_dst, val);
+                                    self.set(base, done_dst, Value::bool(false));
+                                    self.set(base, idx, Value::int(next as i32));
+                                }
+                                None => self.set(base, done_dst, Value::bool(true)),
+                            }
+                            ip += 1;
+                            continue;
+                        }
                         let len = match self.heap.get(it.heap_index()) {
                             HeapObj::Array(items) => items.len(),
                             HeapObj::Set(items) => items.len(),
-                            HeapObj::Str(s) => s.char_len,
+                            HeapObj::Str(s) => s.units(),
                             HeapObj::Cons { len, .. } => *len,
                             HeapObj::Map { keys, .. } => keys.len(),
                             // The LIVE length each step: a tracking view follows its
@@ -4818,25 +4852,42 @@ impl<'p> Vm<'p> {
                                 } {
                                     cursor += 1;
                                 }
-                                let len = match self.heap.get(it.heap_index()) {
-                                    HeapObj::Array(items) => items.len(),
-                                    HeapObj::Set(items) => items.len(),
-                                    HeapObj::Str(s) => s.char_len,
-                                    HeapObj::Cons { len, .. } => *len,
-                                    HeapObj::Map { keys, .. } => keys.len(),
-                                    _ => {
-                                        return Err(Thrown(format!(
-                                            "TypeError: {} is not iterable",
-                                            self.display(it)
-                                        )))
-                                    }
+                                // A STRING iterates by CODE POINT (one step per
+                                // scalar) while the cursor advances in UTF-16
+                                // units; flatten a rope first (no-op otherwise).
+                                self.heap.flatten(it.heap_index());
+                                let str_step = match self.heap.get(it.heap_index()) {
+                                    HeapObj::Str(s) => Some(s.cp_step(cursor)),
+                                    _ => None,
                                 };
-                                if cursor < len {
-                                    let val = self.get_index(it, Value::int(cursor as i32))?;
-                                    self.set(base, idx, Value::int((cursor + 1) as i32));
-                                    self.iter_result(val, false)
+                                if let Some(step) = str_step {
+                                    match step {
+                                        Some((c, next)) => {
+                                            let val = self.alloc_str(c.to_string());
+                                            self.set(base, idx, Value::int(next as i32));
+                                            self.iter_result(val, false)
+                                        }
+                                        None => self.iter_result(Value::UNDEFINED, true),
+                                    }
                                 } else {
-                                    self.iter_result(Value::UNDEFINED, true)
+                                    let len = match self.heap.get(it.heap_index()) {
+                                        HeapObj::Array(items) => items.len(),
+                                        HeapObj::Set(items) => items.len(),
+                                        HeapObj::Map { keys, .. } => keys.len(),
+                                        _ => {
+                                            return Err(Thrown(format!(
+                                                "TypeError: {} is not iterable",
+                                                self.display(it)
+                                            )))
+                                        }
+                                    };
+                                    if cursor < len {
+                                        let val = self.get_index(it, Value::int(cursor as i32))?;
+                                        self.set(base, idx, Value::int((cursor + 1) as i32));
+                                        self.iter_result(val, false)
+                                    } else {
+                                        self.iter_result(Value::UNDEFINED, true)
+                                    }
                                 }
                             }
                         };

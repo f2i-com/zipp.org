@@ -178,22 +178,256 @@ impl ObjMap {
 }
 
 /// A flat (contiguous) JS string with cached metadata so `.length` and indexing
-/// are O(1). `char_len` is the Unicode-scalar count (the engine measures
-/// `.length` in scalars throughout); `ascii` flags the common all-ASCII case,
-/// where the i-th character is the i-th byte — O(1) random access. Non-ASCII
-/// strings fall back to an O(i) `chars().nth(i)` walk (correct, just slower).
+/// are O(1) for the common all-ASCII case. `bytes` is always well-formed UTF-8
+/// at this stage (a lone surrogate is not representable — a WTF-8 payload is a
+/// later stage, which is why the fields are PRIVATE: every access funnels
+/// through the accessors below, so the representation can change under them).
+/// `units` caches the string's length in UTF-16 CODE UNITS — the measure of
+/// every JS-observable string position (`.length`, `charCodeAt`, `slice`, …).
+/// `ascii` flags the all-ASCII case, where the i-th unit is the i-th byte —
+/// O(1) random access. Non-ASCII strings decode with an O(i) walk (correct,
+/// just slower — matching the previous `chars().nth(i)` cost model).
 #[derive(Clone, Debug)]
 pub struct JsStr {
-    pub bytes: String,
-    pub char_len: usize,
-    pub ascii: bool,
+    bytes: String,
+    units: usize,
+    ascii: bool,
+}
+
+/// UTF-16 code units contributed by one Unicode scalar: 1 for BMP, 2 for an
+/// astral (supplementary-plane) scalar. This is THE unit/scalar switch — every
+/// positional helper below counts through it.
+#[inline]
+pub fn char_units(c: char) -> usize {
+    c.len_utf16()
+}
+
+/// UTF-16 code-unit length of a well-formed `&str`.
+pub fn str_units(s: &str) -> usize {
+    if s.is_ascii() {
+        s.len()
+    } else {
+        s.chars().map(char_units).sum()
+    }
+}
+
+/// Unit position of char-boundary byte offset `b` in `s` (clamped to the end).
+pub fn byte_to_units(s: &str, b: usize) -> usize {
+    str_units(&s[..b.min(s.len())])
+}
+
+/// Resolve unit position `u` in `s` to byte offsets, clamped to the end:
+/// `(floor, ceil)` are equal at a scalar boundary; a `u` that lands BETWEEN the
+/// halves of a surrogate pair gives the enclosing astral scalar's (start, end).
+pub fn unit_byte_bounds(s: &str, u: usize) -> (usize, usize) {
+    if u == 0 {
+        return (0, 0);
+    }
+    let mut units = 0usize;
+    for (b, c) in s.char_indices() {
+        if units == u {
+            return (b, b);
+        }
+        let n = char_units(c);
+        if units + n > u {
+            // `u` addresses this scalar's trail half (only possible when n == 2).
+            return (b, b + c.len_utf8());
+        }
+        units += n;
+    }
+    (s.len(), s.len())
+}
+
+/// Byte offset of unit position `u`, rounding a mid-pair position UP to the next
+/// scalar boundary — exact for SEARCH-START positions (a well-formed needle can
+/// never match starting at a trail unit). Anchored positions (`startsWith`/
+/// `endsWith`/`lastIndexOf` caps) use `unit_byte_bounds` to detect the split.
+pub fn unit_to_byte(s: &str, u: usize) -> usize {
+    unit_byte_bounds(s, u).1
+}
+
+/// Substring of `s` by UNIT positions `[a, b)`. A bound that splits a surrogate
+/// pair keeps U+FFFD for the covered half (a lone surrogate is not yet
+/// representable; the WTF-8 stage makes this exact). Pair-splitting bounds are
+/// the rare case — BMP-only positions slice exactly.
+pub fn slice_units_str(s: &str, a: usize, b: usize) -> String {
+    if a >= b {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut pos = 0usize;
+    for c in s.chars() {
+        if pos >= b {
+            break;
+        }
+        let n = char_units(c);
+        if pos >= a && pos + n <= b {
+            out.push(c);
+        } else if n == 2 && ((pos >= a && pos < b) || (pos + 1 >= a && pos + 1 < b)) {
+            // The window covers exactly one half of this pair.
+            out.push('\u{FFFD}');
+        }
+        pos += n;
+    }
+    out
+}
+
+/// The chars of `s` exploded into 1-UNIT pieces: each BMP scalar itself; an
+/// astral scalar contributes TWO pieces (its surrogate halves — degraded to
+/// U+FFFD until the WTF-8 stage). Backs `split('')` and string spread-into-
+/// object, whose elements are 1-unit strings per spec.
+pub fn unit_chars(s: &str) -> Vec<char> {
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        if char_units(c) == 1 {
+            out.push(c);
+        } else {
+            out.push('\u{FFFD}');
+            out.push('\u{FFFD}');
+        }
+    }
+    out
+}
+
+/// The `off`-th UTF-16 unit of scalar `c` (`off` 0 = the scalar itself / the
+/// high surrogate; 1 = the low surrogate of an astral scalar).
+#[inline]
+fn unit_of(c: char, off: usize) -> u16 {
+    let cp = c as u32;
+    if cp < 0x10000 {
+        cp as u16
+    } else {
+        let v = cp - 0x10000;
+        if off == 0 {
+            0xD800 | (v >> 10) as u16
+        } else {
+            0xDC00 | (v & 0x3FF) as u16
+        }
+    }
 }
 
 impl JsStr {
     pub fn new(bytes: String) -> JsStr {
         let ascii = bytes.is_ascii();
-        let char_len = if ascii { bytes.len() } else { bytes.chars().count() };
-        JsStr { bytes, char_len, ascii }
+        let units = if ascii { bytes.len() } else { str_units(&bytes) };
+        JsStr { bytes, units, ascii }
+    }
+
+    /// The content as `&str` — always valid (well-formed) at this stage. The
+    /// WTF-8 stage narrows this to the well-formed case (lossy elsewhere).
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.bytes
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes.as_bytes()
+    }
+
+    /// Length in UTF-16 code units — the JS `.length`.
+    #[inline]
+    pub fn units(&self) -> usize {
+        self.units
+    }
+
+    #[inline]
+    pub fn is_ascii(&self) -> bool {
+        self.ascii
+    }
+
+    /// Append one ASCII byte (the `s += digit` fast path), updating metadata.
+    #[inline]
+    pub fn push_ascii(&mut self, b: u8) {
+        debug_assert!(b < 128);
+        self.bytes.push(b as char);
+        self.units += 1;
+    }
+
+    /// Append a (well-formed) string, updating the cached metadata.
+    pub fn push_str(&mut self, add: &str) {
+        self.units += str_units(add);
+        self.ascii &= add.is_ascii();
+        self.bytes.push_str(add);
+    }
+
+    /// Locate unit position `i`: the scalar containing it and `i`'s offset
+    /// within that scalar's units (0 = lead, 1 = the trail of a pair). O(1)
+    /// for ASCII, O(i) otherwise.
+    fn locate_unit(&self, i: usize) -> Option<(char, usize)> {
+        if self.ascii {
+            return self.bytes.as_bytes().get(i).map(|&b| (b as char, 0));
+        }
+        if i >= self.units {
+            return None;
+        }
+        let mut pos = 0usize;
+        for c in self.bytes.chars() {
+            let n = char_units(c);
+            if i < pos + n {
+                return Some((c, i - pos));
+            }
+            pos += n;
+        }
+        None
+    }
+
+    /// The UTF-16 code unit at unit position `i` (a surrogate half for an
+    /// astral scalar) — `charCodeAt` semantics.
+    pub fn unit_at(&self, i: usize) -> Option<u16> {
+        self.locate_unit(i).map(|(c, off)| unit_of(c, off))
+    }
+
+    /// The 1-unit string content at unit position `i`: the BMP scalar itself,
+    /// or U+FFFD for either half of a surrogate pair (not representable alone
+    /// until the WTF-8 stage) — `charAt`/`at`/bracket-index semantics.
+    pub fn unit_char(&self, i: usize) -> Option<char> {
+        self.locate_unit(i)
+            .map(|(c, _)| if (c as u32) < 0x10000 { c } else { '\u{FFFD}' })
+    }
+
+    /// CodePointAt(unit position) per spec: the FULL code point when `i`
+    /// addresses a lead unit, or the trail surrogate's value when `i` lands in
+    /// the middle of a pair.
+    pub fn code_point_at(&self, i: usize) -> Option<u32> {
+        self.locate_unit(i)
+            .map(|(c, off)| if off == 0 { c as u32 } else { unit_of(c, 1) as u32 })
+    }
+
+    /// Substring by UNIT positions `[a, b)` (see `slice_units_str`). Not yet
+    /// called (string methods slice their owned clone via `slice_units_str`);
+    /// kept as the in-place accessor the WTF-8 stage's creation/observation
+    /// sites funnel through.
+    #[allow(dead_code)]
+    pub fn slice_units(&self, a: usize, b: usize) -> String {
+        if self.ascii {
+            let (a, b) = (a.min(self.bytes.len()), b.min(self.bytes.len()));
+            if a >= b {
+                String::new()
+            } else {
+                self.bytes[a..b].to_string()
+            }
+        } else {
+            slice_units_str(&self.bytes, a, b)
+        }
+    }
+
+    /// Iterate the code points (for-of/spread semantics — one item per scalar).
+    /// The WTF-8 stage extends this with a decoder that can yield lone
+    /// surrogates; keep callers agnostic of the underlying byte walk. (The
+    /// iteration sites currently read `str_cow(..).chars()` — they migrate
+    /// here when the byte payload stops being plain UTF-8.)
+    #[allow(dead_code)]
+    pub fn code_points(&self) -> impl Iterator<Item = char> + '_ {
+        self.bytes.chars()
+    }
+
+    /// One for-of step at unit position `pos`: the code point starting there
+    /// and the position one CODE POINT later (units advance by 1 or 2). `None`
+    /// once past the end.
+    pub fn cp_step(&self, pos: usize) -> Option<(char, usize)> {
+        self.locate_unit(pos)
+            .map(|(c, off)| (c, pos - off + char_units(c)))
     }
 }
 
@@ -776,10 +1010,10 @@ impl Heap {
         let mut objs = Vec::with_capacity(160);
         let mut versions = Vec::with_capacity(160);
         for b in 0u8..128 {
-            objs.push(HeapObj::Str(JsStr { bytes: (b as char).to_string(), char_len: 1, ascii: true }));
+            objs.push(HeapObj::Str(JsStr::new((b as char).to_string())));
             versions.push(0);
         }
-        objs.push(HeapObj::Str(JsStr { bytes: String::new(), char_len: 0, ascii: true }));
+        objs.push(HeapObj::Str(JsStr::new(String::new())));
         versions.push(0);
         let live = objs.len();
         Heap { objs, versions, free: Vec::new(), live, gc_requested: false, gc_threshold: GC_MIN_THRESHOLD }
@@ -902,6 +1136,9 @@ impl Heap {
     }
 
     /// Allocate a rope node over two string-like children (O(1) concatenation).
+    /// `len` is the children's combined length in the SAME measure as
+    /// `JsStr::units` (UTF-16 code units) — `str_units` of both sides summed,
+    /// which stays additive across concatenation.
     #[inline]
     pub fn alloc_cons(&mut self, left: u32, right: u32, len: usize) -> u32 {
         self.alloc(HeapObj::Cons { left, right, len })
@@ -913,11 +1150,12 @@ impl Heap {
         matches!(self.get(idx), HeapObj::Str(_) | HeapObj::Cons { .. })
     }
 
-    /// Character length of a string-like object — O(1): a rope stores it; a flat
-    /// `JsStr` caches it (computed once in `JsStr::new`). `None` if not a string.
-    pub fn str_char_len(&self, idx: u32) -> Option<usize> {
+    /// UTF-16 code-unit length of a string-like object (the JS `.length`) —
+    /// O(1): a rope stores it; a flat `JsStr` caches it (computed once in
+    /// `JsStr::new`). `None` if not a string.
+    pub fn str_units(&self, idx: u32) -> Option<usize> {
         match self.get(idx) {
-            HeapObj::Str(s) => Some(s.char_len),
+            HeapObj::Str(s) => Some(s.units()),
             HeapObj::Cons { len, .. } => Some(*len),
             _ => None,
         }
@@ -928,7 +1166,7 @@ impl Heap {
     #[inline]
     pub fn str_is_empty(&self, idx: u32) -> Option<bool> {
         match self.get(idx) {
-            HeapObj::Str(s) => Some(s.char_len == 0),
+            HeapObj::Str(s) => Some(s.units() == 0),
             HeapObj::Cons { len, .. } => Some(*len == 0),
             _ => None,
         }
@@ -943,7 +1181,7 @@ impl Heap {
         let mut stack = vec![idx];
         while let Some(n) = stack.pop() {
             match self.get(n) {
-                HeapObj::Str(s) => out.push_str(&s.bytes),
+                HeapObj::Str(s) => out.push_str(s.as_str()),
                 HeapObj::Cons { left, right, .. } => {
                     stack.push(*right);
                     stack.push(*left);
@@ -958,7 +1196,7 @@ impl Heap {
     /// `None` if `idx` isn't a string.
     pub fn str_cow(&self, idx: u32) -> Option<Cow<'_, str>> {
         match self.get(idx) {
-            HeapObj::Str(s) => Some(Cow::Borrowed(s.bytes.as_str())),
+            HeapObj::Str(s) => Some(Cow::Borrowed(s.as_str())),
             HeapObj::Cons { len, .. } => {
                 let mut out = String::with_capacity(*len);
                 self.write_str(idx, &mut out);
@@ -972,7 +1210,7 @@ impl Heap {
     /// both are already flat — the common case for a hot `a === b` comparison.
     pub fn str_eq(&self, a: u32, b: u32) -> bool {
         match (self.get(a), self.get(b)) {
-            (HeapObj::Str(x), HeapObj::Str(y)) => x.bytes == y.bytes,
+            (HeapObj::Str(x), HeapObj::Str(y)) => x.as_str() == y.as_str(),
             _ => {
                 let (mut sa, mut sb) = (String::new(), String::new());
                 self.write_str(a, &mut sa);

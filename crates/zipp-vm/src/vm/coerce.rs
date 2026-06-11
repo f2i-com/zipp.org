@@ -577,8 +577,8 @@ impl<'p> Vm<'p> {
                 // flat strings / ropes, so a `s += x` loop is O(n) overall.
                 let li = self.to_str_idx(pa);
                 let ri = self.to_str_idx(pb);
-                let llen = self.heap.str_char_len(li).unwrap_or(0);
-                let rlen = self.heap.str_char_len(ri).unwrap_or(0);
+                let llen = self.heap.str_units(li).unwrap_or(0);
+                let rlen = self.heap.str_units(ri).unwrap_or(0);
                 return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
             }
             return Ok(Value::num(self.to_number(pa)? + self.to_number(pb)?));
@@ -604,8 +604,7 @@ impl<'p> Vm<'p> {
             let n = val.as_int();
             if (0..=9).contains(&n) {
                 if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
-                    js.bytes.push((b'0' + n as u8) as char);
-                    js.char_len += 1;
+                    js.push_ascii(b'0' + n as u8);
                     return acc;
                 }
             }
@@ -615,11 +614,7 @@ impl<'p> Vm<'p> {
         let add: String = self.heap.str_cow(ri).map(|c| c.into_owned()).unwrap_or_default();
         if mutable {
             if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
-                let cl = add.chars().count();
-                let asc = add.is_ascii();
-                js.bytes.push_str(&add);
-                js.char_len += cl;
-                js.ascii &= asc;
+                js.push_str(&add); // updates the cached unit length + ascii flag
                 return acc;
             }
         }
@@ -1235,7 +1230,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Temporal { kind: 7, .. } => self.zdt_to_string(v.heap_index()),
                 HeapObj::Temporal { .. } => "[object Temporal]".into(),
                 HeapObj::Intl { .. } => "[object Object]".into(),
-                HeapObj::Str(s) => s.bytes.clone(),
+                HeapObj::Str(s) => s.as_str().to_string(),
                 HeapObj::Cons { .. } => {
                     let mut out = String::new();
                     self.heap.write_str(v.heap_index(), &mut out);
@@ -1314,7 +1309,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn inspect(&self, v: Value) -> String {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
-                HeapObj::Str(s) => return s.bytes.clone(), // top-level strings unquoted
+                HeapObj::Str(s) => return s.as_str().to_string(), // top-level strings unquoted
                 HeapObj::Cons { .. } => {
                     let mut out = String::new();
                     self.heap.write_str(v.heap_index(), &mut out);
@@ -1396,7 +1391,7 @@ impl<'p> Vm<'p> {
                 ];
                 format!("Intl.{} {{}}", NAMES.get(*kind as usize).copied().unwrap_or("?"))
             }
-            HeapObj::Str(s) => format!("'{}'", s.bytes),
+            HeapObj::Str(s) => format!("'{}'", s.as_str()),
             HeapObj::Cons { .. } => {
                 let mut out = String::new();
                 self.heap.write_str(v.heap_index(), &mut out);

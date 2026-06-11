@@ -825,10 +825,10 @@ impl<'p> Vm<'p> {
     /// `Object.getOwnPropertyDescriptor(obj, key)` — the property's descriptor, or
     /// undefined for a missing own property / non-object.
     /// If `obj` is a primitive String value or a boxed String (`new String(s)`),
-    /// return `(wrapped_string_value, char_len)` — the source of a String exotic's
-    /// own integer-index character properties and its non-writable `length`. The
-    /// reflective `Object.*` methods use this so a string (boxed by ToObject) reports
-    /// those exotic own props. `None` for any non-string value.
+    /// return `(wrapped_string_value, unit_len)` — the source of a String exotic's
+    /// own integer-index (UTF-16 unit) properties and its non-writable `length`.
+    /// The reflective `Object.*` methods use this so a string (boxed by ToObject)
+    /// reports those exotic own props. `None` for any non-string value.
     pub(crate) fn string_exotic_chars(&self, obj: Value) -> Option<(Value, usize)> {
         if !obj.is_heap() {
             return None;
@@ -836,9 +836,9 @@ impl<'p> Vm<'p> {
         let idx = obj.heap_index();
         if let HeapObj::Boxed { kind: 0, value } = self.heap.get(idx) {
             let v = *value;
-            return self.heap.str_char_len(v.heap_index()).map(|n| (v, n));
+            return self.heap.str_units(v.heap_index()).map(|n| (v, n));
         }
-        self.heap.str_char_len(idx).map(|n| (obj, n))
+        self.heap.str_units(idx).map(|n| (obj, n))
     }
 
     pub(crate) fn object_get_own_property_descriptor(&mut self, obj: Value, key: &str) -> Value {
@@ -2550,7 +2550,7 @@ impl<'p> Vm<'p> {
             // which then fails ToPropertyDescriptor (a non-object) → TypeError.
             HeapObj::Boxed { kind: 0, value } => {
                 let v = *value;
-                let n = self.heap.str_cow(v.heap_index()).map(|s| s.chars().count()).unwrap_or(0);
+                let n = self.heap.str_units(v.heap_index()).unwrap_or(0);
                 let mut ks: Vec<String> = (0..n).map(|i| i.to_string()).collect();
                 // Plus any own enumerable properties added to the String wrapper.
                 if let Some(m) = self.arr_props.get(&pidx) {
@@ -3786,7 +3786,7 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Str(s) => {
                 if key == "length" {
-                    Ok(len_value(s.char_len))
+                    Ok(len_value(s.units()))
                 } else {
                     self.proto_member_get(self.str_proto, key, obj)
                 }
