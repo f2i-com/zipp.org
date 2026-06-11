@@ -7070,6 +7070,66 @@ impl<'a> FnCompiler<'a> {
         // `obj.x++` / `arr[i]--` etc — read the member, yield old (postfix) or
         // new (prefix), write the incremented value back to the same slot.
         match &u.argument {
+            // `super.x++` / `--super.x` — read via the super-get sequence,
+            // coerce/step, write back via the super-set sequence.
+            ox::SimpleAssignmentTarget::StaticMemberExpression(m)
+                if matches!(&m.object, ox::Expression::Super(_)) =>
+            {
+                let pid = self.super_class;
+                if pid.is_none() && !self.super_home_obj {
+                    return Err("`super.x++` is only valid in a method".into());
+                }
+                self.this_check();
+                let name = self.string_name(m.property.name.as_str());
+                let cur = self.temp();
+                match pid {
+                    Some(p) => self.emit(Instr::SuperGet { dst: cur, home_class_id: p, name }),
+                    None => self.emit(Instr::SuperGetObj { dst: cur, name }),
+                }
+                let oldnum = self.temp();
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
+                let nw = self.temp();
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
+                match pid {
+                    Some(p) => self.emit(Instr::SuperSet { home_class_id: p, name, val: nw }),
+                    None => self.emit(Instr::SuperSetObj { name, val: nw }),
+                }
+                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
+                return Ok(dst);
+            }
+            // `super[k]++` / `--super[k]` — SuperProperty evaluation checks the
+            // this-TDZ BEFORE evaluating the key Expression
+            // (prop-expr-uninitialized-this-putvalue-increment), and the
+            // computed super ops capture GetSuperBase before ToPropertyKey.
+            ox::SimpleAssignmentTarget::ComputedMemberExpression(m)
+                if matches!(&m.object, ox::Expression::Super(_)) =>
+            {
+                let pid = self.super_class;
+                if pid.is_none() && !self.super_home_obj {
+                    return Err("`super[k]++` is only valid in a method".into());
+                }
+                self.this_check();
+                let key = self.expr(&m.expression)?;
+                let key_reg = self.alloc_reg();
+                if key != key_reg {
+                    self.emit(Instr::Move { dst: key_reg, src: key });
+                }
+                let cur = self.temp();
+                match pid {
+                    Some(p) => self.emit(Instr::SuperGetComputed { dst: cur, home_class_id: p, key: key_reg }),
+                    None => self.emit(Instr::SuperGetObjComputed { dst: cur, key: key_reg }),
+                }
+                let oldnum = self.temp();
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
+                let nw = self.temp();
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
+                match pid {
+                    Some(p) => self.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: nw }),
+                    None => self.emit(Instr::SuperSetObjComputed { key: key_reg, val: nw }),
+                }
+                self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
+                return Ok(dst);
+            }
             ox::SimpleAssignmentTarget::StaticMemberExpression(m) => {
                 let obj = self.expr(&m.object)?;
                 let name = self.string_name(m.property.name.as_str());
@@ -9105,7 +9165,9 @@ impl<'a> FnCompiler<'a> {
                     .ok_or("`super(...)` is only valid in a derived class constructor")?;
                 let args_arr = self.build_spread_args(&c.arguments)?;
                 self.emit(Instr::SuperCtorSpread { home_class_id: pid, args: args_arr });
-                self.emit(Instr::LoadUndefined { dst });
+                // `super(...)` evaluates to the new bound `this` (BindThisValue's
+                // result) — SuperCtorSpread rebinds reg 0 to it (call-expr-value).
+                self.emit(Instr::Move { dst, src: 0 });
                 return Ok(dst);
             }
             // `Math.max(...arr)` / `Math.min(...arr)` / `Math.hypot(...arr)` —
@@ -9213,7 +9275,9 @@ impl<'a> FnCompiler<'a> {
             // (Spread `super(...args)` is handled in the spread block above.)
             let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
             self.emit(Instr::SuperCtor { home_class_id: pid, arg_base, argc });
-            self.emit(Instr::LoadUndefined { dst }); // `super()` yields undefined here
+            // `super()` evaluates to the new bound `this` (BindThisValue's
+            // result) — SuperCtor rebinds reg 0 to it (call-expr-value).
+            self.emit(Instr::Move { dst, src: 0 });
             return Ok(dst);
         }
         // `super.method(args)` — call an inherited method with the current `this`.

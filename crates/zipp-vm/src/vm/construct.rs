@@ -1983,6 +1983,25 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// GetSuperConstructor() for a `super(...)` call: the LIVE [[GetPrototypeOf]]
+    /// of the active class object. The common case reads the static parent link
+    /// (`super_parent`); an `Object.setPrototypeOf(C, X)` override (recorded in
+    /// `proto_of`) retargets it — a non-constructor X is a TypeError thrown at
+    /// the SuperCall site (after ArgumentListEvaluation; call-proto-not-ctor).
+    pub(crate) fn super_ctor_func(&mut self, home_class_id: u32) -> Result<Value, Thrown> {
+        let not_ctor = || Thrown("TypeError: superclass is not a constructor".into());
+        let home = self.class_values.get(home_class_id as usize).copied().flatten();
+        if let Some(h) = home.filter(|h| h.is_heap()) {
+            if let Some(&p) = self.proto_of.get(&h.heap_index()) {
+                if !self.is_constructor(p) {
+                    return Err(not_ctor());
+                }
+                return Ok(p);
+            }
+        }
+        self.super_parent(home_class_id).ok_or_else(not_ctor)
+    }
+
     /// The super BASE object for a `super.x` reference inside a method of class
     /// `home_class_id`: GetPrototypeOf(HomeObject), where HomeObject is the class's
     /// own `prototype`. For `class C extends B` this is `B.prototype`; for a BASE
@@ -2014,7 +2033,9 @@ impl<'p> Vm<'p> {
     /// `super.key = v`: PutValue on a super reference. If the super base's prototype
     /// chain exposes a setter for `key`, invoke it with `this` = the receiver;
     /// otherwise create/update an own property on the receiver itself (the spec sets
-    /// on the receiver, not the prototype).
+    /// on the receiver, not the prototype). `strict` comes from the REFERENCE SITE
+    /// (class methods are always strict; an object-literal method in sloppy code is
+    /// not — a rejected write is then a silent no-op, prop-dot-obj-ref-non-strict).
     pub(crate) fn super_set(
         &mut self,
         home_class_id: u32,
@@ -2022,25 +2043,10 @@ impl<'p> Vm<'p> {
         this: Value,
         v: Value,
         is_static: bool,
+        strict: bool,
     ) -> Result<(), Thrown> {
         let proto = self.super_base(home_class_id, is_static);
-        // MakeSuperPropertyReference: RequireObjectCoercible(GetSuperBase()).
-        self.require_object_coercible(proto)?;
-        let setter = self.lookup_accessor(proto, key, true);
-        if self.is_callable(setter) {
-            self.call_value(setter, this, &[v])?;
-        } else {
-            // `super.x = v` PutValue sets on the receiver. `super` only appears in
-            // class methods, which are always strict — so a failed [[Set]] (e.g. a
-            // frozen receiver) is a TypeError, not a silent no-op.
-            // OrdinarySetWithOwnDescriptor consults Receiver.[[GetOwnProperty]]
-            // FIRST: a deferred-namespace receiver triggers evaluation, and a
-            // namespace receiver's uninit export throws ReferenceError.
-            self.defer_check(this, key)?;
-            self.ns_tdz_check(this, key)?;
-            self.set_prop(this, key, v, true)?;
-        }
-        Ok(())
+        self.super_set_obj(proto, key, this, v, strict)
     }
 
     /// The super BASE for an OBJECT-method `super.x`: GetPrototypeOf([[HomeObject]]),
@@ -2060,24 +2066,31 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `super.key = v` for an OBJECT method: like `super_set` but the base prototype
-    /// is already resolved from the home object. An inherited setter on the chain is
-    /// invoked with `this` = the receiver; otherwise the value is set on the receiver.
+    /// `super.key = v` with the base prototype already resolved (the class
+    /// variant resolves it via `super_base`, the object-method variant via the
+    /// [[HomeObject]]). An inherited setter on the chain is invoked with `this`
+    /// = the receiver; otherwise the value is set on the receiver, with the
+    /// REFERENCE SITE's strictness (a sloppy method's rejected write no-ops).
     pub(crate) fn super_set_obj(
         &mut self,
         proto: Value,
         key: &str,
         this: Value,
         v: Value,
+        strict: bool,
     ) -> Result<(), Thrown> {
+        // MakeSuperPropertyReference: RequireObjectCoercible(GetSuperBase()).
         self.require_object_coercible(proto)?;
         let setter = self.lookup_accessor(proto, key, true);
         if self.is_callable(setter) {
             self.call_value(setter, this, &[v])?;
         } else {
-            self.defer_check(this, key)?; // receiver [[GetOwnProperty]] may trigger
-            self.ns_tdz_check(this, key)?; // receiver [[GetOwnProperty]] (TDZ)
-            self.set_prop(this, key, v, true)?;
+            // OrdinarySetWithOwnDescriptor consults Receiver.[[GetOwnProperty]]
+            // FIRST: a deferred-namespace receiver triggers evaluation, and a
+            // namespace receiver's uninit export throws ReferenceError.
+            self.defer_check(this, key)?;
+            self.ns_tdz_check(this, key)?;
+            self.set_prop(this, key, v, strict)?;
         }
         Ok(())
     }

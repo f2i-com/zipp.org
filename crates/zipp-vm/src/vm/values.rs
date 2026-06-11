@@ -31,6 +31,12 @@ impl<'p> Vm<'p> {
                 if map.get(&k).is_some() {
                     return true;
                 }
+                // %Array.prototype% is an Array exotic: its `length` is a real
+                // own property (virtual, in arr_proto_len), so
+                // `"length" in Object.create(Array.prototype)` is true.
+                if k == "length" && idx == self.arr_proto && self.arr_proto != 0 {
+                    return true;
+                }
                 // Inherited method/getter/setter through the class chain.
                 let class = map.class;
                 let mut cur = class;
@@ -173,6 +179,12 @@ impl<'p> Vm<'p> {
                 // Exotic objects (boxed primitives, Date, Promise, RegExp, Weak*,
                 // …) keep their named own props in the arr_props side table.
                 if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
+                    return true;
+                }
+                // A RegExp instance's `lastIndex` is an own data property held
+                // in the heap object itself (not arr_props) —
+                // `"lastIndex" in re` is true.
+                if k == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
                     return true;
                 }
                 // A callable's assigned own properties (`fn.x = …`) live in the
@@ -667,6 +679,11 @@ impl<'p> Vm<'p> {
             if matches!(self.heap.get(idx), HeapObj::Object(m) if m.get(&k).is_some()) {
                 return Ok(true);
             }
+            // %Array.prototype%'s exotic `length` (virtual own prop) — mirrors
+            // has_property's Object arm.
+            if k == "length" && idx == self.arr_proto && self.arr_proto != 0 {
+                return Ok(true);
+            }
             let mut cur = match self.heap.get(idx) {
                 HeapObj::Object(m) => m.class,
                 _ => None,
@@ -703,6 +720,36 @@ impl<'p> Vm<'p> {
             return match proto {
                 Some(p) => self.has_property_dyn(p, key),
                 None => Ok(false),
+            };
+        }
+        // An ARRAY with a custom prototype chain can have a Proxy in it whose
+        // 'has' trap must fire with the right (target, key) arguments
+        // (has/call-in-prototype-index) — the immutable walk treats it as
+        // inert. Check the own properties (dense index / length / arr_props),
+        // then recurse dynamically up the ACTUAL chain.
+        if matches!(self.heap.get(idx), HeapObj::Array(_)) {
+            let k = self.key_of(key);
+            let int_index = array_index(key).or_else(|| match k.parse::<u32>() {
+                Ok(n) if n != u32::MAX && n.to_string() == k => Some(n as usize),
+                _ => None,
+            });
+            let own = if let Some(i) = int_index {
+                matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole())
+                    || self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
+            } else {
+                k == "length" || self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())
+            };
+            if own {
+                return Ok(true);
+            }
+            let proto = match self.proto_of.get(&idx) {
+                Some(&p) => p,
+                None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                None => Value::NULL,
+            };
+            return match proto.is_heap() {
+                true => self.has_property_dyn(proto, key),
+                false => Ok(false),
             };
         }
         // A TypedArray with a USER prototype chain can have a Proxy in it whose

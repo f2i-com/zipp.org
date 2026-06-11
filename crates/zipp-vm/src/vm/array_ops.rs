@@ -876,7 +876,8 @@ impl<'p> Vm<'p> {
     }
     /// Set(O, "length", n, true).
     fn al_set_len(&mut self, this: Value, n: i64) -> Result<(), Thrown> {
-        self.set_prop(this, "length", Value::num(n as f64), true)
+        self.set_prop(this, "length", Value::num(n as f64), true)?;
+        Ok(())
     }
     /// HasProperty(O, i) — proxy-aware (dispatches a Proxy `has` trap).
     fn al_has(&mut self, this: Value, i: i64) -> Result<bool, Thrown> {

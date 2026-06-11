@@ -2621,6 +2621,38 @@ impl<'p> Vm<'p> {
                 .map(|(k, _)| k.clone())
                 .collect()
         };
+        // A PROXY descriptor bag follows the spec protocol exactly:
+        // props.[[OwnPropertyKeys]]() (the ownKeys trap, or the target's
+        // ordinary integer-first key order when absent), then per key
+        // [[GetOwnProperty]] (the gopd trap — an undefined or non-enumerable
+        // result skips the key), then Get + ToPropertyDescriptor, with ALL
+        // descriptors collected/validated BEFORE any define lands on `obj`
+        // (defineProperties/proxy-no-ownkeys-returned-keys-order).
+        if self.proxy_parts(pidx).is_some() {
+            // `keys`/`pending` hold Values across user trap calls — hold GC off.
+            let _gc = self.gc_lock_guard();
+            let keys_arr = self.object_own_keys(props)?;
+            let keys = self.array_snapshot(keys_arr.heap_index());
+            let mut pending: Vec<(String, Value)> = Vec::new();
+            for kv in keys {
+                let k = self.key_of(kv);
+                let desc = self.proxy_gopd(props, &k)?.unwrap_or(Value::UNDEFINED);
+                if desc == Value::UNDEFINED {
+                    continue;
+                }
+                let en = self.get_prop(desc, "enumerable")?;
+                if !self.truthy(en) {
+                    continue;
+                }
+                let desc_obj = self.get_prop(props, &k)?;
+                self.read_descriptor(desc_obj)?; // ToPropertyDescriptor (validation)
+                pending.push((k, desc_obj));
+            }
+            for (k, d) in pending {
+                self.object_define_property(obj, &k, d)?;
+            }
+            return Ok(());
+        }
         // OwnPropertyKeys(ToObject(props)) filtered to enumerable. The descriptor
         // bag may be any object — a function (own props in fn_props) or an exotic
         // object (arr_props) — not only a plain Object.
@@ -2808,6 +2840,26 @@ impl<'p> Vm<'p> {
         while cur != 0 && guard < 64 {
             guard += 1;
             saw_obj_proto |= cur == self.obj_proto;
+            // A Proxy chain node: parent.[[Set]](P, V, Receiver) — its `set`
+            // trap fires with the ORIGINAL receiver (call-parameters-
+            // prototype-index); with no trap, [[Set]] forwards to the proxy's
+            // target — continue the walk from there with the same receiver.
+            if self.proxy_parts(cur).is_some() {
+                match self.proxy_set_bool(Value::heap(cur), &key, val, obj)? {
+                    Some(true) => return Ok(true),
+                    Some(false) => {
+                        self.reject_write(&key, strict)?;
+                        return Ok(true);
+                    }
+                    None => {
+                        cur = match self.proxy_parts(cur).map(|(t, _, _)| t) {
+                            Some(t) if t.is_heap() => t.heap_index(),
+                            _ => 0,
+                        };
+                        continue;
+                    }
+                }
+            }
             // A TypedArray chain node absorbs an INVALID index silently (report
             // handled — no write, no coercion, no reject); a valid index is a
             // plain writable data prop, so the caller writes the own element.
@@ -3902,8 +3954,10 @@ impl<'p> Vm<'p> {
                 } else {
                     // A method as a VALUE (`arr.map`, `arr.slice`, …) → Array.prototype,
                     // or the subclass prototype for a `class extends Array` instance.
+                    // Accessor-AWARE: a defineProperty'd getter on Array.prototype
+                    // is invoked with the array as receiver (15.2.3.6-4-579).
                     let eff = self.array_eff_proto(obj.heap_index());
-                    Ok(self.proto_member(eff, key))
+                    self.proto_member_get(eff, key, receiver)
                 }
             }
             HeapObj::Str(s) => {

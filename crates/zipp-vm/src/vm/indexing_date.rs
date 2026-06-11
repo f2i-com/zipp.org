@@ -288,7 +288,8 @@ impl<'p> Vm<'p> {
                 self.ta_coerce_for_set(idx, val)?;
                 return Ok(());
             }
-            return self.set_prop(obj, &k, val, strict);
+            self.set_prop(obj, &k, val, strict)?;
+            return Ok(());
         }
         // Callable / class computed assignment (`fn["x"] = v`, `C["s"] = v`) is
         // property assignment: route through `set_prop` (honours non-writable
@@ -304,7 +305,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Proxy { .. }
         ) {
             let k = self.key_of(key);
-            return self.set_prop(obj, &k, val, strict);
+            self.set_prop(obj, &k, val, strict)?;
+            return Ok(());
         }
         // An Array with a non-index key (`arr["foo"] = v`, `arr.length` is handled
         // in set_prop) is a NAMED property → route through set_prop (-> arr_props),
@@ -319,9 +321,11 @@ impl<'p> Vm<'p> {
             if canonical_index_str(&k).is_some()
                 && self.arr_props.get(&idx).map_or(false, |m| m.frozen)
             {
-                return self.reject_write(&k, strict);
+                self.reject_write(&k, strict)?;
+                return Ok(());
             }
-            return self.set_prop(obj, &k, val, strict);
+            self.set_prop(obj, &k, val, strict)?;
+            return Ok(());
         }
         // A defineProperty'd special index (accessor / non-writable / arr_props
         // value) is handled by set_prop's own-property path (override-aware) — its
@@ -333,7 +337,8 @@ impl<'p> Vm<'p> {
                 && self.array_index_override(idx, i).is_some()
             {
                 let k = self.key_of(key);
-                return self.set_prop(obj, &k, val, strict);
+                self.set_prop(obj, &k, val, strict)?;
+                return Ok(());
             }
         }
         // OrdinarySet prototype step: assigning an array index that is ABSENT as an
@@ -364,7 +369,8 @@ impl<'p> Vm<'p> {
             && matches!(self.heap.get(idx), HeapObj::Array(_))
             && self.arr_props.get(&idx).map_or(false, |m| m.frozen)
         {
-            return self.reject_write(&self.key_of(key), strict);
+            self.reject_write(&self.key_of(key), strict)?;
+            return Ok(());
         }
         // A NEW index (past the current length) on a non-extensible array adds an own
         // property → rejected (sloppy no-op / strict TypeError). An in-range index is
@@ -382,7 +388,8 @@ impl<'p> Vm<'p> {
                     || (self.array_length_nonwritable.contains(&idx)
                         && i >= self.js_array_len(idx)))
             {
-                return self.reject_write(&self.key_of(key), strict);
+                self.reject_write(&self.key_of(key), strict)?;
+            return Ok(());
             }
         }
         // An ARGUMENTS object's `length` is a fixed own data property (argc):
@@ -449,7 +456,8 @@ impl<'p> Vm<'p> {
             // `Array.prototype.<m>.call(dateLike, …)` saw zero elements.)
             _ => {
                 let k = self.key_of(key);
-                self.set_prop(obj, &k, val, strict)
+                self.set_prop(obj, &k, val, strict)?;
+                Ok(())
             }
         }
     }

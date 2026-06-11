@@ -2337,9 +2337,16 @@ impl<'p> Vm<'p> {
                     return Ok(Value::bool(false));
                 }
                 // A Proxy's [[Set]] is its `set` trap: Reflect.set reports the trap's
-                // boolean (an assignment swallows a falsish result). No trap → fall
-                // through to the OrdinarySet/forward path below.
+                // boolean (an assignment swallows a falsish result). With NO trap,
+                // [[Set]] forwards to the target with the SAME receiver — the
+                // receiver-aware forward also reports the [[Set]] boolean (a
+                // rejected exotic write — RegExp flags, fn length, a frozen
+                // target — must read false, not true).
                 if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
+                    return Ok(Value::bool(b));
+                }
+                if let Some((t, _, _)) = self.proxy_parts(a0.heap_index()) {
+                    let b = self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false)?;
                     return Ok(Value::bool(b));
                 }
                 // TypedArray [[Set]] (10.4.5.5) step 1, for any canonical numeric
@@ -2622,8 +2629,36 @@ impl<'p> Vm<'p> {
                 // THROW that propagates — only a rejected [[DefineOwnProperty]]
                 // (non-configurable redefine, non-extensible new key) returns false.
                 self.read_descriptor(desc)?;
+                // Whether a live defineProperty trap sits anywhere on a0's
+                // proxy chain (structural peek — no observable handler Get):
+                // a trap's ABRUPT completion (or an invariant violation) must
+                // PROPAGATE through Reflect.defineProperty
+                // (return-abrupt-from-result), while its falsish result — and
+                // any ordinary trap-less rejection — reads as false.
+                let mut define_trap = false;
+                let mut cur = a0;
+                while let Some((t, h, _)) = self.proxy_parts(cur.heap_index()) {
+                    if h.is_heap()
+                        && matches!(
+                            self.heap.get(h.heap_index()),
+                            HeapObj::Object(m) if m.get("defineProperty").is_some_and(|v| !v.is_nullish())
+                        )
+                    {
+                        define_trap = true;
+                        break;
+                    }
+                    cur = t;
+                }
                 match self.object_define_property(a0, &key, desc) {
                     Ok(()) => Value::bool(true),
+                    Err(e)
+                        if define_trap
+                            && !e.0.starts_with(
+                                "TypeError: proxy 'defineProperty' trap returned falsish",
+                            ) =>
+                    {
+                        return Err(e);
+                    }
                     Err(_) => Value::bool(false),
                 }
             }

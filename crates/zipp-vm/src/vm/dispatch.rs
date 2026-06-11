@@ -1493,8 +1493,11 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::SuperCtor { home_class_id, arg_base, argc } => {
-                        let parent = self.super_parent(home_class_id)
-                            .ok_or_else(|| Thrown("TypeError: superclass is not a constructor".into()))?;
+                        // GetSuperConstructor() is the LIVE [[GetPrototypeOf]] of
+                        // the class object: Object.setPrototypeOf(C, X) retargets
+                        // super(), and IsConstructor is checked AFTER the argument
+                        // registers were evaluated (call-proto-not-ctor).
+                        let parent = self.super_ctor_func(home_class_id)?;
                         let this = self.get(base, 0);
                         let mut args: Vec<Value> = Vec::with_capacity(argc as usize);
                         for i in 0..argc {
@@ -1510,8 +1513,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::SuperCtorSpread { home_class_id, args } => {
-                        let parent = self.super_parent(home_class_id)
-                            .ok_or_else(|| Thrown("TypeError: superclass is not a constructor".into()))?;
+                        let parent = self.super_ctor_func(home_class_id)?;
                         let this = self.get(base, 0);
                         let args_v = self.get(base, args);
                         let arg_vec = self.array_snapshot(args_v.heap_index());
@@ -1569,9 +1571,10 @@ impl<'p> Vm<'p> {
                         // ToPropertyKey(key), resolve on the super base with
                         // `this` = the current receiver, spread-call.
                         let kv = self.get(base, key);
+                        // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
+                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         let ks = self.coerce_index_key(kv)?;
                         let ks = self.key_of(ks);
-                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
                         let m = self.get_member(proto, &ks, this)?;
@@ -1603,8 +1606,12 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperGetComputed { dst, home_class_id, key } => {
                         let kv = self.get(base, key);
-                        let ks = self.to_property_key(kv)?;
+                        // GetSuperBase runs at MakeSuperPropertyReference time —
+                        // BEFORE GetValue's ToPropertyKey coercion (whose
+                        // toString may retarget the home object's prototype):
+                        // prop-expr-getsuperbase-before-topropertykey-*.
                         let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        let ks = self.to_property_key(kv)?;
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -1614,8 +1621,9 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperMethodComputed { dst, home_class_id, key, arg_base, argc } => {
                         let kv = self.get(base, key);
-                        let ks = self.to_property_key(kv)?;
+                        // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
                         let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        let ks = self.to_property_key(kv)?;
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -1634,16 +1642,21 @@ impl<'p> Vm<'p> {
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
                         let is_static = self.func(func_id as usize).super_static;
-                        self.super_set(home_class_id, &key, this, v, is_static)?;
+                        // PutValue strictness comes from the reference site (the
+                        // enclosing function) — class methods are always strict.
+                        let strict = self.func(func_id as usize).is_strict;
+                        self.super_set(home_class_id, &key, this, v, is_static, strict)?;
                         ip += 1;
                     }
                     Instr::SuperSetComputed { home_class_id, key, val } => {
                         let kv = self.get(base, key);
+                        // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
+                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         let ks = self.to_property_key(kv)?;
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
-                        let is_static = self.func(func_id as usize).super_static;
-                        self.super_set(home_class_id, &ks, this, v, is_static)?;
+                        let strict = self.func(func_id as usize).is_strict;
+                        self.super_set_obj(proto, &ks, this, v, strict)?;
                         ip += 1;
                     }
                     Instr::SetHomeObject { method, home } => {
@@ -1666,8 +1679,9 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperGetObjComputed { dst, key } => {
                         let kv = self.get(base, key);
-                        let ks = self.to_property_key(kv)?;
+                        // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        let ks = self.to_property_key(kv)?;
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
                         let r = self.get_member(proto, &ks, this)?;
@@ -1680,16 +1694,21 @@ impl<'p> Vm<'p> {
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
-                        self.super_set_obj(proto, &key, this, v)?;
+                        // A sloppy object-literal method's rejected super-write
+                        // is a silent no-op (prop-dot-obj-ref-non-strict).
+                        let strict = self.func(func_id as usize).is_strict;
+                        self.super_set_obj(proto, &key, this, v, strict)?;
                         ip += 1;
                     }
                     Instr::SuperSetObjComputed { key, val } => {
                         let kv = self.get(base, key);
-                        let ks = self.to_property_key(kv)?;
+                        // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        let ks = self.to_property_key(kv)?;
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
-                        self.super_set_obj(proto, &ks, this, v)?;
+                        let strict = self.func(func_id as usize).is_strict;
+                        self.super_set_obj(proto, &ks, this, v, strict)?;
                         ip += 1;
                     }
                     Instr::SuperMethodObj { dst, name, arg_base, argc } => {
@@ -1712,8 +1731,9 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperMethodObjComputed { dst, key, arg_base, argc } => {
                         let kv = self.get(base, key);
-                        let ks = self.to_property_key(kv)?;
+                        // GetSuperBase BEFORE ToPropertyKey (see SuperGetComputed).
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
+                        let ks = self.to_property_key(kv)?;
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
                         let m = self.get_member(proto, &ks, this)?;
