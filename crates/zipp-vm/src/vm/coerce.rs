@@ -1053,15 +1053,15 @@ impl<'p> Vm<'p> {
         {
             return Ok(None);
         }
-        // A Boxed SYMBOL finds Symbol.prototype[@@toPrimitive], which returns
-        // the wrapped symbol (so ToString(Object(sym)) THROWS instead of
-        // calling Symbol.prototype.toString). Other Boxed kinds have no
-        // @@toPrimitive on their prototype chains - no hook.
-        if let HeapObj::Boxed { kind, value } = self.heap.get(v.heap_index()) {
-            if *kind == 3 {
-                return Ok(Some(*value));
+        // A Boxed SYMBOL falls through to the real GetMethod lookup: it finds
+        // Symbol.prototype[@@toPrimitive] (returning the wrapped symbol, so
+        // ToString(Object(sym)) THROWS) — unless user code deleted/redefined
+        // the hook, in which case ordinary toString/valueOf semantics apply.
+        // Other Boxed kinds have no @@toPrimitive on their chains - no hook.
+        if let HeapObj::Boxed { kind, .. } = self.heap.get(v.heap_index()) {
+            if *kind != 3 {
+                return Ok(None);
             }
-            return Ok(None);
         }
         // GetMethod(v, @@toPrimitive): undefined/null → no hook (None); a
         // present-but-not-callable @@toPrimitive is a TypeError, not a fallthrough.
