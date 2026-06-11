@@ -1463,14 +1463,34 @@ impl<'p> Vm<'p> {
             self.pending_throw = Some(e);
             return Err(Thrown(msg));
         }
-        // A typed import ({type:'json'|'text'}) builds a synthetic namespace
-        // with a single `default` export; unknown types reject.
+        // A typed import ({type:'json'|'text'|'bytes'}) builds a synthetic
+        // namespace with a single `default` export; unknown types reject.
         if let Some(t) = mtype {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|_| Thrown("TypeError: module not found".into()))?;
             let val = match t {
-                "json" => self.json_parse(&text)?,
-                "text" => self.alloc_str(text),
+                // CreateBytesModule: the raw file bytes as a Uint8Array over
+                // an IMMUTABLE ArrayBuffer (read as binary — a PNG fixture is
+                // not UTF-8).
+                "bytes" => {
+                    let bytes = std::fs::read(&path)
+                        .map_err(|_| Thrown("TypeError: module not found".into()))?;
+                    let buf = self
+                        .heap
+                        .alloc(HeapObj::ArrayBuffer { data: bytes, detached: false });
+                    if self.arraybuffer_proto != 0 {
+                        self.proto_of.insert(buf, Value::heap(self.arraybuffer_proto));
+                    }
+                    self.immutable_buffers.insert(buf);
+                    // kind 1 = Uint8Array (TA_KINDS); view over the whole buffer.
+                    self.build_typed_array(1, &[Value::heap(buf)])?
+                }
+                "json" | "text" => {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|_| Thrown("TypeError: module not found".into()))?;
+                    match t {
+                        "json" => self.json_parse(&text)?,
+                        _ => self.alloc_str(text),
+                    }
+                }
                 _ => {
                     return Err(Thrown(format!(
                         "TypeError: unsupported module type '{t}'"
