@@ -288,6 +288,23 @@ fn rewrite_string_accumulators(f: &mut FuncProto, is_top_level: bool) {
     }
 }
 
+
+/// The `type` import attribute of an import/export-from declaration's
+/// `with { ... }` clause, if present.
+fn with_clause_type(wc: &Option<oxc_allocator::Box<ox::WithClause>>) -> Option<String> {
+    let wc = wc.as_ref()?;
+    for e in &wc.with_entries {
+        let key = match &e.key {
+            ox::ImportAttributeKey::Identifier(id) => id.name.as_str(),
+            ox::ImportAttributeKey::StringLiteral(s) => s.value.as_str(),
+        };
+        if key == "type" {
+            return Some(e.value.value.to_string());
+        }
+    }
+    None
+}
+
 pub fn compile_program(prog: &ox::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, false)
 }
@@ -1221,12 +1238,14 @@ impl Compiler {
                                     local_slot: slot,
                                     import: ImportName::DeferNamespace,
                                     specifier: d.source.value.to_string(),
+                                    mtype: with_clause_type(&d.with_clause),
                                 });
                             } else {
                                 fc.cx.module_imports.push(ImportEntry {
                                     local_slot: u32::MAX,
                                     import: ImportName::LoadOnly,
                                     specifier: d.source.value.to_string(),
+                                    mtype: with_clause_type(&d.with_clause),
                                 });
                             }
                             continue;
@@ -1255,6 +1274,7 @@ impl Compiler {
                                         local_slot: slot,
                                         import,
                                         specifier: spec.clone(),
+                                        mtype: with_clause_type(&d.with_clause),
                                     });
                                 }
                             }
@@ -1263,6 +1283,7 @@ impl Compiler {
                                     local_slot: u32::MAX,
                                     import: ImportName::SideEffect,
                                     specifier: spec.clone(),
+                                    mtype: with_clause_type(&d.with_clause),
                                 });
                             }
                         }
@@ -1273,6 +1294,7 @@ impl Compiler {
                                 local_slot: u32::MAX,
                                 import: ImportName::SideEffect,
                                 specifier: srcspec.value.to_string(),
+                                mtype: with_clause_type(&e.with_clause),
                             });
                         }
                     }
@@ -1281,6 +1303,7 @@ impl Compiler {
                             local_slot: u32::MAX,
                             import: ImportName::SideEffect,
                             specifier: e.source.value.to_string(),
+                            mtype: with_clause_type(&e.with_clause),
                         });
                     }
                     _ => {}

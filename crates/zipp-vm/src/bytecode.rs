@@ -764,6 +764,9 @@ pub struct ImportEntry {
     pub local_slot: u32,
     pub import: ImportName,
     pub specifier: String,
+    /// The `type` import attribute (`with { type: "json" }`), driving the
+    /// loader's synthetic JSON/text module semantics. None = ordinary module.
+    pub mtype: Option<String>,
 }
 
 #[derive(Clone, Debug)]

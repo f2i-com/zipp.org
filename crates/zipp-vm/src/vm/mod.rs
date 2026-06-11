@@ -517,6 +517,10 @@ pub struct Vm<'p> {
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep.
     error_data: std::collections::HashSet<u32>,
+    /// Typed-module cache: (canonical path, type attribute) → namespace for
+    /// `with { type: "json" | "text" }` imports — DISTINCT records from the
+    /// same file's JS module. Values are GC roots like module_cache.
+    typed_module_cache: std::collections::HashMap<(std::path::PathBuf, String), Value>,
     /// The function VALUE being invoked for the generator/async allocation in
     /// flight (set by the call site just before alloc_generator /
     /// alloc_async / alloc_async_generator; consumed at their entry).

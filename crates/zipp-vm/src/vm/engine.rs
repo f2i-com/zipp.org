@@ -180,6 +180,7 @@ impl<'p> Vm<'p> {
             immutable_buffers: std::collections::HashSet::new(),
             error_data: std::collections::HashSet::new(),
             fn_name_cells: std::collections::HashSet::new(),
+            typed_module_cache: std::collections::HashMap::new(),
             pending_gen_callee: Value::UNDEFINED,
             gen_callee: std::collections::HashMap::new(),
             eval_script_gdi: false,
@@ -1375,8 +1376,18 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         let path = std::fs::canonicalize(raw_path)
             .map_err(|_| Thrown("TypeError: module not found".into()))?;
-        if let Some(&ns) = self.module_cache.get(&path) {
-            return Ok(ns);
+        // A typed import is a DISTINCT module record from the same file's JS
+        // module (e.g. a module importing ITSELF with { type: "text" }):
+        // cached under (path, type), checked before the JS cache.
+        if let Some(t) = mtype {
+            if let Some(&ns) = self.typed_module_cache.get(&(path.clone(), t.to_string())) {
+                return Ok(ns);
+            }
+        }
+        if mtype.is_none() {
+            if let Some(&ns) = self.module_cache.get(&path) {
+                return Ok(ns);
+            }
         }
         // A module that already FAILED evaluation re-throws the SAME error on
         // every later import (its abrupt completion is permanent).
@@ -1403,7 +1414,8 @@ impl<'p> Vm<'p> {
             let slot = (self.globals.len() - 1) as u32;
             let ns_idx = self.alloc_empty_namespace();
             self.populate_module_namespace(ns_idx, &[("default".to_string(), slot)]);
-            self.module_cache.insert(path.clone(), Value::heap(ns_idx));
+            self.typed_module_cache
+                .insert((path.clone(), t.to_string()), Value::heap(ns_idx));
             return Ok(Value::heap(ns_idx));
         }
         let code = std::fs::read_to_string(&path)
@@ -1537,8 +1549,11 @@ impl<'p> Vm<'p> {
                     None => std::path::PathBuf::from(&e.specifier),
                 };
                 let dep_canon = std::fs::canonicalize(&dep_raw).unwrap_or_else(|_| dep_raw.clone());
-                let is_self = dep_canon == path;
-                let in_flight = !is_self && self.module_loading.contains(&dep_canon);
+                // A TYPED import (json/text) is a DISTINCT module record even
+                // for the importing file itself — never self/in-flight.
+                let is_self = dep_canon == path && e.mtype.is_none();
+                let in_flight =
+                    !is_self && e.mtype.is_none() && self.module_loading.contains(&dep_canon);
                 use crate::bytecode::ImportName as IN;
                 match &e.import {
                     IN::LoadOnly => {
@@ -1556,7 +1571,7 @@ impl<'p> Vm<'p> {
                     }
                     IN::SideEffect => {
                         if !is_self && !in_flight {
-                            self.import_module_sync(&dep_raw, None)?;
+                            self.import_module_sync(&dep_raw, e.mtype.as_deref())?;
                         }
                     }
                     IN::Named(n) => {
@@ -1600,7 +1615,7 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         } else {
-                            match self.resolve_export(&dep_raw, n)? {
+                            match self.resolve_export(&dep_raw, n, e.mtype.as_deref())? {
                                 Some(slot) => {
                                     import_aliases.insert(e.local_slot, slot);
                                 }
@@ -1648,7 +1663,7 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         } else {
-                            match self.resolve_export(&dep_raw, "default")? {
+                            match self.resolve_export(&dep_raw, "default", e.mtype.as_deref())? {
                                 Some(slot) => {
                                     import_aliases.insert(e.local_slot, slot);
                                 }
@@ -1667,7 +1682,7 @@ impl<'p> Vm<'p> {
                             // after it exists.
                             self_ns_locals.push(e.local_slot);
                         } else {
-                            let ns = self.import_module_sync(&dep_raw, None)?;
+                            let ns = self.import_module_sync(&dep_raw, e.mtype.as_deref())?;
                             ns_writes.push((e.local_slot, ns));
                         }
                     }
@@ -1904,7 +1919,7 @@ impl<'p> Vm<'p> {
                 Some(d) => d.join(spec),
                 None => std::path::PathBuf::from(spec),
             };
-            if let Some(slot) = self.resolve_export(&dep, imported)? {
+            if let Some(slot) = self.resolve_export(&dep, imported, None)? {
                 full.push((exported.clone(), slot));
             } else {
                 return Err(Thrown(format!(
@@ -1952,9 +1967,20 @@ impl<'p> Vm<'p> {
         &mut self,
         raw_path: &std::path::Path,
         name: &str,
+        mtype: Option<&str>,
     ) -> Result<Option<u32>, Thrown> {
         let dep = std::fs::canonicalize(raw_path)
             .map_err(|_| Thrown("TypeError: module not found".into()))?;
+        // A TYPED request (json/text) is its own module record: resolve via
+        // the typed loader, never the (possibly in-flight) JS module's
+        // registries — a file may import ITSELF as text.
+        if mtype.is_some() {
+            let ns = self.import_module_sync(&dep, mtype)?;
+            return Ok(self
+                .module_namespaces
+                .get(&ns.heap_index())
+                .and_then(|m| m.get(name).copied()));
+        }
         let ambiguous_check = |vm: &Self, ns_idx: u32| -> Result<(), Thrown> {
             if vm.module_ambiguous.get(&ns_idx).is_some_and(|s| s.contains(name)) {
                 return Err(Thrown(format!(
@@ -1984,7 +2010,7 @@ impl<'p> Vm<'p> {
         if let Some(m) = self.module_own.get(&dep) {
             return Ok(m.get(name).copied());
         }
-        let ns = self.import_module_sync(&dep, None)?;
+        let ns = self.import_module_sync(&dep, mtype)?;
         ambiguous_check(self, ns.heap_index())?;
         Ok(self
             .module_namespaces
@@ -2237,7 +2263,7 @@ impl<'p> Vm<'p> {
         }
         let Some((reex, stars, pdir)) = self.module_pending_reexports.get(dep).cloned() else {
             // Completed (or never in-flight): normal resolution.
-            return self.resolve_export(dep, name);
+            return self.resolve_export(dep, name, None);
         };
         let join = |pdir: Option<&std::path::Path>, spec: &str| -> std::path::PathBuf {
             let raw = match pdir {
