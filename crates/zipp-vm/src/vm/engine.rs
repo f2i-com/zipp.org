@@ -2480,6 +2480,11 @@ impl<'p> Vm<'p> {
                             *home_class += base_class;
                         }
                     }
+                    Instr::FieldInit { class_id, .. } => {
+                        if *class_id != u32::MAX {
+                            *class_id += base_class;
+                        }
+                    }
                     _ => {}
                 }
             }

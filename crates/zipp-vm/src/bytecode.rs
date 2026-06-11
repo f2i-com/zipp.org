@@ -322,9 +322,12 @@ pub enum Instr {
     /// in source order. Read later by `FieldInit`.
     PushFieldKey { class: Reg, key: Reg },
     /// `this[key] = val` for the `key_index`-th computed instance field, run in a
-    /// constructor: looks up the key from the instance's class `computed_field_keys`
-    /// (eval-once at class definition) and assigns. `this` is reg 0.
-    FieldInit { key_index: u16, val: Reg },
+    /// constructor: looks up the key from `class_id`'s runtime class value's
+    /// `computed_field_keys` (eval-once at class definition) and assigns —
+    /// resolved by the EXECUTING class, not `this`'s class, because a parent
+    /// constructor's return-override makes `this` a foreign object.
+    /// `class_id == u32::MAX` falls back to `this`'s class. `this` is reg 0.
+    FieldInit { key_index: u16, val: Reg, class_id: u32 },
     /// `dst = Array(args…)` / `new Array(args…)`: a single numeric arg makes an
     /// array of that length (holes → undefined); otherwise an array of the args.
     ArrayCtor { dst: Reg, arg_base: Reg, argc: u16 },

@@ -1415,19 +1415,36 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
-                    Instr::FieldInit { key_index, val } => {
+                    Instr::FieldInit { key_index, val, class_id } => {
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
-                        // The computed key was evaluated once at class definition and
-                        // stored on this instance's class.
-                        let key = match self.heap.get(this.heap_index()) {
-                            HeapObj::Object(m) => m.class.and_then(|cidx| {
-                                match self.heap.get(cidx) {
-                                    HeapObj::Class(c) => c.computed_field_keys.get(key_index as usize).copied(),
+                        // The computed key was evaluated once at class definition.
+                        // Resolve via the EXECUTING class (a parent's return-
+                        // override makes `this` a foreign object — possibly with
+                        // no class link at all); fall back to `this`'s class for
+                        // the sentinel (a base class, no override possible).
+                        let key = if class_id != u32::MAX {
+                            self.class_values
+                                .get(class_id as usize)
+                                .copied()
+                                .flatten()
+                                .filter(|cv| cv.is_heap())
+                                .and_then(|cv| match self.heap.get(cv.heap_index()) {
+                                    HeapObj::Class(c) => {
+                                        c.computed_field_keys.get(key_index as usize).copied()
+                                    }
                                     _ => None,
-                                }
-                            }),
-                            _ => None,
+                                })
+                        } else {
+                            match self.heap.get(this.heap_index()) {
+                                HeapObj::Object(m) => m.class.and_then(|cidx| {
+                                    match self.heap.get(cidx) {
+                                        HeapObj::Class(c) => c.computed_field_keys.get(key_index as usize).copied(),
+                                        _ => None,
+                                    }
+                                }),
+                                _ => None,
+                            }
                         };
                         if let Some(key) = key {
                             // CreateDataPropertyOrThrow (an own define, prototype

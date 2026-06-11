@@ -1645,7 +1645,11 @@ impl Compiler {
                     t
                 }
             };
-            fc.emit(Instr::FieldInit { key_index: i as u16, val: v });
+            fc.emit(Instr::FieldInit {
+                key_index: i as u16,
+                val: v,
+                class_id: fc.super_class.unwrap_or(u32::MAX),
+            });
             fc.next_reg = save;
         }
         for s in body {
