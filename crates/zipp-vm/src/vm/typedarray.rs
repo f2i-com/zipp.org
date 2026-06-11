@@ -57,9 +57,25 @@ impl<'p> Vm<'p> {
         }
     }
     pub(crate) fn alloc_array_buffer(&mut self, byte_len: usize) -> u32 {
-        let idx = self.heap.alloc(HeapObj::ArrayBuffer { data: vec![0u8; byte_len], detached: false });
+        let idx = self.heap.alloc(HeapObj::ArrayBuffer { data: vec![0u8; byte_len].into(), detached: false });
         if self.arraybuffer_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.arraybuffer_proto));
+        }
+        idx
+    }
+    /// Allocate a SharedArrayBuffer: TRULY-SHARED bytes (`AbData::Shared`, so a
+    /// worker agent handed this buffer aliases the same memory), marked in
+    /// `shared_buffers` and linked to %SharedArrayBuffer.prototype%. A growable
+    /// SAB preallocates `maxByteLength` zeroed bytes; `grow` is a length store.
+    pub(crate) fn alloc_shared_array_buffer(&mut self, byte_len: usize, max: Option<usize>) -> u32 {
+        let mem = crate::heap::SharedMem::new(byte_len, max.unwrap_or(byte_len));
+        let idx = self.heap.alloc(HeapObj::ArrayBuffer {
+            data: crate::heap::AbData::Shared(std::sync::Arc::new(mem)),
+            detached: false,
+        });
+        self.shared_buffers.insert(idx);
+        if self.sab_proto != 0 {
+            self.proto_of.insert(idx, Value::heap(self.sab_proto));
         }
         idx
     }
@@ -380,17 +396,20 @@ impl<'p> Vm<'p> {
     }
 
     /// `new SharedArrayBuffer(length[, {maxByteLength}])`. Reuses the ArrayBuffer
-    /// representation + length/maxByteLength validation, then marks the buffer
-    /// shared and links it to %SharedArrayBuffer.prototype%. A SAB is growable
-    /// (never shrinks/detaches); the `maxByteLength` option makes `grow` available.
+    /// length/maxByteLength validation, then allocates truly-shared storage,
+    /// marks the buffer shared and links it to %SharedArrayBuffer.prototype%.
+    /// A SAB is growable (never shrinks/detaches); the `maxByteLength` option
+    /// makes `grow` available.
     pub(crate) fn build_shared_array_buffer(&mut self, args: &[Value]) -> Result<Value, Thrown> {
-        let v = self.build_array_buffer(args)?;
-        let idx = v.heap_index();
-        self.shared_buffers.insert(idx);
-        if self.sab_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.sab_proto));
+        let (n, max_byte_length) = self.validate_array_buffer_args(args)?;
+        if n > MAX_ARRAY_BUFFER_LEN as usize {
+            return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
         }
-        Ok(v)
+        let idx = self.alloc_shared_array_buffer(n, max_byte_length);
+        if let Some(m) = max_byte_length {
+            self.ab_max.insert(idx, m);
+        }
+        Ok(Value::heap(idx))
     }
 
     /// Validate an Atomics receiver/index: the receiver must be an INTEGER
@@ -662,9 +681,46 @@ impl<'p> Vm<'p> {
             return Ok(Value::num(woken));
         }
         // load / store / read-modify-write. (Immutable-buffer writes already threw in
-        // atomic_validate, before any coercion.)
+        // atomic_validate, before any coercion.) An element backed by a SHARED
+        // (SAB) buffer is accessed with REAL atomic instructions (SeqCst) at its
+        // byte address, so worker-agent threads observe the op atomically; a
+        // Local buffer keeps the plain single-threaded path. The Arc + offset
+        // stay valid across the value coercions below (shared storage never
+        // moves), and the observable coercion order is identical on both paths.
+        let elem_size = native::TA_KINDS[kind as usize].1;
+        let sab_target: Option<(std::sync::Arc<crate::heap::SharedMem>, usize)> =
+            match self.heap.get(ti) {
+                HeapObj::TypedArray { buffer, byte_offset, .. } => {
+                    let off = byte_offset + i * elem_size;
+                    match self.heap.get(*buffer) {
+                        HeapObj::ArrayBuffer { data, .. } => {
+                            data.shared().map(|m| (m.clone(), off))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
         if is_bigint {
             let v_in = if op == "load" { 0 } else { self.to_bigint(a2)? };
+            if let Some((mem, off)) = sab_target {
+                if off + elem_size <= mem.capacity() {
+                    let repl = if op == "compareExchange" {
+                        self.to_bigint(args.get(3).copied().unwrap_or(Value::UNDEFINED))?
+                    } else {
+                        0
+                    };
+                    let old = sab_atomic_op(&mem, kind, off, op, v_in as i64, repl as i64);
+                    // NumericToRawBytes wrapped the operand to 64 bits for the
+                    // memory op; `store` still RETURNS the unwrapped ToBigInt.
+                    let old_b: i128 = if kind == 9 { old as i128 } else { (old as u64) as i128 };
+                    return Ok(if op == "store" {
+                        self.make_bigint(v_in)
+                    } else {
+                        self.make_bigint(old_b)
+                    });
+                }
+            }
             let cur = self.ta_element_get(ti, i);
             let old = self.to_bigint(cur)?;
             match op {
@@ -706,6 +762,24 @@ impl<'p> Vm<'p> {
             }
         } else {
             let v_in = if op == "load" { 0 } else { self.to_integer_or_zero(a2)? };
+            if let Some((mem, off)) = sab_target {
+                if off + elem_size <= mem.capacity() {
+                    let repl = if op == "compareExchange" {
+                        self.to_integer_or_zero(args.get(3).copied().unwrap_or(Value::UNDEFINED))?
+                    } else {
+                        0
+                    };
+                    let old = sab_atomic_op(&mem, kind, off, op, v_in, repl);
+                    // The operand wraps to the element type inside the memory
+                    // op (NumericToRawBytes); `store` still RETURNS the
+                    // unwrapped ToIntegerOrInfinity value.
+                    return Ok(if op == "store" {
+                        Value::num(v_in as f64)
+                    } else {
+                        Value::num(old as f64)
+                    });
+                }
+            }
             let cur = self.ta_element_get(ti, i);
             let old_i = cur.as_f64() as i64;
             match op {
@@ -1022,4 +1096,64 @@ impl<'p> Vm<'p> {
         Ok(Some(self.make_bigint(r)))
     }
 
+}
+
+/// One `Atomics.<op>` data access on a truly-shared (SAB-backed) element,
+/// performed with REAL atomic instructions (SeqCst everywhere) so concurrent
+/// agent threads observe it atomically. `off` is the element's absolute byte
+/// offset within `mem`; it is element-size aligned (a TypedArray's
+/// `byteOffset` is element-aligned by construction and the SharedMem base is
+/// 8-byte aligned). `v`/`repl` are the already-coerced operand(s) — they wrap
+/// to the element type here, per NumericToRawBytes. Returns the OLD element
+/// value (current value for `load`), sign/zero-extended to `i64` per the
+/// element kind; the `store` return is unused (callers return the input).
+fn sab_atomic_op(
+    mem: &crate::heap::SharedMem,
+    kind: u8,
+    off: usize,
+    op: &str,
+    v: i64,
+    repl: i64,
+) -> i64 {
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::atomic::*;
+    macro_rules! go {
+        ($aty:ty, $ity:ty) => {{
+            // SAFETY: `off + size <= capacity` (caller-checked), the pointer is
+            // element-aligned (see fn doc), and the allocation is fixed for the
+            // life of the Arc — so this reference is valid; concurrent access
+            // from other agent threads is exactly what the atomic type permits.
+            let a = unsafe { &*(mem.base_ptr().add(off) as *const $aty) };
+            let vv = v as $ity;
+            let old: $ity = match op {
+                "load" => a.load(SeqCst),
+                "store" => {
+                    a.store(vv, SeqCst);
+                    vv
+                }
+                "add" => a.fetch_add(vv, SeqCst),
+                "sub" => a.fetch_sub(vv, SeqCst),
+                "and" => a.fetch_and(vv, SeqCst),
+                "or" => a.fetch_or(vv, SeqCst),
+                "xor" => a.fetch_xor(vv, SeqCst),
+                "exchange" => a.swap(vv, SeqCst),
+                "compareExchange" => match a.compare_exchange(vv, repl as $ity, SeqCst, SeqCst) {
+                    Ok(o) | Err(o) => o,
+                },
+                _ => a.load(SeqCst),
+            };
+            old as i64
+        }};
+    }
+    match kind {
+        0 => go!(AtomicI8, i8),
+        // Kind 2 (Uint8Clamped) never reaches Atomics (rejected in validation).
+        1 | 2 => go!(AtomicU8, u8),
+        3 => go!(AtomicI16, i16),
+        4 => go!(AtomicU16, u16),
+        5 => go!(AtomicI32, i32),
+        6 => go!(AtomicU32, u32),
+        9 => go!(AtomicI64, i64),
+        _ => go!(AtomicU64, u64),
+    }
 }

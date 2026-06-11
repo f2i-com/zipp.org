@@ -1284,7 +1284,7 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("RangeError: ArrayBuffer resize length out of range".into()));
                 }
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(idx) {
-                    data.resize(n as usize, 0u8);
+                    data.resize_bytes(n as usize);
                 }
                 Ok(Some(Value::UNDEFINED))
             }
@@ -1300,8 +1300,11 @@ impl<'p> Vm<'p> {
                 if n < len as i64 || n as usize > max {
                     return Err(Thrown("RangeError: SharedArrayBuffer grow length out of range".into()));
                 }
+                // A Shared store grows by an atomic length store (the bytes are
+                // preallocated to maxByteLength, zeroed); Local falls back to a
+                // Vec resize.
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(idx) {
-                    data.resize(n as usize, 0u8);
+                    data.resize_bytes(n as usize);
                 }
                 Ok(Some(Value::UNDEFINED))
             }
@@ -1337,14 +1340,13 @@ impl<'p> Vm<'p> {
                     if sp == Value::NULL { Value::UNDEFINED } else { sp }
                 };
                 let new_idx = if species == Value::UNDEFINED {
-                    let b = self.alloc_array_buffer(new_len);
                     if is_shared {
-                        self.shared_buffers.insert(b);
-                        if self.sab_proto != 0 {
-                            self.proto_of.insert(b, Value::heap(self.sab_proto));
-                        }
+                        // A SAB slice is a NEW SharedArrayBuffer (copied bytes,
+                        // not aliased memory) — allocate truly-shared storage.
+                        self.alloc_shared_array_buffer(new_len, None)
+                    } else {
+                        self.alloc_array_buffer(new_len)
                     }
-                    b
                 } else {
                     if !self.is_constructor(species) {
                         return Err(Thrown(
@@ -1431,7 +1433,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let bytes: Vec<u8> = match self.heap.get(idx) {
-                    HeapObj::ArrayBuffer { data, .. } => data.clone(),
+                    HeapObj::ArrayBuffer { data, .. } => data.to_vec(),
                     _ => Vec::new(),
                 };
                 let new_idx = self.alloc_array_buffer(new_len);
@@ -1440,9 +1442,11 @@ impl<'p> Vm<'p> {
                     data[..n].copy_from_slice(&bytes[..n]);
                 }
                 self.immutable_buffers.insert(new_idx);
-                // Detach the source.
+                // Detach the source. (A SAB never reaches transfer — the native
+                // brand check rejects shared receivers — so `data` is Local; the
+                // resize_bytes(0) clear keeps the quirk fast path total anyway.)
                 if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(idx) {
-                    data.clear();
+                    data.resize_bytes(0);
                     *detached = true;
                 }
                 Ok(Some(Value::heap(new_idx)))
@@ -1515,7 +1519,7 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: Cannot transfer an immutable ArrayBuffer".into()));
                 }
                 let bytes: Vec<u8> = match self.heap.get(idx) {
-                    HeapObj::ArrayBuffer { data, .. } => data.clone(),
+                    HeapObj::ArrayBuffer { data, .. } => data.to_vec(),
                     _ => Vec::new(),
                 };
                 let new_idx = self.alloc_array_buffer(new_len);
@@ -1530,7 +1534,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(idx) {
-                    data.clear();
+                    data.resize_bytes(0);
                     *detached = true;
                 }
                 Ok(Some(Value::heap(new_idx)))

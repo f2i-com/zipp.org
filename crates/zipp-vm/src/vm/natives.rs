@@ -2731,7 +2731,9 @@ impl<'p> Vm<'p> {
                 if let Some(buf) = self.as_array_buffer(a0) {
                     if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buf) {
                         *detached = true;
-                        data.clear();
+                        // resize_bytes(0) == clear for a Local Vec; a (harness-
+                        // detached) Shared store drops its visible length to 0.
+                        data.resize_bytes(0);
                     }
                 }
                 Value::NULL

@@ -923,13 +923,10 @@ impl<'p> Vm<'p> {
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
                 return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
             }
-            let buf = self.alloc_array_buffer(n);
+            // Truly-shared storage (marks shared_buffers + links sab_proto).
+            let buf = self.alloc_shared_array_buffer(n, max);
             if let Some(m) = max {
                 self.ab_max.insert(buf, m);
-            }
-            self.shared_buffers.insert(buf);
-            if self.sab_proto != 0 {
-                self.proto_of.insert(buf, Value::heap(self.sab_proto));
             }
             return Ok(self.set_ctor_proto(Value::heap(buf), over));
         }
@@ -1563,7 +1560,8 @@ impl<'p> Vm<'p> {
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
                 return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
             }
-            *self.heap.get_mut(oidx) = HeapObj::ArrayBuffer { data: vec![0u8; n], detached: false };
+            *self.heap.get_mut(oidx) =
+                HeapObj::ArrayBuffer { data: vec![0u8; n].into(), detached: false };
             if let Some(m) = max {
                 self.ab_max.insert(oidx, m);
             }

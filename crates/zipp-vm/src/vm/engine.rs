@@ -1475,7 +1475,7 @@ impl<'p> Vm<'p> {
                         .map_err(|_| Thrown("TypeError: module not found".into()))?;
                     let buf = self
                         .heap
-                        .alloc(HeapObj::ArrayBuffer { data: bytes, detached: false });
+                        .alloc(HeapObj::ArrayBuffer { data: bytes.into(), detached: false });
                     if self.arraybuffer_proto != 0 {
                         self.proto_of.insert(buf, Value::heap(self.arraybuffer_proto));
                     }

@@ -13,6 +13,8 @@
 
 use crate::value::Value;
 use std::borrow::Cow;
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A JS object: insertion-ordered string-keyed properties.
 #[derive(Clone, Debug, Default)]
@@ -346,6 +348,186 @@ pub struct AsyncGenState {
     pub queue: Vec<(Value, u32)>,
 }
 
+/// An ArrayBuffer's byte storage. A plain `ArrayBuffer` owns its bytes per-VM
+/// (`Local`); a `SharedArrayBuffer` holds an `Arc` to process-shared memory
+/// (`Shared`) so agents on other threads alias the SAME bytes — cloning the
+/// heap object (or handing the buffer to a worker agent) clones the Arc, never
+/// the memory, which is exactly SharedArrayBuffer semantics. `Deref<[u8]>` /
+/// `DerefMut` make almost every byte access (`data.len()`, `&data[a..b]`,
+/// `data[i] = x`, `copy_from_slice`) work unchanged on both variants.
+#[derive(Clone, Debug)]
+pub enum AbData {
+    Local(Vec<u8>),
+    Shared(std::sync::Arc<SharedMem>),
+}
+
+/// The process-shared byte store behind a `SharedArrayBuffer`. The backing
+/// allocation is FIXED at construction (a growable SAB preallocates
+/// `maxByteLength` bytes, zeroed); only the visible byte length moves, via an
+/// atomic store, so `grow` never reallocates and raw pointers held by other
+/// agent threads stay valid forever (the `Arc` keeps the allocation alive).
+/// Storage is allocated as `u64` words so the base is 8-byte aligned: Atomics
+/// element accesses cast interior pointers to `AtomicU8`..`AtomicU64`, and a
+/// TypedArray's `byteOffset` is element-size aligned by construction.
+pub struct SharedMem {
+    buf: UnsafeCell<Box<[u64]>>,
+    /// Fixed capacity in bytes (== `maxByteLength`; == the initial length for a
+    /// non-growable SAB).
+    cap: usize,
+    /// Current visible byte length (`grow` stores Release; readers load Acquire).
+    len: AtomicUsize,
+}
+
+// SAFETY: `SharedMem` is the engine's model of JS shared memory, which is racy
+// BY SPEC (ECMA-262 memory model): concurrent non-atomic accesses to a
+// SharedArrayBuffer may tear, and that is a permitted outcome for non-atomic
+// ops. The allocation itself is fixed (never moved/freed while an Arc holds
+// it) and `len` only changes through an atomic. Atomic ops (Atomics.*) go
+// through real atomic instructions on interior pointers, never through the
+// plain slice views.
+unsafe impl Send for SharedMem {}
+unsafe impl Sync for SharedMem {}
+
+impl SharedMem {
+    /// Allocate `cap` bytes of zeroed shared storage with `len` initially
+    /// visible (`len <= cap`; a non-growable SAB passes `len == cap`).
+    pub fn new(len: usize, cap: usize) -> SharedMem {
+        let words = cap.div_ceil(8).max(1);
+        SharedMem {
+            buf: UnsafeCell::new(vec![0u64; words].into_boxed_slice()),
+            cap,
+            len: AtomicUsize::new(len.min(cap)),
+        }
+    }
+    /// The current visible byte length.
+    #[inline]
+    pub fn byte_len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+    /// Fixed capacity in bytes (`maxByteLength`).
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+    /// Move the visible length (clamped to capacity). `grow` only ever raises
+    /// it; the shrink direction (engine-internal quirk paths only — spec SABs
+    /// never shrink) zeroes the dropped tail so a later grow re-exposes zeroes,
+    /// matching `Vec::resize` semantics on the Local variant.
+    pub fn set_byte_len(&self, n: usize) {
+        let n = n.min(self.cap);
+        let old = self.len.swap(n, Ordering::AcqRel);
+        if n < old {
+            // SAFETY: n..old is within the fixed allocation; single-VM quirk
+            // path (no concurrent agents reach a shrinking SAB).
+            unsafe {
+                std::ptr::write_bytes(self.base_ptr().add(n), 0, old - n);
+            }
+        }
+    }
+    /// Raw base pointer (8-byte aligned) — for the Atomics element accesses.
+    #[inline]
+    pub fn base_ptr(&self) -> *mut u8 {
+        unsafe { (*self.buf.get()).as_mut_ptr() as *mut u8 }
+    }
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the allocation is fixed and outlives `self`; see the
+        // Send/Sync note for why cross-thread tearing is acceptable here.
+        unsafe { std::slice::from_raw_parts(self.base_ptr(), self.byte_len()) }
+    }
+}
+
+impl std::fmt::Debug for SharedMem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedMem")
+            .field("len", &self.byte_len())
+            .field("cap", &self.cap)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AbData {
+    /// Current byte length (Shared: the visible length, not the capacity).
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            AbData::Local(v) => v.len(),
+            AbData::Shared(m) => m.byte_len(),
+        }
+    }
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// The mutable `Vec` for STRUCTURAL mutations (detach-clear / resize /
+    /// transfer) — `None` for a Shared buffer, whose allocation is fixed
+    /// (callers either error first or route length changes via
+    /// [`AbData::resize_bytes`]). Reserved for paths that must distinguish the
+    /// variants; the current sites all go through `resize_bytes`.
+    #[inline]
+    #[allow(dead_code)]
+    pub fn local_mut(&mut self) -> Option<&mut Vec<u8>> {
+        match self {
+            AbData::Local(v) => Some(v),
+            AbData::Shared(_) => None,
+        }
+    }
+    /// The shared store, when this is a SharedArrayBuffer's data.
+    #[inline]
+    pub fn shared(&self) -> Option<&std::sync::Arc<SharedMem>> {
+        match self {
+            AbData::Local(_) => None,
+            AbData::Shared(m) => Some(m),
+        }
+    }
+    /// Structural resize to `n` bytes: Local resizes the Vec (zero-filling
+    /// growth); Shared stores the new visible length (the allocation is
+    /// preallocated to `maxByteLength` — callers validate `n <= max`).
+    pub fn resize_bytes(&mut self, n: usize) {
+        match self {
+            AbData::Local(v) => v.resize(n, 0u8),
+            AbData::Shared(m) => m.set_byte_len(n),
+        }
+    }
+}
+
+impl From<Vec<u8>> for AbData {
+    #[inline]
+    fn from(v: Vec<u8>) -> AbData {
+        AbData::Local(v)
+    }
+}
+
+impl std::ops::Deref for AbData {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            AbData::Local(v) => v,
+            AbData::Shared(m) => m.as_slice(),
+        }
+    }
+}
+
+impl std::ops::DerefMut for AbData {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            AbData::Local(v) => v,
+            // SAFETY (engine contract): JS SharedArrayBuffer memory is racy by
+            // spec — tearing on concurrent non-atomic access is a permitted
+            // outcome, so handing out a byte view of shared memory is sound
+            // for the engine's usage. Within one VM the heap hands out only
+            // one buffer borrow at a time; Atomics ops never use this path
+            // (they use real atomic instructions on SharedMem directly).
+            AbData::Shared(m) => unsafe {
+                std::slice::from_raw_parts_mut(m.base_ptr(), m.byte_len())
+            },
+        }
+    }
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -471,8 +653,9 @@ pub enum HeapObj {
     /// apply ToLength, invoking its `valueOf` at the spec-mandated time.
     RegExp { regex: Box<regress::Regex>, source: String, flags: String, last_index: Value },
     /// A JS `ArrayBuffer` — a raw byte buffer backing TypedArrays/DataViews.
-    /// `detached` is set by transfer (we never detach via GC); `data` is the bytes.
-    ArrayBuffer { data: Vec<u8>, detached: bool },
+    /// `detached` is set by transfer (we never detach via GC); `data` is the bytes
+    /// ([`AbData`]: per-VM `Local` for ArrayBuffers, `Shared` for SharedArrayBuffers).
+    ArrayBuffer { data: AbData, detached: bool },
     /// A JS TypedArray view (`Int8Array`, `Float64Array`, …). `kind` indexes the
     /// element type (see `vm::native::TA_KINDS`); `buffer` is the backing
     /// `ArrayBuffer`'s heap index; `byte_offset`/`length` (in elements) frame the view.
