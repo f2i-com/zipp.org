@@ -2648,6 +2648,32 @@ impl<'a> FnCompiler<'a> {
             }
             S::SwitchStatement(s) => self.switch_stmt(s)?,
             S::ReturnStatement(r) => {
+                // Proper tail call: strict `return f(args)` in an UNPROTECTED
+                // context (no try handlers, no enclosing loop with an iterator
+                // to close, no using scope, not generator/async/script/eval)
+                // reuses the current frame — constant stack for tail
+                // recursion. The TailCall prefix falls through to the
+                // ordinary Call+Return for non-plain callees.
+                if let Some(ox::Expression::CallExpression(c)) = &r.argument {
+                    if self.tail_call_position() && self.tail_callable(c) {
+                        let save = self.next_reg;
+                        let ct = self.alloc_reg();
+                        let cv = self.expr_into(&c.callee, ct)?;
+                        if cv != ct {
+                            self.emit(Instr::Move { dst: ct, src: cv });
+                        }
+                        let exprs: Vec<&ox::Expression> =
+                            c.arguments.iter().filter_map(|a| a.as_expression()).collect();
+                        let arg_base = self.eval_contiguous(&exprs)?;
+                        let argc = exprs.len() as u16;
+                        self.emit(Instr::TailCall { callee: ct, arg_base, argc });
+                        let dst = self.alloc_reg();
+                        self.emit(Instr::Call { dst, callee: ct, arg_base, argc });
+                        self.emit(Instr::Return { src: dst });
+                        self.next_reg = save;
+                        return Ok(());
+                    }
+                }
                 // Evaluate the return value FIRST (its side effects precede the
                 // iterator closes), then run IteratorClose on every enclosing for-of /
                 // for-await-of (innermost first) — a `return` is an abrupt completion
@@ -7289,6 +7315,41 @@ impl<'a> FnCompiler<'a> {
             // Unreachable: the inner class binding is const (is_const above threw).
             Binding::ClassName(_) => {}
         }
+    }
+
+    /// Whether the current compile position allows a PROPER TAIL CALL: a
+    /// strict function body with nothing to unwind through on return — no
+    /// try handlers, no enclosing loop holding an iterator to close, no
+    /// `using` scope — and not a generator/async/script/eval body (their
+    /// returns thread extra machinery).
+    fn tail_call_position(&self) -> bool {
+        self.cx.in_strict
+            && !self.is_script
+            && self.handler_depth == 0
+            && self.completion_reg.is_none()
+            && self.using_scope_reg.is_none()
+            && !self.in_generator
+            && !self.in_async
+            && !self.in_param_init
+            && self.loop_ctx.iter().all(|c| c.iter_close.is_none())
+    }
+
+    /// Whether the call expression itself is tail-callable: a plain
+    /// (non-optional, spread-free) call whose callee carries no receiver —
+    /// an identifier (except direct `eval`) or another plain call.
+    fn tail_callable(&self, c: &ox::CallExpression) -> bool {
+        if c.optional || c.arguments.iter().any(|a| a.as_expression().is_none()) {
+            return false;
+        }
+        fn callee_ok(e: &ox::Expression) -> bool {
+            match e {
+                ox::Expression::Identifier(id) => id.name != "eval",
+                ox::Expression::CallExpression(inner) => !inner.optional,
+                ox::Expression::ParenthesizedExpression(p) => callee_ok(&p.expression),
+                _ => false,
+            }
+        }
+        callee_ok(&c.callee)
     }
 
     /// Assignment-reference SNAPSHOT for a sloppy direct-eval zone: PutValue

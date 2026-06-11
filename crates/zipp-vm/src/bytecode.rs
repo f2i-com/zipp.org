@@ -593,6 +593,12 @@ pub enum Instr {
     /// `dst = delete obj[key]` — computed property delete (strict: throw on false).
     DeleteIndex { dst: Reg, obj: Reg, key: Reg, strict: bool },
 
+    /// Proper-tail-call prefix (strict `return f(args)` in an unprotected
+    /// context): when the callee is a PLAIN function/closure, REUSE the
+    /// current frame (constant stack for tail recursion) and never fall
+    /// through; any other callee falls through to the ordinary Call+Return
+    /// the compiler emits right after.
+    TailCall { callee: Reg, arg_base: Reg, argc: u16 },
     /// Call `callee` with `argc` arguments staged in registers
     /// `[arg_base, arg_base+argc)`. Result lands in `dst`.
     Call { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },

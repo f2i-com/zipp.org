@@ -3491,6 +3491,102 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
 
+                    Instr::TailCall { callee, arg_base, argc } => {
+                        // Proper tail call: REUSE this frame for a PLAIN
+                        // function/closure callee (constant stack). Any other
+                        // callee (native/bound/class/generator/async/primitive)
+                        // falls through to the Call+Return emitted after.
+                        let callee_v = self.get(base, callee);
+                        let plain = if callee_v.is_heap() {
+                            match self.heap.get(callee_v.heap_index()) {
+                                HeapObj::Func(id) => Some((*id, NO_CLOSURE)),
+                                HeapObj::Closure { func, .. } => {
+                                    Some((*func, callee_v.heap_index()))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let Some((fid, closure)) = plain else {
+                            ip += 1;
+                            continue;
+                        };
+                        let (callee_regs, callee_params, rest_reg, arguments_reg, p_strict, p_lex, simple) = {
+                            let p = self.func(fid as usize);
+                            if p.is_generator || p.is_async {
+                                ip += 1;
+                                continue;
+                            }
+                            (
+                                (p.reg_count as usize).max(1),
+                                p.param_count as usize,
+                                p.rest_reg,
+                                p.arguments_reg,
+                                p.is_strict,
+                                p.lexical_this,
+                                p.simple_params,
+                            )
+                        };
+                        // Args live above `base` — copy them out BEFORE the
+                        // window is rebuilt in place.
+                        let argv: Vec<Value> =
+                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                        // A tail call is a plain call: this = undefined, then
+                        // the CALLEE's own binding rules (arrow lexical this /
+                        // sloppy global substitution).
+                        let this_val = if p_lex && closure != NO_CLOSURE {
+                            self.rebind_arrow_this(fid, closure, Value::UNDEFINED)
+                        } else if !p_strict && self.global_this != 0 {
+                            Value::heap(self.global_this)
+                        } else {
+                            Value::UNDEFINED
+                        };
+                        self.regs.truncate(base);
+                        if self.regs_would_overflow(base + callee_regs) {
+                            return Err(Thrown(
+                                "RangeError: Maximum call stack size exceeded".into(),
+                            ));
+                        }
+                        self.regs.resize(base + callee_regs, Value::UNDEFINED);
+                        self.regs[base] = this_val;
+                        let n = argv.len().min(callee_params);
+                        for (i, &a) in argv.iter().take(n).enumerate() {
+                            self.regs[base + 1 + i] = a;
+                        }
+                        if let Some(rreg) = rest_reg {
+                            let extra: Vec<Value> =
+                                argv.get(callee_params..).unwrap_or(&[]).to_vec();
+                            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+                            self.regs[base + rreg as usize] = arr;
+                        }
+                        let mut args_obj = u32::MAX;
+                        if let Some(areg) = arguments_reg {
+                            let mapinfo = (!p_strict && simple)
+                                .then(|| (self.frames.len() - 1, base, callee_params));
+                            let arr = self.build_arguments_object(
+                                argv.clone(),
+                                callee_v,
+                                p_strict,
+                                mapinfo,
+                            );
+                            self.regs[base + areg as usize] = arr;
+                            if mapinfo.is_some() {
+                                args_obj = arr.heap_index();
+                            }
+                        }
+                        let fr = self.frames.last_mut().unwrap();
+                        fr.func = fid;
+                        fr.closure = closure;
+                        fr.ip = 0;
+                        fr.handlers.clear();
+                        fr.callee = callee_v;
+                        fr.new_target = Value::UNDEFINED;
+                        fr.eval_scope = u32::MAX;
+                        fr.super_done = false;
+                        fr.args_obj = args_obj;
+                        break; // re-snapshot the frame coordinates
+                    }
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
                         // A callable Proxy: route through call_value (apply trap).
