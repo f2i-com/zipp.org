@@ -1053,8 +1053,14 @@ impl<'p> Vm<'p> {
                     HeapObj::Native(_) | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } => None,
                     // A constructor global (Array, Date, Temporal.Instant, …) is stored
                     // as an is_ctor Object — it is callable and `typeof` "function", so it
-                    // renders in the `[native code]` form rather than throwing.
+                    // renders in the `[native code]` form rather than throwing. So does
+                    // %Function.prototype% itself (a built-in function).
                     HeapObj::Object(m) if m.is_ctor => None,
+                    HeapObj::Object(_)
+                        if self.fn_proto != 0 && this.heap_index() == self.fn_proto =>
+                    {
+                        None
+                    }
                     // A callable Proxy (its target is callable) is a function for
                     // toString purposes — render the `[native code]` form, not throw.
                     HeapObj::Proxy { target, revoked, .. }

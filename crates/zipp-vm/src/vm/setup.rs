@@ -159,12 +159,12 @@ impl<'p> Vm<'p> {
     /// returning `(ctor, prototype)` heap indices. These are NOT global — they are
     /// reached via `Object.getPrototypeOf(function*(){}).constructor` etc. Their
     /// chain (spec 27.3/27.4/27.7): ctor [[Prototype]] = %Function%, ctor.prototype
-    /// = proto ({w:false,e:false,c:true}); proto [[Prototype]] = %Function.prototype%,
-    /// proto.constructor = ctor, proto[@@toStringTag] = `tag`. Requires `fn_proto`
-    /// and `function_ctor` already set.
+    /// = proto ({w:false,e:false,c:false}); proto [[Prototype]] = %Function.prototype%,
+    /// proto.constructor = ctor ({w:false,e:false,c:true}), proto[@@toStringTag] =
+    /// `tag`. Requires `fn_proto` and `function_ctor` already set.
     fn build_dynamic_fn_intrinsic(&mut self, tag: &str) -> (u32, u32) {
-        // {writable:false, enumerable:false, configurable:true} — name/length and
-        // the intrinsic .prototype and @@toStringTag descriptor.
+        // {writable:false, enumerable:false, configurable:true} — name/length, the
+        // prototype's `constructor` back-reference and @@toStringTag descriptor.
         let nameish = PropAttr {
             writable: false,
             enumerable: false,
@@ -172,17 +172,18 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
-        let method_attr = PropAttr {
-            writable: true,
+        // The ctor's own `.prototype` is additionally NON-configurable.
+        let proto_attr = PropAttr {
+            writable: false,
             enumerable: false,
-            configurable: true,
+            configurable: false,
             accessor: false,
             setter: Value::UNDEFINED,
         };
         let proto = self.heap.alloc(HeapObj::Object(ObjMap::new()));
         self.proto_of.insert(proto, Value::heap(self.fn_proto));
         let mut cm = ObjMap::new();
-        cm.define("prototype", Value::heap(proto), nameish);
+        cm.define("prototype", Value::heap(proto), proto_attr);
         cm.is_ctor = true;
         let ctor = self.heap.alloc(HeapObj::Object(cm));
         self.proto_of.insert(ctor, Value::heap(self.function_ctor));
@@ -194,7 +195,7 @@ impl<'p> Vm<'p> {
         }
         if let HeapObj::Object(m) = self.heap.get_mut(proto) {
             m.define("@@toStringTag", tagv, nameish);
-            m.define("constructor", Value::heap(ctor), method_attr);
+            m.define("constructor", Value::heap(ctor), nameish);
         }
         (ctor, proto)
     }
@@ -448,6 +449,16 @@ impl<'p> Vm<'p> {
         // Cache the single canonical %ThrowTypeError% so a strict arguments object's
         // callee poison-pill reuses THIS instance (intrinsic identity is observable).
         self.throw_type_error = thrower;
+        // %ThrowTypeError% is born FROZEN: non-extensible with non-configurable
+        // name/length (spec 10.2.4.1). The integrity flags live in the arr_props
+        // side table (a Native has no inline map); the descriptor/delete paths
+        // read them to report name/length non-configurable.
+        {
+            let m = self.arr_props.entry(thrower.heap_index()).or_insert_with(ObjMap::new);
+            m.extensible = false;
+            m.sealed = true;
+            m.frozen = true;
+        }
         let restricted_attr = PropAttr {
             writable: false,
             enumerable: false,
@@ -843,6 +854,13 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Object(m) = self.heap.get_mut(fn_proto) {
                     m.define("prototype", pv, proto_nw);
                 }
+                // The back-reference: %GeneratorPrototype%.constructor is
+                // %GeneratorFunction.prototype% (the OBJECT, not the ctor) —
+                // same {w:false, e:false, c:true} attrs; async-gen likewise.
+                let cv = Value::heap(fn_proto);
+                if let HeapObj::Object(m) = self.heap.get_mut(inst_proto) {
+                    m.define("constructor", cv, proto_nw);
+                }
             }
         }
         // Default @@iterator: Map → entries, Set → values (alias to the same fn).
@@ -1025,9 +1043,9 @@ impl<'p> Vm<'p> {
                 m.define("isError", iserr, method_attr);
             }
         }
-        // `Symbol`: a callable-but-NOT-constructable function object (typeof
-        // "function" via the type_of special case; `new Symbol()` throws because
-        // it's not is_ctor). The well-known symbols (iterator/toPrimitive/…) are
+        // `Symbol`: a callable function object whose [[Construct]] always throws
+        // (typeof "function"; `new Symbol()` is a TypeError via the explicit
+        // construct-path arms). The well-known symbols (iterator/toPrimitive/…) are
         // real Symbol VALUES whose property-key form is the engine's `@@`-prefixed
         // key, so symbol-keyed access and iteration use one unified mechanism.
         {
@@ -1054,6 +1072,10 @@ impl<'p> Vm<'p> {
             m.define("keyFor", keyfor_v, method_attr);
             m.define("name", name_v, fn_attr);
             m.define("length", Value::num(0.0), fn_attr);
+            // IsConstructor(Symbol) is TRUE (it has [[Construct]]; the construct
+            // paths make it throw) — so it is a valid Reflect.construct newTarget
+            // and its [[Prototype]] reports %Function.prototype%.
+            m.is_ctor = true;
             let symbol_ctor = self.heap.alloc(HeapObj::Object(m));
             self.symbol_ctor = symbol_ctor;
             // Symbol.prototype.constructor === Symbol.
@@ -1115,6 +1137,9 @@ impl<'p> Vm<'p> {
             m.define("asUintN", asuintn, method_attr);
             m.define("name", name_v, fn_attr);
             m.define("length", Value::num(1.0), fn_attr);
+            // IsConstructor(BigInt) is TRUE (like Symbol above); `new BigInt()`
+            // still throws via the explicit construct-path arms.
+            m.is_ctor = true;
             let bigint_ctor = self.heap.alloc(HeapObj::Object(m));
             self.bigint_ctor = bigint_ctor;
             // BigInt.prototype[@@toStringTag] === "BigInt" (a non-writable,
@@ -2336,7 +2361,7 @@ impl<'p> Vm<'p> {
             if matches!(self.heap.get(v), HeapObj::Object(m) if m.is_ctor) {
                 let len = match name {
                     "Date" => 7.0,
-                    "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator"
+                    "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator" | "Symbol"
                     | "DisposableStack" | "AsyncDisposableStack" | "ShadowRealm" => 0.0,
                     "AggregateError" => 2.0,  // (errors, message?)
                     "SuppressedError" => 3.0, // (error, suppressed, message?)

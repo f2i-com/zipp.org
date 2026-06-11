@@ -1174,6 +1174,13 @@ impl<'p> Vm<'p> {
                 None => self.construct_with_newtarget(target, args, new_target),
             };
         }
+        // Symbol/BigInt report IsConstructor true (is_ctor — they serve as a
+        // Reflect.construct newTarget) but their [[Construct]] unconditionally
+        // throws: `new Symbol()` / `new BigInt()` are TypeErrors.
+        if ci != 0 && (ci == self.symbol_ctor || ci == self.bigint_ctor) {
+            let n = if ci == self.symbol_ctor { "Symbol" } else { "BigInt" };
+            return Err(Thrown(format!("TypeError: {n} is not a constructor")));
+        }
         // A core built-in constructor used as a VALUE (`new C()` where C is the
         // Array/Object/Map/… constructor reached via a variable, `.constructor`,
         // or a species lookup — not the compile-lowered `new Array()` literal).
@@ -2416,6 +2423,24 @@ impl<'p> Vm<'p> {
         }
         if ci == self.suppressederror_ctor && self.suppressederror_ctor != 0 {
             return self.build_suppressed_error(args);
+        }
+        // `Symbol(desc)` / `BigInt(x)` reached as VALUES (a callback, `.call`, a
+        // bound target — the direct forms are compile-lowered to MakeSymbol /
+        // BigIntFrom): both call, neither constructs.
+        if ci == self.symbol_ctor && self.symbol_ctor != 0 {
+            let d = match args.first().copied() {
+                None => Value::UNDEFINED,
+                Some(v) if v == Value::UNDEFINED => Value::UNDEFINED,
+                Some(v) => {
+                    let s = self.to_js_string(v)?;
+                    self.alloc_str(s)
+                }
+            };
+            return Ok(self.make_symbol(d));
+        }
+        if ci == self.bigint_ctor && self.bigint_ctor != 0 {
+            let n = self.bigint_from(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+            return Ok(self.make_bigint(n));
         }
         let proto = match self.heap.get(callee.heap_index()) {
             HeapObj::Object(m) => m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index()),

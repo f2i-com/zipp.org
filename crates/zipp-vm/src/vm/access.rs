@@ -239,6 +239,11 @@ impl<'p> Vm<'p> {
         // must be removed AND tombstoned together — removing only the override
         // would let the synthesized intrinsic resurface after `delete`.
         if (key == "name" || key == "length") && self.is_callable(obj) {
+            // A frozen/sealed function's name/length are non-configurable
+            // (%ThrowTypeError% is born frozen) — `delete` fails.
+            if self.arr_props.get(&idx).map_or(false, |m| m.frozen || m.sealed) {
+                return Value::bool(false);
+            }
             let ovr_attr = self
                 .fn_props
                 .get(&idx)
@@ -959,21 +964,13 @@ impl<'p> Vm<'p> {
             self.heap.get(idx),
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_)
         ) {
-            // `caller`/`arguments` on a STRICT or BOUND function are the inherited
-            // %ThrowTypeError% accessors — assigning either throws, mirroring the
-            // read poison (props.rs). A sloppy function keeps its ordinary write.
-            if key == "caller" || key == "arguments" {
-                let restricted = match self.heap.get(idx) {
-                    HeapObj::Bound { .. } => true,
-                    HeapObj::Func(fid) => self.func(*fid as usize).is_strict,
-                    HeapObj::Closure { func, .. } => self.func(*func as usize).is_strict,
-                    _ => false,
-                };
-                if restricted {
-                    return Err(Thrown(format!(
-                        "TypeError: '{key}' may not be assigned on strict-mode or bound functions"
-                    )));
-                }
+            // `caller`/`arguments` on a restricted function (anything but a legacy
+            // sloppy ordinary one) are the inherited %ThrowTypeError% accessors —
+            // assigning either throws, mirroring the read poison (props.rs).
+            if (key == "caller" || key == "arguments") && self.fn_restricted_caller(idx) {
+                return Err(Thrown(format!(
+                    "TypeError: '{key}' may not be assigned on strict-mode or bound functions"
+                )));
             }
             // Reassigning `fn.prototype = value` redirects what `new fn()` / the
             // `.prototype` getter see. ANY value is honoured (incl. a non-object —

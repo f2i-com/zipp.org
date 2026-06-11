@@ -864,10 +864,13 @@ impl<'p> Vm<'p> {
             let v = Value::num(self.arr_proto_len as f64);
             return self.make_data_descriptor(v, true, false, false);
         }
-        // A callable's `name`/`length`: non-writable, non-enumerable, configurable.
+        // A callable's `name`/`length`: non-writable, non-enumerable, configurable —
+        // unless the function was frozen/sealed (the arr_props integrity flags;
+        // %ThrowTypeError% is born frozen), which makes them non-configurable.
         if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
             if let Some(v) = self.callable_intrinsic_value(obj, key) {
-                return self.make_data_descriptor(v, false, false, true);
+                let cfg = !self.arr_props.get(&idx).map_or(false, |m| m.frozen || m.sealed);
+                return self.make_data_descriptor(v, false, false, cfg);
             }
         }
         // A function's / class's `prototype` is a non-enumerable, non-configurable
@@ -2813,6 +2816,22 @@ impl<'p> Vm<'p> {
         Value::UNDEFINED
     }
 
+    /// AddRestrictedFunctionProperties poison: whether `caller`/`arguments` access
+    /// on this function hits the inherited %ThrowTypeError% accessors. Everything
+    /// except a LEGACY sloppy ordinary function (the only kind engines give own
+    /// caller/arguments) is restricted: strict, generator, async, arrow,
+    /// concise-method, and bound functions.
+    pub(crate) fn fn_restricted_caller(&self, idx: u32) -> bool {
+        let fid = match self.heap.get(idx) {
+            HeapObj::Bound { .. } => return true,
+            HeapObj::Func(fid) => *fid,
+            HeapObj::Closure { func, .. } => *func,
+            _ => return false,
+        };
+        let f = self.func(fid as usize);
+        f.is_strict || f.is_generator || f.is_async || f.lexical_this || f.non_constructable
+    }
+
     pub(crate) fn callable_name_length(&self, obj: Value) -> Option<(String, f64)> {
         let clean = |n: &str| -> String {
             if n.starts_with('<') { String::new() } else { n.to_string() }
@@ -3243,12 +3262,20 @@ impl<'p> Vm<'p> {
         }
         // A function's / class's `.prototype` (a lazily-created, stable object). An
         // explicit `fn.prototype = value` (incl. a non-object) is returned verbatim.
+        // Only callables that OWN a `prototype` (class / ordinary function /
+        // generator) synthesize one — an arrow / async fn / concise method has no
+        // `prototype` property at all and falls through to the proto-chain walk
+        // (undefined), matching the own-property reporting.
         if key == "prototype" {
             if let Some(&v) = self.fn_proto_override.get(&obj.heap_index()) {
                 return Ok(v);
             }
-            if let Some(p) = self.prototype_of(obj) {
-                return Ok(p);
+            if self.callable_has_prototype(obj)
+                || matches!(self.heap.get(obj.heap_index()), HeapObj::Object(m) if m.is_ctor)
+            {
+                if let Some(p) = self.prototype_of(obj) {
+                    return Ok(p);
+                }
             }
         }
         // A RegExp's accessor-like own properties (source/flags/lastIndex + the
@@ -3957,20 +3984,14 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(raw);
                 }
-                // Poison-pill: `caller`/`arguments` on a STRICT or BOUND function are
+                // Poison-pill: `caller`/`arguments` on a restricted function are
                 // the %ThrowTypeError% accessors (AddRestrictedFunctionProperties).
-                // A sloppy function reads `undefined` here (zipp exposes no legacy own
-                // caller/arguments) — handled explicitly so the inherited throwing
-                // accessor on Function.prototype is not leaked as a value by the
-                // proto-chain walk below.
+                // Only a LEGACY sloppy ordinary function reads `undefined` here
+                // (zipp exposes no legacy own caller/arguments) — handled explicitly
+                // so the inherited throwing accessor on Function.prototype is not
+                // leaked as a value by the proto-chain walk below.
                 if key == "caller" || key == "arguments" {
-                    let poison = match self.heap.get(obj.heap_index()) {
-                        HeapObj::Bound { .. } => true,
-                        HeapObj::Func(fid) => self.func(*fid as usize).is_strict,
-                        HeapObj::Closure { func, .. } => self.func(*func as usize).is_strict,
-                        _ => false,
-                    };
-                    if poison {
+                    if self.fn_restricted_caller(obj.heap_index()) {
                         return Err(Thrown(format!(
                             "TypeError: '{key}' may not be accessed on strict-mode or bound functions"
                         )));
