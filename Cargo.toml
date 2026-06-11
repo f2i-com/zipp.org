@@ -16,6 +16,7 @@ members = [
     "crates/zipp-ts",   # OPTIONAL TypeScript frontend: parse .ts with oxc, lower the subset
     "crates/zipp-vm",   # dynamic JS engine: explicit-frame register VM (recursion in an explicit frame stack, not the native stack) + native x86-64 OSR JIT — `zipp js`
     "crates/zipp-cli",  # `zipp run [--prove] [--jit|--llvm|--wasm] file.zipp` + `zipp js file.js`
+    "crates/regress-patched", # vendored regress 0.11.1 + upstream-bug patches (see its VENDORED.md); wired via [patch.crates-io]
 ]
 
 [workspace.package]
@@ -30,6 +31,12 @@ license = "Apache-2.0"
 rustc-hash = "2"
 dynasm = "2.0"
 dynasmrt = "2.0"
+
+# Vendored regress 0.11.1 with upstream-bug patches (scoped ignoreCase for
+# \p/\b/backrefs, duplicate named-group backreference participation,
+# Script=Unknown). See crates/regress-patched/VENDORED.md.
+[patch.crates-io]
+regress = { path = "crates/regress-patched" }
 
 [profile.release]
 opt-level = 3
