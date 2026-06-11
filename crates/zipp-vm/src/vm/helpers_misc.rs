@@ -485,9 +485,10 @@ pub(crate) fn is_private_key(k: &str) -> bool {
     k.starts_with('#')
 }
 
-/// BigInt binary operations (see `bigint_binop`).
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // `Add` is handled inline in `add_values` (string-concat fallthrough)
+/// The numeric binary operators (see `numeric_binop` / `bigint_op` in
+/// vm/bigint.rs). `Ushr` exists so the BigInt path can throw its dedicated
+/// TypeError AFTER ToNumeric coercion, per spec order.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BigOp {
     Add,
     Sub,
@@ -500,11 +501,17 @@ pub(crate) enum BigOp {
     Xor,
     Shl,
     Shr,
+    Ushr,
 }
 
 /// Parse a BigInt string: optional sign + decimal, or a `0x`/`0o`/`0b` prefix.
 /// `None` ⇒ not a valid BigInt literal (→ SyntaxError at the call site).
-pub(crate) fn parse_bigint_str(s: &str) -> Option<i128> {
+/// Values beyond i128 parse exactly into the Big tier (canonical by
+/// construction: the i128 parse is attempted first and only a RANGE failure
+/// falls through — the digits are pre-validated, so `from_str_radix` cannot
+/// fail for any other reason).
+pub(crate) fn parse_bigint_str(s: &str) -> Option<crate::vm::bigint::BigVal> {
+    use crate::vm::bigint::BigVal;
     let s = s.trim();
     let (neg, body, signed) = match s.strip_prefix('-') {
         Some(r) => (true, r, true),
@@ -519,17 +526,25 @@ pub(crate) fn parse_bigint_str(s: &str) -> Option<i128> {
     let non_decimal = [("0x", 16u32), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)]
         .iter()
         .find_map(|(p, r)| body.strip_prefix(p).map(|d| (*r, d)));
-    let v: i128 = if let Some((radix, digits)) = non_decimal {
+    let v: BigVal = if let Some((radix, digits)) = non_decimal {
         if signed || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return None;
         }
-        i128::from_str_radix(digits, radix).ok()?
+        match i128::from_str_radix(digits, radix) {
+            Ok(v) => BigVal::Small(v),
+            // Overflow OR an out-of-radix (but alphanumeric) digit: parse_bytes
+            // re-validates and yields None for the latter.
+            Err(_) => BigVal::Big(num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)?),
+        }
     } else {
         if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        body.parse::<i128>().ok()?
+        match body.parse::<i128>() {
+            Ok(v) => BigVal::Small(v),
+            Err(_) => BigVal::Big(num_bigint::BigInt::parse_bytes(body.as_bytes(), 10)?),
+        }
     };
-    Some(if neg { -v } else { v })
+    Some(if neg { v.neg() } else { v })
 }
 

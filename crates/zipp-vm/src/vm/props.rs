@@ -120,7 +120,7 @@ impl<'p> Vm<'p> {
                 }
                 let ext = match self.heap.get(target.heap_index()) {
                     HeapObj::Object(m) => m.extensible,
-                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) => false,
+                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => false,
                     _ => self.arr_props.get(&target.heap_index()).map_or(true, |m| m.extensible),
                 };
                 Ok(Some(ext))
@@ -166,7 +166,7 @@ impl<'p> Vm<'p> {
                     }
                 } else if !matches!(
                     self.heap.get(ti),
-                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
                 ) {
                     self.arr_props.entry(ti).or_insert_with(ObjMap::new).extensible = false;
                 }
@@ -2406,7 +2406,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(_) => 0u8,
             HeapObj::Class(_) => 1,
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => 2,
-            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) => {
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
                 return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
             }
             _ => 3, // Array named prop + exotic objects -> arr_props side table
@@ -4310,7 +4310,7 @@ impl<'p> Vm<'p> {
                 self.proto_member_get(p, key, obj)
             }
             // A BigInt: methods (toString/valueOf/constructor) via BigInt.prototype.
-            HeapObj::BigInt(_) => {
+            HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
                 let p = self.active_realm_proto(self.bigint_proto);
                 self.proto_member_get(p, key, obj)
             }

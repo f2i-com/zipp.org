@@ -66,7 +66,7 @@ impl<'p> Vm<'p> {
         this.is_heap()
             && !matches!(
                 self.heap.get(this.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
             )
     }
 

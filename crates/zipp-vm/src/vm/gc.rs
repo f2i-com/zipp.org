@@ -479,7 +479,9 @@ impl Vm<'_> {
             | HeapObj::RegExp { .. }
             | HeapObj::ArrayBuffer { .. }
             | HeapObj::Temporal { .. }
-            | HeapObj::BigInt(_) => {}
+            // A BigInt (either representation) holds no heap references.
+            | HeapObj::BigInt(_)
+            | HeapObj::BigIntBig(_) => {}
             HeapObj::Cons { left, right, .. } => {
                 m_idx!(*left);
                 m_idx!(*right);

@@ -607,10 +607,10 @@ impl<'p> Vm<'p> {
                                 Some(v) => Value::int(v),
                                 None => Value::num(va.as_int() as f64 - vb.as_int() as f64),
                             }
-                        } else if let Some(bv) = self.bigint_binop(BigOp::Sub, va, vb)? {
-                            bv
+                        } else if va.is_number() && vb.is_number() {
+                            Value::num(va.as_f64() - vb.as_f64())
                         } else {
-                            Value::num(self.to_number_coerce(va)? - self.to_number_coerce(vb)?)
+                            self.numeric_binop(BigOp::Sub, va, vb)?
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -623,10 +623,10 @@ impl<'p> Vm<'p> {
                                 Some(v) => Value::int(v),
                                 None => Value::num(va.as_int() as f64 * vb.as_int() as f64),
                             }
-                        } else if let Some(bv) = self.bigint_binop(BigOp::Mul, va, vb)? {
-                            bv
+                        } else if va.is_number() && vb.is_number() {
+                            Value::num(va.as_f64() * vb.as_f64())
                         } else {
-                            Value::num(self.to_number_coerce(va)? * self.to_number_coerce(vb)?)
+                            self.numeric_binop(BigOp::Mul, va, vb)?
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -634,10 +634,10 @@ impl<'p> Vm<'p> {
                     Instr::Div { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = if let Some(bv) = self.bigint_binop(BigOp::Div, va, vb)? {
-                            bv
+                        let r = if va.is_number() && vb.is_number() {
+                            Value::num(va.as_f64() / vb.as_f64())
                         } else {
-                            Value::num(self.to_number_coerce(va)? / self.to_number_coerce(vb)?)
+                            self.numeric_binop(BigOp::Div, va, vb)?
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -645,10 +645,10 @@ impl<'p> Vm<'p> {
                     Instr::Mod { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = if let Some(bv) = self.bigint_binop(BigOp::Mod, va, vb)? {
-                            bv
+                        let r = if va.is_number() && vb.is_number() {
+                            Value::num(va.as_f64() % vb.as_f64())
                         } else {
-                            Value::num(self.to_number_coerce(va)? % self.to_number_coerce(vb)?)
+                            self.numeric_binop(BigOp::Mod, va, vb)?
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -661,7 +661,7 @@ impl<'p> Vm<'p> {
                         // object whose valueOf returns a BigInt) is also a TypeError.
                         let r = if va.is_number() {
                             va
-                        } else if self.bigint_value(va).is_some() {
+                        } else if self.is_bigint_prim(va) {
                             return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
                         } else {
                             Value::num(self.to_number_strict(va)?)
@@ -683,10 +683,17 @@ impl<'p> Vm<'p> {
                                     None => Value::num(-(i as f64)),
                                 }
                             }
-                        } else if let Some(n) = self.bigint_value(va) {
-                            self.make_bigint(n.wrapping_neg())
+                        } else if va.is_double() {
+                            Value::num(-va.as_f64())
                         } else {
-                            Value::num(-self.to_number_coerce(va)?)
+                            // Unary minus is ToNumeric: an object (incl. `Object(1n)`
+                            // or a valueOf returning a BigInt) negates AS a BigInt.
+                            let p = self.numeric_prim(va)?;
+                            if let Some(b) = self.bigint_val(p) {
+                                self.make_bigint_val(b.neg())
+                            } else {
+                                Value::num(-self.to_number(p)?)
+                            }
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -695,60 +702,41 @@ impl<'p> Vm<'p> {
                         use crate::bytecode::BitwiseOp as B;
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        // BigInt bitwise: &/|/^/<</>> on two BigInts (incl. wrapper
-                        // objects, via bigint_binop's ToNumeric); `>>>` is not defined
-                        // for BigInt (TypeError); mixing â†’ TypeError.
-                        match op {
-                            B::Ushr => {
-                                if self.this_bigint_value(va).is_some()
-                                    || self.this_bigint_value(vb).is_some()
-                                {
-                                    return Err(Thrown(
-                                        "TypeError: BigInts have no unsigned right shift, use >> instead"
-                                            .into(),
-                                    ));
+                        let bop = match op {
+                            B::And => BigOp::And,
+                            B::Or => BigOp::Or,
+                            B::Xor => BigOp::Xor,
+                            B::Shl => BigOp::Shl,
+                            B::Shr => BigOp::Shr,
+                            B::Ushr => BigOp::Ushr,
+                        };
+                        // Int fast path (the hot `x & 31` shapes); everything else
+                        // takes the full ToNumeric path: BigInt &/|/^/<</>> on two
+                        // BigInts (incl. wrappers/objects whose ToPrimitive yields
+                        // one); `>>>` on BigInts is a TypeError AFTER coercion;
+                        // mixing is a TypeError.
+                        let r = if va.is_int() && vb.is_int() {
+                            let x = va.as_int();
+                            let y = vb.as_int();
+                            match op {
+                                B::And => Value::int(x & y),
+                                B::Or => Value::int(x | y),
+                                B::Xor => Value::int(x ^ y),
+                                // Shift counts use the low 5 bits per the JS spec.
+                                B::Shl => Value::int(x.wrapping_shl((y as u32) & 31)),
+                                B::Shr => Value::int(x >> ((y as u32) & 31)),
+                                B::Ushr => {
+                                    let u = (x as u32) >> ((y as u32) & 31);
+                                    // u32 may exceed i32::MAX â†’ keep numeric range.
+                                    if u <= i32::MAX as u32 {
+                                        Value::int(u as i32)
+                                    } else {
+                                        Value::num(u as f64)
+                                    }
                                 }
                             }
-                            _ => {
-                                let bop = match op {
-                                    B::And => BigOp::And,
-                                    B::Or => BigOp::Or,
-                                    B::Xor => BigOp::Xor,
-                                    B::Shl => BigOp::Shl,
-                                    B::Shr => BigOp::Shr,
-                                    B::Ushr => unreachable!(),
-                                };
-                                if let Some(bv) = self.bigint_binop(bop, va, vb)? {
-                                    self.set(base, dst, bv);
-                                    ip += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                        let x = to_int32(self.to_number_coerce(va)?);
-                        // Shift counts use the low 5 bits per the JS spec.
-                        let r = match op {
-                            B::And => Value::int(x & to_int32(self.to_number_coerce(vb)?)),
-                            B::Or => Value::int(x | to_int32(self.to_number_coerce(vb)?)),
-                            B::Xor => Value::int(x ^ to_int32(self.to_number_coerce(vb)?)),
-                            B::Shl => {
-                                let s = to_uint32(self.to_number_coerce(vb)?) & 31;
-                                Value::int(x.wrapping_shl(s))
-                            }
-                            B::Shr => {
-                                let s = to_uint32(self.to_number_coerce(vb)?) & 31;
-                                Value::int(x >> s)
-                            }
-                            B::Ushr => {
-                                let s = to_uint32(self.to_number_coerce(vb)?) & 31;
-                                let u = to_uint32(self.to_number_coerce(va)?) >> s;
-                                // u32 may exceed i32::MAX â†’ keep numeric range.
-                                if u <= i32::MAX as u32 {
-                                    Value::int(u as i32)
-                                } else {
-                                    Value::num(u as f64)
-                                }
-                            }
+                        } else {
+                            self.numeric_binop(bop, va, vb)?
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -756,48 +744,61 @@ impl<'p> Vm<'p> {
                     Instr::Pow { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = if let Some(bv) = self.bigint_binop(BigOp::Pow, va, vb)? {
-                            bv
-                        } else {
-                            let bb = self.to_number_coerce(va)?;
-                            let ee = self.to_number_coerce(vb)?;
-                            // Spec: |base|==1 with a NaN/±Infinity exponent is NaN
-                            // (C/Rust powf returns 1 — a deliberate deviation).
-                            let p = if (bb == 1.0 || bb == -1.0) && (ee.is_nan() || ee.is_infinite()) {
-                                f64::NAN
-                            } else {
-                                bb.powf(ee)
-                            };
-                            Value::num(p)
-                        };
+                        let r = self.numeric_binop(BigOp::Pow, va, vb)?;
                         self.set(base, dst, r);
                         ip += 1;
                     }
                     Instr::BitNot { dst, a } => {
                         let va = self.get(base, a);
-                        if let Some(n) = self.bigint_value(va) {
-                            let r = self.make_bigint(!n);
-                            self.set(base, dst, r);
-                        } else {
-                            let r = !to_int32(self.to_number_coerce(va)?);
+                        if va.is_int() {
+                            let r = !va.as_int();
                             self.set(base, dst, Value::int(r));
+                        } else {
+                            // `~x` is ToNumeric: a BigInt operand (incl. via an
+                            // object's ToPrimitive) stays a BigInt (~x = -x-1).
+                            let p = self.numeric_prim(va)?;
+                            let r = if let Some(b) = self.bigint_val(p) {
+                                match b {
+                                    BigVal::Small(n) => self.make_bigint(!n),
+                                    BigVal::Big(big) => self.make_bigint_num(!big),
+                                }
+                            } else {
+                                Value::int(!to_int32(self.to_number(p)?))
+                            };
+                            self.set(base, dst, r);
                         }
                         ip += 1;
                     }
-                    Instr::AddInt { dst, a, imm } => {
+                    Instr::AddInt { dst, a, imm, upd } => {
                         let va = self.get(base, a);
                         let r = if va.is_int() {
                             match va.as_int().checked_add(imm) {
                                 Some(v) => Value::int(v),
                                 None => Value::num(va.as_int() as f64 + imm as f64),
                             }
-                        } else if let Some(b) = self.bigint_value(va) {
-                            // `++`/`--` (this op backs every UpdateExpression) on a
-                            // BigInt operand stays a BigInt â€” ToNumeric keeps the type
-                            // (so `n++` yields `n + 1n`, not the Number coercion).
-                            self.make_bigint(b.wrapping_add(imm as i128))
+                        } else if va.is_double() {
+                            Value::num(va.as_f64() + imm as f64)
                         } else {
-                            Value::num(self.to_number_coerce(va)? + imm as f64)
+                            // ToNumeric the operand once, then branch on its type.
+                            let p = self.numeric_prim(va)?;
+                            if let Some(b) = self.bigint_val(p) {
+                                if upd {
+                                    // `++`/`--` (UpdateExpression) on a BigInt stays
+                                    // a BigInt — ToNumeric keeps the type (`n++` is
+                                    // `n + 1n`, not a Number coercion).
+                                    self.bigint_op(
+                                        BigOp::Add,
+                                        b,
+                                        crate::vm::bigint::BigVal::Small(imm as i128),
+                                    )?
+                                } else {
+                                    // Binary `x ± <int literal>` fast path: mixing a
+                                    // BigInt with a Number is the spec's TypeError.
+                                    return Err(Thrown(crate::vm::bigint::BIGINT_MIX_ERR.into()));
+                                }
+                            } else {
+                                Value::num(self.to_number(p)? + imm as f64)
+                            }
                         };
                         self.set(base, dst, r);
                         ip += 1;
@@ -3024,10 +3025,19 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::LoadBigIntBig { dst, idx } => {
+                        // A literal beyond i128: clone the compile-time-parsed
+                        // constant (canonical: the pool only holds out-of-range
+                        // values, so this always allocates the Big tier).
+                        let b = self.func(func_id as usize).bigint_consts[idx as usize].clone();
+                        let v = Value::heap(self.heap.alloc(HeapObj::BigIntBig(Box::new(b))));
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::BigIntFrom { dst, arg } => {
                         let a = self.get(base, arg);
                         let n = self.bigint_from(a)?;
-                        let v = self.make_bigint(n);
+                        let v = self.make_bigint_val(n);
                         self.set(base, dst, v);
                         ip += 1;
                     }

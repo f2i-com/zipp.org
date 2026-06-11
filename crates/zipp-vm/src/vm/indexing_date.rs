@@ -127,6 +127,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::RegExp { .. }
                 | HeapObj::Symbol { .. }
                 | HeapObj::BigInt(_)
+                | HeapObj::BigIntBig(_)
                 | HeapObj::ArrayBuffer { .. }
                 | HeapObj::DataView { .. }
                 | HeapObj::Proxy { .. }

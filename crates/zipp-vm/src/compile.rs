@@ -1543,6 +1543,7 @@ impl Compiler {
             simple_params: params_ast.map(params_are_simple).unwrap_or(false),
             constants: fc.constants,
             string_constants: fc.string_constants,
+            bigint_consts: fc.bigint_consts,
             wtf8_consts: fc.wtf8_consts,
             name_global: None, // set by the caller for top-level declarations
             upvalues,
@@ -1732,6 +1733,7 @@ impl Compiler {
             simple_params: false, // strict (class body) — never mapped anyway
             constants: fc.constants,
             string_constants: fc.string_constants,
+            bigint_consts: fc.bigint_consts,
             wtf8_consts: fc.wtf8_consts,
             name_global: None,
             upvalues,
@@ -1857,6 +1859,7 @@ impl Compiler {
             simple_params: false, // an arrow has no own `arguments`
             constants: fc.constants,
             string_constants: fc.string_constants,
+            bigint_consts: fc.bigint_consts,
             wtf8_consts: fc.wtf8_consts,
             name_global: None,
             upvalues,
@@ -1949,6 +1952,7 @@ fn placeholder(name: &str) -> FuncProto {
         simple_params: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
+        bigint_consts: Vec::new(),
         wtf8_consts: Vec::new(),
         name_global: None,
         upvalues: Vec::new(),
@@ -1976,6 +1980,8 @@ struct FnCompiler<'a> {
     code: Vec<Instr>,
     constants: Vec<Value>,
     string_constants: Vec<String>,
+    /// BigInt literal constants beyond i128 (see `FuncProto::bigint_consts`).
+    bigint_consts: Vec<num_bigint::BigInt>,
     /// `string_constants` indices holding the oxc lone-surrogate MARKER form
     /// (see `Function::wtf8_consts`).
     wtf8_consts: Vec<u32>,
@@ -2235,6 +2241,7 @@ impl<'a> FnCompiler<'a> {
             code: Vec::new(),
             constants: Vec::new(),
             string_constants: Vec::new(),
+            bigint_consts: Vec::new(),
             wtf8_consts: Vec::new(),
             scopes: vec![Vec::new()],
             next_reg: 0,
@@ -6208,7 +6215,7 @@ impl<'a> FnCompiler<'a> {
         for c in ctx.continue_jumps {
             self.patch_jump(c, cont); // continue → increment + re-test
         }
-        self.emit(Instr::AddInt { dst: idx_reg, a: idx_reg, imm: 1 });
+        self.emit(Instr::AddInt { dst: idx_reg, a: idx_reg, imm: 1, upd: false });
         self.emit(Instr::Jump { target: top });
         let end = self.here();
         self.patch_jump(jf, end);
@@ -6269,12 +6276,24 @@ impl<'a> FnCompiler<'a> {
             }
             E::BigIntLiteral(b) => {
                 // oxc gives `value` as a base-10 string (the source base is already
-                // normalized). Parse to i128 (our BigInt repr); too-large literals
-                // are out of range for now.
-                let v = b.value.as_str().parse::<i128>().map_err(|_| {
-                    "BigInt literals beyond i128 are not in the zipp-vm subset yet".to_string()
-                })?;
-                self.emit(Instr::LoadBigInt { dst, value: v });
+                // normalized). In-range literals load as inline i128 (the fast
+                // tier); beyond-i128 literals parse ONCE into the program's
+                // arbitrary-precision constant pool (the digits are decimal by
+                // construction, so only an out-of-range value reaches the pool —
+                // the canonical-form invariant holds).
+                match b.value.as_str().parse::<i128>() {
+                    Ok(v) => self.emit(Instr::LoadBigInt { dst, value: v }),
+                    Err(_) => {
+                        let big = b
+                            .value
+                            .as_str()
+                            .parse::<num_bigint::BigInt>()
+                            .map_err(|_| "invalid BigInt literal".to_string())?;
+                        let idx = self.bigint_consts.len() as u32;
+                        self.bigint_consts.push(big);
+                        self.emit(Instr::LoadBigIntBig { dst, idx });
+                    }
+                }
                 Ok(dst)
             }
             E::RegExpLiteral(r) => {
@@ -7394,7 +7413,7 @@ impl<'a> FnCompiler<'a> {
                 if matches!(b.operator, Op::Subtraction) {
                     imm = -imm;
                 }
-                self.emit(Instr::AddInt { dst, a, imm });
+                self.emit(Instr::AddInt { dst, a, imm, upd: false });
                 return Ok(dst);
             }
         }
@@ -7679,9 +7698,9 @@ impl<'a> FnCompiler<'a> {
                     None => self.emit(Instr::SuperGetObj { dst: cur, name }),
                 }
                 let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
                 let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
                 match pid {
                     Some(p) => self.emit(Instr::SuperSet { home_class_id: p, name, val: nw }),
                     None => self.emit(Instr::SuperSetObj { name, val: nw }),
@@ -7712,9 +7731,9 @@ impl<'a> FnCompiler<'a> {
                     None => self.emit(Instr::SuperGetObjComputed { dst: cur, key: key_reg }),
                 }
                 let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
                 let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
                 match pid {
                     Some(p) => self.emit(Instr::SuperSetComputed { home_class_id: p, key: key_reg, val: nw }),
                     None => self.emit(Instr::SuperSetObjComputed { key: key_reg, val: nw }),
@@ -7731,9 +7750,9 @@ impl<'a> FnCompiler<'a> {
                 // and yield the COERCED old (postfix) — `x++` returns a number, not
                 // the raw operand. Single coercion = one valueOf for an object operand.
                 let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
                 let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
                 self.emit(Instr::SetProp { obj, name, val: nw });
                 self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
                 return Ok(dst);
@@ -7748,9 +7767,9 @@ impl<'a> FnCompiler<'a> {
                 let cur = self.temp();
                 self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
                 let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
                 let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
                 self.emit(Instr::SetIndex { obj, key: keyk, val: nw });
                 self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
                 return Ok(dst);
@@ -7763,9 +7782,9 @@ impl<'a> FnCompiler<'a> {
                 let cur = self.temp();
                 self.emit(Instr::GetProp { dst: cur, obj, name });
                 let oldnum = self.temp();
-                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0 });
+                self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
                 let nw = self.temp();
-                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta });
+                self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
                 self.emit(Instr::SetProp { obj, name, val: nw });
                 self.emit(Instr::Move { dst, src: if u.prefix { nw } else { oldnum } });
                 return Ok(dst);
@@ -7788,15 +7807,15 @@ impl<'a> FnCompiler<'a> {
             let (found, tgt) = self.emit_with_probe(&name, &with_objs);
             self.emit_with_rmw_read(&name, found, tgt, dst);
             if u.prefix {
-                self.emit(Instr::AddInt { dst, a: dst, imm: delta });
+                self.emit(Instr::AddInt { dst, a: dst, imm: delta, upd: true });
                 self.emit_with_rmw_write(&name, found, tgt, dst);
                 return Ok(dst); // dst holds the new value
             }
             // Postfix: ToNumeric(old) in place, derive the new value, store it,
             // return the COERCED old.
-            self.emit(Instr::AddInt { dst, a: dst, imm: 0 });
+            self.emit(Instr::AddInt { dst, a: dst, imm: 0, upd: true });
             let tmp = self.temp();
-            self.emit(Instr::AddInt { dst: tmp, a: dst, imm: delta });
+            self.emit(Instr::AddInt { dst: tmp, a: dst, imm: delta, upd: true });
             self.emit_with_rmw_write(&name, found, tgt, tmp);
             self.next_reg -= 1; // reclaim tmp
             return Ok(dst); // dst still holds the (coerced) old value
@@ -7806,14 +7825,14 @@ impl<'a> FnCompiler<'a> {
             if !self.const_regs.contains(&r) {
                 // Plain mutable register local: mutate in place.
                 if u.prefix {
-                    self.emit(Instr::AddInt { dst: r, a: r, imm: delta });
+                    self.emit(Instr::AddInt { dst: r, a: r, imm: delta, upd: true });
                     if r != dst {
                         self.emit(Instr::Move { dst, src: r });
                     }
                 } else {
                     // Yield ToNumeric(old) (one coercion), then increment from it.
-                    self.emit(Instr::AddInt { dst, a: r, imm: 0 });
-                    self.emit(Instr::AddInt { dst: r, a: dst, imm: delta });
+                    self.emit(Instr::AddInt { dst, a: r, imm: 0, upd: true });
+                    self.emit(Instr::AddInt { dst: r, a: dst, imm: delta, upd: true });
                 }
                 return Ok(dst);
             }
@@ -7822,15 +7841,15 @@ impl<'a> FnCompiler<'a> {
         // back (store_binding throws for a const after the read + increment).
         let cur = self.load_binding(&binding, dst); // == dst
         if u.prefix {
-            self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta });
+            self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta, upd: true });
             self.store_binding(&binding, cur);
             Ok(dst) // dst holds the new value
         } else {
             // Coerce the old value in place (cur == dst), compute the new value in a
             // temp, store it, and return the COERCED old.
-            self.emit(Instr::AddInt { dst: cur, a: cur, imm: 0 });
+            self.emit(Instr::AddInt { dst: cur, a: cur, imm: 0, upd: true });
             let tmp = self.temp();
-            self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta });
+            self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta, upd: true });
             self.store_binding(&binding, tmp);
             self.next_reg -= 1; // reclaim tmp
             Ok(dst) // dst still holds the (coerced) old value

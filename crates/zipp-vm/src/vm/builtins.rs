@@ -756,12 +756,12 @@ impl<'p> Vm<'p> {
                 // coerced a single time and in the right order). The coerced Value
                 // is built after the index coercions so it needs no GC rooting.
                 let is_big = native::TA_KINDS[kind as usize].2;
-                let big = if is_big { self.to_bigint(a0)? } else { 0 };
+                let big = if is_big { Some(self.to_bigint(a0)?) } else { None };
                 let num = if is_big { 0.0 } else { self.to_number_coerce(a0)? };
                 let start = self.ta_rel_index(a1, 0, len)?;
                 let end = self.ta_rel_index(args.get(2).copied().unwrap_or(Value::UNDEFINED), len, len)?;
-                let v = if is_big {
-                    Value::heap(self.heap.alloc(HeapObj::BigInt(big)))
+                let v = if let Some(b) = big {
+                    self.make_bigint_val(b)
                 } else {
                     Value::num(num)
                 };
@@ -851,7 +851,7 @@ impl<'p> Vm<'p> {
                         ));
                     }
                     let big = self.to_bigint(a1)?;
-                    Value::heap(self.heap.alloc(HeapObj::BigInt(big)))
+                    self.make_bigint_val(big)
                 } else {
                     let num = self.to_number_coerce(a1)?;
                     Value::num(num)
@@ -1237,12 +1237,10 @@ impl<'p> Vm<'p> {
                 a[..2].copy_from_slice(&crate::vm::helpers_num2::f64_to_f16_bits(f).to_le_bytes());
                 a
             } else if kind >= 9 {
-                let n = self.to_bigint(v)?;
-                if kind == 9 {
-                    (n as i64).to_le_bytes()
-                } else {
-                    (n as u64).to_le_bytes()
-                }
+                // NumericToRawBytes: wrap to the low 64 bits (two's complement
+                // — same byte image for BigInt64 and BigUint64; exact for any
+                // magnitude, incl. the Big tier).
+                self.to_bigint(v)?.to_u64_wrap().to_le_bytes()
             } else {
                 let f = self.to_number_coerce(v)?;
                 ta_encode(kind, f)
@@ -2099,7 +2097,10 @@ impl<'p> Vm<'p> {
                         }
                         let raw_size = self.get_prop(a0, "size")?;
                         if raw_size.is_heap()
-                            && matches!(self.heap.get(raw_size.heap_index()), HeapObj::BigInt(_))
+                            && matches!(
+                                self.heap.get(raw_size.heap_index()),
+                                HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                            )
                         {
                             return Err(Thrown("TypeError: Set-like 'size' cannot be a BigInt".into()));
                         }

@@ -288,7 +288,12 @@ impl<'p> Vm<'p> {
             }
             self.to_bigint(v)?;
         } else {
-            if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
+            if v.is_heap()
+                && matches!(
+                    self.heap.get(v.heap_index()),
+                    HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                )
+            {
                 return Err(Thrown("TypeError: cannot convert a BigInt to a number".into()));
             }
             self.to_number_coerce(v)?;
@@ -314,20 +319,19 @@ impl<'p> Vm<'p> {
                     "TypeError: cannot convert a Number to a BigInt typed-array element".into(),
                 ));
             }
+            // NumericToRawBytes: wrap to the low 64 bits, two's complement
+            // (exact for any magnitude — a Big-tier value wraps correctly).
             let n = self.to_bigint(v)?;
-            if kind == 9 {
-                let mut o = [0u8; 8];
-                o.copy_from_slice(&(n as i64).to_le_bytes());
-                o
-            } else {
-                let mut o = [0u8; 8];
-                o.copy_from_slice(&(n as u64).to_le_bytes());
-                o
-            }
+            n.to_u64_wrap().to_le_bytes()
         } else {
             // ToNumber(BigInt) throws in SetTypedArrayElement (the engine's
             // to_number is deliberately lenient on BigInt for comparisons).
-            if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
+            if v.is_heap()
+                && matches!(
+                    self.heap.get(v.heap_index()),
+                    HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                )
+            {
                 return Err(Thrown("TypeError: cannot convert a BigInt to a number".into()));
             }
             // ToNumber(value) per SetTypedArrayElement: an object element runs
@@ -585,8 +589,9 @@ impl<'p> Vm<'p> {
             }
             let cur = self.ta_element_get(ti, i);
             let (expected, eq) = if is_bigint {
-                let e = self.to_bigint(a2)?;
-                (e, e == self.to_bigint(cur)?)
+                // ToBigInt64(value): wrap to i64 (kind 9 is the only BigInt kind here).
+                let e = self.to_bigint(a2)?.to_i64_wrap() as i128;
+                (e, e == self.to_bigint(cur)?.to_i64_wrap() as i128)
             } else {
                 let e = self.to_integer_or_zero(a2)? as i128;
                 (e, e == (cur.as_f64() as i64) as i128)
@@ -655,8 +660,9 @@ impl<'p> Vm<'p> {
             if op == "wait" {
                 let cur = self.ta_element_get(ti, i);
                 let (expected, eq) = if is_bigint {
-                    let e = self.to_bigint(a2)?;
-                    (e, e == self.to_bigint(cur)?)
+                    // ToBigInt64(value): wrap to i64 (kind 9 only).
+                    let e = self.to_bigint(a2)?.to_i64_wrap() as i128;
+                    (e, e == self.to_bigint(cur)?.to_i64_wrap() as i128)
                 } else {
                     let e = self.to_integer_or_zero(a2)? as i128;
                     (e, e == (cur.as_f64() as i64) as i128)
@@ -778,50 +784,61 @@ impl<'p> Vm<'p> {
                 _ => None,
             };
         if is_bigint {
-            let v_in = if op == "load" { 0 } else { self.to_bigint(a2)? };
+            let v_b = if op == "load" {
+                BigVal::Small(0)
+            } else {
+                self.to_bigint(a2)?
+            };
+            // NumericToRawBytes: the memory op uses the value wrapped to 64
+            // bits (exact for any magnitude, incl. the Big tier); `store`
+            // still RETURNS the unwrapped ToBigInt value.
+            let v64 = v_b.to_i64_wrap();
             if let Some((mem, off)) = sab_target {
                 if off + elem_size <= mem.capacity() {
                     let repl = if op == "compareExchange" {
                         self.to_bigint(args.get(3).copied().unwrap_or(Value::UNDEFINED))?
+                            .to_i64_wrap()
                     } else {
                         0
                     };
-                    let old = sab_atomic_op(&mem, kind, off, op, v_in as i64, repl as i64);
-                    // NumericToRawBytes wrapped the operand to 64 bits for the
-                    // memory op; `store` still RETURNS the unwrapped ToBigInt.
+                    let old = sab_atomic_op(&mem, kind, off, op, v64, repl);
                     let old_b: i128 = if kind == 9 { old as i128 } else { (old as u64) as i128 };
                     return Ok(if op == "store" {
-                        self.make_bigint(v_in)
+                        self.make_bigint_val(v_b)
                     } else {
                         self.make_bigint(old_b)
                     });
                 }
             }
             let cur = self.ta_element_get(ti, i);
-            let old = self.to_bigint(cur)?;
+            // The element value always fits i64/u64, so this is exact.
+            let old = self.to_bigint(cur)?.to_i128_sat();
             match op {
                 "load" => Ok(self.make_bigint(old)),
                 "store" => {
-                    let nv = self.make_bigint(v_in);
+                    let nv = self.make_bigint_val(v_b.clone());
                     self.ta_element_set(ti, i, nv)?;
-                    Ok(self.make_bigint(v_in))
+                    Ok(self.make_bigint_val(v_b))
                 }
                 "compareExchange" => {
                     let repl = self.to_bigint(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
                     // NumericToRawBytes: the EXPECTED value compares as the
                     // element type (BigInt64 wraps to i64, BigUint64 to u64).
                     let expected = if kind == 9 {
-                        (v_in as i64) as i128
+                        v64 as i128
                     } else {
-                        (v_in as u64) as i128
+                        (v64 as u64) as i128
                     };
                     if old == expected {
-                        let nv = self.make_bigint(repl);
+                        let nv = self.make_bigint_val(repl);
                         self.ta_element_set(ti, i, nv)?;
                     }
                     Ok(self.make_bigint(old))
                 }
                 _ => {
+                    // Mod-2^64 arithmetic: the wrapped operand is equivalent
+                    // (ta_element_set wraps the result to the element type).
+                    let v_in = v64 as i128;
                     let new = match op {
                         "add" => old.wrapping_add(v_in),
                         "sub" => old.wrapping_sub(v_in),
@@ -1105,72 +1122,6 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(idx))
     }
 
-    /// A binary arithmetic/bitwise op where at least one operand might be a BigInt.
-    /// `Ok(None)` ⇒ neither is a BigInt (caller does its numeric path); `Ok(Some)`
-    /// ⇒ both BigInt (result); `Err` ⇒ exactly one BigInt (mixing TypeError) or a
-    /// BigInt-specific RangeError (÷0, negative exponent).
-    pub(crate) fn bigint_binop(&mut self, op: BigOp, va: Value, vb: Value) -> Result<Option<Value>, Thrown> {
-        // A BigInt is "involved" if either operand is a BigInt primitive or a BigInt
-        // wrapper object (`Object(1n)`) — detectable without running user code. If
-        // neither is, this is a Number op (return None → the caller's numeric path).
-        if self.this_bigint_value(va).is_none() && self.this_bigint_value(vb).is_none() {
-            return Ok(None);
-        }
-        // ApplyStringOrNumericBinaryOperator: ToNumeric each operand (ToPrimitive with
-        // the number hint — `Object(1n)`/`{valueOf(){return 1n}}` → the BigInt). Both
-        // must then be BigInt; mixing BigInt with a non-BigInt is a TypeError.
-        let pa = self.to_primitive_number(va)?;
-        let pb = self.to_primitive_number(vb)?;
-        let (a, b) = match (self.bigint_value(pa), self.bigint_value(pb)) {
-            (Some(a), Some(b)) => (a, b),
-            _ => {
-                return Err(Thrown(
-                    "TypeError: Cannot mix BigInt and other types, use explicit conversions".into(),
-                ))
-            }
-        };
-        // zipp's BigInt is fixed-width i128: a result beyond ±(2^127−1)
-        // SATURATES to ±i128::MAX instead of wrapping. Wrapping let huge
-        // magnitudes masquerade as small values (2n**128n evaluated to 0n, so
-        // `new Temporal.Instant(2n**128n)` sailed past its range check);
-        // saturation is still lossy for exact-value math beyond i128, but it
-        // preserves the sign and the hugeness, which range validation observes.
-        // ±i128::MAX (not MIN) keeps negation involutive.
-        let sat = |neg: bool| if neg { -i128::MAX } else { i128::MAX };
-        let r = match op {
-            BigOp::Add => a.checked_add(b).unwrap_or_else(|| sat(a < 0)),
-            BigOp::Sub => a.checked_sub(b).unwrap_or_else(|| sat(a < 0)),
-            BigOp::Mul => a.checked_mul(b).unwrap_or_else(|| sat((a < 0) != (b < 0))),
-            BigOp::Div | BigOp::Mod if b == 0 => {
-                return Err(Thrown("RangeError: Division by zero".into()))
-            }
-            // checked_div/rem fail only for i128::MIN / -1.
-            BigOp::Div => a.checked_div(b).unwrap_or(i128::MAX),
-            BigOp::Mod => a.checked_rem(b).unwrap_or(0),
-            BigOp::Pow if b < 0 => {
-                return Err(Thrown("RangeError: Exponent must be non-negative".into()))
-            }
-            BigOp::Pow => a
-                .checked_pow(b.min(u32::MAX as i128) as u32)
-                .unwrap_or_else(|| sat(a < 0 && b % 2 == 1)),
-            BigOp::And => a & b,
-            BigOp::Or => a | b,
-            BigOp::Xor => a ^ b,
-            BigOp::Shl => {
-                // A left shift is a × 2^b: detect dropped bits by round-trip.
-                if a == 0 || b <= 0 {
-                    a.wrapping_shl(b as u32)
-                } else if b >= 128 {
-                    sat(a < 0)
-                } else {
-                    let r = a.wrapping_shl(b as u32);
-                    if (r >> (b as u32)) == a { r } else { sat(a < 0) }
-                }
-            }
-            BigOp::Shr => a.wrapping_shr(b as u32),
-        };
-        Ok(Some(self.make_bigint(r)))
-    }
 
 }
 

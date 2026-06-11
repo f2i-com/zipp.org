@@ -58,7 +58,12 @@ impl<'p> Vm<'p> {
     /// (ToNumber semantics; our plain to_number is lenient on BigInt), a user
     /// valueOf/toString is honoured, and the result must be a finite integer.
     pub(crate) fn duration_field(&mut self, v: Value) -> Result<f64, Thrown> {
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
+        if v.is_heap()
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+            )
+        {
             return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
         }
         let n = self.to_number_coerce(v)?;
@@ -1104,7 +1109,12 @@ impl<'p> Vm<'p> {
         if v == Value::UNDEFINED {
             return Ok(1);
         }
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::BigInt(_)) {
+        if v.is_heap()
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+            )
+        {
             return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
         }
         // ToIntegerWithTruncation: a non-integer is truncated toward zero (2.5 -> 2),
@@ -1969,7 +1979,8 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn make_zoned_date_time(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
-        let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+        // Beyond-i128 saturates (sign preserved) — certainly out of range below.
+        let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?.to_i128_sat();
         if ns.abs() > 8_640_000_000_000_000_000_000 {
             return Err(Thrown("RangeError: ZonedDateTime outside the supported range".into()));
         }

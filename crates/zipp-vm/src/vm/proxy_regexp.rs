@@ -491,7 +491,7 @@ impl<'p> Vm<'p> {
             let is_object = r.is_heap()
                 && !matches!(
                     self.heap.get(r.heap_index()),
-                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
                 );
             if r != Value::NULL && !is_object {
                 return Err(Thrown(

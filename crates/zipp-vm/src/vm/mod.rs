@@ -986,6 +986,7 @@ mod misc_methods;
 mod array_ops;
 mod string_ops;
 mod coerce;
+pub(crate) mod bigint;
 mod native;
 mod agents;
 mod helpers_misc;
@@ -995,6 +996,7 @@ mod helpers_json;
 pub(crate) mod helpers_num2;
 mod gc;
 
+pub(crate) use bigint::*;
 pub(crate) use helpers_misc::*;
 pub(crate) use helpers_datetime::*;
 pub(crate) use helpers_numeric::*;

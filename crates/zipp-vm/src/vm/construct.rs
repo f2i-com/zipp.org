@@ -101,7 +101,7 @@ impl<'p> Vm<'p> {
                     }
                     if matches!(
                         self.heap.get(result.heap_index()),
-                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
                     ) {
                         return Ok(result);
                     }
@@ -1218,7 +1218,10 @@ impl<'p> Vm<'p> {
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.instant_ctor && ci != 0 {
-            let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+            // Beyond-i128 saturates (sign preserved) — certainly outside the
+            // Instant range, which make_instant validates.
+            let ns =
+                self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?.to_i128_sat();
             let r = self.make_instant(ns)?;
             let over = self.newtarget_proto_override(new_target, cv, self.instant_proto)?;
             return Ok(self.set_ctor_proto(r, over));
@@ -2597,7 +2600,7 @@ impl<'p> Vm<'p> {
         }
         if ci == self.bigint_ctor && self.bigint_ctor != 0 {
             let n = self.bigint_from(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-            return Ok(self.make_bigint(n));
+            return Ok(self.make_bigint_val(n));
         }
         let proto = match self.heap.get(callee.heap_index()) {
             HeapObj::Object(m) => m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index()),
@@ -2671,7 +2674,7 @@ impl<'p> Vm<'p> {
         }
         if matches!(
             self.heap.get(v.heap_index()),
-            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
         ) {
             return Ok(v);
         }
@@ -3120,7 +3123,10 @@ impl<'p> Vm<'p> {
         if !v.is_heap() {
             return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
         }
-        if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. } | HeapObj::BigInt(_)) {
+        if matches!(
+            self.heap.get(v.heap_index()),
+            HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+        ) {
             return Err(Thrown("TypeError: value is not iterable".into()));
         }
         let drain = match self.heap.get(v.heap_index()) {

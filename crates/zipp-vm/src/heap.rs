@@ -1241,10 +1241,17 @@ pub enum HeapObj {
     /// clone it directly); for Locale it also holds the parsed language/region/…
     /// subtags read back by the prototype getters. `typeof` is "object".
     Intl { kind: u8, resolved: u32 },
-    /// A JS `BigInt` primitive. Stored as `i128` (covers the common test262
-    /// magnitudes; true arbitrary precision is a later refinement). Compared by
-    /// VALUE (`1n === 1n`), not identity; `typeof` is "bigint".
+    /// A JS `BigInt` primitive in the FAST representation: any value that fits
+    /// `i128` (virtually all real arithmetic). Compared by VALUE (`1n === 1n`),
+    /// not identity; `typeof` is "bigint".
     BigInt(i128),
+    /// A JS `BigInt` primitive OUTSIDE i128 range (arbitrary precision via
+    /// `num_bigint`). CANONICAL-FORM INVARIANT: a `BigIntBig` NEVER holds an
+    /// i128-representable value — `Vm::make_bigint_val`/`BigVal::from_num`
+    /// (vm/bigint.rs) demote on construction, so equality/ordering between the
+    /// two variants never has to cross-compare (a `BigInt` and a `BigIntBig`
+    /// are always unequal). Holds no heap references (GC trace is a no-op).
+    BigIntBig(Box<num_bigint::BigInt>),
     /// A JS `Symbol` primitive. Identity is the heap index (so `===` and use as a
     /// property key dedupe correctly). `desc` is the description (a string Value or
     /// UNDEFINED). `prop_key` is the internal string under which the symbol is

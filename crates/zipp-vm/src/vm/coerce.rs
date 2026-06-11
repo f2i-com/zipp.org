@@ -204,7 +204,7 @@ impl<'p> Vm<'p> {
             && !self.heap.is_str_like(v.heap_index())
             && !matches!(
                 self.heap.get(v.heap_index()),
-                HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
             )
     }
 
@@ -240,7 +240,7 @@ impl<'p> Vm<'p> {
         let kind = match self.heap.get(v.heap_index()) {
             HeapObj::Str(_) | HeapObj::Cons { .. } => 0u8,
             HeapObj::Symbol { .. } => 3u8,
-            HeapObj::BigInt(_) => 4u8,
+            HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => 4u8,
             _ => return Ok(v),
         };
         Ok(Value::heap(self.heap.alloc(HeapObj::Boxed { kind, value: v })))
@@ -278,8 +278,10 @@ impl<'p> Vm<'p> {
         // ToString(bigint) is BigIntToString - direct and unobservable (the
         // user-patchable BigInt.prototype.toString must NOT run for a
         // primitive BigInt; only a Boxed BigInt object takes the protocol).
-        if let HeapObj::BigInt(b) = self.heap.get(v.heap_index()) {
-            return Ok(b.to_string());
+        match self.heap.get(v.heap_index()) {
+            HeapObj::BigInt(b) => return Ok(b.to_string()),
+            HeapObj::BigIntBig(b) => return Ok(b.to_string()),
+            _ => {}
         }
         // ToString(object) is ToPrimitive(input, "string") then a string coercion;
         // honour a `@@toPrimitive` hook before falling back to toString/valueOf.
@@ -401,8 +403,12 @@ impl<'p> Vm<'p> {
             if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
                 return self.heap.str_eq(ai, bi);
             }
-            if let (HeapObj::BigInt(x), HeapObj::BigInt(y)) = (self.heap.get(ai), self.heap.get(bi)) {
-                return x == y;
+            // BigInts compare by VALUE; canonical form means a Small (i128) and
+            // a Big (beyond-i128) can never be equal, so same-tier suffices.
+            match (self.heap.get(ai), self.heap.get(bi)) {
+                (HeapObj::BigInt(x), HeapObj::BigInt(y)) => return x == y,
+                (HeapObj::BigIntBig(x), HeapObj::BigIntBig(y)) => return x == y,
+                _ => {}
             }
         }
         false
@@ -420,7 +426,7 @@ impl<'p> Vm<'p> {
         v.is_heap()
             && !matches!(
                 self.heap.get(v.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
             )
     }
 
@@ -450,12 +456,12 @@ impl<'p> Vm<'p> {
         // BigInt loose equality compares mathematical values across types
         // (`1n == 1`, `1n == "1"`, `1n == true`), so handle it before the generic
         // same-tag/heap shortcuts (two distinct 1n allocations aren't bit-equal).
-        let (ab, bb) = (self.bigint_value(a), self.bigint_value(b));
+        let (ab, bb) = (self.bigint_val(a), self.bigint_val(b));
         if ab.is_some() || bb.is_some() {
             return Ok(match (ab, bb) {
                 (Some(x), Some(y)) => x == y,
-                (Some(x), None) => self.bigint_loose_eq_other(x, b),
-                (None, Some(y)) => self.bigint_loose_eq_other(y, a),
+                (Some(x), None) => self.bigint_loose_eq_other(&x, b),
+                (None, Some(y)) => self.bigint_loose_eq_other(&y, a),
                 _ => false,
             });
         }
@@ -502,22 +508,23 @@ impl<'p> Vm<'p> {
     /// `BigInt x == <non-BigInt other>`: compare mathematical values. Number must
     /// be a finite integer; a string is parsed as a BigInt; boolean → 0/1; an
     /// object/symbol/null/undefined is never loosely equal to a BigInt here.
-    pub(crate) fn bigint_loose_eq_other(&self, x: i128, other: Value) -> bool {
+    pub(crate) fn bigint_loose_eq_other(&self, x: &BigVal, other: Value) -> bool {
         if other.is_bool() {
-            return x == if other.as_bool() { 1 } else { 0 };
+            return *x == BigVal::Small(if other.as_bool() { 1 } else { 0 });
         }
         if other.is_number() {
-            let n = other.as_f64();
-            return n.is_finite() && n.fract() == 0.0 && (x as f64) == n;
+            // EXACT mathematical comparison — `x as f64` would round a large
+            // i128/Big and wrongly equal a nearby Number.
+            return x.cmp_f64(other.as_f64()) == Some(std::cmp::Ordering::Equal);
         }
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
                 // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
                 let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
                 if t.is_empty() {
-                    return x == 0;
+                    return *x == BigVal::Small(0);
                 }
-                return parse_bigint_str(t).is_some_and(|y| y == x);
+                return parse_bigint_str(t).is_some_and(|y| y == *x);
             }
         }
         false
@@ -534,28 +541,7 @@ impl<'p> Vm<'p> {
 
     /// The `+` operator on two already-fetched Values (shared by the interpreter's
     /// `Add`/`StrConcat` and the JIT's `jit_concat` helper).
-    #[inline]
-    /// ToPrimitive a boxed primitive (`new Number(5)` → 5) for use in operators;
-    /// a non-box passes through. (Our boxes' valueOf returns the wrapped value, so
-    /// this is ToPrimitive with the default/number hint.)
-    pub(crate) fn unwrap_boxed(&self, v: Value) -> Value {
-        if v.is_heap() {
-            if let HeapObj::Boxed { value, .. } = self.heap.get(v.heap_index()) {
-                return *value;
-            }
-        }
-        v
-    }
-
     pub(crate) fn add_values(&mut self, va: Value, vb: Value) -> Result<Value, Thrown> {
-        let (va, vb) = (self.unwrap_boxed(va), self.unwrap_boxed(vb));
-        // A Symbol operand can't be added: ToString (string side) and ToNumber
-        // (numeric side) both throw for a Symbol.
-        for v in [va, vb] {
-            if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
-                return Err(Thrown("TypeError: Cannot convert a Symbol value to a string".into()));
-            }
-        }
         // Fast path: int + int with overflow check.
         if va.is_int() && vb.is_int() {
             return Ok(match va.as_int().checked_add(vb.as_int()) {
@@ -563,42 +549,56 @@ impl<'p> Vm<'p> {
                 None => Value::num(va.as_int() as f64 + vb.as_int() as f64),
             });
         }
-        // BigInt `+`: both BigInt → addition; BigInt + string → concatenation
-        // (ToString the BigInt); BigInt + anything-else → mixing TypeError.
-        let (ab, bb) = (self.bigint_value(va), self.bigint_value(vb));
-        if ab.is_some() || bb.is_some() {
-            if let (Some(x), Some(y)) = (ab, bb) {
-                return Ok(self.make_bigint(x.wrapping_add(y)));
-            }
-            let other = if ab.is_some() { vb } else { va };
-            let other_is_str = other.is_heap() && self.heap.is_str_like(other.heap_index());
-            if !other_is_str {
-                return Err(Thrown(
-                    "TypeError: Cannot mix BigInt and other types, use explicit conversions".into(),
-                ));
-            }
-            // else: fall through to string concatenation (to_str_idx → decimal).
+        // Fast path: string + string (the hot concat shape, incl. jit_concat) —
+        // strings pass ToPrimitive unchanged, so skipping it is unobservable.
+        if va.is_heap()
+            && vb.is_heap()
+            && self.heap.is_str_like(va.heap_index())
+            && self.heap.is_str_like(vb.heap_index())
+        {
+            let (li, ri) = (va.heap_index(), vb.heap_index());
+            let llen = self.heap.str_units(li).unwrap_or(0);
+            let rlen = self.heap.str_units(ri).unwrap_or(0);
+            return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
         }
-        // If either side is a heap value, reduce both to primitives first
-        // (ToPrimitive, default hint). If either primitive is a String, `+` is
-        // string concatenation; otherwise it is numeric addition.
-        if va.is_heap() || vb.is_heap() {
-            let pa = self.to_primitive_default(va)?;
-            let pb = self.to_primitive_default(vb)?;
-            let pa_str = pa.is_heap() && self.heap.is_str_like(pa.heap_index());
-            let pb_str = pb.is_heap() && self.heap.is_str_like(pb.heap_index());
-            if pa_str || pb_str {
-                // Build a rope (cons-string) in O(1) — children point at existing
-                // flat strings / ropes, so a `s += x` loop is O(n) overall.
-                let li = self.to_str_idx(pa);
-                let ri = self.to_str_idx(pb);
-                let llen = self.heap.str_units(li).unwrap_or(0);
-                let rlen = self.heap.str_units(ri).unwrap_or(0);
-                return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
+        // ToPrimitive(default hint) each operand IN ORDER — objects (including
+        // boxed wrappers like `Object(1n)` / `new Number(5)`) run the
+        // observable valueOf/toString/@@toPrimitive protocol; primitives pass
+        // through unchanged.
+        // GC INVARIANT: `pa` (possibly a fresh primitive from va's valueOf) is
+        // held in a Rust local — unrooted — while vb's coercion runs user code.
+        let _gc = self.gc_lock_guard();
+        let pa = self.to_primitive_default(va)?;
+        let pb = self.to_primitive_default(vb)?;
+        let pa_str = pa.is_heap() && self.heap.is_str_like(pa.heap_index());
+        let pb_str = pb.is_heap() && self.heap.is_str_like(pb.heap_index());
+        if pa_str || pb_str {
+            // String concatenation. ToString of a Symbol operand throws; a
+            // BigInt stringifies (decimal, no "n") via to_str_idx.
+            for v in [pa, pb] {
+                if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
+                    return Err(Thrown(
+                        "TypeError: Cannot convert a Symbol value to a string".into(),
+                    ));
+                }
             }
-            return Ok(Value::num(self.to_number(pa)? + self.to_number(pb)?));
+            // Build a rope (cons-string) in O(1) — children point at existing
+            // flat strings / ropes, so a `s += x` loop is O(n) overall.
+            let li = self.to_str_idx(pa);
+            let ri = self.to_str_idx(pb);
+            let llen = self.heap.str_units(li).unwrap_or(0);
+            let rlen = self.heap.str_units(ri).unwrap_or(0);
+            return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
         }
-        Ok(Value::num(self.to_number(va)? + self.to_number(vb)?))
+        // Numeric `+`: both BigInt → BigInt addition; BigInt + non-BigInt →
+        // the spec's mixing TypeError; otherwise Number addition (ToNumber of
+        // a Symbol throws there).
+        let (ab, bb) = (self.bigint_val(pa), self.bigint_val(pb));
+        match (ab, bb) {
+            (Some(x), Some(y)) => self.bigint_op(crate::vm::helpers_misc::BigOp::Add, x, y),
+            (None, None) => Ok(Value::num(self.to_number(pa)? + self.to_number(pb)?)),
+            _ => Err(Thrown(BIGINT_MIX_ERR.into())),
+        }
     }
 
     /// `acc + val` as a string append that MUTATES `acc`'s buffer in place when
@@ -734,15 +734,15 @@ impl<'p> Vm<'p> {
         va: Value,
         vb: Value,
     ) -> Result<Option<Option<std::cmp::Ordering>>, Thrown> {
-        let ab = self.bigint_i128(va);
-        let bb = self.bigint_i128(vb);
+        let ab = self.bigint_val(va);
+        let bb = self.bigint_val(vb);
         if ab.is_none() && bb.is_none() {
             return Ok(None);
         }
         let ord = match (ab, bb) {
             (Some(x), Some(y)) => Some(x.cmp(&y)),
-            (Some(x), None) => self.cmp_bigint_other(x, vb)?,
-            (None, Some(y)) => self.cmp_bigint_other(y, va)?.map(|o| o.reverse()),
+            (Some(x), None) => self.cmp_bigint_other(&x, vb)?,
+            (None, Some(y)) => self.cmp_bigint_other(&y, va)?.map(|o| o.reverse()),
             (None, None) => unreachable!(),
         };
         Ok(Some(ord))
@@ -753,24 +753,15 @@ impl<'p> Vm<'p> {
     /// through f64; whitespace-only → 0n; a non-integer string → undefined, i.e.
     /// unordered so every relational result is false). A Number/Boolean compares
     /// by mathematical value.
-    fn cmp_bigint_other(&self, x: i128, other: Value) -> Result<Option<std::cmp::Ordering>, Thrown> {
+    fn cmp_bigint_other(&self, x: &BigVal, other: Value) -> Result<Option<std::cmp::Ordering>, Thrown> {
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                let y = if s.trim().is_empty() { Some(0i128) } else { parse_bigint_str(&s) };
+                let y =
+                    if s.trim().is_empty() { Some(BigVal::Small(0)) } else { parse_bigint_str(&s) };
                 return Ok(y.map(|y| x.cmp(&y)));
             }
         }
-        Ok(cmp_i128_f64(x, self.to_number(other)?))
-    }
-
-    /// The i128 value of a BigInt heap object, if `v` is one.
-    fn bigint_i128(&self, v: Value) -> Option<i128> {
-        if v.is_heap() {
-            if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
-                return Some(*n);
-            }
-        }
-        None
+        Ok(x.cmp_f64(self.to_number(other)?))
     }
 
     /// JS relational comparison of two STRING operands is lexicographic by UTF-16
@@ -831,10 +822,11 @@ impl<'p> Vm<'p> {
                 return self.heap.str_eq(ai, bi);
             }
             // BigInt === BigInt compares by value (1n === 1n), not heap identity.
-            if let (HeapObj::BigInt(x), HeapObj::BigInt(y)) =
-                (self.heap.get(ai), self.heap.get(bi))
-            {
-                return x == y;
+            // Canonical form: a Small (i128) never equals a Big (beyond-i128).
+            match (self.heap.get(ai), self.heap.get(bi)) {
+                (HeapObj::BigInt(x), HeapObj::BigInt(y)) => return x == y,
+                (HeapObj::BigIntBig(x), HeapObj::BigIntBig(y)) => return x == y,
+                _ => {}
             }
         }
         false
@@ -885,9 +877,15 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: Cannot convert a Symbol value to a number".into()));
         }
         // A BigInt's numeric value (for `Number(1n)` and relational comparison;
-        // arithmetic mixing is rejected earlier by `bigint_binop`).
-        if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
-            return Ok(*n as f64);
+        // arithmetic mixing is rejected earlier by `numeric_binop`).
+        match self.heap.get(v.heap_index()) {
+            HeapObj::BigInt(n) => return Ok(*n as f64),
+            HeapObj::BigIntBig(b) => {
+                use num_traits::ToPrimitive;
+                // Correctly rounded; beyond-f64 magnitudes become ±Infinity.
+                return Ok(b.to_f64().unwrap_or(f64::NAN));
+            }
+            _ => {}
         }
         if let Some(s) = self.heap.str_cow(v.heap_index()) {
             // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
@@ -1006,6 +1004,7 @@ impl<'p> Vm<'p> {
             HeapObj::Date(_)
                 | HeapObj::Symbol { .. }
                 | HeapObj::BigInt(_)
+                | HeapObj::BigIntBig(_)
                 | HeapObj::Str(_)
                 | HeapObj::Cons { .. }
         ) {
@@ -1029,7 +1028,7 @@ impl<'p> Vm<'p> {
         let prim = if v.is_heap()
             && !matches!(
                 self.heap.get(v.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
             ) {
             self.to_primitive_number(v)?
         } else {
@@ -1037,7 +1036,7 @@ impl<'p> Vm<'p> {
         };
         if prim.is_heap() {
             match self.heap.get(prim.heap_index()) {
-                HeapObj::BigInt(_) => {
+                HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
                     return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
                 }
                 HeapObj::Symbol { .. } => {
@@ -1062,6 +1061,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Str(_)
                     | HeapObj::Cons { .. }
                     | HeapObj::BigInt(_)
+                    | HeapObj::BigIntBig(_)
                     | HeapObj::Symbol { .. }
             )
         {
@@ -1091,7 +1091,7 @@ impl<'p> Vm<'p> {
         let is_obj = r.is_heap()
             && !matches!(
                 self.heap.get(r.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
             );
         if is_obj {
             return Err(Thrown("TypeError: Cannot convert object to primitive value".into()));
@@ -1116,7 +1116,7 @@ impl<'p> Vm<'p> {
                 let is_primitive = !r.is_heap()
                     || matches!(
                         self.heap.get(r.heap_index()),
-                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
                     );
                 if is_primitive {
                     return Ok(r);
@@ -1136,7 +1136,7 @@ impl<'p> Vm<'p> {
         }
         if matches!(
             self.heap.get(v.heap_index()),
-            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
         ) {
             return Ok(v);
         }
@@ -1159,7 +1159,7 @@ impl<'p> Vm<'p> {
                 let is_primitive = !r.is_heap()
                     || matches!(
                         self.heap.get(r.heap_index()),
-                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::Symbol { .. }
+                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) | HeapObj::Symbol { .. }
                     );
                 if is_primitive {
                     return Ok(r);
@@ -1188,6 +1188,7 @@ impl<'p> Vm<'p> {
                         HeapObj::Str(_)
                             | HeapObj::Cons { .. }
                             | HeapObj::BigInt(_)
+                            | HeapObj::BigIntBig(_)
                             | HeapObj::Symbol { .. }
                     );
                 if is_primitive {
@@ -1291,6 +1292,7 @@ impl<'p> Vm<'p> {
                 }
                 // ToString(BigInt) is the decimal digits with NO "n" (String(1n) === "1").
                 HeapObj::BigInt(n) => n.to_string(),
+                HeapObj::BigIntBig(b) => b.to_string(),
                 HeapObj::RegExp { source, flags, .. } => {
                     let s = if source.is_empty() { "(?:)" } else { source };
                     format!("/{s}/{flags}")
@@ -1497,6 +1499,7 @@ impl<'p> Vm<'p> {
             }
             // console.log shows BigInt with the `n` suffix (1n), unlike ToString.
             HeapObj::BigInt(n) => format!("{n}n"),
+            HeapObj::BigIntBig(b) => format!("{b}n"),
             HeapObj::RegExp { source, flags, .. } => {
                 let s = if source.is_empty() { "(?:)" } else { source };
                 format!("/{s}/{flags}")
@@ -1566,7 +1569,7 @@ impl<'p> Vm<'p> {
 
 /// Exact ordering of an i128 (a BigInt) against an f64, comparing mathematical
 /// values without rounding the integer. `None` means unordered (the f64 is NaN).
-fn cmp_i128_f64(x: i128, y: f64) -> Option<std::cmp::Ordering> {
+pub(crate) fn cmp_i128_f64(x: i128, y: f64) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     if y.is_nan() {
         return None;

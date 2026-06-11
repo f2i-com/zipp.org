@@ -61,7 +61,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Cell(inner) => self.type_of(*inner), // see through an upvalue cell
                 HeapObj::Proxy { target, .. } => self.type_of(*target), // typeof = target's
                 HeapObj::Symbol { .. } => "symbol",
-                HeapObj::BigInt(_) => "bigint",
+                HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => "bigint",
                 // The built-in constructor globals (Object/Array/Map/…) are callable.
                 HeapObj::Object(m) if m.is_ctor => "function",
                 // %Function.prototype% is itself a (no-op) callable function.
@@ -619,7 +619,7 @@ impl<'p> Vm<'p> {
         }
         if matches!(
             self.heap.get(obj.heap_index()),
-            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
         ) {
             return self.primitive_base_set(obj, key, val, strict);
         }
@@ -1302,7 +1302,7 @@ impl<'p> Vm<'p> {
             match self.heap.get(obj.heap_index()) {
                 HeapObj::Str(_) | HeapObj::Cons { .. } => self.str_proto,
                 HeapObj::Symbol { .. } => self.symbol_proto,
-                HeapObj::BigInt(_) => self.bigint_proto,
+                HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => self.bigint_proto,
                 _ => 0,
             }
         } else {

@@ -808,7 +808,7 @@ fn compile_proto(
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
-            Instr::AddInt { dst, a, imm } => {
+            Instr::AddInt { dst, a, imm, .. } => {
                 guard_int(&mut ops, a, bail);
                 dynasm!(ops
                     ; mov eax, [rbx + dreg(a)]    // low 32 bits = i32 payload
@@ -1417,7 +1417,7 @@ fn emit_kernel_arith(
             dynasm!(ops ; mov rax, [rbx + dreg(src)] ; mov [rbx + dreg(dst)], rax);
             Some(KBody::Plain)
         }
-        Instr::AddInt { dst, a, imm } => {
+        Instr::AddInt { dst, a, imm, .. } => {
             load_num_xmm(ops, a, 0, bail);
             dynasm!(ops ; mov eax, imm ; cvtsi2sd xmm1, eax ; addsd xmm0, xmm1);
             store_xmm(ops, dst);
@@ -2769,7 +2769,7 @@ fn compile_region_regalloc(
             Instr::Sub { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Sub),
             Instr::Mul { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Mul),
             Instr::Div { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Div),
-            Instr::AddInt { dst, a, imm } => {
+            Instr::AddInt { dst, a, imm, .. } => {
                 let d = xh(&plan, dst);
                 let ax = xh(&plan, a);
                 dynasm!(ops
@@ -3096,7 +3096,7 @@ fn compile_region_int(
                     ; => done
                 );
             }
-            Instr::AddInt { dst, a, imm } => {
+            Instr::AddInt { dst, a, imm, .. } => {
                 let d = xh(&plan, dst);
                 let ax = xh(&plan, a);
                 // Materialise the (sign-extended) immediate as i64 in xmm0.
@@ -3614,7 +3614,7 @@ fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::AddInt { dst, a, imm } => {
+            Instr::AddInt { dst, a, imm, .. } => {
                 // a + imm in f64: load a, materialise imm as a double, addsd.
                 load_num_xmm(&mut ops, a, 0, bail);
                 dynasm!(ops

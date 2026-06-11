@@ -1437,6 +1437,8 @@ version = "0.0.1"
 dependencies = [
  "dynasm",
  "dynasmrt",
+ "num-bigint",
+ "num-traits",
  "oxc_allocator",
  "oxc_ast",
  "oxc_parser",

@@ -106,7 +106,13 @@ pub enum Instr {
     BitNot { dst: Reg, a: Reg },
 
     /// `dst = a + <int immediate>` — the canonical `i + 1`, `n - 1` shape.
-    AddInt { dst: Reg, a: Reg, imm: i32 },
+    /// `upd` distinguishes the two sources with DIFFERENT BigInt semantics:
+    /// an UpdateExpression (`++`/`--`, upd=true) is ToNumeric and keeps a
+    /// BigInt operand a BigInt (`n++` adds 1n), while the binary `x ± lit`
+    /// fast path (upd=false) must throw the spec's mixing TypeError for a
+    /// BigInt operand (`1n - 1` throws). Identical for Number operands (the
+    /// JIT, which only handles numbers, ignores the flag).
+    AddInt { dst: Reg, a: Reg, imm: i32, upd: bool },
 
     /// `dst = a + b` — SEMANTICALLY IDENTICAL to `Add` (same operator, same
     /// coercion). A pure JIT routing hint emitted by a compile pass for the
@@ -526,6 +532,9 @@ pub enum Instr {
     MakeSymbol { dst: Reg, desc: Option<Reg> },
     /// `dst = <BigInt literal>` (`123n`) — allocate a BigInt with the given value.
     LoadBigInt { dst: Reg, value: i128 },
+    /// `dst = <BigInt literal beyond i128>` — allocate an arbitrary-precision
+    /// BigInt from the function's `bigint_consts[idx]` (parsed at compile time).
+    LoadBigIntBig { dst: Reg, idx: u32 },
     /// `dst = BigInt(arg)` — convert a number/string/boolean/BigInt to a BigInt
     /// (non-integer number → RangeError; symbol/null/undefined → TypeError).
     BigIntFrom { dst: Reg, arg: Reg },
@@ -894,6 +903,10 @@ pub struct FuncProto {
     /// Heap-string constants referenced by `LoadConst` need their text; this
     /// parallels `constants` for the string case (resolved at load time).
     pub string_constants: Vec<String>,
+    /// BigInt literal constants BEYOND i128 (`LoadBigIntBig` indexes here),
+    /// parsed once at compile time. In-range literals stay inline in
+    /// `LoadBigInt`; this pool is empty for virtually every function.
+    pub bigint_consts: Vec<num_bigint::BigInt>,
     /// `string_constants` indices whose text is the oxc LONE-SURROGATE marker
     /// form (`\u{FFFD}XXXX` per lone surrogate, `\u{FFFD}fffd` for a literal
     /// U+FFFD — the parser's lossless encoding for `'\uD800'`-style literals).

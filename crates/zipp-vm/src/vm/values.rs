@@ -1207,39 +1207,15 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::BigInt(v)))
     }
 
-    /// The i128 of a BigInt value, else None.
-    pub(crate) fn bigint_value(&self, v: Value) -> Option<i128> {
-        if v.is_heap() {
-            if let HeapObj::BigInt(n) = self.heap.get(v.heap_index()) {
-                return Some(*n);
-            }
-        }
-        None
-    }
-
-    /// thisBigIntValue(v): the i128 of a BigInt primitive OR a boxed BigInt wrapper
-    /// (`Object(1n)`, a Boxed of kind 4); `None` otherwise. Backs
-    /// BigInt.prototype.{toString,valueOf}, which accept the wrapper object.
-    pub(crate) fn this_bigint_value(&self, v: Value) -> Option<i128> {
-        if v.is_heap() {
-            match self.heap.get(v.heap_index()) {
-                HeapObj::BigInt(n) => return Some(*n),
-                HeapObj::Boxed { kind: 4, value } => return self.bigint_value(*value),
-                _ => {}
-            }
-        }
-        None
-    }
-
     /// `ToBigInt(v)` (used by `BigInt(x)`, asIntN/asUintN, and `==`). A non-integer
     /// number → RangeError; symbol/null/undefined/object → TypeError; a bad numeric
     /// string → SyntaxError.
-    pub(crate) fn to_bigint(&mut self, v: Value) -> Result<i128, Thrown> {
-        if let Some(n) = self.bigint_value(v) {
+    pub(crate) fn to_bigint(&mut self, v: Value) -> Result<BigVal, Thrown> {
+        if let Some(n) = self.bigint_val(v) {
             return Ok(n);
         }
         if v.is_bool() {
-            return Ok(if v.as_bool() { 1 } else { 0 });
+            return Ok(BigVal::Small(if v.as_bool() { 1 } else { 0 }));
         }
         // ToBigInt of a Number is a TypeError — a Number is only accepted by the
         // BigInt() constructor's NumberToBigInt step (see `bigint_from`). This covers
@@ -1252,7 +1228,7 @@ impl<'p> Vm<'p> {
             let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
             let t = s.trim();
             if t.is_empty() {
-                return Ok(0);
+                return Ok(BigVal::Small(0));
             }
             return parse_bigint_str(t)
                 .ok_or_else(|| Thrown(format!("SyntaxError: Cannot convert {t} to a BigInt")));
@@ -1272,7 +1248,7 @@ impl<'p> Vm<'p> {
     /// value is taken through ToPrimitive(number); an integral Number is accepted
     /// via NumberToBigInt (a non-integral Number is a RangeError), and any other
     /// primitive falls through to the strict ToBigInt (Boolean/String/BigInt).
-    pub(crate) fn bigint_from(&mut self, v: Value) -> Result<i128, Thrown> {
+    pub(crate) fn bigint_from(&mut self, v: Value) -> Result<BigVal, Thrown> {
         let prim = if self.is_object_value(v) {
             self.to_primitive_number(v)?
         } else {
@@ -1286,7 +1262,16 @@ impl<'p> Vm<'p> {
                         .into(),
                 ));
             }
-            return Ok(d as i128);
+            // Safely within i128 → fast tier; near/beyond the boundary → exact
+            // num-bigint conversion (an f64 integer is always exact), then
+            // canonicalize (`BigInt(1e300)` is a real beyond-i128 BigInt now).
+            if d.abs() < (1i128 << 126) as f64 {
+                return Ok(BigVal::Small(d as i128));
+            }
+            use num_traits::FromPrimitive;
+            let b = num_bigint::BigInt::from_f64(d)
+                .ok_or_else(|| Thrown("RangeError: Cannot convert to a BigInt".into()))?;
+            return Ok(BigVal::from_num(b));
         }
         self.to_bigint(prim)
     }

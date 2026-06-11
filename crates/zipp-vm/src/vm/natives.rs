@@ -995,7 +995,7 @@ impl<'p> Vm<'p> {
                 }
             }
             BIGINT_TO_STRING => {
-                let n = match self.this_bigint_value(this) {
+                let n = match self.this_bigint_val(this) {
                     Some(n) => n,
                     None => {
                         return Err(Thrown(
@@ -1010,11 +1010,11 @@ impl<'p> Vm<'p> {
                 if !(2..=36).contains(&radix) {
                     return Err(Thrown("RangeError: toString() radix must be between 2 and 36".into()));
                 }
-                self.alloc_str(bigint_to_radix(n, radix as u32))
+                self.alloc_str(n.to_radix_string(radix as u32))
             }
             BIGINT_VALUE_OF => {
-                match self.this_bigint_value(this) {
-                    Some(n) => self.make_bigint(n),
+                match self.this_bigint_val(this) {
+                    Some(n) => self.make_bigint_val(n),
                     None => {
                         return Err(Thrown(
                             "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt".into(),
@@ -1033,13 +1033,11 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let x = self.to_bigint(a1)?;
-                let b = bits.min(u32::MAX as usize) as u32;
-                let r = if id == BIGINT_AS_INTN {
-                    bigint_as_intn(b, x)
+                if id == BIGINT_AS_INTN {
+                    self.bigint_as_intn_val(bits as u64, x)?
                 } else {
-                    bigint_as_uintn(b, x)
-                };
-                self.make_bigint(r)
+                    self.bigint_as_uintn_val(bits as u64, x)?
+                }
             }
             REGEXP_EXEC => {
                 if !matches!(
@@ -1305,6 +1303,7 @@ impl<'p> Vm<'p> {
                         HeapObj::Str(_)
                             | HeapObj::Cons { .. }
                             | HeapObj::BigInt(_)
+                            | HeapObj::BigIntBig(_)
                             | HeapObj::Symbol { .. }
                     );
                 if !is_obj {
@@ -2121,7 +2120,8 @@ impl<'p> Vm<'p> {
                         HeapObj::Str(_)
                         | HeapObj::Cons { .. }
                         | HeapObj::Symbol { .. }
-                        | HeapObj::BigInt(_) => {}
+                        | HeapObj::BigInt(_)
+                        | HeapObj::BigIntBig(_) => {}
                         HeapObj::Object(_) => {
                             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                                 match id {
@@ -2202,7 +2202,8 @@ impl<'p> Vm<'p> {
                         HeapObj::Str(_)
                         | HeapObj::Cons { .. }
                         | HeapObj::Symbol { .. }
-                        | HeapObj::BigInt(_) => (true, true, false),
+                        | HeapObj::BigInt(_)
+                        | HeapObj::BigIntBig(_) => (true, true, false),
                         // An exotic object (Array / TypedArray / Map / Set / …) whose
                         // elements live outside arr_props: the explicit seal/freeze
                         // markers are authoritative (the vacuous attrs-based check
@@ -4342,11 +4343,13 @@ impl<'p> Vm<'p> {
                 self.make_instant((n as i128) * 1_000_000_000)?
             }
             INST_FROM_EPOCH_NS => {
-                let ns = self.to_bigint(a0)?;
+                // Beyond-i128 saturates (sign preserved) — certainly outside the
+                // Instant range, which make_instant validates.
+                let ns = self.to_bigint(a0)?.to_i128_sat();
                 self.make_instant(ns)?
             }
             INST_FROM_EPOCH_US => {
-                let ns = self.to_bigint(a0)? * 1_000;
+                let ns = self.to_bigint(a0)?.to_i128_sat().saturating_mul(1_000);
                 self.make_instant(ns)?
             }
             INST_COMPARE => {

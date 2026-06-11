@@ -295,7 +295,7 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::Native(_)
             | HeapObj::Symbol { .. } => return Ok(None),
-            HeapObj::BigInt(_) => {
+            HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
                 return Err(Thrown("TypeError: Do not know how to serialize a BigInt".into()))
             }
             // A boxed primitive serializes as ToString / ToNumber / its boolean —
@@ -319,7 +319,10 @@ impl<'p> Vm<'p> {
             // Symbol falls through to SerializeJSONObject ("{}").
             HeapObj::Boxed { value, .. } => {
                 if value.is_heap()
-                    && matches!(self.heap.get(value.heap_index()), HeapObj::BigInt(_))
+                    && matches!(
+                        self.heap.get(value.heap_index()),
+                        HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                    )
                 {
                     return Err(Thrown(
                         "TypeError: Do not know how to serialize a BigInt".into(),
