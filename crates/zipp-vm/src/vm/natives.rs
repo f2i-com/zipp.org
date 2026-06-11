@@ -759,9 +759,21 @@ impl<'p> Vm<'p> {
                         _ => {}
                     }
                 }
-                let regex = regress::Regex::with_flags(&source, rflags.as_str()).map_err(|e| {
-                    Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
-                })?;
+                // Pattern characters: code points in `u`/`v` mode, UTF-16 code
+                // units otherwise (an astral literal is its two surrogate
+                // halves; group names recombine pairs) — kept in sync with
+                // `build_regexp`.
+                let compile_cps: Vec<u32> = if flags.contains('u') || flags.contains('v') {
+                    source.chars().map(u32::from).collect()
+                } else {
+                    super::proxy_regexp::nonunicode_pattern_chars(
+                        &source.encode_utf16().collect::<Vec<u16>>(),
+                    )
+                };
+                let regex = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
+                    .map_err(|e| {
+                        Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
+                    })?;
                 if let HeapObj::RegExp { regex: r, source: s, flags: fl, .. } =
                     self.heap.get_mut(this.heap_index())
                 {
@@ -972,10 +984,14 @@ impl<'p> Vm<'p> {
                 // A custom @@species Construct re-enters the interpreter; hold the
                 // un-rooted match Values across it by suspending GC.
                 let _gc = self.gc_lock_guard();
-                let s = self.to_js_string(a0)?;
+                // ToString(string) — IDENTITY for a string value (exact WTF-8).
+                let s_val = self.to_str_value(a0)?;
                 let flags_v = self.get_prop(this, "flags")?;
                 let flags = self.to_js_string(flags_v)?;
                 let global = flags.contains('g');
+                // fullUnicode is captured HERE per CreateRegExpStringIterator —
+                // it drives the driver's AdvanceStringIndex on empty matches.
+                let full_unicode = flags.contains('u') || flags.contains('v');
                 // C = SpeciesConstructor(R, %RegExp%).
                 let default_ctor = Value::heap(self.regexp_ctor);
                 let c = {
@@ -1008,14 +1024,14 @@ impl<'p> Vm<'p> {
                 let li_v = self.get_prop(this, "lastIndex")?;
                 let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
                 self.set_regexp_last_index(matcher_idx, li);
-                let s_val = self.alloc_str(s.clone());
                 // Build a LAZY %RegExpStringIterator%: an empty Iterator object whose
                 // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
                 // exec/lastIndex side effects are observable per step, not up front.
                 let proto = self.regexp_string_iter_proto;
                 let it =
                     self.heap.alloc(HeapObj::Iterator { items: Vec::new(), index: 0, proto, live: None });
-                self.regexp_string_iters.insert(it, (matcher_idx, s_val, global, false));
+                let fbits = (global as u8) | ((full_unicode as u8) << 1);
+                self.regexp_string_iters.insert(it, (matcher_idx, s_val, fbits, false));
                 Value::heap(it)
             }
             REGEXP_GET_GLOBAL
@@ -2463,8 +2479,12 @@ impl<'p> Vm<'p> {
                 // A lazy %RegExpStringIterator%: run ONE RegExpExec (via the abstract
                 // protocol, honouring a user `exec`) per next(). A null result, or the
                 // single match of a non-global regex, latches done; a global empty
-                // match advances lastIndex so the next step makes progress.
-                if let Some(&(regexp, string, global, done)) = self.regexp_string_iters.get(&it_idx) {
+                // match advances lastIndex (spec AdvanceStringIndex: +1 unit, +2 over
+                // an astral surrogate pair when the iterator's fullUnicode bit is set)
+                // so the next step makes progress.
+                if let Some(&(regexp, string, fbits, done)) = self.regexp_string_iters.get(&it_idx) {
+                    let global = fbits & 1 != 0;
+                    let full_unicode = fbits & 2 != 0;
                     let (value, ret_done, latch) = if done {
                         (Value::UNDEFINED, true, true)
                     } else {
@@ -2480,17 +2500,18 @@ impl<'p> Vm<'p> {
                                 let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
                                 // ToLength(Get(R,"lastIndex")) — a throwing
                                 // lastIndex.valueOf must propagate, not be swallowed;
-                                // the 2^53-1 clamp applies BEFORE the +1 advance.
+                                // the 2^53-1 clamp applies BEFORE the advance.
                                 let cur = self
                                     .to_integer_or_zero(cur_v)?
                                     .clamp(0, (1i64 << 53) - 1)
                                     as usize;
-                                self.set_regexp_last_index(regexp, cur + 1);
+                                let next = self.advance_index_on_value(string, cur, full_unicode);
+                                self.set_regexp_last_index(regexp, next);
                             }
                             (r, false, false)
                         }
                     };
-                    self.regexp_string_iters.insert(it_idx, (regexp, string, global, latch));
+                    self.regexp_string_iters.insert(it_idx, (regexp, string, fbits, latch));
                     let mut m = ObjMap::new();
                     m.set("value", value);
                     m.set("done", Value::bool(ret_done));

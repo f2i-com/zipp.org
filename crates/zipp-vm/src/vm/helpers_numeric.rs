@@ -56,18 +56,6 @@ pub(crate) fn clamp_u8(f: f64) -> u8 {
     r as u8
 }
 
-/// Convert a byte offset into `s` to a char offset (regress reports byte offsets;
-/// our string indexing is char-based). Identity for ASCII.
-pub(crate) fn byte_to_char(s: &str, byte: usize) -> usize {
-    let b = byte.min(s.len());
-    s[..b].chars().count()
-}
-
-/// Convert a char offset into `s` to a byte offset (for seeking regress).
-pub(crate) fn char_to_byte(s: &str, ch: usize) -> usize {
-    s.char_indices().nth(ch).map(|(b, _)| b).unwrap_or(s.len())
-}
-
 /// Format an i128 BigInt in the given radix (2..=36), lowercase digits.
 pub(crate) fn bigint_to_radix(n: i128, radix: u32) -> String {
     if radix == 10 {

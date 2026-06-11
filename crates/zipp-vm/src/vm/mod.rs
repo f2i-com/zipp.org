@@ -297,10 +297,12 @@ pub struct Vm<'p> {
     /// cached objects are permanent GC roots (they live as long as the realm).
     template_cache: std::collections::HashMap<(u32, u32), Value>,
     /// Lazy %RegExpStringIterator% state, keyed by the iterator's heap index:
-    /// (matcher regexp heap idx, subject string, global flag, done latch). Its
-    /// `next()` drives RegExpExec (honouring a user `exec`) one match at a time,
-    /// rather than matchAll eagerly collecting every match up front.
-    regexp_string_iters: std::collections::HashMap<u32, (u32, Value, bool, bool)>,
+    /// (matcher regexp heap idx, subject string, flag bits — bit0 global, bit1
+    /// fullUnicode (`u`/`v`, captured at creation per CreateRegExpStringIterator),
+    /// done latch). Its `next()` drives RegExpExec (honouring a user `exec`) one
+    /// match at a time, rather than matchAll eagerly collecting every match up
+    /// front.
+    regexp_string_iters: std::collections::HashMap<u32, (u32, Value, u8, bool)>,
     /// Monotone counter minting a fresh private brand per class evaluation (1 = first;
     /// 0 = unbranded).
     next_private_brand: u64,

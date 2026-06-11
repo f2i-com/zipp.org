@@ -417,8 +417,7 @@ impl<'p> Vm<'p> {
                 let global =
                     matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
                 let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let out = self.regex_replace(&s, re, repl, global)?;
-                Ok(Some(self.alloc_str(out)))
+                Ok(Some(self.regex_replace(idx, re, repl, global)?))
             }
             // `replaceAll` (regexp or otherwise) funnels into `string_replace_plain`,
             // which performs the spec step-2 checks (IsRegExp → global-flag, GetMethod

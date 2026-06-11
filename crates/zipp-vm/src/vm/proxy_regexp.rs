@@ -226,24 +226,30 @@ impl<'p> Vm<'p> {
     /// generic over any Object `rx`, honouring a user `exec`/`flags`/`lastIndex`,
     /// reading each result's `0`/`length`/`index`/group-N/`groups` via Get, and
     /// building the replacement from THOSE values. Reuses `regexp_exec_abstract` so a
-    /// user `exec` governs the matches. (zipp indexes strings by Unicode scalar, so
-    /// AdvanceStringIndex advances one scalar.)
+    /// user `exec` governs the matches. All positions (`index`, lastIndex, slice
+    /// bounds, the replacer's offset argument) are UTF-16 unit indices.
     pub(crate) fn regexp_symbol_replace(
         &mut self,
         rx: Value,
         string: Value,
         replace_value: Value,
     ) -> Result<Value, Thrown> {
-        let s = self.to_js_string(string)?;
-        let s_chars: Vec<char> = s.chars().collect();
-        let length_s = s_chars.len();
-        let s_val = self.alloc_str(s.clone());
+        // ToString(string) — IDENTITY for a string value (exact WTF-8).
+        let s_val = self.to_str_value(string)?;
+        // Encode ONCE; every position below indexes this unit buffer.
+        let u16s: Vec<u16> = self.value_units(s_val);
+        let length_s = u16s.len();
+        // `s_val` and `results` live in Rust locals across exec/replacer
+        // re-entries — hold GC off for the whole protocol.
+        let _gc = self.gc_lock_guard();
         let functional = self.is_callable(replace_value);
         let replace_str = if functional { String::new() } else { self.to_js_string(replace_value)? };
         // flags / global / fullUnicode are observable (Get, ToString).
         let flags_v = self.get_prop(rx, "flags")?;
         let flags = self.to_js_string(flags_v)?;
         let global = flags.contains('g');
+        // fullUnicode (`u`/`v`) selects code-point AdvanceStringIndex.
+        let full_unicode = flags.contains('u') || flags.contains('v');
         if global {
             self.set_prop(rx, "lastIndex", Value::int(0), true)?;
         }
@@ -267,21 +273,25 @@ impl<'p> Vm<'p> {
             let match0 = self.get_prop(result, "0")?;
             if self.to_js_string(match0)?.is_empty() {
                 let li_v = self.get_prop(rx, "lastIndex")?;
-                // ToLength: clamp to 2^53-1 BEFORE the +1 advance.
+                // ToLength: clamp to 2^53-1 BEFORE the advance.
                 let this_index =
                     self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
-                self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), true)?;
+                let next = advance_string_index(&u16s, this_index, full_unicode);
+                self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
         }
-        // Build the accumulated result, reading each match's fields via Get.
-        let mut accumulated = String::new();
+        // Build the accumulated result (WTF-8 — subject slices stay exact),
+        // reading each match's fields via Get.
+        let mut accumulated: Vec<u8> = Vec::new();
         let mut next_pos: usize = 0;
         for result in results {
             let len_v = self.get_prop(result, "length")?;
             let n_captures = (self.to_integer_or_zero(len_v)?.max(0) as usize).saturating_sub(1);
             let matched_v = self.get_prop(result, "0")?;
-            let matched = self.to_js_string(matched_v)?;
-            let match_len = matched.chars().count();
+            // ToString(Get(result,"0")) — IDENTITY for a string value; its UNIT
+            // length determines how far this match consumes the subject.
+            let matched_val = self.to_str_value(matched_v)?;
+            let match_len = self.heap.str_units(matched_val.heap_index()).unwrap_or(0);
             let pos_v = self.get_prop(result, "index")?;
             let position = self.to_integer_or_zero(pos_v)?.clamp(0, length_s as i64) as usize;
             let mut captures: Vec<Option<String>> = Vec::with_capacity(n_captures);
@@ -295,9 +305,11 @@ impl<'p> Vm<'p> {
             }
             let named_v = self.get_prop(result, "groups")?;
             let named_defined = named_v != Value::UNDEFINED;
-            let replacement = if functional {
+            // Replacement bytes (WTF-8): the functional path appends a returned
+            // string's EXACT bytes; the template path expands over lossy views.
+            let replacement: Vec<u8> = if functional {
                 let mut argv: Vec<Value> = Vec::with_capacity(n_captures + 4);
-                argv.push(self.alloc_str(matched.clone()));
+                argv.push(matched_val);
                 for c in &captures {
                     argv.push(match c {
                         Some(g) => self.alloc_str(g.clone()),
@@ -310,7 +322,11 @@ impl<'p> Vm<'p> {
                     argv.push(named_v);
                 }
                 let r = self.call_value(replace_value, Value::UNDEFINED, &argv)?;
-                self.to_js_string(r)?
+                let rv = self.to_str_value(r)?;
+                self.heap
+                    .str_wtf8_cow(rv.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default()
             } else {
                 // GetSubstitution: read the named-capture group object's own props.
                 // Step l.i.1 — when `groups` is not undefined it is ToObject'd, so a
@@ -337,23 +353,35 @@ impl<'p> Vm<'p> {
                 } else {
                     Vec::new()
                 };
-                let pre: String = s_chars[..position].iter().collect();
+                let matched_lossy = self
+                    .heap
+                    .str_cow(matched_val.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                let pre = String::from_utf16_lossy(&u16s[..position]);
                 let post_start = (position + match_len).min(length_s);
-                let post: String = s_chars[post_start..].iter().collect();
-                self.expand_replacement(&replace_str, &matched, &captures, &named_list, named_defined, &pre, &post)
+                let post = String::from_utf16_lossy(&u16s[post_start..]);
+                self.expand_replacement(
+                    &replace_str,
+                    &matched_lossy,
+                    &captures,
+                    &named_list,
+                    named_defined,
+                    &pre,
+                    &post,
+                )
+                .into_bytes()
             };
             if position >= next_pos {
-                let prefix: String = s_chars[next_pos..position].iter().collect();
-                accumulated.push_str(&prefix);
-                accumulated.push_str(&replacement);
+                push_units(&mut accumulated, &u16s[next_pos..position]);
+                crate::heap::wtf8_push(&mut accumulated, &replacement);
                 next_pos = position + match_len;
             }
         }
         if next_pos < length_s {
-            let tail: String = s_chars[next_pos..].iter().collect();
-            accumulated.push_str(&tail);
+            push_units(&mut accumulated, &u16s[next_pos..]);
         }
-        Ok(self.alloc_str(accumulated))
+        Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(accumulated))))
     }
 
     /// RegExpExec (ES 22.2.7.1): the exec PROTOCOL. When the regex has a callable
@@ -365,8 +393,9 @@ impl<'p> Vm<'p> {
         let re_v = Value::heap(re);
         let exec = self.get_prop(re_v, "exec")?;
         if self.is_callable(exec) {
-            let s_str = self.to_js_string(input)?;
-            let s = self.alloc_str(s_str);
+            // ToString(S) — IDENTITY for a string value (exact WTF-8; a lossy
+            // copy would strip lone surrogates before exec ever sees them).
+            let s = self.to_str_value(input)?;
             let r = self.call_value(exec, re_v, &[s])?;
             let is_object = r.is_heap()
                 && !matches!(
@@ -398,8 +427,14 @@ impl<'p> Vm<'p> {
         if !flags.contains('g') {
             return self.regexp_exec_abstract(re, input);
         }
-        let s_str = self.to_js_string(input)?;
-        let s_val = self.alloc_str(s_str);
+        // fullUnicode (`u`/`v`) selects code-point AdvanceStringIndex.
+        let full_unicode = flags.contains('u') || flags.contains('v');
+        // ToString(string) — IDENTITY for a string value (exact WTF-8).
+        let s_val = self.to_str_value(input)?;
+        // Unit buffer for the empty-match AdvanceStringIndex step.
+        let u16s: Vec<u16> = self.value_units(s_val);
+        // `s_val`/`elems` live in Rust locals across exec re-entries.
+        let _gc = self.gc_lock_guard();
         self.set_prop(rx, "lastIndex", Value::int(0), false)?;
         let mut elems: Vec<Value> = Vec::new();
         let mut guard = 0u32;
@@ -413,15 +448,18 @@ impl<'p> Vm<'p> {
                 break;
             }
             let m0 = self.get_prop(result, "0")?;
-            let match_str = self.to_js_string(m0)?;
-            let is_empty = match_str.is_empty();
-            elems.push(self.alloc_str(match_str));
+            // ToString(Get(result,"0")) — IDENTITY for a string value, so a
+            // lone-surrogate match survives into the result array.
+            let m0_val = self.to_str_value(m0)?;
+            let is_empty = self.heap.str_units(m0_val.heap_index()) == Some(0);
+            elems.push(m0_val);
             if is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
-                // ToLength: clamp to 2^53-1 BEFORE the +1 advance.
+                // ToLength: clamp to 2^53-1 BEFORE the advance.
                 let this_index =
                     self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
-                self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), true)?;
+                let next = advance_string_index(&u16s, this_index, full_unicode);
+                self.set_prop(rx, "lastIndex", Value::num(next as f64), true)?;
             }
         }
         if elems.is_empty() {
@@ -441,11 +479,15 @@ impl<'p> Vm<'p> {
         // OBSERVABLE @@split (22.2.6.14), generic over any Object `rx`:
         // SpeciesConstructor(rx, %RegExp%) builds a sticky (`y`) splitter, then a
         // loop calls RegExpExec (honouring a user `exec`) reading lastIndex/length/
-        // captures via Get. zipp indexes by Unicode scalar (AdvanceStringIndex = +1).
+        // captures via Get. Positions p/q/e are UTF-16 unit indices; the no-match
+        // advance is spec AdvanceStringIndex (+2 over an astral pair in `u`/`v`).
         let rx = Value::heap(re);
-        let s_str = self.to_js_string(input)?;
-        let s_chars: Vec<char> = s_str.chars().collect();
-        let size = s_chars.len();
+        // ToString(string) — IDENTITY for a string value (exact WTF-8).
+        let s_val = self.to_str_value(input)?;
+        let u16s: Vec<u16> = self.value_units(s_val);
+        let size = u16s.len();
+        // `s_val`/`a` live in Rust locals across construct/exec re-entries.
+        let _gc = self.gc_lock_guard();
         // SpeciesConstructor(rx, %RegExp%).
         let default_ctor = Value::heap(self.regexp_ctor);
         let c = {
@@ -474,6 +516,8 @@ impl<'p> Vm<'p> {
         // flags (observable) + force the sticky `y` flag on the splitter copy.
         let flags_v = self.get_prop(rx, "flags")?;
         let flags = self.to_js_string(flags_v)?;
+        // unicodeMatching (`u`/`v`) selects code-point AdvanceStringIndex.
+        let unicode_matching = flags.contains('u') || flags.contains('v');
         let new_flags = if flags.contains('y') { flags } else { format!("{flags}y") };
         let new_flags_v = self.alloc_str(new_flags);
         let splitter = self.construct(c, &[rx, new_flags_v])?;
@@ -486,7 +530,6 @@ impl<'p> Vm<'p> {
         if lim == 0 {
             return Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))));
         }
-        let s_val = self.alloc_str(s_str.clone());
         // Empty input: one exec; if it matches, the result is empty, else [S].
         if size == 0 {
             let z = self.regexp_exec_abstract(splitter.heap_index(), s_val)?;
@@ -506,18 +549,18 @@ impl<'p> Vm<'p> {
             self.set_prop(splitter, "lastIndex", Value::num(q as f64), true)?;
             let z = self.regexp_exec_abstract(splitter.heap_index(), s_val)?;
             if z == Value::NULL {
-                q += 1;
+                q = advance_string_index(&u16s, q, unicode_matching);
                 continue;
             }
             // e = min(ToLength(Get(splitter,"lastIndex")), size).
             let li_v = self.get_prop(splitter, "lastIndex")?;
             let e = (self.to_integer_or_zero(li_v)?.max(0) as usize).min(size);
             if e == p {
-                q += 1;
+                q = advance_string_index(&u16s, q, unicode_matching);
                 continue;
             }
-            let t: String = s_chars[p..q].iter().collect();
-            a.push(self.alloc_str(t));
+            let t = self.units_value(&u16s[p..q]);
+            a.push(t);
             if a.len() as u64 == lim {
                 return Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))));
             }
@@ -534,8 +577,8 @@ impl<'p> Vm<'p> {
             }
             q = p;
         }
-        let tail: String = s_chars[p..].iter().collect();
-        a.push(self.alloc_str(tail));
+        let tail = self.units_value(&u16s[p..]);
+        a.push(tail);
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(a))))
     }
 
@@ -574,12 +617,29 @@ impl<'p> Vm<'p> {
     /// `RegExp.prototype.exec(input)`: returns the match-result Array (group 0 +
     /// captures, with `.index`/`.input`/`.groups` in the side table) or `null`.
     /// Advances `lastIndex` for a global/sticky regex.
+    ///
+    /// Matching runs over the subject's UTF-16 CODE UNITS (regress
+    /// `find_from_utf16` for `u`/`v` regexes — code-point elements — and
+    /// `find_from_ucs2` otherwise — each unit is an element, so `/./` matches
+    /// one surrogate half). Every position regress reports (match range,
+    /// capture ranges) is a unit index, identical to JS string indexing
+    /// engine-wide: `lastIndex` seeds the search directly and `.index` /
+    /// `indices` / `lastIndex` writes take the ranges verbatim.
     pub(crate) fn regexp_exec(&mut self, re_idx: u32, input_v: Value) -> Result<Value, Thrown> {
-        let input = self.to_js_string(input_v)?;
-        let (global, sticky, has_indices) = match self.heap.get(re_idx) {
-            HeapObj::RegExp { flags, .. } => {
-                (flags.contains('g'), flags.contains('y'), flags.contains('d'))
-            }
+        // ToString(string) — IDENTITY for a string value (exact WTF-8 content:
+        // a lone-surrogate subject keeps its surrogate rather than decaying to
+        // U+FFFD, so `/\uD800/` can match it).
+        let input_val = self.to_str_value(input_v)?;
+        // `input_val` + the result pieces below live in Rust locals across a
+        // possible `lastIndex.valueOf` re-entry — hold GC off until we return.
+        let _gc = self.gc_lock_guard();
+        let (global, sticky, has_indices, unicode) = match self.heap.get(re_idx) {
+            HeapObj::RegExp { flags, .. } => (
+                flags.contains('g'),
+                flags.contains('y'),
+                flags.contains('d'),
+                flags.contains('u') || flags.contains('v'),
+            ),
             _ => {
                 return Err(Thrown(
                     "TypeError: RegExp.prototype.exec called on a non-RegExp".into(),
@@ -593,17 +653,25 @@ impl<'p> Vm<'p> {
         let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
         let stateful = global || sticky;
         let start = if stateful { li } else { 0 };
-        let byte_start = char_to_byte(&input, start);
-        let found = if start > input.chars().count() {
+        // Encode the subject ONCE per exec; `lastIndex` is already a unit
+        // index engine-wide, so it is the search start with no conversion.
+        let u16s: Vec<u16> = self.value_units(input_val);
+        let found = if start > u16s.len() {
             None
         } else {
             match self.heap.get(re_idx) {
-                HeapObj::RegExp { regex, .. } => regex.find_from(&input, byte_start).next(),
+                HeapObj::RegExp { regex, .. } => {
+                    if unicode {
+                        regex.find_from_utf16(&u16s, start).next()
+                    } else {
+                        regex.find_from_ucs2(&u16s, start).next()
+                    }
+                }
                 _ => None,
             }
         };
         // Sticky: the match must begin exactly at the search start.
-        let found = found.filter(|m| !(sticky && m.start() != byte_start));
+        let found = found.filter(|m| !(sticky && m.start() != start));
         let m = match found {
             Some(m) => m,
             None => {
@@ -616,12 +684,11 @@ impl<'p> Vm<'p> {
             }
         };
         let (mstart, mend) = (m.start(), m.end());
-        let whole = self.alloc_str(input[m.range()].to_string());
+        let whole = self.units_value(&u16s[mstart..mend]);
         let mut elems = vec![whole];
-        let caps = m.captures.clone();
-        for cap in &caps {
+        for cap in &m.captures {
             let v = match cap {
-                Some(r) => self.alloc_str(input[r.clone()].to_string()),
+                Some(r) => self.units_value(&u16s[r.clone()]),
                 None => Value::UNDEFINED,
             };
             elems.push(v);
@@ -634,7 +701,7 @@ impl<'p> Vm<'p> {
             let mut gm = ObjMap::new();
             for (name, r) in &named {
                 let v = match r {
-                    Some(r) => self.alloc_str(input[r.clone()].to_string()),
+                    Some(r) => self.units_value(&u16s[r.clone()]),
                     None => Value::UNDEFINED,
                 };
                 gm.set(name, v);
@@ -645,8 +712,8 @@ impl<'p> Vm<'p> {
             Value::heap(gidx)
         };
         let arr_idx = self.heap.alloc(HeapObj::Array(elems));
-        let index_v = Value::num(byte_to_char(&input, mstart) as f64);
-        let input_sv = self.alloc_str(input.clone());
+        let index_v = Value::num(mstart as f64);
+        let input_sv = input_val;
         // index/input/groups are real own data properties of the result array
         // (writable, enumerable, configurable) so reflection sees them.
         let attr = PropAttr {
@@ -656,16 +723,16 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
-        // `/d` (hasIndices): an `indices` array of [start,end] char ranges for the
-        // whole match + each capture group, with `.groups` for named groups.
+        // `/d` (hasIndices): an `indices` array of [start,end] unit ranges for
+        // the whole match + each capture group, with `.groups` for named groups.
         let indices_v = if has_indices {
             let mk = |vm: &mut Self, r: &std::ops::Range<usize>| -> Value {
-                let s = Value::num(byte_to_char(&input, r.start) as f64);
-                let e = Value::num(byte_to_char(&input, r.end) as f64);
+                let s = Value::num(r.start as f64);
+                let e = Value::num(r.end as f64);
                 Value::heap(vm.heap.alloc(HeapObj::Array(vec![s, e])))
             };
             let mut idx_elems = vec![mk(self, &(mstart..mend))];
-            for cap in &caps {
+            for cap in &m.captures {
                 idx_elems.push(match cap {
                     Some(r) => mk(self, r),
                     None => Value::UNDEFINED,
@@ -705,46 +772,100 @@ impl<'p> Vm<'p> {
         }
         if stateful {
             // RegExpBuiltinExec Set(R,"lastIndex",e,true): throws if non-writable.
-            let e = byte_to_char(&input, mend) as f64;
-            self.set_prop(Value::heap(re_idx), "lastIndex", Value::num(e), true)?;
+            self.set_prop(Value::heap(re_idx), "lastIndex", Value::num(mend as f64), true)?;
         }
         Ok(Value::heap(arr_idx))
     }
 
+    /// The string's UTF-16 code units — EXACT: an astral scalar yields its two
+    /// halves and a lone surrogate its own 0xD800–0xDFFF value (which is what
+    /// lets a `\uD800` pattern match a real lone-surrogate subject). `v` must
+    /// be a string value (callers come through `to_str_value`).
+    pub(crate) fn value_units(&mut self, v: Value) -> Vec<u16> {
+        if !v.is_heap() {
+            return Vec::new();
+        }
+        let idx = v.heap_index();
+        self.heap.flatten(idx);
+        match self.heap.get(idx) {
+            HeapObj::Str(js) if js.is_ascii() => js.as_bytes().iter().map(|&b| b as u16).collect(),
+            HeapObj::Str(js) => js.units_iter().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Allocate the string for a unit-slice of a subject — built as WTF-8 so
+    /// lone surrogates round-trip exactly and a covered (high, low) pair
+    /// recombines into its astral scalar (canonical form).
+    pub(crate) fn units_value(&mut self, units: &[u16]) -> Value {
+        let mut out: Vec<u8> = Vec::with_capacity(units.len() * 3);
+        push_units(&mut out, units);
+        Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
+    }
+
+    /// AdvanceStringIndex reading the units from heap string `s` (for the lazy
+    /// matchAll driver, which doesn't keep an encoded unit buffer around).
+    pub(crate) fn advance_index_on_value(&mut self, s: Value, index: usize, unicode: bool) -> usize {
+        if unicode && s.is_heap() {
+            self.heap.flatten(s.heap_index());
+            if let HeapObj::Str(js) = self.heap.get(s.heap_index()) {
+                if let (Some(hi), Some(lo)) = (js.unit_at(index), js.unit_at(index + 1)) {
+                    if (0xD800..=0xDBFF).contains(&hi) && (0xDC00..=0xDFFF).contains(&lo) {
+                        return index + 2;
+                    }
+                }
+            }
+        }
+        index + 1
+    }
+
     /// Regex-backed `String.prototype.replace`/`replaceAll`. `repl` is a function
     /// (called `(match, ...groups, offset, input)`) or a template string (`$&`/`$N`/…).
-    pub(crate) fn regex_replace(&mut self, s: &str, re: u32, repl: Value, global: bool) -> Result<String, Thrown> {
+    /// `s_idx` is the receiver string's heap index. All positions are UTF-16
+    /// unit indices; the output is assembled as WTF-8 so the subject's lone
+    /// surrogates (and a functional replacer's) round-trip exactly.
+    pub(crate) fn regex_replace(
+        &mut self,
+        s_idx: u32,
+        re: u32,
+        repl: Value,
+        global: bool,
+    ) -> Result<Value, Thrown> {
+        // Encode the subject ONCE; every regress range below indexes into it.
+        let u16s: Vec<u16> = self.value_units(Value::heap(s_idx));
         let matches: Vec<regress::Match> = match self.heap.get(re) {
-            HeapObj::RegExp { regex, .. } => {
-                if global {
-                    regex.find_iter(s).collect()
-                } else {
-                    regex.find(s).into_iter().collect()
+            HeapObj::RegExp { regex, flags, .. } => {
+                let unicode = flags.contains('u') || flags.contains('v');
+                match (unicode, global) {
+                    (true, true) => regex.find_from_utf16(&u16s, 0).collect(),
+                    (true, false) => regex.find_from_utf16(&u16s, 0).next().into_iter().collect(),
+                    (false, true) => regex.find_from_ucs2(&u16s, 0).collect(),
+                    (false, false) => regex.find_from_ucs2(&u16s, 0).next().into_iter().collect(),
                 }
             }
             _ => Vec::new(),
         };
         let callable = repl.is_heap() && self.heap.as_callable(repl.heap_index()).is_some();
         let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
-        let mut out = String::new();
+        let mut out: Vec<u8> = Vec::new();
         let mut last = 0usize;
         for m in &matches {
             let (st, en) = (m.start(), m.end());
             if st < last {
                 continue;
             }
-            out.push_str(&s[last..st]);
-            let whole = s[m.range()].to_string();
+            push_units(&mut out, &u16s[last..st]);
             if callable {
-                let mut argv = vec![self.alloc_str(whole)];
+                let whole = self.units_value(&u16s[m.range()]);
+                let mut argv = vec![whole];
                 for cap in &m.captures {
                     argv.push(match cap {
-                        Some(r) => self.alloc_str(s[r.clone()].to_string()),
+                        Some(r) => self.units_value(&u16s[r.clone()]),
                         None => Value::UNDEFINED,
                     });
                 }
-                argv.push(Value::num(byte_to_char(s, st) as f64));
-                argv.push(self.alloc_str(s.to_string()));
+                argv.push(Value::num(st as f64));
+                argv.push(Value::heap(s_idx));
                 // RegExp.prototype[@@replace] step 14.k.iv: when the regex has named
                 // capture groups, a `groups` object (OrdinaryObjectCreate(null)) is
                 // the FINAL replacer argument. (Mirrors the exec/array path above.)
@@ -754,7 +875,7 @@ impl<'p> Vm<'p> {
                     let mut gm = ObjMap::new();
                     for (name, r) in &named {
                         let v = match r {
-                            Some(r) => self.alloc_str(s[r.clone()].to_string()),
+                            Some(r) => self.units_value(&u16s[r.clone()]),
                             None => Value::UNDEFINED,
                         };
                         gm.set(name, v);
@@ -764,14 +885,27 @@ impl<'p> Vm<'p> {
                     argv.push(Value::heap(gidx));
                 }
                 let r = self.call_value(repl, Value::UNDEFINED, &argv)?;
-                let rs = self.to_js_string(r)?;
-                out.push_str(&rs);
+                // ToString(result) — exact bytes (a returned lone-surrogate
+                // string keeps its surrogate; `wtf8_push` canonicalizes the seam).
+                let rv = self.to_str_value(r)?;
+                let bytes = self
+                    .heap
+                    .str_wtf8_cow(rv.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                crate::heap::wtf8_push(&mut out, &bytes);
             } else {
-                let groups: Vec<Option<String>> =
-                    m.captures.iter().map(|c| c.as_ref().map(|r| s[r.clone()].to_string())).collect();
+                // GetSubstitution over LOSSY views (the template + captures come
+                // through ToString); positions stay unit-exact either way.
+                let whole = String::from_utf16_lossy(&u16s[m.range()]);
+                let groups: Vec<Option<String>> = m
+                    .captures
+                    .iter()
+                    .map(|c| c.as_ref().map(|r| String::from_utf16_lossy(&u16s[r.clone()])))
+                    .collect();
                 let named: Vec<(String, Option<String>)> = m
                     .named_groups()
-                    .map(|(n, r)| (n.to_string(), r.map(|r| s[r].to_string())))
+                    .map(|(n, r)| (n.to_string(), r.map(|r| String::from_utf16_lossy(&u16s[r]))))
                     .collect();
                 let rep = self.expand_replacement(
                     &repl_str,
@@ -779,19 +913,128 @@ impl<'p> Vm<'p> {
                     &groups,
                     &named,
                     !named.is_empty(),
-                    &s[..st],
-                    &s[en..],
+                    &String::from_utf16_lossy(&u16s[..st]),
+                    &String::from_utf16_lossy(&u16s[en..]),
                 );
-                out.push_str(&rep);
+                crate::heap::wtf8_push(&mut out, rep.as_bytes());
             }
             last = en;
         }
-        out.push_str(&s[last..]);
-        Ok(out)
+        push_units(&mut out, &u16s[last..]);
+        Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out))))
     }
 
     // ── TypedArrays / ArrayBuffer / DataView ──
 
+}
+
+/// The pattern characters fed to the regress parser for a NON-`u`/`v` regex,
+/// from the pattern's UTF-16 units. The spec grammar reads such a pattern per
+/// CODE UNIT — an astral literal is its two surrogate halves, each its own
+/// pattern character (so it matches over UCS-2 subject units) — EXCEPT inside
+/// RegExpIdentifierName (a group name `(?<name>…)` / `\k<name>`), where
+/// surrogate pairs recombine into code points. Tracks character-class nesting
+/// so a literal `(?<` / `\k<` inside `[...]` stays plain units.
+pub(crate) fn nonunicode_pattern_chars(units: &[u16]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(units.len());
+    let mut i = 0usize;
+    let mut in_class = false;
+    let mut in_name = false;
+    while i < units.len() {
+        let u = units[i] as u32;
+        if in_name {
+            if u == '>' as u32 {
+                in_name = false;
+                out.push(u);
+                i += 1;
+            } else if (0xD800..=0xDBFF).contains(&units[i])
+                && i + 1 < units.len()
+                && (0xDC00..=0xDFFF).contains(&units[i + 1])
+            {
+                let (hi, lo) = (units[i] as u32, units[i + 1] as u32);
+                out.push(0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+                i += 2;
+            } else {
+                out.push(u);
+                i += 1;
+            }
+            continue;
+        }
+        match u {
+            // An escape: copy `\` + the next unit verbatim (so `\[`/`\]` can't
+            // flip the class state), EXCEPT `\k<` outside a class, which opens
+            // a group-name reference.
+            0x5C => {
+                out.push(u);
+                if i + 1 < units.len() {
+                    let n = units[i + 1] as u32;
+                    out.push(n);
+                    if !in_class
+                        && n == 'k' as u32
+                        && i + 2 < units.len()
+                        && units[i + 2] == '<' as u16
+                    {
+                        out.push('<' as u32);
+                        in_name = true;
+                        i += 3;
+                        continue;
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            0x5B if !in_class => {
+                in_class = true;
+                out.push(u);
+                i += 1;
+            }
+            0x5D if in_class => {
+                in_class = false;
+                out.push(u);
+                i += 1;
+            }
+            // `(?<` not followed by `=`/`!` (lookbehinds) opens a group name.
+            0x28 if !in_class
+                && i + 2 < units.len()
+                && units[i + 1] == '?' as u16
+                && units[i + 2] == '<' as u16
+                && units.get(i + 3).map_or(true, |&n| n != '=' as u16 && n != '!' as u16) =>
+            {
+                out.extend_from_slice(&['(' as u32, '?' as u32, '<' as u32]);
+                in_name = true;
+                i += 3;
+            }
+            _ => {
+                out.push(u);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Append `units` onto WTF-8 buffer `out` — exact (`wtf8_push_cp`
+/// canonicalizes an adjacent (high, low) pair back into its astral scalar).
+pub(crate) fn push_units(out: &mut Vec<u8>, units: &[u16]) {
+    for &u in units {
+        crate::heap::wtf8_push_cp(out, u as u32);
+    }
+}
+
+/// AdvanceStringIndex (ES 22.2.7.3): +1 code UNIT, or +2 when `unicode`
+/// (the `u`/`v` flags) and `index` sits on a high surrogate directly followed
+/// by a low surrogate (one astral code point).
+pub(crate) fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
+    if unicode
+        && index + 1 < units.len()
+        && (0xD800..=0xDBFF).contains(&units[index])
+        && (0xDC00..=0xDFFF).contains(&units[index + 1])
+    {
+        index + 2
+    } else {
+        index + 1
+    }
 }
 
 /// Assemble a RegExp `flags` string in the canonical order `dgimsuvy`,

@@ -1252,6 +1252,21 @@ impl<'p> Vm<'p> {
             Some(HeapObj::RegExp { source, flags, .. }) => Some((source.clone(), flags.clone())),
             _ => None,
         };
+        // EXACT pattern bytes, captured when the pattern VALUE is a string
+        // holding lone surrogates: `new RegExp('\uD800')` must compile the
+        // surrogate itself (ToString below is LOSSY — it would compile U+FFFD).
+        // `regress::Regex::from_unicode` accepts the pattern characters directly.
+        let exact_bytes: Option<Vec<u8>> = if p.is_heap() && self.heap.is_str_like(p.heap_index()) {
+            self.heap.str_wtf8_cow(p.heap_index()).and_then(|b| {
+                if crate::heap::wtf8_is_wellformed(&b) {
+                    None
+                } else {
+                    Some(b.into_owned())
+                }
+            })
+        } else {
+            None
+        };
         let (source, inherited) = if let Some((src, fl)) = real_regexp {
             (src, Some(fl))
         } else if p.is_undefined() {
@@ -1305,7 +1320,26 @@ impl<'p> Vm<'p> {
                 _ => {}
             }
         }
-        let regex = regress::Regex::with_flags(&source, rflags.as_str())
+        // The PATTERN CHARACTERS fed to the regress parser. In `u`/`v` mode the
+        // pattern is a sequence of code points; otherwise the spec grammar reads
+        // UTF-16 CODE UNITS — an astral literal is its two surrogate halves,
+        // each its own pattern character, so `/𠮷/` (non-u) is the 2-unit
+        // sequence `𠮷` and matches over UCS-2 subject units (group NAMES
+        // recombine pairs — see `nonunicode_pattern_chars`). The exact-bytes
+        // form (lone-surrogate pattern string) feeds the surrogates verbatim;
+        // `.source` stays lossy (display only).
+        let unicode_mode = seen.contains(&'u') || seen.contains(&'v');
+        let compile_cps: Vec<u32> = match (&exact_bytes, unicode_mode) {
+            (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
+            (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
+                &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
+            ),
+            (None, true) => source.chars().map(u32::from).collect(),
+            (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
+                &source.encode_utf16().collect::<Vec<u16>>(),
+            ),
+        };
+        let regex = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
             .map_err(|e| Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}")))?;
         let idx = self
             .heap

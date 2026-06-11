@@ -12,7 +12,9 @@ oxc_parser = "0.126.0"
 oxc_span = "0.126.0"
 oxc_syntax = "0.126.0"
 rustc-hash = { workspace = true }
-regress = "0.11"
+# `utf16`: find_from_utf16/find_from_ucs2 — regex execution directly over
+# UTF-16 code units (ES semantics; ranges/positions are unit indices).
+regress = { version = "0.11", features = ["utf16"] }
 unicode-normalization = "0.1"
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
