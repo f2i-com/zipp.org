@@ -5292,6 +5292,18 @@ impl<'a> FnCompiler<'a> {
             // suspends on the former and passes the latter straight through.
             let step = self.alloc_reg();
             self.emit(Instr::ForAwaitNext { dst: step, iter: iter_reg, idx: idx_reg });
+            // AsyncFromSyncIteratorContinuation: a SYNC source's raw
+            // {value,done} becomes the spec's capability promise resolving
+            // to { value: await value, done } — built synchronously inside
+            // this turn (observable constructor read + the one-job unwrap
+            // hop), so the single Await below covers both iterator kinds.
+            if let Some(s) = sync_reg {
+                let jskip = self.here();
+                self.emit(Instr::JumpIfFalse { cond: s, target: 0 });
+                self.emit(Instr::AsyncFromSyncStep { dst: step, step });
+                let after = self.here();
+                self.patch_jump(jskip, after);
+            }
             let r = self.alloc_reg();
             self.emit(Instr::Await { dst: r, val: step });
             let done_name = self.string_name("done");
@@ -5300,16 +5312,6 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
             let value_name = self.string_name("value");
             self.emit(Instr::GetProp { dst: elem, obj: r, name: value_name });
-            // AsyncFromSyncIteratorContinuation: a SYNC source's yielded value
-            // is itself resolved and awaited — an array of promises iterates
-            // their settled values, and a rejected element throws into the loop.
-            if let Some(s) = sync_reg {
-                let jskip = self.here();
-                self.emit(Instr::JumpIfFalse { cond: s, target: 0 });
-                self.emit(Instr::Await { dst: elem, val: elem });
-                let after = self.here();
-                self.patch_jump(jskip, after);
-            }
             j
         } else {
             self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter: iter_reg, idx: idx_reg });

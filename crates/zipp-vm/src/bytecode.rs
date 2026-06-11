@@ -328,6 +328,13 @@ pub enum Instr {
     /// constructor's return-override makes `this` a foreign object.
     /// `class_id == u32::MAX` falls back to `this`'s class. `this` is reg 0.
     FieldInit { key_index: u16, val: Reg, class_id: u32 },
+    /// AsyncFromSyncIteratorContinuation(step): from a SYNC iterator's raw
+    /// `{value, done}` result, build the spec's capability promise that
+    /// resolves to `{ value: await value, done }`. Runs in ordinary dispatch
+    /// context, synchronously inside the next() turn — the value's observable
+    /// constructor read (PromiseResolve) happens BEFORE any job runs, and the
+    /// unwrap costs exactly one reaction job (the spec's extra hop).
+    AsyncFromSyncStep { dst: Reg, step: Reg },
     /// `dst = Array(args…)` / `new Array(args…)`: a single numeric arg makes an
     /// array of that length (holes → undefined); otherwise an array of the args.
     ArrayCtor { dst: Reg, arg_base: Reg, argc: u16 },

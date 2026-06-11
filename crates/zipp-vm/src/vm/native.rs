@@ -241,6 +241,9 @@ pub const AGENT_SET_TIMEOUT: u16 = 900;
 /// become persistent realm bindings, unlike indirect eval's discarded
 /// lexical environment).
 pub const DOLLAR262_EVAL_SCRIPT: u16 = 901;
+/// Async-from-Sync unwrap reaction: called with the awaited element value,
+/// `this` = the bound `done` flag; returns the `{value, done}` iter result.
+pub const UNWRAP_ITER_RESULT: u16 = 902;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

@@ -4427,6 +4427,85 @@ impl<'p> Vm<'p> {
                         self.pending_await = Some((v, ip, f.handlers));
                         return Ok(v);
                     }
+                    Instr::AsyncFromSyncStep { dst, step } => {
+                        // AsyncFromSyncIteratorContinuation(step): read value/
+                        // done from the SYNC result, PromiseResolve the value
+                        // (observable constructor read for a native promise,
+                        // here in ordinary dispatch context, BEFORE any job),
+                        // and chain the unwrap reaction into a fresh capability
+                        // promise that resolves to { value: await value, done }.
+                        // IfAbruptRejectPromise: a throw from any step here
+                        // (value/done getters, the constructor read) REJECTS
+                        // the capability — next() returns it normally and the
+                        // following Await surfaces the rejection at the await
+                        // point (with the frame's handlers restored).
+                        let s = self.get(base, step);
+                        let cap = self.alloc_promise();
+                        let abrupt = |vm: &mut Self, cap: u32, msg: &str| {
+                            let reason = vm
+                                .pending_throw
+                                .take()
+                                .unwrap_or_else(|| vm.error_from_thrown(msg));
+                            vm.reject(cap, reason);
+                        };
+                        'cont: {
+                            let value = match self.get_prop(s, "value") {
+                                Ok(v) => v,
+                                Err(Thrown(msg)) => {
+                                    abrupt(self, cap, &msg);
+                                    break 'cont;
+                                }
+                            };
+                            let done_v = match self.get_prop(s, "done") {
+                                Ok(v) => v,
+                                Err(Thrown(msg)) => {
+                                    abrupt(self, cap, &msg);
+                                    break 'cont;
+                                }
+                            };
+                            let done = self.truthy(done_v);
+                            let wrapper = if value.is_heap()
+                                && matches!(
+                                    self.heap.get(value.heap_index()),
+                                    HeapObj::Promise { .. }
+                                )
+                            {
+                                match self.get_prop(value, "constructor") {
+                                    Ok(c) => {
+                                        let intrinsic = self
+                                            .global_by_name("Promise")
+                                            .unwrap_or(Value::UNDEFINED);
+                                        if c == intrinsic {
+                                            value.heap_index()
+                                        } else {
+                                            let p = self.alloc_promise();
+                                            self.resolve(p, value);
+                                            p
+                                        }
+                                    }
+                                    Err(Thrown(msg)) => {
+                                        abrupt(self, cap, &msg);
+                                        break 'cont;
+                                    }
+                                }
+                            } else {
+                                let p = self.alloc_promise();
+                                self.resolve(p, value);
+                                p
+                            };
+                            let target = Value::heap(
+                                self.heap.alloc(HeapObj::Native(native::UNWRAP_ITER_RESULT)),
+                            );
+                            let unwrap = Value::heap(self.heap.alloc(HeapObj::Bound {
+                                target,
+                                this: Value::bool(done),
+                                args: Vec::new(),
+                            }));
+                            self.then_internal(wrapper, unwrap, Value::UNDEFINED, Some(cap));
+                        }
+                        self.set(base, dst, Value::heap(cap));
+                        ip += 1;
+                    }
                     Instr::IterClose { iter } => {
                         let it = self.get(base, iter);
                         self.iterator_close(it)?;
@@ -4553,8 +4632,14 @@ impl<'p> Vm<'p> {
                             HeapObj::Generator { .. } => self
                                 .generator_method(it.heap_index(), "next", &[])?
                                 .unwrap_or(Value::UNDEFINED),
-                            // A user iterator object (sync or async) with `.next()`.
-                            HeapObj::Object(_) | HeapObj::Proxy { .. } => {
+                            // A user iterator object (sync or async) with `.next()` —
+                            // including a BUILTIN iterator / iterator helper handed
+                            // over by a custom @@asyncIterator (driven through its
+                            // prototype `next`, same protocol).
+                            HeapObj::Object(_)
+                            | HeapObj::Proxy { .. }
+                            | HeapObj::Iterator { .. }
+                            | HeapObj::IterHelper { .. } => {
                                 let next = self.get_prop(it, "next")?;
                                 if self.is_callable(next) {
                                     self.call_value(next, it, &[])?

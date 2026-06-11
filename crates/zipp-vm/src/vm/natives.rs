@@ -2654,6 +2654,13 @@ impl<'p> Vm<'p> {
                 let code = self.to_js_string(a0)?;
                 self.eval_script(&code)?
             }
+            UNWRAP_ITER_RESULT => {
+                // Async-from-Sync unwrap reaction: `this` carries the bound
+                // `done` flag; the argument is the awaited element value.
+                let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let done = this == Value::bool(true);
+                self.iter_result(v, done)
+            }
             DOLLAR262_CREATE_REALM => self.create_realm(),
             // Object.prototype Annex-B accessor helpers.
             OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {
