@@ -2247,6 +2247,9 @@ impl<'p> Vm<'p> {
             self.heap.alloc(HeapObj::Native(GLOBAL_DECODE_URI_COMPONENT));
         let escape_fn = self.heap.alloc(HeapObj::Native(GLOBAL_ESCAPE));
         let unescape_fn = self.heap.alloc(HeapObj::Native(GLOBAL_UNESCAPE));
+        // Host `print` as a first-class value (shells + the test262 harness
+        // expect a global; the bare call form compiles to the Print instr).
+        let print_fn = self.heap.alloc(HeapObj::Native(native::GLOBAL_PRINT));
         // `globalThis`: an empty Object whose property access is routed to the
         // global slots by name (see get_prop/set_prop/has_own_property).
         let global_this = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -2345,6 +2348,7 @@ impl<'p> Vm<'p> {
             ("decodeURIComponent", decode_uri_component_fn),
             ("escape", escape_fn),
             ("unescape", unescape_fn),
+            ("print", print_fn),
             ("eval", eval_fn),
             ("globalThis", global_this),
             ("$262", self.dollar262),

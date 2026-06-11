@@ -1241,9 +1241,13 @@ impl<'p> Vm<'p> {
     /// A RegExp pattern contributes its source (+ its flags when none are given);
     /// else ToString. Validates flags + compiles via `regress` (bad → SyntaxError).
     pub(crate) fn build_regexp(&mut self, p: Value, f: Value) -> Result<Value, Thrown> {
-        // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when none
-        // are given). Computed first so the heap borrow is released before the
-        // observable `is_regexp`/`Get` calls below.
+        // Step 1: IsRegExp(pattern) — an OBSERVABLE Get(pattern, @@match) which
+        // may MUTATE the pattern (e.g. a getter calling pattern.compile(..)), so
+        // it must run BEFORE the [[OriginalSource]]/[[OriginalFlags]] snapshot.
+        // (Non-objects return false with no Get.)
+        let pattern_is_regexp = self.is_regexp(p)?;
+        // A real RegExp exotic contributes its [[OriginalSource]] (+ flags when
+        // none are given) via its slots, regardless of a falsy @@match override.
         let real_regexp = match p.is_heap().then(|| self.heap.get(p.heap_index())) {
             Some(HeapObj::RegExp { source, flags, .. }) => Some((source.clone(), flags.clone())),
             _ => None,
@@ -1252,7 +1256,7 @@ impl<'p> Vm<'p> {
             (src, Some(fl))
         } else if p.is_undefined() {
             (String::new(), None)
-        } else if self.is_regexp(p)? {
+        } else if pattern_is_regexp {
             // A RegExp-LIKE object (truthy `@@match`, but not a real RegExp exotic):
             // read `source`/`flags` via Get (observable, may throw) per the RegExp
             // constructor, instead of ToString(pattern).

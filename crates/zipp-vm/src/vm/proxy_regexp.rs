@@ -267,7 +267,9 @@ impl<'p> Vm<'p> {
             let match0 = self.get_prop(result, "0")?;
             if self.to_js_string(match0)?.is_empty() {
                 let li_v = self.get_prop(rx, "lastIndex")?;
-                let this_index = self.to_integer_or_zero(li_v)?.max(0) as usize;
+                // ToLength: clamp to 2^53-1 BEFORE the +1 advance.
+                let this_index =
+                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
                 self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), true)?;
             }
         }
@@ -416,7 +418,9 @@ impl<'p> Vm<'p> {
             elems.push(self.alloc_str(match_str));
             if is_empty {
                 let li_v = self.get_prop(rx, "lastIndex")?;
-                let this_index = self.to_integer_or_zero(li_v)?.max(0) as usize;
+                // ToLength: clamp to 2^53-1 BEFORE the +1 advance.
+                let this_index =
+                    self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
                 self.set_prop(rx, "lastIndex", Value::num((this_index + 1) as f64), true)?;
             }
         }

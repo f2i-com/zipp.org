@@ -2295,6 +2295,26 @@ impl<'p> Vm<'p> {
             3 => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
             _ => self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
+        // A RegExp's `lastIndex` is a struct-backed own data property (default
+        // {writable:true, enumerable:false, configurable:false}; only attr
+        // overrides live in arr_props, the VALUE's source of truth is the slot).
+        // Seed `existing` from the slot so the merge validates against the real
+        // descriptor; the merged value is written back through to the slot below.
+        let regexp_last_index =
+            key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. });
+        if regexp_last_index {
+            if let HeapObj::RegExp { last_index, .. } = self.heap.get(idx) {
+                let li = *last_index;
+                let attrs = existing.map(|(a, _)| a).unwrap_or(PropAttr {
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                });
+                existing = Some((attrs, li));
+            }
+        }
         // A first `name`/`length` redefine on a callable/class: seed `existing` from
         // the synthesized intrinsic (a configurable data property) so the merge
         // treats it as a redefinition that preserves writable:false/enumerable:false.
@@ -2345,6 +2365,13 @@ impl<'p> Vm<'p> {
             }
             _ => {
                 self.fn_props.entry(idx).or_insert_with(ObjMap::new).define(key, stored, attr);
+            }
+        }
+        // Write a defined `lastIndex` VALUE through to the RegExp slot (the
+        // getter and `exec` read the slot; arr_props only carries the attrs).
+        if regexp_last_index && !attr.accessor {
+            if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
+                *last_index = stored;
             }
         }
         // A redefined callable/class `name`/`length` now lives as an explicit own

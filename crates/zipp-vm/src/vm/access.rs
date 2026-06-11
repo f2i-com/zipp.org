@@ -1337,6 +1337,20 @@ impl<'p> Vm<'p> {
                     }
                     cur = c.parent;
                 }
+                // A builtin-constructor parent (`class C extends RegExp`): an
+                // ACCESSOR entry on its map (e.g. the legacy RegExp.input/$_
+                // statics) governs the write — invoke its setter with the class
+                // as receiver (the brand check rejects a subclass), or reject
+                // for a getter-only one. A data entry keeps the own-write path.
+                HeapObj::Object(m) => {
+                    if let Some(i) = m.pos(key) {
+                        if m.attrs[i].accessor {
+                            let s = m.attrs[i].setter;
+                            return Some(if s.is_undefined() { None } else { Some(s) });
+                        }
+                    }
+                    break;
+                }
                 _ => break,
             }
         }

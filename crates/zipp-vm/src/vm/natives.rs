@@ -717,6 +717,17 @@ impl<'p> Vm<'p> {
                         "TypeError: RegExp.prototype.compile may not be used on a subclass instance".into(),
                     ));
                 }
+                // AnnexB step 3: if pattern has [[RegExpMatcher]], flags must be
+                // undefined (TypeError) — never stringified into a flags string.
+                if matches!(
+                    a0.is_heap().then(|| self.heap.get(a0.heap_index())),
+                    Some(HeapObj::RegExp { .. })
+                ) && a1 != Value::UNDEFINED
+                {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.compile: flags must be undefined when pattern is a RegExp".into(),
+                    ));
+                }
                 // Reuse the constructor path (validates flags, builds the matcher),
                 // then move the freshly built fields into the receiver.
                 let built = self.build_regexp(a0, a1)?;
@@ -737,14 +748,17 @@ impl<'p> Vm<'p> {
                 let regex = regress::Regex::with_flags(&source, rflags.as_str()).map_err(|e| {
                     Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
                 })?;
-                if let HeapObj::RegExp { regex: r, source: s, flags: fl, last_index } =
+                if let HeapObj::RegExp { regex: r, source: s, flags: fl, .. } =
                     self.heap.get_mut(this.heap_index())
                 {
                     *r = Box::new(regex);
                     *s = source;
                     *fl = flags;
-                    *last_index = Value::int(0);
                 }
+                // RegExpInitialize step 12: Set(obj, "lastIndex", 0, true) AFTER
+                // the slots update — a non-writable lastIndex throws TypeError
+                // with source/flags already recompiled.
+                self.set_prop(this, "lastIndex", Value::int(0), true)?;
                 this
             }
             REGEXP_ESCAPE => {
@@ -811,7 +825,10 @@ impl<'p> Vm<'p> {
             REGEXP_TO_STRING => {
                 let (src, flg) = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::RegExp { source, flags, .. }) => {
-                        let (s, f) = (source.clone(), flags.clone());
+                        // Spec reads the `flags` getter, which assembles the
+                        // canonical `dgimsuvy` order regardless of storage order.
+                        let (s, f) =
+                            (source.clone(), super::proxy_regexp::canonical_flags(flags));
                         (self.escaped_source(&s), f)
                     }
                     _ => {
@@ -956,8 +973,10 @@ impl<'p> Vm<'p> {
                         }
                     }
                 };
-                // matcher = Construct(C, «R, flags»).
-                let matcher = self.construct(c, &[this, flags_v])?;
+                // matcher = Construct(C, «R, flags») — `flags` is the ALREADY
+                // ToString'd string (a user flags.toString must not run twice).
+                let flags_str = self.alloc_str(flags.clone());
+                let matcher = self.construct(c, &[this, flags_str])?;
                 let matcher_idx = matcher.heap_index();
                 // lastIndex = ToLength(Get(R, "lastIndex")); Set(matcher, lastIndex).
                 let li_v = self.get_prop(this, "lastIndex")?;
@@ -1338,6 +1357,13 @@ impl<'p> Vm<'p> {
                 Some(s) => self.alloc_str(s),
                 None => Value::NULL,
             },
+            GLOBAL_PRINT => {
+                // Mirrors the Print instruction (console.log): inspect each
+                // argument, join with spaces, append one stdout line.
+                let parts: Vec<String> = args.iter().map(|&v| self.inspect(v)).collect();
+                self.output.push(parts.join(" "));
+                Value::UNDEFINED
+            }
             AGENT_SLEEP => {
                 let ms = self
                     .to_number_coerce(args.first().copied().unwrap_or(Value::UNDEFINED))?
@@ -2383,8 +2409,12 @@ impl<'p> Vm<'p> {
                             if m0s.is_empty() {
                                 let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
                                 // ToLength(Get(R,"lastIndex")) — a throwing
-                                // lastIndex.valueOf must propagate, not be swallowed.
-                                let cur = self.to_integer_or_zero(cur_v)?.max(0) as usize;
+                                // lastIndex.valueOf must propagate, not be swallowed;
+                                // the 2^53-1 clamp applies BEFORE the +1 advance.
+                                let cur = self
+                                    .to_integer_or_zero(cur_v)?
+                                    .clamp(0, (1i64 << 53) - 1)
+                                    as usize;
                                 self.set_regexp_last_index(regexp, cur + 1);
                             }
                             (r, false, false)

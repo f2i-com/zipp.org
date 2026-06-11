@@ -254,6 +254,9 @@ pub const AGENT_SLEEP: u16 = 904;
 /// error chain first.
 pub const DISPOSE_ASYNC_STEP: u16 = 905;
 pub const DISPOSE_ASYNC_STEP_REJECT: u16 = 906;
+/// Host `print(...)` as a first-class global value (the bare CALL form is
+/// compiled to the Print instruction; this covers `var p = print` etc.).
+pub const GLOBAL_PRINT: u16 = 907;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -1035,6 +1038,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_IS_NAN => ("isNaN", 1),
         GLOBAL_IS_FINITE => ("isFinite", 1),
         GLOBAL_EVAL => ("eval", 1),
+        GLOBAL_PRINT => ("print", 1),
         SAB_GROW => ("grow", 1),
         SAB_SLICE => ("slice", 2),
         DISPOSABLE_USE => ("use", 1),
