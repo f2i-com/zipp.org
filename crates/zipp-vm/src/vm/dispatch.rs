@@ -1549,6 +1549,28 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, r);
                         ip += 1;
                     }
+                    Instr::SuperMethodComputedSpread { dst, home_class_id, key, args } => {
+                        // `super[key](...args)` — computed SuperMethodSpread:
+                        // ToPropertyKey(key), resolve on the super base with
+                        // `this` = the current receiver, spread-call.
+                        let kv = self.get(base, key);
+                        let ks = self.coerce_index_key(kv)?;
+                        let ks = self.key_of(ks);
+                        let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
+                        self.require_object_coercible(proto)?;
+                        let this = self.get(base, 0);
+                        let m = self.get_member(proto, &ks, this)?;
+                        if !self.is_callable(m) {
+                            return Err(Thrown(format!(
+                                "TypeError: super[{ks}] is not a function"
+                            )));
+                        }
+                        let args_v = self.get(base, args);
+                        let arg_vec = self.array_snapshot(args_v.heap_index());
+                        let r = self.call_value(m, this, &arg_vec)?;
+                        self.set(base, dst, r);
+                        ip += 1;
+                    }
                     Instr::SuperGet { dst, home_class_id, name } => {
                         // `super.name` read: resolve on the super base (the home
                         // object's [[Prototype]]) with `this` = the current receiver

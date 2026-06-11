@@ -371,6 +371,8 @@ pub enum Instr {
     /// `dst = super.name(...args_array)` — super method call spreading the elements
     /// of `args` (`this` = the current receiver). The spread analogue of SuperMethod.
     SuperMethodSpread { dst: Reg, home_class_id: u32, name: u32, args: Reg },
+    /// `super[key](...args_array)`: computed form of SuperMethodSpread.
+    SuperMethodComputedSpread { dst: Reg, home_class_id: u32, key: Reg, args: Reg },
     /// `dst = new callee(...args_array)` — construct `callee` spreading the
     /// elements of the array in `args` as the arguments.
     NewSpread { dst: Reg, callee: Reg, args: Reg },

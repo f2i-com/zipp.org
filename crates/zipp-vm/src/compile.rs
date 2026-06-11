@@ -9003,6 +9003,25 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::CallMethodSpread { dst, obj, name, args: args_arr });
                 return Ok(dst);
             }
+            // `super[key](...args)` — computed super member with spread args
+            // (must precede the generic computed arm: `super` is not a value).
+            if let ox::Expression::ComputedMemberExpression(m) = &c.callee {
+                if matches!(&m.object, ox::Expression::Super(_)) {
+                    let pid = self
+                        .super_class
+                        .ok_or("`super[...](...)` is only valid in a derived class")?;
+                    self.this_check();
+                    let key = self.expr(&m.expression)?;
+                    let args_arr = self.build_spread_args(&c.arguments)?;
+                    self.emit(Instr::SuperMethodComputedSpread {
+                        dst,
+                        home_class_id: pid,
+                        key,
+                        args: args_arr,
+                    });
+                    return Ok(dst);
+                }
+            }
             // Computed method call `obj[key](...)` — bind `this` = obj (a plain
             // CallSpread on the GET result would lose the receiver).
             if let ox::Expression::ComputedMemberExpression(m) = &c.callee {

@@ -541,6 +541,7 @@ impl<'p> Vm<'p> {
         flags: &str,
         last_index: Value,
         key: &str,
+        eff_proto: u32,
     ) -> Result<Value, Thrown> {
         Ok(match key {
             "lastIndex" => last_index,
@@ -560,7 +561,9 @@ impl<'p> Vm<'p> {
             "unicodeSets" => Value::bool(flags.contains('v')),
             "sticky" => Value::bool(flags.contains('y')),
             "hasIndices" => Value::bool(flags.contains('d')),
-            _ => self.proto_member(self.regexp_proto, key),
+            // A subclass instance resolves through ITS prototype (proto_of)
+            // so class [Symbol.replace]/exec overrides shadow the builtin.
+            _ => self.proto_member(eff_proto, key),
         })
     }
 
