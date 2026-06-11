@@ -4768,7 +4768,10 @@ fn uri_decode(bytes: &[u8], reserved: &[u8]) -> Result<crate::heap::JsStr, ()> {
             }
             let overlong =
                 (n == 2 && cp < 0x80) || (n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000);
-            if overlong || cp > 0x10FFFF {
+            // %-escaped sequences are STRICT UTF-8: a surrogate-range escape
+            // ('%ED%BF%BF') is a URIError — only RAW lone-surrogate code
+            // units (the non-'%' copy path above) pass through verbatim.
+            if overlong || cp > 0x10FFFF || (0xD800..=0xDFFF).contains(&cp) {
                 return Err(());
             }
             wtf8_push_cp(&mut out, cp);
