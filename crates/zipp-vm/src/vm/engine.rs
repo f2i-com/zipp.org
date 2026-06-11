@@ -137,6 +137,7 @@ impl<'p> Vm<'p> {
             agent_shared: None,
             agent_role: agents::AgentRole::Main,
             broadcast_cb: Value::UNDEFINED,
+            mailbox: std::sync::Arc::new(agents::Mailbox::default()),
             deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
             sloppy_eval_memo: Vec::new(),

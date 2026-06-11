@@ -150,7 +150,7 @@ impl Vm<'_> {
         for v in self.module_errors.values() {
             root_val!(*v);
         }
-        for &(buf, _, p, _) in &self.async_waiters {
+        for &(buf, _, p, _, _) in &self.async_waiters {
             root_idx!(buf);
             root_idx!(p);
         }

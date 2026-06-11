@@ -571,10 +571,12 @@ impl<'p> Vm<'p> {
         let (ti, i, kind) =
             self.atomic_validate(a0, a1, waitable, needs_shared, is_write, !waitable)?;
         let is_bigint = native::TA_KINDS[kind as usize].2;
-        // waitAsync(ta, index, value, timeout) -> { async, value }. Single agent:
-        // never truly blocks. value differs -> {async:false, value:"not-equal"};
-        // matches with timeout 0 -> {async:false, value:"timed-out"}; matches with
-        // a positive timeout -> {async:true, value:<pending promise>} (no notifier).
+        // waitAsync(ta, index, value, timeout) -> { async, value }. value differs
+        // -> {async:false, value:"not-equal"}; matches with timeout 0 ->
+        // {async:false, value:"timed-out"}; matches with a positive timeout ->
+        // {async:true, value:<pending promise>}, registered BOTH in the global
+        // waiter registry (any agent's notify can wake it through this Vm's
+        // mailbox) and in the local `async_waiters` (deadline bookkeeping).
         if op == "waitAsync" {
             if !matches!(kind, 5 | 9) {
                 return Err(Thrown(
@@ -582,32 +584,53 @@ impl<'p> Vm<'p> {
                 ));
             }
             let cur = self.ta_element_get(ti, i);
-            let eq = if is_bigint {
-                self.to_bigint(a2)? == self.to_bigint(cur)?
+            let (expected, eq) = if is_bigint {
+                let e = self.to_bigint(a2)?;
+                (e, e == self.to_bigint(cur)?)
             } else {
-                self.to_integer_or_zero(a2)? == (cur.as_f64() as i64)
+                let e = self.to_integer_or_zero(a2)? as i128;
+                (e, e == (cur.as_f64() as i64) as i128)
             };
             // ToNumber(timeout): NaN/absent -> +Infinity; clamp to >= 0.
             let t_raw = self.to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
             let timeout = if t_raw.is_nan() { f64::INFINITY } else { t_raw.max(0.0) };
-            let (is_async, value) = if !eq {
+            let (buf, addr) = self.ta_wait_addr(ti, i);
+            let mem = match self.heap.get(buf) {
+                HeapObj::ArrayBuffer { data, .. } => data.shared().cloned(),
+                _ => None,
+            };
+            let (is_async, value) = if let Some(mem) = mem {
+                // Truly-shared storage: decide under the registry lock — the
+                // element is RE-loaded there (SeqCst), making the check
+                // atomic against a racing notify on another thread.
+                let key = (std::sync::Arc::as_ptr(&mem) as usize, addr);
+                match agents::register_async_waiter(key, timeout, &self.mailbox, || {
+                    sab_atomic_op(&mem, kind, addr, "load", 0, 0) as i128 == expected
+                }) {
+                    agents::AsyncWaitDecision::NotEqual => {
+                        (false, self.alloc_str("not-equal".to_string()))
+                    }
+                    agents::AsyncWaitDecision::TimedOut => {
+                        (false, self.alloc_str("timed-out".to_string()))
+                    }
+                    agents::AsyncWaitDecision::Registered(id) => {
+                        let p = self.alloc_promise();
+                        self.async_waiters
+                            .push((buf, addr, p, agents::finite_deadline(timeout), id));
+                        (true, Value::heap(p))
+                    }
+                }
+            } else if !eq {
+                // Non-shared storage (defensive — atomic_validate required a
+                // SAB): single agent, no registry; id 0 = never registered,
+                // so its deadline always resolves "timed-out".
                 (false, self.alloc_str("not-equal".to_string()))
             } else if timeout == 0.0 {
                 (false, self.alloc_str("timed-out".to_string()))
             } else {
-                // Would block: register a WAITER — notify resolves it "ok",
-                // a finite timeout resolves it "timed-out" in the event loop.
                 let p = self.alloc_promise();
-                let (buf, addr) = self.ta_wait_addr(ti, i);
-                let deadline = if timeout.is_finite() {
-                    Some(
-                        std::time::Instant::now()
-                            + std::time::Duration::from_secs_f64(timeout / 1000.0),
-                    )
-                } else {
-                    None
-                };
-                self.async_waiters.push((buf, addr, p, deadline));
+                self.async_waiters
+                    .push((buf, addr, p, agents::finite_deadline(timeout), 0));
                 (true, Value::heap(p))
             };
             let mut m = crate::heap::ObjMap::new();
@@ -627,20 +650,20 @@ impl<'p> Vm<'p> {
             return Ok(Value::heap(obj));
         }
         // wait/notify: the Int32Array/BigInt64Array + SharedArrayBuffer checks
-        // already ran in atomic_validate (before the index coercion). No real waiters
-        // in a single agent.
+        // already ran in atomic_validate (before the index coercion).
         if op == "wait" || op == "notify" {
             if op == "wait" {
                 let cur = self.ta_element_get(ti, i);
-                let eq = if is_bigint {
-                    self.to_bigint(a2)? == self.to_bigint(cur)?
+                let (expected, eq) = if is_bigint {
+                    let e = self.to_bigint(a2)?;
+                    (e, e == self.to_bigint(cur)?)
                 } else {
-                    self.to_integer_or_zero(a2)? == (cur.as_f64() as i64)
+                    let e = self.to_integer_or_zero(a2)? as i128;
+                    (e, e == (cur.as_f64() as i64) as i128)
                 };
-                // ToNumber(timeout) runs (DoWait step 6) even though a single
-                // agent never blocks — a Symbol is a TypeError, a poisoned
-                // valueOf throws.
-                let _t = self
+                // ToNumber(timeout) runs next (DoWait step 6) — a Symbol is a
+                // TypeError, a poisoned valueOf throws.
+                let t_raw = self
                     .to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
                 // DoWait step: a sync wait in an agent that cannot suspend is a
                 // TypeError — AFTER the value/timeout coercions, per spec order.
@@ -649,13 +672,36 @@ impl<'p> Vm<'p> {
                         "TypeError: Atomics.wait cannot suspend in this agent".into(),
                     ));
                 }
-                // Equal value would block; with no notifier this returns "timed-out".
+                // NaN timeout -> +Infinity; clamp to >= 0.
+                let timeout = if t_raw.is_nan() { f64::INFINITY } else { t_raw.max(0.0) };
+                let (buf, addr) = self.ta_wait_addr(ti, i);
+                let mem = match self.heap.get(buf) {
+                    HeapObj::ArrayBuffer { data, .. } => data.shared().cloned(),
+                    _ => None,
+                };
+                // Truly-shared storage: REALLY suspend this agent, FIFO-
+                // registered so another agent's notify can wake it. The
+                // element is re-loaded (SeqCst) under the registry lock.
+                if let Some(mem) = mem {
+                    let key = (std::sync::Arc::as_ptr(&mem) as usize, addr);
+                    let outcome = agents::sync_wait(key, timeout, || {
+                        sab_atomic_op(&mem, kind, addr, "load", 0, 0) as i128 == expected
+                    });
+                    let s = match outcome {
+                        agents::WaitOutcome::NotEqual => "not-equal",
+                        agents::WaitOutcome::TimedOut => "timed-out",
+                        agents::WaitOutcome::Ok => "ok",
+                    };
+                    return Ok(self.alloc_str(s.to_string()));
+                }
+                // Non-shared storage (defensive — atomic_validate required a
+                // SAB): single agent, no notifier — an equal value "blocks"
+                // for zero time.
                 return Ok(self.alloc_str(if eq { "timed-out" } else { "not-equal" }.to_string()));
             }
             // notify(ta, index, count): ToIntegerOrInfinity(count) runs (so a Symbol /
             // throwing valueOf is observed, after the index coercion). Wake up to
-            // `count` waitAsync waiters registered on this (buffer, address) FIFO,
-            // resolving each promise "ok".
+            // `count` waiters registered on this (memory, address) FIFO.
             let count = if a2 == Value::UNDEFINED {
                 f64::INFINITY
             } else {
@@ -663,9 +709,39 @@ impl<'p> Vm<'p> {
                 if n.is_nan() { 0.0 } else { n.trunc().max(0.0) }
             };
             let (buf, addr) = self.ta_wait_addr(ti, i);
+            let mem = match self.heap.get(buf) {
+                HeapObj::ArrayBuffer { data, .. } => data.shared().cloned(),
+                _ => None,
+            };
+            // Truly-shared: pop from the global registry — blocked sync waits
+            // on any thread wake there, a remote Vm's waitAsync is delivered
+            // through its mailbox, and THIS Vm's own waitAsync entries come
+            // back as ids to resolve "ok" in place.
+            if let Some(mem) = mem {
+                let key = (std::sync::Arc::as_ptr(&mem) as usize, addr);
+                let (woken, own) = agents::notify_waiters(key, count, &self.mailbox);
+                if !own.is_empty() {
+                    let mut to_wake: Vec<u32> = Vec::new();
+                    self.async_waiters.retain(|&(_, _, p, _, id)| {
+                        if own.contains(&id) {
+                            to_wake.push(p);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    for p in to_wake {
+                        let v = self.alloc_str("ok".to_string());
+                        self.resolve(p, v);
+                    }
+                }
+                return Ok(Value::num(woken));
+            }
+            // Non-shared buffer: no cross-agent waiter can exist (and none of
+            // this Vm's either — waitAsync requires a SAB); reports 0 woken.
             let mut woken = 0.0;
             let mut to_wake: Vec<u32> = Vec::new();
-            self.async_waiters.retain(|&(b, a, p, _)| {
+            self.async_waiters.retain(|&(b, a, p, _, _)| {
                 if woken < count && b == buf && a == addr {
                     to_wake.push(p);
                     woken += 1.0;

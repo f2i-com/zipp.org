@@ -19,14 +19,15 @@
 use super::*;
 use crate::heap::{AbData, HeapObj, SharedMem};
 use crate::value::Value;
-use std::collections::VecDeque;
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 /// Which side of the agent API this Vm is: the CLI entry Vm (`Main`) or an
-/// `agent.start` worker thread's Vm (`Worker`). Stage D's event-loop
-/// stay-alive rule branches on this; stage C only records it.
+/// `agent.start` worker thread's Vm (`Worker`). The event loop's stay-alive
+/// rule branches on this: a Worker also parks for INFINITE-deadline
+/// waitAsync waiters (the main agent's notify is what ends them).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // read by stage D (cross-thread wait/notify)
 pub(crate) enum AgentRole {
     Main,
     Worker,
@@ -221,4 +222,234 @@ impl<'p> Vm<'p> {
         }
         idx
     }
+}
+
+// ── the process-global Atomics waiter registry (stage D) ──
+//
+// Spec WaiterList: one FIFO of suspended `Atomics.wait` calls and pending
+// `Atomics.waitAsync` promises per (shared memory, byte address), shared by
+// every agent thread in the process. The registry Mutex is the spec's
+// critical section: the waited value is re-loaded and the waiter enqueued
+// under it, so a `notify` can neither slip between the check and the enqueue
+// (lost wakeup) nor observe a half-registered waiter.
+//
+// LOCK ORDER: registry FIRST, then any cell/mailbox lock — never the
+// reverse, and no lock is ever held across user-code reentry.
+
+/// Key of one waiter list: (`Arc::as_ptr` of the `SharedMem`, absolute byte
+/// address of the element). Only Shared (SAB-backed) accesses register —
+/// the pointer identifies the same memory across every agent's heap (workers
+/// re-wrap the same Arc) and is only ever COMPARED, never dereferenced.
+pub(crate) type WaiterKey = (usize, usize);
+
+/// One registered waiter, FIFO-ordered per key. A blocked `Atomics.wait`
+/// parks on its own [`WaitCell`]; an `Atomics.waitAsync` records its Vm's
+/// [`Mailbox`] plus the unique id its `async_waiters` tuple carries.
+pub(crate) enum WaiterEntry {
+    Sync(Arc<WaitCell>),
+    Async { mailbox: Arc<Mailbox>, id: u64 },
+}
+
+/// What a blocked `Atomics.wait` parks on: `state` 0 = waiting, 1 = notified.
+/// `notify` flips the state under the registry lock; the waiter re-checks it
+/// around every condvar wake, so a spurious wakeup (or a plain data op on the
+/// address — see the no-spurious-wakeup-* tests) never ends the wait early.
+pub(crate) struct WaitCell {
+    state: Mutex<u8>,
+    cv: Condvar,
+}
+
+/// A Vm's cross-thread `Atomics.waitAsync` wake channel: `notify` (from any
+/// agent) pushes the woken waiter's id and signals `cv`; the owning Vm's
+/// event loop sleeps on `cv` instead of a plain `thread::sleep` (so a remote
+/// notify wakes it immediately) and drains `wakes` first each iteration,
+/// resolving the matching promises "ok".
+#[derive(Default)]
+pub(crate) struct Mailbox {
+    pub(crate) wakes: Mutex<Vec<u64>>,
+    pub(crate) cv: Condvar,
+}
+
+/// The per-(memory, address) FIFO waiter lists (see module-level lock order).
+fn waiters() -> &'static Mutex<HashMap<WaiterKey, VecDeque<WaiterEntry>>> {
+    static WAITERS: OnceLock<Mutex<HashMap<WaiterKey, VecDeque<WaiterEntry>>>> = OnceLock::new();
+    WAITERS.get_or_init(Default::default)
+}
+
+/// Unique ids tying a registry `Async` entry to one Vm `async_waiters` tuple
+/// (0 is reserved for "never registered").
+fn next_waiter_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// `timeout_ms` (clamped >= 0, possibly +inf) as an `Instant` deadline; None
+/// = wait forever. Finite values are capped (~1 year) so
+/// `Duration::from_secs_f64` cannot overflow on absurd-but-finite timeouts.
+pub(crate) fn finite_deadline(timeout_ms: f64) -> Option<std::time::Instant> {
+    if timeout_ms.is_finite() {
+        let secs = (timeout_ms / 1000.0).min(86_400.0 * 365.0);
+        Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(secs))
+    } else {
+        None
+    }
+}
+
+/// How a blocking `Atomics.wait` ended.
+pub(crate) enum WaitOutcome {
+    NotEqual,
+    TimedOut,
+    Ok,
+}
+
+/// Suspend the calling agent in `Atomics.wait` (spec DoWait): under the
+/// registry lock re-load the element (`still_equal` runs the SeqCst load) and
+/// bail "not-equal" on a mismatch, "timed-out" on a zero timeout; otherwise
+/// enqueue a fresh cell FIFO and park on it until notified or the deadline
+/// lapses. A lapsed waiter deregisters itself under the registry lock —
+/// finding its entry already gone means a `notify` popped (and counted) it
+/// concurrently, and that wake wins: "ok".
+pub(crate) fn sync_wait(
+    key: WaiterKey,
+    timeout_ms: f64,
+    still_equal: impl FnOnce() -> bool,
+) -> WaitOutcome {
+    let cell = Arc::new(WaitCell { state: Mutex::new(0), cv: Condvar::new() });
+    {
+        let mut reg = waiters().lock().unwrap();
+        if !still_equal() {
+            return WaitOutcome::NotEqual;
+        }
+        if timeout_ms == 0.0 {
+            return WaitOutcome::TimedOut;
+        }
+        reg.entry(key).or_default().push_back(WaiterEntry::Sync(Arc::clone(&cell)));
+    }
+    let deadline = finite_deadline(timeout_ms);
+    let mut st = cell.state.lock().unwrap();
+    loop {
+        if *st == 1 {
+            return WaitOutcome::Ok;
+        }
+        match deadline {
+            None => st = cell.cv.wait(st).unwrap(),
+            Some(d) => {
+                let now = std::time::Instant::now();
+                if now >= d {
+                    break;
+                }
+                st = cell.cv.wait_timeout(st, d - now).unwrap().0;
+            }
+        }
+    }
+    // Deadline lapsed with state still 0: drop the cell lock BEFORE taking
+    // the registry lock (lock order) and remove our own entry if it survives.
+    drop(st);
+    let mut reg = waiters().lock().unwrap();
+    let removed = match reg.get_mut(&key) {
+        Some(q) => {
+            let before = q.len();
+            q.retain(|e| !matches!(e, WaiterEntry::Sync(c) if Arc::ptr_eq(c, &cell)));
+            let removed = q.len() != before;
+            if q.is_empty() {
+                reg.remove(&key);
+            }
+            removed
+        }
+        None => false,
+    };
+    if removed {
+        WaitOutcome::TimedOut
+    } else {
+        WaitOutcome::Ok
+    }
+}
+
+/// What `Atomics.waitAsync` decided under the registry lock.
+pub(crate) enum AsyncWaitDecision {
+    NotEqual,
+    TimedOut,
+    Registered(u64),
+}
+
+/// Register an `Atomics.waitAsync` waiter: the same atomic check-and-enqueue
+/// as [`sync_wait`], but the enqueued entry carries the caller's mailbox and
+/// a fresh id instead of a parked cell. The caller files the id (with the
+/// promise + deadline) in its `async_waiters`.
+pub(crate) fn register_async_waiter(
+    key: WaiterKey,
+    timeout_ms: f64,
+    mailbox: &Arc<Mailbox>,
+    still_equal: impl FnOnce() -> bool,
+) -> AsyncWaitDecision {
+    let mut reg = waiters().lock().unwrap();
+    if !still_equal() {
+        return AsyncWaitDecision::NotEqual;
+    }
+    if timeout_ms == 0.0 {
+        return AsyncWaitDecision::TimedOut;
+    }
+    let id = next_waiter_id();
+    reg.entry(key)
+        .or_default()
+        .push_back(WaiterEntry::Async { mailbox: Arc::clone(mailbox), id });
+    AsyncWaitDecision::Registered(id)
+}
+
+/// `Atomics.notify`: pop up to `count` (may be +inf) waiters FIFO and wake
+/// each — a Sync waiter's cell is flipped + signalled and a remote Async
+/// waiter's id is delivered to its Vm's mailbox, both UNDER the registry lock
+/// (so a deadline that later finds its registry entry gone can rely on the
+/// wake already sitting in its mailbox); an Async waiter belonging to the
+/// CALLING Vm (`own_mailbox`) is instead returned for direct in-place
+/// resolution. Returns (total woken, own ids).
+pub(crate) fn notify_waiters(
+    key: WaiterKey,
+    count: f64,
+    own_mailbox: &Arc<Mailbox>,
+) -> (f64, Vec<u64>) {
+    let mut woken = 0.0;
+    let mut own = Vec::new();
+    let mut reg = waiters().lock().unwrap();
+    if let Some(q) = reg.get_mut(&key) {
+        while woken < count {
+            let Some(e) = q.pop_front() else { break };
+            match e {
+                WaiterEntry::Sync(cell) => {
+                    *cell.state.lock().unwrap() = 1;
+                    cell.cv.notify_one();
+                }
+                WaiterEntry::Async { mailbox, id } => {
+                    if Arc::ptr_eq(&mailbox, own_mailbox) {
+                        own.push(id);
+                    } else {
+                        mailbox.wakes.lock().unwrap().push(id);
+                        mailbox.cv.notify_all();
+                    }
+                }
+            }
+            woken += 1.0;
+        }
+        if q.is_empty() {
+            reg.remove(&key);
+        }
+    }
+    (woken, own)
+}
+
+/// Deadline expiry for one waitAsync registration: remove entry `id` under
+/// the registry lock. True = it was still queued (the caller resolves
+/// "timed-out"); false = a notify already popped it (the caller skips the
+/// resolution — the "ok" wake is guaranteed to be in the caller's mailbox,
+/// see [`notify_waiters`]).
+pub(crate) fn take_async_waiter(key: WaiterKey, id: u64) -> bool {
+    let mut reg = waiters().lock().unwrap();
+    let Some(q) = reg.get_mut(&key) else { return false };
+    let before = q.len();
+    q.retain(|e| !matches!(e, WaiterEntry::Async { id: i, .. } if *i == id));
+    let removed = q.len() != before;
+    if q.is_empty() {
+        reg.remove(&key);
+    }
+    removed
 }

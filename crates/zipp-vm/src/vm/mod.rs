@@ -637,10 +637,12 @@ pub struct Vm<'p> {
     /// (mark/split_off discipline keeps nested links separate). GC ROOTS.
     link_pending_deps: Vec<Value>,
     /// Registered Atomics.waitAsync waiters: (buffer heap idx, byte address,
-    /// pending promise idx, optional deadline). `notify` resolves matching
-    /// entries "ok" FIFO; a due deadline resolves "timed-out" in the event
-    /// loop. Promise indices are GC ROOTS.
-    async_waiters: Vec<(u32, usize, u32, Option<std::time::Instant>)>,
+    /// pending promise idx, optional deadline, global-registry waiter id).
+    /// `notify` (local or via the cross-thread mailbox) resolves matching
+    /// entries "ok"; a due deadline resolves "timed-out" in the event loop —
+    /// unless its registry entry is already gone (a notify won the race).
+    /// Buffer + promise indices are GC ROOTS; the id needs no rooting.
+    async_waiters: Vec<(u32, usize, u32, Option<std::time::Instant>, u64)>,
     /// `$262.agent.setTimeout` macrotasks: (due, callback). Callback Values
     /// are GC ROOTS.
     timer_queue: Vec<(std::time::Instant, Value)>,
@@ -657,6 +659,12 @@ pub struct Vm<'p> {
     /// Worker-side `$262.agent.receiveBroadcast` callback, invoked as
     /// `cb(sab, id)` for each broadcast retrieved. GC ROOT (gc.rs).
     broadcast_cb: Value,
+    /// This Vm's cross-thread `Atomics.waitAsync` wake channel: a `notify`
+    /// in ANY agent pushes a woken waiter's id here and signals the condvar;
+    /// the event loop sleeps on that condvar and drains the ids first each
+    /// iteration. Created unconditionally so a remote notify never races a
+    /// lazy init; holds no Values (nothing to root).
+    mailbox: std::sync::Arc<agents::Mailbox>,
     /// The ShadowRealm whose code is CURRENTLY evaluating (heap index of the
     /// realm object), if any — global-name resolution inside `evaluate` binds
     /// non-builtin names to that realm's own slot table.

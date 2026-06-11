@@ -1863,27 +1863,77 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// The full event loop: drain microtasks, then — while `$262.agent`
-    /// timers or FINITE-deadline waitAsync waiters remain — sleep to the
-    /// earliest due time, fire it (timer callback / "timed-out" resolution),
-    /// and drain again. Infinite-deadline waiters do NOT keep the loop alive.
+    /// Deliver cross-thread `Atomics.notify` wakes: drain this Vm's mailbox
+    /// and resolve each matching waitAsync promise "ok" (the notifier already
+    /// removed the global-registry entry; this removes the local bookkeeping).
+    /// An id with no surviving entry is dropped.
+    fn drain_mailbox(&mut self) {
+        let ids = std::mem::take(&mut *self.mailbox.wakes.lock().unwrap());
+        if ids.is_empty() {
+            return;
+        }
+        let mut to_wake: Vec<u32> = Vec::new();
+        self.async_waiters.retain(|&(_, _, p, _, id)| {
+            if id != 0 && ids.contains(&id) {
+                to_wake.push(p);
+                false
+            } else {
+                true
+            }
+        });
+        for p in to_wake {
+            let _gc = self.gc_lock_guard();
+            let v = self.alloc_str("ok".to_string());
+            self.resolve(p, v);
+        }
+    }
+
+    /// The full event loop: deliver cross-thread waitAsync wakes, drain
+    /// microtasks, then — while `$262.agent` timers or FINITE-deadline
+    /// waitAsync waiters remain — sleep until the earliest due time ON THE
+    /// MAILBOX CONDVAR (a remote `Atomics.notify` wakes the loop immediately
+    /// instead of after the full timeout), fire what is due, and go again.
+    /// Infinite-deadline waiters do not keep a Main loop alive; a WORKER
+    /// agent parks for them — the main agent's notify is what ends them.
     pub(crate) fn run_event_loop(&mut self) {
         loop {
+            // Cross-thread wakes FIRST: an "ok" resolution beats both the
+            // microtask drain and the deadline bookkeeping below.
+            self.drain_mailbox();
             self.drain_microtasks();
             let now = std::time::Instant::now();
             let next_timer = self.timer_queue.iter().map(|(d, _)| *d).min();
             let next_wait = self
                 .async_waiters
                 .iter()
-                .filter_map(|(_, _, _, d)| *d)
+                .filter_map(|(_, _, _, d, _)| *d)
                 .min();
             let due = match (next_timer, next_wait) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
-            let Some(due) = due else { break };
+            let Some(due) = due else {
+                if self.agent_role == agents::AgentRole::Worker
+                    && !self.async_waiters.is_empty()
+                {
+                    // Worker with only infinite-deadline waiters: park until a
+                    // notify lands in the mailbox (re-check under the lock —
+                    // a wake may have arrived since the drain above).
+                    let wakes = self.mailbox.wakes.lock().unwrap();
+                    if wakes.is_empty() {
+                        drop(self.mailbox.cv.wait(wakes).unwrap());
+                    }
+                    continue;
+                }
+                break;
+            };
             if due > now {
-                std::thread::sleep(due - now);
+                // Interruptible sleep: notify pushes into the mailbox and
+                // signals this condvar (spurious wakeups just re-loop).
+                let wakes = self.mailbox.wakes.lock().unwrap();
+                if wakes.is_empty() {
+                    drop(self.mailbox.cv.wait_timeout(wakes, due - now).unwrap().0);
+                }
             }
             let now = std::time::Instant::now();
             // Fire due timers (FIFO among due ones by due-time order).
@@ -1901,16 +1951,39 @@ impl<'p> Vm<'p> {
                 let _gc = self.gc_lock_guard();
                 let _ = self.call_value(cb, Value::UNDEFINED, &[]);
             }
-            // Resolve due waitAsync waiters "timed-out".
+            // Resolve due waitAsync waiters "timed-out" — DEREGISTERING under
+            // the registry lock first. An entry already gone means a notify
+            // won the race: skip the resolution and keep the local tuple; the
+            // "ok" wake is already in the mailbox (notify delivers under the
+            // registry lock) and the next iteration's drain resolves it.
+            let waiters = std::mem::take(&mut self.async_waiters);
             let mut due_waiters: Vec<u32> = Vec::new();
-            self.async_waiters.retain(|&(_, _, p, d)| {
-                if d.is_some_and(|d| d <= now) {
-                    due_waiters.push(p);
-                    false
-                } else {
-                    true
+            let mut kept = Vec::with_capacity(waiters.len());
+            for w in waiters {
+                let (buf, addr, p, d, id) = w;
+                if !d.is_some_and(|d| d <= now) {
+                    kept.push(w);
+                    continue;
                 }
-            });
+                let timed_out = id == 0 || {
+                    let mem_key = match self.heap.get(buf) {
+                        HeapObj::ArrayBuffer { data, .. } => {
+                            data.shared().map(|m| std::sync::Arc::as_ptr(m) as usize)
+                        }
+                        _ => None,
+                    };
+                    match mem_key {
+                        Some(k) => agents::take_async_waiter((k, addr), id),
+                        None => true,
+                    }
+                };
+                if timed_out {
+                    due_waiters.push(p);
+                } else {
+                    kept.push(w);
+                }
+            }
+            self.async_waiters = kept;
             for p in due_waiters {
                 let _gc = self.gc_lock_guard();
                 let v = self.alloc_str("timed-out".to_string());
