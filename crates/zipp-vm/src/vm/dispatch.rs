@@ -3534,7 +3534,12 @@ impl<'p> Vm<'p> {
                         // program's bindings.
                         let nonconfig = self.program.hoisted_globals.contains(&slot)
                             || self.program.decl_globals.contains(&slot)
-                            || self.program.lexical_globals.contains(&slot);
+                            || self.program.lexical_globals.contains(&slot)
+                            // An evalScript-created LEXICAL binding lives in the
+                            // declarative record — DeleteBinding returns false
+                            // and the binding persists (only eval VARs delete).
+                            || self.eval_lexical_globals.contains(&slot)
+                            || self.eval_const_globals.contains(&slot);
                         if nonconfig {
                             self.set(base, dst, Value::bool(false));
                         } else {
