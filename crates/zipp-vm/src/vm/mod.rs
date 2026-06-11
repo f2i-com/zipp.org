@@ -646,6 +646,17 @@ pub struct Vm<'p> {
     timer_queue: Vec<(std::time::Instant, Value)>,
     /// VM construction time — the `$262.agent.monotonicNow()` epoch.
     vm_start: std::time::Instant,
+    /// Cross-agent state for the `$262.agent` worker subsystem (report FIFO +
+    /// one handle per started agent). `None` until the first `agent.start` —
+    /// a run that never starts an agent pays nothing; each worker Vm holds a
+    /// clone of the same Arc.
+    agent_shared: Option<std::sync::Arc<agents::AgentShared>>,
+    /// Whether this Vm is the CLI entry agent (`Main`) or an `agent.start`
+    /// worker thread's Vm (`Worker`).
+    agent_role: agents::AgentRole,
+    /// Worker-side `$262.agent.receiveBroadcast` callback, invoked as
+    /// `cb(sab, id)` for each broadcast retrieved. GC ROOT (gc.rs).
+    broadcast_cb: Value,
     /// The ShadowRealm whose code is CURRENTLY evaluating (heap index of the
     /// realm object), if any — global-name resolution inside `evaluate` binds
     /// non-builtin names to that realm's own slot table.

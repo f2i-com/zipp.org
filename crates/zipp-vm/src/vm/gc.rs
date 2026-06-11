@@ -157,6 +157,8 @@ impl Vm<'_> {
         for (_, cb) in &self.timer_queue {
             root_val!(*cb);
         }
+        // Worker-side $262.agent.receiveBroadcast callback (invoked per broadcast).
+        root_val!(self.broadcast_cb);
         for v in self.closure_home.values() {
             root_val!(*v);
         }

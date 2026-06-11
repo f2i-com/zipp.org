@@ -2263,18 +2263,31 @@ impl<'p> Vm<'p> {
         // falsy, callable→undefined).
         let d262_htmldda = self.heap.alloc(HeapObj::Object(ObjMap::new()));
         self.is_htmldda.insert(d262_htmldda);
-        // `$262.agent`: monotonicNow/setTimeout/getReport/sleep. getReport
+        // `$262.agent`: the full multi-agent surface (vm/agents.rs). getReport
         // must exist (returning null on empty) even before any worker agent
-        // starts — atomicsHelper.js binds it unconditionally at load.
+        // starts — atomicsHelper.js binds it unconditionally at load. The
+        // main-side (start/broadcast/getReport) and worker-side
+        // (receiveBroadcast/report/leaving) members are all defined in BOTH
+        // roles — atomicsHelper only calls the role-appropriate ones.
         let ag_now = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_MONOTONIC_NOW)));
         let ag_st = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_SET_TIMEOUT)));
         let ag_gr = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_GET_REPORT)));
         let ag_sl = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_SLEEP)));
+        let ag_start = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_START)));
+        let ag_bcast = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_BROADCAST)));
+        let ag_recv = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_RECEIVE_BROADCAST)));
+        let ag_rep = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_REPORT)));
+        let ag_leave = Value::heap(self.heap.alloc(HeapObj::Native(AGENT_LEAVING)));
         let mut agent = ObjMap::new();
         agent.define("monotonicNow", ag_now, method_attr);
         agent.define("setTimeout", ag_st, method_attr);
         agent.define("getReport", ag_gr, method_attr);
         agent.define("sleep", ag_sl, method_attr);
+        agent.define("start", ag_start, method_attr);
+        agent.define("broadcast", ag_bcast, method_attr);
+        agent.define("receiveBroadcast", ag_recv, method_attr);
+        agent.define("report", ag_rep, method_attr);
+        agent.define("leaving", ag_leave, method_attr);
         let agent_obj = Value::heap(self.heap.alloc(HeapObj::Object(agent)));
         let d262_eval_script =
             Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_EVAL_SCRIPT)));

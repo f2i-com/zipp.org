@@ -1357,6 +1357,42 @@ impl<'p> Vm<'p> {
                 Some(s) => self.alloc_str(s),
                 None => Value::NULL,
             },
+            AGENT_START => {
+                // Spawn a concurrent worker agent (its own thread + Vm/realm)
+                // and BLOCK until it signals it is running (INTERPRETING.md).
+                let src =
+                    self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                self.agent_start(src);
+                Value::UNDEFINED
+            }
+            AGENT_BROADCAST => {
+                // Blocks until every started agent has RETRIEVED the SAB
+                // (workers ack on receipt, before their callback runs).
+                let sab = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let id = match args.get(1).copied() {
+                    Some(v) if v != Value::UNDEFINED => self.to_number_coerce(v)?,
+                    _ => 0.0,
+                };
+                self.agent_broadcast(sab, id)?;
+                Value::UNDEFINED
+            }
+            AGENT_RECEIVE_BROADCAST => {
+                // Worker-side: register cb(sab, id) for the next broadcast.
+                // GC ROOT (gc.rs traces broadcast_cb).
+                self.broadcast_cb = args.first().copied().unwrap_or(Value::UNDEFINED);
+                Value::UNDEFINED
+            }
+            AGENT_REPORT => {
+                // ToString(x) onto the shared FIFO the main agent's
+                // getReport() pops. Workers report; main pushing is harmless.
+                let v = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let s = self.to_js_string(v)?;
+                self.agent_push_report(s);
+                Value::UNDEFINED
+            }
+            // Marks the worker done; its thread may linger parked on the
+            // broadcast channel (process exit reaps it — one test per process).
+            AGENT_LEAVING => Value::UNDEFINED,
             GLOBAL_PRINT => {
                 // Mirrors the Print instruction (console.log): inspect each
                 // argument, join with spaces, append one stdout line.

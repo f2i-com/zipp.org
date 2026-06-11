@@ -257,6 +257,15 @@ pub const DISPOSE_ASYNC_STEP_REJECT: u16 = 906;
 /// Host `print(...)` as a first-class global value (the bare CALL form is
 /// compiled to the Print instruction; this covers `var p = print` etc.).
 pub const GLOBAL_PRINT: u16 = 907;
+/// The `$262.agent` worker-thread slice (vm/agents.rs): `start(src)` spawns a
+/// concurrent agent (blocks until running); `broadcast(sab[, id])` blocks
+/// until every agent retrieved the SAB; worker-side `receiveBroadcast(cb)` /
+/// `report(x)` / `leaving()`.
+pub const AGENT_START: u16 = 908;
+pub const AGENT_BROADCAST: u16 = 909;
+pub const AGENT_RECEIVE_BROADCAST: u16 = 910;
+pub const AGENT_REPORT: u16 = 911;
+pub const AGENT_LEAVING: u16 = 912;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
