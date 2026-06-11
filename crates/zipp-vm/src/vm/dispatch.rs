@@ -2569,6 +2569,16 @@ impl<'p> Vm<'p> {
                         self.set(base, reg, Value::heap(cell));
                         ip += 1;
                     }
+                    Instr::MakeCellFnName { reg } => {
+                        // A named function expression's own-name cell: tagged
+                        // immutable so nested-closure / eval writes no-op
+                        // (sloppy) or throw (strict).
+                        let v = self.get(base, reg);
+                        let cell = self.heap.alloc(HeapObj::Cell(v));
+                        self.fn_name_cells.insert(cell);
+                        self.set(base, reg, Value::heap(cell));
+                        ip += 1;
+                    }
                     Instr::MakeCellTdz { reg } => {
                         // A captured lexical pre-created at entry: the cell starts in
                         // its TDZ (UNINITIALIZED) until the textual declaration runs.
@@ -2608,6 +2618,18 @@ impl<'p> Vm<'p> {
                     }
                     Instr::UpvalSet { idx, src } => {
                         let cell = self.closure_upvalue(cur_closure, idx);
+                        // A named function expression's own-name binding is
+                        // immutable: strict writer → TypeError, sloppy → no-op.
+                        if !self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell) {
+                            let f = self.frames.last().unwrap().func;
+                            if self.func(f as usize).is_strict {
+                                return Err(Thrown(
+                                    "TypeError: Assignment to constant variable.".into(),
+                                ));
+                            }
+                            ip += 1;
+                            continue;
+                        }
                         let v = self.get(base, src);
                         self.heap.cell_set(cell, v);
                         ip += 1;
@@ -2638,6 +2660,17 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let cell = self.closure_upvalue(cur_closure, idx);
+                        // Immutable own-name binding (see UpvalSet).
+                        if !self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell) {
+                            let f = self.frames.last().unwrap().func;
+                            if self.func(f as usize).is_strict {
+                                return Err(Thrown(
+                                    "TypeError: Assignment to constant variable.".into(),
+                                ));
+                            }
+                            ip += 1;
+                            continue;
+                        }
                         self.heap.cell_set(cell, v);
                         ip += 1;
                     }
@@ -3473,6 +3506,7 @@ impl<'p> Vm<'p> {
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = callee_v;
                             let ag = self.alloc_async_generator(fid, closure, Value::UNDEFINED, &argv)?;
                             self.set(base, dst, ag);
                             ip += 1;
@@ -3482,6 +3516,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = callee_v;
                             let g = self.alloc_generator(fid, closure, Value::UNDEFINED, &argv)?;
                             self.set(base, dst, g);
                             ip += 1;
@@ -3492,6 +3527,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_async {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = callee_v;
                             let p = self.alloc_async(fid, closure, Value::UNDEFINED, &argv);
                             self.set(base, dst, p);
                             ip += 1;
@@ -3670,6 +3706,7 @@ impl<'p> Vm<'p> {
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = prop;
                             let ag = self.alloc_async_generator(fid, closure, recv, &argv)?;
                             self.set(base, dst, ag);
                             ip += 1;
@@ -3679,6 +3716,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = prop;
                             let g = self.alloc_generator(fid, closure, recv, &argv)?;
                             self.set(base, dst, g);
                             ip += 1;
@@ -3689,6 +3727,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_async {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = prop;
                             let p = self.alloc_async(fid, closure, recv, &argv);
                             self.set(base, dst, p);
                             ip += 1;
@@ -3736,6 +3775,7 @@ impl<'p> Vm<'p> {
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = method;
                             let ag = self.alloc_async_generator(fid, closure, recv, &argv)?;
                             self.set(base, dst, ag);
                             ip += 1;
@@ -3744,6 +3784,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_generator {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = method;
                             let g = self.alloc_generator(fid, closure, recv, &argv)?;
                             self.set(base, dst, g);
                             ip += 1;
@@ -3752,6 +3793,7 @@ impl<'p> Vm<'p> {
                         if self.func(fid as usize).is_async {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            self.pending_gen_callee = method;
                             let p = self.alloc_async(fid, closure, recv, &argv);
                             self.set(base, dst, p);
                             ip += 1;

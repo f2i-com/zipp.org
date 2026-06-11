@@ -942,6 +942,12 @@ impl Compiler {
                 all.push(r.to_string());
             }
             all.extend(hoisted_var_names(body));
+            // The named function expression's own name too: the eval program
+            // must close over its (immutable) cell — `eval("fn = 1")` resolves
+            // the funcEnv binding, not a fresh global.
+            if let Some(sn) = self_name {
+                all.push(sn.to_string());
+            }
             captured.extend(all);
         }
         let mut fc = FnCompiler::new(self, params, rest, captured, enclosing);
@@ -1026,11 +1032,18 @@ impl Compiler {
         // captures the name — box it into a cell like a captured parameter. Only set
         // up when the name is actually referenced and not shadowed by a param/local.
         if let Some(sn) = self_name {
-            if capture::free_vars(params, body).contains(sn) {
+            // A body containing a direct eval may reference the name only
+            // inside the eval STRING (invisible to free_vars): bind it anyway
+            // so the eval program can close over it.
+            if capture::free_vars(params, body).contains(sn) || body_refs_eval {
                 let r = fc.alloc_reg();
                 fc.emit(Instr::LoadCallee { dst: r });
                 if fc.captured.contains(sn) {
-                    fc.emit(Instr::MakeCell { reg: r });
+                    // The self-name binding is IMMUTABLE: the cell is tagged
+                    // so a nested closure's / eval's write is a sloppy no-op
+                    // or a strict TypeError (the body's own writes are
+                    // intercepted at compile time in store_binding).
+                    fc.emit(Instr::MakeCellFnName { reg: r });
                     fc.cell_regs.insert(r);
                 }
                 fc.self_name = Some((sn.to_string(), r));

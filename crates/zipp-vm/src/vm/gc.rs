@@ -151,6 +151,9 @@ impl Vm<'_> {
         for v in self.closure_home.values() {
             root_val!(*v);
         }
+        for v in self.gen_callee.values() {
+            root_val!(*v);
+        }
         if let Some(v) = self.from_async_fn {
             root_val!(v);
         }
@@ -365,6 +368,8 @@ impl Vm<'_> {
         self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.error_data.retain(|&k| marks[k as usize]);
         self.arguments_objs.retain(|&k, _| marks[k as usize]);
+        self.fn_name_cells.retain(|&k| marks[k as usize]);
+        self.gen_callee.retain(|&k, _| marks[k as usize]);
         self.module_namespaces.retain(|&k, _| marks[k as usize]);
         self.closure_home.retain(|&k, _| marks[k as usize]);
         self.dispose_stacks.retain(|&k, _| marks[k as usize]);

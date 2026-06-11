@@ -179,6 +179,9 @@ impl<'p> Vm<'p> {
             shared_buffers: std::collections::HashSet::new(),
             immutable_buffers: std::collections::HashSet::new(),
             error_data: std::collections::HashSet::new(),
+            fn_name_cells: std::collections::HashSet::new(),
+            pending_gen_callee: Value::UNDEFINED,
+            gen_callee: std::collections::HashMap::new(),
             eval_script_gdi: false,
             eval_lexical_globals: std::collections::HashSet::new(),
             eval_const_globals: std::collections::HashSet::new(),
@@ -952,17 +955,20 @@ impl<'p> Vm<'p> {
         // iterator); it doesn't run until `.next()` (but its parameter prologue
         // runs eagerly here, so a destructuring throw propagates from the call).
         if is_gen && is_async {
+            self.pending_gen_callee = callee;
             return self.alloc_async_generator(func_id, closure, this, args);
         }
         // Calling a generator function builds a suspended Generator, not a frame.
         // (The parameter prologue runs eagerly here, so a destructuring throw
         // propagates from the call.)
         if is_gen {
+            self.pending_gen_callee = callee;
             return self.alloc_generator(func_id, closure, this, args);
         }
         // Calling an async function runs synchronously up to the first `await`,
         // then returns its result Promise.
         if is_async {
+            self.pending_gen_callee = callee;
             return Ok(self.alloc_async(func_id, closure, this, args));
         }
         if self.frames.len() >= MAX_FRAMES {

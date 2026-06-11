@@ -452,6 +452,11 @@ pub enum Instr {
     /// capture: a `CellGet`/`UpvalGet` before the binding's textual declaration
     /// runs (its TDZ) then throws a ReferenceError instead of reading undefined.
     MakeCellTdz { reg: Reg },
+    /// Like `MakeCell` but the cell is tagged IMMUTABLE — a named function
+    /// expression's own-name binding. A nested closure's / eval's write
+    /// through it (UpvalSet / StoreUpvalDyn) is a silent no-op in sloppy code
+    /// and a TypeError in strict code.
+    MakeCellFnName { reg: Reg },
     /// `dst = *<cell in reg>` — read a captured local's cell.
     CellGet { dst: Reg, cell: Reg },
     /// `*<cell in reg> = src` — write a captured local's cell.

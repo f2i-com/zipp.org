@@ -517,6 +517,20 @@ pub struct Vm<'p> {
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep.
     error_data: std::collections::HashSet<u32>,
+    /// The function VALUE being invoked for the generator/async allocation in
+    /// flight (set by the call site just before alloc_generator /
+    /// alloc_async / alloc_async_generator; consumed at their entry).
+    pending_gen_callee: Value,
+    /// Generator / AsyncGenerator / AsyncState heap index → the function
+    /// value that created it. Resumes bind it as Frame.callee so LoadCallee
+    /// (a named function expression's self-name) keeps the caller-visible
+    /// identity across suspensions. Values are GC roots; keys pruned on sweep.
+    gen_callee: std::collections::HashMap<u32, Value>,
+    /// Heap indices of IMMUTABLE cells — named function expressions' own-name
+    /// bindings (MakeCellFnName). UpvalSet/StoreUpvalDyn writes through one
+    /// no-op in sloppy code and throw TypeError in strict code. Pruned on GC
+    /// sweep (the cells themselves are ordinary traced heap objects).
+    fn_name_cells: std::collections::HashSet<u32>,
     /// `$262.evalScript` flag: the NEXT eval-program instantiation uses SCRIPT
     /// GlobalDeclarationInstantiation semantics (non-configurable brandNew
     /// bindings, lexical-collision SyntaxErrors, realm-persistent lexicals)

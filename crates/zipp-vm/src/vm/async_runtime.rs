@@ -29,6 +29,7 @@ impl<'p> Vm<'p> {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Thrown> {
+        let gen_callee = std::mem::replace(&mut self.pending_gen_callee, Value::UNDEFINED);
         let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
@@ -71,7 +72,7 @@ impl<'p> Vm<'p> {
             closure,
             handlers: Vec::new(),
             new_target: Value::UNDEFINED,
-            callee: Value::UNDEFINED,
+            callee: gen_callee,
         });
         let outcome = self.run_loop(stop);
         if let Some((_v, genstart_ip)) = self.pending_yield.take() {
@@ -86,6 +87,10 @@ impl<'p> Vm<'p> {
                 regs: back,
                 handlers,
             });
+            if gen_callee != Value::UNDEFINED {
+                // Resumes re-bind this as Frame.callee (LoadCallee identity).
+                self.gen_callee.insert(g, gen_callee);
+            }
             // A param-prologue direct eval created a dynamic EvalScope on the
             // (now-parked) frame: keep it resolvable across suspensions.
             if esc != u32::MAX {
@@ -194,7 +199,9 @@ impl<'p> Vm<'p> {
             closure,
             handlers: saved_handlers,
             new_target: Value::UNDEFINED,
-            callee: Value::UNDEFINED,
+            // The creating call's function value (named fn-expression
+            // self-name identity survives suspension).
+            callee: self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED),
         });
         // Restore the activation's dynamic EvalScope (created by a direct eval
         // in the param prologue or an earlier resume), parked on the generator.
@@ -581,6 +588,7 @@ impl<'p> Vm<'p> {
     /// to its first `await` (or to completion / a throw). Returns the activation's
     /// result Promise — the value an `async` call evaluates to.
     pub(crate) fn alloc_async(&mut self, func_id: u32, closure: u32, this: Value, args: &[Value]) -> Value {
+        let gen_callee = std::mem::replace(&mut self.pending_gen_callee, Value::UNDEFINED);
         // An async arrow captures `this` lexically (call sites pass UNDEFINED/recv).
         let this = self.rebind_arrow_this(func_id, closure, this);
         let proto = self.func(func_id as usize);
@@ -613,6 +621,10 @@ impl<'p> Vm<'p> {
             result,
             handlers: Vec::new(),
         })));
+        if gen_callee != Value::UNDEFINED {
+            // Every drive/resume binds this as Frame.callee (LoadCallee identity).
+            self.gen_callee.insert(idx, gen_callee);
+        }
         // Run from the top until the first await suspends it (or it finishes —
         // settling `result` either way).
         self.drive_async(idx, Resume::Value(Value::UNDEFINED));
@@ -631,6 +643,7 @@ impl<'p> Vm<'p> {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Thrown> {
+        let gen_callee = std::mem::replace(&mut self.pending_gen_callee, Value::UNDEFINED);
         let proto = self.func(func_id as usize);
         let reg_count = (proto.reg_count as usize).max(1);
         let param_count = proto.param_count as usize;
@@ -667,7 +680,7 @@ impl<'p> Vm<'p> {
             closure,
             handlers: Vec::new(),
             new_target: Value::UNDEFINED,
-            callee: Value::UNDEFINED,
+            callee: gen_callee,
         });
         let outcome = self.run_loop(stop);
         self.pending_yield_eval_scope = u32::MAX;
@@ -683,14 +696,19 @@ impl<'p> Vm<'p> {
                 Err(t) => return Err(t),
             }
         };
-        Ok(Value::heap(self.heap.alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
+        let ag = self.heap.alloc(HeapObj::AsyncGenerator(Box::new(AsyncGenState {
             func: func_id,
             closure,
             state,
             regs,
             handlers: Vec::new(),
             queue: Vec::new(),
-        })))))
+        })));
+        if gen_callee != Value::UNDEFINED {
+            // Resumes re-bind this as Frame.callee (LoadCallee identity).
+            self.gen_callee.insert(ag, gen_callee);
+        }
+        Ok(Value::heap(ag))
     }
 
     /// `.next()`/`.return()`/`.throw()` on an async generator. Each returns a
@@ -866,7 +884,9 @@ impl<'p> Vm<'p> {
             closure,
             handlers: saved_handlers,
             new_target: Value::UNDEFINED,
-            callee: Value::UNDEFINED,
+            // The creating call's function value (named fn-expression
+            // self-name identity survives suspension).
+            callee: self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED),
         });
         // Resume after the suspending op, delivering the sent/awaited value. The
         // op at `resume_ip` is a Yield (resumed by `.next(v)`) or Await (resumed
@@ -1574,7 +1594,9 @@ impl<'p> Vm<'p> {
             closure,
             handlers: saved_handlers,
             new_target: Value::UNDEFINED,
-            callee: Value::UNDEFINED,
+            // The creating call's function value (named fn-expression
+            // self-name identity survives suspension).
+            callee: self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED),
         });
         // Position the resume point and deliver the awaited value / rejection.
         let outcome = if resume_ip == usize::MAX {
