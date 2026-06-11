@@ -1011,6 +1011,15 @@ impl<'p> Vm<'p> {
                         let consts = &self.func(func_id as usize).string_constants;
                         let excluded =
                             &consts[exclude_start as usize..exclude_start as usize + exclude_count as usize];
+                        // A Proxy source: trap-aware CopyDataProperties (ownKeys
+                        // → gopd → get per key, excluded keys never probed).
+                        if s.is_heap() && self.proxy_parts(s.heap_index()).is_some() {
+                            let m = self.copy_data_properties_rest(s, excluded)?;
+                            let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
+                        }
                         // Copy src's own enumerable keys except the destructured
                         // siblings â€” Getting each (CopyDataProperties), so a getter's
                         // VALUE is copied (not the accessor) and a throw propagates.
@@ -1053,6 +1062,14 @@ impl<'p> Vm<'p> {
                         for i in 0..n {
                             let kv = self.get(base, keys_base + i);
                             excluded.push(self.to_property_key(kv)?);
+                        }
+                        // A Proxy source: trap-aware CopyDataProperties.
+                        if s.is_heap() && self.proxy_parts(s.heap_index()).is_some() {
+                            let m = self.copy_data_properties_rest(s, &excluded)?;
+                            let v = Value::heap(self.heap.alloc(HeapObj::Object(m)));
+                            self.set(base, dst, v);
+                            ip += 1;
+                            continue;
                         }
                         let keys: Vec<String> = if s.is_heap() {
                             match self.heap.get(s.heap_index()) {
@@ -3253,6 +3270,22 @@ impl<'p> Vm<'p> {
                             } else {
                                 let k = key.to_string();
                                 self.set_prop(o, &k, v, false)?;
+                            }
+                        }
+                        ip += 1;
+                    }
+                    Instr::InitDataPropDyn { obj, key, val } => {
+                        // CreateDataProperty with a computed key: ordinary own
+                        // data property — never the __proto__ setter.
+                        let o = self.get(base, obj);
+                        let k = self.get(base, key);
+                        let v = self.get(base, val);
+                        let ks = self.key_of(k);
+                        if o.is_heap() {
+                            if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                                m.define(&ks, v, crate::heap::PropAttr::data());
+                            } else {
+                                self.set_prop(o, &ks, v, false)?;
                             }
                         }
                         ip += 1;

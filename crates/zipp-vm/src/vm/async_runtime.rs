@@ -35,6 +35,23 @@ impl<'p> Vm<'p> {
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
         let arguments_reg = proto.arguments_reg;
+        // OrdinaryCallBindThis: a SLOPPY (non-arrow) generator/async invoked
+        // with a nullish `this` binds the global object; a primitive boxes.
+        let this = if !proto.lexical_this
+            && !proto.is_strict
+            && this.is_nullish()
+            && self.global_this != 0
+        {
+            Value::heap(self.global_this)
+        } else if !proto.lexical_this
+            && !proto.is_strict
+            && !self.is_object_value(this)
+            && self.global_this != 0
+        {
+            self.to_object(this).unwrap_or(this)
+        } else {
+            this
+        };
         let mut regs = vec![Value::UNDEFINED; reg_count];
         regs[0] = this;
         let n = args.len().min(param_count);
@@ -596,6 +613,23 @@ impl<'p> Vm<'p> {
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
         let arguments_reg = proto.arguments_reg;
+        // OrdinaryCallBindThis: a SLOPPY (non-arrow) generator/async invoked
+        // with a nullish `this` binds the global object; a primitive boxes.
+        let this = if !proto.lexical_this
+            && !proto.is_strict
+            && this.is_nullish()
+            && self.global_this != 0
+        {
+            Value::heap(self.global_this)
+        } else if !proto.lexical_this
+            && !proto.is_strict
+            && !self.is_object_value(this)
+            && self.global_this != 0
+        {
+            self.to_object(this).unwrap_or(this)
+        } else {
+            this
+        };
         let mut regs = vec![Value::UNDEFINED; reg_count];
         regs[0] = this;
         let n = args.len().min(param_count);
@@ -649,6 +683,23 @@ impl<'p> Vm<'p> {
         let param_count = proto.param_count as usize;
         let rest_reg = proto.rest_reg;
         let arguments_reg = proto.arguments_reg;
+        // OrdinaryCallBindThis: a SLOPPY (non-arrow) generator/async invoked
+        // with a nullish `this` binds the global object; a primitive boxes.
+        let this = if !proto.lexical_this
+            && !proto.is_strict
+            && this.is_nullish()
+            && self.global_this != 0
+        {
+            Value::heap(self.global_this)
+        } else if !proto.lexical_this
+            && !proto.is_strict
+            && !self.is_object_value(this)
+            && self.global_this != 0
+        {
+            self.to_object(this).unwrap_or(this)
+        } else {
+            this
+        };
         let mut regs = vec![Value::UNDEFINED; reg_count];
         regs[0] = this;
         let n = args.len().min(param_count);

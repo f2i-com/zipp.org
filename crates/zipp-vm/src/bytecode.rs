@@ -571,6 +571,11 @@ pub enum Instr {
     /// fresh object — CreateDataProperty, NOT [[Set]]: used for object-literal data
     /// properties, which must ignore any inherited accessor / non-writable property.
     InitDataProp { obj: Reg, name: u32, val: Reg },
+    /// CreateDataProperty with a COMPUTED key (already ToPropertyKey'd via
+    /// `ToPropKey`) on an object literal: an ordinary own data property even
+    /// for "__proto__" — only the textual `__proto__:` colon form sets the
+    /// prototype.
+    InitDataPropDyn { obj: Reg, key: Reg, val: Reg },
     /// `dst = delete obj.<string_constants[name]>` — remove an own property;
     /// `dst` is the boolean result (true unless the property is non-deletable).
     /// In strict mode a false result throws a TypeError instead.

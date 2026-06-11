@@ -2143,6 +2143,60 @@ impl<'p> Vm<'p> {
         Ok(target)
     }
 
+    /// CopyDataProperties for an object REST pattern (`{a, ...rest} = src`):
+    /// trap-aware like `object_assign` (ownKeys → per-key [[GetOwnProperty]]
+    /// → enumerable → [[Get]]), but skipping the destructured sibling keys
+    /// WITHOUT calling gopd/get on them, collecting into a fresh map.
+    pub(crate) fn copy_data_properties_rest(
+        &mut self,
+        src: Value,
+        excluded: &[String],
+    ) -> Result<ObjMap, Thrown> {
+        let mut m = ObjMap::new();
+        if !src.is_heap() {
+            return Ok(m);
+        }
+        // A string source spreads as index → char.
+        if matches!(self.heap.get(src.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
+            let chars: Vec<char> =
+                self.heap.str_cow(src.heap_index()).unwrap().chars().collect();
+            for (i, c) in chars.into_iter().enumerate() {
+                let k = i.to_string();
+                if excluded.iter().any(|e| *e == k) {
+                    continue;
+                }
+                let v = self.alloc_str(c.to_string());
+                m.set(&k, v);
+            }
+            return Ok(m);
+        }
+        let keys_v = self.object_own_keys(src)?;
+        let keys: Vec<Value> = match self.heap.get(keys_v.heap_index()) {
+            HeapObj::Array(a) => a.clone(),
+            _ => Vec::new(),
+        };
+        for k in keys {
+            let ks = self.key_of(k);
+            if excluded.iter().any(|e| *e == ks) {
+                continue;
+            }
+            let desc = match self.proxy_gopd(src, &ks)? {
+                Some(d) => d,
+                None => self.object_get_own_property_descriptor(src, &ks),
+            };
+            if desc.is_undefined() {
+                continue;
+            }
+            let en = self.get_prop(desc, "enumerable")?;
+            if !self.truthy(en) {
+                continue;
+            }
+            let v = self.get_member(src, &ks, src)?;
+            m.set(&ks, v);
+        }
+        Ok(m)
+    }
+
     /// `Array.from(src[, mapFn])`: build an array from an array, a string's
     /// chars, or an array-like (`{length, 0:…}`), applying `mapFn(value, index)`
     /// when it is a function.

@@ -3290,6 +3290,7 @@ impl<'a> FnCompiler<'a> {
             ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
             ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
             ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
+                                ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
             _ => return Err("unsupported destructuring property key".into()),
         };
         let nidx = self.string_name(&name);
@@ -6376,6 +6377,7 @@ impl<'a> FnCompiler<'a> {
                                 ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                                 ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
                                 ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
+                                ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
                                 _ => return Err("unsupported accessor key in the zipp-vm subset".into()),
                             };
                             let kr = self.alloc_reg();
@@ -6409,9 +6411,15 @@ impl<'a> FnCompiler<'a> {
                             prefix: if is_setter { 2 } else { 1 },
                         });
                     } else if p.computed {
-                        // Computed key `{[expr]: v}` → SetIndex.
+                        // Computed key `{[expr]: v}` → CreateDataProperty with a
+                        // runtime key: ToPropertyKey runs BEFORE the value
+                        // evaluates (its coercion side effects order first), and
+                        // a computed "__proto__" defines an ORDINARY own
+                        // property (only the textual colon form sets the proto).
                         let ke = p.key.as_expression().ok_or("unsupported computed object key")?;
-                        let key = self.expr(ke)?;
+                        let raw = self.expr(ke)?;
+                        let key = self.alloc_reg();
+                        self.emit(Instr::ToPropKey { dst: key, obj: dst, src: raw });
                         // A computed concise method gets a [[HomeObject]] (for super).
                         if p.method {
                             self.cx.obj_method_super = true;
@@ -6434,7 +6442,7 @@ impl<'a> FnCompiler<'a> {
                         if is_anonymous_fn_def(&p.value) {
                             self.emit(Instr::SetFnNameFromKey { func: v, key, prefix: 0 });
                         }
-                        self.emit(Instr::SetIndex { obj: dst, key, val: v });
+                        self.emit(Instr::InitDataPropDyn { obj: dst, key, val: v });
                         if p.method {
                             self.emit(Instr::SetHomeObject { method: v, home: dst });
                         }
@@ -6444,6 +6452,7 @@ impl<'a> FnCompiler<'a> {
                             ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                             ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
                             ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
+                                ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
                             _ => return Err("unsupported object key in the zipp-vm subset".into()),
                         };
                         let name = self.string_name(&key);
@@ -6457,7 +6466,7 @@ impl<'a> FnCompiler<'a> {
                         if p.method {
                             self.cx.obj_method_super = true;
                         }
-                        let v = if key == "__proto__" && !p.method {
+                        let v = if key == "__proto__" && !p.method && !p.shorthand {
                             self.expr_into(&p.value, vtmp)?
                         } else {
                             self.compile_named_init(vtmp, &p.value, &key)?
@@ -6473,10 +6482,12 @@ impl<'a> FnCompiler<'a> {
                                 self.cx.src_slice(p.span.start, p.span.end);
                             self.cx.functions[fid].non_constructable = true; // concise method
                         }
-                        // `{ __proto__: v }` (colon form) sets the prototype — a real
-                        // [[Set]]/proto-setter; every other key is CreateDataProperty,
-                        // which must ignore an inherited accessor / non-writable prop.
-                        if key == "__proto__" && !p.method {
+                        // `{ __proto__: v }` (colon form ONLY — shorthand
+                        // `{ __proto__ }` is an ordinary data property) sets the
+                        // prototype — a real [[Set]]/proto-setter; every other
+                        // key is CreateDataProperty, which must ignore an
+                        // inherited accessor / non-writable prop.
+                        if key == "__proto__" && !p.method && !p.shorthand {
                             self.emit(Instr::SetProp { obj: dst, name, val: v });
                         } else {
                             self.emit(Instr::InitDataProp { obj: dst, name, val: v });
@@ -9415,6 +9426,8 @@ fn class_key_name(key: &ox::PropertyKey) -> R<String> {
         ox::PropertyKey::StaticIdentifier(id) => Ok(id.name.to_string()),
         ox::PropertyKey::StringLiteral(s) => Ok(s.value.to_string()),
         ox::PropertyKey::NumericLiteral(n) => Ok(fmt_key_num(n.value)),
+        // A BigInt key's property name is its base-10 value string.
+        ox::PropertyKey::BigIntLiteral(b) => Ok(b.value.to_string()),
         // A private member `#x`: keyed by "#x" (a reserved property name; the
         // engine does not enforce true hard privacy, but `this.#x` works).
         ox::PropertyKey::PrivateIdentifier(id) => Ok(private_key(&id.name)),
