@@ -7616,9 +7616,14 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
         let done = self.alloc_reg();
         self.emit(Instr::LoadBool { dst: done, val: false });
-        let exc = self.alloc_reg();
+        // FINALLY-kind protection (not catch): a `yield` inside the pattern
+        // can suspend the generator with this iterator OPEN — a later
+        // `.return()` injects a RETURN completion that unwinds through
+        // finally handlers only, and IteratorClose must run then too.
+        let kind_reg = self.alloc_reg();
+        let val_reg = self.alloc_reg();
         let push_at = self.here();
-        self.emit(Instr::PushHandler { catch_target: 0, catch_reg: exc });
+        self.emit(Instr::PushFinally { target: 0, kind_reg, val_reg });
         self.handler_depth += 1;
         for el in &arr.elements {
             let save = self.next_reg;
@@ -7689,7 +7694,7 @@ impl<'a> FnCompiler<'a> {
             }
             self.next_reg = save;
         }
-        self.emit(Instr::PopHandler);
+        self.emit(Instr::PopFinally);
         self.handler_depth -= 1;
         // Normal completion: close iff not exhausted (strict result checks).
         let jskip = self.here();
@@ -7697,17 +7702,34 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::IterClose { iter: iter_reg });
         let jend = self.here();
         self.emit(Instr::Jump { target: 0 });
-        // Abrupt: close quietly (the original throw is preserved), re-raise.
-        let catch_start = self.here();
-        if let Instr::PushHandler { catch_target, .. } = &mut self.code[push_at as usize] {
-            *catch_target = catch_start;
+        // ABRUPT exits land here (a throw from the pattern, or a RETURN
+        // completion unwinding through a `yield` inside it). Exhausted /
+        // iterator-own abrupts skip the close; a THROW closes QUIETLY (the
+        // original reason wins); a return closes STRICTLY (IteratorClose's
+        // own throw / non-object TypeError replaces the completion).
+        // EndFinally then resumes whatever completion remains pending.
+        let fin_start = self.here();
+        if let Instr::PushFinally { target, .. } = &mut self.code[push_at as usize] {
+            *target = fin_start;
         }
-        let jskip2 = self.here();
+        let jresume = self.here();
         self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+        let two = self.alloc_reg();
+        self.emit(Instr::LoadInt { dst: two, val: 2 });
+        let isthrow = self.alloc_reg();
+        self.emit(Instr::Eq { dst: isthrow, a: kind_reg, b: two });
+        let jnotthrow = self.here();
+        self.emit(Instr::JumpIfFalse { cond: isthrow, target: 0 });
         self.emit(Instr::IterCloseQuiet { iter: iter_reg });
-        let rethrow = self.here();
-        self.patch_jump(jskip2, rethrow);
-        self.emit(Instr::Throw { src: exc });
+        let jresume2 = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let at_ret = self.here();
+        self.patch_jump(jnotthrow, at_ret);
+        self.emit(Instr::IterClose { iter: iter_reg });
+        let resume = self.here();
+        self.patch_jump(jresume, resume);
+        self.patch_jump(jresume2, resume);
+        self.emit(Instr::EndFinally { kind_reg, val_reg });
         let end = self.here();
         self.patch_jump(jskip, end);
         self.patch_jump(jend, end);
