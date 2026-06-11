@@ -8759,6 +8759,23 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
             }
+            // Direct `eval(...args)`: a spread call of the unshadowed global
+            // `eval` is STILL a direct eval — the spread list's first element
+            // is the code argument (extras are ignored, like eval(a, b)).
+            if let ox::Expression::Identifier(id) = &c.callee {
+                if id.name == "eval"
+                    && matches!(self.resolve("eval"), Binding::Global(_))
+                    && self.with_objs_for("eval").is_empty()
+                {
+                    let args_arr = self.build_spread_args(&c.arguments)?;
+                    let arg = self.alloc_reg();
+                    let zero = self.alloc_reg();
+                    self.emit(Instr::LoadInt { dst: zero, val: 0 });
+                    self.emit(Instr::GetIndex { dst: arg, obj: args_arr, key: zero });
+                    self.emit_direct_eval(arg, dst);
+                    return Ok(dst);
+                }
+            }
             // `super.m(...args)` — a StaticMemberExpression whose object is `super`
             // (which is not a value, so it must be handled before the generic
             // StaticMember case evaluates the object).
@@ -8862,75 +8879,7 @@ impl<'a> FnCompiler<'a> {
                 } else {
                     arg_base
                 };
-                // The visible caller bindings (boxed cells, innermost shadowing
-                // first) — the eval program closes over them. An EVAL ROOT also
-                // maps its own cell locals AND its seeded caller upvalues (kind
-                // 1), so nested evals keep reaching the original caller scope.
-                let eval_root = self.is_script && self.cx.eval_locals;
-                let site = if self.box_all_locals || eval_root {
-                    let mut map: Vec<(String, u8, u16)> = Vec::new();
-                    let mut seen = std::collections::HashSet::new();
-                    for scope in self.scopes.iter().rev() {
-                        for (n, r) in scope.iter().rev() {
-                            if self.cell_regs.contains(r) && seen.insert(n.clone()) {
-                                map.push((n.clone(), 0u8, *r));
-                            }
-                        }
-                    }
-                    if let Some((n, r)) = self.self_name.clone() {
-                        if self.cell_regs.contains(&r) && seen.insert(n.clone()) {
-                            map.push((n, 0u8, r));
-                        }
-                    }
-                    if eval_root {
-                        let ups: Vec<String> =
-                            self.upvalues.borrow().iter().map(|(n, _)| n.clone()).collect();
-                        for (i, n) in ups.iter().enumerate() {
-                            if seen.insert(n.clone()) {
-                                map.push((n.clone(), 1u8, i as u16));
-                            }
-                        }
-                    }
-                    // In a parameter default, the eval's sloppy var/function
-                    // names may not collide with the PARAM scope (the params
-                    // and, for non-arrows, the implicit `arguments`).
-                    let param_collisions = if self.in_param_init {
-                        let mut names = self.param_names.clone();
-                        if self.arguments_reg.is_some()
-                            && !names.iter().any(|n| n == "arguments")
-                        {
-                            names.push("arguments".to_string());
-                        }
-                        Some(names)
-                    } else {
-                        None
-                    };
-                    let s = self.eval_sites.len() as u16;
-                    self.eval_sites.push((map, param_collisions));
-                    s
-                } else {
-                    u16::MAX
-                };
-                // The effective `this` to inherit: a static field initializer holds
-                // it in `this_override`, otherwise it is reg 0.
-                let this_reg = self.this_override.unwrap_or(0);
-                self.emit(Instr::DirectEval {
-                    dst,
-                    arg,
-                    new_target_ok: self.cx.new_target_ok,
-                    this_reg,
-                    home_class: self.super_class.unwrap_or(u32::MAX),
-                    super_static: self.super_static,
-                    ban_arguments: self.cx.in_field_init,
-                    strict_caller: self.cx.in_strict,
-                    super_home_obj: self.super_home_obj,
-                    // The eval's variable environment: GLOBAL only when the
-                    // call site is the script top level (a function/arrow/param
-                    // context keeps the old slot behavior until the dynamic
-                    // caller-env lands).
-                    var_env_is_global: self.is_script,
-                    site,
-                });
+                self.emit_direct_eval(arg, dst);
                 return Ok(dst);
             }
         }
@@ -9310,6 +9259,80 @@ impl<'a> FnCompiler<'a> {
     /// NOT land inside the still-unfilled argument slots. So we reserve the
     /// whole block first (bumping `next_reg` past it), which forces per-arg
     /// temps to allocate ABOVE the block; we then reclaim them after each arg.
+    /// Emit the `DirectEval` op for a direct `eval(<arg>)` call site:
+    /// builds the visible-caller-bindings site map and the instruction.
+    fn emit_direct_eval(&mut self, arg: Reg, dst: Reg) {
+                // The visible caller bindings (boxed cells, innermost shadowing
+        // first) — the eval program closes over them. An EVAL ROOT also
+        // maps its own cell locals AND its seeded caller upvalues (kind
+        // 1), so nested evals keep reaching the original caller scope.
+        let eval_root = self.is_script && self.cx.eval_locals;
+        let site = if self.box_all_locals || eval_root {
+            let mut map: Vec<(String, u8, u16)> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for scope in self.scopes.iter().rev() {
+                for (n, r) in scope.iter().rev() {
+                    if self.cell_regs.contains(r) && seen.insert(n.clone()) {
+                        map.push((n.clone(), 0u8, *r));
+                    }
+                }
+            }
+            if let Some((n, r)) = self.self_name.clone() {
+                if self.cell_regs.contains(&r) && seen.insert(n.clone()) {
+                    map.push((n, 0u8, r));
+                }
+            }
+            if eval_root {
+                let ups: Vec<String> =
+                    self.upvalues.borrow().iter().map(|(n, _)| n.clone()).collect();
+                for (i, n) in ups.iter().enumerate() {
+                    if seen.insert(n.clone()) {
+                        map.push((n.clone(), 1u8, i as u16));
+                    }
+                }
+            }
+            // In a parameter default, the eval's sloppy var/function
+            // names may not collide with the PARAM scope (the params
+            // and, for non-arrows, the implicit `arguments`).
+            let param_collisions = if self.in_param_init {
+                let mut names = self.param_names.clone();
+                if self.arguments_reg.is_some()
+                    && !names.iter().any(|n| n == "arguments")
+                {
+                    names.push("arguments".to_string());
+                }
+                Some(names)
+            } else {
+                None
+            };
+            let s = self.eval_sites.len() as u16;
+            self.eval_sites.push((map, param_collisions));
+            s
+        } else {
+            u16::MAX
+        };
+        // The effective `this` to inherit: a static field initializer holds
+        // it in `this_override`, otherwise it is reg 0.
+        let this_reg = self.this_override.unwrap_or(0);
+        self.emit(Instr::DirectEval {
+            dst,
+            arg,
+            new_target_ok: self.cx.new_target_ok,
+            this_reg,
+            home_class: self.super_class.unwrap_or(u32::MAX),
+            super_static: self.super_static,
+            ban_arguments: self.cx.in_field_init,
+            strict_caller: self.cx.in_strict,
+            super_home_obj: self.super_home_obj,
+            // The eval's variable environment: GLOBAL only when the
+            // call site is the script top level (a function/arrow/param
+            // context keeps the old slot behavior until the dynamic
+            // caller-env lands).
+            var_env_is_global: self.is_script,
+            site,
+        });
+    }
+
     fn eval_args_contiguous(
         &mut self,
         args: &oxc_allocator::Vec<ox::Argument>,
