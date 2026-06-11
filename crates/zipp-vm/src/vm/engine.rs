@@ -121,6 +121,7 @@ impl<'p> Vm<'p> {
             can_block: std::env::var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             module_loading: std::collections::HashSet::new(),
             pending_module_body: None,
+            module_body_promise: std::collections::HashMap::new(),
             link_pending_deps: Vec::new(),
             deferred_ns_cache: std::collections::HashMap::new(),
             deferred_ns_state: std::collections::HashMap::new(),
@@ -1386,6 +1387,26 @@ impl<'p> Vm<'p> {
         }
         if mtype.is_none() {
             if let Some(&ns) = self.module_cache.get(&path) {
+                // A cached module that SUSPENDED (top-level await): later
+                // importers settle from the same body promise — never from
+                // the incomplete namespace directly.
+                if let Some(&bp) = self.module_body_promise.get(&path) {
+                    let pending = bp.is_heap()
+                        && matches!(
+                            self.heap.get(bp.heap_index()),
+                            HeapObj::Promise {
+                                state: crate::heap::PromiseState::Pending,
+                                ..
+                            }
+                        );
+                    // NOT for a SELF-import from the module's own (still
+                    // executing) body: chaining its import promise on its own
+                    // body promise is a deadlock cycle — the spec resolves a
+                    // self-import against the in-progress record directly.
+                    if pending && !self.executing_modules.contains(&path) {
+                        self.pending_module_body = Some(bp);
+                    }
+                }
                 return Ok(ns);
             }
         }
@@ -1803,6 +1824,7 @@ impl<'p> Vm<'p> {
                         self.then_internal(bp.heap_index(), on_ok, on_fail, None);
                     }
                     self.pending_module_body = Some(Value::heap(cap));
+                    self.module_body_promise.insert(path.clone(), Value::heap(cap));
                     return {
                         self.module_own.remove(&path);
                         self.module_pending_reexports.remove(&path);
@@ -1855,6 +1877,15 @@ impl<'p> Vm<'p> {
                             }
                             Some((crate::heap::PromiseState::Pending, _)) => {
                                 self.pending_module_body = Some(v);
+                                // Register for late importers ONLY when the
+                                // suspension is a REAL top-level await. A body
+                                // can also suspend at its own dynamic-import
+                                // ops — chaining a self-import on that body
+                                // promise is a deadlock cycle (the resumption
+                                // depends on the import it would wait for).
+                                if self.module_has_tla(&path) {
+                                    self.module_body_promise.insert(path.clone(), v);
+                                }
                                 Ok((full2, ambiguous))
                             }
                             _ => Ok((full2, ambiguous)),

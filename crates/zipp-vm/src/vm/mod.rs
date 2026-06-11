@@ -517,6 +517,13 @@ pub struct Vm<'p> {
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep.
     error_data: std::collections::HashSet<u32>,
+    /// Body promises of modules whose evaluation SUSPENDED (top-level await,
+    /// or deps still pending): canonical path → the promise importers settle
+    /// from. A LATER import of the same module (its namespace is already
+    /// cached) re-publishes this as pending_module_body so the new importer
+    /// chains on the SAME TopLevelCapability instead of resolving with the
+    /// incomplete namespace. Entries persist after settlement.
+    module_body_promise: std::collections::HashMap<std::path::PathBuf, Value>,
     /// Typed-module cache: (canonical path, type attribute) → namespace for
     /// `with { type: "json" | "text" }` imports — DISTINCT records from the
     /// same file's JS module. Values are GC roots like module_cache.
