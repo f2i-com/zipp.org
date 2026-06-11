@@ -950,8 +950,9 @@ impl<'p> Vm<'p> {
         }
         if ci == self.weakref_ctor && ci != 0 {
             let t = args.first().copied().unwrap_or(Value::UNDEFINED);
-            if !self.is_object_value(t) {
-                return Err(Thrown("TypeError: WeakRef: target must be an object".into()));
+            // CanBeHeldWeakly: any object, or a non-registered Symbol.
+            if !self.can_be_held_weakly(t) {
+                return Err(Thrown("TypeError: WeakRef: target cannot be held weakly".into()));
             }
             let over = self.newtarget_proto_override(new_target, cv, self.weakref_proto)?;
             let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));

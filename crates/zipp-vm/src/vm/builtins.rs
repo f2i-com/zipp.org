@@ -1918,20 +1918,21 @@ impl<'p> Vm<'p> {
             "register" => {
                 let held = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let token = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: FinalizationRegistry.register: target must be an object".into()));
+                // CanBeHeldWeakly: any object, or a non-registered Symbol.
+                if !self.can_be_held_weakly(a0) {
+                    return Err(Thrown("TypeError: FinalizationRegistry.register: target cannot be held weakly".into()));
                 }
                 if self.same_value(a0, held) {
                     return Err(Thrown(
                         "TypeError: FinalizationRegistry.register: target and held value must not be the same".into(),
                     ));
                 }
-                if token != Value::UNDEFINED && !self.is_object_value(token) {
+                if token != Value::UNDEFINED && !self.can_be_held_weakly(token) {
                     return Err(Thrown(
-                        "TypeError: FinalizationRegistry.register: unregister token must be an object".into(),
+                        "TypeError: FinalizationRegistry.register: unregister token cannot be held weakly".into(),
                     ));
                 }
-                if self.is_object_value(token) {
+                if token != Value::UNDEFINED {
                     if let HeapObj::FinalizationRegistry { tokens, .. } = self.heap.get_mut(idx) {
                         tokens.push(token);
                     }
@@ -1939,9 +1940,9 @@ impl<'p> Vm<'p> {
                 Ok(Value::UNDEFINED)
             }
             "unregister" => {
-                if !self.is_object_value(a0) {
+                if !self.can_be_held_weakly(a0) {
                     return Err(Thrown(
-                        "TypeError: FinalizationRegistry.unregister: token must be an object".into(),
+                        "TypeError: FinalizationRegistry.unregister: token cannot be held weakly".into(),
                     ));
                 }
                 let mut removed = false;

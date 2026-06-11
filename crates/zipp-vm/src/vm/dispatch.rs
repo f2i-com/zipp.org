@@ -1801,9 +1801,10 @@ impl<'p> Vm<'p> {
                     }
                     Instr::NewWeakRef { dst, target } => {
                         let t = self.get(base, target);
-                        if !self.is_object_value(t) {
+                        // CanBeHeldWeakly: any object, or a non-registered Symbol.
+                        if !self.can_be_held_weakly(t) {
                             return Err(Thrown(
-                                "TypeError: WeakRef: target must be an object".into(),
+                                "TypeError: WeakRef: target cannot be held weakly".into(),
                             ));
                         }
                         let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));
