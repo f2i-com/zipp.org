@@ -260,6 +260,12 @@ impl<'p> Vm<'p> {
         if matches!(self.heap.get(v.heap_index()), HeapObj::Symbol { .. }) {
             return Err(Thrown("TypeError: Cannot convert a Symbol value to a string".into()));
         }
+        // ToString(bigint) is BigIntToString - direct and unobservable (the
+        // user-patchable BigInt.prototype.toString must NOT run for a
+        // primitive BigInt; only a Boxed BigInt object takes the protocol).
+        if let HeapObj::BigInt(b) = self.heap.get(v.heap_index()) {
+            return Ok(b.to_string());
+        }
         // ToString(object) is ToPrimitive(input, "string") then a string coercion;
         // honour a `@@toPrimitive` hook before falling back to toString/valueOf.
         if let Some(p) = self.symbol_to_primitive(v, "string")? {
@@ -939,6 +945,24 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// `ToIntegerOrInfinity(v)` like `to_integer_or_zero`, but via the STRICT
+    /// ToNumber (a BigInt or Symbol argument is a TypeError, per spec) - for
+    /// String.prototype position/count arguments.
+    pub(crate) fn to_integer_strict(&mut self, v: Value) -> Result<i64, Thrown> {
+        let n = self.to_number_strict(v)?;
+        if n.is_nan() {
+            return Ok(0);
+        }
+        let t = n.trunc();
+        Ok(if t >= i64::MAX as f64 {
+            i64::MAX
+        } else if t <= i64::MIN as f64 {
+            i64::MIN
+        } else {
+            t as i64
+        })
+    }
+
     /// ToIndex(v) (ES 7.1.22): ToIntegerOrInfinity, then a RangeError if the
     /// result is negative or exceeds 2^53-1. `undefined` → 0. Backs the
     /// byteOffset/length arguments of the TypedArray/DataView constructors, so
@@ -1025,9 +1049,18 @@ impl<'p> Vm<'p> {
                     | HeapObj::Cons { .. }
                     | HeapObj::BigInt(_)
                     | HeapObj::Symbol { .. }
-                    | HeapObj::Boxed { .. }
             )
         {
+            return Ok(None);
+        }
+        // A Boxed SYMBOL finds Symbol.prototype[@@toPrimitive], which returns
+        // the wrapped symbol (so ToString(Object(sym)) THROWS instead of
+        // calling Symbol.prototype.toString). Other Boxed kinds have no
+        // @@toPrimitive on their prototype chains - no hook.
+        if let HeapObj::Boxed { kind, value } = self.heap.get(v.heap_index()) {
+            if *kind == 3 {
+                return Ok(Some(*value));
+            }
             return Ok(None);
         }
         // GetMethod(v, @@toPrimitive): undefined/null → no hook (None); a

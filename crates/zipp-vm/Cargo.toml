@@ -13,6 +13,7 @@ oxc_span = "0.126.0"
 oxc_syntax = "0.126.0"
 rustc-hash = { workspace = true }
 regress = "0.11"
+unicode-normalization = "0.1"
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
 

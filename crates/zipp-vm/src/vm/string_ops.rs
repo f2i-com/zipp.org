@@ -136,7 +136,7 @@ impl<'p> Vm<'p> {
         // per-char loop — `s.charCodeAt(i)` scanning is a very common idiom).
         match name {
             "charCodeAt" => {
-                let i = self.to_integer_or_zero(arg0)?;
+                let i = self.to_integer_strict(arg0)?;
                 let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
                 return Ok(Some(match c {
                     Some(c) => Value::int(c as i32),
@@ -144,7 +144,7 @@ impl<'p> Vm<'p> {
                 }));
             }
             "codePointAt" => {
-                let i = self.to_integer_or_zero(arg0)?;
+                let i = self.to_integer_strict(arg0)?;
                 let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
                 return Ok(Some(match c {
                     Some(c) => Value::int(c as i32),
@@ -152,13 +152,13 @@ impl<'p> Vm<'p> {
                 }));
             }
             "charAt" => {
-                let i = self.to_integer_or_zero(arg0)?;
+                let i = self.to_integer_strict(arg0)?;
                 let c = if i >= 0 { self.heap_char_at(idx, i as usize) } else { None };
                 return Ok(Some(self.alloc_str(c.map(|c| c.to_string()).unwrap_or_default())));
             }
             "at" => {
                 let len = self.heap_char_len(idx) as i64;
-                let i = self.to_integer_or_zero(arg0)?;
+                let i = self.to_integer_strict(arg0)?;
                 let abs = if i < 0 { i + len } else { i };
                 let c = if abs >= 0 && abs < len { self.heap_char_at(idx, abs as usize) } else { None };
                 return Ok(Some(match c {
@@ -187,7 +187,7 @@ impl<'p> Vm<'p> {
                 let needle = self.to_js_string(arg0)?;
                 // Optional fromIndex (ToInteger, a char position) to start at.
                 let from = if args.len() >= 2 {
-                    self.to_integer_or_zero(args[1])?.max(0) as usize
+                    self.to_integer_strict(args[1])?.max(0) as usize
                 } else {
                     0
                 };
@@ -207,7 +207,7 @@ impl<'p> Vm<'p> {
                 let needle = self.to_js_string(arg0)?;
                 let len = char_len(&s) as i64;
                 let pos = if args.len() >= 2 {
-                    self.to_integer_or_zero(args[1])?.clamp(0, len)
+                    self.to_integer_strict(args[1])?.clamp(0, len)
                 } else {
                     0
                 } as usize;
@@ -222,13 +222,13 @@ impl<'p> Vm<'p> {
                 // would wrap Infinity to -1).
                 let len = char_len(&s) as i64;
                 let norm = |i: i64| if i < 0 { len.saturating_add(i).max(0) } else { i.min(len) };
-                let start = if args.is_empty() { 0 } else { norm(self.to_integer_or_zero(arg0)?) };
+                let start = if args.is_empty() { 0 } else { norm(self.to_integer_strict(arg0)?) };
                 // An absent OR explicitly-`undefined` end defaults to the string
                 // length (ToIntegerOrInfinity is only applied to a defined end).
                 let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
                     len
                 } else {
-                    norm(self.to_integer_or_zero(args[1])?)
+                    norm(self.to_integer_strict(args[1])?)
                 };
                 let out: String = if start < end {
                     s.chars().skip(start as usize).take((end - start) as usize).collect()
@@ -241,12 +241,12 @@ impl<'p> Vm<'p> {
                 // Each index clamps to [0,len] (negatives -> 0), then start/end swap
                 // so start <= end (distinct from slice's negative-from-end mapping).
                 let len = char_len(&s) as i64;
-                let s0 = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)?.clamp(0, len) };
+                let s0 = if args.is_empty() { 0 } else { self.to_integer_strict(arg0)?.clamp(0, len) };
                 // An absent OR explicitly-`undefined` end defaults to the length.
                 let e0 = if args.len() < 2 || args[1] == Value::UNDEFINED {
                     len
                 } else {
-                    self.to_integer_or_zero(args[1])?.clamp(0, len)
+                    self.to_integer_strict(args[1])?.clamp(0, len)
                 };
                 let (from, to) = if s0 <= e0 { (s0, e0) } else { (e0, s0) };
                 let out: String = s.chars().skip(from as usize).take((to - from) as usize).collect();
@@ -414,7 +414,7 @@ impl<'p> Vm<'p> {
                 let needle = self.to_js_string(arg0)?;
                 let len = char_len(&s) as i64;
                 let pos =
-                    if args.len() >= 2 { self.to_integer_or_zero(args[1])?.clamp(0, len) } else { 0 }
+                    if args.len() >= 2 { self.to_integer_strict(args[1])?.clamp(0, len) } else { 0 }
                         as usize;
                 let byte = s.char_indices().nth(pos).map(|(b, _)| b).unwrap_or(s.len());
                 Ok(Some(Value::bool(s[byte..].starts_with(&needle))))
@@ -428,7 +428,7 @@ impl<'p> Vm<'p> {
                 let needle = self.to_js_string(arg0)?;
                 let len = char_len(&s) as i64;
                 let end = if args.len() >= 2 && args[1] != Value::UNDEFINED {
-                    self.to_integer_or_zero(args[1])?.clamp(0, len)
+                    self.to_integer_strict(args[1])?.clamp(0, len)
                 } else {
                     len
                 } as usize;
@@ -449,7 +449,7 @@ impl<'p> Vm<'p> {
                 // Legacy substr(start, length); negative start counts from the end.
                 let chars: Vec<char> = s.chars().collect();
                 let len = chars.len() as i64;
-                let mut start = if args.is_empty() { 0 } else { self.to_integer_or_zero(arg0)? };
+                let mut start = if args.is_empty() { 0 } else { self.to_integer_strict(arg0)? };
                 if start < 0 {
                     start = (len + start).max(0);
                 }
@@ -458,16 +458,21 @@ impl<'p> Vm<'p> {
                 let count = if args.len() < 2 || args[1] == Value::UNDEFINED {
                     avail
                 } else {
-                    let c = self.to_integer_or_zero(args[1])?;
+                    let c = self.to_integer_strict(args[1])?;
                     if c < 0 { 0 } else { (c as usize).min(avail) }
                 };
                 let sub: String = chars[start..start + count].iter().collect();
                 Ok(Some(self.alloc_str(sub)))
             }
             "localeCompare" => {
-                // No Intl: a code-unit ordinal comparison (the default approximation).
-                let other = self.display(arg0);
-                let ord = match s.as_str().cmp(other.as_str()) {
+                // No full Intl collation, but canonically-equivalent strings
+                // MUST compare equal (spec: the comparison honors canonical
+                // equivalence) - compare NFC normal forms.
+                use unicode_normalization::UnicodeNormalization;
+                let other = self.to_js_string(arg0)?;
+                let a: String = s.nfc().collect();
+                let b: String = other.nfc().collect();
+                let ord = match a.cmp(&b) {
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
@@ -491,7 +496,14 @@ impl<'p> Vm<'p> {
                         "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.".into(),
                     ));
                 }
-                Ok(Some(self.alloc_str(s.clone())))
+                use unicode_normalization::UnicodeNormalization;
+                let out: String = match form.as_str() {
+                    "NFC" => s.nfc().collect(),
+                    "NFD" => s.nfd().collect(),
+                    "NFKC" => s.nfkc().collect(),
+                    _ => s.nfkd().collect(),
+                };
+                Ok(Some(self.alloc_str(out)))
             }
             // Engine strings are valid UTF-8 (no lone surrogates), so always well-formed.
             "isWellFormed" => Ok(Some(Value::bool(true))),
@@ -501,7 +513,7 @@ impl<'p> Vm<'p> {
             "valueOf" | "toString" => Ok(Some(Value::heap(idx))),
             "padStart" | "padEnd" => {
                 let cur = char_len(&s);
-                let t = self.to_integer_or_zero(arg0)?;
+                let t = self.to_integer_strict(arg0)?;
                 let target = if t > 0 { t as usize } else { 0 };
                 if target as u64 > (1u64 << 28) {
                     return Err(Thrown("RangeError: Invalid string length".into()));
