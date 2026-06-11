@@ -776,6 +776,27 @@ pub struct Vm<'p> {
     shadowrealm_ctor: u32,
     shadowrealm_proto: u32,
     shadow_realms: std::collections::HashSet<u32>,
+    /// Callable created by a ShadowRealm's `evaluate` → its realm INSTANCE heap
+    /// idx. A WrappedFunction call switches `active_realm` to the target's
+    /// realm so `globalThis.x` in its body binds the realm's slots at CALL time
+    /// (not just during `evaluate`). u32→u32 (no Values); gc.rs roots the realm
+    /// instances and retains live keys.
+    shadow_fn_realm: std::collections::HashMap<u32, u32>,
+    /// `%AbstractModuleSource%` ctor + prototype (source-phase-imports proposal).
+    /// Reached via `$262.AbstractModuleSource`; the ctor always throws when
+    /// called/constructed and the prototype carries the @@toStringTag accessor.
+    abstractmodulesource_ctor: u32,
+    abstractmodulesource_proto: u32,
+    /// CreateResolvingFunctions [[AlreadyResolved]] records: `resolver_pair_next`
+    /// hands out fresh pair ids; a pair id enters `resolved_pairs` the first time
+    /// either function of the pair fires (ids only — no `Value`s, GC-inert).
+    resolver_pair_next: u32,
+    resolved_pairs: std::collections::HashSet<u32>,
+    /// The intrinsic %Promise% constructor and %Promise.prototype.then% heap
+    /// indices (the objects built in setup_globals), independent of later
+    /// patches — identity anchors for the adoption fast-path check.
+    promise_ctor_intrinsic: u32,
+    promise_then_intrinsic: u32,
     /// `$262.createRealm()` realm registry. `realms[r]` maps a MAIN-realm intrinsic
     /// prototype heap index to realm `r`'s corresponding prototype (realm 0 = the
     /// main realm, an empty map). `obj_realm` tags a heap index (a realm's

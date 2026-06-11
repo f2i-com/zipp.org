@@ -56,6 +56,40 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// True when `String.prototype.replace`'s internal regex fast path is
+    /// UNOBSERVABLE for instance `re`: its [[Prototype]] is exactly
+    /// %RegExp.prototype%, it has no own exec/flags/@@replace overrides, and
+    /// the prototype's `exec` / `@@replace` are still the intrinsic natives.
+    /// Anything else (a subclass instance, a patched prototype) must run the
+    /// full observable @@replace protocol.
+    pub(crate) fn regexp_replace_fast_ok(&self, re: u32) -> bool {
+        match self.proto_of.get(&re) {
+            None => {}
+            Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
+            _ => return false,
+        }
+        if self.arr_props.get(&re).is_some_and(|m| {
+            m.pos("exec").is_some() || m.pos("flags").is_some() || m.pos("@@replace").is_some()
+        }) {
+            return false;
+        }
+        match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => {
+                let intrinsic = |k: &str, id: u16| {
+                    m.pos(k).is_some_and(|i| {
+                        !m.attrs[i].accessor
+                            && m.vals[i].is_heap()
+                            && matches!(self.heap.get(m.vals[i].heap_index()),
+                                        HeapObj::Native(n) if *n == id)
+                    })
+                };
+                intrinsic("exec", native::REGEXP_EXEC)
+                    && intrinsic("@@replace", native::REGEXP_SYM_REPLACE)
+            }
+            _ => false,
+        }
+    }
+
     /// The heap index if `v` is a RegExp, else None.
     pub(crate) fn as_regexp(&self, v: Value) -> Option<u32> {
         if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::RegExp { .. }) {
@@ -385,17 +419,26 @@ impl<'p> Vm<'p> {
                     // Object(null) would return {}, but this is the internal op).
                     self.require_object_coercible(named_v)?;
                     let obj = self.to_object(named_v)?;
-                    let names_v = self.object_own_property_names(obj)?;
-                    let key_vals = self.array_snapshot(names_v.heap_index());
-                    let mut keys: Vec<String> = Vec::with_capacity(key_vals.len());
-                    for k in key_vals {
-                        keys.push(self.display(k));
-                    }
-                    let mut v = Vec::with_capacity(keys.len());
-                    for k in keys {
-                        let val = self.get_prop(obj, &k)?;
-                        let sv = if val == Value::UNDEFINED { None } else { Some(self.to_js_string(val)?) };
-                        v.push((k, sv));
+                    // GetSubstitution reads EXACTLY the template's `$<name>`
+                    // groups via Get — through the PROTOTYPE chain, so an
+                    // inherited group property resolves (groups-object-subclass)
+                    // and a missing one substitutes the empty string.
+                    let mut v: Vec<(String, Option<String>)> = Vec::new();
+                    let mut rest = replace_str.as_str();
+                    while let Some(p) = rest.find("$<") {
+                        rest = &rest[p + 2..];
+                        let Some(e) = rest.find('>') else { break };
+                        let name = rest[..e].to_string();
+                        rest = &rest[e + 1..];
+                        if !v.iter().any(|(n, _)| *n == name) {
+                            let val = self.get_prop(obj, &name)?;
+                            let sv = if val == Value::UNDEFINED {
+                                None
+                            } else {
+                                Some(self.to_js_string(val)?)
+                            };
+                            v.push((name, sv));
+                        }
                     }
                     v
                 } else {

@@ -342,7 +342,8 @@ impl<'p> Vm<'p> {
                 removed |= c.static_getters.len() != gl || c.static_setters.len() != sl;
                 removed
             }
-            // A function's assigned own property (`delete fn.x`).
+            // A function's assigned own property (`delete fn.x`) — the
+            // non-configurable case already returned false above.
             HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                 self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key))
             }
@@ -608,7 +609,19 @@ impl<'p> Vm<'p> {
         strict: bool,
     ) -> Result<bool, Thrown> {
         if !obj.is_heap() {
-            return Err(Thrown("TypeError: cannot set property of non-object".into()));
+            if obj.is_nullish() {
+                return Err(Thrown("TypeError: cannot set property of non-object".into()));
+            }
+            // PutValue 6.a: a PRIMITIVE base (number/boolean here; the heap
+            // primitives are routed below) is conceptually ToObject'd and the
+            // write runs OrdinarySet against the wrapper's prototype chain.
+            return self.primitive_base_set(obj, key, val, strict);
+        }
+        if matches!(
+            self.heap.get(obj.heap_index()),
+            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_)
+        ) {
+            return self.primitive_base_set(obj, key, val, strict);
         }
         // ShadowRealm evaluate: `globalThis.x = v` binds the REALM's x (the
         // same slot a bare `x` resolves to inside the realm).
@@ -1254,6 +1267,67 @@ impl<'p> Vm<'p> {
         Ok(true)
     }
 
+    /// PutValue step 6.a — `[[Set]]` with a PRIMITIVE base (`0..x = 1`,
+    /// `''.x = 1`, `true.x = 1`, `Symbol().x = 1`): base is conceptually
+    /// ToObject'd, so OrdinarySet walks the wrapper's PROTOTYPE chain with the
+    /// primitive as the receiver. An inherited setter/proxy-set fires; anything
+    /// that bottoms out in a data write fails — CreateDataProperty on a
+    /// non-object receiver returns false (sloppy no-op, strict TypeError).
+    fn primitive_base_set(
+        &mut self,
+        obj: Value,
+        key: &str,
+        val: Value,
+        strict: bool,
+    ) -> Result<bool, Thrown> {
+        // A string base: an in-range index / `length` is a NON-WRITABLE own
+        // data property of the wrapper — rejected before any proto walk.
+        if let Some((_, len)) = self.string_exotic_chars(obj) {
+            let own_str_prop = key == "length"
+                || key
+                    .parse::<usize>()
+                    .is_ok_and(|i| i.to_string() == key && i < len);
+            if own_str_prop {
+                return self.reject_write(key, strict);
+            }
+        }
+        // The wrapper prototype for the primitive's type, honoring the realm of
+        // the CURRENT execution context (active_realm_proto maps the main-realm
+        // intrinsic to the running child realm's image).
+        let main_proto = if obj.is_number() {
+            self.num_proto
+        } else if obj.is_bool() {
+            self.bool_proto
+        } else if obj.is_heap() {
+            match self.heap.get(obj.heap_index()) {
+                HeapObj::Str(_) | HeapObj::Cons { .. } => self.str_proto,
+                HeapObj::Symbol { .. } => self.symbol_proto,
+                HeapObj::BigInt(_) => self.bigint_proto,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        if main_proto == 0 {
+            return self.reject_write(key, strict);
+        }
+        let proto = self.active_realm_proto(main_proto);
+        match self.proto_chain_set_from(Value::heap(proto), key, val, obj)? {
+            ProtoSet::Setter(setter) => {
+                self.call_value(setter, obj, &[val])?;
+                Ok(true)
+            }
+            ProtoSet::Proxy(true) => Ok(true),
+            ProtoSet::Absorbed => Ok(true),
+            ProtoSet::GetterOnly | ProtoSet::Proxy(false) | ProtoSet::NonWritable => {
+                self.reject_write(key, strict)
+            }
+            // No inherited accessor/proxy: the own-data write on a primitive
+            // receiver fails (OrdinarySetWithOwnDescriptor step 2.c).
+            ProtoSet::DataWrite => self.reject_write(key, strict),
+        }
+    }
+
     /// Walk `start_idx`'s prototype-object chain for an own accessor named `key`,
     /// for the [[Set]] algorithm. Returns:
     /// * `Some(Some(setter))` — an accessor with a setter (invoke it);
@@ -1261,7 +1335,14 @@ impl<'p> Vm<'p> {
     /// * `None` — no accessor reached (a data property shadows / the chain ends),
     ///   so the caller writes an own data property.
     fn proto_chain_set(&mut self, start_idx: u32, key: &str, val: Value, receiver: Value) -> Result<ProtoSet, Thrown> {
-        let mut cur = self.object_get_prototype_of(Value::heap(start_idx));
+        let start = self.object_get_prototype_of(Value::heap(start_idx));
+        self.proto_chain_set_from(start, key, val, receiver)
+    }
+
+    /// `proto_chain_set` starting AT `cur` itself (inclusive) — the entry point
+    /// for a PRIMITIVE-base [[Set]], whose walk begins at the primitive's
+    /// wrapper prototype (the conceptual ToObject(base)'s [[Prototype]]).
+    fn proto_chain_set_from(&mut self, mut cur: Value, key: &str, val: Value, receiver: Value) -> Result<ProtoSet, Thrown> {
         for _ in 0..1000 {
             if !cur.is_heap() {
                 return Ok(ProtoSet::DataWrite);

@@ -6857,6 +6857,73 @@ impl<'a> FnCompiler<'a> {
         self.next_reg = save; // scratch temps dead after the check
     }
 
+    /// Lower a PARENTHESIZED-chain member callee — `(a?.b)(…)` / `(a?.[k])(…)`
+    /// — to `(callee, base)` registers so the call still binds `this` = base.
+    /// The chain ends at the parens: a nullish base lands the CALLEE at
+    /// undefined (its own bail boundary), and the call then throws (or an
+    /// outer `?.()` bails). Returns None for non-member chain elements
+    /// (call chains etc. — those stay value-calls).
+    fn chain_member_callee(&mut self, ce: &ox::ChainExpression) -> R<Option<(Reg, Reg)>> {
+        enum Kind<'a, 'x> {
+            Static(&'a ox::StaticMemberExpression<'x>),
+            Computed(&'a ox::ComputedMemberExpression<'x>),
+        }
+        let kind = match &ce.expression {
+            ox::ChainElement::StaticMemberExpression(m)
+                if !matches!(&m.object, ox::Expression::Super(_)) =>
+            {
+                Kind::Static(m)
+            }
+            ox::ChainElement::ComputedMemberExpression(m)
+                if !matches!(&m.object, ox::Expression::Super(_)) =>
+            {
+                Kind::Computed(m)
+            }
+            _ => return Ok(None),
+        };
+        self.chain_bails.push(Vec::new());
+        let res: R<(Reg, Reg)> = (|| {
+            let (object, optional) = match &kind {
+                Kind::Static(m) => (&m.object, m.optional),
+                Kind::Computed(m) => (&m.object, m.optional),
+            };
+            let o = self.expr(object)?;
+            let obj = self.alloc_reg();
+            if o != obj {
+                self.emit(Instr::Move { dst: obj, src: o });
+            }
+            if optional {
+                self.emit_optional_check(obj);
+            }
+            let callee = self.alloc_reg();
+            match &kind {
+                Kind::Static(m) => {
+                    let name = self.string_name(m.property.name.as_str());
+                    self.emit(Instr::GetProp { dst: callee, obj, name });
+                }
+                Kind::Computed(m) => {
+                    let key = self.expr(&m.expression)?;
+                    self.emit(Instr::GetIndex { dst: callee, obj, key });
+                }
+            }
+            Ok((callee, obj))
+        })();
+        let bails = self.chain_bails.pop().unwrap();
+        let (callee, obj) = res?;
+        if !bails.is_empty() {
+            let jmp = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            let undef_at = self.here();
+            self.emit(Instr::LoadUndefined { dst: callee });
+            let end = self.here();
+            self.patch_jump(jmp, end);
+            for b in bails {
+                self.patch_jump(b, undef_at);
+            }
+        }
+        Ok(Some((callee, obj)))
+    }
+
     /// Compile an optional chain `a?.b…`: open a short-circuit boundary, compile
     /// the chain element (its `?.` links record bail jumps), then route any
     /// short-circuit to a single `undefined` result.
@@ -7498,9 +7565,14 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             ox::Expression::ComputedMemberExpression(m) => {
-                // `delete super[expr]`: evaluate `expr` (its side effects + ToPropertyKey
-                // happen), then throw a ReferenceError — a super reference has no delete.
+                // `delete super[expr]`: SuperProperty evaluation does
+                // GetThisBinding BEFORE the key expression — in a derived ctor
+                // before super() that ReferenceError fires FIRST and `expr`
+                // never runs. Otherwise evaluate `expr` (side effects +
+                // ToPropertyKey), then throw a ReferenceError — a super
+                // reference has no delete.
                 if matches!(&m.object, ox::Expression::Super(_)) {
+                    self.this_check();
                     let _ = self.expr(&m.expression)?;
                     let e = self.alloc_reg();
                     self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
@@ -7535,25 +7607,43 @@ impl<'a> FnCompiler<'a> {
                 // A binding is non-configurable — `delete` yields `false` — when it is
                 // a local (param/`var`/`let`/`const`/function) or a DECLARED global
                 // `var`/`let`/`const`. A builtin, an implicitly-created global
-                // (`x = 1` with no declaration), or an unresolvable name is
-                // configurable / a no-op, so `delete` yields `true`.
+                // (`x = 1` with no declaration), an eval-introduced var, or an
+                // unresolvable name is configurable / a no-op, so `delete` yields
+                // `true` — and a configurable binding is actually REMOVED.
                 // `NaN`/`Infinity`/`undefined` are the only non-configurable builtin
                 // global properties; they're not tracked as compiler globals, so
                 // check them by name (a local of that name still resolves below).
-                let non_configurable = matches!(id.name.as_str(), "NaN" | "Infinity" | "undefined")
-                    || match self.resolve_existing(&id.name) {
-                        Some(Binding::Local(_))
-                        | Some(Binding::LocalCell(_))
-                        | Some(Binding::Upvalue(_))
-                        | Some(Binding::ClassName(_)) => true,
-                        Some(Binding::Global(slot)) => {
-                            self.cx.hoisted_globals.contains(&slot)
-                                || self.cx.lexical_globals.contains(&slot)
-                                || self.cx.decl_globals.contains(&slot)
-                        }
-                        None => false,
-                    };
-                self.emit(Instr::LoadBool { dst, val: !non_configurable });
+                if matches!(id.name.as_str(), "NaN" | "Infinity" | "undefined") {
+                    self.emit(Instr::LoadBool { dst, val: false });
+                    return Ok(dst);
+                }
+                match self.resolve_existing(&id.name) {
+                    Some(Binding::Local(_))
+                    | Some(Binding::LocalCell(_))
+                    | Some(Binding::Upvalue(_))
+                    | Some(Binding::ClassName(_)) => {
+                        self.emit(Instr::LoadBool { dst, val: false });
+                    }
+                    Some(Binding::Global(slot)) => {
+                        // A resolved GLOBAL defers to the runtime: DeleteGlobal
+                        // checks the PROGRAM's decl lists (an eval-compiled
+                        // `delete x` must see the program's `var x` as
+                        // non-configurable, and an eval-introduced var as
+                        // deletable — this compilation's own cx lists can't
+                        // tell) and removes a configurable binding.
+                        self.emit(Instr::DeleteGlobal { dst, slot });
+                    }
+                    None => {
+                        // Unreferenced-so-far name: allocate its global slot
+                        // (like an identifier reference would) so the runtime
+                        // check sees the LIVE binding — crucial for an eval'd
+                        // `delete x` whose `x` only exists in the outer
+                        // program. A never-declared name's fresh slot is
+                        // UNINITIALIZED, so DeleteGlobal is a true no-op.
+                        let slot = self.cx.global_slot(&id.name) as u32;
+                        self.emit(Instr::DeleteGlobal { dst, slot });
+                    }
+                }
                 Ok(dst)
             }
             other => {
@@ -9912,13 +10002,108 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn call(&mut self, c: &ox::CallExpression, dst: Reg) -> R<Reg> {
-        // Optional call `f?.(args)`: evaluate the callee as a VALUE (its own `?.`
-        // links short-circuit inside the chain), bail to undefined if it's
-        // nullish, else call it. (Uses the general value-call, so `o?.m?.()` calls
-        // with `this = undefined` — a rare edge.)
+        // Optional call `f?.(args)` — EvaluateCall: a MEMBER callee (even
+        // through parens) preserves its base as `this`; `super.m?.()` binds the
+        // running `this`. The base's own `?.` links short-circuit inside the
+        // chain, and a nullish callee bails to undefined WITHOUT evaluating
+        // the arguments.
         if c.optional {
+            let mut inner: &ox::Expression = &c.callee;
+            while let ox::Expression::ParenthesizedExpression(p) = inner {
+                inner = &p.expression;
+            }
+            let has_spread =
+                c.arguments.iter().any(|a| matches!(a, ox::Argument::SpreadElement(_)));
+            match inner {
+                ox::Expression::StaticMemberExpression(m)
+                    if !matches!(&m.object, ox::Expression::Super(_)) && !has_spread =>
+                {
+                    let o = self.expr(&m.object)?;
+                    let obj = self.alloc_reg();
+                    if o != obj {
+                        self.emit(Instr::Move { dst: obj, src: o });
+                    }
+                    if m.optional {
+                        self.emit_optional_check(obj);
+                    }
+                    let name = self.string_name(m.property.name.as_str());
+                    let callee = self.alloc_reg();
+                    self.emit(Instr::GetProp { dst: callee, obj, name });
+                    self.emit_optional_check(callee);
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                    return Ok(dst);
+                }
+                ox::Expression::ComputedMemberExpression(m)
+                    if !matches!(&m.object, ox::Expression::Super(_)) && !has_spread =>
+                {
+                    let o = self.expr(&m.object)?;
+                    let obj = self.alloc_reg();
+                    if o != obj {
+                        self.emit(Instr::Move { dst: obj, src: o });
+                    }
+                    if m.optional {
+                        self.emit_optional_check(obj);
+                    }
+                    let key = self.expr(&m.expression)?;
+                    let callee = self.alloc_reg();
+                    self.emit(Instr::GetIndex { dst: callee, obj, key });
+                    self.emit_optional_check(callee);
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                    return Ok(dst);
+                }
+                ox::Expression::PrivateFieldExpression(p) if !has_spread => {
+                    self.check_private_declared(&p.field.name)?;
+                    let o = self.expr(&p.object)?;
+                    let obj = self.alloc_reg();
+                    if o != obj {
+                        self.emit(Instr::Move { dst: obj, src: o });
+                    }
+                    if p.optional {
+                        self.emit_optional_check(obj);
+                    }
+                    let name = self.string_name(&private_key(&p.field.name));
+                    let callee = self.alloc_reg();
+                    self.emit(Instr::GetProp { dst: callee, obj, name });
+                    self.emit_optional_check(callee);
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                    return Ok(dst);
+                }
+                // `super.m?.()` / `super[k]?.()`: the member lowering performs
+                // the read (incl. the this-TDZ check); `this` is frame reg 0.
+                ox::Expression::StaticMemberExpression(_)
+                | ox::Expression::ComputedMemberExpression(_)
+                    if !has_spread =>
+                {
+                    let callee = self.expr(inner)?;
+                    self.emit_optional_check(callee);
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    self.emit(Instr::CallWithThis { dst, callee, this_v: 0, arg_base, argc });
+                    return Ok(dst);
+                }
+                // `(a?.b)?.()`: a parenthesized-chain member callee still
+                // binds `this` = base; the inner chain's bail lands the
+                // callee at undefined, then the outer `?.()` bails on it.
+                ox::Expression::ChainExpression(ce) if !has_spread => {
+                    if let Some((callee, obj)) = self.chain_member_callee(ce)? {
+                        self.emit_optional_check(callee);
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                        self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                        return Ok(dst);
+                    }
+                }
+                _ => {}
+            }
             let callee = self.expr(&c.callee)?;
             self.emit_optional_check(callee);
+            if has_spread {
+                // `fn?.(...xs)`: spread args after the nullish bail.
+                let args_arr = self.build_spread_args(&c.arguments)?;
+                self.emit(Instr::CallSpread { dst, callee, args: args_arr });
+                return Ok(dst);
+            }
             let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
             self.emit(Instr::Call { dst, callee, arg_base, argc });
             return Ok(dst);
@@ -10391,9 +10576,28 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // A PARENTHESIZED member callee preserves its reference — `(a.b)()` and
+        // `(a?.b)()` call with `this` = a (parens are transparent to
+        // EvaluateCall; only a comma/assignment breaks the reference).
+        let mut peeled: &ox::Expression = &c.callee;
+        while let ox::Expression::ParenthesizedExpression(p) = peeled {
+            peeled = &p.expression;
+        }
+        // `(a?.b)(args)`: a parenthesized-CHAIN member callee — the chain ends
+        // at the parens (nullish base → undefined callee → the call throws),
+        // but the member base still binds `this`.
+        if let ox::Expression::ChainExpression(ce) = peeled {
+            if !c.arguments.iter().any(|a| matches!(a, ox::Argument::SpreadElement(_))) {
+                if let Some((callee, obj)) = self.chain_member_callee(ce)? {
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    self.emit(Instr::CallWithThis { dst, callee, this_v: obj, arg_base, argc });
+                    return Ok(dst);
+                }
+            }
+        }
         // Method call `obj.name(args…)` → CallMethod, binding `this` to obj.
         // (Computed-member calls `obj[k](…)` fall through to the generic path.)
-        if let ox::Expression::StaticMemberExpression(m) = &c.callee {
+        if let ox::Expression::StaticMemberExpression(m) = peeled {
             let obj = self.expr(&m.object)?;
             if m.optional {
                 self.emit_optional_check(obj); // `obj?.method()` — short-circuit if obj nullish
@@ -10418,7 +10622,7 @@ impl<'a> FnCompiler<'a> {
             return Ok(dst);
         }
         // Private method call `obj.#m(args…)` → CallMethod on the "#m" key.
-        if let ox::Expression::PrivateFieldExpression(p) = &c.callee {
+        if let ox::Expression::PrivateFieldExpression(p) = peeled {
             self.check_private_declared(&p.field.name)?;
             let obj = self.expr(&p.object)?;
             let name = self.string_name(&private_key(&p.field.name));
@@ -10429,7 +10633,7 @@ impl<'a> FnCompiler<'a> {
 
         // Computed method call `obj[key](args…)` → bind `this` to obj. Evaluate
         // `super[expr](args…)` — computed inherited-method call.
-        if let ox::Expression::ComputedMemberExpression(m) = &c.callee {
+        if let ox::Expression::ComputedMemberExpression(m) = peeled {
             if matches!(&m.object, ox::Expression::Super(_)) {
                 let is_class = self.super_class;
                 if is_class.is_none() && !self.super_home_obj {
@@ -10451,7 +10655,7 @@ impl<'a> FnCompiler<'a> {
             }
         }
         // obj and the key into stable registers (below the contiguous arg block).
-        if let ox::Expression::ComputedMemberExpression(m) = &c.callee {
+        if let ox::Expression::ComputedMemberExpression(m) = peeled {
             let obj = self.expr(&m.object)?;
             let obj_reg = self.alloc_reg();
             if obj != obj_reg {

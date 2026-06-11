@@ -1145,8 +1145,13 @@ pub enum HeapObj {
         handled: bool,
     },
     /// A native `resolve`/`reject` function bound to a promise — the pair handed
-    /// to a `new Promise(executor)`. Calling it settles `promise`.
-    BoundResolver { promise: u32, is_reject: bool },
+    /// to a `new Promise(executor)`. Calling it settles `promise`. `pair` is the
+    /// CreateResolvingFunctions [[AlreadyResolved]] record id shared by the
+    /// resolve+reject of one pair (0 = untracked): the FIRST call through either
+    /// function consumes it and every later call is a spec no-op — even while the
+    /// promise is still Pending because the first resolve deferred to a thenable
+    /// job (see `Vm::resolver_pair_fire`).
+    BoundResolver { promise: u32, is_reject: bool, pair: u32 },
     /// A `Date`: milliseconds since the Unix epoch (NaN = Invalid Date). The
     /// engine treats all component getters/setters as UTC (a documented
     /// simplification — node uses the host time zone for the non-UTC ones).

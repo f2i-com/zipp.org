@@ -1967,16 +1967,20 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         let p = self.alloc_promise();
+                        let pair = self.new_resolver_pair();
                         let res = Value::heap(
-                            self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
+                            self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false, pair }),
                         );
                         let rej = Value::heap(
-                            self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true }),
+                            self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true, pair }),
                         );
-                        // A throwing executor rejects the promise.
+                        // A throwing executor rejects the promise — via the pair's
+                        // [[Reject]], a no-op once resolve/reject already fired.
                         if self.call_value(exec, Value::UNDEFINED, &[res, rej]).is_err() {
                             let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
-                            self.reject(p, reason);
+                            if self.resolver_pair_fire(pair) {
+                                self.reject(p, reason);
+                            }
                         }
                         self.set(base, dst, Value::heap(p));
                         ip += 1;
@@ -2336,9 +2340,13 @@ impl<'p> Vm<'p> {
                             S::ObjectAssign => self.object_assign(&args)?,
                             S::ObjectFromEntries => self.object_from_entries(a0)?,
                             S::PromiseResolve => {
-                                // Promise.resolve(p) of an existing Promise is identity.
+                                // Promise.resolve(p) of an existing Promise is identity
+                                // ONLY when Get(p, "constructor") is still %Promise%
+                                // (PromiseResolve step 2) — a changed constructor gets
+                                // a fresh adopting promise.
                                 if a0.is_heap()
                                     && matches!(self.heap.get(a0.heap_index()), HeapObj::Promise { .. })
+                                    && self.get_prop(a0, "constructor")? == self.promise_ctor_value()
                                 {
                                     a0
                                 } else {
@@ -3515,6 +3523,28 @@ impl<'p> Vm<'p> {
                         }
                         ip += 1;
                     }
+                    Instr::DeleteGlobal { dst, slot } => {
+                        // Sloppy `delete <global>`: a DECLARED global binding
+                        // (program var/function/class/let/const slot) is
+                        // non-configurable → false; everything else (implicit
+                        // `x = 1` global, builtin, eval-made var) is REMOVED —
+                        // its slot returns to the never-declared sentinel — and
+                        // yields true. Checked at RUNTIME against the program's
+                        // decl lists so eval-compiled deletes agree with the
+                        // program's bindings.
+                        let nonconfig = self.program.hoisted_globals.contains(&slot)
+                            || self.program.decl_globals.contains(&slot)
+                            || self.program.lexical_globals.contains(&slot);
+                        if nonconfig {
+                            self.set(base, dst, Value::bool(false));
+                        } else {
+                            if let Some(g) = self.globals.get_mut(slot as usize) {
+                                *g = Value::UNINITIALIZED;
+                            }
+                            self.set(base, dst, Value::bool(true));
+                        }
+                        ip += 1;
+                    }
                     Instr::DeleteProp { dst, obj, name, strict } => {
                         let o = self.get(base, obj);
                         // `delete obj.x` does ToObject(base) â€” null/undefined throw a
@@ -3802,19 +3832,22 @@ impl<'p> Vm<'p> {
                         }
                         // A native resolve/reject function (from `new Promise`).
                         if callee_v.is_heap() {
-                            if let HeapObj::BoundResolver { promise, is_reject } =
+                            if let HeapObj::BoundResolver { promise, is_reject, pair } =
                                 self.heap.get(callee_v.heap_index())
                             {
-                                let (p, isr) = (*promise, *is_reject);
+                                let (p, isr, pid) = (*promise, *is_reject, *pair);
                                 let arg = if argc >= 1 {
                                     self.get(base, arg_base)
                                 } else {
                                     Value::UNDEFINED
                                 };
-                                if isr {
-                                    self.reject(p, arg);
-                                } else {
-                                    self.resolve(p, arg);
+                                // [[AlreadyResolved]]: only the pair's FIRST call acts.
+                                if self.resolver_pair_fire(pid) {
+                                    if isr {
+                                        self.reject(p, arg);
+                                    } else {
+                                        self.resolve(p, arg);
+                                    }
                                 }
                                 self.set(base, dst, Value::UNDEFINED);
                                 ip += 1;

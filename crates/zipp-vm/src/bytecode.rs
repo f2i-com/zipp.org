@@ -620,6 +620,13 @@ pub enum Instr {
     DeleteProp { dst: Reg, obj: Reg, name: u32, strict: bool },
     /// `dst = delete obj[key]` — computed property delete (strict: throw on false).
     DeleteIndex { dst: Reg, obj: Reg, key: Reg, strict: bool },
+    /// `dst = delete <global identifier>` (sloppy only). A DECLARED global —
+    /// the program's `hoisted_globals`/`decl_globals`/`lexical_globals` slot
+    /// lists — is non-configurable: yields `false`, binding untouched.
+    /// Anything else (an implicitly-created `x = 1` global, a builtin, an
+    /// eval-introduced var) is removed — the slot returns to the
+    /// `UNINITIALIZED` never-declared sentinel — and yields `true`.
+    DeleteGlobal { dst: Reg, slot: u32 },
 
     /// Proper-tail-call prefix (strict `return f(args)` in an unprotected
     /// context): when the callee is a PLAIN function/closure, REUSE the

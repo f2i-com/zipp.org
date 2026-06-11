@@ -1491,6 +1491,16 @@ impl<'p> Vm<'p> {
                         "TypeError: Function.prototype.bind called on a non-callable".into(),
                     ));
                 }
+                // Spec 20.2.3.2 steps 3-5: HasOwnProperty(Target, "length") →
+                // Get(Target, "length"), then Get(Target, "name") — both
+                // OBSERVABLE (a throwing accessor propagates before the bound
+                // function exists). The values themselves resolve lazily from
+                // the target (existing name/length machinery), so only the Gets
+                // are performed here.
+                if self.has_own_property(this, "length") {
+                    let _ = self.get_prop(this, "length")?;
+                }
+                let _ = self.get_prop(this, "name")?;
                 let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
                 Value::heap(self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound }))
             }
@@ -2121,6 +2131,20 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
+                        // A TypedArray on a RESIZABLE buffer can never lose
+                        // extensibility: [[PreventExtensions]] returns false
+                        // when IsTypedArrayFixedLength is false (a length-
+                        // tracking view, or ANY view over a resizable buffer)
+                        // — so preventExtensions/seal/freeze all throw. A
+                        // fixed-buffer TypedArray with elements still rejects
+                        // FREEZE (its indices are writable, non-configurable).
+                        HeapObj::TypedArray { buffer, .. }
+                            if self.ab_max.contains_key(buffer) =>
+                        {
+                            return Err(Thrown(
+                                "TypeError: Cannot prevent extensions on a TypedArray backed by a resizable ArrayBuffer".into(),
+                            ));
+                        }
                         _ => {
                             let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new);
                             match id {
@@ -2134,6 +2158,25 @@ impl<'p> Vm<'p> {
                                 && matches!(self.heap.get(idx), HeapObj::Array(_))
                             {
                                 self.array_length_nonwritable.insert(idx);
+                            }
+                            // A callable's own properties live in the fn_props
+                            // side map — freeze/seal their ATTRIBUTES there too
+                            // (the extensible flag stays in arr_props).
+                            if matches!(
+                                self.heap.get(idx),
+                                HeapObj::Func(_)
+                                    | HeapObj::Closure { .. }
+                                    | HeapObj::Bound { .. }
+                                    | HeapObj::Wrapped { .. }
+                                    | HeapObj::Native(_)
+                            ) {
+                                if let Some(fm) = self.fn_props.get_mut(&idx) {
+                                    match id {
+                                        OBJ_FREEZE => fm.freeze(),
+                                        OBJ_SEAL => fm.seal(),
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
                     }
@@ -2252,11 +2295,12 @@ impl<'p> Vm<'p> {
                 // `promise` is the object it produced.
                 let (promise, resolve, reject) = if this == self.promise_ctor_value() {
                     let p = self.alloc_promise();
+                    let pair = self.new_resolver_pair();
                     let res = Value::heap(
-                        self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false }),
+                        self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false, pair }),
                     );
                     let rej = Value::heap(
-                        self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true }),
+                        self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true, pair }),
                     );
                     (Value::heap(p), res, rej)
                 } else {
@@ -3459,6 +3503,39 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            // get %AbstractModuleSource%.prototype[@@toStringTag]: undefined for
+            // any receiver without a [[ModuleSourceClassName]] slot — i.e. every
+            // value today (never throws, even on primitives).
+            ABSTRACT_MODULE_SOURCE_TAG_GET => Value::UNDEFINED,
+            // PromiseReactionJob against an EXOTIC capability promise: run the
+            // handler (Identity/Thrower when non-callable) and settle through the
+            // capability's captured resolve/reject functions IN THE SAME JOB.
+            CAP_REACTION => {
+                let handler = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let cap_resolve = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let cap_reject = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                let is_reject = args.get(3).copied().unwrap_or(Value::FALSE) == Value::TRUE;
+                let arg = args.get(4).copied().unwrap_or(Value::UNDEFINED);
+                // Un-rooted capability functions held across the JS re-entries.
+                let _gc = self.gc_lock_guard();
+                if !self.is_callable(handler) {
+                    // Identity → capResolve(arg); Thrower → capReject(reason).
+                    let f = if is_reject { cap_reject } else { cap_resolve };
+                    self.call_value(f, Value::UNDEFINED, &[arg])?;
+                    return Ok(Value::UNDEFINED);
+                }
+                match self.call_value(handler, Value::UNDEFINED, &[arg]) {
+                    Ok(v) => self.call_value(cap_resolve, Value::UNDEFINED, &[v])?,
+                    Err(Thrown(msg)) => {
+                        let e = match self.pending_throw.take() {
+                            Some(v) => v,
+                            None => self.alloc_error_from_message(&msg),
+                        };
+                        self.call_value(cap_reject, Value::UNDEFINED, &[e])?
+                    }
+                };
+                Value::UNDEFINED
+            }
             ITER_TAG_GET => self.alloc_str("Iterator".to_string()),
             ITER_TAG_SET => {
                 self.setter_ignoring_proto_props(
@@ -3857,7 +3934,18 @@ impl<'p> Vm<'p> {
                         // observably Calls its resolve — returning x unchanged when x
                         // is already a promise whose .constructor === this.
                         if this == self.promise_ctor_value() {
-                            Value::heap(self.to_promise(a))
+                            // PromiseResolve step 2: x is returned AS-IS only when
+                            // Get(x, "constructor") is C — a promise whose
+                            // constructor was changed gets a fresh adopting promise.
+                            let is_native_promise = a.is_heap()
+                                && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. });
+                            if is_native_promise && self.get_prop(a, "constructor")? != this {
+                                let p = self.alloc_promise();
+                                self.resolve(p, a);
+                                Value::heap(p)
+                            } else {
+                                Value::heap(self.to_promise(a))
+                            }
                         } else {
                             let already = a.is_heap()
                                 && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. })

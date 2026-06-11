@@ -414,10 +414,27 @@ impl<'p> Vm<'p> {
             }
             "replace" if self.as_regexp(arg0).is_some() => {
                 let re = self.as_regexp(arg0).unwrap();
-                let global =
-                    matches!(self.heap.get(re), HeapObj::RegExp { flags, .. } if flags.contains('g'));
                 let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                Ok(Some(self.regex_replace(idx, re, repl, global)?))
+                // The internal fast path is valid only for a PLAIN regex: its
+                // [[Prototype]] is %RegExp.prototype% and exec/@@replace are
+                // still the intrinsics. A SUBCLASS instance (overridden exec)
+                // or a patched prototype must run the OBSERVABLE @@replace
+                // protocol — user exec result, `groups` via Get (incl. the
+                // prototype chain), GetSubstitution $<name> via Get.
+                if self.regexp_replace_fast_ok(re) {
+                    let global = matches!(
+                        self.heap.get(re),
+                        HeapObj::RegExp { flags, .. } if flags.contains('g')
+                    );
+                    Ok(Some(self.regex_replace(idx, re, repl, global)?))
+                } else {
+                    let sl = self
+                        .heap
+                        .str_cow(idx)
+                        .map(|c| c.into_owned())
+                        .unwrap_or_default();
+                    Ok(Some(self.string_replace_plain(&sl, idx, arg0, repl, false)?))
+                }
             }
             // `replaceAll` (regexp or otherwise) funnels into `string_replace_plain`,
             // which performs the spec step-2 checks (IsRegExp → global-flag, GetMethod

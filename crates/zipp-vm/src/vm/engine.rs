@@ -227,6 +227,13 @@ impl<'p> Vm<'p> {
             shadowrealm_ctor: 0,
             shadowrealm_proto: 0,
             shadow_realms: std::collections::HashSet::new(),
+            shadow_fn_realm: std::collections::HashMap::new(),
+            abstractmodulesource_ctor: 0,
+            abstractmodulesource_proto: 0,
+            resolver_pair_next: 1,
+            resolved_pairs: std::collections::HashSet::new(),
+            promise_ctor_intrinsic: 0,
+            promise_then_intrinsic: 0,
             realms: vec![std::collections::HashMap::new()], // realm 0 = main
             obj_realm: std::collections::HashMap::new(),
             realm_ctor_main: std::collections::HashMap::new(),
@@ -878,7 +885,15 @@ impl<'p> Vm<'p> {
                     }
                 }
                 self.native_callee_realm = prev_ncr;
-                let res = match self.call_value(t, Value::UNDEFINED, &wargs) {
+                // OrdinaryCallEvaluateBody runs in the TARGET's realm: a
+                // ShadowRealm-born callable re-enters with ITS realm active so
+                // `globalThis.x` in the body binds that realm's slots; an
+                // untagged (main-realm) target runs with no realm active.
+                let prev_ar = self.active_realm;
+                self.active_realm = self.shadow_fn_realm.get(&t.heap_index()).copied();
+                let call_res = self.call_value(t, Value::UNDEFINED, &wargs);
+                self.active_realm = prev_ar;
+                let res = match call_res {
                     Ok(v) => {
                         // The RESULT wraps back into the CALLER realm — the
                         // realm of the wrapper being invoked.
@@ -953,13 +968,16 @@ impl<'p> Vm<'p> {
         }
         // A native resolve/reject function settles its bound promise.
         if callee.is_heap() {
-            if let HeapObj::BoundResolver { promise, is_reject } = self.heap.get(callee.heap_index()) {
-                let (p, isr) = (*promise, *is_reject);
+            if let HeapObj::BoundResolver { promise, is_reject, pair } = self.heap.get(callee.heap_index()) {
+                let (p, isr, pr) = (*promise, *is_reject, *pair);
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
-                if isr {
-                    self.reject(p, arg);
-                } else {
-                    self.resolve(p, arg);
+                // [[AlreadyResolved]]: only the pair's FIRST call acts.
+                if self.resolver_pair_fire(pr) {
+                    if isr {
+                        self.reject(p, arg);
+                    } else {
+                        self.resolve(p, arg);
+                    }
                 }
                 return Ok(Value::UNDEFINED);
             }
@@ -2781,6 +2799,12 @@ impl<'p> Vm<'p> {
                     | Instr::EvalScopeHas { idx, .. }
                     | Instr::EvalScopeSet { idx, .. } => {
                         *idx = gmap[*idx as usize];
+                    }
+                    // `delete <global>`: the slot operand maps like every other
+                    // global reference (the runtime checks the MAIN program's
+                    // decl lists against the mapped slot).
+                    Instr::DeleteGlobal { slot, .. } => {
+                        *slot = gmap[*slot as usize];
                     }
                     // The upvalue index is the eval closure's own; only the
                     // NAME handle is a global slot.

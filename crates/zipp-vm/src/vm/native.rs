@@ -271,6 +271,17 @@ pub const AGENT_LEAVING: u16 = 912;
 /// ThrowCompletion(reason)) — close errors are swallowed and the ORIGINAL
 /// reason re-throws, so the capability promise rejects with it.
 pub const AFS_CLOSE_REJECT: u16 = 913;
+/// `get %AbstractModuleSource%.prototype[@@toStringTag]`: returns the
+/// receiver's [[ModuleSourceClassName]] if it has the slot, else undefined
+/// (never throws). No ModuleSource exotics exist yet (source-phase imports
+/// are not wired), so it currently always returns undefined.
+pub const ABSTRACT_MODULE_SOURCE_TAG_GET: u16 = 914;
+/// PromiseReactionJob for an EXOTIC capability (NewPromiseCapability whose
+/// constructor produced a non-native-Promise object): runs the handler and
+/// settles through the capability's CAPTURED resolve/reject JS functions in the
+/// same job. Bound args: [handler, capResolve, capReject, isRejectReaction];
+/// the reaction's settled value/reason arrives as the trailing call argument.
+pub const CAP_REACTION: u16 = 915;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

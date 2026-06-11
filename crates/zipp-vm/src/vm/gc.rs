@@ -226,6 +226,12 @@ impl Vm<'_> {
         for &k in self.obj_realm.keys() {
             root_idx!(k);
         }
+        // ShadowRealm-born callables: root the realm INSTANCES so the
+        // `shadow_fn_realm` values (and the realm's `realm_globals` table) never
+        // go stale; the fn KEYS are retained post-sweep against live marks.
+        for &r in self.shadow_fn_realm.values() {
+            root_idx!(r);
+        }
         for m in &self.realms {
             for (&main_p, &realm_p) in m {
                 root_idx!(main_p);
@@ -390,6 +396,7 @@ impl Vm<'_> {
         self.instance_brand.retain(|&k, _| marks[k as usize]);
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
         self.closure_eval_scope.retain(|&k, _| marks[k as usize]);
+        self.shadow_fn_realm.retain(|&k, _| marks[k as usize]);
         self.private_fields.retain(|&k, _| marks[k as usize]);
         // Keep declared-name records only for brands still referenced by a live
         // lexical chain or instance brand (these maps were just pruned by marks).

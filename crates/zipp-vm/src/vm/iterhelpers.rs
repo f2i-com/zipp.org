@@ -253,6 +253,54 @@ impl<'p> Vm<'p> {
         Ok(it)
     }
 
+    /// GetIteratorFlattenable + GetIteratorDirect's observable `Get(iter, "next")`:
+    /// returns a 2-element heap Array `[iterator, nextMethod]` — the zip "Iterator
+    /// Record". The Get is observable (proxy logs see it) and the cached method
+    /// drives every later step (the spec's [[NextMethod]] is read ONCE).
+    fn get_iterator_record_flattenable(
+        &mut self,
+        v: Value,
+        reject_primitives: bool,
+    ) -> Result<Value, Thrown> {
+        let it = self.get_iterator_flattenable(v, reject_primitives)?;
+        let next = self.get_prop(it, "next")?;
+        Ok(Value::heap(self.heap.alloc(HeapObj::Array(vec![it, next]))))
+    }
+
+    /// The iterator of a zip slot: a `[iterator, next]` record Array yields its
+    /// first element; a bare iterator (or the NULL closed marker) passes through.
+    fn iz_rec_iter(&self, rec: Value) -> Value {
+        if rec.is_heap() {
+            if let HeapObj::Array(a) = self.heap.get(rec.heap_index()) {
+                return a.first().copied().unwrap_or(Value::NULL);
+            }
+        }
+        rec
+    }
+
+    /// The `[iterator, next]` pair of a zip record slot (a bare iterator gets a
+    /// freshly-read `next`; NULL yields None).
+    fn iz_rec_parts(&self, rec: Value) -> Option<(Value, Value)> {
+        if rec.is_heap() {
+            if let HeapObj::Array(a) = self.heap.get(rec.heap_index()) {
+                if a.len() >= 2 {
+                    return Some((a[0], a[1]));
+                }
+            }
+        }
+        None
+    }
+
+    /// IteratorStepValue on a zip record slot: drive the iterator with its
+    /// CACHED `next` ([[NextMethod]] — never re-read). A legacy bare-iterator
+    /// slot falls back to the re-reading step.
+    fn iz_step(&mut self, rec: Value) -> Result<Option<Value>, Thrown> {
+        match self.iz_rec_parts(rec) {
+            Some((it, next)) => self.iterator_step_with(it, next),
+            None => self.iterator_step(rec),
+        }
+    }
+
     /// `Iterator.concat(...items)` (ES2025). Each item must be an Object with a
     /// callable `@@iterator`; the method is read ONCE here (eagerly, in argument
     /// order) and paired with its iterable. The returned Iterator Helper opens
@@ -381,9 +429,9 @@ impl<'p> Vm<'p> {
                 if value == Value::UNDEFINED {
                     continue;
                 }
-                match self.get_iterator_flattenable(value, true) {
-                    Ok(it) => {
-                        iters.push(it);
+                match self.get_iterator_record_flattenable(value, true) {
+                    Ok(rec) => {
+                        iters.push(rec);
                         keys.push(k);
                     }
                     Err(e) => close_and_throw!(e),
@@ -392,19 +440,23 @@ impl<'p> Vm<'p> {
         } else {
             // A real (steppable) iterator over the input — `get_iterator` returns a
             // plain array unchanged (no `.next()`), so use the @@iterator call form.
+            // GetIteratorDirect: the input's `next` is Get ONCE (observable) and
+            // cached for every step (spec [[NextMethod]]).
             let input_iter = self.get_iterator_direct(iterables)?;
+            let input_next = self.get_prop(input_iter, "next")?;
             loop {
-                match self.iterator_step(input_iter) {
+                match self.iterator_step_with(input_iter, input_next) {
                     Ok(None) => break,
-                    Ok(Some(value)) => match self.get_iterator_flattenable(value, true) {
-                        Ok(it) => iters.push(it),
+                    Ok(Some(value)) => match self.get_iterator_record_flattenable(value, true) {
+                        Ok(rec) => iters.push(rec),
                         Err(e) => {
-                            // Close the input iterator + the already-opened inner
-                            // iterators (in reverse), then propagate — keeping the
-                            // original abrupt value (close throws are discarded).
+                            // IfAbruptCloseIterators over «inputIter» ⧺ iters closes
+                            // in REVERSE list order: the opened inner iterators
+                            // (highest first), then the input iterator LAST — keeping
+                            // the original abrupt value (close throws are discarded).
                             let saved = self.pending_throw;
-                            let _ = self.iterator_close(input_iter);
                             let _ = self.iz_close_except(&iters, usize::MAX);
+                            let _ = self.iterator_close(input_iter);
                             self.pending_throw = saved;
                             return Err(e);
                         }
@@ -442,22 +494,34 @@ impl<'p> Vm<'p> {
             } else {
                 // The padding option is iterated via real GetIterator (a non-iterable
                 // such as `{}` is a TypeError — unlike GetIteratorFlattenable, which
-                // would treat it as its own iterator).
+                // would treat it as its own iterator). GetIteratorDirect Gets `next`
+                // ONCE (observable) and that cached method drives every step.
                 let pad_iter = match self.get_iterator_direct(padding_option) {
                     Ok(it) => it,
                     Err(e) => pad_throw!(e),
                 };
+                let pad_next = match self.get_prop(pad_iter, "next") {
+                    Ok(n) => n,
+                    Err(e) => pad_throw!(e),
+                };
+                let mut exhausted = false;
                 for slot in padding.iter_mut() {
-                    match self.iterator_step(pad_iter) {
+                    match self.iterator_step_with(pad_iter, pad_next) {
                         Ok(Some(v)) => *slot = v,
-                        Ok(None) => break,
+                        Ok(None) => {
+                            exhausted = true;
+                            break;
+                        }
                         Err(e) => pad_throw!(e),
                     }
                 }
-                // IteratorClose(padding): a throwing return() propagates (closing the
-                // inputs first).
-                if let Err(e) = self.iterator_close(pad_iter) {
-                    pad_throw!(e);
+                // IteratorClose(padding) — but ONLY when the iterator was not run
+                // to exhaustion ([[Done]] suppresses the close; no `return` read).
+                // A throwing return() propagates (closing the inputs first).
+                if !exhausted {
+                    if let Err(e) = self.iterator_close(pad_iter) {
+                        pad_throw!(e);
+                    }
                 }
             }
         }
@@ -499,7 +563,8 @@ impl<'p> Vm<'p> {
         let mut first_pt: Option<Value> = None;
         for j in (0..iters.len()).rev() {
             if j != except && iters[j] != Value::NULL {
-                if let Err(e) = self.iterator_close(iters[j]) {
+                let it = self.iz_rec_iter(iters[j]);
+                if let Err(e) = self.iterator_close(it) {
                     if err.is_none() {
                         err = Some(e);
                         first_pt = self.pending_throw;
@@ -528,7 +593,8 @@ impl<'p> Vm<'p> {
         let hi = hi.min(iters.len());
         for j in (lo..hi).rev() {
             if iters[j] != Value::NULL {
-                let _ = self.iterator_close(iters[j]);
+                let it = self.iz_rec_iter(iters[j]);
+                let _ = self.iterator_close(it);
             }
         }
         self.pending_throw = saved;
@@ -539,7 +605,8 @@ impl<'p> Vm<'p> {
         let saved = self.pending_throw;
         for j in (0..iters.len()).rev() {
             if j != except && iters[j] != Value::NULL {
-                let _ = self.iterator_close(iters[j]);
+                let it = self.iz_rec_iter(iters[j]);
+                let _ = self.iterator_close(it);
             }
         }
         self.pending_throw = saved;
@@ -625,7 +692,7 @@ impl<'p> Vm<'p> {
             0 => {
                 // shortest: any exhausted iterator finishes the zip; close the rest.
                 for i in 0..count {
-                    match self.iterator_step(iters[i]) {
+                    match self.iz_step(iters[i]) {
                         Ok(None) => {
                             // Normal completion: close the others — a close error
                             // surfaces (the completion was not abrupt).
@@ -654,7 +721,7 @@ impl<'p> Vm<'p> {
                         results[i] = pad(i);
                         continue;
                     }
-                    match self.iterator_step(iters[i]) {
+                    match self.iz_step(iters[i]) {
                         Ok(None) => {
                             // Mark exhausted in BOTH the heap (persists to the next
                             // step) and the local copy (so an abrupt close below skips
@@ -682,7 +749,7 @@ impl<'p> Vm<'p> {
             _ => {
                 // strict: every iterator must end on the same step.
                 for i in 0..count {
-                    match self.iterator_step(iters[i]) {
+                    match self.iz_step(iters[i]) {
                         Ok(None) => {
                             self.ih_set_done(idx);
                             if i == 0 {
@@ -693,7 +760,7 @@ impl<'p> Vm<'p> {
                                 // triggers a close — both in reverse, keeping the
                                 // surviving completion value.
                                 for j in 1..count {
-                                    match self.iterator_step(iters[j]) {
+                                    match self.iz_step(iters[j]) {
                                         Ok(None) => {}
                                         Ok(Some(_)) => {
                                             let thr = self.iz_strict_type_error();

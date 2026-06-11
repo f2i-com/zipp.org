@@ -422,6 +422,78 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Hand out a fresh CreateResolvingFunctions [[AlreadyResolved]] record id
+    /// (shared by the resolve+reject `BoundResolver`s of one pair).
+    pub(crate) fn new_resolver_pair(&mut self) -> u32 {
+        let id = self.resolver_pair_next;
+        self.resolver_pair_next += 1;
+        id
+    }
+
+    /// Consume a pair's [[AlreadyResolved]] record: true the FIRST time either
+    /// function of the pair fires, false (spec no-op) for every later call.
+    /// `pair == 0` (untracked internal resolvers) always fires.
+    pub(crate) fn resolver_pair_fire(&mut self, pair: u32) -> bool {
+        pair == 0 || self.resolved_pairs.insert(pair)
+    }
+
+    /// True when adopting `value` (a native promise) into a resolution can skip
+    /// the observable Get("then") + PromiseResolveThenableJob + `then` call: the
+    /// instance is a PLAIN promise (its [[Prototype]] is exactly
+    /// %Promise.prototype%, no own `then`/`constructor`) and the prototype's
+    /// `then`/`constructor` are still the intrinsic data properties. Anything
+    /// else (a subclass instance, a patched `Promise.prototype.then`, a shadowed
+    /// `constructor`) takes the spec path — the thenable job's `then` call and
+    /// its SpeciesConstructor lookups are observable (finally/species tests).
+    fn promise_adoption_unobservable(&mut self, value: Value) -> bool {
+        if self.promise_proto == 0
+            || self.prototype_of(value) != Some(Value::heap(self.promise_proto))
+            || self.has_own_property(value, "then")
+            || self.has_own_property(value, "constructor")
+        {
+            return false;
+        }
+        // %Promise.prototype%: own `then` must still be the intrinsic native
+        // data prop, own `constructor` the intrinsic %Promise% data prop.
+        let (then_ok, ctor_ok) = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => {
+                let check = |key: &str, pred: &dyn Fn(Value) -> bool| {
+                    m.keys
+                        .iter()
+                        .position(|k| k == key)
+                        .is_some_and(|i| !m.attrs[i].accessor && pred(m.vals[i]))
+                };
+                (
+                    check("then", &|v: Value| {
+                        v.is_heap() && v.heap_index() == self.promise_then_intrinsic
+                    }),
+                    check("constructor", &|v: Value| {
+                        v.is_heap() && v.heap_index() == self.promise_ctor_intrinsic
+                    }),
+                )
+            }
+            _ => (false, false),
+        };
+        if !(then_ok && ctor_ok) {
+            return false;
+        }
+        // %Promise%[@@species] must still be the intrinsic getter (the species
+        // lookup inside `then` would observably call a replacement).
+        match self.heap.get(self.promise_ctor_intrinsic) {
+            HeapObj::Object(m) => match m.keys.iter().position(|k| k == "@@species") {
+                None => true,
+                Some(i) => {
+                    let v = m.vals[i];
+                    m.attrs[i].accessor
+                        && v.is_heap()
+                        && matches!(self.heap.get(v.heap_index()),
+                                    HeapObj::Native(id) if *id == native::SPECIES_GET)
+                }
+            },
+            _ => false,
+        }
+    }
+
     /// JS `[[Resolve]]`: a thenable/Promise value is ADOPTED (p forwards when it
     /// settles); a self-resolution rejects with a TypeError; else fulfill.
     pub(crate) fn resolve(&mut self, p: u32, value: Value) {
@@ -432,13 +504,16 @@ impl<'p> Vm<'p> {
                 return;
             }
             if matches!(self.heap.get(value.heap_index()), HeapObj::Promise { .. })
-                && !self.has_own_property(value, "then")
+                && self.promise_adoption_unobservable(value)
             {
-                // A native promise with the INTRINSIC `then` adopts state directly
-                // (a valid optimisation of the resolve procedure). An OWN/overridden
-                // `then` must be OBSERVED instead — the spec does
-                // Get(resolution,"then") and enqueues PromiseResolveThenableJob — so
-                // a shadowed `then` falls through to the generic thenable adoption.
+                // A PLAIN native promise reached through the INTRINSIC `then`
+                // adopts state directly (a valid optimisation of the resolve
+                // procedure — no observable Get/call differs). A subclass
+                // instance or patched `then`/`constructor` must be OBSERVED
+                // instead — the spec does Get(resolution,"then") and enqueues
+                // PromiseResolveThenableJob, whose `then` call runs
+                // SpeciesConstructor — so those fall through to the generic
+                // thenable adoption below.
                 let inner = value.heap_index();
                 self.then_internal(inner, Value::UNDEFINED, Value::UNDEFINED, Some(p));
                 return;
@@ -536,15 +611,41 @@ impl<'p> Vm<'p> {
         on_r: Value,
     ) -> Result<Value, Thrown> {
         let c = self.promise_species_constructor(Value::heap(idx))?;
+        // PerformPromiseThen steps 3-4: a NON-CALLABLE handler is Identity /
+        // Thrower — `then_internal`'s undefined callback is exactly that
+        // pass-through (so `p.then(3, 5)` forwards instead of throwing).
+        let on_f = if self.is_callable(on_f) { on_f } else { Value::UNDEFINED };
+        let on_r = if self.is_callable(on_r) { on_r } else { Value::UNDEFINED };
         if c == self.promise_ctor_value() {
             let dep = self.then_internal(idx, on_f, on_r, None);
             return Ok(Value::heap(dep));
         }
-        let (cap_promise, _resolve, _reject) = self.new_promise_capability(c)?;
+        let (cap_promise, cap_resolve, cap_reject) = self.new_promise_capability(c)?;
         if cap_promise.is_heap()
             && matches!(self.heap.get(cap_promise.heap_index()), HeapObj::Promise { .. })
         {
             self.then_internal(idx, on_f, on_r, Some(cap_promise.heap_index()));
+        } else {
+            // An EXOTIC capability promise (the constructor returned a plain
+            // object): reactions can't settle it as a native promise — route
+            // them through the CAPTURED resolve/reject functions via
+            // CAP_REACTION wrappers (called in the reaction job itself). The
+            // throwaway native dependent only receives the wrappers' undefined.
+            let _gc = self.gc_lock_guard(); // cap_* held across allocs
+            let f_native = Value::heap(self.heap.alloc(HeapObj::Native(native::CAP_REACTION)));
+            let r_native = Value::heap(self.heap.alloc(HeapObj::Native(native::CAP_REACTION)));
+            let f_cb = Value::heap(self.heap.alloc(HeapObj::Bound {
+                target: f_native,
+                this: Value::UNDEFINED,
+                args: vec![on_f, cap_resolve, cap_reject, Value::FALSE],
+            }));
+            let r_cb = Value::heap(self.heap.alloc(HeapObj::Bound {
+                target: r_native,
+                this: Value::UNDEFINED,
+                args: vec![on_r, cap_resolve, cap_reject, Value::TRUE],
+            }));
+            let dep = self.alloc_promise();
+            self.then_internal(idx, f_cb, r_cb, Some(dep));
         }
         Ok(cap_promise)
     }
@@ -1902,14 +2003,17 @@ impl<'p> Vm<'p> {
                     return;
                 }
                 if callback.is_heap() {
-                    if let HeapObj::BoundResolver { promise, is_reject } =
+                    if let HeapObj::BoundResolver { promise, is_reject, pair } =
                         self.heap.get(callback.heap_index())
                     {
-                        let (pr, isr) = (*promise, *is_reject);
-                        if isr {
-                            self.reject(pr, arg);
-                        } else {
-                            self.resolve(pr, arg);
+                        let (pr, isr, pid) = (*promise, *is_reject, *pair);
+                        // [[AlreadyResolved]]: only the pair's FIRST call acts.
+                        if self.resolver_pair_fire(pid) {
+                            if isr {
+                                self.reject(pr, arg);
+                            } else {
+                                self.resolve(pr, arg);
+                            }
                         }
                         return;
                     }
@@ -1947,18 +2051,23 @@ impl<'p> Vm<'p> {
             // guard, so a thenable that calls both / twice is handled). A throwing
             // `then` rejects the promise (a no-op if it already settled).
             Microtask::ThenableJob { thenable, then, promise } => {
+                let pair = self.new_resolver_pair();
                 let res = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise, is_reject: false }),
+                    self.heap.alloc(HeapObj::BoundResolver { promise, is_reject: false, pair }),
                 );
                 let rej = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise, is_reject: true }),
+                    self.heap.alloc(HeapObj::BoundResolver { promise, is_reject: true, pair }),
                 );
                 if let Err(Thrown(msg)) = self.call_value(then, thenable, &[res, rej]) {
                     let e = match self.pending_throw.take() {
                         Some(v) => v,
                         None => self.alloc_error_from_message(&msg),
                     };
-                    self.reject(promise, e);
+                    // Spec: the job's catch calls resolvingFunctions.[[Reject]] —
+                    // a no-op when the pair already fired inside `then`.
+                    if self.resolver_pair_fire(pair) {
+                        self.reject(promise, e);
+                    }
                 }
             }
         }

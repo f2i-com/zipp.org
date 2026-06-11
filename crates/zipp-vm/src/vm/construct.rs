@@ -93,6 +93,10 @@ impl<'p> Vm<'p> {
                 // callable crosses as a fresh WrappedFunction exotic.
                 if result.is_heap() {
                     if self.is_callable(result) {
+                        // Remember the callable's HOME realm: a later call
+                        // through the wrapper re-enters with this realm active
+                        // (its `globalThis.x` binds the realm slots).
+                        self.shadow_fn_realm.insert(result.heap_index(), this.heap_index());
                         return self.wrapped_function_create(result);
                     }
                     if matches!(
@@ -111,7 +115,7 @@ impl<'p> Vm<'p> {
                 // Steps 3-4 run SYNCHRONOUSLY before any promise is built:
                 // ToString(specifier) (a poisoned valueOf throws here), and the
                 // exportName must already BE a String (no coercion).
-                let _spec = self.to_js_string(a0)?;
+                let spec = self.to_js_string(a0)?;
                 let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 let name_is_str = a1.is_heap()
                     && matches!(
@@ -124,12 +128,89 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                // Module loading is unsupported; return a rejected promise.
+                // ShadowRealmImportValue: load + evaluate the module through the
+                // existing module pipeline (resolved against the running
+                // script's directory, evaluated with the realm active), then
+                // ExportGetter: the named export must exist; a callable crosses
+                // as a WrappedFunction, a primitive as-is, anything else is a
+                // TypeError. EVERY failure after argument validation REJECTS
+                // the returned promise (never throws synchronously).
+                let export_name = self.display(a1);
+                let settle: Result<Value, Value> =
+                    match self.module_base_dir.as_ref().map(|d| d.join(&spec)) {
+                        None => {
+                            let e = self.alloc_error_from_message(
+                                "TypeError: ShadowRealm.prototype.importValue: no module base",
+                            );
+                            Err(e)
+                        }
+                        Some(path) => {
+                            let prev_realm = self.active_realm;
+                            self.active_realm = Some(this.heap_index());
+                            let imported = self.import_module(&path, None);
+                            self.active_realm = prev_realm;
+                            // A TLA module body promise is not awaited here
+                            // (boundary: sync-completing modules only).
+                            self.pending_module_body = None;
+                            match imported {
+                                Ok(ns) => {
+                                    if !self.has_own_property(ns, &export_name) {
+                                        let e = self.alloc_error_from_message(&format!(
+                                            "TypeError: ShadowRealm.prototype.importValue: no export named '{export_name}'"
+                                        ));
+                                        Err(e)
+                                    } else {
+                                        match self.get_prop(ns, &export_name) {
+                                            Ok(v) if v.is_heap() && self.is_callable(v) => {
+                                                self.shadow_fn_realm
+                                                    .insert(v.heap_index(), this.heap_index());
+                                                match self.wrapped_function_create(v) {
+                                                    Ok(w) => Ok(w),
+                                                    Err(Thrown(msg)) => {
+                                                        let e = match self.pending_throw.take() {
+                                                            Some(t) => t,
+                                                            None => self.alloc_error_from_message(&msg),
+                                                        };
+                                                        Err(e)
+                                                    }
+                                                }
+                                            }
+                                            Ok(v) if self.is_object_value(v) => {
+                                                let e = self.alloc_error_from_message(
+                                                    "TypeError: ShadowRealm.prototype.importValue: export is not a primitive or callable",
+                                                );
+                                                Err(e)
+                                            }
+                                            Ok(v) => Ok(v),
+                                            Err(Thrown(msg)) => {
+                                                let e = match self.pending_throw.take() {
+                                                    Some(t) => t,
+                                                    None => self.alloc_error_from_message(&msg),
+                                                };
+                                                Err(e)
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(Thrown(_)) => {
+                                    // The module failed to load/evaluate: the
+                                    // error cannot cross the boundary — reject
+                                    // with a caller-realm TypeError.
+                                    self.pending_throw.take();
+                                    let e = self.alloc_error_from_message(
+                                        "TypeError: ShadowRealm.prototype.importValue: module evaluation failed",
+                                    );
+                                    Err(e)
+                                }
+                            }
+                        }
+                    };
+                let _gc = self.gc_lock_guard(); // settle value held across alloc
                 let p = self.alloc_promise();
-                let e = self.alloc_error_from_message(
-                    "TypeError: ShadowRealm.prototype.importValue is not supported",
-                );
-                self.reject(p, e);
+                match settle {
+                    Ok(v) => self.resolve(p, v),
+                    Err(e) => self.reject(p, e),
+                }
                 Ok(Value::heap(p))
             }
             _ => Ok(Value::UNDEFINED),
@@ -1016,6 +1097,13 @@ impl<'p> Vm<'p> {
             );
             return Ok(self.set_ctor_proto(fr, over));
         }
+        if ci == self.abstractmodulesource_ctor && ci != 0 {
+            // 28.1.1.1 %AbstractModuleSource% ( ): step 1 — throw a TypeError
+            // (abstract; never directly constructable, even via a subclass).
+            return Err(Thrown(
+                "TypeError: AbstractModuleSource is not constructable".into(),
+            ));
+        }
         if ci == self.shadowrealm_ctor && ci != 0 {
             let over = self.newtarget_proto_override(new_target, cv, self.shadowrealm_proto)?;
             let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
@@ -1335,15 +1423,20 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 let prom = self.alloc_promise();
+                let pair = self.new_resolver_pair();
                 let res = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise: prom, is_reject: false }),
+                    self.heap.alloc(HeapObj::BoundResolver { promise: prom, is_reject: false, pair }),
                 );
                 let rej = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise: prom, is_reject: true }),
+                    self.heap.alloc(HeapObj::BoundResolver { promise: prom, is_reject: true, pair }),
                 );
                 if self.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
                     let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
-                    self.reject(prom, reason);
+                    // Step 10.a Call([[Reject]]): no-op once the pair fired
+                    // (resolve-then-throw keeps the resolution).
+                    if self.resolver_pair_fire(pair) {
+                        self.reject(prom, reason);
+                    }
                 }
                 return Ok(self.set_ctor_proto(Value::heap(prom), over));
             }
@@ -1804,13 +1897,19 @@ impl<'p> Vm<'p> {
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
-            let res =
-                Value::heap(self.heap.alloc(HeapObj::BoundResolver { promise: oidx, is_reject: false }));
-            let rej =
-                Value::heap(self.heap.alloc(HeapObj::BoundResolver { promise: oidx, is_reject: true }));
+            let pair = self.new_resolver_pair();
+            let res = Value::heap(
+                self.heap.alloc(HeapObj::BoundResolver { promise: oidx, is_reject: false, pair }),
+            );
+            let rej = Value::heap(
+                self.heap.alloc(HeapObj::BoundResolver { promise: oidx, is_reject: true, pair }),
+            );
             if self.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
                 let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
-                self.reject(oidx, reason);
+                // Step 10.a Call([[Reject]]): no-op once the pair fired.
+                if self.resolver_pair_fire(pair) {
+                    self.reject(oidx, reason);
+                }
             }
             return Ok(true);
         }

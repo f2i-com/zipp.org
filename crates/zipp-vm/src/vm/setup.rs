@@ -599,6 +599,17 @@ impl<'p> Vm<'p> {
             ],
             Some(promise_proto),
         );
+        // The INTRINSIC %Promise% / %Promise.prototype.then% identities, for the
+        // resolve()-adoption fast-path observability check
+        // (promise_adoption_unobservable).
+        self.promise_ctor_intrinsic = promise_ctor;
+        if let HeapObj::Object(m) = self.heap.get(promise_proto) {
+            if let Some(v) = m.get("then") {
+                if v.is_heap() {
+                    self.promise_then_intrinsic = v.heap_index();
+                }
+            }
+        }
         // `Reflect`: a namespace object (no .prototype) of static methods that
         // mostly delegate to the existing property machinery.
         let reflect_ctor = build(
@@ -2248,6 +2259,48 @@ impl<'p> Vm<'p> {
                 m.define("constructor", Value::heap(ctor), method_attr);
             }
         }
+        // %AbstractModuleSource% (source-phase-imports): an abstract ctor that
+        // always throws; reached via `$262.AbstractModuleSource` (not a global).
+        // ctor: name "AbstractModuleSource", length 0, [[Prototype]] =
+        // %Function.prototype%, .prototype {w:false,e:false,c:false}. proto:
+        // [[Prototype]] = %Object.prototype%, constructor back-ref, and a
+        // @@toStringTag ACCESSOR (getter-only, set undefined, {e:false,c:true}).
+        {
+            let nameish = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let p = build(self, &[], None);
+            self.proto_of.insert(p, Value::heap(obj_proto));
+            let tag_get = Value::heap(
+                self.heap.alloc(HeapObj::Native(native::ABSTRACT_MODULE_SOURCE_TAG_GET)),
+            );
+            let tag_acc = PropAttr {
+                writable: false,
+                enumerable: false,
+                configurable: true,
+                accessor: true,
+                setter: Value::UNDEFINED,
+            };
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("@@toStringTag", tag_get, tag_acc);
+            }
+            self.abstractmodulesource_proto = p;
+            let ctor = build(self, &[], Some(p));
+            self.proto_of.insert(ctor, Value::heap(self.fn_proto));
+            let name_v = self.alloc_str("AbstractModuleSource".to_string());
+            if let HeapObj::Object(m) = self.heap.get_mut(ctor) {
+                m.define("name", name_v, nameish);
+                m.define("length", Value::num(0.0), nameish);
+            }
+            self.abstractmodulesource_ctor = ctor;
+            if let HeapObj::Object(m) = self.heap.get_mut(p) {
+                m.define("constructor", Value::heap(ctor), method_attr);
+            }
+        }
         // Bare global functions as first-class values (the call form is GlobalFn).
         // parse_int_fn/parse_float_fn were allocated up front (shared with Number.*).
         let is_nan_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_NAN));
@@ -2314,6 +2367,11 @@ impl<'p> Vm<'p> {
         d262.define("gc", d262_gc, method_attr);
         d262.define("createRealm", d262_create_realm, method_attr);
         d262.define("IsHTMLDDA", Value::heap(d262_htmldda), method_attr);
+        d262.define(
+            "AbstractModuleSource",
+            Value::heap(self.abstractmodulesource_ctor),
+            method_attr,
+        );
         self.dollar262 = self.heap.alloc(HeapObj::Object(d262));
         // Inject into the reserved global slots (collect first to end the program
         // borrow before mutating `self.globals`).

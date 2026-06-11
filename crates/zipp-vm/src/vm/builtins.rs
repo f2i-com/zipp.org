@@ -108,6 +108,13 @@ impl<'p> Vm<'p> {
                 "bind" => {
                     let this = args.first().copied().unwrap_or(Value::UNDEFINED);
                     let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+                    // Spec 20.2.3.2 steps 3-5 (mirrors FN_BIND): the
+                    // HasOwnProperty(length) → Get(length) → Get(name) reads are
+                    // OBSERVABLE; a throwing accessor propagates here.
+                    if self.has_own_property(recv, "length") {
+                        let _ = self.get_prop(recv, "length")?;
+                    }
+                    let _ = self.get_prop(recv, "name")?;
                     let b = self.heap.alloc(HeapObj::Bound { target: recv, this, args: bound });
                     return Ok(Some(Value::heap(b)));
                 }
@@ -207,15 +214,22 @@ impl<'p> Vm<'p> {
             HeapObj::Generator { .. } => self.generator_method(idx, name, args),
             HeapObj::AsyncGenerator(_) => Ok(self.async_generator_method(idx, name, args)),
             HeapObj::Promise { .. } => {
-                // An OWN (shadowing) `then`/`catch`/`finally` — e.g. a test that
-                // does `p.then = fn` to observe how the built-in invokes it — must
-                // win over the intrinsic. Defer to the caller's get_prop +
-                // call_value so the override runs (mirrors the toString/valueOf
-                // deferral above). Unshadowed promises take the inline path.
-                if self.has_own_property(recv, name) {
-                    Ok(None)
-                } else {
+                // `then`/`catch`/`finally` must resolve through the receiver's
+                // WHOLE prototype chain — an OWN shadow (`p.then = fn`), a
+                // patched `Promise.prototype.then`, or a subclass override must
+                // win over the intrinsic (tests observe those calls). Only when
+                // the chain resolves to the matching kind-7 intrinsic native
+                // does the inline path fire; otherwise defer to the caller's
+                // get_prop + call_value so the override runs.
+                let m = self.get_prop(recv, name)?;
+                let is_intrinsic = m.is_heap()
+                    && matches!(self.heap.get(m.heap_index()),
+                                HeapObj::Native(id) if native::proto_method(*id)
+                                    .is_some_and(|(n, k, _)| k == 7 && n == name));
+                if is_intrinsic {
                     self.promise_method(idx, name, args)
+                } else {
+                    Ok(None)
                 }
             }
             HeapObj::Date(_) => self.date_method(idx, name, args),

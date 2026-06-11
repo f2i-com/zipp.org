@@ -1105,13 +1105,60 @@ impl<'p> Vm<'p> {
             let has_name = self.callable_has_intrinsic(obj, "name");
             match self.heap.get(idx) {
                 // Private names (stored as "#x") are not reflectable own properties.
-                HeapObj::Object(m) => keys.extend(
-                    spec_key_order(&m.keys)
-                        .into_iter()
-                        .map(|i| &m.keys[i])
-                        .filter(|k| !is_hidden_key(k))
-                        .cloned(),
-                ),
+                HeapObj::Object(m) => {
+                    keys.extend(
+                        spec_key_order(&m.keys)
+                            .into_iter()
+                            .map(|i| &m.keys[i])
+                            .filter(|k| !is_hidden_key(k))
+                            .cloned(),
+                    );
+                    // The GLOBAL object: builtin globals (Object, Math, NaN, …)
+                    // and the program's INITIALIZED var/function globals are
+                    // slot-backed routed own properties, not ObjMap entries —
+                    // surface them for getOwnPropertyNames/Reflect.ownKeys.
+                    // Top-level let/const are NOT global-object properties, a
+                    // never-initialized slot does not exist, and a
+                    // `delete globalThis.X`'d builtin stays gone.
+                    // (Skipped inside a child-realm evaluation: the realm's
+                    // global surface is its OWN binding table, and a
+                    // ShadowRealm's globalThis must expose only configurable
+                    // properties.)
+                    if idx == self.global_this && self.global_this != 0 && self.active_realm.is_none() {
+                        let mut seen: std::collections::HashSet<String> =
+                            keys.iter().cloned().collect();
+                        for n in ["NaN", "Infinity", "undefined"] {
+                            if !self.deleted_globals.contains(n) && seen.insert(n.to_string()) {
+                                keys.push(n.to_string());
+                            }
+                        }
+                        for (i, name) in self.program.global_names.iter().enumerate() {
+                            let v =
+                                self.globals.get(i).copied().unwrap_or(Value::UNINITIALIZED);
+                            if v.is_uninitialized()
+                                || is_hidden_key(name)
+                                || self.program.lexical_globals.contains(&(i as u32))
+                                || self.deleted_globals.contains(name)
+                            {
+                                continue;
+                            }
+                            if seen.insert(name.clone()) {
+                                keys.push(name.clone());
+                            }
+                        }
+                        // Builtins the program never referenced (no slot).
+                        let mut extra: Vec<String> = self
+                            .builtin_globals
+                            .keys()
+                            .filter(|n| {
+                                !self.deleted_globals.contains(*n) && !seen.contains(*n)
+                            })
+                            .cloned()
+                            .collect();
+                        extra.sort_unstable();
+                        keys.extend(extra);
+                    }
+                }
                 HeapObj::Array(items) => {
                     let dense_len = items.len();
                     for i in 0..dense_len {
@@ -1268,17 +1315,42 @@ impl<'p> Vm<'p> {
                         );
                     }
                 }
-                // A String exotic (boxed `new String(s)` or a raw string): the
-                // character indices `0..length` first, then `length`, then any named
-                // own prop assigned to the wrapper.
+                // A String exotic (boxed `new String(s)` or a raw string): ALL
+                // integer-index keys first ascending — the character indices
+                // `0..length` plus any ASSIGNED index past them — then `length`,
+                // then the named own props in creation order.
                 HeapObj::Boxed { kind: 0, .. } | HeapObj::Str(_) | HeapObj::Cons { .. } => {
                     if let Some((_, len)) = self.string_exotic_chars(obj) {
                         for i in 0..len {
                             keys.push(i.to_string());
                         }
+                        if let Some(m) = self.arr_props.get(&idx) {
+                            let mut extra: Vec<usize> = m
+                                .keys
+                                .iter()
+                                .filter(|k| !is_hidden_key(k))
+                                .filter_map(|k| {
+                                    canonical_index_str(k)
+                                        .filter(|n| *n < 4_294_967_295 && *n >= len)
+                                })
+                                .collect();
+                            extra.sort_unstable();
+                            keys.extend(extra.into_iter().map(|n| n.to_string()));
+                        }
                         keys.push("length".to_string());
-                    }
-                    if let Some(m) = self.arr_props.get(&idx) {
+                        if let Some(m) = self.arr_props.get(&idx) {
+                            keys.extend(
+                                m.keys
+                                    .iter()
+                                    .filter(|k| {
+                                        !is_hidden_key(k)
+                                            && canonical_index_str(k)
+                                                .map_or(true, |n| n >= 4_294_967_295)
+                                    })
+                                    .cloned(),
+                            );
+                        }
+                    } else if let Some(m) = self.arr_props.get(&idx) {
                         keys.extend(m.keys.iter().filter(|k| !is_hidden_key(k)).cloned());
                     }
                 }
@@ -1957,6 +2029,14 @@ impl<'p> Vm<'p> {
                             }
                             let t_wr = self.get_prop(target_desc, "writable")?;
                             let t_writable = self.truthy(t_wr);
+                            // Step 16.c: a non-configurable WRITABLE data prop
+                            // cannot be reported non-writable by the trap.
+                            let t_is_data = self.has_property_str(target_desc, "writable");
+                            if t_is_data && t_writable && wr == Some(false) {
+                                return Err(Thrown(
+                                    "TypeError: proxy can't report a non-configurable writable target property as non-writable".into(),
+                                ));
+                            }
                             if !t_writable {
                                 if wr == Some(true) {
                                     return Err(Thrown(
@@ -2286,6 +2366,38 @@ impl<'p> Vm<'p> {
             }
             return Ok(());
         }
+        // A String WRAPPER's char indices and `length` are exotic NON-WRITABLE,
+        // NON-CONFIGURABLE data properties: a redefinition must satisfy
+        // ValidateAndApplyPropertyDescriptor against that descriptor (same
+        // value, no accessor, no flag escalation) — else TypeError.
+        if matches!(self.heap.get(idx), HeapObj::Boxed { kind: 0, .. }) {
+            if let Some((sval, len)) = self.string_exotic_chars(obj) {
+                let is_char =
+                    key.parse::<usize>().is_ok_and(|i| i.to_string() == key && i < len);
+                if is_char || key == "length" {
+                    let cur = if is_char {
+                        let i: usize = key.parse().unwrap();
+                        self.get_index(sval, Value::num(i as f64)).unwrap_or(Value::UNDEFINED)
+                    } else {
+                        Value::num(len as f64)
+                    };
+                    let (value, get, set, wr, en, cf) = self.read_descriptor(desc)?;
+                    let bad = get.is_some()
+                        || set.is_some()
+                        || cf == Some(true)
+                        || wr == Some(true)
+                        || (is_char && en == Some(false))
+                        || (!is_char && en == Some(true))
+                        || value.is_some_and(|v| !self.same_value(v, cur));
+                    if bad {
+                        return Err(Thrown(format!(
+                            "TypeError: Cannot redefine property: {key}"
+                        )));
+                    }
+                    return Ok(());
+                }
+            }
+        }
         // 0 = plain object, 1 = class (own props live in `statics`), 2 = callable
         // (own props live in `fn_props`), 3 = the generic side table `arr_props`
         // (array named props + every other exotic object: Map/Set/Date/Promise/
@@ -2311,6 +2423,16 @@ impl<'p> Vm<'p> {
         // / method has no intrinsic `prototype`, so an explicit one is a real own
         // property (stored in fn_props below).
         if target != 0 && key == "prototype" && self.callable_has_prototype(obj) {
+            // The synthesized `prototype` is {writable:true, enumerable:false,
+            // configurable:false}: converting it to an ACCESSOR — or making it
+            // configurable/enumerable — is an illegal non-configurable
+            // redefinition (a data-value redefine stays accepted-but-unmodelled).
+            let (_v, get, set, _wr, d_en, d_cf) = self.read_descriptor(desc)?;
+            if get.is_some() || set.is_some() || d_cf == Some(true) || d_en == Some(true) {
+                return Err(Thrown(
+                    "TypeError: Cannot redefine property: prototype".into(),
+                ));
+            }
             return Ok(());
         }
         let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
