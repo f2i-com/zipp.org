@@ -4399,6 +4399,30 @@ impl<'p> Vm<'p> {
                         // frame is always the top (and the run_loop stop frame) at
                         // an await, so popping returns to `drive_async`.
                         let v = self.get(base, val);
+                        // Await's PromiseResolve(%Promise%, v): a NATIVE promise
+                        // performs the OBSERVABLE Get(v, "constructor") HERE —
+                        // ordinary dispatch context, where a getter (or its
+                        // throw, via `?` while the frame and its handlers are
+                        // still live) behaves like any user call at the await
+                        // site. Pass-through only when it IS the realm
+                        // %Promise%; otherwise a fresh promise ADOPTS v (the
+                        // spec's NewPromiseCapability route, same extra jobs).
+                        let v = if v.is_heap()
+                            && matches!(self.heap.get(v.heap_index()), HeapObj::Promise { .. })
+                        {
+                            let c = self.get_prop(v, "constructor")?;
+                            let intrinsic =
+                                self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                            if c == intrinsic {
+                                v
+                            } else {
+                                let p = self.alloc_promise();
+                                self.resolve(p, v);
+                                Value::heap(p)
+                            }
+                        } else {
+                            v
+                        };
                         let f = self.frames.pop().unwrap();
                         self.pending_await = Some((v, ip, f.handlers));
                         return Ok(v);
