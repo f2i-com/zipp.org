@@ -206,19 +206,15 @@ impl<'p> Vm<'p> {
                     // 1-char String + re-intern per access (that alloc dominated
                     // `s[i]` scans). O(1) for ASCII (i-th unit == i-th byte); a
                     // multi-byte string decodes the UTF-16 unit at `i` (O(i)) —
-                    // a surrogate half reads as U+FFFD until strings are WTF-8.
+                    // a surrogate half is a REAL 1-unit lone-surrogate string.
                     if s.is_ascii() {
                         return Ok(match s.as_bytes().get(i) {
                             Some(&b) => Value::heap(b as u32),
                             None => Value::UNDEFINED,
                         });
                     }
-                    match s.unit_char(i) {
-                        Some(ch) if (ch as u32) < 128 => return Ok(Value::heap(ch as u32)),
-                        Some(ch) => {
-                            let cs = ch.to_string();
-                            return Ok(self.alloc_str(cs));
-                        }
+                    match s.unit_at(i) {
+                        Some(u) => return Ok(self.str_from_unit(u)),
                         None => return Ok(Value::UNDEFINED),
                     }
                 }

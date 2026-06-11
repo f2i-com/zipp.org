@@ -847,6 +847,12 @@ pub struct FuncProto {
     /// Heap-string constants referenced by `LoadConst` need their text; this
     /// parallels `constants` for the string case (resolved at load time).
     pub string_constants: Vec<String>,
+    /// `string_constants` indices whose text is the oxc LONE-SURROGATE marker
+    /// form (`\u{FFFD}XXXX` per lone surrogate, `\u{FFFD}fffd` for a literal
+    /// U+FFFD — the parser's lossless encoding for `'\uD800'`-style literals).
+    /// `resolve_const` decodes these to real WTF-8 lone surrogates at intern
+    /// time. Sorted (push order is ascending); almost always empty.
+    pub wtf8_consts: Vec<u32>,
     /// If this function's name is hoisted to a global binding, the slot index;
     /// the VM materialises a function object into that global at startup.
     pub name_global: Option<u16>,

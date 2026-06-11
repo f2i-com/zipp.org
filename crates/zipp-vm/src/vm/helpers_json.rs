@@ -12,20 +12,40 @@ pub(crate) fn json_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
+        json_quote_cp(&mut out, c as u32);
     }
     out.push('"');
     out
+}
+
+/// `json_quote` over a string's exact WTF-8 bytes: a LONE surrogate emits the
+/// `\udXXX` escape (QuoteJSONString / ES2019 well-formed JSON.stringify);
+/// well-formed astral scalars emit as-is.
+pub(crate) fn json_quote_wtf8(b: &[u8]) -> String {
+    let mut out = String::with_capacity(b.len() + 2);
+    out.push('"');
+    for cp in crate::heap::wtf8_code_points(b) {
+        json_quote_cp(&mut out, cp);
+    }
+    out.push('"');
+    out
+}
+
+/// One code point of JSON string-literal quoting. `cp` may be a lone
+/// surrogate (escaped — it has no UTF-8 form).
+fn json_quote_cp(out: &mut String, cp: u32) {
+    match cp {
+        0x22 => out.push_str("\\\""),
+        0x5C => out.push_str("\\\\"),
+        0x0A => out.push_str("\\n"),
+        0x0D => out.push_str("\\r"),
+        0x09 => out.push_str("\\t"),
+        0x08 => out.push_str("\\b"),
+        0x0C => out.push_str("\\f"),
+        c if c < 0x20 => out.push_str(&format!("\\u{c:04x}")),
+        c if (0xD800..=0xDFFF).contains(&c) => out.push_str(&format!("\\u{c:04x}")),
+        c => out.push(char::from_u32(c).unwrap_or('\u{FFFD}')),
+    }
 }
 
 pub(crate) fn json_skip_ws(b: &[u8], i: &mut usize) {
@@ -62,55 +82,42 @@ pub(crate) fn json_hex4(b: &[u8], pos: usize) -> Result<u32, Thrown> {
     Ok(v)
 }
 
-/// Parse a JSON string literal starting at the opening `"` (index `*i`), applying
-/// escapes (incl. `\uXXXX` and surrogate pairs). Plain content is flushed as UTF-8
-/// slices so multi-byte characters survive intact.
-pub(crate) fn json_parse_string(src: &str, i: &mut usize) -> Result<String, Thrown> {
-    let b = src.as_bytes();
+/// Parse a JSON string literal starting at the opening `"` (index `*i`),
+/// applying escapes. The result is WTF-8 (a `JsStr`): each `\uXXXX` escape
+/// pushes its CODE UNIT through `wtf8_push_cp`, which combines a high+low
+/// escape pair into the astral scalar and keeps an unpaired surrogate as a
+/// real lone surrogate — an unpaired high followed by a non-low escape does
+/// NOT consume that next escape (each unit is pushed independently). Plain
+/// content is flushed as byte slices so multi-byte characters survive intact.
+pub(crate) fn json_parse_string(src: &[u8], i: &mut usize) -> Result<crate::heap::JsStr, Thrown> {
+    let b = src;
     *i += 1; // opening quote
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     let mut run = *i;
     loop {
         match b.get(*i).copied() {
             None => return Err(Thrown("SyntaxError: Unterminated string in JSON".into())),
             Some(b'"') => {
-                out.push_str(&src[run..*i]);
+                out.extend_from_slice(&b[run..*i]);
                 *i += 1;
-                return Ok(out);
+                return Ok(crate::heap::JsStr::from_wtf8(out));
             }
             Some(b'\\') => {
-                out.push_str(&src[run..*i]); // flush the plain run before the escape
+                out.extend_from_slice(&b[run..*i]); // flush the plain run before the escape
                 *i += 1;
                 match b.get(*i).copied() {
-                    Some(b'"') => out.push('"'),
-                    Some(b'\\') => out.push('\\'),
-                    Some(b'/') => out.push('/'),
-                    Some(b'n') => out.push('\n'),
-                    Some(b'r') => out.push('\r'),
-                    Some(b't') => out.push('\t'),
-                    Some(b'b') => out.push('\u{0008}'),
-                    Some(b'f') => out.push('\u{000c}'),
+                    Some(b'"') => out.push(b'"'),
+                    Some(b'\\') => out.push(b'\\'),
+                    Some(b'/') => out.push(b'/'),
+                    Some(b'n') => out.push(b'\n'),
+                    Some(b'r') => out.push(b'\r'),
+                    Some(b't') => out.push(b'\t'),
+                    Some(b'b') => out.push(0x08),
+                    Some(b'f') => out.push(0x0C),
                     Some(b'u') => {
-                        let cp = json_hex4(b, *i + 1)?;
+                        let cu = json_hex4(b, *i + 1)?;
                         *i += 4; // past the 4 hex (now at the last one)
-                        let ch = if (0xD800..=0xDBFF).contains(&cp) {
-                            // High surrogate: combine with a following \uXXXX low.
-                            if b.get(*i + 1) == Some(&b'\\') && b.get(*i + 2) == Some(&b'u') {
-                                let lo = json_hex4(b, *i + 3)?;
-                                if (0xDC00..=0xDFFF).contains(&lo) {
-                                    *i += 6;
-                                    let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                    char::from_u32(c).unwrap_or('\u{FFFD}')
-                                } else {
-                                    '\u{FFFD}'
-                                }
-                            } else {
-                                '\u{FFFD}'
-                            }
-                        } else {
-                            char::from_u32(cp).unwrap_or('\u{FFFD}')
-                        };
-                        out.push(ch);
+                        crate::heap::wtf8_push_cp(&mut out, cu);
                     }
                     _ => return Err(Thrown("SyntaxError: Invalid escape in JSON string".into())),
                 }

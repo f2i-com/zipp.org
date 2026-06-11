@@ -591,8 +591,22 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
-                let s = self.to_js_string(this)?;
-                let cps: Vec<Value> = s.chars().map(|c| self.alloc_str(c.to_string())).collect();
+                // A string receiver iterates its EXACT code points (a lone
+                // surrogate yields a real 1-unit surrogate string); other
+                // receivers coerce through ToString (observable, may throw).
+                let cp_list: Vec<u32> =
+                    if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
+                        let si = this.heap_index();
+                        self.heap.flatten(si);
+                        match self.heap.get(si) {
+                            HeapObj::Str(js) => js.code_points().collect(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        let s = self.to_js_string(this)?;
+                        s.chars().map(|c| c as u32).collect()
+                    };
+                let cps: Vec<Value> = cp_list.into_iter().map(|cp| self.str_from_cp(cp)).collect();
                 self.make_iterator(cps, self.string_iter_proto)
             }
             SYMBOL_FOR => {
@@ -769,7 +783,11 @@ impl<'p> Vm<'p> {
                         "TypeError: RegExp.escape called with a non-string argument".into(),
                     ));
                 }
-                let s = self.to_js_string(a0)?;
+                // EXACT code points (the argument is a string by the check
+                // above): a lone surrogate must escape as \uNNNN, which the
+                // lossy &str view could never carry.
+                let bytes: Vec<u8> =
+                    self.heap.str_wtf8_cow(a0.heap_index()).unwrap().into_owned();
                 // EncodeForRegExpEscape's "other punctuators" / WhiteSpace /
                 // LineTerminator / lone-surrogate set: hex-escaped (\xNN if <=0xFF,
                 // else \uNNNN per UTF-16 code unit). Tab/VT/FF/LF/CR use the control
@@ -788,8 +806,16 @@ impl<'p> Vm<'p> {
                         || (0xD800..=0xDFFF).contains(&u)
                 };
                 let mut out = String::new();
-                for c in s.chars() {
-                    let u = c as u32;
+                for u in crate::heap::wtf8_code_points(&bytes) {
+                    // A LONE surrogate has no `char`: it is in the `other` set —
+                    // emit its \uNNNN escape directly.
+                    let c = match char::from_u32(u) {
+                        Some(c) => c,
+                        None => {
+                            out.push_str(&format!("\\u{u:04x}"));
+                            continue;
+                        }
+                    };
                     if out.is_empty() && (c.is_ascii_digit() || c.is_ascii_alphabetic()) {
                         // A leading digit/letter is hex-escaped so the escape can't
                         // fuse with a preceding regex token (e.g. \0, a quantifier).
@@ -2230,7 +2256,15 @@ impl<'p> Vm<'p> {
             // (The direct `JSON.parse(x)` call form is compile-lowered to a JSON op;
             // these back the value form + reflection.)
             JSON_PARSE => {
-                let s = self.to_js_string(a0)?;
+                // EXACT input bytes for a string argument: JSON text may carry
+                // raw lone surrogates inside string literals (valid JSON text,
+                // preserved in the parsed value). Non-strings ToString-coerce
+                // (observable, may throw).
+                let s: Vec<u8> = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
+                    self.heap.str_wtf8_cow(a0.heap_index()).unwrap().into_owned()
+                } else {
+                    self.to_js_string(a0)?.into_bytes()
+                };
                 let reviver = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if self.is_callable(reviver) {
                     let _gc = self.gc_lock_guard();
@@ -2284,7 +2318,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 // Validate it parses as one complete JSON value (checks trailing).
-                self.json_parse(&s)?;
+                self.json_parse(s.as_bytes())?;
                 let _gc = self.gc_lock_guard();
                 let sval = self.alloc_str(s);
                 let mut m = crate::heap::ObjMap::new();
@@ -2955,6 +2989,9 @@ impl<'p> Vm<'p> {
             // (decode). Malformed input → URIError.
             GLOBAL_ENCODE_URI => {
                 let s = self.to_js_string(a0)?;
+                // Encode 6.2.c: a LONE surrogate is a URIError. The lossy
+                // coercion above hides it (U+FFFD) — check the exact bytes.
+                self.uri_check_wellformed(a0)?;
                 match uri_encode(&s, b"#;/?:@&=+$,") {
                     Ok(r) => self.alloc_str(r),
                     Err(_) => return Err(Thrown("URIError: URI malformed".into())),
@@ -2962,6 +2999,7 @@ impl<'p> Vm<'p> {
             }
             GLOBAL_ENCODE_URI_COMPONENT => {
                 let s = self.to_js_string(a0)?;
+                self.uri_check_wellformed(a0)?; // lone surrogate -> URIError
                 match uri_encode(&s, b"") {
                     Ok(r) => self.alloc_str(r),
                     Err(_) => return Err(Thrown("URIError: URI malformed".into())),
@@ -3186,22 +3224,25 @@ impl<'p> Vm<'p> {
             }
             // String static methods.
             STR_FROM_CHAR_CODE => {
-                // ToUint16 per arg; adjacent surrogate halves combine — see
-                // `string_from_char_codes`.
-                let s = self.string_from_char_codes(args)?;
-                self.alloc_str(s)
+                // ToUint16 per arg; adjacent surrogate halves combine, a lone
+                // half stays a real lone surrogate — see `string_from_char_codes`.
+                let js = self.string_from_char_codes(args)?;
+                Value::heap(self.heap.alloc_js(js))
             }
             STR_FROM_CODE_POINT => {
-                let mut s = String::new();
+                // WTF-8 build: a surrogate code point passes through as a real
+                // lone surrogate (and a high+low argument pair canonicalizes
+                // into the astral scalar, matching the UTF-16 join semantics).
+                let mut out: Vec<u8> = Vec::with_capacity(args.len());
                 for &v in args {
                     let n = self.to_number_strict(v)?;
                     if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
                         return Err(Thrown(format!("RangeError: Invalid code point {n}")));
                     }
-                    // A lone-surrogate code point can't be a Rust char → replacement.
-                    s.push(char::from_u32(n as u32).unwrap_or('\u{FFFD}'));
+                    crate::heap::wtf8_push_cp(&mut out, n as u32);
                 }
-                self.alloc_str(s)
+                let js = crate::heap::JsStr::from_wtf8(out);
+                Value::heap(self.heap.alloc_js(js))
             }
             // Date static methods as values.
             DATE_NOW => Value::num(
@@ -4210,6 +4251,21 @@ impl<'p> Vm<'p> {
 }
 
 /// The always-unescaped set for the Encode operation: uriAlpha + DecimalDigit +
+impl<'p> Vm<'p> {
+    /// URIError when `v` is a string VALUE containing a lone surrogate
+    /// (Encode step 6.2.c) — the exact WTF-8 check behind the lossy `&str`
+    /// view the URI codecs operate on.
+    fn uri_check_wellformed(&self, v: Value) -> Result<(), Thrown> {
+        if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
+            let b = self.heap.str_wtf8_cow(v.heap_index()).unwrap();
+            if !crate::heap::wtf8_is_wellformed(&b) {
+                return Err(Thrown("URIError: URI malformed".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// uriMark. (encodeURI additionally keeps uriReserved + "#"; those extra chars
 /// are passed in by the caller.)
 const URI_UNESCAPED: &[u8] =

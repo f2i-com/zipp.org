@@ -250,6 +250,21 @@ impl<'p> Vm<'p> {
     /// object (ToPrimitive with the string hint). Primitives and engine strings use
     /// `display`; a plain object with only the built-in (native) toString also falls
     /// back to `display` (which already yields "[object Object]" / the array join).
+    /// `ToString(v)` as a string VALUE: IDENTITY (the same heap string — exact
+    /// WTF-8 content, lone surrogates preserved) when `v` is already a string;
+    /// otherwise the `to_js_string` coercion (observable, may throw),
+    /// allocated. Use this wherever the coerced string becomes a VALUE the
+    /// program can read back (ToStr op, String(x), error.message, …) — the
+    /// `to_js_string` + `alloc_str` pair would silently lossy-copy a
+    /// lone-surrogate string.
+    pub(crate) fn to_str_value(&mut self, v: Value) -> Result<Value, Thrown> {
+        if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
+            return Ok(v);
+        }
+        let s = self.to_js_string(v)?;
+        Ok(self.alloc_str(s))
+    }
+
     pub(crate) fn to_js_string(&mut self, v: Value) -> Result<String, Thrown> {
         if !v.is_heap() || self.heap.is_str_like(v.heap_index()) {
             return Ok(self.display(v));
@@ -609,22 +624,24 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // General: materialise `val`'s string form (same coercion as `+`).
+        // General: materialise `val`'s EXACT (WTF-8) string form (same coercion
+        // as `+`) — `push_wtf8` canonicalizes a high+low surrogate seam.
         let ri = self.to_str_idx(val);
-        let add: String = self.heap.str_cow(ri).map(|c| c.into_owned()).unwrap_or_default();
+        let add: Vec<u8> =
+            self.heap.str_wtf8_cow(ri).map(|c| c.into_owned()).unwrap_or_default();
         if mutable {
             if let HeapObj::Str(js) = self.heap.get_mut(acc.heap_index()) {
-                js.push_str(&add); // updates the cached unit length + ascii flag
+                js.push_wtf8(&add); // updates the cached unit length + ascii flag
                 return acc;
             }
         }
         // Fresh buffer (first append / interned / rope acc): flatten acc + add into
         // a NON-interned `Str` (bypass `alloc_str`'s interning so it's mutable next).
         let li = self.to_str_idx(acc);
-        let mut s: String =
-            self.heap.str_cow(li).map(|c| c.into_owned()).unwrap_or_default();
-        s.push_str(&add);
-        Value::heap(self.heap.alloc(HeapObj::Str(crate::heap::JsStr::new(s))))
+        let mut s: Vec<u8> =
+            self.heap.str_wtf8_cow(li).map(|c| c.into_owned()).unwrap_or_default();
+        crate::heap::wtf8_push(&mut s, &add);
+        Value::heap(self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_wtf8(s))))
     }
 
     /// Heap index of a string-like object representing `v`: `v`'s own index when
@@ -766,8 +783,8 @@ impl<'p> Vm<'p> {
             && self.heap.is_str_like(va.heap_index())
             && self.heap.is_str_like(vb.heap_index())
         {
-            let sa = self.heap.str_cow(va.heap_index())?;
-            let sb = self.heap.str_cow(vb.heap_index())?;
+            let sa = self.heap.str_wtf8_cow(va.heap_index())?;
+            let sb = self.heap.str_wtf8_cow(vb.heap_index())?;
             let (a, b) = (sa.as_ref(), sb.as_ref());
             // Fast path: ASCII byte order == UTF-16 code-unit order (and
             // `is_ascii` is vectorised), so the hot common case stays a byte cmp.
@@ -776,9 +793,11 @@ impl<'p> Vm<'p> {
             }
             // Non-ASCII: an astral (>BMP) char is a UTF-16 surrogate pair
             // (0xD800–0xDBFF) that sorts BELOW the 0xE000–0xFFFF BMP range, so a
-            // Rust &str (code-point) cmp is wrong. Compare by UTF-16 code units —
-            // identical to a byte cmp for BMP-only strings, just slower.
-            return Some(a.encode_utf16().cmp(b.encode_utf16()));
+            // byte (code-point-order) cmp is wrong. Compare by UTF-16 code units
+            // over the WTF-8 bytes — a LONE surrogate orders by its own unit
+            // value, an astral scalar by its lead surrogate first (the
+            // `wtf8_units_iter` decode), exactly the spec's unit order.
+            return Some(crate::heap::wtf8_units_iter(a).cmp(crate::heap::wtf8_units_iter(b)));
         }
         None
     }
@@ -1230,11 +1249,10 @@ impl<'p> Vm<'p> {
                 HeapObj::Temporal { kind: 7, .. } => self.zdt_to_string(v.heap_index()),
                 HeapObj::Temporal { .. } => "[object Temporal]".into(),
                 HeapObj::Intl { .. } => "[object Object]".into(),
-                HeapObj::Str(s) => s.as_str().to_string(),
+                // Display is a LOSSY observation: a lone surrogate reads U+FFFD.
+                HeapObj::Str(s) => s.to_lossy_string(),
                 HeapObj::Cons { .. } => {
-                    let mut out = String::new();
-                    self.heap.write_str(v.heap_index(), &mut out);
-                    out
+                    self.heap.str_cow(v.heap_index()).map(|c| c.into_owned()).unwrap_or_default()
                 }
                 HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) => {
                     "function".into()
@@ -1309,11 +1327,14 @@ impl<'p> Vm<'p> {
     pub(crate) fn inspect(&self, v: Value) -> String {
         if v.is_heap() {
             match self.heap.get(v.heap_index()) {
-                HeapObj::Str(s) => return s.as_str().to_string(), // top-level strings unquoted
+                // Top-level strings unquoted; LOSSY (console rendering).
+                HeapObj::Str(s) => return s.to_lossy_string(),
                 HeapObj::Cons { .. } => {
-                    let mut out = String::new();
-                    self.heap.write_str(v.heap_index(), &mut out);
-                    return out;
+                    return self
+                        .heap
+                        .str_cow(v.heap_index())
+                        .map(|c| c.into_owned())
+                        .unwrap_or_default();
                 }
                 _ => return self.inspect_nested(v),
             }
@@ -1391,10 +1412,10 @@ impl<'p> Vm<'p> {
                 ];
                 format!("Intl.{} {{}}", NAMES.get(*kind as usize).copied().unwrap_or("?"))
             }
-            HeapObj::Str(s) => format!("'{}'", s.as_str()),
+            HeapObj::Str(s) => format!("'{}'", s.as_str_lossy()),
             HeapObj::Cons { .. } => {
-                let mut out = String::new();
-                self.heap.write_str(v.heap_index(), &mut out);
+                let out =
+                    self.heap.str_cow(v.heap_index()).map(|c| c.into_owned()).unwrap_or_default();
                 format!("'{out}'")
             }
             HeapObj::Func(id) => self.func_label(*id),
@@ -1522,12 +1543,21 @@ impl<'p> Vm<'p> {
     /// Resolve a constant slot: most are plain Values; string constants are
     /// stored as a sentinel index into the function's `string_constants` and
     /// interned to a heap string on first use.
+    /// A `wtf8_consts`-flagged slot holds the oxc lone-surrogate MARKER form —
+    /// decoded here into a real WTF-8 string (this is where `'\uD800'` becomes
+    /// a 1-unit lone-surrogate string).
     #[inline]
     pub(crate) fn resolve_const(&mut self, func_id: u32, v: Value) -> Value {
         // String constants are encoded as `Value::heap(STRING_CONST_BIT | i)`.
         if v.is_heap() && (v.heap_index() & STRING_CONST_BIT) != 0 {
             let si = (v.heap_index() & !STRING_CONST_BIT) as usize;
-            let s = self.func(func_id as usize).string_constants[si].clone();
+            let f = self.func(func_id as usize);
+            if !f.wtf8_consts.is_empty() && f.wtf8_consts.binary_search(&(si as u32)).is_ok() {
+                let bytes = crate::heap::decode_lone_surrogate_markers(&f.string_constants[si]);
+                let js = crate::heap::JsStr::from_wtf8(bytes);
+                return Value::heap(self.heap.alloc_js(js));
+            }
+            let s = f.string_constants[si].clone();
             return self.alloc_str(s);
         }
         v

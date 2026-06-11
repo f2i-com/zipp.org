@@ -1026,7 +1026,13 @@ impl Compiler {
             // strict"). Directives run before the body, so seed the completion with
             // each (the last wins) — body expression statements then overwrite it.
             for d in directives {
-                let idx = fc.add_string_const(d.expression.value.as_str());
+                // A directive's literal may carry lone surrogates
+                // (`eval("'\uD800'")` completes with the 1-unit string).
+                let idx = if d.expression.lone_surrogates {
+                    fc.add_string_const_wtf8(d.expression.value.as_str())
+                } else {
+                    fc.add_string_const(d.expression.value.as_str())
+                };
                 fc.emit(Instr::LoadConst { dst: cr, idx });
             }
         }
@@ -1502,6 +1508,7 @@ impl Compiler {
             simple_params: params_ast.map(params_are_simple).unwrap_or(false),
             constants: fc.constants,
             string_constants: fc.string_constants,
+            wtf8_consts: fc.wtf8_consts,
             name_global: None, // set by the caller for top-level declarations
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
@@ -1690,6 +1697,7 @@ impl Compiler {
             simple_params: false, // strict (class body) — never mapped anyway
             constants: fc.constants,
             string_constants: fc.string_constants,
+            wtf8_consts: fc.wtf8_consts,
             name_global: None,
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
@@ -1800,6 +1808,7 @@ impl Compiler {
             simple_params: false, // an arrow has no own `arguments`
             constants: fc.constants,
             string_constants: fc.string_constants,
+            wtf8_consts: fc.wtf8_consts,
             name_global: None,
             upvalues,
             eval_sites: std::mem::take(&mut fc.eval_sites),
@@ -1891,6 +1900,7 @@ fn placeholder(name: &str) -> FuncProto {
         simple_params: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
+        wtf8_consts: Vec::new(),
         name_global: None,
         upvalues: Vec::new(),
         eval_sites: Vec::new(),
@@ -1917,6 +1927,9 @@ struct FnCompiler<'a> {
     code: Vec<Instr>,
     constants: Vec<Value>,
     string_constants: Vec<String>,
+    /// `string_constants` indices holding the oxc lone-surrogate MARKER form
+    /// (see `Function::wtf8_consts`).
+    wtf8_consts: Vec<u32>,
     /// Lexical scope chain: each entry is (name, register).
     scopes: Vec<Vec<(String, Reg)>>,
     /// Next free register / high-water mark.
@@ -2154,6 +2167,7 @@ impl<'a> FnCompiler<'a> {
             code: Vec::new(),
             constants: Vec::new(),
             string_constants: Vec::new(),
+            wtf8_consts: Vec::new(),
             scopes: vec![Vec::new()],
             next_reg: 0,
             max_reg: 0,
@@ -2483,6 +2497,18 @@ impl<'a> FnCompiler<'a> {
         let si = self.string_constants.len() as u32;
         self.string_constants.push(s.to_string());
         // Encode as a "pending string" heap Value the VM interns on first load.
+        let v = Value::heap(STRING_CONST_BIT | si);
+        self.add_const(v)
+    }
+
+    /// `add_string_const` for a literal oxc flagged `.lone_surrogates`: the
+    /// text is the lossless MARKER form (`\u{FFFD}XXXX` per lone surrogate);
+    /// recording the index makes `resolve_const` decode it to real WTF-8 lone
+    /// surrogates at intern time.
+    fn add_string_const_wtf8(&mut self, s: &str) -> u32 {
+        let si = self.string_constants.len() as u32;
+        self.wtf8_consts.push(si);
+        self.string_constants.push(s.to_string());
         let v = Value::heap(STRING_CONST_BIT | si);
         self.add_const(v)
     }
@@ -3397,7 +3423,7 @@ impl<'a> FnCompiler<'a> {
         }
         let name = match key {
             ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-            ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
+            ox::PropertyKey::StringLiteral(s) => string_literal_key(s),
             ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
                                 ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
             _ => return Err("unsupported destructuring property key".into()),
@@ -5748,7 +5774,13 @@ impl<'a> FnCompiler<'a> {
                 Ok(dst)
             }
             E::StringLiteral(s) => {
-                let idx = self.add_string_const(s.value.as_str());
+                // `.lone_surrogates` literals carry the oxc marker encoding —
+                // route through the WTF-8-decoding constant slot.
+                let idx = if s.lone_surrogates {
+                    self.add_string_const_wtf8(s.value.as_str())
+                } else {
+                    self.add_string_const(s.value.as_str())
+                };
                 self.emit(Instr::LoadConst { dst, idx });
                 Ok(dst)
             }
@@ -5759,8 +5791,13 @@ impl<'a> FnCompiler<'a> {
                 // hint tries `valueOf` before `toString` (wrong for e.g. a Temporal
                 // value, whose `valueOf` throws). After ToStr both operands are
                 // strings, so each `+` is a pure (rope) concat.
-                let q0 = t.quasis[0].value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
-                let idx = self.add_string_const(q0);
+                let q0e = &t.quasis[0];
+                let q0 = q0e.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
+                let idx = if q0e.lone_surrogates {
+                    self.add_string_const_wtf8(q0)
+                } else {
+                    self.add_string_const(q0)
+                };
                 self.emit(Instr::LoadConst { dst, idx });
                 for (i, e) in t.expressions.iter().enumerate() {
                     let r = self.expr(e)?;
@@ -5770,7 +5807,11 @@ impl<'a> FnCompiler<'a> {
                     if let Some(qe) = t.quasis.get(i + 1) {
                         let q = qe.value.cooked.as_ref().map(|s| s.as_str()).unwrap_or("");
                         if !q.is_empty() {
-                            let qidx = self.add_string_const(q);
+                            let qidx = if qe.lone_surrogates {
+                                self.add_string_const_wtf8(q)
+                            } else {
+                                self.add_string_const(q)
+                            };
                             let qr = self.temp();
                             self.emit(Instr::LoadConst { dst: qr, idx: qidx });
                             self.emit(Instr::Add { dst, a: dst, b: qr });
@@ -6401,7 +6442,14 @@ impl<'a> FnCompiler<'a> {
             let r = self.alloc_reg();
             match q.value.cooked.as_ref() {
                 Some(s) => {
-                    let idx = self.add_string_const(s.as_str());
+                    // A `.lone_surrogates` quasi cooks to the oxc marker form —
+                    // decode to real WTF-8 at intern time. (Raw parts below are
+                    // source text — never markers.)
+                    let idx = if q.lone_surrogates {
+                        self.add_string_const_wtf8(s.as_str())
+                    } else {
+                        self.add_string_const(s.as_str())
+                    };
                     self.emit(Instr::LoadConst { dst: r, idx });
                 }
                 None => self.emit(Instr::LoadUndefined { dst: r }),
@@ -6521,7 +6569,7 @@ impl<'a> FnCompiler<'a> {
                         } else {
                             let k = match &p.key {
                                 ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                                ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                                ox::PropertyKey::StringLiteral(s) => string_literal_key(s),
                                 ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
                                 ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
                                 _ => return Err("unsupported accessor key in the zipp-vm subset".into()),
@@ -6596,7 +6644,7 @@ impl<'a> FnCompiler<'a> {
                         // Static identifier / string / number literal key.
                         let key = match &p.key {
                             ox::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
-                            ox::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                            ox::PropertyKey::StringLiteral(s) => string_literal_key(s),
                             ox::PropertyKey::NumericLiteral(n) => fmt_key_num(n.value),
                                 ox::PropertyKey::BigIntLiteral(b) => b.value.to_string(),
                             _ => return Err("unsupported object key in the zipp-vm subset".into()),
@@ -9667,7 +9715,21 @@ fn module_export_name(n: &ox::ModuleExportName) -> String {
     match n {
         ox::ModuleExportName::IdentifierName(id) => id.name.to_string(),
         ox::ModuleExportName::IdentifierReference(id) => id.name.to_string(),
-        ox::ModuleExportName::StringLiteral(s) => s.value.to_string(),
+        ox::ModuleExportName::StringLiteral(s) => string_literal_key(s),
+    }
+}
+
+/// A string-literal PROPERTY KEY's text. Property keys are Rust `String`s
+/// engine-wide (`ObjMap.keys`), which cannot hold a lone surrogate — a
+/// `.lone_surrogates` key decodes LOSSILY (each lone surrogate → U+FFFD, so
+/// two distinct lone-surrogate keys collide). Documented stage-2 limit.
+fn string_literal_key(s: &ox::StringLiteral) -> String {
+    if s.lone_surrogates {
+        crate::heap::wtf8_into_lossy_string(crate::heap::decode_lone_surrogate_markers(
+            s.value.as_str(),
+        ))
+    } else {
+        s.value.to_string()
     }
 }
 
@@ -9676,7 +9738,7 @@ fn module_export_name(n: &ox::ModuleExportName) -> String {
 fn class_key_name(key: &ox::PropertyKey) -> R<String> {
     match key {
         ox::PropertyKey::StaticIdentifier(id) => Ok(id.name.to_string()),
-        ox::PropertyKey::StringLiteral(s) => Ok(s.value.to_string()),
+        ox::PropertyKey::StringLiteral(s) => Ok(string_literal_key(s)),
         ox::PropertyKey::NumericLiteral(n) => Ok(fmt_key_num(n.value)),
         // A BigInt key's property name is its base-10 value string.
         ox::PropertyKey::BigIntLiteral(b) => Ok(b.value.to_string()),

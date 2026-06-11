@@ -178,20 +178,29 @@ impl ObjMap {
 }
 
 /// A flat (contiguous) JS string with cached metadata so `.length` and indexing
-/// are O(1) for the common all-ASCII case. `bytes` is always well-formed UTF-8
-/// at this stage (a lone surrogate is not representable — a WTF-8 payload is a
-/// later stage, which is why the fields are PRIVATE: every access funnels
-/// through the accessors below, so the representation can change under them).
-/// `units` caches the string's length in UTF-16 CODE UNITS — the measure of
-/// every JS-observable string position (`.length`, `charCodeAt`, `slice`, …).
-/// `ascii` flags the all-ASCII case, where the i-th unit is the i-th byte —
-/// O(1) random access. Non-ASCII strings decode with an O(i) walk (correct,
-/// just slower — matching the previous `chars().nth(i)` cost model).
+/// are O(1) for the common all-ASCII case. `bytes` holds WTF-8: well-formed
+/// UTF-8 for the overwhelmingly common case, PLUS lone surrogates (which JS
+/// strings can contain but UTF-8 prohibits) encoded as the 3-byte sequence
+/// UTF-8 *would* use for their code point: `0xED 0xA0-0xBF 0x80-0xBF` (high
+/// halves `0xED 0xA0-0xAF ..`, low halves `0xED 0xB0-0xBF ..`). The buffer is
+/// kept CANONICAL — an encoded high surrogate is never immediately followed by
+/// an encoded low surrogate (that pair is always stored as the astral scalar's
+/// 4-byte encoding; see `wtf8_push`/`wtf8_push_cp`) — so byte equality remains
+/// content equality. The fields are PRIVATE: every access funnels through the
+/// accessors below, which decode WTF-8 (never `from_utf8_unchecked` over
+/// surrogate bytes — that would be UB through `str`'s validity invariant).
+/// `units` caches the length in UTF-16 CODE UNITS — the measure of every
+/// JS-observable string position (`.length`, `charCodeAt`, `slice`, …); a lone
+/// surrogate is 1 unit, an astral scalar 2. `ascii` flags the all-ASCII case,
+/// where the i-th unit is the i-th byte — O(1) random access. `wellformed`
+/// (no lone surrogates ⇔ the bytes are valid UTF-8) is computed once at
+/// construction; only well-formed strings may be viewed as `&str`.
 #[derive(Clone, Debug)]
 pub struct JsStr {
-    bytes: String,
+    bytes: Vec<u8>,
     units: usize,
     ascii: bool,
+    wellformed: bool,
 }
 
 /// UTF-16 code units contributed by one Unicode scalar: 1 for BMP, 2 for an
@@ -246,54 +255,22 @@ pub fn unit_to_byte(s: &str, u: usize) -> usize {
     unit_byte_bounds(s, u).1
 }
 
-/// Substring of `s` by UNIT positions `[a, b)`. A bound that splits a surrogate
-/// pair keeps U+FFFD for the covered half (a lone surrogate is not yet
-/// representable; the WTF-8 stage makes this exact). Pair-splitting bounds are
-/// the rare case — BMP-only positions slice exactly.
-pub fn slice_units_str(s: &str, a: usize, b: usize) -> String {
-    if a >= b {
-        return String::new();
-    }
-    let mut out = String::new();
-    let mut pos = 0usize;
-    for c in s.chars() {
-        if pos >= b {
-            break;
-        }
-        let n = char_units(c);
-        if pos >= a && pos + n <= b {
-            out.push(c);
-        } else if n == 2 && ((pos >= a && pos < b) || (pos + 1 >= a && pos + 1 < b)) {
-            // The window covers exactly one half of this pair.
-            out.push('\u{FFFD}');
-        }
-        pos += n;
-    }
-    out
-}
+// ── WTF-8 primitives ──
+// The byte-level helpers every accessor builds on. All of them treat the
+// surrogate range exactly like any other 3-byte sequence; none of them ever
+// construct a `&str` over the bytes.
 
-/// The chars of `s` exploded into 1-UNIT pieces: each BMP scalar itself; an
-/// astral scalar contributes TWO pieces (its surrogate halves — degraded to
-/// U+FFFD until the WTF-8 stage). Backs `split('')` and string spread-into-
-/// object, whose elements are 1-unit strings per spec.
-pub fn unit_chars(s: &str) -> Vec<char> {
-    let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        if char_units(c) == 1 {
-            out.push(c);
-        } else {
-            out.push('\u{FFFD}');
-            out.push('\u{FFFD}');
-        }
-    }
-    out
-}
-
-/// The `off`-th UTF-16 unit of scalar `c` (`off` 0 = the scalar itself / the
-/// high surrogate; 1 = the low surrogate of an astral scalar).
+/// UTF-16 code units contributed by code point `cp` (1 for BMP — including a
+/// lone surrogate — 2 for an astral scalar).
 #[inline]
-fn unit_of(c: char, off: usize) -> u16 {
-    let cp = c as u32;
+pub fn cp_units(cp: u32) -> usize {
+    if cp < 0x10000 { 1 } else { 2 }
+}
+
+/// The `off`-th UTF-16 unit of code point `cp` (`off` 0 = the code point
+/// itself / the high surrogate; 1 = the low surrogate of an astral scalar).
+#[inline]
+fn unit_of_cp(cp: u32, off: usize) -> u16 {
     if cp < 0x10000 {
         cp as u16
     } else {
@@ -306,23 +283,291 @@ fn unit_of(c: char, off: usize) -> u16 {
     }
 }
 
+/// Decode the code point whose encoding starts at byte `i` of WTF-8 buffer `b`
+/// (which must be a lead position of a valid sequence — the engine only builds
+/// valid WTF-8). Returns `(code point, encoded byte length)`. A surrogate
+/// decodes like any 3-byte sequence — the one place WTF-8 differs from UTF-8.
+#[inline]
+pub fn wtf8_decode(b: &[u8], i: usize) -> (u32, usize) {
+    let b0 = b[i] as u32;
+    if b0 < 0x80 {
+        (b0, 1)
+    } else if b0 < 0xE0 {
+        (((b0 & 0x1F) << 6) | (b[i + 1] as u32 & 0x3F), 2)
+    } else if b0 < 0xF0 {
+        ((((b0 & 0x0F) << 12) | ((b[i + 1] as u32 & 0x3F) << 6)) | (b[i + 2] as u32 & 0x3F), 3)
+    } else {
+        (
+            ((b0 & 0x07) << 18)
+                | ((b[i + 1] as u32 & 0x3F) << 12)
+                | ((b[i + 2] as u32 & 0x3F) << 6)
+                | (b[i + 3] as u32 & 0x3F),
+            4,
+        )
+    }
+}
+
+/// UTF-16 unit count of a WTF-8 buffer: one per lead byte, plus one extra per
+/// 4-byte (astral) sequence. A 3-byte lone-surrogate encoding counts 1.
+pub fn wtf8_units(b: &[u8]) -> usize {
+    b.iter().map(|&x| ((x & 0xC0) != 0x80) as usize + (x >= 0xF0) as usize).sum()
+}
+
+/// Whether WTF-8 buffer `b` contains NO surrogate encodings — for engine-built
+/// buffers this is exactly "the bytes are valid UTF-8".
+pub fn wtf8_is_wellformed(b: &[u8]) -> bool {
+    !b.windows(2).any(|w| w[0] == 0xED && (0xA0..=0xBF).contains(&w[1]))
+}
+
+/// Raw WTF-8 encode of `cp` (a surrogate allowed) onto `out` — NO seam
+/// canonicalization (use `wtf8_push_cp` when `cp` may be a low surrogate
+/// completing a trailing high).
+fn push_cp_raw(out: &mut Vec<u8>, cp: u32) {
+    if cp < 0x80 {
+        out.push(cp as u8);
+    } else if cp < 0x800 {
+        out.push(0xC0 | (cp >> 6) as u8);
+        out.push(0x80 | (cp & 0x3F) as u8);
+    } else if cp < 0x10000 {
+        out.push(0xE0 | (cp >> 12) as u8);
+        out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
+        out.push(0x80 | (cp & 0x3F) as u8);
+    } else {
+        out.push(0xF0 | (cp >> 18) as u8);
+        out.push(0x80 | ((cp >> 12) & 0x3F) as u8);
+        out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
+        out.push(0x80 | (cp & 0x3F) as u8);
+    }
+}
+
+/// Push code point `cp` (a surrogate allowed) onto WTF-8 buffer `out`,
+/// CANONICALIZING: a low surrogate that completes a trailing high surrogate
+/// merges into the astral scalar's 4-byte encoding — exactly the JS rule that
+/// `'\uD800' + '\uDC00'` is the 1-code-point string `'\u{10000}'`.
+pub fn wtf8_push_cp(out: &mut Vec<u8>, cp: u32) {
+    if (0xDC00..=0xDFFF).contains(&cp) {
+        let n = out.len();
+        if n >= 3 && out[n - 3] == 0xED && (0xA0..=0xAF).contains(&out[n - 2]) {
+            let (hi, _) = wtf8_decode(out, n - 3);
+            out.truncate(n - 3);
+            push_cp_raw(out, 0x10000 + ((hi - 0xD800) << 10) + (cp - 0xDC00));
+            return;
+        }
+    }
+    push_cp_raw(out, cp);
+}
+
+/// Append WTF-8 `seg` onto WTF-8 `out`, canonicalizing the SEAM: a trailing
+/// high surrogate in `out` followed by a leading low surrogate in `seg` merges
+/// into the astral 4-byte encoding (unit count is unaffected: 1+1 halves = the
+/// astral scalar's 2 units, so rope length math stays additive). The common
+/// case bails on one byte compare (an ASCII tail can't end a surrogate).
+pub fn wtf8_push(out: &mut Vec<u8>, seg: &[u8]) {
+    let n = out.len();
+    if n >= 3
+        && seg.len() >= 3
+        && *out.last().unwrap() >= 0x80
+        && out[n - 3] == 0xED
+        && (0xA0..=0xAF).contains(&out[n - 2])
+        && seg[0] == 0xED
+        && (0xB0..=0xBF).contains(&seg[1])
+    {
+        let (hi, _) = wtf8_decode(out, n - 3);
+        let (lo, _) = wtf8_decode(seg, 0);
+        out.truncate(n - 3);
+        push_cp_raw(out, 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+        out.extend_from_slice(&seg[3..]);
+        return;
+    }
+    out.extend_from_slice(seg);
+}
+
+/// Iterate the UTF-16 code units of a WTF-8 buffer: BMP code points (including
+/// lone surrogates) yield their own value; an astral scalar yields its two
+/// halves. This is the UTF-16 view every JS string comparison/order is defined
+/// over.
+pub fn wtf8_units_iter(b: &[u8]) -> impl Iterator<Item = u16> + '_ {
+    let mut i = 0usize;
+    let mut low: Option<u16> = None;
+    std::iter::from_fn(move || {
+        if let Some(u) = low.take() {
+            return Some(u);
+        }
+        if i >= b.len() {
+            return None;
+        }
+        let (cp, len) = wtf8_decode(b, i);
+        i += len;
+        if cp >= 0x10000 {
+            low = Some(unit_of_cp(cp, 1));
+            Some(unit_of_cp(cp, 0))
+        } else {
+            Some(cp as u16)
+        }
+    })
+}
+
+/// Iterate the code points of a WTF-8 buffer (a lone surrogate yields its
+/// surrogate value 0xD800–0xDFFF — NOT a `char`, which can't hold it).
+pub fn wtf8_code_points(b: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    let mut i = 0usize;
+    std::iter::from_fn(move || {
+        if i >= b.len() {
+            return None;
+        }
+        let (cp, len) = wtf8_decode(b, i);
+        i += len;
+        Some(cp)
+    })
+}
+
+/// Owned LOSSY `String` of a WTF-8 buffer: each lone-surrogate triple becomes
+/// U+FFFD. Both encodings are 3 bytes, so byte offsets and unit positions in
+/// the lossy form are IDENTICAL to the exact form — position math computed on
+/// the lossy view remains valid for the WTF-8 original.
+pub fn wtf8_to_lossy_string(b: &[u8]) -> String {
+    wtf8_into_lossy_string(b.to_vec())
+}
+
+/// Decode oxc's lone-surrogate marker encoding into WTF-8 bytes. The parser
+/// cooks a string/template literal containing lone-surrogate escapes (e.g.
+/// `'\uD800'`) into text where each lone surrogate is the 5-char marker
+/// `\u{FFFD}XXXX` (4 lowercase hex = the code unit) and a LITERAL U+FFFD is
+/// `\u{FFFD}fffd`, setting `.lone_surrogates` on the AST node. Only flagged
+/// literals are decoded (an unflagged string may contain genuine U+FFFD +
+/// hex-looking text). Output is canonical WTF-8 via `wtf8_push_cp`.
+pub fn decode_lone_surrogate_markers(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\u{FFFD}' {
+            let rest = it.as_str();
+            if rest.len() >= 4 && rest.as_bytes()[..4].iter().all(|b| b.is_ascii_hexdigit()) {
+                let cu = u32::from_str_radix(&rest[..4], 16).unwrap();
+                for _ in 0..4 {
+                    it.next();
+                }
+                wtf8_push_cp(&mut out, cu);
+                continue;
+            }
+            // Defensive: an unmarked U+FFFD (oxc escapes them all when the
+            // flag is set) passes through literally.
+        }
+        wtf8_push_cp(&mut out, c as u32);
+    }
+    out
+}
+
+/// Consuming form of [`wtf8_to_lossy_string`] (patches the buffer in place).
+pub fn wtf8_into_lossy_string(mut v: Vec<u8>) -> String {
+    let mut i = 0;
+    while i + 2 < v.len() {
+        if v[i] == 0xED && (0xA0..=0xBF).contains(&v[i + 1]) {
+            // U+FFFD's UTF-8 encoding, also 3 bytes.
+            v[i] = 0xEF;
+            v[i + 1] = 0xBF;
+            v[i + 2] = 0xBD;
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    // Engine-built buffers are valid UTF-8 after the patch; degrade any
+    // unexpected residue through the checked lossy path rather than UB.
+    match String::from_utf8(v) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(&e.into_bytes()).into_owned(),
+    }
+}
+
 impl JsStr {
+    /// Construct from a (necessarily well-formed) Rust `String` — the common
+    /// path for every string the engine builds out of `&str` material.
     pub fn new(bytes: String) -> JsStr {
         let ascii = bytes.is_ascii();
         let units = if ascii { bytes.len() } else { str_units(&bytes) };
-        JsStr { bytes, units, ascii }
+        JsStr { bytes: bytes.into_bytes(), units, ascii, wellformed: true }
     }
 
-    /// The content as `&str` — always valid (well-formed) at this stage. The
-    /// WTF-8 stage narrows this to the well-formed case (lossy elsewhere).
+    /// Construct from WTF-8 bytes (the creation sites that can produce lone
+    /// surrogates: literal marker decode, fromCharCode/fromCodePoint,
+    /// JSON.parse, slicing, rope flattening). The buffer must be valid,
+    /// CANONICAL WTF-8 — every producer in the engine builds it through
+    /// `wtf8_push`/`wtf8_push_cp`/`slice_units`, which maintain that.
+    pub fn from_wtf8(bytes: Vec<u8>) -> JsStr {
+        if bytes.is_ascii() {
+            return JsStr { units: bytes.len(), bytes, ascii: true, wellformed: true };
+        }
+        let wellformed = wtf8_is_wellformed(&bytes);
+        debug_assert!(
+            !wellformed || std::str::from_utf8(&bytes).is_ok(),
+            "from_wtf8: surrogate-free buffer must be valid UTF-8"
+        );
+        debug_assert!(
+            {
+                // Canonical form: no encoded high surrogate immediately
+                // followed by an encoded low surrogate.
+                !bytes.windows(6).any(|w| {
+                    w[0] == 0xED
+                        && (0xA0..=0xAF).contains(&w[1])
+                        && w[3] == 0xED
+                        && (0xB0..=0xBF).contains(&w[4])
+                })
+            },
+            "from_wtf8: non-canonical surrogate pair encoding"
+        );
+        let units = wtf8_units(&bytes);
+        JsStr { bytes, units, ascii: false, wellformed }
+    }
+
+    /// A 1-code-point string (`cp` may be a lone surrogate).
+    pub fn from_code_point(cp: u32) -> JsStr {
+        let mut v = Vec::with_capacity(4);
+        push_cp_raw(&mut v, cp);
+        JsStr::from_wtf8(v)
+    }
+
+    /// The content as `&str` — ONLY for well-formed strings (the type's
+    /// validity invariant forbids surrogate bytes). Callers that can see a
+    /// lone-surrogate string use `as_str_lossy` (observation paths: display,
+    /// parsing, regex input, …) or the WTF-8 accessors (exact paths).
+    /// Panics on a non-well-formed string — every call site must guarantee
+    /// well-formedness (e.g. just constructed from `&str` material).
+    #[allow(dead_code)]
     #[inline]
-    pub fn as_str(&self) -> &str {
-        &self.bytes
+    pub fn as_str_wf(&self) -> &str {
+        assert!(self.wellformed, "as_str_wf on a string containing lone surrogates");
+        // SAFETY: `wellformed` records that `bytes` holds no surrogate
+        // encodings; the bytes otherwise originate from safe `String`s or the
+        // engine's WTF-8 encoders, so they are valid UTF-8 (checked by
+        // `from_wtf8`'s debug assertion).
+        unsafe { std::str::from_utf8_unchecked(&self.bytes) }
     }
 
+    /// The content as `&str`, LOSSY for the lone-surrogate case (each lone
+    /// surrogate reads as U+FFFD — same byte length, so positions computed on
+    /// the lossy view remain valid for the exact bytes). Borrowed (free) for
+    /// well-formed strings — the overwhelmingly common case.
+    #[inline]
+    pub fn as_str_lossy(&self) -> Cow<'_, str> {
+        if self.wellformed {
+            // SAFETY: as in `as_str_wf` — `wellformed` ⇒ valid UTF-8.
+            Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(&self.bytes) })
+        } else {
+            Cow::Owned(wtf8_to_lossy_string(&self.bytes))
+        }
+    }
+
+    /// Owned lossy `String` (see `as_str_lossy`).
+    pub fn to_lossy_string(&self) -> String {
+        self.as_str_lossy().into_owned()
+    }
+
+    /// The raw WTF-8 bytes. NOT necessarily valid UTF-8 — never view them as
+    /// `&str`; decode with the `wtf8_*` helpers.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        self.bytes.as_bytes()
+        &self.bytes
     }
 
     /// Length in UTF-16 code units — the JS `.length`.
@@ -336,98 +581,137 @@ impl JsStr {
         self.ascii
     }
 
+    /// No lone surrogates (`String.prototype.isWellFormed`) — O(1), computed
+    /// at construction.
+    #[inline]
+    pub fn is_wellformed(&self) -> bool {
+        self.wellformed
+    }
+
     /// Append one ASCII byte (the `s += digit` fast path), updating metadata.
     #[inline]
     pub fn push_ascii(&mut self, b: u8) {
         debug_assert!(b < 128);
-        self.bytes.push(b as char);
+        self.bytes.push(b);
         self.units += 1;
     }
 
-    /// Append a (well-formed) string, updating the cached metadata.
+    /// Append a well-formed string, updating the cached metadata. No seam
+    /// canonicalization is needed: a `&str` can never START with a low
+    /// surrogate, so a trailing high surrogate in `self` stays lone.
+    /// (Currently unreferenced — the append path goes through `push_wtf8` —
+    /// kept as the natural `&str` entry of the accessor layer.)
+    #[allow(dead_code)]
     pub fn push_str(&mut self, add: &str) {
         self.units += str_units(add);
         self.ascii &= add.is_ascii();
-        self.bytes.push_str(add);
+        self.bytes.extend_from_slice(add.as_bytes());
     }
 
-    /// Locate unit position `i`: the scalar containing it and `i`'s offset
-    /// within that scalar's units (0 = lead, 1 = the trail of a pair). O(1)
-    /// for ASCII, O(i) otherwise.
-    fn locate_unit(&self, i: usize) -> Option<(char, usize)> {
+    /// Append WTF-8 bytes (an exact `+=` of another string's content),
+    /// canonicalizing the seam. Unit length stays additive across the merge.
+    pub fn push_wtf8(&mut self, add: &[u8]) {
+        let add_ascii = add.is_ascii();
+        self.units += if add_ascii { add.len() } else { wtf8_units(add) };
+        if self.wellformed && (add_ascii || wtf8_is_wellformed(add)) {
+            // Surrogate-free on both sides: plain append, no seam possible.
+            self.ascii &= add_ascii;
+            self.bytes.extend_from_slice(add);
+        } else {
+            self.ascii = false;
+            wtf8_push(&mut self.bytes, add);
+            self.wellformed = wtf8_is_wellformed(&self.bytes);
+        }
+    }
+
+    /// Locate unit position `i`: the code point containing it and `i`'s offset
+    /// within that code point's units (0 = lead, 1 = the trail of an astral
+    /// pair). O(1) for ASCII, O(i) otherwise.
+    fn locate_unit(&self, i: usize) -> Option<(u32, usize)> {
         if self.ascii {
-            return self.bytes.as_bytes().get(i).map(|&b| (b as char, 0));
+            return self.bytes.get(i).map(|&b| (b as u32, 0));
         }
         if i >= self.units {
             return None;
         }
         let mut pos = 0usize;
-        for c in self.bytes.chars() {
-            let n = char_units(c);
+        let mut bi = 0usize;
+        while bi < self.bytes.len() {
+            let (cp, blen) = wtf8_decode(&self.bytes, bi);
+            let n = cp_units(cp);
             if i < pos + n {
-                return Some((c, i - pos));
+                return Some((cp, i - pos));
             }
             pos += n;
+            bi += blen;
         }
         None
     }
 
-    /// The UTF-16 code unit at unit position `i` (a surrogate half for an
-    /// astral scalar) — `charCodeAt` semantics.
+    /// The UTF-16 code unit at unit position `i` (a lone surrogate's own
+    /// value; a surrogate half for an astral scalar) — `charCodeAt` semantics.
     pub fn unit_at(&self, i: usize) -> Option<u16> {
-        self.locate_unit(i).map(|(c, off)| unit_of(c, off))
-    }
-
-    /// The 1-unit string content at unit position `i`: the BMP scalar itself,
-    /// or U+FFFD for either half of a surrogate pair (not representable alone
-    /// until the WTF-8 stage) — `charAt`/`at`/bracket-index semantics.
-    pub fn unit_char(&self, i: usize) -> Option<char> {
-        self.locate_unit(i)
-            .map(|(c, _)| if (c as u32) < 0x10000 { c } else { '\u{FFFD}' })
+        self.locate_unit(i).map(|(cp, off)| unit_of_cp(cp, off))
     }
 
     /// CodePointAt(unit position) per spec: the FULL code point when `i`
-    /// addresses a lead unit, or the trail surrogate's value when `i` lands in
-    /// the middle of a pair.
+    /// addresses a lead unit, the trail surrogate's value mid-pair, and a lone
+    /// surrogate's own value.
     pub fn code_point_at(&self, i: usize) -> Option<u32> {
         self.locate_unit(i)
-            .map(|(c, off)| if off == 0 { c as u32 } else { unit_of(c, 1) as u32 })
+            .map(|(cp, off)| if off == 0 { cp } else { unit_of_cp(cp, 1) as u32 })
     }
 
-    /// Substring by UNIT positions `[a, b)` (see `slice_units_str`). Not yet
-    /// called (string methods slice their owned clone via `slice_units_str`);
-    /// kept as the in-place accessor the WTF-8 stage's creation/observation
-    /// sites funnel through.
-    #[allow(dead_code)]
-    pub fn slice_units(&self, a: usize, b: usize) -> String {
+    /// Substring by UNIT positions `[a, b)`. A bound that splits a surrogate
+    /// pair yields the REAL covered half (a 1-unit lone-surrogate string).
+    /// The output of slicing a canonical buffer is canonical: a low half cut
+    /// from one scalar can only be FOLLOWED by what followed that scalar, and
+    /// a high half can only END the slice.
+    pub fn slice_units(&self, a: usize, b: usize) -> JsStr {
         if self.ascii {
             let (a, b) = (a.min(self.bytes.len()), b.min(self.bytes.len()));
-            if a >= b {
-                String::new()
-            } else {
-                self.bytes[a..b].to_string()
-            }
-        } else {
-            slice_units_str(&self.bytes, a, b)
+            return JsStr::from_wtf8(if a >= b { Vec::new() } else { self.bytes[a..b].to_vec() });
         }
+        let mut out: Vec<u8> = Vec::new();
+        if a < b {
+            let (mut pos, mut bi) = (0usize, 0usize);
+            while bi < self.bytes.len() && pos < b {
+                let (cp, blen) = wtf8_decode(&self.bytes, bi);
+                let n = cp_units(cp);
+                if pos >= a && pos + n <= b {
+                    out.extend_from_slice(&self.bytes[bi..bi + blen]);
+                } else if n == 2 && pos >= a && pos < b {
+                    // Window covers only the lead half.
+                    push_cp_raw(&mut out, unit_of_cp(cp, 0) as u32);
+                } else if n == 2 && pos + 1 >= a && pos + 1 < b {
+                    // Window covers only the trail half.
+                    push_cp_raw(&mut out, unit_of_cp(cp, 1) as u32);
+                }
+                pos += n;
+                bi += blen;
+            }
+        }
+        JsStr::from_wtf8(out)
     }
 
-    /// Iterate the code points (for-of/spread semantics — one item per scalar).
-    /// The WTF-8 stage extends this with a decoder that can yield lone
-    /// surrogates; keep callers agnostic of the underlying byte walk. (The
-    /// iteration sites currently read `str_cow(..).chars()` — they migrate
-    /// here when the byte payload stops being plain UTF-8.)
-    #[allow(dead_code)]
-    pub fn code_points(&self) -> impl Iterator<Item = char> + '_ {
-        self.bytes.chars()
+    /// Iterate the code points (for-of/spread semantics — one item per code
+    /// point; a lone surrogate yields its 0xD800–0xDFFF value).
+    pub fn code_points(&self) -> impl Iterator<Item = u32> + '_ {
+        wtf8_code_points(&self.bytes)
+    }
+
+    /// Iterate the UTF-16 code units (split('') / string-spread semantics —
+    /// an astral scalar contributes its two halves).
+    pub fn units_iter(&self) -> impl Iterator<Item = u16> + '_ {
+        wtf8_units_iter(&self.bytes)
     }
 
     /// One for-of step at unit position `pos`: the code point starting there
     /// and the position one CODE POINT later (units advance by 1 or 2). `None`
     /// once past the end.
-    pub fn cp_step(&self, pos: usize) -> Option<(char, usize)> {
+    pub fn cp_step(&self, pos: usize) -> Option<(u32, usize)> {
         self.locate_unit(pos)
-            .map(|(c, off)| (c, pos - off + char_units(c)))
+            .map(|(cp, off)| (cp, pos - off + cp_units(cp)))
     }
 }
 
@@ -1135,6 +1419,18 @@ impl Heap {
         self.alloc(HeapObj::Str(JsStr::new(s)))
     }
 
+    /// `alloc_str` for an already-built `JsStr` (the WTF-8 creation sites):
+    /// same interning of the empty / single-ASCII-char strings.
+    pub fn alloc_js(&mut self, js: JsStr) -> u32 {
+        let b = js.as_bytes();
+        match b.len() {
+            0 => return INTERN_EMPTY,
+            1 if b[0] < 128 => return b[0] as u32,
+            _ => {}
+        }
+        self.alloc(HeapObj::Str(js))
+    }
+
     /// Allocate a rope node over two string-like children (O(1) concatenation).
     /// `len` is the children's combined length in the SAME measure as
     /// `JsStr::units` (UTF-16 code units) — `str_units` of both sides summed,
@@ -1172,16 +1468,18 @@ impl Heap {
         }
     }
 
-    /// Append the full character content of a (possibly rope) string to `out`.
+    /// Append the full WTF-8 content of a (possibly rope) string to `out`,
+    /// canonicalizing each segment seam (a high surrogate ending one segment
+    /// merges with a low surrogate opening the next — `wtf8_push`).
     /// Iterative, not recursive: a `s += x` loop builds a left-leaning rope that
     /// can be thousands of nodes deep, which would overflow the stack.
-    pub fn write_str(&self, idx: u32, out: &mut String) {
+    pub fn write_wtf8(&self, idx: u32, out: &mut Vec<u8>) {
         // Explicit stack; push the right child then the left so the left is
         // popped (appended) first — preserving left-to-right concatenation.
         let mut stack = vec![idx];
         while let Some(n) = stack.pop() {
             match self.get(n) {
-                HeapObj::Str(s) => out.push_str(s.as_str()),
+                HeapObj::Str(s) => wtf8_push(out, s.as_bytes()),
                 HeapObj::Cons { left, right, .. } => {
                     stack.push(*right);
                     stack.push(*left);
@@ -1191,15 +1489,33 @@ impl Heap {
         }
     }
 
-    /// Borrow a string-like as `&str` without allocating when it is already flat
-    /// (the common case); materialize a rope into an owned `String` otherwise.
-    /// `None` if `idx` isn't a string.
+    /// Borrow a string-like as `&str` without allocating when it is already
+    /// flat AND well-formed (the common case); materialize a rope / a
+    /// lone-surrogate string into an owned `String` otherwise — LOSSY for lone
+    /// surrogates (each reads as U+FFFD, byte-length preserving, so positions
+    /// stay exchangeable with the exact bytes). Exact consumers use
+    /// `str_wtf8_cow`. `None` if `idx` isn't a string.
     pub fn str_cow(&self, idx: u32) -> Option<Cow<'_, str>> {
         match self.get(idx) {
-            HeapObj::Str(s) => Some(Cow::Borrowed(s.as_str())),
+            HeapObj::Str(s) => Some(s.as_str_lossy()),
             HeapObj::Cons { len, .. } => {
-                let mut out = String::with_capacity(*len);
-                self.write_str(idx, &mut out);
+                let mut out = Vec::with_capacity(*len);
+                self.write_wtf8(idx, &mut out);
+                Some(Cow::Owned(wtf8_into_lossy_string(out)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The EXACT (WTF-8) byte content of a string-like: borrowed when flat,
+    /// materialized (with seam canonicalization) for a rope. `None` if not a
+    /// string.
+    pub fn str_wtf8_cow(&self, idx: u32) -> Option<Cow<'_, [u8]>> {
+        match self.get(idx) {
+            HeapObj::Str(s) => Some(Cow::Borrowed(s.as_bytes())),
+            HeapObj::Cons { len, .. } => {
+                let mut out = Vec::with_capacity(*len);
+                self.write_wtf8(idx, &mut out);
                 Some(Cow::Owned(out))
             }
             _ => None,
@@ -1208,13 +1524,16 @@ impl Heap {
 
     /// Content equality of two string-like objects. Fast (no allocation) when
     /// both are already flat — the common case for a hot `a === b` comparison.
+    /// Byte equality IS content equality: the WTF-8 buffers are canonical
+    /// (`write_wtf8`/`wtf8_push` merge cross-segment surrogate pairs), so two
+    /// equal unit sequences always have identical bytes.
     pub fn str_eq(&self, a: u32, b: u32) -> bool {
         match (self.get(a), self.get(b)) {
-            (HeapObj::Str(x), HeapObj::Str(y)) => x.as_str() == y.as_str(),
+            (HeapObj::Str(x), HeapObj::Str(y)) => x.as_bytes() == y.as_bytes(),
             _ => {
-                let (mut sa, mut sb) = (String::new(), String::new());
-                self.write_str(a, &mut sa);
-                self.write_str(b, &mut sb);
+                let (mut sa, mut sb) = (Vec::new(), Vec::new());
+                self.write_wtf8(a, &mut sa);
+                self.write_wtf8(b, &mut sb);
                 sa == sb
             }
         }
@@ -1236,9 +1555,9 @@ impl Heap {
             HeapObj::Cons { len, .. } => *len,
             _ => return,
         };
-        let mut out = String::with_capacity(len);
-        self.write_str(idx, &mut out);
-        self.objs[idx as usize] = HeapObj::Str(JsStr::new(out));
+        let mut out = Vec::with_capacity(len);
+        self.write_wtf8(idx, &mut out);
+        self.objs[idx as usize] = HeapObj::Str(JsStr::from_wtf8(out));
     }
 
     /// Resolve a callable (plain function or closure) to its function id and

@@ -285,8 +285,10 @@ impl<'p> Vm<'p> {
         // Leaf / primitive-wrapper cases (no recursion into properties).
         match self.heap.get(idx) {
             HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                let s = self.heap.str_cow(idx).unwrap().into_owned();
-                return Ok(Some(json_quote(&s)));
+                // EXACT bytes: a lone surrogate must emit its \udXXX escape
+                // (well-formed JSON.stringify), not a U+FFFD substitution.
+                let b = self.heap.str_wtf8_cow(idx).unwrap().into_owned();
+                return Ok(Some(json_quote_wtf8(&b)));
             }
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
@@ -431,25 +433,25 @@ impl<'p> Vm<'p> {
     /// Parse a JSON string into a Value, or throw SyntaxError. Recursive-descent
     /// over the byte string (structure tokens are ASCII; string content is
     /// flushed as UTF-8 slices). Allocates heap objects/arrays/strings.
-    pub(crate) fn json_parse(&mut self, src: &str) -> Result<Value, Thrown> {
+    pub(crate) fn json_parse(&mut self, src: &[u8]) -> Result<Value, Thrown> {
         let mut i = 0;
-        json_skip_ws(src.as_bytes(), &mut i);
+        json_skip_ws(src, &mut i);
         let v = self.json_parse_value(src, &mut i)?;
-        json_skip_ws(src.as_bytes(), &mut i);
+        json_skip_ws(src, &mut i);
         if i != src.len() {
             return Err(Thrown("SyntaxError: Unexpected non-whitespace character after JSON".into()));
         }
         Ok(v)
     }
 
-    pub(crate) fn json_parse_value(&mut self, src: &str, i: &mut usize) -> Result<Value, Thrown> {
-        let b = src.as_bytes();
+    pub(crate) fn json_parse_value(&mut self, src: &[u8], i: &mut usize) -> Result<Value, Thrown> {
+        let b = src;
         match b.get(*i).copied() {
             Some(b'{') => self.json_parse_object(src, i),
             Some(b'[') => self.json_parse_array(src, i),
             Some(b'"') => {
-                let s = json_parse_string(src, i)?;
-                Ok(self.alloc_str(s))
+                let js = json_parse_string(src, i)?;
+                Ok(Value::heap(self.heap.alloc_js(js)))
             }
             Some(b't') => {
                 json_expect(b, i, "true")?;
@@ -468,8 +470,8 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn json_parse_array(&mut self, src: &str, i: &mut usize) -> Result<Value, Thrown> {
-        let b = src.as_bytes();
+    pub(crate) fn json_parse_array(&mut self, src: &[u8], i: &mut usize) -> Result<Value, Thrown> {
+        let b = src;
         *i += 1; // '['
         let mut items = Vec::new();
         json_skip_ws(b, i);
@@ -494,8 +496,8 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(items))))
     }
 
-    pub(crate) fn json_parse_object(&mut self, src: &str, i: &mut usize) -> Result<Value, Thrown> {
-        let b = src.as_bytes();
+    pub(crate) fn json_parse_object(&mut self, src: &[u8], i: &mut usize) -> Result<Value, Thrown> {
+        let b = src;
         *i += 1; // '{'
         let mut pairs: Vec<(String, Value)> = Vec::new();
         json_skip_ws(b, i);
@@ -505,7 +507,7 @@ impl<'p> Vm<'p> {
                 if b.get(*i) != Some(&b'"') {
                     return Err(Thrown("SyntaxError: Expected property name string in JSON".into()));
                 }
-                let key = json_parse_string(src, i)?;
+                let key = json_parse_string(src, i)?.to_lossy_string();
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
@@ -670,11 +672,11 @@ impl<'p> Vm<'p> {
 
     /// Like [`json_parse`], but also returns a parallel source tree recording the
     /// raw JSON text of every value (for the parse-with-source reviver context).
-    pub(crate) fn json_parse_with_src(&mut self, src: &str) -> Result<(Value, JsonSrc), Thrown> {
+    pub(crate) fn json_parse_with_src(&mut self, src: &[u8]) -> Result<(Value, JsonSrc), Thrown> {
         let mut i = 0;
-        json_skip_ws(src.as_bytes(), &mut i);
+        json_skip_ws(src, &mut i);
         let r = self.json_parse_value_src(src, &mut i)?;
-        json_skip_ws(src.as_bytes(), &mut i);
+        json_skip_ws(src, &mut i);
         if i != src.len() {
             return Err(Thrown("SyntaxError: Unexpected non-whitespace character after JSON".into()));
         }
@@ -683,10 +685,10 @@ impl<'p> Vm<'p> {
 
     fn json_parse_value_src(
         &mut self,
-        src: &str,
+        src: &[u8],
         i: &mut usize,
     ) -> Result<(Value, JsonSrc), Thrown> {
-        let b = src.as_bytes();
+        let b = src;
         match b.get(*i).copied() {
             Some(b'{') => self.json_parse_object_src(src, i),
             Some(b'[') => self.json_parse_array_src(src, i),
@@ -694,17 +696,19 @@ impl<'p> Vm<'p> {
                 // A primitive (string/number/true/false/null): record its exact span.
                 let start = *i;
                 let v = self.json_parse_value(src, i)?;
-                Ok((v, JsonSrc::Prim(src[start..*i].to_string())))
+                // `context.source` is a Rust String — LOSSY if the span holds
+                // a raw lone surrogate (documented limit; escapes round-trip).
+                Ok((v, JsonSrc::Prim(crate::heap::wtf8_to_lossy_string(&src[start..*i]))))
             }
         }
     }
 
     fn json_parse_array_src(
         &mut self,
-        src: &str,
+        src: &[u8],
         i: &mut usize,
     ) -> Result<(Value, JsonSrc), Thrown> {
-        let b = src.as_bytes();
+        let b = src;
         *i += 1; // '['
         let mut items = Vec::new();
         let mut srcs = Vec::new();
@@ -730,10 +734,10 @@ impl<'p> Vm<'p> {
 
     fn json_parse_object_src(
         &mut self,
-        src: &str,
+        src: &[u8],
         i: &mut usize,
     ) -> Result<(Value, JsonSrc), Thrown> {
-        let b = src.as_bytes();
+        let b = src;
         *i += 1; // '{'
         let mut pairs: Vec<(String, Value)> = Vec::new();
         let mut srcs: Vec<(String, JsonSrc)> = Vec::new();
@@ -744,7 +748,7 @@ impl<'p> Vm<'p> {
                 if b.get(*i) != Some(&b'"') {
                     return Err(Thrown("SyntaxError: Expected property name string in JSON".into()));
                 }
-                let key = json_parse_string(src, i)?;
+                let key = json_parse_string(src, i)?.to_lossy_string();
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));

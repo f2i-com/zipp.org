@@ -145,8 +145,7 @@ impl<'p> Vm<'p> {
         let message = args.get(2).copied().unwrap_or(Value::UNDEFINED);
         // message ToString runs first (may execute user code) — before any alloc.
         let msg_val = if message != Value::UNDEFINED {
-            let s = self.to_js_string(message)?;
-            Some(self.alloc_str(s))
+            Some(self.to_str_value(message)?)
         } else {
             None
         };
@@ -839,10 +838,7 @@ impl<'p> Vm<'p> {
             // real ToString (observable / abrupt) before iterating arg[0] into `errors`.
             let e = if k == 7 {
                 let msg = match args.get(1).copied() {
-                    Some(m) if m != Value::UNDEFINED => {
-                        let s = self.to_js_string(m)?;
-                        Some(self.alloc_str(s))
-                    }
+                    Some(m) if m != Value::UNDEFINED => Some(self.to_str_value(m)?),
                     _ => None,
                 };
                 let e = self.make_error(7, msg);
@@ -854,10 +850,7 @@ impl<'p> Vm<'p> {
                 // a Symbol message throws TypeError, and a throwing toString /
                 // @@toPrimitive propagates — before the error object is allocated.
                 let msg = match args.first().copied() {
-                    Some(m) if m != Value::UNDEFINED => {
-                        let s = self.to_js_string(m)?;
-                        Some(self.alloc_str(s))
-                    }
+                    Some(m) if m != Value::UNDEFINED => Some(self.to_str_value(m)?),
                     _ => None,
                 };
                 self.make_error(k as u8, msg)
@@ -1246,8 +1239,13 @@ impl<'p> Vm<'p> {
                 return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.str_proto && self.str_proto != 0 {
-                let s = if args.is_empty() { String::new() } else { self.to_js_string(a0)? };
-                let sv = self.alloc_str(s);
+                // Identity for a string argument: `new String('\uD800')` boxes
+                // the exact lone-surrogate string.
+                let sv = if args.is_empty() {
+                    self.alloc_str(String::new())
+                } else {
+                    self.to_str_value(a0)?
+                };
                 let r = Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 0, value: sv }));
                 return Ok(self.set_ctor_proto(r, over));
             }
@@ -2267,18 +2265,22 @@ impl<'p> Vm<'p> {
             }
             // Gather (key, val) pairs under the immutable borrow, then write.
             // (A string source spreads as index→1-UNIT string, like an array —
-            // the String exotic's own keys are unit positions.)
-            let str_chars: Option<Vec<char>> = match self.heap.get(src.heap_index()) {
-                HeapObj::Str(_) | HeapObj::Cons { .. } => {
-                    Some(crate::heap::unit_chars(&self.heap.str_cow(src.heap_index()).unwrap()))
-                }
+            // the String exotic's own keys are unit positions; a surrogate half
+            // is a REAL 1-unit lone-surrogate string.)
+            let str_units: Option<Vec<u16>> = match self.heap.get(src.heap_index()) {
+                HeapObj::Str(_) | HeapObj::Cons { .. } => Some(
+                    crate::heap::wtf8_units_iter(
+                        &self.heap.str_wtf8_cow(src.heap_index()).unwrap(),
+                    )
+                    .collect(),
+                ),
                 _ => None,
             };
-            let pairs: Vec<(String, Value)> = if let Some(chars) = str_chars {
-                chars
+            let pairs: Vec<(String, Value)> = if let Some(units) = str_units {
+                units
                     .into_iter()
                     .enumerate()
-                    .map(|(i, c)| (i.to_string(), self.alloc_str(c.to_string())))
+                    .map(|(i, u)| (i.to_string(), self.str_from_unit(u)))
                     .collect()
             } else {
                 // CopyDataProperties: ? from.[[OwnPropertyKeys]]() (integer, string,
@@ -2351,16 +2353,19 @@ impl<'p> Vm<'p> {
         if !src.is_heap() {
             return Ok(m);
         }
-        // A string source spreads as index → 1-UNIT string (unit-position keys).
+        // A string source spreads as index → 1-UNIT string (unit-position keys;
+        // a surrogate half is a REAL 1-unit lone-surrogate string).
         if matches!(self.heap.get(src.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
-            let chars: Vec<char> =
-                crate::heap::unit_chars(&self.heap.str_cow(src.heap_index()).unwrap());
-            for (i, c) in chars.into_iter().enumerate() {
+            let units: Vec<u16> = crate::heap::wtf8_units_iter(
+                &self.heap.str_wtf8_cow(src.heap_index()).unwrap(),
+            )
+            .collect();
+            for (i, u) in units.into_iter().enumerate() {
                 let k = i.to_string();
                 if excluded.iter().any(|e| *e == k) {
                     continue;
                 }
-                let v = self.alloc_str(c.to_string());
+                let v = self.str_from_unit(u);
                 m.set(&k, v);
             }
             return Ok(m);
@@ -2430,10 +2435,7 @@ impl<'p> Vm<'p> {
             let d = match args.first().copied() {
                 None => Value::UNDEFINED,
                 Some(v) if v == Value::UNDEFINED => Value::UNDEFINED,
-                Some(v) => {
-                    let s = self.to_js_string(v)?;
-                    self.alloc_str(s)
-                }
+                Some(v) => self.to_str_value(v)?,
             };
             return Ok(self.make_symbol(d));
         }

@@ -1491,7 +1491,7 @@ impl<'p> Vm<'p> {
                     let text = std::fs::read_to_string(&path)
                         .map_err(|_| Thrown("TypeError: module not found".into()))?;
                     match t {
-                        "json" => self.json_parse(&text)?,
+                        "json" => self.json_parse(text.as_bytes())?,
                         _ => self.alloc_str(text),
                     }
                 }

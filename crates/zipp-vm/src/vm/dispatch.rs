@@ -589,8 +589,9 @@ impl<'p> Vm<'p> {
                     // for template-literal substitutions.
                     Instr::ToStr { dst, a } => {
                         let av = self.get(base, a);
-                        let s = self.to_js_string(av)?;
-                        let r = self.alloc_str(s);
+                        // Identity for strings (exact — lone surrogates survive
+                        // template interpolation), coercion otherwise.
+                        let r = self.to_str_value(av)?;
                         self.set(base, dst, r);
                         ip += 1;
                     }
@@ -892,7 +893,13 @@ impl<'p> Vm<'p> {
                     Instr::JsonParse { dst, a } => {
                         let arg = self.get(base, a);
                         // ToString (invokes toString/valueOf; throws TypeError for a Symbol).
-                        let s = self.to_js_string(arg)?;
+                        // EXACT bytes for a string argument (raw lone surrogates
+                        // inside JSON string literals are preserved).
+                        let s: Vec<u8> = if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
+                            self.heap.str_wtf8_cow(arg.heap_index()).unwrap().into_owned()
+                        } else {
+                            self.to_js_string(arg)?.into_bytes()
+                        };
                         let v = self.json_parse(&s)?; // propagates SyntaxError as a throw
                         self.set(base, dst, v);
                         ip += 1;
@@ -1990,8 +1997,8 @@ impl<'p> Vm<'p> {
                                     // Proper ToString: routes objects/functions
                                     // through their `toString` (so a function yields
                                     // its real source via Function.prototype.toString).
-                                    let s = self.to_js_string(a0)?;
-                                    self.alloc_str(s)
+                                    // Identity for strings (exact WTF-8 content).
+                                    self.to_str_value(a0)?
                                 }
                             }
                             G::Boolean => Value::bool(argc >= 1 && self.truthy(a0)),
@@ -2261,8 +2268,8 @@ impl<'p> Vm<'p> {
                                 // ToUint16(ToNumber(v)) per arg, in argument order;
                                 // adjacent (high, low) surrogate halves combine into
                                 // the astral scalar â€” see `string_from_char_codes`.
-                                let s = self.string_from_char_codes(&args)?;
-                                self.alloc_str(s)
+                                let js = self.string_from_char_codes(&args)?;
+                                Value::heap(self.heap.alloc_js(js))
                             }
                             S::ObjectAssign => self.object_assign(&args)?,
                             S::ObjectFromEntries => self.object_from_entries(a0)?,
@@ -2795,8 +2802,7 @@ impl<'p> Vm<'p> {
                                 if m == Value::UNDEFINED {
                                     None
                                 } else {
-                                    let s = self.to_js_string(m)?;
-                                    Some(self.alloc_str(s))
+                                    Some(self.to_str_value(m)?)
                                 }
                             }
                             None => None,
@@ -2848,8 +2854,7 @@ impl<'p> Vm<'p> {
                                 if v == Value::UNDEFINED {
                                     Value::UNDEFINED
                                 } else {
-                                    let s = self.to_js_string(v)?;
-                                    self.alloc_str(s)
+                                    self.to_str_value(v)?
                                 }
                             }
                             None => Value::UNDEFINED,
@@ -4472,8 +4477,10 @@ impl<'p> Vm<'p> {
                                 };
                                 if let Some(step) = str_step {
                                     match step {
-                                        Some((c, next)) => {
-                                            let val = self.alloc_str(c.to_string());
+                                        Some((cp, next)) => {
+                                            // `cp` may be a lone surrogate — a real
+                                            // 1-unit surrogate string, not U+FFFD.
+                                            let val = self.str_from_cp(cp);
                                             self.set(base, idx, Value::int(next as i32));
                                             self.iter_result(val, false)
                                         }
@@ -4758,8 +4765,10 @@ impl<'p> Vm<'p> {
                         };
                         if let Some(step) = str_step {
                             match step {
-                                Some((c, next)) => {
-                                    let val = self.alloc_str(c.to_string());
+                                Some((cp, next)) => {
+                                    // `cp` may be a lone surrogate — a real 1-unit
+                                    // surrogate string, not U+FFFD.
+                                    let val = self.str_from_cp(cp);
                                     self.set(base, value_dst, val);
                                     self.set(base, done_dst, Value::bool(false));
                                     self.set(base, idx, Value::int(next as i32));
@@ -4862,8 +4871,10 @@ impl<'p> Vm<'p> {
                                 };
                                 if let Some(step) = str_step {
                                     match step {
-                                        Some((c, next)) => {
-                                            let val = self.alloc_str(c.to_string());
+                                        Some((cp, next)) => {
+                                            // `cp` may be a lone surrogate — a real
+                                            // 1-unit surrogate string, not U+FFFD.
+                                            let val = self.str_from_cp(cp);
                                             self.set(base, idx, Value::int(next as i32));
                                             self.iter_result(val, false)
                                         }
