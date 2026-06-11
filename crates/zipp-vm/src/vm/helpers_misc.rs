@@ -231,6 +231,12 @@ pub(crate) extern "win64" fn jit_array_push(
     }
     // SAFETY: exclusive view; pins only the register file, not the array's Vec.
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // A SPARSE array's length is NOT items.len() — the virtual-length side table
+    // governs (push must place the element AT that length and may throw): deopt
+    // so the interpreter's length-aware push runs.
+    if vm.array_js_len.contains_key(&arr.heap_index()) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {
             items.push(Value::from_bits(val_bits));
@@ -360,7 +366,10 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             if vm.arguments_objs.contains_key(&idx) {
                 return crate::codegen::SELF_CALL_DEOPT;
             }
-            return len_value(items.len()).bits();
+            // A SPARSE array's JS length lives in the virtual-length side
+            // table (still uncached — correct value, plain helper miss).
+            let n = vm.array_js_len.get(&idx).map_or(items.len(), |&n| n as usize);
+            return len_value(n).bits();
         }
         HeapObj::Str(s) if key == "length" => return len_value(s.units()).bits(),
         HeapObj::Cons { len, .. } if key == "length" => return len_value(*len).bits(),

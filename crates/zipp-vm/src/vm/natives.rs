@@ -2381,15 +2381,14 @@ impl<'p> Vm<'p> {
                     {
                         return Ok(Value::bool(false));
                     }
-                    if u as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
-                        return Err(Thrown(
-                            "RangeError: array length exceeds the engine's dense-array limit".into(),
-                        ));
+                    // Mirror the ordinary `arr.length = n` path: stop the shrink
+                    // at a non-configurable index, sweep the doomed arr_props
+                    // entries, and keep the virtual (sparse) length consistent.
+                    let mut final_len = u as usize;
+                    if let Some(ki) = self.array_shrink_blocker(aidx, final_len) {
+                        final_len = ki + 1;
                     }
-                    if let HeapObj::Array(items) = self.heap.get_mut(aidx) {
-                        items.resize(u as usize, Value::HOLE);
-                    }
-                    self.heap.bump_version(aidx);
+                    self.array_apply_length(aidx, final_len);
                     return Ok(Value::bool(true));
                 }
                 // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor

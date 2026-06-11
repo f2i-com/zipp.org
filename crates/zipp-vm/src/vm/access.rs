@@ -828,46 +828,17 @@ impl<'p> Vm<'p> {
             {
                 return self.reject_write("length", strict);
             }
-            if n as usize > crate::vm::MAX_DENSE_ARRAY_LEN {
-                return Err(Thrown(
-                    "RangeError: array length exceeds the engine's dense-array limit".into(),
-                ));
-            }
             // Truncation deletes index properties >= newLen in DESCENDING
             // order, stopping at the first NON-CONFIGURABLE one: it survives
             // and the final length becomes thatIndex + 1 (ArraySetLength).
             let mut final_len = n as usize;
-            if let Some(m) = self.arr_props.get(&idx) {
-                let highest_noncfg = m
-                    .keys
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, k)| {
-                        canonical_index_str(k)
-                            .filter(|ki| *ki >= n as usize && !m.attrs[i].configurable)
-                    })
-                    .max();
-                if let Some(ki) = highest_noncfg {
-                    final_len = ki + 1;
-                }
+            if let Some(ki) = self.array_shrink_blocker(idx, final_len) {
+                final_len = ki + 1;
             }
-            if let Some(m) = self.arr_props.get_mut(&idx) {
-                let doomed: Vec<String> = m
-                    .keys
-                    .iter()
-                    .filter(|k| canonical_index_str(k).is_some_and(|i| i >= final_len))
-                    .cloned()
-                    .collect();
-                for k in doomed {
-                    m.remove(&k);
-                }
-            }
-            if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                // Extending past the current length adds HOLES (absent elements),
-                // not present `undefined`s; truncating just drops the tail.
-                items.resize(final_len, Value::HOLE);
-            }
-            self.heap.bump_version(idx);
+            // Sweeps the doomed arr_props index entries, truncates/extends the
+            // dense store (extending adds HOLES — absent elements), and keeps
+            // the virtual length (a sparse `n` past the dense cap) consistent.
+            self.array_apply_length(idx, final_len);
             return Ok(());
         }
         // A callable's `name`/`length` are non-writable: assignment is a sloppy
@@ -1044,20 +1015,21 @@ impl<'p> Vm<'p> {
         // (numeric indices + `length` were handled above). Mirrors fn_props.
         if matches!(self.heap.get(idx), HeapObj::Array(_)) {
             // A canonical numeric-string key is an array INDEX (`arr["0"] = v` is
-            // `arr[0] = v`) — write to the dense elements, extending with holes.
-            // (A huge index past the dense limit, or a non-canonical key, falls
-            // through to the arr_props side table as a named property.)
+            // `arr[0] = v`) — write to the dense elements, extending with holes,
+            // or to the SPARSE overlay past the eager-materialization cap.
+            // (`"4294967295"` (2^32-1) and beyond are NOT array indices — they
+            // fall through to the arr_props side table as named properties.)
             if let Ok(n) = key.parse::<usize>() {
-                if n.to_string() == key && n < crate::vm::MAX_DENSE_ARRAY_LEN {
+                if n.to_string() == key && n < 4_294_967_295 {
                     // A LIVE-mapped arguments index also writes the formal's
                     // register ([[ParameterMap]] [[Set]] companion); the
                     // ordinary store below remains the escape store.
                     self.args_mapped_set(idx, n, val);
-                    // A special (defineProperty'd) index lives in arr_props and
-                    // overrides the dense slot. Its accessor / non-writable cases
-                    // were already handled by the own_attr block above, so only a
-                    // writable special data index reaches here — update it in place
-                    // (preserving its attributes).
+                    // A special (defineProperty'd) index — or a SPARSE element —
+                    // lives in arr_props and overrides the dense slot. Its
+                    // accessor / non-writable cases were already handled by the
+                    // own_attr block above, so only a writable data index reaches
+                    // here — update it in place (preserving its attributes).
                     if self.array_index_override(idx, n).is_some() {
                         self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
                         self.heap.bump_version(idx);
@@ -1070,12 +1042,31 @@ impl<'p> Vm<'p> {
                         matches!(self.heap.get(idx), HeapObj::Array(items) if n < items.len());
                     // Extending past the current length grows `length`; a non-writable
                     // `length` (defineProperty / freeze) rejects that — Array
-                    // [[DefineOwnProperty]]: index >= oldLen && length non-writable → false.
+                    // [[DefineOwnProperty]]: index >= oldLen && length non-writable →
+                    // false. (An index below a sparse array's VIRTUAL length doesn't
+                    // grow it.)
                     if !present
                         && (self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
-                            || self.array_length_nonwritable.contains(&idx))
+                            || (self.array_length_nonwritable.contains(&idx)
+                                && n >= self.js_array_len(idx)))
                     {
                         return self.reject_write(key, strict);
+                    }
+                    // Past the eager-materialization cap AND the dense prefix:
+                    // a sparse-overlay element + a virtual-length bump (never a
+                    // billions-of-holes resize). Mirrors set_index's numeric path.
+                    if n >= crate::vm::MAX_DENSE_ARRAY_LEN && !present {
+                        if !self.arguments_objs.contains_key(&idx) {
+                            self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+                            self.array_grow_js_len(idx, n);
+                            self.heap.bump_version(idx);
+                            return Ok(());
+                        }
+                        // An ARGUMENTS object's past-the-end index stays an
+                        // ordinary named own property (length is argc).
+                        self.arr_props.entry(idx).or_insert_with(ObjMap::new).set(key, val);
+                        self.heap.bump_version(idx);
+                        return Ok(());
                     }
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         if n >= items.len() {

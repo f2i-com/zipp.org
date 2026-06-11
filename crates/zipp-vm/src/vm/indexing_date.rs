@@ -181,8 +181,9 @@ impl<'p> Vm<'p> {
                 // (a computed method name / `@@iterator`, mirroring dot access).
                 let k = self.key_of(key);
                 if k == "length" && !self.arguments_objs.contains_key(&aidx) {
-                    if let HeapObj::Array(items) = self.heap.get(aidx) {
-                        return Ok(len_value(items.len()));
+                    if matches!(self.heap.get(aidx), HeapObj::Array(_)) {
+                        // A sparse array's JS length lives in the side table.
+                        return Ok(len_value(self.js_array_len(aidx)));
                     }
                 }
                 self.get_prop(obj, &k)
@@ -355,16 +356,6 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        // Assigning past the dense-array cap (`a[2**31] = v`) would eagerly grow
-        // the Vec to billions of holes and OOM — zipp has no sparse arrays, so
-        // throw a RangeError instead. (Checked before the &mut borrow below.)
-        if let Some(i) = array_index(key) {
-            if matches!(self.heap.get(idx), HeapObj::Array(_)) && i >= crate::vm::MAX_DENSE_ARRAY_LEN {
-                return Err(Thrown(
-                    "RangeError: array index exceeds the engine's dense-array limit".into(),
-                ));
-            }
-        }
         // A FROZEN array has non-writable elements: ANY index write (even to an
         // existing element) is rejected (sloppy no-op / strict TypeError). A sealed
         // (not frozen) array keeps writable elements — only NEW indices are blocked
@@ -386,7 +377,10 @@ impl<'p> Vm<'p> {
             if !present
                 && matches!(self.heap.get(idx), HeapObj::Array(_))
                 && (self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
-                    || self.array_length_nonwritable.contains(&idx))
+                    // Growing the JS length needs a writable `length`; an index
+                    // below a sparse array's VIRTUAL length doesn't grow it.
+                    || (self.array_length_nonwritable.contains(&idx)
+                        && i >= self.js_array_len(idx)))
             {
                 return self.reject_write(&self.key_of(key), strict);
             }
@@ -411,6 +405,25 @@ impl<'p> Vm<'p> {
         if let Some(i) = array_index(key) {
             if matches!(self.heap.get(idx), HeapObj::Array(_)) {
                 self.args_mapped_set(idx, i, val);
+            }
+        }
+        // A write past the eager-materialization cap goes to the SPARSE overlay:
+        // the element lives in arr_props under its canonical index key (default
+        // data attributes) and the JS length in the virtual-length side table —
+        // the dense Vec is never resized to billions of holes. (An overridden /
+        // defineProperty'd index was routed to set_prop above, and an arguments
+        // object's past-the-end write returned above, so this index is NEW.)
+        if let Some(i) = array_index(key) {
+            if i >= crate::vm::MAX_DENSE_ARRAY_LEN
+                && matches!(self.heap.get(idx), HeapObj::Array(items) if i >= items.len())
+            {
+                self.arr_props
+                    .entry(idx)
+                    .or_insert_with(ObjMap::new)
+                    .set(&i.to_string(), val);
+                self.array_grow_js_len(idx, i);
+                self.heap.bump_version(idx);
+                return Ok(());
             }
         }
         match self.heap.get_mut(idx) {

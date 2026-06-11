@@ -1231,23 +1231,29 @@ impl<'p> Vm<'p> {
             // newTarget.prototype rather than the built-in's default `p`.
             let over = self.newtarget_proto_override(new_target, cv, p)?;
             if p == self.arr_proto && self.arr_proto != 0 {
+                let mut virtual_len: Option<u32> = None;
                 let arr = if args.len() == 1 && a0.is_number() {
                     let n = a0.as_f64();
                     if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }
                     if n as usize > super::MAX_DENSE_ARRAY_LEN {
-                        return Err(Thrown(
-                            "RangeError: array length exceeds the engine's dense-array limit".into(),
-                        ));
+                        // Past the eager-materialization cap: a SPARSE array — no
+                        // elements, just a virtual length in the side table.
+                        virtual_len = Some(n as u32);
+                        Vec::new()
+                    } else {
+                        // `new Array(n)` / `Array(n)` creates n HOLES (absent
+                        // elements), not n present `undefined`s.
+                        vec![Value::HOLE; n as usize]
                     }
-                    // `new Array(n)` / `Array(n)` creates n HOLES (absent elements),
-                    // not n present `undefined`s.
-                    vec![Value::HOLE; n as usize]
                 } else {
                     args.to_vec()
                 };
                 let r = Value::heap(self.heap.alloc(HeapObj::Array(arr)));
+                if let Some(n) = virtual_len {
+                    self.array_js_len.insert(r.heap_index(), n);
+                }
                 return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.obj_proto && self.obj_proto != 0 {

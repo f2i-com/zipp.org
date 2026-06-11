@@ -400,15 +400,32 @@ impl<'p> Vm<'p> {
                 }
             }
             if let Some(m) = self.arr_props.get(&idx) {
+                // SPARSE-overlay index keys (>= the dense prefix) continue the
+                // ascending index run BEFORE any named key — integer indices sort
+                // first in spec own-key order. ("4294967295" and beyond are NOT
+                // array indices; they stay named, in insertion order.)
+                let mut sparse: Vec<usize> = Vec::new();
                 for (j, k) in m.keys.iter().enumerate() {
                     if !m.attrs[j].enumerable || is_hidden_key(k) {
                         continue;
                     }
-                    // A special index key is already covered by the dense range.
-                    if let Ok(n) = k.parse::<usize>() {
-                        if n.to_string() == k.as_str() && n < len {
-                            continue;
+                    if let Some(n) = canonical_index_str(k).filter(|n| *n < 4_294_967_295) {
+                        // An index key < the dense length is already covered by
+                        // the dense range above.
+                        if n >= len {
+                            sparse.push(n);
                         }
+                    }
+                }
+                sparse.sort_unstable();
+                ks.extend(sparse.into_iter().map(|n| n.to_string()));
+                for (j, k) in m.keys.iter().enumerate() {
+                    if !m.attrs[j].enumerable || is_hidden_key(k) {
+                        continue;
+                    }
+                    // Index keys were emitted (dense range / sparse run) above.
+                    if canonical_index_str(k).is_some_and(|n| n < 4_294_967_295) {
+                        continue;
                     }
                     ks.push(k.clone());
                 }
@@ -953,7 +970,8 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Array(items) => {
                 if key == "length" && !self.arguments_objs.contains_key(&idx) {
-                    let len = len_value(items.len());
+                    // A sparse array's JS length lives in the side table.
+                    let len = len_value(self.js_array_len(idx));
                     let writable = !self.array_length_nonwritable.contains(&idx);
                     return self.make_data_descriptor(len, writable, false, false);
                 }
@@ -1088,10 +1106,26 @@ impl<'p> Vm<'p> {
                             keys.push(i.to_string());
                         }
                     }
+                    if let Some(m) = self.arr_props.get(&idx) {
+                        // SPARSE-overlay index keys (>= the dense prefix) continue
+                        // the ascending index run before "length"/named keys.
+                        // ("4294967295"+ are NOT array indices — named below.)
+                        let mut sparse: Vec<usize> = m
+                            .keys
+                            .iter()
+                            .filter(|k| !is_hidden_key(k))
+                            .filter_map(|k| {
+                                canonical_index_str(k)
+                                    .filter(|n| *n < 4_294_967_295 && *n >= dense_len)
+                            })
+                            .collect();
+                        sparse.sort_unstable();
+                        keys.extend(sparse.into_iter().map(|n| n.to_string()));
+                    }
                     keys.push("length".to_string());
                     if let Some(m) = self.arr_props.get(&idx) {
-                        // Named own props only — a special index key in arr_props is
-                        // already covered by the dense `0..len` range above.
+                        // Named own props only — index keys in arr_props were
+                        // covered by the dense range / sparse run above.
                         keys.extend(
                             m.keys
                                 .iter()
@@ -1099,12 +1133,7 @@ impl<'p> Vm<'p> {
                                     if is_hidden_key(k) {
                                         return false;
                                     }
-                                    if let Ok(n) = k.parse::<usize>() {
-                                        if n.to_string() == k.as_str() && n < dense_len {
-                                            return false;
-                                        }
-                                    }
-                                    true
+                                    canonical_index_str(k).map_or(true, |n| n >= 4_294_967_295)
                                 })
                                 .cloned(),
                         );
@@ -1942,11 +1971,6 @@ impl<'p> Vm<'p> {
                 // beyond are ORDINARY named properties → fall through to the generic
                 // arr_props path (not a dense slot, no dense-limit error).
                 if i.to_string() == key && i < 0xFFFF_FFFF {
-                    if i >= crate::vm::MAX_DENSE_ARRAY_LEN {
-                        return Err(Thrown(
-                            "RangeError: array index exceeds the engine's dense-array limit".into(),
-                        ));
-                    }
                     let (value, get, set, d_wr, d_en, d_cf) = self.read_descriptor(desc)?;
                     let key_i = i.to_string();
                     // Current descriptor of index i: a special arr_props entry wins;
@@ -1956,12 +1980,13 @@ impl<'p> Vm<'p> {
                         _ => (0, None),
                     };
                     // Array [[DefineOwnProperty]] for an array index P=n: if n >= the
-                    // current length and `length` is non-writable (defineProperty /
+                    // current JS length and `length` is non-writable (defineProperty /
                     // freeze), the define fails — it would grow `length` (ArraySetLength
-                    // forbidden). `n >= dense_len` already implies the index is absent
-                    // (a special override keeps a dense placeholder). A TypeError from
+                    // forbidden). A sparse array's length is the VIRTUAL one (an index
+                    // below it doesn't grow anything). A TypeError from
                     // DefinePropertyOrThrow; the array is left unchanged.
-                    if i >= dense_len && self.array_length_nonwritable.contains(&idx) {
+                    if i >= self.js_array_len(idx) && self.array_length_nonwritable.contains(&idx)
+                    {
                         return Err(Thrown(format!(
                             "TypeError: Cannot define property {i}: array length is not writable"
                         )));
@@ -2028,7 +2053,13 @@ impl<'p> Vm<'p> {
                     // window is an ordinary named own property — `length`
                     // (items.len()) must stay argc, so never grow the Vec.
                     let args_past = i >= dense_len && self.arguments_objs.contains_key(&idx);
-                    if is_default_data && !args_past {
+                    // Past the eager-materialization cap AND the dense prefix:
+                    // a SPARSE define — the entry lives in arr_props with NO
+                    // dense placeholder (the Vec is never resized to billions
+                    // of holes); `length` comes from the virtual side table.
+                    let sparse_target =
+                        i >= crate::vm::MAX_DENSE_ARRAY_LEN && i >= dense_len && !args_past;
+                    if is_default_data && !args_past && !sparse_target {
                         // Lives in the dense Vec; drop any stale special override.
                         if let Some(m) = self.arr_props.get_mut(&idx) {
                             m.remove(&key_i);
@@ -2042,8 +2073,9 @@ impl<'p> Vm<'p> {
                         }
                     } else {
                         // Special: store in arr_props and keep a dense placeholder so
-                        // `length` counts the index (NOT for arguments — see above).
-                        if i >= dense_len && !args_past {
+                        // `length` counts the index (NOT for arguments or a sparse
+                        // index — see above).
+                        if i >= dense_len && !args_past && !sparse_target {
                             if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                                 // Intervening slots are HOLES; the slot at `i`
                                 // itself is only a placeholder (presence comes
@@ -2055,6 +2087,9 @@ impl<'p> Vm<'p> {
                             .entry(idx)
                             .or_insert_with(ObjMap::new)
                             .define(&key_i, stored, attr);
+                        if sparse_target {
+                            self.array_grow_js_len(idx, i);
+                        }
                     }
                     self.heap.bump_version(idx);
                     return Ok(());
@@ -2141,10 +2176,7 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: Cannot redefine property: length".into()));
                 }
                 let cur_writable = !self.array_length_nonwritable.contains(&idx);
-                let cur_len = match self.heap.get(idx) {
-                    HeapObj::Array(items) => items.len(),
-                    _ => 0,
-                };
+                let cur_len = self.js_array_len(idx);
                 // A non-configurable, NON-writable `length`: it can't be made writable
                 // again, and its value can only be "redefined" to the SAME length.
                 if !cur_writable {
@@ -2161,48 +2193,25 @@ impl<'p> Vm<'p> {
                     return Ok(());
                 }
                 if let Some(new_len) = new_len {
-                    if new_len > crate::vm::MAX_DENSE_ARRAY_LEN {
-                        return Err(Thrown(
-                            "RangeError: array length exceeds the engine's dense-array limit".into(),
-                        ));
-                    }
-                    let cur_len = match self.heap.get(idx) {
-                        HeapObj::Array(items) => items.len(),
-                        _ => 0,
-                    };
                     // Shrinking past a NON-configurable index does a PARTIAL shrink:
                     // delete the deletable indices above it, stop the length at
                     // blocker+1, set the length non-writable if requested, THEN throw
                     // (ArraySetLength steps 16-17). `effective_len` is where the length
                     // actually lands; `blocked` records that a TypeError is due.
+                    // The blocker scan walks arr_props KEYS (never the integer range —
+                    // a sparse array's length can be 2^32-1).
                     let mut effective_len = new_len;
                     let mut blocked = false;
                     if new_len < cur_len {
-                        // Walk DOWN from the top; the highest non-configurable
-                        // (non-deletable) index in [new_len, cur_len) is the blocker.
-                        let mut i = cur_len;
-                        while i > new_len {
-                            i -= 1;
-                            if self
-                                .array_index_override(idx, i)
-                                .map_or(false, |(a, _)| !a.configurable)
-                            {
-                                effective_len = i + 1;
-                                blocked = true;
-                                break;
-                            }
-                        }
-                        // Drop any (configurable) special overrides being truncated.
-                        if let Some(m) = self.arr_props.get_mut(&idx) {
-                            for i in effective_len..cur_len {
-                                m.remove(&i.to_string());
-                            }
+                        if let Some(ki) = self.array_shrink_blocker(idx, new_len) {
+                            effective_len = ki + 1;
+                            blocked = true;
                         }
                     }
-                    if let HeapObj::Array(items) = self.heap.get_mut(idx) {
-                        items.resize(effective_len, Value::HOLE);
-                    }
-                    self.heap.bump_version(idx);
+                    // Sweeps the doomed arr_props index entries, resizes the dense
+                    // store, and keeps the virtual length (a sparse `new_len` past
+                    // the dense cap) consistent.
+                    self.array_apply_length(idx, effective_len);
                     if blocked {
                         // A partial shrink still applies `writable:false` (newWritable)
                         // before throwing.
@@ -2518,6 +2527,81 @@ impl<'p> Vm<'p> {
         let m = self.arr_props.get(&arr_idx)?;
         let p = m.pos(&i.to_string())?;
         Some((m.attrs[p], m.vals[p]))
+    }
+
+    /// The JS `length` of the array at `arr_idx`: the dense element count, unless
+    /// the array is SPARSE — its virtual length (always larger) is then recorded
+    /// in the `array_js_len` side table. Result is `0..=2^32-1`.
+    pub(crate) fn js_array_len(&self, arr_idx: u32) -> usize {
+        if let Some(&n) = self.array_js_len.get(&arr_idx) {
+            return n as usize;
+        }
+        match self.heap.get(arr_idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => 0,
+        }
+    }
+
+    /// Record that array index `i` now exists as an own property (a sparse write
+    /// past the dense prefix): grow the virtual JS length to `i + 1` when that
+    /// exceeds the current length. `i` is a valid array index (< 2^32-1), so the
+    /// new length fits u32.
+    pub(crate) fn array_grow_js_len(&mut self, arr_idx: u32, i: usize) {
+        if i + 1 > self.js_array_len(arr_idx) {
+            self.array_js_len.insert(arr_idx, (i + 1) as u32);
+        }
+    }
+
+    /// ArraySetLength truncation blocker: the highest NON-configurable own array
+    /// index `>= new_len` (it survives the shrink and the final length becomes
+    /// blocker + 1). Only a defineProperty'd override in `arr_props` can be
+    /// non-configurable, so a scan of its keys covers every candidate — including
+    /// sparse-overlay indices far past the dense prefix (never walk the integer
+    /// RANGE here: a virtual length can be 2^32-1).
+    pub(crate) fn array_shrink_blocker(&self, arr_idx: u32, new_len: usize) -> Option<usize> {
+        let m = self.arr_props.get(&arr_idx)?;
+        m.keys
+            .iter()
+            .enumerate()
+            .filter_map(|(i, k)| {
+                canonical_index_str(k).filter(|ki| *ki >= new_len && !m.attrs[i].configurable)
+            })
+            .max()
+    }
+
+    /// Apply a VALIDATED new `length` to a real array: drop the (configurable)
+    /// arr_props index entries `>= n`, resize the dense store, and keep the
+    /// virtual-length side table consistent (entry present iff the JS length
+    /// exceeds the dense element count). The caller has already run the ToUint32
+    /// coercion, the writability check, and resolved any non-configurable
+    /// blocker into `n`.
+    pub(crate) fn array_apply_length(&mut self, arr_idx: u32, n: usize) {
+        if let Some(m) = self.arr_props.get_mut(&arr_idx) {
+            let doomed: Vec<String> = m
+                .keys
+                .iter()
+                .filter(|k| canonical_index_str(k).is_some_and(|i| i >= n))
+                .cloned()
+                .collect();
+            for k in doomed {
+                m.remove(&k);
+            }
+        }
+        let dense_len = match self.heap.get(arr_idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => 0,
+        };
+        if n <= dense_len || n <= crate::vm::MAX_DENSE_ARRAY_LEN {
+            // Materialized: truncate, or extend with HOLES (absent elements).
+            if let HeapObj::Array(items) = self.heap.get_mut(arr_idx) {
+                items.resize(n, Value::HOLE);
+            }
+            self.array_js_len.remove(&arr_idx);
+        } else {
+            // Keep the dense prefix; the JS length lives in the side table.
+            self.array_js_len.insert(arr_idx, n as u32);
+        }
+        self.heap.bump_version(arr_idx);
     }
 
     /// `Object.defineProperties(obj, props)` — define each own enumerable key of
@@ -3769,7 +3853,8 @@ impl<'p> Vm<'p> {
         match self.heap.get(obj.heap_index()) {
             HeapObj::Array(items) => {
                 if key == "length" && !self.arguments_objs.contains_key(&obj.heap_index()) {
-                    Ok(len_value(items.len()))
+                    // A sparse array's JS length lives in the side table.
+                    Ok(len_value(self.js_array_len(obj.heap_index())))
                 } else if let Some(i) = key.parse::<u32>().ok().filter(|i| i.to_string() == key) {
                     // Element access via a canonical numeric STRING key (`arr["0"]`,
                     // object-pattern destructuring `{0: x} = arr`): GetProp must read
@@ -3786,6 +3871,21 @@ impl<'p> Vm<'p> {
                         }
                         Ok(own.unwrap())
                     } else {
+                        // A SPARSE-overlay element (or a defineProperty'd index whose
+                        // dense placeholder is a hole) lives in arr_props — it is an
+                        // own property, consulted before the prototype chain.
+                        if let Some((a, v)) =
+                            self.array_index_override(obj.heap_index(), i as usize)
+                        {
+                            if a.accessor {
+                                return if v == Value::UNDEFINED {
+                                    Ok(Value::UNDEFINED)
+                                } else {
+                                    self.call_value(v, receiver, &[])
+                                };
+                            }
+                            return Ok(v);
+                        }
                         // Not an own element → [[Get]] continues up the prototype chain.
                         // A subclass-of-Array instance records its own prototype in
                         // proto_of (chains to Array.prototype); else the default arr_proto.

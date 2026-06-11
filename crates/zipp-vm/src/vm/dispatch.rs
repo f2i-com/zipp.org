@@ -1729,6 +1729,7 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::ArrayCtor { dst, arg_base, argc } => {
+                        let mut virtual_len: Option<u32> = None;
                         let arr = if argc == 1 && self.get(base, arg_base).is_number() {
                             // `Array(n)` â†’ n HOLES (absent elements), not n undefineds.
                             let n = self.get(base, arg_base).as_f64();
@@ -1736,15 +1737,20 @@ impl<'p> Vm<'p> {
                                 return Err(Thrown("RangeError: Invalid array length".into()));
                             }
                             if n as usize > super::MAX_DENSE_ARRAY_LEN {
-                                return Err(Thrown(
-                                    "RangeError: array length exceeds the engine's dense-array limit".into(),
-                                ));
+                                // Past the eager-materialization cap: a SPARSE
+                                // array — no elements, just a virtual length.
+                                virtual_len = Some(n as u32);
+                                Vec::new()
+                            } else {
+                                vec![Value::HOLE; n as usize]
                             }
-                            vec![Value::HOLE; n as usize]
                         } else {
                             (0..argc).map(|i| self.get(base, arg_base + i)).collect()
                         };
                         let v = Value::heap(self.heap.alloc(HeapObj::Array(arr)));
+                        if let Some(n) = virtual_len {
+                            self.array_js_len.insert(v.heap_index(), n);
+                        }
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2564,6 +2570,48 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::ForInLive { dst, obj, key } => {
+                        // EnumerateObjectProperties: a snapshotted key deleted (or
+                        // otherwise removed) before its visit is skipped. The check
+                        // must be NON-observable, so it errs on "live": a primitive
+                        // receiver, a Proxy anywhere on the chain (its has/ownKeys
+                        // traps must not fire here — the snapshot already ran the
+                        // spec'd ownKeys/gopd protocol), and globalThis' reserved
+                        // builtin bindings all stay visited.
+                        let o = self.get(base, obj);
+                        let kv = self.get(base, key);
+                        let live = if !o.is_heap() {
+                            true
+                        } else if self.has_property(o, kv) {
+                            true
+                        } else {
+                            let k = self.key_of(kv);
+                            if self.has_own_property(o, &k) {
+                                true
+                            } else {
+                                // Absent per the ordinary walk — but a Proxy on the
+                                // chain is opaque to it, so treat that as live.
+                                let mut cur = o;
+                                let mut saw_proxy = false;
+                                for _ in 0..100_000 {
+                                    if !cur.is_heap() {
+                                        break;
+                                    }
+                                    if matches!(
+                                        self.heap.get(cur.heap_index()),
+                                        HeapObj::Proxy { .. }
+                                    ) {
+                                        saw_proxy = true;
+                                        break;
+                                    }
+                                    cur = self.object_get_prototype_of(cur);
+                                }
+                                saw_proxy
+                            }
+                        };
+                        self.set(base, dst, Value::bool(live));
+                        ip += 1;
+                    }
                     Instr::ObjectValues { dst, obj } => {
                         let o = self.get(base, obj);
                         self.require_object_coercible(o)?;
@@ -2584,7 +2632,13 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let v = if o.is_heap() {
                             match self.heap.get(o.heap_index()) {
-                                HeapObj::Array(items) => len_value(items.len()),
+                                // (For-in key snapshots are always dense, but stay
+                                // virtual-length-aware for any future reuse.)
+                                HeapObj::Array(items) => len_value(
+                                    self.array_js_len
+                                        .get(&o.heap_index())
+                                        .map_or(items.len(), |&n| n as usize),
+                                ),
                                 HeapObj::Str(s) => len_value(s.units()),
                                 HeapObj::Cons { len, .. } => len_value(*len),
                                 // for-of over a Map/Set iterates `size` slots (a
@@ -3867,6 +3921,10 @@ impl<'p> Vm<'p> {
                                     .map_or(false, |m| m.is_frozen()))
                             && !(!self.array_length_nonwritable.is_empty()
                                 && self.array_length_nonwritable.contains(&recv.heap_index()))
+                            // A SPARSE array's length is virtual — push must place
+                            // the element AT that length (array_method's routed path).
+                            && !(!self.array_js_len.is_empty()
+                                && self.array_js_len.contains_key(&recv.heap_index()))
                         {
                             let v = self.get(base, arg_base);
                             let len = if let HeapObj::Array(items) =

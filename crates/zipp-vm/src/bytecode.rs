@@ -527,6 +527,14 @@ pub enum Instr {
     /// the [[Prototype]] chain with shadowing dedup (vs `ObjectKeys`, own-only).
     /// null/undefined receiver → empty (for-in over nullish does not throw).
     ForInKeys { dst: Reg, obj: Reg },
+    /// `dst = <is the snapshotted for-in key still present on obj?>` — the
+    /// per-iteration liveness re-check of EnumerateObjectProperties: a key
+    /// deleted (or otherwise removed) after the `ForInKeys` snapshot but before
+    /// its visit is skipped. Uses the NON-observable own+prototype presence
+    /// check; a Proxy receiver stays snapshot-only (its `has` trap must NOT
+    /// fire — the spec'd protocol is ownKeys + per-key gopd, already applied by
+    /// the snapshot), as does a primitive.
+    ForInLive { dst: Reg, obj: Reg, key: Reg },
     /// `dst = Object.values(obj)` — array of the object's own values (or array
     /// elements).
     ObjectValues { dst: Reg, obj: Reg },

@@ -5683,6 +5683,15 @@ impl<'a> FnCompiler<'a> {
             var_reg
         };
         self.emit(Instr::GetIndex { dst: key_dst, obj: keys_reg, key: idx_reg });
+        // EnumerateObjectProperties: a not-yet-visited key DELETED during the
+        // loop is skipped — re-check liveness against the receiver each
+        // iteration (the snapshot in keys_reg is taken once) and jump to the
+        // increment when the key is gone.
+        let live = self.temp();
+        self.emit(Instr::ForInLive { dst: live, obj: obj_reg, key: key_dst });
+        let live_jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond: live, target: 0 });
+        self.next_reg -= 1;
         if let Some(p) = pattern {
             if head_lexical {
                 let mut names = std::collections::HashSet::new();
@@ -5715,6 +5724,7 @@ impl<'a> FnCompiler<'a> {
         self.stmt(&f.body)?;
         let ctx = self.loop_ctx.pop().unwrap();
         let cont = self.here();
+        self.patch_jump(live_jf, cont); // dead (deleted) key → skip to increment
         for c in ctx.continue_jumps {
             self.patch_jump(c, cont); // continue → increment + re-test
         }

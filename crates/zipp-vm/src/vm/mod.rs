@@ -390,6 +390,15 @@ pub struct Vm<'p> {
     /// (rare) non-writable flag is recorded here — read by the length descriptor,
     /// `arr.length = n`, and the push/pop/shift/unshift mutators.
     array_length_nonwritable: std::collections::HashSet<u32>,
+    /// SPARSE arrays: heap idx → the JS `length` when it EXCEEDS the dense
+    /// element count (`new Array(4e9)`, `a[3e9] = v`, `a.length = 2**32-1`).
+    /// Sparse elements themselves live in `arr_props` under canonical index
+    /// keys (GC-traced there); this table holds no Values — sweep-only. Absent
+    /// for every fully-materialized array, so dense behavior is unchanged
+    /// (`js_array_len` falls back to `items.len()`). Values are `1..=u32::MAX`
+    /// (a JS length is at most 2^32-1) and always exceed both the dense length
+    /// and `MAX_DENSE_ARRAY_LEN` at insertion time.
+    array_js_len: std::collections::HashMap<u32, u32>,
     /// Set once an integer-indexed own property is defined on `Array.prototype` or
     /// `Object.prototype` (the prototypes in every plain array's chain). While false
     /// — the overwhelmingly common case — `a[i] = v` for an absent index takes the

@@ -1487,7 +1487,9 @@ impl<'p> Vm<'p> {
         // (non-native) JS-callback branch reads each element live, so a callback's
         // mid-iteration mutation is still observed; only the non-mutating native
         // numeric kernel snapshots.
-        if (self.arr_props.contains_key(&idx) || self.array_has_holes(idx))
+        if (self.arr_props.contains_key(&idx)
+            || self.array_js_len.contains_key(&idx)
+            || self.array_has_holes(idx))
             && matches!(
                 name,
                 "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
@@ -1497,8 +1499,11 @@ impl<'p> Vm<'p> {
         }
         // Likewise route the SEARCH methods off the dense fast path when the array
         // carries a side table (a defineProperty'd index accessor must have its getter
-        // invoked) OR has holes (indexOf/lastIndexOf skip holes via HasProperty).
-        if (self.arr_props.contains_key(&idx) || self.array_has_holes(idx))
+        // invoked), a virtual (sparse) length, OR has holes (indexOf/lastIndexOf skip
+        // holes via HasProperty).
+        if (self.arr_props.contains_key(&idx)
+            || self.array_js_len.contains_key(&idx)
+            || self.array_has_holes(idx))
             && matches!(name, "indexOf" | "lastIndexOf" | "includes")
         {
             return self.array_like_search(Value::heap(idx), name, args);
@@ -1546,6 +1551,16 @@ impl<'p> Vm<'p> {
         // abstract al_set path). The fast Vec append below bypasses set_index, so route
         // to the abstract path then. Gated on the flag, so the common fast path stands.
         if (name == "push" || name == "unshift") && self.array_proto_has_index {
+            return self.array_like_mutate(Value::heap(idx), name, args);
+        }
+        // A VIRTUAL-length (sparse) array's mutators must read and write `length`
+        // through the side table and place elements via the abstract protocol —
+        // e.g. a push at length 2^32-1 stores a NAMED prop ("4294967295" is not an
+        // array index) and then the length set to 2^32 throws RangeError, per
+        // ArraySetLength. The dense Vec fast paths below would use items.len().
+        if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice" | "reverse")
+            && self.array_js_len.contains_key(&idx)
+        {
             return self.array_like_mutate(Value::heap(idx), name, args);
         }
         match name {
