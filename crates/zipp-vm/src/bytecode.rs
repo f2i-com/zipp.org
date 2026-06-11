@@ -842,7 +842,10 @@ pub struct FuncProto {
     /// (EvalDeclarationInstantiation: a sloppy eval declaring one of these
     /// names — the parameters or the implicit `arguments` — is a SyntaxError).
     /// Indexed by the DirectEval instr's `site` (u16::MAX = no map).
-    pub eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>)>,
+    /// The third element: the LEXICAL (`let`/`const`/`class`) caller binding
+    /// names visible at the call site — a sloppy eval's var/function name
+    /// colliding with one is a SyntaxError (EvalDeclarationInstantiation).
+    pub eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
     /// Exact source text of this function (sliced from the program source by the
     /// function node's span), used by `Function.prototype.toString`. Empty for
     /// the synthetic top-level script body and for placeholders, in which case

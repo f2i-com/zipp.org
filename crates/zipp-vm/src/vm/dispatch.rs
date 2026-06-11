@@ -3409,12 +3409,22 @@ impl<'p> Vm<'p> {
                                 } else {
                                     None
                                 },
+                                // Visible LEXICAL caller bindings: a sloppy
+                                // eval's var/fn name colliding with one is a
+                                // SyntaxError.
+                                if site != u16::MAX {
+                                    self.func(func_id as usize).eval_sites[site as usize]
+                                        .2
+                                        .clone()
+                                } else {
+                                    Vec::new()
+                                },
                                 {
                                     // The site's visible caller bindings: their
                                     // boxed cells become the eval closure's
                                     // upvalues.
                                     if site != u16::MAX {
-                                        let (map, _) = self.func(func_id as usize).eval_sites
+                                        let (map, _, _) = self.func(func_id as usize).eval_sites
                                             [site as usize]
                                             .clone();
                                         let mut names = Vec::with_capacity(map.len());

@@ -1133,6 +1133,7 @@ impl<'p> Vm<'p> {
         caller_home_obj: Option<Value>,
         var_env_global: bool,
         param_collisions: Option<Vec<String>>,
+        lexical_collisions: Vec<String>,
         caller_scope: Option<(Vec<String>, Vec<Value>)>,
         eval_scope_idx: Option<u32>,
     ) -> Result<Value, Thrown> {
@@ -1147,7 +1148,7 @@ impl<'p> Vm<'p> {
         // A direct eval in a PARAMETER DEFAULT: its sloppy var/function names
         // may not collide with the param-scope bindings (params + implicit
         // `arguments`) — SyntaxError BEFORE anything runs or is declared.
-        if let Some(cols) = &param_collisions {
+        if param_collisions.is_some() || !lexical_collisions.is_empty() {
             let src_strict = force_strict
                 || ret
                     .program
@@ -1156,7 +1157,16 @@ impl<'p> Vm<'p> {
                     .any(|d| d.directive.as_str() == "use strict");
             if !src_strict {
                 for n in crate::compile::eval_var_and_fn_names(&ret.program) {
-                    if cols.iter().any(|c| *c == n) {
+                    if param_collisions.as_ref().map_or(false, |c| c.iter().any(|c| *c == n)) {
+                        return Err(Thrown(format!(
+                            "SyntaxError: Identifier '{n}' has already been declared"
+                        )));
+                    }
+                    // EvalDeclarationInstantiation step 5: a var/function name
+                    // colliding with a LEXICAL binding between the eval's
+                    // lexEnv and its varEnv (the calling function) is a
+                    // SyntaxError, before any binding is created.
+                    if lexical_collisions.iter().any(|c| *c == n) {
                         return Err(Thrown(format!(
                             "SyntaxError: Identifier '{n}' has already been declared"
                         )));
@@ -1318,7 +1328,7 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None)?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1342,7 +1352,7 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, None, None)?;
+        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None)?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }

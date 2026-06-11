@@ -3081,7 +3081,7 @@ impl<'p> Vm<'p> {
                     a0
                 } else {
                     let code = self.display(a0);
-                    return self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, true, None, None, None);
+                    return self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, true, None, Vec::new(), None, None);
                 }
             }
             // String static methods.

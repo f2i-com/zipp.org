@@ -1935,7 +1935,7 @@ struct FnCompiler<'a> {
     box_all_locals: bool,
     /// Scope maps for this function's DirectEval call sites (see
     /// FuncProto::eval_sites).
-    eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>)>,
+    eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
     /// True while this function's parameter defaults compile: a direct eval
     /// there sits in the PARAM scope (its sloppy var/function declarations
     /// collide with parameter names / the implicit `arguments`).
@@ -1983,6 +1983,9 @@ struct FnCompiler<'a> {
     /// runtime TypeError. Each const local has a unique register, so reassignment
     /// is detected by register identity (no name-shadowing ambiguity).
     const_regs: HashSet<Reg>,
+    /// Registers bound by LEXICAL local declarations (let/const/class) —
+    /// visible-lexical collection for direct-eval site maps.
+    lexical_regs: HashSet<Reg>,
     /// Parameter names currently in the Temporal Dead Zone while a parameter
     /// default initializer is being compiled: a default that references the
     /// parameter itself (`(x = x)`) or a later parameter (`(x = y, y)`) reads a
@@ -2160,6 +2163,7 @@ impl<'a> FnCompiler<'a> {
             self_name: None,
             captured,
             cell_regs: HashSet::new(),
+            lexical_regs: HashSet::new(),
             const_regs: HashSet::new(),
             param_tdz: HashSet::new(),
             upvalues: Rc::new(RefCell::new(Vec::new())),
@@ -3023,6 +3027,7 @@ impl<'a> FnCompiler<'a> {
             if is_const {
                 self.const_regs.insert(reg);
             }
+            self.lexical_regs.insert(reg);
             let is_cell = self.cell_regs.contains(&reg);
             if let Some(init) = &decl.init {
                 if is_cell {
@@ -9305,8 +9310,18 @@ impl<'a> FnCompiler<'a> {
             } else {
                 None
             };
+            // LEXICAL caller bindings visible here (the live scope stack
+            // at this call site gives the correct block nesting).
+            let mut lex: Vec<String> = Vec::new();
+            for scope in self.scopes.iter().rev() {
+                for (n, r) in scope.iter().rev() {
+                    if self.lexical_regs.contains(r) && !lex.iter().any(|e| e == n) {
+                        lex.push(n.clone());
+                    }
+                }
+            }
             let s = self.eval_sites.len() as u16;
-            self.eval_sites.push((map, param_collisions));
+            self.eval_sites.push((map, param_collisions, lex));
             s
         } else {
             u16::MAX
