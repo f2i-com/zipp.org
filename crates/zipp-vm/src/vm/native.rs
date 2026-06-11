@@ -244,6 +244,10 @@ pub const DOLLAR262_EVAL_SCRIPT: u16 = 901;
 /// Async-from-Sync unwrap reaction: called with the awaited element value,
 /// `this` = the bound `done` flag; returns the `{value, done}` iter result.
 pub const UNWRAP_ITER_RESULT: u16 = 902;
+/// `$262.agent.getReport()` — pop the oldest worker-agent report string
+/// (null when the queue is empty) — and `$262.agent.sleep(ms)`.
+pub const AGENT_GET_REPORT: u16 = 903;
+pub const AGENT_SLEEP: u16 = 904;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

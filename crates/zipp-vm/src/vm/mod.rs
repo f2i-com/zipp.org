@@ -881,6 +881,7 @@ mod array_ops;
 mod string_ops;
 mod coerce;
 mod native;
+mod agents;
 mod helpers_misc;
 mod helpers_datetime;
 mod helpers_numeric;

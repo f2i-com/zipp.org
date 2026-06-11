@@ -1309,6 +1309,17 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            AGENT_GET_REPORT => match self.agent_pop_report() {
+                Some(s) => self.alloc_str(s),
+                None => Value::NULL,
+            },
+            AGENT_SLEEP => {
+                let ms = self
+                    .to_number_coerce(args.first().copied().unwrap_or(Value::UNDEFINED))?
+                    .max(0.0);
+                std::thread::sleep(std::time::Duration::from_secs_f64(ms / 1000.0));
+                Value::UNDEFINED
+            }
             MODULE_DEP_FAIL => {
                 let cap = this.as_f64() as u32;
                 if self.deferred_mods.remove(&cap).is_some() {
