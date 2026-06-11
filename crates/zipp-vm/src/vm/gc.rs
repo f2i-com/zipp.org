@@ -122,7 +122,7 @@ impl Vm<'_> {
         if let Some(v) = self.pending_throw {
             root_val!(v);
         }
-        for v in self.module_body_promise.values() {
+        for (v, _) in self.module_body_promise.values() {
             root_val!(*v);
         }
         for v in self.typed_module_cache.values() {

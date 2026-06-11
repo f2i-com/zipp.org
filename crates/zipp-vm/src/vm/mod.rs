@@ -523,7 +523,11 @@ pub struct Vm<'p> {
     /// cached) re-publishes this as pending_module_body so the new importer
     /// chains on the SAME TopLevelCapability instead of resolving with the
     /// incomplete namespace. Entries persist after settlement.
-    module_body_promise: std::collections::HashMap<std::path::PathBuf, Value>,
+    /// The bool: true = registered via the DEPS-PENDING (capability) path —
+    /// an ANCESTOR whose body waits on other suspended modules (a cycle
+    /// root); false = a direct top-level-await suspension. Late importers of
+    /// a TLA module inside a cycle wait on the cycle ROOT's capability.
+    module_body_promise: std::collections::HashMap<std::path::PathBuf, (Value, bool)>,
     /// Typed-module cache: (canonical path, type attribute) → namespace for
     /// `with { type: "json" | "text" }` imports — DISTINCT records from the
     /// same file's JS module. Values are GC roots like module_cache.

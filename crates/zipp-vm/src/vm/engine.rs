@@ -1390,7 +1390,7 @@ impl<'p> Vm<'p> {
                 // A cached module that SUSPENDED (top-level await): later
                 // importers settle from the same body promise — never from
                 // the incomplete namespace directly.
-                if let Some(&bp) = self.module_body_promise.get(&path) {
+                if let Some(&(bp, _)) = self.module_body_promise.get(&path) {
                     let pending = bp.is_heap()
                         && matches!(
                             self.heap.get(bp.heap_index()),
@@ -1404,7 +1404,38 @@ impl<'p> Vm<'p> {
                     // body promise is a deadlock cycle — the spec resolves a
                     // self-import against the in-progress record directly.
                     if pending && !self.executing_modules.contains(&path) {
-                        self.pending_module_body = Some(bp);
+                        // A suspended module inside a CYCLE completes only
+                        // when its CYCLE ROOT does (InnerModuleEvaluation
+                        // 11.c.iv waits on requiredModule.[[CycleRoot]]):
+                        // prefer a pending ANCESTOR capability (a cap-kind
+                        // registration) whose request graph reaches this
+                        // module.
+                        let mut chosen = bp;
+                        let mut candidates: Vec<(std::path::PathBuf, Value)> = Vec::new();
+                        for (p2, &(b2, cap2)) in &self.module_body_promise {
+                            let p2_pending = cap2
+                                && *p2 != path
+                                && b2.is_heap()
+                                && matches!(
+                                    self.heap.get(b2.heap_index()),
+                                    HeapObj::Promise {
+                                        state: crate::heap::PromiseState::Pending,
+                                        ..
+                                    }
+                                );
+                            if p2_pending {
+                                candidates.push((p2.clone(), b2));
+                            }
+                        }
+                        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+                        for (p2, b2) in candidates {
+                            let mut seen = std::collections::HashSet::new();
+                            if self.module_graph_reaches(&p2, &path, &mut seen) {
+                                chosen = b2;
+                                break;
+                            }
+                        }
+                        self.pending_module_body = Some(chosen);
                     }
                 }
                 return Ok(ns);
@@ -1824,7 +1855,7 @@ impl<'p> Vm<'p> {
                         self.then_internal(bp.heap_index(), on_ok, on_fail, None);
                     }
                     self.pending_module_body = Some(Value::heap(cap));
-                    self.module_body_promise.insert(path.clone(), Value::heap(cap));
+                    self.module_body_promise.insert(path.clone(), (Value::heap(cap), true));
                     return {
                         self.module_own.remove(&path);
                         self.module_pending_reexports.remove(&path);
@@ -1884,7 +1915,7 @@ impl<'p> Vm<'p> {
                                 // promise is a deadlock cycle (the resumption
                                 // depends on the import it would wait for).
                                 if self.module_has_tla(&path) {
-                                    self.module_body_promise.insert(path.clone(), v);
+                                    self.module_body_promise.insert(path.clone(), (v, false));
                                 }
                                 Ok((full2, ambiguous))
                             }
@@ -2305,6 +2336,28 @@ impl<'p> Vm<'p> {
         Ok(out)
     }
 
+    /// Whether `from`'s static request graph reaches `target` (cycle-root
+    /// detection for late importers of a suspended cycle member).
+    fn module_graph_reaches(
+        &mut self,
+        from: &std::path::PathBuf,
+        target: &std::path::PathBuf,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> bool {
+        if !seen.insert(from.clone()) {
+            return false;
+        }
+        let Ok(reqs) = self.module_requests(from) else {
+            return false;
+        };
+        for dep in reqs {
+            if dep == *target || self.module_graph_reaches(&dep, target, seen) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn prescan_module_requests(
         &mut self,
         path: &std::path::PathBuf,
@@ -2336,7 +2389,7 @@ impl<'p> Vm<'p> {
             return false; // evaluating / link in flight
         }
         // A body suspended at top-level await = evaluating-async.
-        if let Some(&bp) = self.module_body_promise.get(path) {
+        if let Some(&(bp, _)) = self.module_body_promise.get(path) {
             if bp.is_heap()
                 && matches!(
                     self.heap.get(bp.heap_index()),
