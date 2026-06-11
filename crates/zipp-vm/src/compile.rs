@@ -2727,7 +2727,22 @@ impl<'a> FnCompiler<'a> {
                 // that closes the iterator (a throwing `return()` then propagates,
                 // discarding the value). `break`/`throw` already close via their paths.
                 let v = match &r.argument {
-                    Some(arg) => Some(self.expr(arg)?),
+                    Some(arg) => {
+                        let v = self.expr(arg)?;
+                        // In an ASYNC GENERATOR, `return expr;` performs
+                        // Await(exprValue) (spec ReturnStatement evaluation): a
+                        // thenable operand is adopted (observable `then` read)
+                        // and an explicit `return undefined` settles one tick
+                        // later than an implicit return. Awaits into a temp so
+                        // a returned local's register isn't clobbered.
+                        if self.in_generator && self.in_async {
+                            let t = self.temp();
+                            self.emit(Instr::Await { dst: t, val: v });
+                            Some(t)
+                        } else {
+                            Some(v)
+                        }
+                    }
                     None => None,
                 };
                 let iters: Vec<Reg> =
@@ -5405,7 +5420,7 @@ impl<'a> FnCompiler<'a> {
             if let Some(s) = sync_reg {
                 let jskip = self.here();
                 self.emit(Instr::JumpIfFalse { cond: s, target: 0 });
-                self.emit(Instr::AsyncFromSyncStep { dst: step, step });
+                self.emit(Instr::AsyncFromSyncStep { dst: step, step, iter: iter_reg });
                 let after = self.here();
                 self.patch_jump(jskip, after);
             }
@@ -8712,6 +8727,7 @@ impl<'a> FnCompiler<'a> {
                 let next_name = self.string_name("next");
                 self.emit(Instr::GetProp { dst: next_fn, obj: iter, name: next_name });
                 let excr = self.alloc_reg(); // catch reg for an injected outer .throw()
+                let cerr = self.alloc_reg(); // abrupt unwrap completion (close-on-rejection)
                 let step = self.alloc_reg();
                 let r = self.alloc_reg();
                 let done = self.alloc_reg();
@@ -8736,16 +8752,35 @@ impl<'a> FnCompiler<'a> {
                 let jdone = self.here();
                 self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → yield* value (r.value)
                 self.emit(Instr::GetProp { dst: value, obj: r, name: value_name });
-                // AsyncFromSyncIterator unwrap: a SYNC inner iterator's stepped
-                // value is AWAITED before the async-yield (a rejected promise
-                // throws HERE, closing the generator and rejecting the front
-                // promise); an ASYNC inner iterator's value is yielded as-is
-                // (yield-star-promise-not-unwrapped).
+                // AsyncFromSyncIterator unwrap (AsyncFromSyncIteratorContinuation,
+                // closeOnRejection = true): a SYNC inner iterator's stepped value
+                // is AWAITED before the async-yield; an abrupt unwrap — the Await's
+                // observable PromiseResolve (a poisoned `constructor`) or a
+                // rejected value-promise — first does IteratorClose(inner) QUIETLY,
+                // then re-throws the ORIGINAL reason (closing the generator and
+                // rejecting the front promise). An ASYNC inner iterator's value is
+                // yielded as-is (yield-star-promise-not-unwrapped). The
+                // throw-delegation's not-done path re-enters here at `unwrap_pt`.
+                let unwrap_pt = self.here();
                 let jskip_aw = self.here();
                 self.emit(Instr::JumpIfFalse { cond: is_sync, target: 0 });
+                let ph_aw = self.here();
+                self.emit(Instr::PushHandler { catch_target: 0, catch_reg: cerr });
+                self.handler_depth += 1;
                 self.emit(Instr::Await { dst: value, val: value });
+                self.emit(Instr::PopHandler);
+                self.handler_depth -= 1;
+                let jaw_ok = self.here();
+                self.emit(Instr::Jump { target: 0 });
+                let close_catch = self.here();
+                if let Instr::PushHandler { catch_target, .. } = &mut self.code[ph_aw as usize] {
+                    *catch_target = close_catch;
+                }
+                self.emit(Instr::IterCloseQuiet { iter });
+                self.emit(Instr::Throw { src: cerr });
                 let after_aw = self.here();
                 self.patch_jump(jskip_aw, after_aw);
+                self.patch_jump(jaw_ok, after_aw);
                 // --- (async-)yield the value, with a handler that delegates an outer
                 //     .throw() into the inner iterator's `throw` ---
                 let yield_pt = self.here();
@@ -8768,7 +8803,13 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::AsyncIterReturnStep { dst: tstep, has_dst: hasret, iter, ret: sent });
                 let jhas = self.here();
                 self.emit(Instr::JumpIfTrue { cond: hasret, target: 0 });
-                self.emit(Instr::Return { src: sent }); // no inner return → generator returns `sent`
+                // No inner `return` method: the received return value is AWAITED
+                // (spec: if return is undefined and generatorKind is async, set
+                // received.[[Value]] to ? Await(received.[[Value]])) before the
+                // generator returns it — a thenable is adopted (observable `then`
+                // read + one tick), and a rejection unwinds instead.
+                self.emit(Instr::Await { dst: sent, val: sent });
+                self.emit(Instr::Return { src: sent });
                 let has_ret = self.here();
                 self.patch_jump(jhas, has_ret);
                 self.emit(Instr::Await { dst: taw, val: tstep });
@@ -8781,6 +8822,14 @@ impl<'a> FnCompiler<'a> {
                 let ret_done = self.here();
                 self.patch_jump(jretdone, ret_done);
                 self.emit(Instr::GetProp { dst: value, obj: taw, name: value_name });
+                // A SYNC inner's `return()` result value is unwrapped by the
+                // AsyncFromSync continuation (closeOnRejection = false here):
+                // await it before completing (iterator-result-unwrap-promise).
+                let jrv = self.here();
+                self.emit(Instr::JumpIfFalse { cond: is_sync, target: 0 });
+                self.emit(Instr::Await { dst: value, val: value });
+                let after_rv = self.here();
+                self.patch_jump(jrv, after_rv);
                 self.emit(Instr::Return { src: value }); // generator returns inner.return's value
                 // --- catch: an outer .throw(excr) was injected here. Delegate to the
                 //     inner iterator's throw (or TypeError if it has none), await the
@@ -8796,11 +8845,22 @@ impl<'a> FnCompiler<'a> {
                 let jdone2 = self.here();
                 self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // inner.throw done → value
                 self.emit(Instr::GetProp { dst: value, obj: taw, name: value_name });
-                self.emit(Instr::Jump { target: yield_pt }); // re-yield the delegated value
-                // done via inner.throw: yield* value = taw.value.
+                // Not done: a SYNC inner's delegated value takes the same
+                // close-on-rejection unwrap as a next() step (the AsyncFromSync
+                // throw() continuation also has closeOnRejection = true), then
+                // the yield at `yield_pt`.
+                self.emit(Instr::Jump { target: unwrap_pt });
+                // done via inner.throw: yield* value = taw.value (awaited for a
+                // SYNC inner — the continuation unwraps it; done == true means
+                // no close-on-rejection, a plain await).
                 let done_label2 = self.here();
                 self.patch_jump(jdone2, done_label2);
                 self.emit(Instr::GetProp { dst, obj: taw, name: value_name });
+                let jtv = self.here();
+                self.emit(Instr::JumpIfFalse { cond: is_sync, target: 0 });
+                self.emit(Instr::Await { dst, val: dst });
+                let after_tv = self.here();
+                self.patch_jump(jtv, after_tv);
                 let jend = self.here();
                 self.emit(Instr::Jump { target: 0 });
                 // done via next(): yield* value = r.value.

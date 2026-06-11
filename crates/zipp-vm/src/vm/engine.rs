@@ -88,6 +88,7 @@ impl<'p> Vm<'p> {
             pending_yield: None,
             pending_yield_handlers: Vec::new(),
             pending_yield_eval_scope: u32::MAX,
+            pending_yield_raw: false,
             pending_await: None,
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),

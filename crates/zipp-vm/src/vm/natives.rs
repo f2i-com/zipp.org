@@ -3245,6 +3245,20 @@ impl<'p> Vm<'p> {
                 let done = this == Value::bool(true);
                 self.iter_result(v, done)
             }
+            AFS_CLOSE_REJECT => {
+                // Async-from-Sync close-on-rejection reaction (bound args =
+                // [syncIterator], the call arg is the rejection reason):
+                // IteratorClose(syncIterator, ThrowCompletion(reason)) — close
+                // errors are swallowed (the throw completion wins) and the
+                // original reason re-throws; run_microtask's Err arm then
+                // rejects the capability promise with it.
+                let iter = args.first().copied().unwrap_or(Value::UNDEFINED);
+                let reason = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                let _gc = self.gc_lock_guard();
+                let _ = self.iterator_close(iter);
+                self.pending_throw = Some(reason);
+                return Err(Thrown(self.throw_message(reason)));
+            }
             DOLLAR262_CREATE_REALM => self.create_realm(),
             // Object.prototype Annex-B accessor helpers.
             OBJPROTO_DEFINE_GETTER | OBJPROTO_DEFINE_SETTER => {

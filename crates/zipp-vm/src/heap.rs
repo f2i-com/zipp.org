@@ -871,11 +871,24 @@ pub struct AsyncStateData {
     pub handlers: Vec<Handler>,
 }
 
+/// One pending request on an async generator (spec AsyncGeneratorRequest): the
+/// completion kind a `.next()`/`.throw()`/`.return()` call wants delivered, its
+/// argument, and the result promise that call returned. Requests are serviced
+/// FIFO by `async_gen_service_queue`. GC: `arg` and `promise` are traced via the
+/// owning [`AsyncGenState`]'s edge arm in `gc.rs`.
+#[derive(Clone, Debug)]
+pub struct AsyncGenRequest {
+    /// 0 = next, 1 = throw, 2 = return.
+    pub kind: u8,
+    pub arg: Value,
+    pub promise: u32,
+}
+
 /// Payload of [`HeapObj::AsyncGenerator`] (an `async function*` activation). Like
 /// a generator (suspend/resume on `yield`) AND an async activation (suspend on
 /// `await`), so it carries the saved window + handlers like both. `queue` holds
-/// the result promises of `.next()`/`.return()`/`.throw()` calls awaiting the
-/// next yield/return (FIFO) — each `.next()` returns a Promise.
+/// the pending `.next()`/`.return()`/`.throw()` requests awaiting the next
+/// yield/return (FIFO) — each call returns a Promise.
 #[derive(Clone, Debug)]
 pub struct AsyncGenState {
     pub func: u32,
@@ -883,11 +896,15 @@ pub struct AsyncGenState {
     pub state: GenState,
     pub regs: Vec<Value>,
     pub handlers: Vec<Handler>,
-    /// Pending `.next()` requests, FIFO: `(sent_arg, result_promise)`. The `sent_arg`
-    /// is the value passed to `.next(v)`; it must be stored (not just the promise)
-    /// because a request can be QUEUED while the generator is awaiting, and the value
-    /// must be delivered to the eventual `yield` when the request is finally serviced.
-    pub queue: Vec<(Value, u32)>,
+    /// Pending requests, FIFO. The argument must be stored (not just the promise)
+    /// because a request can be QUEUED while the generator is awaiting/running, and
+    /// the value must be delivered when the request is finally serviced.
+    pub queue: Vec<AsyncGenRequest>,
+    /// Spec state "awaiting-return": the front request is a `.return(v)` whose
+    /// argument is being awaited (AsyncGeneratorAwaitReturn / the Await step of
+    /// UnwrapYieldResumption). While set, new requests only enqueue; the await's
+    /// settlement re-enters `drive_async_gen`, which routes it.
+    pub awaiting_return: bool,
 }
 
 /// An ArrayBuffer's byte storage. A plain `ArrayBuffer` owns its bytes per-VM

@@ -333,8 +333,11 @@ pub enum Instr {
     /// resolves to `{ value: await value, done }`. Runs in ordinary dispatch
     /// context, synchronously inside the next() turn — the value's observable
     /// constructor read (PromiseResolve) happens BEFORE any job runs, and the
-    /// unwrap costs exactly one reaction job (the spec's extra hop).
-    AsyncFromSyncStep { dst: Reg, step: Reg },
+    /// unwrap costs exactly one reaction job (the spec's extra hop). `iter` is
+    /// the SYNC iterator (the record's [[Iterator]]): with done == false it is
+    /// closed when PromiseResolve aborts or the awaited value rejects
+    /// (closeOnRejection — spec steps 7 and 13), before the capability rejects.
+    AsyncFromSyncStep { dst: Reg, step: Reg, iter: Reg },
     /// `dst = Array(args…)` / `new Array(args…)`: a single numeric arg makes an
     /// array of that length (holes → undefined); otherwise an array of the args.
     ArrayCtor { dst: Reg, arg_base: Reg, argc: u16 },

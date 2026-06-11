@@ -4549,9 +4549,25 @@ impl<'p> Vm<'p> {
                     Instr::AsyncIterThrowStep { dst, iter, exc } => {
                         let it = self.get(base, iter);
                         let e = self.get(base, exc);
+                        // GetMethod(iterator, "throw"): a poisoned getter propagates
+                        // (rejecting the outer request with the thrown value, via the
+                        // generator's unwind).
                         let m = self.get_member(it, "throw", it)?;
-                        if m.is_nullish() || !self.is_callable(m) {
-                            // No usable `throw` on the delegated iterator â†’ TypeError.
+                        if m.is_nullish() {
+                            // %AsyncFromSyncIteratorPrototype%.throw steps 7.a-h: no
+                            // `throw` method — IteratorClose(iterator, NORMAL) FIRST
+                            // (the iterator gets a chance to clean up; a poisoned /
+                            // throwing `return` or a non-object close result
+                            // propagates INSTEAD of the TypeError), then a TypeError
+                            // for the protocol violation.
+                            self.iterator_close(it)?;
+                            return Err(Thrown(
+                                "TypeError: the iterator does not provide a 'throw' method".into(),
+                            ));
+                        }
+                        if !self.is_callable(m) {
+                            // GetMethod: present-but-not-callable is a TypeError
+                            // (no close — the abrupt GetMethod rejects directly).
                             return Err(Thrown(
                                 "TypeError: the iterator does not provide a 'throw' method".into(),
                             ));
@@ -4566,6 +4582,12 @@ impl<'p> Vm<'p> {
                         let sent_v = self.get(base, sent);
                         let (val, done_b, ret_b) =
                             self.iter_delegate_step(iter_v, mode_code, sent_v)?;
+                        // Not done ⇒ `val` is the inner iterator's RAW result object
+                        // and the immediately-following `YieldDelegate` must forward
+                        // it verbatim — flag the suspension so `gen_resume` skips the
+                        // fresh `{value, done}` re-wrap. Nothing observable runs
+                        // between here and the YieldDelegate (two register jumps).
+                        self.pending_yield_raw = !done_b && !ret_b;
                         self.set(base, value_dst, val);
                         self.set(base, done_dst, Value::bool(done_b));
                         self.set(base, ret_dst, Value::bool(ret_b));
@@ -4623,19 +4645,26 @@ impl<'p> Vm<'p> {
                         self.pending_await = Some((v, ip, f.handlers));
                         return Ok(v);
                     }
-                    Instr::AsyncFromSyncStep { dst, step } => {
-                        // AsyncFromSyncIteratorContinuation(step): read value/
-                        // done from the SYNC result, PromiseResolve the value
-                        // (observable constructor read for a native promise,
-                        // here in ordinary dispatch context, BEFORE any job),
-                        // and chain the unwrap reaction into a fresh capability
-                        // promise that resolves to { value: await value, done }.
-                        // IfAbruptRejectPromise: a throw from any step here
-                        // (value/done getters, the constructor read) REJECTS
-                        // the capability — next() returns it normally and the
-                        // following Await surfaces the rejection at the await
-                        // point (with the frame's handlers restored).
+                    Instr::AsyncFromSyncStep { dst, step, iter } => {
+                        // AsyncFromSyncIteratorContinuation(step): read done/
+                        // value from the SYNC result (IteratorComplete BEFORE
+                        // IteratorValue, spec steps 2/4), PromiseResolve the
+                        // value (observable constructor read for a native
+                        // promise, here in ordinary dispatch context, BEFORE
+                        // any job), and chain the unwrap reaction into a fresh
+                        // capability promise resolving { value: await value,
+                        // done }. IfAbruptRejectPromise: a throw from any step
+                        // here (done/value getters, the constructor read)
+                        // REJECTS the capability — next() returns it normally
+                        // and the following Await surfaces the rejection at
+                        // the await point (with the frame's handlers
+                        // restored). closeOnRejection (steps 7/13): with
+                        // done == false, an abrupt PromiseResolve closes the
+                        // sync iterator FIRST (errors swallowed, the original
+                        // reason wins), and a rejecting awaited value routes
+                        // through AFS_CLOSE_REJECT (close, then re-reject).
                         let s = self.get(base, step);
+                        let it = self.get(base, iter);
                         let cap = self.alloc_promise();
                         let abrupt = |vm: &mut Self, cap: u32, msg: &str| {
                             let reason = vm
@@ -4645,13 +4674,6 @@ impl<'p> Vm<'p> {
                             vm.reject(cap, reason);
                         };
                         'cont: {
-                            let value = match self.get_prop(s, "value") {
-                                Ok(v) => v,
-                                Err(Thrown(msg)) => {
-                                    abrupt(self, cap, &msg);
-                                    break 'cont;
-                                }
-                            };
                             let done_v = match self.get_prop(s, "done") {
                                 Ok(v) => v,
                                 Err(Thrown(msg)) => {
@@ -4660,6 +4682,13 @@ impl<'p> Vm<'p> {
                                 }
                             };
                             let done = self.truthy(done_v);
+                            let value = match self.get_prop(s, "value") {
+                                Ok(v) => v,
+                                Err(Thrown(msg)) => {
+                                    abrupt(self, cap, &msg);
+                                    break 'cont;
+                                }
+                            };
                             let wrapper = if value.is_heap()
                                 && matches!(
                                     self.heap.get(value.heap_index()),
@@ -4680,6 +4709,14 @@ impl<'p> Vm<'p> {
                                         }
                                     }
                                     Err(Thrown(msg)) => {
+                                        // Step 7: IteratorClose(syncIterator,
+                                        // valueWrapper) — quiet, the original
+                                        // error rejects the capability.
+                                        if !done {
+                                            let original = self.pending_throw.take();
+                                            let _ = self.iterator_close(it);
+                                            self.pending_throw = original;
+                                        }
                                         abrupt(self, cap, &msg);
                                         break 'cont;
                                     }
@@ -4697,7 +4734,21 @@ impl<'p> Vm<'p> {
                                 this: Value::bool(done),
                                 args: Vec::new(),
                             }));
-                            self.then_internal(wrapper, unwrap, Value::UNDEFINED, Some(cap));
+                            // Step 13: onRejected closes the sync iterator only
+                            // while iteration is incomplete.
+                            let on_reject = if done {
+                                Value::UNDEFINED
+                            } else {
+                                let t = Value::heap(
+                                    self.heap.alloc(HeapObj::Native(native::AFS_CLOSE_REJECT)),
+                                );
+                                Value::heap(self.heap.alloc(HeapObj::Bound {
+                                    target: t,
+                                    this: Value::UNDEFINED,
+                                    args: vec![it],
+                                }))
+                            };
+                            self.then_internal(wrapper, unwrap, on_reject, Some(cap));
                         }
                         self.set(base, dst, Value::heap(cap));
                         ip += 1;

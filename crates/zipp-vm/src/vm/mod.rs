@@ -274,6 +274,12 @@ pub struct Vm<'p> {
     /// `pending_yield`; the parker stamps it on the generator so a resume can
     /// restore it (param-prologue evals outlive the GenStart suspension).
     pending_yield_eval_scope: u32,
+    /// Set by `IterDelegate` when its not-done step is about to be yielded by the
+    /// following `YieldDelegate`: the yielded value IS the inner iterator's raw
+    /// result object, and `gen_resume` must forward it to the caller VERBATIM
+    /// (spec GeneratorYield(innerResult)) instead of re-wrapping in a fresh
+    /// `{value, done}` — the inner object's identity/extra props are observable.
+    pending_yield_raw: bool,
     /// Set by an `Await` op (the awaited value + the Await's ip + the activation's
     /// live `try` handlers); `drive_async` `.take()`s it to suspend the async
     /// activation, mirroring `pending_yield`. Unlike generators, async activations

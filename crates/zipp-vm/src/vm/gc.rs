@@ -528,9 +528,9 @@ impl Vm<'_> {
                 for &v in &s.regs {
                     m_val!(v);
                 }
-                for &(arg, q) in &s.queue {
-                    m_val!(arg);
-                    m_idx!(q);
+                for r in &s.queue {
+                    m_val!(r.arg);
+                    m_idx!(r.promise);
                 }
             }
             HeapObj::AsyncState(s) => {

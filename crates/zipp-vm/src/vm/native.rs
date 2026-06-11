@@ -266,6 +266,11 @@ pub const AGENT_BROADCAST: u16 = 909;
 pub const AGENT_RECEIVE_BROADCAST: u16 = 910;
 pub const AGENT_REPORT: u16 = 911;
 pub const AGENT_LEAVING: u16 = 912;
+/// Async-from-Sync close-on-rejection reaction (bound to `[syncIterator]`;
+/// called with the rejection reason): IteratorClose(syncIterator,
+/// ThrowCompletion(reason)) — close errors are swallowed and the ORIGINAL
+/// reason re-throws, so the capability promise rejects with it.
+pub const AFS_CLOSE_REJECT: u16 = 913;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

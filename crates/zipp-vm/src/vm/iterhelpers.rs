@@ -142,33 +142,39 @@ impl<'p> Vm<'p> {
     /// per the outer generator's resume `mode` (0 = next, 1 = throw, 2 = return)
     /// with argument `sent`, applying the missing-method rules. Returns
     /// `(value, done, ret)`: `done` ⇒ the `yield*` expression completes with
-    /// `value`; `ret` ⇒ the generator must RETURN `value`; both false ⇒ yield
-    /// `value` and keep delegating.
+    /// `value`; `ret` ⇒ the generator must RETURN `value`; both false ⇒ `value`
+    /// is the inner iterator's RAW result object, to be yielded VERBATIM (spec
+    /// GeneratorYield(innerResult) — IteratorValue is read ONLY once done, so a
+    /// `value` getter is untouched while delegation is ongoing and the inner
+    /// result's identity/shape reaches the outer caller unchanged).
     pub(crate) fn iter_delegate_step(
         &mut self,
         iter: Value,
         mode: i32,
         sent: Value,
     ) -> Result<(Value, bool, bool), Thrown> {
-        // Read result.value/result.done after validating `result` is an object.
-        let unpack = |vm: &mut Self, result: Value| -> Result<(Value, bool), Thrown> {
+        // IteratorComplete: validate `result` is an object, then read only `done`.
+        let complete = |vm: &mut Self, result: Value| -> Result<bool, Thrown> {
             if !vm.is_object_value(result) {
                 return Err(Thrown(
                     "TypeError: iterator result is not an object".into(),
                 ));
             }
             let d = vm.get_prop(result, "done")?;
-            let done = vm.truthy(d);
-            let value = vm.get_prop(result, "value")?;
-            Ok((value, done))
+            Ok(vm.truthy(d))
         };
         match mode {
-            // next: result = iter.next(sent) → done completes the yield* expression.
+            // next: result = iter.next(sent) → done completes the yield* expression
+            // with IteratorValue(result); not done yields the result verbatim.
             0 => {
                 let next = self.get_prop(iter, "next")?;
                 let result = self.call_value(next, iter, &[sent])?;
-                let (value, done) = unpack(self, result)?;
-                Ok((value, done, false))
+                let done = complete(self, result)?;
+                if done {
+                    let value = self.get_prop(result, "value")?;
+                    return Ok((value, true, false));
+                }
+                Ok((result, false, false))
             }
             // throw: forward to iter.throw(sent); a missing `throw` closes the
             // iterator and is a TypeError (the inner can't handle the throw).
@@ -184,8 +190,12 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: iterator 'throw' is not a function".into()));
                 }
                 let result = self.call_value(throw_m, iter, &[sent])?;
-                let (value, done) = unpack(self, result)?;
-                Ok((value, done, false))
+                let done = complete(self, result)?;
+                if done {
+                    let value = self.get_prop(result, "value")?;
+                    return Ok((value, true, false));
+                }
+                Ok((result, false, false))
             }
             // return: forward to iter.return(sent); a missing `return` ends the
             // generator with `sent`; otherwise a done result ends it with the value.
@@ -198,8 +208,12 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: iterator 'return' is not a function".into()));
                 }
                 let result = self.call_value(ret_m, iter, &[sent])?;
-                let (value, done) = unpack(self, result)?;
-                Ok((value, false, done))
+                let done = complete(self, result)?;
+                if done {
+                    let value = self.get_prop(result, "value")?;
+                    return Ok((value, false, true));
+                }
+                Ok((result, false, false))
             }
         }
     }
