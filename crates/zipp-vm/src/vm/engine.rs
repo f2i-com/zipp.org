@@ -2072,6 +2072,35 @@ impl<'p> Vm<'p> {
         }
         let mut seen = std::collections::HashSet::new();
         self.prescan_module_requests(&path, &mut seen)?;
+        // The proposal evaluates a deferred graph's ASYNC subgraphs EAGERLY
+        // at load time (so a later trigger can stay synchronous): import any
+        // reachable module with top-level await now — its own dependencies
+        // evaluate with it; sync-only parts of the graph stay deferred.
+        // DFS request order (deterministic — evaluation logs are observable).
+        let mut graph: Vec<std::path::PathBuf> = Vec::new();
+        let mut gseen = std::collections::HashSet::new();
+        let mut stack = vec![path.clone()];
+        while let Some(m) = stack.pop() {
+            if !gseen.insert(m.clone()) {
+                continue;
+            }
+            graph.push(m.clone());
+            if let Ok(reqs) = self.module_requests(&m) {
+                // Reverse so the explicit stack pops requests in source order.
+                for r in reqs.into_iter().rev() {
+                    stack.push(r);
+                }
+            }
+        }
+        for m in graph {
+            if !self.module_cache.contains_key(&m)
+                && !self.module_loading.contains(&m)
+                && !self.executing_modules.contains(&m)
+                && self.module_has_tla(&m)
+            {
+                self.import_module_sync(&m, None)?;
+            }
+        }
         let _gc = self.gc_lock_guard();
         let tag = self.alloc_str("Deferred Module".to_string());
         let mut m = crate::heap::ObjMap::new();
@@ -2103,10 +2132,12 @@ impl<'p> Vm<'p> {
         let Some(path) = self.deferred_ns_state.get(&idx).cloned() else {
             return Ok(());
         };
-        // The target module is ALREADY mid-evaluation (its own body, or a
-        // trigger that recursed back into it): a synchronous trigger cannot
-        // complete it — TypeError per the proposal.
-        if self.executing_modules.contains(&path) || self.module_loading.contains(&path) {
+        // ReadyForSyncExecution: the module — or ANYTHING its graph reaches —
+        // mid-evaluation/loading (or an unevaluated async subgraph) cannot be
+        // completed by a synchronous trigger: TypeError per the proposal,
+        // BEFORE evaluating any part of the graph.
+        let mut seen = std::collections::HashSet::new();
+        if !self.ready_for_sync_execution(&path, &mut seen) {
             return Err(Thrown(
                 "TypeError: Cannot synchronously evaluate a deferred module that is currently evaluating"
                     .into(),
@@ -2228,14 +2259,12 @@ impl<'p> Vm<'p> {
     /// import's target): read + parse it and resolve its requested specifiers
     /// recursively — an unreadable file is a host TypeError, a parse failure a
     /// SyntaxError. Already-cached / already-seen modules are done.
-    fn prescan_module_requests(
+    /// The canonical paths of `path`'s DIRECT module requests (import /
+    /// export-from / export-* sources), resolving each against its dir.
+    fn module_requests(
         &mut self,
         path: &std::path::PathBuf,
-        seen: &mut std::collections::HashSet<std::path::PathBuf>,
-    ) -> Result<(), Thrown> {
-        if !seen.insert(path.clone()) || self.module_cache.contains_key(path) {
-            return Ok(());
-        }
+    ) -> Result<Vec<std::path::PathBuf>, Thrown> {
         let code = std::fs::read_to_string(path).map_err(|_| {
             Thrown(format!(
                 "TypeError: Failed to resolve module specifier '{}'",
@@ -2249,6 +2278,7 @@ impl<'p> Vm<'p> {
             return Err(Thrown(format!("SyntaxError: {}", ret.errors[0])));
         }
         let dir = path.parent().map(|p| p.to_path_buf());
+        let mut out = Vec::new();
         for s in &ret.program.body {
             use oxc_ast::ast::Statement as S;
             let spec: Option<String> = match s {
@@ -2269,11 +2299,68 @@ impl<'p> Vm<'p> {
                         "TypeError: Failed to resolve module specifier '{spec}'"
                     )));
                 }
-                let canon = std::fs::canonicalize(&raw).unwrap_or(raw);
-                self.prescan_module_requests(&canon, seen)?;
+                out.push(std::fs::canonicalize(&raw).unwrap_or(raw));
             }
         }
+        Ok(out)
+    }
+
+    fn prescan_module_requests(
+        &mut self,
+        path: &std::path::PathBuf,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> Result<(), Thrown> {
+        if !seen.insert(path.clone()) || self.module_cache.contains_key(path) {
+            return Ok(());
+        }
+        for canon in self.module_requests(path)? {
+            self.prescan_module_requests(&canon, seen)?;
+        }
         Ok(())
+    }
+
+    /// The proposal's ReadyForSyncExecution: can `path`'s graph evaluate
+    /// synchronously RIGHT NOW? False when any reachable unevaluated module
+    /// is mid-evaluation/loading or contains top-level await.
+    fn ready_for_sync_execution(
+        &mut self,
+        path: &std::path::PathBuf,
+        seen: &mut std::collections::HashSet<std::path::PathBuf>,
+    ) -> bool {
+        if !seen.insert(path.clone()) {
+            return true;
+        }
+        // BEFORE the cache check: a namespace is pre-registered (cached)
+        // while its module is still evaluating / mid-link.
+        if self.executing_modules.contains(path) || self.module_loading.contains(path) {
+            return false; // evaluating / link in flight
+        }
+        // A body suspended at top-level await = evaluating-async.
+        if let Some(&bp) = self.module_body_promise.get(path) {
+            if bp.is_heap()
+                && matches!(
+                    self.heap.get(bp.heap_index()),
+                    HeapObj::Promise { state: crate::heap::PromiseState::Pending, .. }
+                )
+            {
+                return false;
+            }
+        }
+        if self.module_cache.contains_key(path) {
+            return true; // evaluated
+        }
+        if self.module_has_tla(path) {
+            return false; // HasTLA, not yet evaluated
+        }
+        let Ok(reqs) = self.module_requests(path) else {
+            return true; // resolution errors surface at evaluation
+        };
+        for dep in reqs {
+            if !self.ready_for_sync_execution(&dep, seen) {
+                return false;
+            }
+        }
+        true
     }
 
     /// ResolveExport through modules whose link is IN FLIGHT: own bindings
