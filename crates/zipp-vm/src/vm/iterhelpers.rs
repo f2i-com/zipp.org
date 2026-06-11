@@ -30,7 +30,12 @@ impl<'p> Vm<'p> {
                 "TypeError: Cannot assign to read only property '{key}'"
             )));
         }
-        let own = self.object_get_own_property_descriptor(this, key);
+        // [[GetOwnProperty]]: trap-aware for a Proxy receiver (the gOPD trap
+        // is observable), else the ordinary descriptor lookup.
+        let own = match self.proxy_gopd(this, key)? {
+            Some(d) => d,
+            None => self.object_get_own_property_descriptor(this, key),
+        };
         if own == Value::UNDEFINED {
             let attr = PropAttr {
                 writable: true,

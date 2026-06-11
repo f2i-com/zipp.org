@@ -523,7 +523,21 @@ impl<'p> Vm<'p> {
                         // a property the RHS created meanwhile must not resolve it.)
                         if self.globals[idx as usize].is_uninitialized() {
                             let name = self.global_slot_name(idx).unwrap_or_else(|| "?".into());
-                            return Err(Thrown(format!("ReferenceError: {name} is not defined")));
+                            // The reference IS resolvable when the name is a
+                            // builtin global: undefined/NaN/Infinity are
+                            // non-writable data props (strict write →
+                            // TypeError); any other builtin is writable —
+                            // the write lands on the global object (slot).
+                            if matches!(name.as_str(), "undefined" | "NaN" | "Infinity") {
+                                return Err(Thrown(format!(
+                                    "TypeError: Cannot assign to read only property '{name}'"
+                                )));
+                            }
+                            if self.global_by_name(&name).is_none() {
+                                return Err(Thrown(format!(
+                                    "ReferenceError: {name} is not defined"
+                                )));
+                            }
                         }
                         // A $262.evalScript `const` is immutable once initialized.
                         if !self.eval_const_globals.is_empty()
@@ -2174,7 +2188,25 @@ impl<'p> Vm<'p> {
                                     && (self.instance_of_class(v, c.heap_index())
                                         || self.instanceof_via_proto(v, c))
                             }
-                            2 => self.instanceof_via_proto(v, c),
+                            2 => {
+                                // OrdinaryHasInstance step 4: a non-object
+                                // C.prototype (e.g. `F.prototype = undefined`)
+                                // is a TypeError — the fast path's silent
+                                // `false` hid it. Unwrap a bind chain first.
+                                let mut cc = c;
+                                for _ in 0..1000 {
+                                    match cc.is_heap().then(|| self.heap.get(cc.heap_index())) {
+                                        Some(HeapObj::Bound { target, .. }) => cc = *target,
+                                        _ => break,
+                                    }
+                                }
+                                if self.prototype_of(cc).is_none() {
+                                    return Err(Thrown(
+                                        "TypeError: Function has non-object prototype in instanceof check".into(),
+                                    ));
+                                }
+                                self.instanceof_via_proto(v, c)
+                            }
                             // A plain callable RHS: spec OrdinaryHasInstance â€” reads
                             // `C.prototype` via [[Get]] (a getter runs; a non-object
                             // prototype throws), returns false for a primitive LHS.
@@ -2755,9 +2787,14 @@ impl<'p> Vm<'p> {
                         let v = self.make_error(kind, msg);
                         // InstallErrorCause (ES2022): an options object with a `cause`
                         // gives the error a non-enumerable own `cause` property.
+                        // HasProperty walks the proto chain AND fires a Proxy
+                        // `has` trap (observable; its throw propagates).
                         if let Some(or) = opts {
                             let options = self.get(base, or);
-                            if self.is_object_value(options) && self.has_own_property(options, "cause") {
+                            let kc = self.alloc_str("cause".to_string());
+                            if self.is_object_value(options)
+                                && self.has_property_dyn(options, kc)?
+                            {
                                 let cause = self.get_prop(options, "cause")?;
                                 if let HeapObj::Object(m) = self.heap.get_mut(v.heap_index()) {
                                     m.define(

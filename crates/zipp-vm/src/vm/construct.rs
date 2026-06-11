@@ -862,6 +862,29 @@ impl<'p> Vm<'p> {
                 };
                 self.make_error(k as u8, msg)
             };
+            // InstallErrorCause: options (arg 1; arg 2 for AggregateError) with
+            // a `cause` (HasProperty: proto chain + has trap, observable) adds
+            // a non-enumerable own `cause` data property.
+            let options = args.get(if k == 7 { 2 } else { 1 }).copied().unwrap_or(Value::UNDEFINED);
+            if self.is_object_value(options) {
+                let kc = self.alloc_str("cause".to_string());
+                if self.has_property_dyn(options, kc)? {
+                    let cause = self.get_prop(options, "cause")?;
+                    if let HeapObj::Object(m) = self.heap.get_mut(e.heap_index()) {
+                        m.define(
+                            "cause",
+                            cause,
+                            PropAttr {
+                                writable: true,
+                                enumerable: false,
+                                configurable: true,
+                                accessor: false,
+                                setter: Value::UNDEFINED,
+                            },
+                        );
+                    }
+                }
+            }
             return Ok(self.set_ctor_proto(e, over));
         }
         // ArrayBuffer / DataView / TypedArray constructors used as values.

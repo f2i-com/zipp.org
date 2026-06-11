@@ -6037,15 +6037,25 @@ impl<'a> FnCompiler<'a> {
                 // General `new C(args)`: evaluate the constructor value, then the
                 // args (contiguous), and let the VM build the instance. When the
                 // arguments contain a spread (`new C(...xs)`), build a flat args
-                // array and construct via NewSpread instead.
-                let callee = self.expr(&n.callee)?;
+                // array and construct via NewSpread instead. The constructor is
+                // SNAPSHOTTED into a temp before the args run: an argument's
+                // side effect reassigning the callee variable must not change
+                // which value is constructed (EvaluateNew takes GetValue first).
+                let cv = self.expr(&n.callee)?;
+                let save = self.next_reg;
+                let callee = self.temp();
+                if cv != callee {
+                    self.emit(Instr::Move { dst: callee, src: cv });
+                }
                 if n.arguments.iter().any(|a| a.as_expression().is_none()) {
                     let args_arr = self.build_spread_args(&n.arguments)?;
                     self.emit(Instr::NewSpread { dst, callee, args: args_arr });
+                    self.next_reg = save; // reclaim the callee temp (+ arg scratch)
                     return Ok(dst);
                 }
                 let (arg_base, argc) = self.eval_args_contiguous(&n.arguments)?;
                 self.emit(Instr::New { dst, callee, arg_base, argc });
+                self.next_reg = save; // reclaim the callee temp + args
                 Ok(dst)
             }
             E::FunctionExpression(f) => {
@@ -6229,15 +6239,28 @@ impl<'a> FnCompiler<'a> {
     /// `?.` short-circuit: if `obj` is null/undefined (loose `== null`), jump to
     /// the enclosing chain's "undefined" block, recorded for patching at chain
     /// exit. No-op outside a chain (an `optional` flag can only appear in one).
+    /// Emit `cond = (v === undefined) || (v === null)` — the SPEC nullish
+    /// test. (LooseEq-against-undefined also matches an [[IsHTMLDDA]]
+    /// object, which `??` / `??=` / `?.` must NOT treat as nullish.)
+    fn emit_is_nullish(&mut self, v: Reg, cond: Reg, scratch: Reg) {
+        self.emit(Instr::LoadUndefined { dst: scratch });
+        self.emit(Instr::Eq { dst: cond, a: v, b: scratch });
+        let j = self.here();
+        self.emit(Instr::JumpIfTrue { cond, target: 0 });
+        self.emit(Instr::LoadNull { dst: scratch });
+        self.emit(Instr::Eq { dst: cond, a: v, b: scratch });
+        let end = self.here();
+        self.patch_jump(j, end);
+    }
+
     fn emit_optional_check(&mut self, obj: Reg) {
         if self.chain_bails.is_empty() {
             return;
         }
         let save = self.next_reg;
         let nreg = self.alloc_reg();
-        self.emit(Instr::LoadNull { dst: nreg });
         let cond = self.alloc_reg();
-        self.emit(Instr::LooseEq { dst: cond, a: obj, b: nreg }); // true iff null OR undefined
+        self.emit_is_nullish(obj, cond, nreg);
         let jt = self.here();
         self.emit(Instr::JumpIfTrue { cond, target: 0 });
         self.chain_bails.last_mut().unwrap().push(jt);
@@ -6747,13 +6770,11 @@ impl<'a> FnCompiler<'a> {
                 self.patch_jump(j, end);
             }
             Op::Coalesce => {
-                // `a ?? b`: keep `a` unless it is null/undefined. `== undefined`
-                // (loose) is true for both null and undefined.
+                // `a ?? b`: keep `a` unless it is STRICTLY null/undefined.
                 let save = self.next_reg;
                 let undef = self.alloc_reg();
-                self.emit(Instr::LoadUndefined { dst: undef });
                 let isnull = self.alloc_reg();
-                self.emit(Instr::LooseEq { dst: isnull, a: dst, b: undef });
+                self.emit_is_nullish(dst, isnull, undef);
                 let j = self.here();
                 self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 }); // non-nullish → keep dst
                 self.next_reg = save; // the nullish-test temps are dead now
@@ -8074,12 +8095,11 @@ impl<'a> FnCompiler<'a> {
                 j
             }
             _ => {
-                // ??= : skip when `val` is NOT null/undefined.
+                // ??= : skip when `val` is NOT strictly null/undefined.
                 let save = self.next_reg;
                 let undef = self.alloc_reg();
-                self.emit(Instr::LoadUndefined { dst: undef });
                 let isnull = self.alloc_reg();
-                self.emit(Instr::LooseEq { dst: isnull, a: val, b: undef });
+                self.emit_is_nullish(val, isnull, undef);
                 let j = self.here();
                 self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 });
                 self.next_reg = save;
