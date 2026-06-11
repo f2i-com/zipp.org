@@ -1194,6 +1194,18 @@ impl<'p> Vm<'p> {
                 "SyntaxError: import/export declarations may only appear in modules".into(),
             ));
         }
+        // UsingDeclaration is not allowed at eval top level (eval-code is not
+        // a "using"-eligible scope: spec UsingDeclaration static semantics).
+        if ret.program.body.iter().any(|s| {
+            matches!(s, oxc_ast::ast::Statement::VariableDeclaration(d)
+                if matches!(d.kind,
+                    oxc_ast::ast::VariableDeclarationKind::Using
+                        | oxc_ast::ast::VariableDeclarationKind::AwaitUsing))
+        }) {
+            return Err(Thrown(
+                "SyntaxError: using declarations may not appear at eval top level".into(),
+            ));
+        }
         // A DIRECT eval sees the caller's lexical private scope: the declared
         // NAMES gate the compile-time early error; the brand CHAIN drives the
         // runtime declaring-class resolution inside the eval'd code.

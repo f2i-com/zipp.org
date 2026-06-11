@@ -2307,8 +2307,16 @@ impl<'a> FnCompiler<'a> {
     }
     fn pop_scope(&mut self) {
         let scope = self.scopes.pop().unwrap();
-        // Free the registers the scope's locals used (block-local reuse).
+        // Free the registers the scope's locals used (block-local reuse) —
+        // and drop their per-register markings, or a later local reallocated
+        // onto the same register would inherit const-ness / cell-ness
+        // (`{ const a = 1; } { let b = 2; b = 3; }` falsely threw TypeError).
         self.next_reg -= scope.len() as Reg;
+        for (_, r) in &scope {
+            self.const_regs.remove(r);
+            self.cell_regs.remove(r);
+            self.lexical_regs.remove(r);
+        }
     }
 
     fn declare_local(&mut self, name: &str) -> Reg {
@@ -2918,8 +2926,14 @@ impl<'a> FnCompiler<'a> {
     fn var_decl(&mut self, d: &ox::VariableDeclaration) -> R<()> {
         // A `const` binding is immutable: record its slot/register so a later
         // assignment throws a TypeError (initialization below never goes through
-        // store_binding, so it is unaffected).
-        let is_const = d.kind == ox::VariableDeclarationKind::Const;
+        // store_binding, so it is unaffected). `using`/`await using` bindings
+        // are equally immutable (CreateImmutableBinding in the spec).
+        let is_const = matches!(
+            d.kind,
+            ox::VariableDeclarationKind::Const
+                | ox::VariableDeclarationKind::Using
+                | ox::VariableDeclarationKind::AwaitUsing
+        );
         for decl in &d.declarations {
             // Destructuring declaration (`let {a,b} = o`, `let [x,...r] = arr`):
             // declare every leaf binding, evaluate the initializer once into a
@@ -3105,6 +3119,14 @@ impl<'a> FnCompiler<'a> {
             }
             self.lexical_regs.insert(reg);
             let is_cell = self.cell_regs.contains(&reg);
+            // `using x = <expr reading x>` is a TDZ ReferenceError: the
+            // binding initializes only when the declaration completes (the
+            // general let/const self-read isn't routed through this check, so
+            // scope the guard to `using` where the tests demand it).
+            let tdz_added = matches!(
+                d.kind,
+                ox::VariableDeclarationKind::Using | ox::VariableDeclarationKind::AwaitUsing
+            ) && self.param_tdz.insert(name.to_string());
             if let Some(init) = &decl.init {
                 if is_cell {
                     // The init value must be written THROUGH the cell.
@@ -3118,17 +3140,23 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::Move { dst: reg, src: v });
                     }
                 }
-            } else if is_cell {
-                // A bare `let x;` initializes the binding to undefined, exiting its
-                // TDZ. A reused entry-precreated cell starts UNINITIALIZED, so this
-                // is where it becomes legal to read; an ordinary captured cell is
-                // already undefined, so this is a harmless re-set.
-                let t = self.temp();
-                self.emit(Instr::LoadUndefined { dst: t });
-                self.emit(Instr::CellSet { cell: reg, src: t });
-                self.next_reg -= 1;
-            } else {
-                self.emit(Instr::LoadUndefined { dst: reg });
+            }
+            if tdz_added {
+                self.param_tdz.remove(name);
+            }
+            if decl.init.is_none() {
+                if is_cell {
+                    // A bare `let x;` initializes the binding to undefined, exiting its
+                    // TDZ. A reused entry-precreated cell starts UNINITIALIZED, so this
+                    // is where it becomes legal to read; an ordinary captured cell is
+                    // already undefined, so this is a harmless re-set.
+                    let t = self.temp();
+                    self.emit(Instr::LoadUndefined { dst: t });
+                    self.emit(Instr::CellSet { cell: reg, src: t });
+                    self.next_reg -= 1;
+                } else {
+                    self.emit(Instr::LoadUndefined { dst: reg });
+                }
             }
             // A `using`/`await using x = init` registers its resource for disposal
             // at block exit (after the binding is stored). `using_scope_reg` is set
@@ -5277,6 +5305,18 @@ impl<'a> FnCompiler<'a> {
             (None, None) => {
                 let var_name = for_left_name(&f.left)?;
                 let r = self.declare_local(&var_name);
+                // A `const`/`using`/`await using` loop variable is immutable
+                // WITHIN an iteration: a body assignment throws TypeError.
+                if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                    if matches!(
+                        d.kind,
+                        ox::VariableDeclarationKind::Const
+                            | ox::VariableDeclarationKind::Using
+                            | ox::VariableDeclarationKind::AwaitUsing
+                    ) {
+                        self.const_regs.insert(r);
+                    }
+                }
                 (r, self.cell_regs.contains(&r))
             }
         };
