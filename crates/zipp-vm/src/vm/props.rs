@@ -3195,6 +3195,23 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // A createRealm child's GLOBAL object (read from ANY realm): a name the
+        // child's own binding table holds (a `var` from its eval/Function code,
+        // or a value previously written through this object) reads the LIVE
+        // binding — `other.x` and a bare `x` inside the child alias one slot.
+        // An UNINITIALIZED slot (a reference that never wrote) falls through to
+        // the ordinary own-property path.
+        if !self.realm_global_objs.is_empty()
+            && obj.is_heap()
+            && self.realm_global_objs.contains_key(&obj.heap_index())
+        {
+            if let Some(&s) = self.realm_globals.get(&obj.heap_index()).and_then(|m| m.get(key)) {
+                let v = self.globals.get(s as usize).copied().unwrap_or(Value::UNDEFINED);
+                if !v.is_uninitialized() {
+                    return Ok(v);
+                }
+            }
+        }
         // Proxy `get` trap (or fall through to the target).
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
@@ -3260,10 +3277,15 @@ impl<'p> Vm<'p> {
             // the accessor-AWARE walk, so a defineProperty'd getter on the
             // prototype is invoked with the primitive as receiver.
             if obj.is_number() {
-                return self.proto_member_get(self.num_proto, key, obj);
+                // Inside a createRealm child, primitive member access resolves
+                // through the CHILD's prototype image (active_realm_proto is the
+                // identity in the main realm).
+                let p = self.active_realm_proto(self.num_proto);
+                return self.proto_member_get(p, key, obj);
             }
             if obj.is_bool() {
-                return self.proto_member_get(self.bool_proto, key, obj);
+                let p = self.active_realm_proto(self.bool_proto);
+                return self.proto_member_get(p, key, obj);
             }
             return Ok(Value::UNDEFINED);
         }
@@ -3788,14 +3810,16 @@ impl<'p> Vm<'p> {
                 if key == "length" {
                     Ok(len_value(s.units()))
                 } else {
-                    self.proto_member_get(self.str_proto, key, obj)
+                    let p = self.active_realm_proto(self.str_proto);
+                    self.proto_member_get(p, key, obj)
                 }
             }
             HeapObj::Cons { len, .. } => {
                 if key == "length" {
                     Ok(len_value(*len))
                 } else {
-                    self.proto_member_get(self.str_proto, key, obj)
+                    let p = self.active_realm_proto(self.str_proto);
+                    self.proto_member_get(p, key, obj)
                 }
             }
             HeapObj::Object(map) => {
@@ -3983,10 +4007,14 @@ impl<'p> Vm<'p> {
                 if key == "description" {
                     return Ok(*desc);
                 }
-                self.proto_member_get(self.symbol_proto, key, obj)
+                let p = self.active_realm_proto(self.symbol_proto);
+                self.proto_member_get(p, key, obj)
             }
             // A BigInt: methods (toString/valueOf/constructor) via BigInt.prototype.
-            HeapObj::BigInt(_) => self.proto_member_get(self.bigint_proto, key, obj),
+            HeapObj::BigInt(_) => {
+                let p = self.active_realm_proto(self.bigint_proto);
+                self.proto_member_get(p, key, obj)
+            }
             // Functions / natives / bound functions: own props set on them
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
             _ if matches!(
@@ -4025,12 +4053,18 @@ impl<'p> Vm<'p> {
                     }
                     return Ok(Value::UNDEFINED);
                 }
-                // Inherited methods: a generator/async function starts at its
-                // dynamic-function intrinsic prototype (so `gen.constructor` is
+                // Inherited methods: an explicit [[Prototype]] override (a
+                // Reflect.construct(Function, …, foreignNewTarget) function whose
+                // proto is another realm's %Function.prototype%) wins; else a
+                // generator/async function starts at its dynamic-function
+                // intrinsic prototype (so `gen.constructor` is
                 // %GeneratorFunction%), else %Function.prototype% (call/apply/bind),
                 // then up to Object.prototype (toString/valueOf/hasOwnProperty/…).
                 let start = self
-                    .callable_dynfn_proto(obj.heap_index())
+                    .proto_of
+                    .get(&obj.heap_index())
+                    .and_then(|p| p.is_heap().then(|| p.heap_index()))
+                    .or_else(|| self.callable_dynfn_proto(obj.heap_index()))
                     .unwrap_or(self.fn_proto);
                 // Accessor-aware so an inherited getter on Function.prototype (or a
                 // dynamic-function intrinsic) is invoked with this = receiver.

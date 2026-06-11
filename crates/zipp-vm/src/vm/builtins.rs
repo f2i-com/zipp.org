@@ -80,7 +80,13 @@ impl<'p> Vm<'p> {
             return self.temporal_method(idx, name, args);
         }
         // ── Function.prototype.call / apply / bind (callable receivers) ──
-        if self.is_callable(recv) {
+        // A createRealm-child function resolves these through its OWN realm's
+        // %Function.prototype% copies (so e.g. apply's CreateListFromArrayLike
+        // TypeError carries the child's constructor identity): skip the inline
+        // fast path and let get_prop + call_value find the realm copy.
+        if self.is_callable(recv)
+            && !(!self.realm_global_objs.is_empty() && self.get_function_realm(recv) != 0)
+        {
             match name {
                 "call" => {
                     let this = args.first().copied().unwrap_or(Value::UNDEFINED);

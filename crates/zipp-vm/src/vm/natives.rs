@@ -212,6 +212,8 @@ impl<'p> Vm<'p> {
             ("DataView", self.dataview_proto), ("Iterator", self.iterator_proto_root),
             ("DisposableStack", self.disposablestack_proto),
             ("AsyncDisposableStack", self.asyncdisposablestack_proto),
+            ("SuppressedError", self.suppressederror_proto),
+            ("ShadowRealm", self.shadowrealm_proto),
         ];
         for (k, t) in native::TA_KINDS.iter().enumerate() {
             ctors.push((t.0, self.ta_protos[k]));
@@ -250,12 +252,39 @@ impl<'p> Vm<'p> {
                     _ => Vec::new(),
                 };
                 for (k, v, mut a) in props {
-                    let copy = self.realm_copy_value(v);
+                    let copy = self.realm_copy_value(v, r);
                     if a.accessor {
-                        a.setter = self.realm_copy_value(a.setter);
+                        a.setter = self.realm_copy_value(a.setter, r);
                     }
                     if let HeapObj::Object(cm) = self.heap.get_mut(ctor_idx) {
                         cm.define(&k, copy, a);
+                    }
+                }
+            }
+            // Copy the MAIN prototype's own props (methods, accessors like the
+            // RegExp flag getters or Error.prototype.stack) onto the realm
+            // prototype the same way — `other.RegExp.prototype.global` etc.
+            // resolve, with distinct same-behaviour identities. `constructor`
+            // stays the realm constructor defined above.
+            if main_proto != 0 {
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_proto) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals.iter())
+                        .zip(mm.attrs.iter())
+                        .filter(|((k, _), _)| k.as_str() != "constructor")
+                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
+                        pm.define(&k, copy, a);
                     }
                 }
             }
@@ -268,40 +297,366 @@ impl<'p> Vm<'p> {
             }
             g.define(name, Value::heap(ctor_idx), data);
         }
-        // Fresh namespace objects (not constructors).
+        // Mirror the MAIN prototype chain structure between the realm prototypes:
+        // realm `TypeError.prototype` → realm `Error.prototype`, every other realm
+        // prototype → realm `Object.prototype` (which keeps its implicit link to
+        // the shared %Object.prototype% — stage-1 single-intrinsics model).
+        {
+            let realm_obj_proto = self.realms[r as usize].get(&self.obj_proto).copied();
+            let realm_err_proto = self.realms[r as usize].get(&self.error_protos[0]).copied();
+            let pairs: Vec<(u32, u32)> = self.realms[r as usize]
+                .iter()
+                .map(|(&m, &p)| (m, p))
+                .collect();
+            for (main_p, realm_p) in pairs {
+                if main_p == self.obj_proto {
+                    continue;
+                }
+                let target = if self.error_protos[1..].contains(&main_p) {
+                    realm_err_proto
+                } else {
+                    realm_obj_proto
+                };
+                if let Some(t) = target {
+                    self.proto_of.insert(realm_p, Value::heap(t));
+                }
+            }
+        }
+        // Namespace objects: fresh per realm, with the main namespace's props
+        // copied (fresh same-id Natives / shared data) so `other.Reflect.construct`
+        // etc. are functional.
         for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl"] {
-            let o_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            let mut m = ObjMap::new();
+            if let Some(&main_ns) = self.builtin_globals.get(ns) {
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ns) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals.iter())
+                        .zip(mm.attrs.iter())
+                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    m.define(&k, copy, a);
+                }
+            }
+            let o_idx = self.heap.alloc(HeapObj::Object(m));
             self.obj_realm.insert(o_idx, r);
             g.define(ns, Value::heap(o_idx), data);
         }
+        // Bare global functions (`other.parseInt`, …) as fresh same-id Natives,
+        // and the global value properties (non-writable, non-configurable).
+        for name in [
+            "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURI",
+            "encodeURIComponent", "decodeURI", "decodeURIComponent", "escape",
+            "unescape", "print",
+        ] {
+            if let Some(&main_fn) = self.builtin_globals.get(name) {
+                let copy = self.realm_copy_value(Value::heap(main_fn), r);
+                self.obj_realm.insert(copy.heap_index(), r);
+                g.define(name, copy, data);
+            }
+        }
+        let frozen = PropAttr { writable: false, enumerable: false, configurable: false, accessor: false, setter: Value::UNDEFINED };
+        g.define("undefined", Value::UNDEFINED, frozen);
+        g.define("NaN", Value::num(f64::NAN), frozen);
+        g.define("Infinity", Value::num(f64::INFINITY), frozen);
         let g_idx = self.heap.alloc(HeapObj::Object(g));
         self.obj_realm.insert(g_idx, r);
+        // Register as a child-realm global: keys the realm's own binding table
+        // (active_realm / realm_globals) and the get/set interception that makes
+        // `other.x` read/write the same binding a bare `x` sees inside the realm.
+        self.realm_global_objs.insert(g_idx, r);
+        // The realm's own `eval`: a distinct function object whose call runs the
+        // code against THIS realm's global bindings (call_value intercepts it).
+        let eval_idx = self.heap.alloc(HeapObj::Native(native::GLOBAL_EVAL));
+        self.obj_realm.insert(eval_idx, r);
+        self.realm_fns.insert(eval_idx, (g_idx, 0));
         // `globalThis` is the realm's global object itself.
         if let HeapObj::Object(gm) = self.heap.get_mut(g_idx) {
             gm.define("globalThis", Value::heap(g_idx), data);
+            gm.define("eval", Value::heap(eval_idx), data);
         }
+        // The realm object mirrors the $262 surface (agent/gc/createRealm/… are
+        // realm-agnostic and shared by copy), with a realm-bound `evalScript`
+        // and this realm's `global`.
         let mut realm = ObjMap::new();
+        if self.dollar262 != 0 {
+            let props: Vec<(String, Value, PropAttr)> = match self.heap.get(self.dollar262) {
+                HeapObj::Object(mm) => mm
+                    .keys
+                    .iter()
+                    .zip(mm.vals.iter())
+                    .zip(mm.attrs.iter())
+                    .filter(|((k, _), _)| k.as_str() != "global" && k.as_str() != "evalScript")
+                    .map(|((k, v), a)| (k.clone(), *v, *a))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            for (k, v, a) in props {
+                let copy = self.realm_copy_value(v, r);
+                realm.define(&k, copy, a);
+            }
+        }
+        let script_idx = self.heap.alloc(HeapObj::Native(native::DOLLAR262_EVAL_SCRIPT));
+        self.obj_realm.insert(script_idx, r);
+        self.realm_fns.insert(script_idx, (g_idx, 1));
+        realm.define("evalScript", Value::heap(script_idx), PropAttr::data());
         realm.define("global", Value::heap(g_idx), data);
         Value::heap(self.heap.alloc(HeapObj::Object(realm)))
     }
 
-    /// Copy a value into a realm: a built-in method (`HeapObj::Native`) becomes a
-    /// FRESH Native with the same id (distinct identity, identical behaviour — so
-    /// `OSymbol.for !== Symbol.for` while the shared registry still works);
-    /// everything else (well-known symbol values, data) is shared by value.
-    fn realm_copy_value(&mut self, v: Value) -> Value {
+    /// The GLOBAL object of createRealm child `r` (None for the main realm or a
+    /// realm id with no registered global — e.g. a pre-stage-1 tag).
+    pub(crate) fn realm_global_obj(&self, r: u32) -> Option<u32> {
+        if r == 0 {
+            return None;
+        }
+        self.realm_global_objs
+            .iter()
+            .find(|&(_, &rid)| rid == r)
+            .map(|(&g, _)| g)
+    }
+
+    /// Whether `main` is one of the dynamic-function constructors — a realm
+    /// facade routing to it must compile the source with the realm ACTIVE so the
+    /// new function's globals bind in the realm's own table.
+    pub(crate) fn realm_main_ctor_is_fn_like(&self, main: u32) -> bool {
+        main != 0
+            && [self.function_ctor, self.gen_fn_ctor, self.async_fn_ctor, self.asyncgen_fn_ctor]
+                .contains(&main)
+    }
+
+    /// The createRealm child whose code is CURRENTLY running: the `active_realm`
+    /// switch (a realm `eval`/`Function` compile+run) or the realm tag of the
+    /// innermost frame's callee — i.e. the spec's "current Realm Record",
+    /// approximated. `None` in the main realm (the common case: one map check).
+    pub(crate) fn current_realm_id(&self) -> Option<u32> {
+        if self.realm_global_objs.is_empty() {
+            return None;
+        }
+        if let Some(rid) = self.active_realm {
+            if let Some(&r) = self.realm_global_objs.get(&rid) {
+                return Some(r);
+            }
+        }
+        if let Some(f) = self.frames.last() {
+            let r = self.get_function_realm(f.callee);
+            if r != 0 {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    /// The %ThrowTypeError% intrinsic of createRealm child `r` — ONE per realm
+    /// (`gOPD(args, 'callee').get` is identical across that realm's strict
+    /// arguments objects, distinct from the main realm's), realm-tagged so
+    /// calling it throws the CHILD's TypeError. Lazily created, cached + rooted.
+    pub(crate) fn realm_throw_type_error(&mut self, r: u32) -> Value {
+        if let Some(&i) = self.realm_throw_type_errors.get(&r) {
+            return Value::heap(i);
+        }
+        let idx = self.heap.alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR));
+        self.obj_realm.insert(idx, r);
+        self.realm_throw_type_errors.insert(r, idx);
+        Value::heap(idx)
+    }
+
+    /// The HOME object of the built-in currently executing via `call_value`'s
+    /// native dispatch: a realm-COPIED native's home is its realm's image of
+    /// `main_proto` (`this === %RegExp.prototype%`-style checks), else the main
+    /// intrinsic itself.
+    #[inline]
+    pub(crate) fn native_home(&self, main_proto: u32) -> u32 {
+        if let Some(r) = self.native_callee_realm {
+            if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_proto)) {
+                return rp;
+            }
+        }
+        main_proto
+    }
+
+    /// The CURRENT realm's image of a main intrinsic prototype: primitive member
+    /// access inside a createRealm child resolves through the CHILD's prototype
+    /// (`other.Number.prototype.x` is visible to `(1).x` inside the child).
+    /// Identity in the main realm — the common case is one is_empty check.
+    #[inline]
+    pub(crate) fn active_realm_proto(&self, main_proto: u32) -> u32 {
+        if !self.realm_global_objs.is_empty() {
+            if let Some(r) = self.current_realm_id() {
+                if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_proto)) {
+                    return rp;
+                }
+            }
+        }
+        main_proto
+    }
+
+    /// Tag a freshly-created function/class with the realm whose code created it
+    /// (no-op in the main realm) — functions born inside a child realm's
+    /// eval/Function code carry the child's realm for GetFunctionRealm,
+    /// OrdinaryCallBindThis, and error-identity purposes.
+    #[inline]
+    pub(crate) fn realm_tag_new(&mut self, idx: u32) {
+        if !self.realm_global_objs.is_empty() {
+            if let Some(r) = self.current_realm_id() {
+                self.obj_realm.insert(idx, r);
+            }
+        }
+    }
+
+    /// Re-link a freshly-synthesised internal error to the CURRENT realm's facade
+    /// prototype (`thrown.constructor === otherRealm.TypeError`): a throw
+    /// materializes while the throwing function's frame is still on the stack,
+    /// so the frame-derived realm IS the spec's current realm. No-op in the main
+    /// realm, or when the error's prototype has no realm image.
+    pub(crate) fn realm_adopt_error(&mut self, err: Value) {
+        if self.realm_global_objs.is_empty() || !err.is_heap() {
+            return;
+        }
+        let Some(r) = self.current_realm_id() else { return };
+        self.realm_adopt_error_to(err, r);
+    }
+
+    /// `realm_adopt_error` with an explicit target realm (used where the FUNCTION
+    /// whose call failed is known, e.g. calling a realm class without `new`).
+    pub(crate) fn realm_adopt_error_to(&mut self, err: Value, r: u32) {
+        if !err.is_heap() {
+            return;
+        }
+        let idx = err.heap_index();
+        let main_p = match self.proto_of.get(&idx) {
+            Some(v) if v.is_heap() => v.heap_index(),
+            _ => return,
+        };
+        if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_p)) {
+            self.proto_of.insert(idx, Value::heap(rp));
+            self.obj_realm.insert(idx, r);
+        }
+    }
+
+    /// After boxing a primitive `this` for a sloppy CALLEE from a child realm,
+    /// re-link the wrapper to the realm's prototype (`func.call(true)` inside a
+    /// realm function sees a Boolean whose `.constructor` is the realm's).
+    pub(crate) fn realm_retag_boxed(&mut self, callee: Value, boxed: Value) {
+        if self.realm_global_objs.is_empty() || !boxed.is_heap() {
+            return;
+        }
+        let r = self.get_function_realm(callee);
+        if r != 0 {
+            self.realm_box_proto(boxed, r);
+        }
+    }
+
+    /// Re-link a primitive wrapper created BY realm `r`'s machinery (sloppy
+    /// `this` boxing, `other.Object(bigint)`) to the realm's wrapper prototype.
+    pub(crate) fn realm_box_proto(&mut self, boxed: Value, r: u32) {
+        if !boxed.is_heap() {
+            return;
+        }
+        let main_p = match self.heap.get(boxed.heap_index()) {
+            HeapObj::Boxed { kind: 0, .. } => self.str_proto,
+            HeapObj::Boxed { kind: 1, .. } => self.num_proto,
+            HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
+            HeapObj::Boxed { kind: 3, .. } => self.symbol_proto,
+            HeapObj::Boxed { kind: 4, .. } => self.bigint_proto,
+            _ => return,
+        };
+        if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main_p)) {
+            self.proto_of.insert(boxed.heap_index(), Value::heap(rp));
+            self.obj_realm.insert(boxed.heap_index(), r);
+        }
+    }
+
+    /// `this` for OrdinaryCallBindThis's global substitution: the CALLEE realm's
+    /// global object (a createRealm child function binds the CHILD's global).
+    pub(crate) fn callee_this_global(&self, callee: Value) -> u32 {
+        if !self.realm_global_objs.is_empty() {
+            let r = self.get_function_realm(callee);
+            if r != 0 {
+                if let Some(g) = self.realm_global_obj(r) {
+                    return g;
+                }
+            }
+        }
+        self.global_this
+    }
+
+    /// A child realm's `eval(src)` / `evalScript(src)` (`kind` 0 / 1): compile +
+    /// run `src` with the child ACTIVE, so global reads/writes inside it resolve
+    /// to the child's binding table and new declarations land on its global.
+    /// Mirrors the main GLOBAL_EVAL/DOLLAR262_EVAL_SCRIPT natives otherwise.
+    pub(crate) fn realm_eval_call(
+        &mut self,
+        gidx: u32,
+        kind: u8,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
+        let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
+        let is_str = a0.is_heap()
+            && matches!(self.heap.get(a0.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. });
+        if !is_str {
+            // eval(x): a non-String x is returned unchanged (spec 19.2.1).
+            return Ok(a0);
+        }
+        let code = self.display(a0);
+        let exact = self.heap.str_exact_if_not_wellformed(a0.heap_index());
+        let prev_realm = self.active_realm;
+        self.active_realm = Some(gidx);
+        // Both kinds run the EVAL pipeline (global sloppy scope, var/function
+        // declarations land on the realm global via var_env_global): unlike the
+        // main `$262.evalScript` program path it returns the COMPLETION VALUE,
+        // which realm tests rely on (`other.evalScript('(function(){…})')`).
+        let _ = kind;
+        let evaled = self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, true, None, Vec::new(), None, None, exact.as_deref());
+        self.active_realm = prev_realm;
+        let v = evaled?;
+        // The completion value (typically a function/class the caller will use)
+        // carries the realm tag for GetFunctionRealm / error identity.
+        if v.is_heap() && self.is_callable(v) {
+            if let Some(&r) = self.realm_global_objs.get(&gidx) {
+                self.obj_realm.insert(v.heap_index(), r);
+            }
+        }
+        Ok(v)
+    }
+
+    /// Copy a value into realm `r`: a built-in method (`HeapObj::Native`) becomes
+    /// a FRESH Native with the same id (distinct identity, identical behaviour —
+    /// so `OSymbol.for !== Symbol.for` while the shared registry still works),
+    /// realm-TAGGED so GetFunctionRealm and error-identity adoption see the
+    /// child; everything else (well-known symbol values, data) is shared by value.
+    fn realm_copy_value(&mut self, v: Value, r: u32) -> Value {
         if v.is_heap() {
             if let HeapObj::Native(id) = self.heap.get(v.heap_index()) {
                 let id = *id;
-                return Value::heap(self.heap.alloc(HeapObj::Native(id)));
+                let idx = self.heap.alloc(HeapObj::Native(id));
+                self.obj_realm.insert(idx, r);
+                return Value::heap(idx);
             }
         }
         v
     }
 
     /// GetFunctionRealm — the realm id a constructor/object belongs to (0 = main).
+    /// Pierces BOUND functions and PROXIES (the spec recurses to the target —
+    /// before the tag check, since `new other.Proxy(mainTarget, …)` realm-tags
+    /// the proxy object itself while its function realm is the TARGET's).
     pub(crate) fn get_function_realm(&self, f: Value) -> u32 {
         if f.is_heap() {
+            match self.heap.get(f.heap_index()) {
+                HeapObj::Bound { target, .. } | HeapObj::Proxy { target, .. } => {
+                    return self.get_function_realm(*target);
+                }
+                _ => {}
+            }
             self.obj_realm.get(&f.heap_index()).copied().unwrap_or(0)
         } else {
             0
@@ -720,12 +1075,25 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 // AnnexB: compile is a LEGACY feature — an instance created by a
-                // RegExp SUBCLASS (its [[Prototype]] is not %RegExp.prototype%)
-                // throws TypeError rather than recompiling.
+                // AnnexB step 1c: SameRealm(O, this compile function) — a
+                // receiver from another realm is a TypeError (thrown with the
+                // FUNCTION's realm identity via the call_value adoption).
+                if !self.realm_global_objs.is_empty()
+                    && self.get_function_realm(this) != self.native_callee_realm.unwrap_or(0)
+                {
+                    return Err(Thrown(
+                        "TypeError: RegExp.prototype.compile: receiver belongs to another realm".into(),
+                    ));
+                }
+                // RegExp SUBCLASS (its [[Prototype]] is not %RegExp.prototype% —
+                // the COMPILE function's own realm's) throws TypeError rather
+                // than recompiling.
                 if self
                     .proto_of
                     .get(&this.heap_index())
-                    .map_or(false, |p| !p.is_heap() || p.heap_index() != self.regexp_proto)
+                    .map_or(false, |p| {
+                        !p.is_heap() || p.heap_index() != self.native_home(self.regexp_proto)
+                    })
                 {
                     return Err(Thrown(
                         "TypeError: RegExp.prototype.compile may not be used on a subclass instance".into(),
@@ -916,7 +1284,7 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let idx = this.heap_index();
-                if idx == self.regexp_proto {
+                if idx == self.native_home(self.regexp_proto) {
                     self.alloc_str("(?:)".to_string())
                 } else if let HeapObj::RegExp { source, .. } = self.heap.get(idx) {
                     let s = source.clone();
@@ -1091,7 +1459,9 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let idx = this.heap_index();
-                if idx == self.regexp_proto {
+                // `this === %RegExp.prototype%` — the GETTER's own realm's
+                // prototype (a realm copy's home is the realm's image).
+                if idx == self.native_home(self.regexp_proto) {
                     Value::UNDEFINED
                 } else if let HeapObj::RegExp { flags, .. } = self.heap.get(idx) {
                     Value::bool(flags.contains(ch))
@@ -2962,6 +3332,24 @@ impl<'p> Vm<'p> {
                     return Err(Thrown(
                         "TypeError: Error.prototype.stack setter requires a string value".into(),
                     ));
+                }
+                // A createRealm child's `Error.prototype` is that realm's HOME
+                // object for its copied setter (which would otherwise re-enter
+                // itself through the own accessor): the SameValue(home) check
+                // applies there too, throwing the CHILD's TypeError.
+                if this.is_heap() && !self.realm_global_objs.is_empty() {
+                    let ti = this.heap_index();
+                    if let Some(&r) = self.obj_realm.get(&ti) {
+                        if self.realms.get(r as usize).and_then(|m| m.get(&self.error_protos[0]))
+                            == Some(&ti)
+                        {
+                            let msg = "TypeError: Cannot assign to read only property 'stack'";
+                            let e = self.alloc_error_from_message(msg);
+                            self.realm_adopt_error_to(e, r);
+                            self.pending_throw = Some(e);
+                            return Err(Thrown(msg.into()));
+                        }
+                    }
                 }
                 self.setter_ignoring_proto_props(this, self.error_protos[0], "stack", a0)?;
                 Value::UNDEFINED

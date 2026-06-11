@@ -31,6 +31,10 @@ impl<'p> Vm<'p> {
                             // object so `catch (e)` sees `e.name`/`e.message` and
                             // `e instanceof TypeError`, matching JS.
                             let v = self.alloc_error_from_message(&t.0);
+                            // The frames are still intact here, so a throw inside
+                            // a createRealm child's function adopts the CHILD's
+                            // error-constructor identity (no-op in the main realm).
+                            self.realm_adopt_error(v);
                             self.pending_throw = Some(v);
                             v
                         }
@@ -1339,6 +1343,10 @@ impl<'p> Vm<'p> {
                         // ctor / field initializers / static blocks (frame.callee = the
                         // class value) resolve the same brands.
                         self.method_brand.insert(v.heap_index(), lex_brands);
+                        // A class evaluated by createRealm-child code carries the
+                        // child's realm tag (its brand-check TypeErrors etc. then
+                        // adopt the child's constructor identity).
+                        self.realm_tag_new(v.heap_index());
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2529,6 +2537,9 @@ impl<'p> Vm<'p> {
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);
                         }
+                        // A function created by createRealm-child code carries
+                        // the child's realm tag (no-op in the main realm).
+                        self.realm_tag_new(v.heap_index());
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2617,6 +2628,7 @@ impl<'p> Vm<'p> {
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);
                         }
+                        self.realm_tag_new(v.heap_index());
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -2651,6 +2663,7 @@ impl<'p> Vm<'p> {
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);
                         }
+                        self.realm_tag_new(v.heap_index());
                         self.set(base, dst, v);
                         ip += 1;
                     }
@@ -3605,7 +3618,8 @@ impl<'p> Vm<'p> {
                         let this_val = if p_lex && closure != NO_CLOSURE {
                             self.rebind_arrow_this(fid, closure, Value::UNDEFINED)
                         } else if !p_strict && self.global_this != 0 {
-                            Value::heap(self.global_this)
+                            // The CALLEE realm's global (createRealm child fns).
+                            Value::heap(self.callee_this_global(callee_v))
                         } else {
                             Value::UNDEFINED
                         };
@@ -3721,7 +3735,7 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let (fid, closure) = self.resolve_callable(callee_v)?;
+                        let (fid, closure) = self.resolve_callable_realm(callee_v)?;
                         // An `async function*` returns an AsyncGenerator (checked
                         // before the plain-generator/async cases since it is both).
                         if self.func(fid as usize).is_generator
@@ -5103,12 +5117,16 @@ impl<'p> Vm<'p> {
     /// when it captures nothing, else a `Closure` over the defining frame's cells.
     pub(crate) fn materialize_callable(&mut self, fid: u32, base: usize, cur_closure: u32) -> Value {
         let sources = self.func(fid as usize).upvalues.clone();
-        if sources.is_empty() {
+        let v = if sources.is_empty() {
             Value::heap(self.heap.alloc(HeapObj::Func(fid)))
         } else {
             let cells = self.capture_upvalue_cells(&sources, base, cur_closure);
             Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: cells, this_val: Value::UNDEFINED }))
-        }
+        };
+        // A class member materialized while createRealm-child code runs carries
+        // the child's realm tag (no-op in the main realm).
+        self.realm_tag_new(v.heap_index());
+        v
     }
 
     /// Resolve a value to `(func_id, closure_heap_idx)`. `closure_heap_idx` is
@@ -5124,6 +5142,28 @@ impl<'p> Vm<'p> {
             }
         }
         Err(Thrown(format!("TypeError: {} is not a function", self.display(v))))
+    }
+
+    /// `resolve_callable`, except a NON-callable born in a createRealm child (a
+    /// realm class called without `new`, the dominant case) eagerly materializes
+    /// its TypeError with the CHILD realm's constructor identity — the unwind
+    /// would otherwise synthesise it with the CALLER's (main) prototype, but per
+    /// spec this throw happens in the callee function's realm.
+    pub(crate) fn resolve_callable_realm(&mut self, v: Value) -> Result<(u32, u32), Thrown> {
+        match self.resolve_callable(v) {
+            Ok(x) => Ok(x),
+            Err(t) => {
+                if !self.realm_global_objs.is_empty() && self.pending_throw.is_none() {
+                    let r = self.get_function_realm(v);
+                    if r != 0 {
+                        let e = self.alloc_error_from_message(&t.0);
+                        self.realm_adopt_error_to(e, r);
+                        self.pending_throw = Some(e);
+                    }
+                }
+                Err(t)
+            }
+        }
     }
 
     /// Push a new frame for `func_id`, binding `this_val` to register 0 and the
@@ -5157,10 +5197,15 @@ impl<'p> Vm<'p> {
         let this_val = if lexical_this && closure != NO_CLOSURE {
             self.rebind_arrow_this(func_id, closure, this_val)
         } else if !is_strict && this_val.is_nullish() && self.global_this != 0 {
-            Value::heap(self.global_this)
+            // The global of the CALLEE's realm: a function born in a
+            // $262.createRealm child binds the CHILD's global object.
+            Value::heap(self.callee_this_global(callee_val))
         } else if !is_strict && !self.is_object_value(this_val) && self.global_this != 0 {
-            // OrdinaryCallBindThis: a sloppy function boxes a primitive `this`.
-            self.to_object(this_val)?
+            // OrdinaryCallBindThis: a sloppy function boxes a primitive `this`
+            // — with the CALLEE realm's wrapper prototype for a realm function.
+            let b = self.to_object(this_val)?;
+            self.realm_retag_boxed(callee_val, b);
+            b
         } else {
             this_val
         };

@@ -582,6 +582,20 @@ impl<'p> Vm<'p> {
                 return Ok(());
             }
         }
+        // A createRealm child's GLOBAL object (written from ANY realm): a name
+        // the child's binding table already holds writes the LIVE slot — so
+        // `other.x = v` is visible to a bare `x` inside the child and vice
+        // versa. A name with no slot yet takes the ordinary own-property path
+        // (a later realm reference seeds its slot from that property).
+        if !self.realm_global_objs.is_empty()
+            && self.realm_global_objs.contains_key(&obj.heap_index())
+            && !key.starts_with("@@")
+        {
+            if let Some(&s) = self.realm_globals.get(&obj.heap_index()).and_then(|m| m.get(key)) {
+                self.globals[s as usize] = val;
+                return Ok(());
+            }
+        }
         // A plain assignment can put an integer index on Array/Object.prototype
         // just like defineProperty — flag it so index stores/mutators consult
         // the prototype chain (two integer compares for ordinary receivers).

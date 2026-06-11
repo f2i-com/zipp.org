@@ -773,6 +773,27 @@ pub struct Vm<'p> {
     /// `new other.Array()` / `other.Symbol('x')` route to the real construction /
     /// call behaviour (with the realm's prototype + realm tag).
     realm_ctor_main: std::collections::HashMap<u32, u32>,
+    /// A `$262.createRealm()` child realm's GLOBAL object heap index → its realm
+    /// id. Doubles as the `active_realm`/`realm_globals` key space for child
+    /// realms (disjoint from ShadowRealm instance indices) and as the gate for
+    /// the realm-global property interception in `get_member`/`set_prop`.
+    /// Keys are GC roots (gc.rs) so the id mapping never goes stale.
+    realm_global_objs: std::collections::HashMap<u32, u32>,
+    /// `other.eval` / `realm.evalScript` function objects (per createRealm child):
+    /// fn heap index → (the child's global-object index, kind 0=eval 1=evalScript).
+    /// `call_value` intercepts these and runs the code with `active_realm` set to
+    /// the child, so its globals bind in the CHILD's table. Keys are GC roots.
+    realm_fns: std::collections::HashMap<u32, (u32, u8)>,
+    /// The realm of the realm-COPIED built-in currently executing via
+    /// `call_native` (None for main-realm built-ins): `this === %RegExp
+    /// .prototype%`-style HOME checks resolve against the COPY's realm image
+    /// (`native_home`). Saved/restored around the call; holds no Values.
+    native_callee_realm: Option<u32>,
+    /// Per-createRealm-child %ThrowTypeError% singleton (realm id → fn heap
+    /// index): a strict arguments object built for a CHILD-realm function gets
+    /// the child's thrower, so the `callee` accessor identity is stable within
+    /// a realm and distinct across realms. Values are GC roots.
+    realm_throw_type_errors: std::collections::HashMap<u32, u32>,
     /// An explicit `fn.prototype = value` assignment, for ANY value — including a
     /// NON-object (undefined/null/primitive) which the `prototypes` map (heap-only)
     /// can't hold. Consulted FIRST by the `.prototype` read / `prototype_of` /

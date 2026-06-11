@@ -117,6 +117,21 @@ impl<'p> Vm<'p> {
         }
         let p = self.heap.alloc(HeapObj::Object(map));
         self.prototypes.insert(idx, p);
+        // A function born in a $262.createRealm child gets a `.prototype` whose
+        // [[Prototype]] is the CHILD's %Object.prototype% (OrdinaryFunctionCreate
+        // runs in the function's realm) — `new fn() instanceof other.Object`.
+        // The extends-null / generator links below take precedence.
+        if !self.realm_global_objs.is_empty() {
+            let r = self.get_function_realm(obj);
+            if r != 0 {
+                if let Some(&rp) =
+                    self.realms.get(r as usize).and_then(|m| m.get(&self.obj_proto))
+                {
+                    self.proto_of.insert(p, Value::heap(rp));
+                    self.obj_realm.insert(p, r);
+                }
+            }
+        }
         // `class C extends null {}`: the prototype object's [[Prototype]] is
         // null (chain walks stop on the non-heap entry).
         if matches!(self.heap.get(idx), HeapObj::Class(c) if c.extends_null) {

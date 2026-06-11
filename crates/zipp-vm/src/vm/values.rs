@@ -926,10 +926,17 @@ impl<'p> Vm<'p> {
     ) -> Value {
         let obj_proto = self.obj_proto;
         let array_values = self.default_array_iter;
-        // The canonical %ThrowTypeError% (set up at init); fall back to a fresh one
-        // only in the unlikely event a strict arguments object is built pre-setup.
+        // The canonical %ThrowTypeError% (set up at init); a createRealm-child
+        // function's strict arguments object gets the CHILD's per-realm
+        // singleton (stable within the realm, distinct across realms). Fall
+        // back to a fresh thrower only in the unlikely event a strict
+        // arguments object is built pre-setup.
         let thrower = if is_strict {
-            if self.throw_type_error != Value::UNDEFINED {
+            let r =
+                if self.realm_global_objs.is_empty() { 0 } else { self.get_function_realm(callee) };
+            if r != 0 {
+                self.realm_throw_type_error(r)
+            } else if self.throw_type_error != Value::UNDEFINED {
                 self.throw_type_error
             } else {
                 Value::heap(self.heap.alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR)))

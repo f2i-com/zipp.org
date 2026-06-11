@@ -132,6 +132,10 @@ impl<'p> Vm<'p> {
             module_errors: std::collections::HashMap::new(),
             active_realm: None,
             realm_globals: std::collections::HashMap::new(),
+            realm_global_objs: std::collections::HashMap::new(),
+            realm_fns: std::collections::HashMap::new(),
+            native_callee_realm: None,
+            realm_throw_type_errors: std::collections::HashMap::new(),
             async_waiters: Vec::new(),
             timer_queue: Vec::new(),
             vm_start: std::time::Instant::now(),
@@ -842,20 +846,62 @@ impl<'p> Vm<'p> {
             if let HeapObj::Wrapped { target, .. } = self.heap.get(callee.heap_index()) {
                 let t = *target;
                 let _gc = self.gc_lock_guard(); // wargs held across allocating calls
+                // The wrapper's CALLER realm: a wrapper built by a createRealm
+                // child's `evaluate` re-wraps callable results (and throws its
+                // boundary TypeErrors) with the CHILD's identities.
+                let wr = self.get_function_realm(callee);
+                let prev_ncr = self.native_callee_realm;
+                let adopt = |vm: &mut Self, msg: &str| {
+                    let e = vm.alloc_error_from_message(msg);
+                    if wr != 0 {
+                        vm.realm_adopt_error_to(e, wr);
+                    }
+                    vm.pending_throw = Some(e);
+                };
+                // ARGUMENTS wrap into the TARGET (shadow) realm — main-modeled,
+                // so no realm context; boundary TypeErrors still carry the
+                // CALLER realm's identity.
+                self.native_callee_realm = None;
                 let mut wargs = Vec::with_capacity(args.len());
                 for &a in args {
-                    wargs.push(self.wrap_realm_value(a)?);
+                    match self.wrap_realm_value(a) {
+                        Ok(w) => wargs.push(w),
+                        Err(t) => {
+                            self.native_callee_realm = prev_ncr;
+                            if self.pending_throw.is_none() {
+                                adopt(self, &t.0);
+                            }
+                            return Err(t);
+                        }
+                    }
                 }
-                return match self.call_value(t, Value::UNDEFINED, &wargs) {
-                    Ok(v) => self.wrap_realm_value(v),
+                self.native_callee_realm = prev_ncr;
+                let res = match self.call_value(t, Value::UNDEFINED, &wargs) {
+                    Ok(v) => {
+                        // The RESULT wraps back into the CALLER realm — the
+                        // realm of the wrapper being invoked.
+                        self.native_callee_realm = (wr != 0).then_some(wr);
+                        let w = self.wrap_realm_value(v);
+                        self.native_callee_realm = prev_ncr;
+                        match w {
+                            Ok(w) => Ok(w),
+                            Err(t) => {
+                                if self.pending_throw.is_none() {
+                                    adopt(self, &t.0);
+                                }
+                                Err(t)
+                            }
+                        }
+                    }
                     Err(_) => {
                         self.pending_throw.take();
-                        Err(Thrown(
-                            "TypeError: WrappedFunction call threw (error wrapped at the realm boundary)"
-                                .into(),
-                        ))
+                        let msg =
+                            "TypeError: WrappedFunction call threw (error wrapped at the realm boundary)";
+                        adopt(self, msg);
+                        Err(Thrown(msg.into()))
                     }
                 };
+                return res;
             }
         }
         // A bound function: invoke its target with the fixed `this` and the bound
@@ -867,8 +913,39 @@ impl<'p> Vm<'p> {
                 all.extend_from_slice(args);
                 return self.call_value(t, th, &all);
             }
+            // A createRealm child's `eval` / `evalScript`: run the code against
+            // the CHILD realm's global bindings (the active_realm switch, the
+            // same machinery ShadowRealm.prototype.evaluate uses).
+            if !self.realm_fns.is_empty() {
+                if let Some(&(gidx, kind)) = self.realm_fns.get(&callee.heap_index()) {
+                    return self.realm_eval_call(gidx, kind, args);
+                }
+            }
             if let HeapObj::Native(id) = self.heap.get(callee.heap_index()) {
                 let id = *id;
+                if !self.realm_global_objs.is_empty() {
+                    // A realm-COPIED builtin (`other.Function.prototype.apply`,
+                    // `other.RegExp.prototype` flag getters, …): run with the
+                    // COPY's realm as the native-callee context (HOME-object
+                    // checks resolve against the realm's image), and an internal
+                    // throw from it carries the CHILD's error-constructor
+                    // identity (the spec's realm of the throwing function).
+                    let r = self.get_function_realm(callee);
+                    let prev = self.native_callee_realm;
+                    self.native_callee_realm = (r != 0).then_some(r);
+                    let res = self.call_native(id, this, args);
+                    self.native_callee_realm = prev;
+                    if r != 0 {
+                        if let Err(ref t) = res {
+                            if self.pending_throw.is_none() {
+                                let e = self.alloc_error_from_message(&t.0);
+                                self.realm_adopt_error_to(e, r);
+                                self.pending_throw = Some(e);
+                            }
+                        }
+                    }
+                    return res;
+                }
                 return self.call_native(id, this, args);
             }
         }
@@ -918,13 +995,25 @@ impl<'p> Vm<'p> {
         }
         // A realm constructor called as a plain function (`other.Symbol('x')`,
         // `other.Array(1, 2)`): route to the MAIN ctor's call behaviour, tagging
-        // the result with the realm.
+        // the result with the realm. `other.Function(src)` compiles `src` with
+        // the CHILD realm active so its globals bind in the child's table.
         if callee.is_heap() {
             if let Some(&main) = self.realm_ctor_main.get(&callee.heap_index()) {
                 let cr = self.get_function_realm(callee);
-                let r = self.call_value(Value::heap(main), this, args)?;
+                let prev_realm = self.active_realm;
+                if self.realm_main_ctor_is_fn_like(main) {
+                    if let Some(g) = self.realm_global_obj(cr) {
+                        self.active_realm = Some(g);
+                    }
+                }
+                let r = self.call_value(Value::heap(main), this, args);
+                self.active_realm = prev_realm;
+                let r = r?;
                 if r.is_heap() && cr != 0 {
                     self.obj_realm.insert(r.heap_index(), cr);
+                    // `other.Object(primitive)` boxes with the REALM's wrapper
+                    // prototype (no-op for a non-Boxed result).
+                    self.realm_box_proto(r, cr);
                 }
                 return Ok(r);
             }
@@ -940,7 +1029,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let (func_id, closure) = self.resolve_callable(callee)?;
+        let (func_id, closure) = self.resolve_callable_realm(callee)?;
         let (is_gen, is_async, is_strict) = {
             let p = self.func(func_id as usize);
             (p.is_generator, p.is_async, p.is_strict)
@@ -953,11 +1042,16 @@ impl<'p> Vm<'p> {
         let this = if closure != NO_CLOSURE && self.func(func_id as usize).lexical_this {
             self.rebind_arrow_this(func_id, closure, this)
         } else if !is_strict && this.is_nullish() && self.global_this != 0 {
-            Value::heap(self.global_this)
+            // OrdinaryCallBindThis: the global of the CALLEE's realm — a function
+            // born in a $262.createRealm child binds the CHILD's global object.
+            Value::heap(self.callee_this_global(callee))
         } else if !is_strict && !self.is_object_value(this) && self.global_this != 0 {
             // OrdinaryCallBindThis: a sloppy function boxes a primitive `this`
-            // (number/string/boolean/symbol/bigint) to its wrapper object.
-            self.to_object(this)?
+            // (number/string/boolean/symbol/bigint) to its wrapper object —
+            // with the CALLEE realm's wrapper prototype for a realm function.
+            let b = self.to_object(this)?;
+            self.realm_retag_boxed(callee, b);
+            b
         } else {
             this
         };
@@ -1056,7 +1150,13 @@ impl<'p> Vm<'p> {
     /// named) draw a fresh EVAL_POOL slot, seeded UNINITIALIZED so a read before a
     /// write is a ReferenceError (matching sloppy global-scope semantics).
     /// Get-or-create the live global slot for `name` in ShadowRealm `rid`'s
-    /// own binding table (fresh slots start UNINITIALIZED).
+    /// own binding table (fresh slots start UNINITIALIZED). For a
+    /// `$262.createRealm()` child (rid = its global object's heap index) a fresh
+    /// slot is SEEDED from the child global object's own property — the facade
+    /// intrinsics (`Object`, `TypeError`, the realm's own `eval`/`Function`) and
+    /// any value main-realm code put there (`other.x = 1`) — falling back to the
+    /// shared main-realm builtin (stage-1: intrinsics without realm identity),
+    /// else UNINITIALIZED (a read before any write is a ReferenceError).
     pub(crate) fn realm_global_slot(&mut self, rid: u32, name: &str) -> Result<u32, Thrown> {
         if let Some(&s) = self.realm_globals.get(&rid).and_then(|m| m.get(name)) {
             return Ok(s);
@@ -1067,9 +1167,24 @@ impl<'p> Vm<'p> {
                 "EvalError: too many distinct globals introduced by eval".into(),
             ));
         }
+        let seed = if self.realm_global_objs.contains_key(&rid) {
+            let own = match self.heap.get(rid) {
+                HeapObj::Object(m) => m.get(name),
+                _ => None,
+            };
+            match own {
+                Some(v) => v,
+                None => match self.builtin_globals.get(name) {
+                    Some(&b) => Value::heap(b),
+                    None => Value::UNINITIALIZED,
+                },
+            }
+        } else {
+            Value::UNINITIALIZED
+        };
         let s = self.eval_global_next;
         self.eval_global_next += 1;
-        self.globals[s as usize] = Value::UNINITIALIZED;
+        self.globals[s as usize] = seed;
         self.realm_globals.entry(rid).or_default().insert(name.to_string(), s);
         Ok(s)
     }
@@ -1080,6 +1195,13 @@ impl<'p> Vm<'p> {
         // the incubating realm's `x`. Builtins stay shared (single-intrinsics
         // model; per-realm intrinsics are a separate feature).
         if let Some(rid) = self.active_realm {
+            // A $262.createRealm child binds EVERY name (builtins included) in
+            // its own table — `realm_global_slot` seeds fresh slots from the
+            // child's global object, so `TypeError` resolves to the CHILD's
+            // facade constructor and `var x` lands on the child global.
+            if self.realm_global_objs.contains_key(&rid) {
+                return self.realm_global_slot(rid, name);
+            }
             if !self.builtin_globals.contains_key(name) {
                 return self.realm_global_slot(rid, name);
             }

@@ -724,12 +724,25 @@ impl<'p> Vm<'p> {
             if self.is_object_value(p) {
                 return Ok(p);
             }
+            // GetFunctionRealm(newTarget) throws on a REVOKED proxy — the
+            // `prototype` Get's trap may have just revoked it.
+            if let Some((_, _, true)) = self.proxy_parts(new_target.heap_index()) {
+                return Err(Thrown(
+                    "TypeError: Cannot construct: newTarget is a revoked proxy".into(),
+                ));
+            }
             // Non-object prototype: GetPrototypeFromConstructor falls back to
-            // GetFunctionRealm(newTarget)'s intrinsic prototype.
+            // GetFunctionRealm(newTarget)'s intrinsic prototype — the realm's
+            // image of `default` when it IS an intrinsic (Iterator), else the
+            // realm's %Object.prototype% (an ordinary function's `default` is
+            // its own `.prototype` object, which has no realm image).
             if default.is_heap() {
                 if let Some(rp) = self.realm_proto_fallback(new_target, default.heap_index()) {
                     return Ok(Value::heap(rp));
                 }
+            }
+            if let Some(rp) = self.realm_proto_fallback(new_target, self.obj_proto) {
+                return Ok(Value::heap(rp));
             }
         }
         Ok(default)
@@ -794,17 +807,15 @@ impl<'p> Vm<'p> {
         if !cv.is_heap() {
             return Err(Thrown("TypeError: value is not a constructor".into()));
         }
-        // A constructor from a `$262.createRealm()` realm. A realm-TAGGED Proxy
-        // (built by `new otherRealm.Proxy(t, h)`, which tags the instance with the
-        // realm) is still a Proxy: its [[Construct]] must run the construct trap
-        // below, not this generic realm-ctor path — so exclude proxies here.
+        // A constructor from a `$262.createRealm()` realm. Only the realm's
+        // FACADE constructors (plain Objects) take this route — a realm-TAGGED
+        // Proxy / class / real function / native (stage-1 realms create those
+        // too) must run its ordinary [[Construct]] below (a realm class's ctor
+        // body, a Proxy's construct trap, a non-constructor's TypeError).
         let cr = self.get_function_realm(cv);
         if cr != 0
             && self.proxy_parts(cv.heap_index()).is_none()
-            && !matches!(
-                self.heap.get(cv.heap_index()),
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
-            )
+            && matches!(self.heap.get(cv.heap_index()), HeapObj::Object(_))
         {
             // If we know the MAIN-realm constructor it mirrors, build a REAL instance
             // by delegating to it with `cv` as newTarget (so the instance's
@@ -812,22 +823,43 @@ impl<'p> Vm<'p> {
             // (`fn.prototype` is now assignable to a non-object, so a real
             // `new other.Function()` works as a settable-prototype newTarget.)
             if let Some(&main) = self.realm_ctor_main.get(&cv.heap_index()) {
-                let res = self.construct_with_newtarget(Value::heap(main), args, cv)?;
+                // `new other.Function(src)` (and the generator/async variants):
+                // compile `src` with the CHILD realm ACTIVE, so the function's
+                // globals bind in the child's own table (its `this`-global and
+                // error identities follow from the realm tag below).
+                let prev_realm = self.active_realm;
+                if self.realm_main_ctor_is_fn_like(main) {
+                    if let Some(g) = self.realm_global_obj(cr) {
+                        self.active_realm = Some(g);
+                    }
+                }
+                // Preserve an EXPLICIT foreign newTarget (`Reflect.construct(
+                // other.Function, args, nt)` resolves nt's realm prototype);
+                // the common `new other.X()` case keeps the facade (cv) so the
+                // REALM's prototype applies.
+                let nt = if new_target == cv { cv } else { new_target };
+                let res = self.construct_with_newtarget(Value::heap(main), args, nt);
+                self.active_realm = prev_realm;
+                let res = res?;
                 if res.is_heap() {
                     self.obj_realm.insert(res.heap_index(), cr);
                 }
                 return Ok(res);
             }
-            // Otherwise a fresh realm-tagged, function-like object (a valid foreign
-            // newTarget / GetFunctionRealm subject, e.g. `new other.Function()`).
-            let proto_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
-            let mut m = ObjMap::new();
-            m.is_ctor = true;
-            m.define("prototype", Value::heap(proto_idx), PropAttr::data());
-            let idx = self.heap.alloc(HeapObj::Object(m));
-            self.obj_realm.insert(idx, cr);
-            self.obj_realm.insert(proto_idx, cr);
-            return Ok(Value::heap(idx));
+            // Otherwise, for a realm CONSTRUCTOR object with no main mirror: a
+            // fresh realm-tagged, function-like object (a valid foreign
+            // newTarget / GetFunctionRealm subject). A realm-tagged NON-ctor
+            // object falls through to the ordinary paths (TypeError).
+            if matches!(self.heap.get(cv.heap_index()), HeapObj::Object(m) if m.is_ctor) {
+                let proto_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                let mut m = ObjMap::new();
+                m.is_ctor = true;
+                m.define("prototype", Value::heap(proto_idx), PropAttr::data());
+                let idx = self.heap.alloc(HeapObj::Object(m));
+                self.obj_realm.insert(idx, cr);
+                self.obj_realm.insert(proto_idx, cr);
+                return Ok(Value::heap(idx));
+            }
         }
         // A built-in error constructor used as a VALUE (`var E = TypeError; new E()`,
         // `Reflect.construct(RangeError, [msg])`). Mirrors the compile-lowered
@@ -985,12 +1017,13 @@ impl<'p> Vm<'p> {
             return Ok(self.set_ctor_proto(fr, over));
         }
         if ci == self.shadowrealm_ctor && ci != 0 {
+            let over = self.newtarget_proto_override(new_target, cv, self.shadowrealm_proto)?;
             let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
             if self.shadowrealm_proto != 0 {
                 self.proto_of.insert(idx, Value::heap(self.shadowrealm_proto));
             }
             self.shadow_realms.insert(idx);
-            return Ok(Value::heap(idx));
+            return Ok(self.set_ctor_proto(Value::heap(idx), over));
         }
         if ci == self.dataview_ctor && ci != 0 {
             let r = self.build_data_view(args)?;
@@ -1384,6 +1417,11 @@ impl<'p> Vm<'p> {
             let p = self.get_prop(new_target, "prototype")?;
             if self.is_object_value(p) {
                 self.proto_of.insert(obj.heap_index(), p);
+            } else if let Some(rp) = self.realm_proto_fallback(new_target, self.obj_proto) {
+                // GetPrototypeFromConstructor: a createRealm-child newTarget
+                // with a non-object `prototype` falls back to ITS realm's
+                // %Object.prototype% (None for a main-realm newTarget).
+                self.proto_of.insert(obj.heap_index(), Value::heap(rp));
             }
         }
         if has_explicit {
@@ -2572,7 +2610,14 @@ impl<'p> Vm<'p> {
             String::new()
         };
         let idx = self.heap.alloc(HeapObj::Wrapped { target, name, length });
-        self.proto_of.insert(idx, Value::heap(self.fn_proto));
+        // The wrapper is created in the CALLER realm — the realm of the
+        // `evaluate` function running now (a realm copy wraps with ITS realm's
+        // %Function.prototype%; the main realm's is the identity).
+        let home = self.native_home(self.fn_proto);
+        self.proto_of.insert(idx, Value::heap(home));
+        if let Some(r) = self.native_callee_realm {
+            self.obj_realm.insert(idx, r);
+        }
         Ok(Value::heap(idx))
     }
 

@@ -232,6 +232,19 @@ impl Vm<'_> {
                 root_idx!(realm_p);
             }
         }
+        // Child-realm global objects and their realm-bound eval/evalScript
+        // functions (also obj_realm-tagged, but rooted explicitly so the
+        // `realm_globals` binding tables and `realm_fns` keys never go stale).
+        for &g in self.realm_global_objs.keys() {
+            root_idx!(g);
+        }
+        for (&f, &(g, _)) in &self.realm_fns {
+            root_idx!(f);
+            root_idx!(g);
+        }
+        for &t in self.realm_throw_type_errors.values() {
+            root_idx!(t);
+        }
         // Explicit `fn.prototype = obj` overrides keep the assigned object alive.
         for (&k, &v) in &self.fn_proto_override {
             root_idx!(k);
