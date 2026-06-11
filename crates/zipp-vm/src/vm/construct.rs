@@ -1015,9 +1015,25 @@ impl<'p> Vm<'p> {
             return Err(Thrown("TypeError: Abstract class TypedArray not directly constructable".into()));
         }
         if ci == self.iterator_ctor && ci != 0 {
-            return Err(Thrown(
-                "TypeError: Abstract class Iterator not directly constructable".into(),
-            ));
+            // %Iterator% is abstract ONLY against itself: `new Iterator()` (or
+            // NewTarget === %Iterator%) throws; a subclass/foreign NewTarget
+            // (super(), Reflect.construct) makes an ordinary object whose
+            // [[Prototype]] comes from NewTarget (realm-intrinsic fallback).
+            if !new_target.is_heap()
+                || new_target == cv
+                || new_target.heap_index() == self.iterator_ctor
+            {
+                return Err(Thrown(
+                    "TypeError: Abstract class Iterator not directly constructable".into(),
+                ));
+            }
+            let proto =
+                self.newtarget_proto(new_target, cv, Value::heap(self.iterator_proto_root))?;
+            let oidx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+            if proto.is_heap() {
+                self.proto_of.insert(oidx, proto);
+            }
+            return Ok(Value::heap(oidx));
         }
         if ci == self.proxy_ctor && ci != 0 {
             return self.make_proxy(

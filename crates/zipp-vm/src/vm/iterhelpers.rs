@@ -8,6 +8,53 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
+    /// SetterThatIgnoresPrototypeProperties(this, home, key, v): non-object
+    /// receiver → TypeError; receiver IS the home object → TypeError; no own
+    /// `key` → CreateDataPropertyOrThrow (bypasses the proto chain — an
+    /// ordinary Set would re-enter this same inherited setter, an infinite
+    /// native recursion); else ordinary Set with Throw = true.
+    pub(crate) fn setter_ignoring_proto_props(
+        &mut self,
+        this: Value,
+        home: u32,
+        key: &str,
+        v: Value,
+    ) -> Result<(), Thrown> {
+        if !self.is_object_value(this) {
+            return Err(Thrown(format!(
+                "TypeError: setter for '{key}' called on a non-object receiver"
+            )));
+        }
+        if this.is_heap() && this.heap_index() == home {
+            return Err(Thrown(format!(
+                "TypeError: Cannot assign to read only property '{key}'"
+            )));
+        }
+        let own = self.object_get_own_property_descriptor(this, key);
+        if own == Value::UNDEFINED {
+            let attr = PropAttr {
+                writable: true,
+                enumerable: true,
+                configurable: true,
+                accessor: false,
+                setter: Value::UNDEFINED,
+            };
+            let mut dm = ObjMap::new();
+            dm.define("value", v, attr);
+            dm.define("writable", Value::bool(true), attr);
+            dm.define("enumerable", Value::bool(true), attr);
+            dm.define("configurable", Value::bool(true), attr);
+            let desc = self.heap.alloc(HeapObj::Object(dm));
+            if self.obj_proto != 0 {
+                self.proto_of.insert(desc, Value::heap(self.obj_proto));
+            }
+            self.object_define_property(this, key, Value::heap(desc))?;
+        } else {
+            self.set_prop(this, key, v, true)?;
+        }
+        Ok(())
+    }
+
     /// GetIteratorDirect receiver check: `this` must be an object (not a string/
     /// symbol/bigint primitive).
     fn iter_receiver_ok(&self, this: Value) -> bool {

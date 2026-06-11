@@ -209,7 +209,9 @@ impl<'p> Vm<'p> {
             ("FinalizationRegistry", self.finreg_proto), ("RegExp", self.regexp_proto),
             ("Promise", self.promise_proto), ("Date", self.date_proto), ("Proxy", 0),
             ("ArrayBuffer", self.arraybuffer_proto), ("SharedArrayBuffer", self.sab_proto),
-            ("DataView", self.dataview_proto),
+            ("DataView", self.dataview_proto), ("Iterator", self.iterator_proto_root),
+            ("DisposableStack", self.disposablestack_proto),
+            ("AsyncDisposableStack", self.asyncdisposablestack_proto),
         ];
         for (k, t) in native::TA_KINDS.iter().enumerate() {
             ctors.push((t.0, self.ta_protos[k]));
@@ -2586,9 +2588,12 @@ impl<'p> Vm<'p> {
                 }
             }
             ITER_HELPER_RETURN => {
-                if this.is_heap() {
-                    let (kind, source, inner, was_done, started) = match self.heap.get(this.heap_index()) {
-                        HeapObj::IterHelper { kind, source, inner, done, running, idx, .. } => {
+                {
+                    let (kind, source, inner, was_done, started) = match this
+                        .is_heap()
+                        .then(|| self.heap.get(this.heap_index()))
+                    {
+                        Some(HeapObj::IterHelper { kind, source, inner, done, running, idx, .. }) => {
                             // Re-entrant return() while a step is executing is a TypeError
                             // (GeneratorValidate), the same as a re-entrant next().
                             if *running {
@@ -2602,7 +2607,12 @@ impl<'p> Vm<'p> {
                             // re-entrant next()/return() during its close does not throw.
                             (*kind, *source, *inner, *done, *idx > 0)
                         }
-                        _ => (0, Value::UNDEFINED, Value::UNDEFINED, true, false),
+                        _ => {
+                            return Err(Thrown(
+                                "TypeError: Iterator Helper return called on an incompatible receiver"
+                                    .into(),
+                            ))
+                        }
                     };
                     // kind 5 = the WrapForValidIterator (Iterator.from): its return()
                     // DELEGATES — GetMethod(iterator, "return") and, if present, returns
@@ -2641,11 +2651,25 @@ impl<'p> Vm<'p> {
                                 None => Ok(()),
                             }
                         } else {
-                            let target = if kind == 6 { inner } else { source };
-                            if self.is_object_value(target) {
-                                self.iterator_close(target)
+                            // flatMap (kind 4) with a LIVE inner iterator (the
+                            // current mapper result): close the inner first —
+                            // its return() must be observed, and an inner
+                            // close error skips the source close (sequential
+                            // finally semantics).
+                            let inner_first = if kind == 4 && self.is_object_value(inner) {
+                                self.iterator_close(inner)
                             } else {
                                 Ok(())
+                            };
+                            if inner_first.is_err() {
+                                inner_first
+                            } else {
+                                let target = if kind == 6 { inner } else { source };
+                                if self.is_object_value(target) {
+                                    self.iterator_close(target)
+                                } else {
+                                    Ok(())
+                                }
                             }
                         };
                         if started {
@@ -2827,15 +2851,12 @@ impl<'p> Vm<'p> {
             }
             ITER_TAG_GET => self.alloc_str("Iterator".to_string()),
             ITER_TAG_SET => {
-                if this.is_heap() && this.heap_index() == self.iterator_proto_root {
-                    return Err(Thrown(
-                        "TypeError: Cannot assign to read only property 'Symbol(Symbol.toStringTag)'"
-                            .into(),
-                    ));
-                }
-                if self.is_object_value(this) {
-                    self.set_prop(this, "@@toStringTag", a0, false)?;
-                }
+                self.setter_ignoring_proto_props(
+                    this,
+                    self.iterator_proto_root,
+                    "@@toStringTag",
+                    a0,
+                )?;
                 Value::UNDEFINED
             }
             ITER_CTOR_GET => {
@@ -2846,14 +2867,12 @@ impl<'p> Vm<'p> {
                 }
             }
             ITER_CTOR_SET => {
-                if this.is_heap() && this.heap_index() == self.iterator_proto_root {
-                    return Err(Thrown(
-                        "TypeError: Cannot assign to read only property 'constructor'".into(),
-                    ));
-                }
-                if self.is_object_value(this) {
-                    self.set_prop(this, "constructor", a0, false)?;
-                }
+                self.setter_ignoring_proto_props(
+                    this,
+                    self.iterator_proto_root,
+                    "constructor",
+                    a0,
+                )?;
                 Value::UNDEFINED
             }
             // Number static methods as values (no coercion, per spec).
