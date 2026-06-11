@@ -3060,16 +3060,28 @@ impl<'p> Vm<'p> {
                 }
             }
             GLOBAL_DECODE_URI => {
-                let s = self.to_js_string(a0)?;
-                match uri_decode(&s, b";/?:@&=+$,#") {
-                    Ok(r) => self.alloc_str(r),
+                // The input must be read EXACTLY (a raw lone surrogate is a
+                // non-'%' code unit the Decode algorithm copies verbatim).
+                let sv = self.to_str_value(a0)?;
+                let bytes = self
+                    .heap
+                    .str_wtf8_cow(sv.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                match uri_decode(&bytes, b";/?:@&=+$,#") {
+                    Ok(r) => Value::heap(self.heap.alloc_js(r)),
                     Err(_) => return Err(Thrown("URIError: URI malformed".into())),
                 }
             }
             GLOBAL_DECODE_URI_COMPONENT => {
-                let s = self.to_js_string(a0)?;
-                match uri_decode(&s, b"") {
-                    Ok(r) => self.alloc_str(r),
+                let sv = self.to_str_value(a0)?;
+                let bytes = self
+                    .heap
+                    .str_wtf8_cow(sv.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                match uri_decode(&bytes, b"") {
+                    Ok(r) => Value::heap(self.heap.alloc_js(r)),
                     Err(_) => return Err(Thrown("URIError: URI malformed".into())),
                 }
             }
@@ -4689,9 +4701,9 @@ fn uri_encode(s: &str, extra: &[u8]) -> Result<String, ()> {
 /// single-byte char that lies in the `reserved` set is left as its original
 /// `%XX` text (decodeURI keeps uriReserved + "#"; decodeURIComponent keeps
 /// nothing). Multi-byte sequences are validated as UTF-8. Malformed → Err.
-fn uri_decode(s: &str, reserved: &[u8]) -> Result<String, ()> {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+fn uri_decode(bytes: &[u8], reserved: &[u8]) -> Result<crate::heap::JsStr, ()> {
+    use crate::heap::{wtf8_push, wtf8_push_cp, JsStr};
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let read = |at: usize| -> Result<u8, ()> {
         if at + 2 >= bytes.len() || bytes[at] != b'%' {
             return Err(());
@@ -4701,8 +4713,24 @@ fn uri_decode(s: &str, reserved: &[u8]) -> Result<String, ()> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'%' {
-            out.push(bytes[i]);
-            i += 1;
+            let b = bytes[i];
+            if b < 0x80 {
+                out.push(b);
+                i += 1;
+            } else {
+                // Copy the whole encoded char through the seam-canonicalizing
+                // append (a raw low surrogate after a %-decoded high merges).
+                let n = if b >> 5 == 0b110 {
+                    2
+                } else if b >> 4 == 0b1110 {
+                    3
+                } else {
+                    4
+                };
+                let end = (i + n).min(bytes.len());
+                wtf8_push(&mut out, &bytes[i..end]);
+                i = end;
+            }
             continue;
         }
         let b0 = read(i)?;
@@ -4714,31 +4742,37 @@ fn uri_decode(s: &str, reserved: &[u8]) -> Result<String, ()> {
             }
             i += 3;
         } else {
-            // UTF-8 lead byte: 2/3/4 total octets.
-            let n = if b0 >> 5 == 0b110 {
-                2
+            // UTF-8 lead byte: 2/3/4 total octets. The spec Decode algorithm
+            // accepts SURROGATE-range 3-byte sequences (each yields its code
+            // UNIT — '%ED%A0%80' decodes to the lone surrogate \uD800, and a
+            // CESU-8 high+low pair canonicalizes into the astral scalar), so
+            // decode manually instead of from_utf8; overlong forms and
+            // beyond-U+10FFFF still reject (URIError).
+            let (n, mut cp) = if b0 >> 5 == 0b110 {
+                (2, (b0 & 0x1F) as u32)
             } else if b0 >> 4 == 0b1110 {
-                3
+                (3, (b0 & 0x0F) as u32)
             } else if b0 >> 3 == 0b11110 {
-                4
+                (4, (b0 & 0x07) as u32)
             } else {
                 return Err(());
             };
-            let mut seq = vec![b0];
             i += 3;
             for _ in 1..n {
                 let cb = read(i)?;
                 if cb & 0xC0 != 0x80 {
                     return Err(());
                 }
-                seq.push(cb);
+                cp = (cp << 6) | (cb & 0x3F) as u32;
                 i += 3;
             }
-            match std::str::from_utf8(&seq) {
-                Ok(valid) => out.extend_from_slice(valid.as_bytes()),
-                Err(_) => return Err(()),
+            let overlong =
+                (n == 2 && cp < 0x80) || (n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000);
+            if overlong || cp > 0x10FFFF {
+                return Err(());
             }
+            wtf8_push_cp(&mut out, cp);
         }
     }
-    String::from_utf8(out).map_err(|_| ())
+    Ok(JsStr::from_wtf8(out))
 }
