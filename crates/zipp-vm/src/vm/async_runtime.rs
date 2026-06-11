@@ -104,6 +104,12 @@ impl<'p> Vm<'p> {
                 regs: back,
                 handlers,
             });
+            // OrdinaryCreateFromConstructor: the instance's [[Prototype]] is
+            // the callee's `prototype` object (a replaced g.prototype flows
+            // through); the HeapObj::Generator fallback stays %GeneratorProto%.
+            if let Some(p) = self.prototype_of(gen_callee) {
+                self.proto_of.insert(g, p);
+            }
             if gen_callee != Value::UNDEFINED {
                 // Resumes re-bind this as Frame.callee (LoadCallee identity).
                 self.gen_callee.insert(g, gen_callee);
@@ -760,6 +766,11 @@ impl<'p> Vm<'p> {
             handlers: Vec::new(),
             queue: Vec::new(),
         })));
+        // OrdinaryCreateFromConstructor: honor the callee's `prototype`
+        // object; the HeapObj::AsyncGenerator fallback stays %AsyncGenProto%.
+        if let Some(p) = self.prototype_of(gen_callee) {
+            self.proto_of.insert(ag, p);
+        }
         if gen_callee != Value::UNDEFINED {
             // Resumes re-bind this as Frame.callee (LoadCallee identity).
             self.gen_callee.insert(ag, gen_callee);

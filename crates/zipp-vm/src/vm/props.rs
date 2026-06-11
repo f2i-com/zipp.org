@@ -3876,15 +3876,26 @@ impl<'p> Vm<'p> {
                 let p = self.iterator_helper_proto;
                 self.proto_chain_get(p, key, obj)
             }
-            // A generator instance delegates to %GeneratorPrototype% (next/return/
-            // throw + @@iterator) which chains to %Iterator.prototype% (the helper
-            // methods). So `g().next`, `g().map`, `g()[Symbol.iterator]` all resolve.
+            // A generator instance delegates to its [[Prototype]] — the
+            // callee's `prototype` object when one was installed at call time
+            // (proto_of), else %GeneratorPrototype% (next/return/throw +
+            // @@iterator) which chains to %Iterator.prototype% (the helper
+            // methods). So `g().next`, `g().map`, `g()[Symbol.iterator]` all
+            // resolve, and a REPLACED g.prototype is honored.
             HeapObj::Generator { .. } => {
-                let p = self.gen_proto;
+                let p = match self.proto_of.get(&obj.heap_index()) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => return Ok(Value::UNDEFINED), // null proto: no chain
+                    None => self.gen_proto,
+                };
                 self.proto_chain_get(p, key, obj)
             }
             HeapObj::AsyncGenerator(_) => {
-                let p = self.asyncgen_proto;
+                let p = match self.proto_of.get(&obj.heap_index()) {
+                    Some(p) if p.is_heap() => p.heap_index(),
+                    Some(_) => return Ok(Value::UNDEFINED),
+                    None => self.asyncgen_proto,
+                };
                 self.proto_chain_get(p, key, obj)
             }
             // A boxed primitive: `length` (String box) reads the wrapped string;
