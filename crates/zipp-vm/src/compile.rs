@@ -2910,6 +2910,29 @@ impl<'a> FnCompiler<'a> {
                 self.pattern_block_local = block_local;
                 self.declare_pattern(&decl.id)?;
                 let save = self.next_reg;
+                // TOP-LEVEL global-bound leaves: INITIALIZE each slot before
+                // extraction. The extraction stores are assignment-flavored —
+                // in STRICT code (a module body) StoreGlobalStrict throws on
+                // an UNINITIALIZED slot, so the leaves' TDZ must end at this
+                // statement, not at the store. Lexical leaves also register
+                // like their simple-identifier siblings (const immutability,
+                // module per-module slots, script-GDI bookkeeping).
+                if self.is_script && self.cx.script_binds_globals && !block_local {
+                    let mut leaves = std::collections::HashSet::new();
+                    capture::collect_pattern_names(&decl.id, &mut leaves);
+                    let undef = self.alloc_reg();
+                    self.emit(Instr::LoadUndefined { dst: undef });
+                    for n in leaves {
+                        let slot = self.cx.global_slot(&n) as u32;
+                        if d.kind.is_lexical() {
+                            self.cx.lexical_globals.insert(slot);
+                        }
+                        // (NOT const_globals: the extraction itself stores
+                        // through store_binding, which throws for a known
+                        // const — initialization must stay writable.)
+                        self.emit(Instr::StoreGlobal { idx: slot, src: undef });
+                    }
+                }
                 let src = self.alloc_reg();
                 let sv = self.expr_into(init, src)?;
                 if sv != src {
