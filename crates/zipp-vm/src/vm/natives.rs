@@ -1956,6 +1956,40 @@ impl<'p> Vm<'p> {
                                 syms.push(sym);
                             }
                         }
+                    } else if let HeapObj::Class(c) = self.heap.get(a0.heap_index()) {
+                        // A class constructor's symbol-keyed STATIC elements
+                        // (methods + accessors) live in the class's own member
+                        // stores, in definition order.
+                        let mut keys: Vec<String> = Vec::new();
+                        for k in c
+                            .statics
+                            .keys
+                            .iter()
+                            .chain(c.static_getters.iter().map(|(n, _)| n))
+                            .chain(c.static_setters.iter().map(|(n, _)| n))
+                        {
+                            if k.starts_with("@@") && !keys.iter().any(|e| e == k) {
+                                keys.push(k.clone());
+                            }
+                        }
+                        for k in keys {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
+                        // Symbol keys assigned directly onto the class value
+                        // (`C[sym] = v`) land in the arr_props side table.
+                        let extra: Vec<String> = self
+                            .arr_props
+                            .get(&a0.heap_index())
+                            .map_or(Vec::new(), |m| {
+                                m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
+                            });
+                        for k in extra {
+                            if let Some(&sym) = self.symbol_keys.get(&k) {
+                                syms.push(sym);
+                            }
+                        }
                     } else {
                         // Exotic heap kinds (TypedArray, DataView, Map, Date, ...)
                         // keep their own props in the arr_props side table;

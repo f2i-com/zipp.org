@@ -1195,6 +1195,13 @@ impl<'p> Vm<'p> {
                             |vm: &mut Self, defs: &[(String, u32)]| -> Vec<(String, Value)> {
                                 defs.iter()
                                     .map(|(n, fid)| {
+                                        // A computed-key PLACEHOLDER (position-only:
+                                        // "\u{1}cm{fid}", no compiled function of its
+                                        // own) — ClassAddMember renames it in place
+                                        // with the materialized member.
+                                        if *fid == u32::MAX {
+                                            return (n.clone(), Value::UNDEFINED);
+                                        }
                                         (n.clone(), vm.materialize_callable(*fid, base, cur_closure))
                                     })
                                     .collect()
@@ -1402,11 +1409,27 @@ impl<'p> Vm<'p> {
                                     5 => &mut c.static_setters,
                                     _ => &mut c.methods,
                                 };
-                                // Replace a same-key member, else append.
-                                if let Some(slot) = list.iter_mut().find(|(n, _)| *n == kstr) {
-                                    slot.1 = fv;
-                                } else {
-                                    list.push((kstr, fv));
+                                // The compile pass parked a position-keeping
+                                // PLACEHOLDER ("\u{1}cm{func_id}") at this member's
+                                // source position; rename it in place — unless an
+                                // earlier same-key member exists (a duplicate keeps
+                                // its ORIGINAL position, last definition wins), in
+                                // which case overwrite that one and drop the parked
+                                // placeholder.
+                                let ph = format!("\u{1}cm{func}");
+                                let dup = list.iter().position(|(n, _)| *n == kstr);
+                                let parked = list.iter().position(|(n, _)| *n == ph);
+                                match (dup, parked) {
+                                    (Some(d), p) => {
+                                        list[d].1 = fv;
+                                        if let Some(p) = p {
+                                            list.remove(p);
+                                        }
+                                    }
+                                    (None, Some(p)) => {
+                                        list[p] = (kstr, fv);
+                                    }
+                                    (None, None) => list.push((kstr, fv)),
                                 }
                             }
                         }
@@ -2176,9 +2199,14 @@ impl<'p> Vm<'p> {
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
                             .clone();
+                        // SetMutableBinding step 2 re-checks HasProperty
+                        // UNCONDITIONALLY (observable through a Proxy `has`
+                        // trap, even in sloppy mode); strict mode then throws
+                        // when the binding vanished since the reference resolved.
                         let kv = self.key_to_value(&key);
-                        if strict && !(self.is_object_value(o) && self.has_property_dyn(o, kv)?)
-                        {
+                        let still_exists =
+                            self.is_object_value(o) && self.has_property_dyn(o, kv)?;
+                        if strict && !still_exists {
                             return Err(Thrown(format!(
                                 "ReferenceError: {key} is not defined"
                             )));
@@ -2782,6 +2810,21 @@ impl<'p> Vm<'p> {
                         self.heap.cell_set(cell_idx, v);
                         ip += 1;
                     }
+                    Instr::CellSetChecked { cell, src } => {
+                        // An ASSIGNMENT to a lexical cell that may still be in
+                        // its TDZ (`{ x = 1; …; let x; }`): writing before the
+                        // declaration initializes it is a ReferenceError.
+                        let cell_idx = self.get(base, cell).heap_index();
+                        if self.heap.cell_get(cell_idx).is_uninitialized() {
+                            return Err(Thrown(
+                                "ReferenceError: cannot access a lexical binding before initialization"
+                                    .to_string(),
+                            ));
+                        }
+                        let v = self.get(base, src);
+                        self.heap.cell_set(cell_idx, v);
+                        ip += 1;
+                    }
                     Instr::UpvalGet { dst, idx } => {
                         let cell = self.closure_upvalue(cur_closure, idx);
                         let v = self.heap.cell_get(cell);
@@ -2807,6 +2850,16 @@ impl<'p> Vm<'p> {
                             }
                             ip += 1;
                             continue;
+                        }
+                        // A lexical binding still in its TDZ (the cell holds the
+                        // UNINITIALIZED sentinel until the declaration runs):
+                        // an assignment through the closure throws — only the
+                        // declaring function's own CellSet initializes it.
+                        if self.heap.cell_get(cell).is_uninitialized() {
+                            return Err(Thrown(
+                                "ReferenceError: cannot access a lexical binding before initialization"
+                                    .to_string(),
+                            ));
                         }
                         let v = self.get(base, src);
                         self.heap.cell_set(cell, v);
@@ -2848,6 +2901,14 @@ impl<'p> Vm<'p> {
                             }
                             ip += 1;
                             continue;
+                        }
+                        // TDZ: a lexical cell still UNINITIALIZED rejects the
+                        // assignment (mirrors UpvalSet).
+                        if self.heap.cell_get(cell).is_uninitialized() {
+                            return Err(Thrown(
+                                "ReferenceError: cannot access a lexical binding before initialization"
+                                    .to_string(),
+                            ));
                         }
                         self.heap.cell_set(cell, v);
                         ip += 1;
@@ -3499,7 +3560,7 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::heap(self.import_meta));
                         ip += 1;
                     }
-                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site } => {
+                    Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site, tail } => {
                         let a0 = self.get(base, arg);
                         let is_str = a0.is_heap()
                             && matches!(
@@ -3507,10 +3568,27 @@ impl<'p> Vm<'p> {
                                 HeapObj::Str(_) | HeapObj::Cons { .. }
                             );
                         // Runtime identity check: direct-eval semantics apply
-                        // only while the global `eval` binding still IS %eval%;
-                        // a rebound `eval` gets an ordinary call of that value.
-                        let live = self.global_by_name("eval").unwrap_or(Value::UNDEFINED);
+                        // only while the live `eval` binding still IS %eval% —
+                        // a dynamic EvalScope shadow (`eval("var eval = f")` in
+                        // an enclosing sloppy activation) wins over the global.
+                        // A rebound `eval` gets an ordinary call of that value —
+                        // a PROPER TAIL CALL when the site is `return eval(…)`
+                        // in a tail position (tco-non-eval-global/-dynamic).
+                        let shadow = self
+                            .frames
+                            .len()
+                            .checked_sub(1)
+                            .and_then(|fi| self.frame_eval_scope(fi))
+                            .and_then(|sc| match self.heap.get(sc) {
+                                HeapObj::EvalScope(m) => m.get("eval").copied(),
+                                _ => None,
+                            });
+                        let live =
+                            shadow.or_else(|| self.global_by_name("eval")).unwrap_or(Value::UNDEFINED);
                         if !(live.is_heap() && live.heap_index() == self.eval_fn_idx) {
+                            if tail && self.try_tail_reuse(base, live, Value::UNDEFINED, &[a0])? {
+                                break; // re-snapshot the frame coordinates
+                            }
                             let r = self.call_value(live, Value::UNDEFINED, &[a0])?;
                             self.set(base, dst, r);
                             ip += 1;
@@ -3651,6 +3729,37 @@ impl<'p> Vm<'p> {
                         // callee (native/bound/class/generator/async/primitive)
                         // falls through to the Call+Return emitted after.
                         let callee_v = self.get(base, callee);
+                        // Args live above `base` — copy them out BEFORE the
+                        // window is rebuilt in place.
+                        let argv: Vec<Value> =
+                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                        if self.try_tail_reuse(base, callee_v, Value::UNDEFINED, &argv)? {
+                            break; // re-snapshot the frame coordinates
+                        }
+                        ip += 1;
+                    }
+                    Instr::TailCallWithThis { callee, this_v, arg_base, argc } => {
+                        // Tail-position with-resolved call: frame reuse with
+                        // `this` = the with-object; non-plain callees fall
+                        // through to the CallWithThis emitted after.
+                        let callee_v = self.get(base, callee);
+                        let this_val = self.get(base, this_v);
+                        let argv: Vec<Value> =
+                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                        if self.try_tail_reuse(base, callee_v, this_val, &argv)? {
+                            break; // re-snapshot the frame coordinates
+                        }
+                        ip += 1;
+                    }
+                    Instr::CallWithThis { dst, callee, this_v, arg_base, argc } => {
+                        // A `with`-resolved identifier call: `this` = the
+                        // with-object. A plain user function pushes a frame in
+                        // THIS dispatch loop (deep with-call recursion must be
+                        // a catchable RangeError, never native-stack overflow);
+                        // everything else (natives, bound, proxies, generators)
+                        // routes through call_value.
+                        let callee_v = self.get(base, callee);
+                        let this_val = self.get(base, this_v);
                         let plain = if callee_v.is_heap() {
                             match self.heap.get(callee_v.heap_index()) {
                                 HeapObj::Func(id) => Some((*id, NO_CLOSURE)),
@@ -3662,85 +3771,21 @@ impl<'p> Vm<'p> {
                         } else {
                             None
                         };
-                        let Some((fid, closure)) = plain else {
-                            ip += 1;
-                            continue;
-                        };
-                        let (callee_regs, callee_params, rest_reg, arguments_reg, p_strict, p_lex, simple) = {
+                        if let Some((fid, closure)) = plain {
                             let p = self.func(fid as usize);
-                            if p.is_generator || p.is_async {
-                                ip += 1;
-                                continue;
+                            if !p.is_generator && !p.is_async {
+                                self.setup_call(
+                                    fid, closure, this_val, base, arg_base, argc, dst,
+                                    ip + 1, callee_v,
+                                )?;
+                                break;
                             }
-                            (
-                                (p.reg_count as usize).max(1),
-                                p.param_count as usize,
-                                p.rest_reg,
-                                p.arguments_reg,
-                                p.is_strict,
-                                p.lexical_this,
-                                p.simple_params,
-                            )
-                        };
-                        // Args live above `base` — copy them out BEFORE the
-                        // window is rebuilt in place.
+                        }
                         let argv: Vec<Value> =
                             (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                        // A tail call is a plain call: this = undefined, then
-                        // the CALLEE's own binding rules (arrow lexical this /
-                        // sloppy global substitution).
-                        let this_val = if p_lex && closure != NO_CLOSURE {
-                            self.rebind_arrow_this(fid, closure, Value::UNDEFINED)
-                        } else if !p_strict && self.global_this != 0 {
-                            // The CALLEE realm's global (createRealm child fns).
-                            Value::heap(self.callee_this_global(callee_v))
-                        } else {
-                            Value::UNDEFINED
-                        };
-                        self.regs.truncate(base);
-                        if self.regs_would_overflow(base + callee_regs) {
-                            return Err(Thrown(
-                                "RangeError: Maximum call stack size exceeded".into(),
-                            ));
-                        }
-                        self.regs.resize(base + callee_regs, Value::UNDEFINED);
-                        self.regs[base] = this_val;
-                        let n = argv.len().min(callee_params);
-                        for (i, &a) in argv.iter().take(n).enumerate() {
-                            self.regs[base + 1 + i] = a;
-                        }
-                        if let Some(rreg) = rest_reg {
-                            let extra: Vec<Value> =
-                                argv.get(callee_params..).unwrap_or(&[]).to_vec();
-                            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
-                            self.regs[base + rreg as usize] = arr;
-                        }
-                        let mut args_obj = u32::MAX;
-                        if let Some(areg) = arguments_reg {
-                            let mapinfo = (!p_strict && simple)
-                                .then(|| (self.frames.len() - 1, base, callee_params));
-                            let arr = self.build_arguments_object(
-                                argv.clone(),
-                                callee_v,
-                                p_strict,
-                                mapinfo,
-                            );
-                            self.regs[base + areg as usize] = arr;
-                            if mapinfo.is_some() {
-                                args_obj = arr.heap_index();
-                            }
-                        }
-                        let fr = self.frames.last_mut().unwrap();
-                        fr.func = fid;
-                        fr.closure = closure;
-                        fr.ip = 0;
-                        fr.handlers.clear();
-                        fr.callee = callee_v;
-                        fr.new_target = Value::UNDEFINED;
-                        fr.eval_scope = u32::MAX;
-                        fr.super_done = false;
-                        fr.args_obj = args_obj;
-                        break; // re-snapshot the frame coordinates
+                        let r = self.call_value(callee_v, this_val, &argv)?;
+                        self.set(base, dst, r);
+                        ip += 1;
                     }
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
@@ -4853,7 +4898,27 @@ impl<'p> Vm<'p> {
                         let _ = self.iterator_close(it);
                         ip += 1;
                     }
-                    Instr::IterNext { value_dst, done_dst, iter, idx } => {
+                    Instr::IterPrime { dst, iter } => {
+                        // Cache a USER-OBJECT iterator's `next` once for the
+                        // loop (the iterator record's [[NextMethod]]); built-in
+                        // fast iterables perform no observable get.
+                        let it = self.get(base, iter);
+                        let nv = if it.is_heap()
+                            && matches!(
+                                self.heap.get(it.heap_index()),
+                                HeapObj::Object(_)
+                                    | HeapObj::Proxy { .. }
+                                    | HeapObj::Iterator { .. }
+                                    | HeapObj::IterHelper { .. }
+                            ) {
+                            self.get_prop(it, "next")?
+                        } else {
+                            Value::UNDEFINED
+                        };
+                        self.set(base, dst, nv);
+                        ip += 1;
+                    }
+                    Instr::IterNext { value_dst, done_dst, iter, idx, next } => {
                         let it = self.get(base, iter);
                         if !it.is_heap() {
                             return Err(Thrown(format!(
@@ -4875,9 +4940,15 @@ impl<'p> Vm<'p> {
                         }
                         // A user iterator object (`@@iterator` already resolved by
                         // GetIterator): pull the next result via `.next()`. Lazy â€”
-                        // a `break` simply stops calling it.
+                        // a `break` simply stops calling it. The cached prologue
+                        // [[NextMethod]] (IterPrime) is used when present; the
+                        // uncached (destructuring) sites re-fetch per step.
                         if matches!(self.heap.get(it.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. }) {
-                            let next = self.get_prop(it, "next")?;
+                            let next = if next != u16::MAX {
+                                self.get(base, next)
+                            } else {
+                                self.get_prop(it, "next")?
+                            };
                             if self.is_callable(next) {
                                 let res = self.call_value(next, it, &[])?;
                                 // IteratorNext step 3: a non-Object result is a TypeError.
@@ -5068,6 +5139,101 @@ impl<'p> Vm<'p> {
     /// pointer taken here and used ONLY for the duration of the call â€” nothing
     /// in between can resize `self.regs` (the JIT subset issues no calls/allocs).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    /// Proper-tail-call frame reuse: when `callee_v` is a PLAIN (non-generator,
+    /// non-async) function or closure, rebuild the CURRENT frame's register
+    /// window in place for it (constant stack for tail recursion) and return
+    /// `true` — the dispatch arm must then `break` to re-snapshot the frame
+    /// coordinates. Any other callee returns `false` (the caller falls through
+    /// to its ordinary call path). `argv` must already be copied OUT of the
+    /// register window (it is truncated here). Shared by `TailCall` and the
+    /// rebound-`eval` fall-through of a tail-position `DirectEval`.
+    pub(crate) fn try_tail_reuse(
+        &mut self,
+        base: usize,
+        callee_v: Value,
+        this_arg: Value,
+        argv: &[Value],
+    ) -> Result<bool, Thrown> {
+        let plain = if callee_v.is_heap() {
+            match self.heap.get(callee_v.heap_index()) {
+                HeapObj::Func(id) => Some((*id, NO_CLOSURE)),
+                HeapObj::Closure { func, .. } => Some((*func, callee_v.heap_index())),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let Some((fid, closure)) = plain else {
+            return Ok(false);
+        };
+        let (callee_regs, callee_params, rest_reg, arguments_reg, p_strict, p_lex, simple) = {
+            let p = self.func(fid as usize);
+            if p.is_generator || p.is_async {
+                return Ok(false);
+            }
+            (
+                (p.reg_count as usize).max(1),
+                p.param_count as usize,
+                p.rest_reg,
+                p.arguments_reg,
+                p.is_strict,
+                p.lexical_this,
+                p.simple_params,
+            )
+        };
+        // OrdinaryCallBindThis on `this_arg` (undefined for a plain tail call,
+        // the with-object for a with-resolved one): arrow lexical this /
+        // sloppy global substitution / sloppy primitive boxing.
+        let this_val = if p_lex && closure != NO_CLOSURE {
+            self.rebind_arrow_this(fid, closure, this_arg)
+        } else if !p_strict && this_arg.is_nullish() && self.global_this != 0 {
+            // The CALLEE realm's global (createRealm child fns).
+            Value::heap(self.callee_this_global(callee_v))
+        } else if !p_strict && !self.is_object_value(this_arg) && self.global_this != 0 {
+            let b = self.to_object(this_arg)?;
+            self.realm_retag_boxed(callee_v, b);
+            b
+        } else {
+            this_arg
+        };
+        self.regs.truncate(base);
+        if self.regs_would_overflow(base + callee_regs) {
+            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+        }
+        self.regs.resize(base + callee_regs, Value::UNDEFINED);
+        self.regs[base] = this_val;
+        let n = argv.len().min(callee_params);
+        for (i, &a) in argv.iter().take(n).enumerate() {
+            self.regs[base + 1 + i] = a;
+        }
+        if let Some(rreg) = rest_reg {
+            let extra: Vec<Value> = argv.get(callee_params..).unwrap_or(&[]).to_vec();
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
+            self.regs[base + rreg as usize] = arr;
+        }
+        let mut args_obj = u32::MAX;
+        if let Some(areg) = arguments_reg {
+            let mapinfo =
+                (!p_strict && simple).then(|| (self.frames.len() - 1, base, callee_params));
+            let arr = self.build_arguments_object(argv.to_vec(), callee_v, p_strict, mapinfo);
+            self.regs[base + areg as usize] = arr;
+            if mapinfo.is_some() {
+                args_obj = arr.heap_index();
+            }
+        }
+        let fr = self.frames.last_mut().unwrap();
+        fr.func = fid;
+        fr.closure = closure;
+        fr.ip = 0;
+        fr.handlers.clear();
+        fr.callee = callee_v;
+        fr.new_target = Value::UNDEFINED;
+        fr.eval_scope = u32::MAX;
+        fr.super_done = false;
+        fr.args_obj = args_obj;
+        Ok(true)
+    }
+
     pub(crate) fn try_run_jit(&mut self, func_id: u32, base: usize) -> Option<(Value, u32)> {
         let jitfn = self.jit.get(func_id)? as *const crate::codegen::JitFn;
         // SAFETY: `jitfn` points into self.jit.compiled (stable for the call).

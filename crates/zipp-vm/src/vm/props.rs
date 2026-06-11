@@ -955,11 +955,25 @@ impl<'p> Vm<'p> {
                                 self.program.hoisted_globals.contains(&(i as u32))
                                     || self.program.decl_globals.contains(&(i as u32))
                             });
+                        // An IMPLICIT global (created by a sloppy assignment to
+                        // an undeclared name — its slot holds a value but it is
+                        // neither script-declared nor a built-in): CreateData-
+                        // Property semantics — writable, ENUMERABLE, configurable.
+                        let implicit = !script_decl
+                            && !self.builtin_globals.contains_key(key)
+                            && self
+                                .program
+                                .global_names
+                                .iter()
+                                .position(|n| n == key)
+                                .and_then(|i| self.globals.get(i))
+                                .is_some_and(|v| !v.is_uninitialized());
                         return match key {
                             "NaN" | "Infinity" | "undefined" => {
                                 self.make_data_descriptor(v, false, false, false)
                             }
                             _ if script_decl => self.make_data_descriptor(v, true, true, false),
+                            _ if implicit => self.make_data_descriptor(v, true, true, true),
                             _ => self.make_data_descriptor(v, true, false, true),
                         };
                     }
@@ -1152,20 +1166,49 @@ impl<'p> Vm<'p> {
                     }
                 }
                 HeapObj::Class(c) => {
-                    // Spec order: the constructor's `length`, `name`, then
-                    // `prototype` are created FIRST. A static element named one of
-                    // them overwrites the VALUE but keeps that early position (it was
-                    // already defined), so emit these three first and skip them when
-                    // listing the remaining static elements.
-                    // A static element named length/name (a method, a computed key,
-                    // a generator, OR a get/set accessor) overrides the intrinsic but
-                    // keeps its position — check all three stores.
+                    // Spec order (OrdinaryOwnPropertyKeys): INTEGER-keyed static
+                    // elements first, ascending; then strings in creation order —
+                    // the constructor's `length`, `name`, then `prototype` are
+                    // created FIRST. A static element named one of those
+                    // overwrites the VALUE but keeps that early position (it was
+                    // already defined), so emit those three before the remaining
+                    // static elements.
                     let static_has = |k: &str| {
                         !is_private_key(k)
                             && (c.statics.pos(k).is_some()
                                 || c.static_getters.iter().any(|(n, _)| n == k)
                                 || c.static_setters.iter().any(|(n, _)| n == k))
                     };
+                    let mut ints: Vec<usize> = Vec::new();
+                    let mut named: Vec<String> = Vec::new();
+                    {
+                        let mut push_key = |k: &str| {
+                            if is_hidden_key(k)
+                                || is_private_key(k)
+                                || matches!(k, "length" | "name" | "prototype")
+                            {
+                                return;
+                            }
+                            if let Some(i) = canonical_index_str(k) {
+                                if !ints.contains(&i) {
+                                    ints.push(i);
+                                }
+                            } else if !named.iter().any(|n| n == k) {
+                                named.push(k.to_string());
+                            }
+                        };
+                        for k in &c.statics.keys {
+                            push_key(k);
+                        }
+                        for (n, _) in &c.static_getters {
+                            push_key(n);
+                        }
+                        for (n, _) in &c.static_setters {
+                            push_key(n);
+                        }
+                    }
+                    ints.sort_unstable();
+                    keys.extend(ints.into_iter().map(|i| i.to_string()));
                     if has_length || static_has("length") {
                         keys.push("length".to_string());
                     }
@@ -1175,27 +1218,7 @@ impl<'p> Vm<'p> {
                     if self.callable_has_prototype(obj) || c.statics.pos("prototype").is_some() {
                         keys.push("prototype".to_string());
                     }
-                    let is_intrinsic_key =
-                        |k: &str| matches!(k, "length" | "name" | "prototype");
-                    keys.extend(
-                        c.statics
-                            .keys
-                            .iter()
-                            .filter(|k| !is_hidden_key(k) && !is_intrinsic_key(k))
-                            .cloned(),
-                    );
-                    for (n, _) in &c.static_getters {
-                        if !is_hidden_key(n) && !is_intrinsic_key(n) && !keys.iter().any(|k| k == n)
-                        {
-                            keys.push(n.clone());
-                        }
-                    }
-                    for (n, _) in &c.static_setters {
-                        if !is_hidden_key(n) && !is_intrinsic_key(n) && !keys.iter().any(|k| k == n)
-                        {
-                            keys.push(n.clone());
-                        }
-                    }
+                    keys.extend(named);
                 }
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }

@@ -604,6 +604,24 @@ fn collect_nested_free(s: &ox::Statement, out: &mut HashSet<String>) {
             collect_nested_free_expr(&d.test, out);
         }
         S::ForStatement(f) => {
+            // A closure in the INIT (`for (let i = 0, f = () => i; …)`)
+            // captures head bindings too — scan declarator initializers.
+            if let Some(init) = &f.init {
+                match init {
+                    ox::ForStatementInit::VariableDeclaration(d) => {
+                        for decl in &d.declarations {
+                            if let Some(i) = &decl.init {
+                                collect_nested_free_expr(i, out);
+                            }
+                        }
+                    }
+                    other => {
+                        if let Some(e) = other.as_expression() {
+                            collect_nested_free_expr(e, out);
+                        }
+                    }
+                }
+            }
             if let Some(t) = &f.test {
                 collect_nested_free_expr(t, out);
             }

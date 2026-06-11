@@ -989,6 +989,12 @@ impl Compiler {
         if is_script && !fc.cx.eval_dynamic_names.is_empty() {
             fc.box_all_locals = true;
         }
+        // A SCRIPT whose program references `eval`: box block-level lexicals
+        // and record eval-site maps so a direct eval sees them (the script's
+        // globals keep their fast paths — only true block locals are boxed).
+        if is_script && capture::free_vars(&[], body).contains("eval") {
+            fc.script_eval_lexicals = true;
+        }
         // A FUNCTION-context eval root compiles its global accesses through
         // the Dyn ops — the caller activation's EvalScope (from this or an
         // earlier eval) may bind any name.
@@ -1130,6 +1136,14 @@ impl Compiler {
             for p in params {
                 blockers.insert(p.clone());
                 protect.insert(p.clone());
+            }
+            // B.3.3.1: a block function named `arguments` is never promoted —
+            // the implicit arguments binding behaves like a formal parameter
+            // (block-decl-func-skip-arguments). Script top level has no
+            // `arguments` binding, so the skip applies to function bodies only.
+            if !is_script {
+                blockers.insert("arguments".to_string());
+                protect.insert("arguments".to_string());
             }
             for s in body {
                 match s {
@@ -1410,9 +1424,17 @@ impl Compiler {
             for s in body {
                 collect_hoisted_vars(s, &mut hv);
             }
+            // Pre-declare EVERY hoisted var at entry (not just captured ones):
+            // (1) a `var` declared inside a BLOCK must occupy a register BELOW
+            // the block scope's, or the block's pop reclaims register space
+            // while the function-scoped binding still references it (a later
+            // local then aliases it: `{ var x = 2 } var z = 3` clobbered x);
+            // (2) the with-chain's static fallback must resolve a `var`
+            // textually after the `with` (unscopables-with); (3) `for (var k
+            // in …)` heads resolve the hoisted binding instead of minting one.
             for name in &hv {
-                if fc.captured.contains(name) && !fc.scopes[0].iter().any(|(n, _)| n == name) {
-                    fc.declare_local(name); // boxes a cell (the register is undefined)
+                if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                    fc.declare_local(name); // boxes a cell if captured (undefined)
                 }
             }
         }
@@ -1795,6 +1817,20 @@ impl Compiler {
                     }
                 }
             }
+            // Pre-declare every hoisted var at entry (mirrors the
+            // function-body pass — register accounting + with-fallback +
+            // for-head resolution; see that pass's comment).
+            {
+                let mut hv = std::collections::HashSet::new();
+                for s in &a.body.statements {
+                    collect_hoisted_vars(s, &mut hv);
+                }
+                for name in &hv {
+                    if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                        fc.declare_local(name);
+                    }
+                }
+            }
             for s in &a.body.statements {
                 fc.stmt(s)?;
             }
@@ -1986,6 +2022,12 @@ struct FnCompiler<'a> {
     /// eval): EVERY local is boxed into a cell so the eval program can close
     /// over the caller scope; DirectEval sites record the visible bindings.
     box_all_locals: bool,
+    /// SCRIPT top level whose program references `eval`: BLOCK-level lexicals
+    /// (which are true locals even at script level) are boxed into cells and
+    /// each direct-eval site records its visible-bindings map, so the eval
+    /// program can close over them (`{ let x; eval('x') }` at script level).
+    /// Never set for non-script bodies (those use `box_all_locals`).
+    script_eval_lexicals: bool,
     /// Scope maps for this function's DirectEval call sites (see
     /// FuncProto::eval_sites).
     eval_sites: Vec<(Vec<(String, u8, u16)>, Option<Vec<String>>, Vec<String>)>,
@@ -2086,6 +2128,19 @@ struct FnCompiler<'a> {
     /// textual declaration REUSES this cell instead of allocating a fresh binding.
     /// Empty unless a body has a captured forward-referenced lexical.
     entry_lexicals: std::collections::HashSet<String>,
+    /// Registers of BLOCK-level lexical (`let`/`const`/`class`) bindings
+    /// pre-created as TDZ cells at block entry (because a nested function
+    /// captures them), whose textual declaration has not yet been compiled.
+    /// The declaration REUSES the register (ending its TDZ); an ASSIGNMENT
+    /// through `store_binding` while still in this set emits the checked
+    /// `CellSetChecked` (a write during the TDZ is a ReferenceError).
+    /// Cleaned per-register in `pop_scope`.
+    block_tdz_cells: HashSet<Reg>,
+    /// Registers holding CATCH PARAMETERS (simple-identifier `catch (e)`
+    /// bindings). Annex B B.3.5 allows a same-named `var` / promoted block
+    /// function alongside one (no early error), so the B.3.3-applicability
+    /// check skips these scope entries. Cleaned per-register in `pop_scope`.
+    catch_param_regs: HashSet<Reg>,
     /// Active optional-chain short-circuit targets: a stack (chains can nest),
     /// each entry collecting the ip of every `?.` nullish-bail jump in that chain.
     /// On exit the chain patches them to a "load undefined" block.
@@ -2194,6 +2249,7 @@ impl<'a> FnCompiler<'a> {
             in_derived_ctor: false,
             heritage_class: None,
             box_all_locals: false,
+            script_eval_lexicals: false,
             eval_sites: Vec::new(),
             in_param_init: false,
             param_names: {
@@ -2210,6 +2266,8 @@ impl<'a> FnCompiler<'a> {
             pending_label: None,
             is_script: false,
             completion_reg: None,
+            block_tdz_cells: HashSet::new(),
+            catch_param_regs: HashSet::new(),
             chain_bails: Vec::new(),
             loop_ctx: Vec::new(),
             handler_depth: 0,
@@ -2343,6 +2401,8 @@ impl<'a> FnCompiler<'a> {
             self.const_regs.remove(r);
             self.cell_regs.remove(r);
             self.lexical_regs.remove(r);
+            self.block_tdz_cells.remove(r);
+            self.catch_param_regs.remove(r);
         }
     }
 
@@ -2352,7 +2412,10 @@ impl<'a> FnCompiler<'a> {
         // Box the local into a cell if a nested function captures it, so the
         // closure and this scope share one mutable slot — or unconditionally in
         // a function whose body may direct-eval (the eval closes over cells).
-        if self.box_all_locals || self.captured.contains(name) {
+        if self.box_all_locals
+            || self.captured.contains(name)
+            || (self.script_eval_lexicals && !name.starts_with('<'))
+        {
             self.emit(Instr::MakeCell { reg: r });
             self.cell_regs.insert(r);
         }
@@ -2499,6 +2562,28 @@ impl<'a> FnCompiler<'a> {
             .any(|s| s.iter().any(|(nm, _)| nm == name))
     }
 
+    /// Like `block_fn_conflicts` but for the B.3.3 VAR-SYNC applicability
+    /// check: a CATCH PARAMETER of the same name is NOT a conflict (B.3.5 —
+    /// `var`+catch-param coexist without an early error, so the promotion is
+    /// NOT skipped: the "no-skip-try" family), while an enclosing block's
+    /// function/lexical binding still is.
+    fn block_fn_sync_conflicts(&self, name: &str) -> bool {
+        let n = self.scopes.len();
+        if n < 2 {
+            return false;
+        }
+        if self.is_script
+            && self.cx.eval_locals
+            && self.entry_lexicals.contains(name)
+            && self.scopes[0].iter().any(|(nm, _)| nm == name)
+        {
+            return true;
+        }
+        self.scopes[1..n - 1].iter().any(|s| {
+            s.iter().any(|(nm, r)| nm == name && !self.catch_param_regs.contains(r))
+        })
+    }
+
     fn add_const(&mut self, v: Value) -> u32 {
         let i = self.constants.len() as u32;
         self.constants.push(v);
@@ -2554,6 +2639,41 @@ impl<'a> FnCompiler<'a> {
             S::VariableDeclaration(d) => self.var_decl(d)?,
             S::BlockStatement(b) => {
                 self.push_scope();
+                // Pre-create TDZ cells for the block's CAPTURED simple-identifier
+                // lexical (`let`/`const`/`class`) declarations, so a closure
+                // materialized BEFORE the textual declaration (`{ function f() {
+                // x = 1; } f(); let x; }`) captures the block's binding (in its
+                // TDZ → ReferenceError) instead of resolving to a global. The
+                // textual declaration reuses the register, ending the TDZ.
+                // Non-captured names keep plain registers (no runtime cost).
+                for st in &b.body {
+                    let mut pre = |fc: &mut Self, name: &str| {
+                        if fc.captured.contains(name)
+                            && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
+                        {
+                            let r = fc.alloc_reg();
+                            fc.scopes.last_mut().unwrap().push((name.to_string(), r));
+                            fc.emit(Instr::MakeCellTdz { reg: r });
+                            fc.cell_regs.insert(r);
+                            fc.block_tdz_cells.insert(r);
+                        }
+                    };
+                    match st {
+                        S::VariableDeclaration(d) if d.kind.is_lexical() => {
+                            for decl in &d.declarations {
+                                if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
+                                    pre(self, id.name.as_str());
+                                }
+                            }
+                        }
+                        S::ClassDeclaration(c) => {
+                            if let Some(id) = &c.id {
+                                pre(self, id.name.as_str());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 // Hoist block-level function declarations: declare each as a local
                 // in this block scope first, so `func_decl` binds it (and forward
                 // references / calls within the block resolve to the local rather
@@ -2561,6 +2681,8 @@ impl<'a> FnCompiler<'a> {
                 // at script top level, `func_decl` binds block functions to globals
                 // (Annex B hoisting), so a local here would shadow that with an
                 // uninitialized slot.
+                let mut entry_fns: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 for st in &b.body {
                     if let S::FunctionDeclaration(f) = st {
                         if let Some(id) = &f.id {
@@ -2582,6 +2704,7 @@ impl<'a> FnCompiler<'a> {
                                 || self.b33_names.contains(nm)
                             {
                                 self.declare_local(nm);
+                                entry_fns.insert(nm.to_string());
                             }
                         }
                     }
@@ -2591,7 +2714,29 @@ impl<'a> FnCompiler<'a> {
                     // resources on every exit — desugar onto a synthetic finally.
                     self.compile_using_block(&b.body, false)?;
                 } else {
+                    // BlockDeclarationInstantiation: the block's function
+                    // declarations are materialized at BLOCK ENTRY (a call
+                    // before the textual declaration works), while the Annex B
+                    // var-binding sync stays at the declaration's textual
+                    // position (B.3.3.3 fires at evaluation, not entry).
                     for st in &b.body {
+                        if let S::FunctionDeclaration(f) = st {
+                            if let Some(id) = &f.id {
+                                if entry_fns.contains(id.name.as_str()) {
+                                    self.func_decl_inner(f, false)?;
+                                }
+                            }
+                        }
+                    }
+                    for st in &b.body {
+                        if let S::FunctionDeclaration(f) = st {
+                            if let Some(id) = &f.id {
+                                if entry_fns.contains(id.name.as_str()) {
+                                    self.emit_b33_sync(id.name.as_str());
+                                    continue;
+                                }
+                            }
+                        }
                         self.stmt(st)?;
                     }
                 }
@@ -2695,29 +2840,18 @@ impl<'a> FnCompiler<'a> {
             }
             S::SwitchStatement(s) => self.switch_stmt(s)?,
             S::ReturnStatement(r) => {
-                // Proper tail call: strict `return f(args)` in an UNPROTECTED
-                // context (no try handlers, no enclosing loop with an iterator
-                // to close, no using scope, not generator/async/script/eval)
-                // reuses the current frame — constant stack for tail
-                // recursion. The TailCall prefix falls through to the
+                // Proper tail call: strict `return <expr with a call in tail
+                // position>` in an UNPROTECTED context (no try handlers, no
+                // enclosing loop with an iterator to close, no using scope,
+                // not generator/async/script/eval) reuses the current frame —
+                // constant stack for tail recursion. Tail positions cover the
+                // call itself plus conditional arms, logical right operands,
+                // sequence finals, parenthesization, and plain-tag tagged
+                // templates. The TailCall prefix falls through to the
                 // ordinary Call+Return for non-plain callees.
-                if let Some(ox::Expression::CallExpression(c)) = &r.argument {
-                    if self.tail_call_position() && self.tail_callable(c) {
-                        let save = self.next_reg;
-                        let ct = self.alloc_reg();
-                        let cv = self.expr_into(&c.callee, ct)?;
-                        if cv != ct {
-                            self.emit(Instr::Move { dst: ct, src: cv });
-                        }
-                        let exprs: Vec<&ox::Expression> =
-                            c.arguments.iter().filter_map(|a| a.as_expression()).collect();
-                        let arg_base = self.eval_contiguous(&exprs)?;
-                        let argc = exprs.len() as u16;
-                        self.emit(Instr::TailCall { callee: ct, arg_base, argc });
-                        let dst = self.alloc_reg();
-                        self.emit(Instr::Call { dst, callee: ct, arg_base, argc });
-                        self.emit(Instr::Return { src: dst });
-                        self.next_reg = save;
+                if let Some(arg) = &r.argument {
+                    if self.tail_call_position() && self.expr_has_tail_call(arg) {
+                        self.emit_tail_return(arg)?;
                         return Ok(());
                     }
                 }
@@ -3028,7 +3162,21 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
                 let src = self.alloc_reg();
-                let sv = self.expr_into(init, src)?;
+                // The pattern's leaves are in their TDZ while the INITIALIZER
+                // evaluates (`let {a} = a` throws); they leave it before the
+                // extraction (a sibling default may read an earlier leaf).
+                let tdz_leaves: Vec<String> = if d.kind.is_lexical() {
+                    let mut names = std::collections::HashSet::new();
+                    capture::collect_pattern_names(&decl.id, &mut names);
+                    names.into_iter().filter(|n| self.param_tdz.insert(n.clone())).collect()
+                } else {
+                    Vec::new()
+                };
+                let sv = self.expr_into(init, src);
+                for n in &tdz_leaves {
+                    self.param_tdz.remove(n);
+                }
+                let sv = sv?;
                 if sv != src {
                     self.emit(Instr::Move { dst: src, src: sv });
                 }
@@ -3071,10 +3219,41 @@ impl<'a> FnCompiler<'a> {
                 }
                 continue;
             }
+            // Annex B 3.5: `var foo = init` where `foo` is SHADOWED by a deeper
+            // block binding (a catch parameter — the only legal shadow of a
+            // var name): the hoisted function/global var binding is untouched
+            // here; the INITIALIZER assigns the shadowing binding via ordinary
+            // resolution (`catch (foo) { var foo = x; }` writes the parameter).
+            if !d.kind.is_lexical()
+                && decl.init.is_some()
+                && self.scopes.len() > 1
+                && self.scopes[1..].iter().flatten().any(|(n, _)| n == name)
+            {
+                let init = decl.init.as_ref().unwrap();
+                let save = self.next_reg;
+                let tmp = self.temp();
+                let v = self.compile_named_init(tmp, init, name)?;
+                let with_objs = self.with_obj_regs(name);
+                if with_objs.is_empty() {
+                    let b = self.resolve(name);
+                    self.store_binding(&b, v);
+                } else {
+                    self.store_with(name, &with_objs, v);
+                }
+                self.next_reg = save;
+                continue;
+            }
             if self.is_script && self.cx.script_binds_globals && !block_scoped_lexical {
                 let slot = self.cx.global_slot(name) as u32;
                 if is_const {
                     self.cx.const_globals.insert(slot);
+                }
+                // A bare `var x;` performs NO assignment — the hoisted slot was
+                // seeded undefined at startup, and re-storing here would RESET
+                // an already-assigned binding (`var x = 5; var x;` keeps 5). A
+                // bare lexical (`let x;`) DOES store: that write ends its TDZ.
+                if decl.init.is_none() && !d.kind.is_lexical() {
+                    continue;
                 }
                 let tmp = self.temp();
                 let v = if let Some(init) = &decl.init {
@@ -3165,6 +3344,19 @@ impl<'a> FnCompiler<'a> {
                     .find(|(n, _)| n == name)
                     .map(|(_, r)| *r)
                     .unwrap_or_else(|| self.declare_local(name))
+            } else if let Some(r) = self
+                .scopes
+                .last()
+                .unwrap()
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, r)| *r)
+                .filter(|r| self.block_tdz_cells.contains(r))
+            {
+                // A block-entry pre-created TDZ cell (captured forward-referenced
+                // lexical): the textual declaration reuses it, ending the TDZ.
+                self.block_tdz_cells.remove(&r);
+                r
             } else {
                 self.declare_local(name)
             };
@@ -3173,14 +3365,11 @@ impl<'a> FnCompiler<'a> {
             }
             self.lexical_regs.insert(reg);
             let is_cell = self.cell_regs.contains(&reg);
-            // `using x = <expr reading x>` is a TDZ ReferenceError: the
-            // binding initializes only when the declaration completes (the
-            // general let/const self-read isn't routed through this check, so
-            // scope the guard to `using` where the tests demand it).
-            let tdz_added = matches!(
-                d.kind,
-                ox::VariableDeclarationKind::Using | ox::VariableDeclarationKind::AwaitUsing
-            ) && self.param_tdz.insert(name.to_string());
+            // A lexical declaration's own initializer reading its binding
+            // (`let x = x + 1`, `const c = c`, `using u = u`) is a TDZ
+            // ReferenceError: the binding initializes only when the
+            // declaration completes.
+            let tdz_added = d.kind.is_lexical() && self.param_tdz.insert(name.to_string());
             if let Some(init) = &decl.init {
                 if is_cell {
                     // The init value must be written THROUGH the cell.
@@ -3247,6 +3436,46 @@ impl<'a> FnCompiler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Resolve the binding of a `for (var x in/of …)` HEAD: the loop creates
+    /// NO binding of its own — it assigns the existing one (a shadowing catch
+    /// parameter, the hoisted function-scope var, or the script global). A
+    /// first-mention name creates the FUNCTION-scoped var binding here (the
+    /// `var` hoist), exactly like `var_decl`'s function path.
+    fn head_var_binding(&mut self, name: &str) -> Binding {
+        // Innermost existing binding (catch param / pre-declared var / param).
+        for scope in self.scopes.iter().rev() {
+            for (n, r) in scope.iter().rev() {
+                if n == name {
+                    return if self.cell_regs.contains(r) {
+                        Binding::LocalCell(*r)
+                    } else {
+                        Binding::Local(*r)
+                    };
+                }
+            }
+        }
+        if self.is_script && self.cx.script_binds_globals {
+            return Binding::Global(self.cx.global_slot(name) as u32);
+        }
+        // EVAL root with the name in the caller scope: assign through the
+        // seeded caller upvalue (mirrors var_decl's eval-caller path).
+        if self.is_script && self.cx.eval_caller_scope.iter().any(|n| n == name) {
+            if let Some(idx) = self.resolve_upvalue(name) {
+                return Binding::Upvalue(idx);
+            }
+        }
+        // First mention: create the function-scoped var binding (scopes[0]).
+        let r = self.alloc_reg();
+        self.scopes[0].push((name.to_string(), r));
+        if self.box_all_locals || self.captured.contains(name) {
+            self.emit(Instr::MakeCell { reg: r });
+            self.cell_regs.insert(r);
+            Binding::LocalCell(r)
+        } else {
+            Binding::Local(r)
+        }
     }
 
     /// Phase 1 of a destructuring declaration: declare every leaf binding the
@@ -3497,6 +3726,64 @@ impl<'a> FnCompiler<'a> {
     }
 
     fn func_decl(&mut self, f: &ox::Function) -> R<()> {
+        self.func_decl_inner(f, true)
+    }
+
+    /// Annex B B.3.3.3 var-binding sync for a block function named `name`,
+    /// reading the value from the BLOCK binding (`src`): emitted at the
+    /// declaration's TEXTUAL position (SetMutableBinding happens when the
+    /// declaration is evaluated, not at block entry).
+    fn emit_b33_sync(&mut self, name: &str) {
+        if !self.b33_names.contains(name) || self.block_fn_sync_conflicts(name) {
+            return;
+        }
+        let Some(b) = self.resolve_existing(name) else { return };
+        let save = self.next_reg;
+        let src = match b {
+            Binding::Local(r) => r,
+            Binding::LocalCell(c) => {
+                let t = self.temp();
+                self.emit(Instr::CellGet { dst: t, cell: c });
+                t
+            }
+            _ => return,
+        };
+        let s0reg = self
+            .scopes
+            .first()
+            .and_then(|s| s.iter().find(|(nm, _)| nm == name).map(|(_, r)| *r));
+        if let Some(s0) = s0reg {
+            if s0 != src {
+                if self.cell_regs.contains(&s0) {
+                    self.emit(Instr::CellSet { cell: s0, src });
+                } else {
+                    self.emit(Instr::Move { dst: s0, src });
+                }
+            }
+        }
+        if self.is_script {
+            let caller_b33_upval = if self.cx.eval_fn_context
+                && self.cx.eval_caller_scope.iter().any(|c| c == name)
+            {
+                self.resolve_upvalue(name)
+            } else {
+                None
+            };
+            if let Some(ui) = caller_b33_upval {
+                self.emit(Instr::UpvalSet { idx: ui, src });
+            } else if s0reg.is_none() {
+                let slot = self.cx.global_slot(name) as u32;
+                if self.box_all_locals || self.cx.dyn_global_zone {
+                    self.emit(Instr::StoreGlobalDyn { idx: slot, src });
+                } else {
+                    self.emit(Instr::StoreGlobal { idx: slot, src });
+                }
+            }
+        }
+        self.next_reg = save;
+    }
+
+    fn func_decl_inner(&mut self, f: &ox::Function, do_sync: bool) -> R<()> {
         let name = f.id.as_ref().map(|i| i.name.to_string());
         // Strict mode: a function may not be named `eval`/`arguments` (the binding
         // is strict if the enclosing scope is strict OR the body opens `"use strict"`).
@@ -3567,8 +3854,20 @@ impl<'a> FnCompiler<'a> {
             // (in `b33_names`) assigns the var the function value when this
             // declaration executes. `s0reg` is that binding's register in the
             // function's base scope; the block-local shadows it inside the block.
+            // A declaration whose `var`-replacement would conflict with a
+            // SAME-NAMED binding in an enclosing block (e.g. a nested block's
+            // `function f(){}` under an outer block that also declares `f`) is
+            // NOT B.3.3-applicable — it stays purely block-local (B.3.3.1's
+            // would-not-produce-Early-Errors condition, checked per declaration
+            // POSITION, not just per name).
+            let b33_applicable = match name.as_deref() {
+                Some(n) => {
+                    do_sync && self.b33_names.contains(n) && !self.block_fn_sync_conflicts(n)
+                }
+                None => false,
+            };
             let s0reg = match name.as_deref() {
-                Some(n) if self.b33_names.contains(n) => self
+                Some(n) if b33_applicable => self
                     .scopes
                     .first()
                     .and_then(|s| s.iter().find(|(nm, _)| nm == n).map(|(_, r)| *r)),
@@ -3582,7 +3881,7 @@ impl<'a> FnCompiler<'a> {
             let caller_b33_upval = match name.as_deref() {
                 Some(n)
                     if self.is_script
-                        && self.b33_names.contains(n)
+                        && b33_applicable
                         && self.cx.eval_fn_context
                         && self.cx.eval_caller_scope.iter().any(|c| c == n) =>
                 {
@@ -3592,9 +3891,7 @@ impl<'a> FnCompiler<'a> {
             };
             let script_b33_slot = match name.as_deref() {
                 Some(n)
-                    if self.is_script
-                        && self.b33_names.contains(n)
-                        && caller_b33_upval.is_none() =>
+                    if self.is_script && b33_applicable && caller_b33_upval.is_none() =>
                 {
                     Some(self.cx.global_slot(n) as u32)
                 }
@@ -3997,19 +4294,49 @@ impl<'a> FnCompiler<'a> {
                         ox::MethodDefinitionKind::Method if m.r#static => 3u8,
                         ox::MethodDefinitionKind::Method => 0u8,
                     };
+                    // A DUPLICATE member name in the same list (`get b(){}` +
+                    // `get ['b'](){}` — both statically nameable) REPLACES the
+                    // earlier definition (last wins) while keeping its original
+                    // position in property order.
+                    fn put_member<'x>(
+                        list: &mut Vec<(String, &'x ox::Function<'x>)>,
+                        name: String,
+                        f: &'x ox::Function<'x>,
+                    ) {
+                        if let Some(slot) = list.iter_mut().find(|(n, _)| *n == name) {
+                            slot.1 = f;
+                        } else {
+                            list.push((name, f));
+                        }
+                    }
                     match class_key_name(&m.key) {
                         Ok(name) => match (m.r#static, m.kind) {
-                            (true, ox::MethodDefinitionKind::Method) => statics.push((name, &m.value)),
-                            (true, ox::MethodDefinitionKind::Get) => static_getters.push((name, &m.value)),
-                            (true, ox::MethodDefinitionKind::Set) => static_setters.push((name, &m.value)),
+                            (true, ox::MethodDefinitionKind::Method) => put_member(&mut statics, name, &m.value),
+                            (true, ox::MethodDefinitionKind::Get) => put_member(&mut static_getters, name, &m.value),
+                            (true, ox::MethodDefinitionKind::Set) => put_member(&mut static_setters, name, &m.value),
                             (true, ox::MethodDefinitionKind::Constructor) => unreachable!(),
-                            (false, ox::MethodDefinitionKind::Method) => methods.push((name, &m.value)),
-                            (false, ox::MethodDefinitionKind::Get) => getters.push((name, &m.value)),
-                            (false, ox::MethodDefinitionKind::Set) => setters.push((name, &m.value)),
+                            (false, ox::MethodDefinitionKind::Method) => put_member(&mut methods, name, &m.value),
+                            (false, ox::MethodDefinitionKind::Get) => put_member(&mut getters, name, &m.value),
+                            (false, ox::MethodDefinitionKind::Set) => put_member(&mut setters, name, &m.value),
                             (false, ox::MethodDefinitionKind::Constructor) => unreachable!(),
                         },
                         Err(e) if m.computed => {
                             let key = m.key.as_expression().ok_or(e)?;
+                            // An INSTANCE member with a runtime-computed key keeps
+                            // its SOURCE position in the prototype's property order:
+                            // park a placeholder entry here; `ClassAddMember` renames
+                            // it in place once the key value is known (the ordinal is
+                            // rewritten to the member's func id below, which the
+                            // dispatch arm can recompute).
+                            if matches!(kind, 0 | 1 | 2) {
+                                let ph = format!("\u{1}cm{}", computed.len());
+                                let list = match kind {
+                                    1 => &mut getters,
+                                    2 => &mut setters,
+                                    _ => &mut methods,
+                                };
+                                list.push((ph, &m.value));
+                            }
                             computed.push((key, &m.value, kind));
                         }
                         Err(e) => return Err(e),
@@ -4100,6 +4427,12 @@ impl<'a> FnCompiler<'a> {
         // Method protos.
         let mut method_defs: Vec<(String, u32)> = Vec::new();
         for (mname, func) in &methods {
+            // A computed-key placeholder: position-only (no function of its
+            // own — the computed loop below compiles it and rewrites the name).
+            if mname.starts_with('\u{1}') {
+                method_defs.push((mname.clone(), u32::MAX));
+                continue;
+            }
             let (params, rest, body) = function_parts(func)?;
             // A method's `.name` is the bare property key (`"m"` / `"#m"`), NOT
             // class-qualified — `toString` uses `proto.source`, set below.
@@ -4126,6 +4459,10 @@ impl<'a> FnCompiler<'a> {
         // Getter protos (compiled identically to a no-arg method).
         let mut getter_defs: Vec<(String, u32)> = Vec::new();
         for (gname, func) in &getters {
+            if gname.starts_with('\u{1}') {
+                getter_defs.push((gname.clone(), u32::MAX));
+                continue;
+            }
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
                 &format!("get {gname}"),
@@ -4150,6 +4487,10 @@ impl<'a> FnCompiler<'a> {
         // Setter protos (a one-parameter method invoked on property write).
         let mut setter_defs: Vec<(String, u32)> = Vec::new();
         for (sname, func) in &setters {
+            if sname.starts_with('\u{1}') {
+                setter_defs.push((sname.clone(), u32::MAX));
+                continue;
+            }
             let (params, rest, body) = function_parts(func)?;
             let mut proto = self.cx.compile_class_fn(
                 &format!("set {sname}"),
@@ -4338,6 +4679,24 @@ impl<'a> FnCompiler<'a> {
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             computed_defs.push((key, fid, *kind));
+        }
+        // Rewrite each instance placeholder's ordinal to its member's FUNC ID
+        // ("\u{1}cm{ordinal}" → "\u{1}cm{fid}"), so the `ClassAddMember`
+        // dispatch arm — which knows only the func id — can find and rename
+        // the parked entry in place (preserving the member's source position).
+        for (i, (_, fid, kind)) in computed_defs.iter().enumerate() {
+            if !matches!(*kind, 0 | 1 | 2) {
+                continue;
+            }
+            let old = format!("\u{1}cm{i}");
+            let list = match *kind {
+                1 => &mut getter_defs,
+                2 => &mut setter_defs,
+                _ => &mut method_defs,
+            };
+            if let Some(slot) = list.iter_mut().find(|(n, _)| *n == old) {
+                slot.0 = format!("\u{1}cm{fid}");
+            }
         }
         // `static { … }` blocks: each body compiles to a zero-arg thunk (like a
         // method, so `this`/`super` and arguments work) that class_decl runs once
@@ -5106,7 +5465,12 @@ impl<'a> FnCompiler<'a> {
                 ox::BindingPattern::BindingIdentifier(id) => {
                     // Strict mode: `catch (eval)` / `catch (arguments)` is an early SyntaxError.
                     strict_name_err(self.cx.in_strict, id.name.as_str())?;
-                    (self.declare_local_no_box(id.name.as_str()), Some(id.name.to_string()), None)
+                    let r = self.declare_local_no_box(id.name.as_str());
+                    // Mark the catch-PARAMETER binding: Annex B B.3.5 lets a
+                    // same-named `var` / block function coexist with it (NOT an
+                    // early error), so the B.3.3 promotion check must ignore it.
+                    self.catch_param_regs.insert(r);
+                    (r, Some(id.name.to_string()), None)
                 }
                 pat => (self.declare_local_no_box("<catch.val>"), None, Some(pat)),
             },
@@ -5329,6 +5693,18 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::GetIterator { dst: iter_reg, src: iter_reg });
             None
         };
+        // GetIterator's iterator RECORD caches the `next` method ONCE in the
+        // prologue (a mid-loop redefinition of `iterator.next` is not observed
+        // — iterator-next-reference). Sync loops only; user-object iterators
+        // only (built-ins keep the registerless cursor fast path, with no
+        // observable prologue get).
+        let next_reg = if f.r#await {
+            None
+        } else {
+            let n = self.declare_local("<forof.next>");
+            self.emit(Instr::IterPrime { dst: n, iter: iter_reg });
+            Some(n)
+        };
         let idx_reg = self.declare_local("<forof.idx>");
         self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
         // Close-on-throw (sync for-of only): if the element binding or the body
@@ -5345,6 +5721,11 @@ impl<'a> FnCompiler<'a> {
         // existing target, or a single (possibly cell-boxed) declared variable.
         let head_lexical = matches!(&f.left,
             ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical());
+        // A `var` head whose binding is NOT a plain current-function register
+        // (catch-param cell / global slot / upvalue): per-iteration writes go
+        // through `store_binding` — the loop creates NO binding of its own
+        // (Annex B catch-redeclared-for-of-var).
+        let mut var_binding: Option<Binding> = None;
         let (var_reg, var_is_cell) = match (pattern, assign_tgt) {
             (Some(p), _) => {
                 // A `let`/`const` head pattern binds HEAD-SCOPE locals (a
@@ -5358,20 +5739,36 @@ impl<'a> FnCompiler<'a> {
             (None, Some(_)) => (0, false), // assignment target: nothing to declare
             (None, None) => {
                 let var_name = for_left_name(&f.left)?;
-                let r = self.declare_local(&var_name);
-                // A `const`/`using`/`await using` loop variable is immutable
-                // WITHIN an iteration: a body assignment throws TypeError.
-                if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
-                    if matches!(
-                        d.kind,
-                        ox::VariableDeclarationKind::Const
-                            | ox::VariableDeclarationKind::Using
-                            | ox::VariableDeclarationKind::AwaitUsing
-                    ) {
-                        self.const_regs.insert(r);
+                if matches!(&f.left,
+                    ox::ForStatementLeft::VariableDeclaration(d)
+                        if d.kind == ox::VariableDeclarationKind::Var)
+                {
+                    // `for (var x of …)`: resolve the EXISTING binding instead
+                    // of declaring a loop-local; a first-mention var creates
+                    // its FUNCTION-scoped binding.
+                    match self.head_var_binding(&var_name) {
+                        Binding::Local(r) => (r, false),
+                        other => {
+                            var_binding = Some(other);
+                            (0, false)
+                        }
                     }
+                } else {
+                    let r = self.declare_local(&var_name);
+                    // A `const`/`using`/`await using` loop variable is immutable
+                    // WITHIN an iteration: a body assignment throws TypeError.
+                    if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                        if matches!(
+                            d.kind,
+                            ox::VariableDeclarationKind::Const
+                                | ox::VariableDeclarationKind::Using
+                                | ox::VariableDeclarationKind::AwaitUsing
+                        ) {
+                            self.const_regs.insert(r);
+                        }
+                    }
+                    (r, self.cell_regs.contains(&r))
                 }
-                (r, self.cell_regs.contains(&r))
             }
         };
 
@@ -5400,8 +5797,13 @@ impl<'a> FnCompiler<'a> {
         let save = self.next_reg;
         let done = self.alloc_reg();
         // Write the element straight into a plain-local loop var; use a temp for a
-        // destructuring pattern, an assignment target, or a cell-boxed var.
-        let elem = if pattern.is_some() || assign_tgt.is_some() || var_is_cell {
+        // destructuring pattern, an assignment target, a cell-boxed var, or a
+        // store-through `var` binding (catch-param / global / upvalue).
+        let elem = if pattern.is_some()
+            || assign_tgt.is_some()
+            || var_is_cell
+            || var_binding.is_some()
+        {
             self.alloc_reg()
         } else {
             var_reg
@@ -5434,7 +5836,13 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::GetProp { dst: elem, obj: r, name: value_name });
             j
         } else {
-            self.emit(Instr::IterNext { value_dst: elem, done_dst: done, iter: iter_reg, idx: idx_reg });
+            self.emit(Instr::IterNext {
+                value_dst: elem,
+                done_dst: done,
+                iter: iter_reg,
+                idx: idx_reg,
+                next: next_reg.unwrap_or(Reg::MAX),
+            });
             let j = self.here();
             self.emit(Instr::JumpIfTrue { cond: done, target: 0 }); // done → exit
             j
@@ -5483,6 +5891,11 @@ impl<'a> FnCompiler<'a> {
             self.extract_pattern(p, elem)?;
         } else if let Some(tgt) = assign_tgt {
             self.assign_target(tgt, elem)?;
+        } else if let Some(b) = &var_binding {
+            // `for (var x of …)` writing a non-register binding (catch-param
+            // cell / global slot / upvalue): plain assignment, NO fresh cell —
+            // `var` is function-scoped (one binding for the whole loop).
+            self.store_binding(b, elem);
         } else if var_is_cell {
             // Per-iteration binding: a FRESH cell each iteration so a closure in
             // the body captures THIS element, not the last one (for-of let).
@@ -5604,6 +6017,33 @@ impl<'a> FnCompiler<'a> {
             decl_pat.filter(|p| !matches!(p, ox::BindingPattern::BindingIdentifier(_)));
         let assign_tgt = f.left.as_assignment_target();
 
+        // Annex B B.3.6: `for (var a = init in obj)` evaluates the initializer
+        // ONCE and assigns it to the (function-scoped / shadowing) binding
+        // BEFORE the object expression runs.
+        if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+            if d.kind == ox::VariableDeclarationKind::Var {
+                if let (Some(init), ox::BindingPattern::BindingIdentifier(id)) =
+                    (&d.declarations[0].init, &d.declarations[0].id)
+                {
+                    // ResolveBinding FIRST (head_var_binding may permanently
+                    // allocate the function-scoped register — it must stay
+                    // below the temp watermark we reclaim to), then evaluate
+                    // the initializer, then PutValue.
+                    let b = self.head_var_binding(id.name.as_str());
+                    let save = self.next_reg;
+                    let tmp = self.temp();
+                    let v = self.compile_named_init(tmp, init, id.name.as_str())?;
+                    let with_objs = self.with_obj_regs(id.name.as_str());
+                    if with_objs.is_empty() {
+                        self.store_binding(&b, v);
+                    } else {
+                        self.store_with(id.name.as_str(), &with_objs, v);
+                    }
+                    self.next_reg = save;
+                }
+            }
+        }
+
         let obj_reg = self.declare_local("<forin.obj>");
         // The right-hand expression sees the loop's `let`/`const` binding(s) in their
         // TDZ (`for (let x in x) {}` throws a ReferenceError), per ForIn/OfHeadEvaluation.
@@ -5651,6 +6091,11 @@ impl<'a> FnCompiler<'a> {
 
         let head_lexical = matches!(&f.left,
             ox::ForStatementLeft::VariableDeclaration(d) if d.kind.is_lexical());
+        // A `var` head whose binding is NOT a plain current-function register —
+        // a shadowing catch parameter cell, a global slot, an upvalue: the
+        // per-iteration write goes through `store_binding` (the loop creates NO
+        // binding of its own — Annex B catch-redeclared-for-in-var).
+        let mut var_binding: Option<Binding> = None;
         let (var_reg, var_is_cell) = match (pattern, assign_tgt) {
             (Some(p), _) => {
                 self.pattern_block_local = head_lexical;
@@ -5662,8 +6107,37 @@ impl<'a> FnCompiler<'a> {
             (None, Some(_)) => (0, false),
             (None, None) => {
                 let var_name = for_left_name(&f.left)?;
-                let r = self.declare_local(&var_name);
-                (r, self.cell_regs.contains(&r))
+                if matches!(&f.left,
+                    ox::ForStatementLeft::VariableDeclaration(d)
+                        if d.kind == ox::VariableDeclarationKind::Var)
+                {
+                    // `for (var x in …)`: resolve the EXISTING binding (the
+                    // hoisted function-scope var, a shadowing catch param, or
+                    // the global slot) instead of declaring a loop-local; a
+                    // first-mention var creates its FUNCTION-scoped binding.
+                    match self.head_var_binding(&var_name) {
+                        Binding::Local(r) => (r, false),
+                        other => {
+                            var_binding = Some(other);
+                            (0, false)
+                        }
+                    }
+                } else {
+                    let r = self.declare_local(&var_name);
+                    // A `const` loop variable is immutable WITHIN an iteration:
+                    // a body assignment throws TypeError (mirrors for-of).
+                    if let ox::ForStatementLeft::VariableDeclaration(d) = &f.left {
+                        if matches!(
+                            d.kind,
+                            ox::VariableDeclarationKind::Const
+                                | ox::VariableDeclarationKind::Using
+                                | ox::VariableDeclarationKind::AwaitUsing
+                        ) {
+                            self.const_regs.insert(r);
+                        }
+                    }
+                    (r, self.cell_regs.contains(&r))
+                }
             }
         };
 
@@ -5675,9 +6149,10 @@ impl<'a> FnCompiler<'a> {
         self.next_reg -= 1;
 
         let save = self.next_reg;
-        // Read the current key into a temp (pattern / assignment target) or
-        // straight into the loop var (a per-iteration cell var is boxed after).
-        let key_dst = if pattern.is_some() || assign_tgt.is_some() {
+        // Read the current key into a temp (pattern / assignment target /
+        // store-through binding) or straight into the loop var (a
+        // per-iteration cell var is boxed after).
+        let key_dst = if pattern.is_some() || assign_tgt.is_some() || var_binding.is_some() {
             self.alloc_reg()
         } else {
             var_reg
@@ -5714,6 +6189,11 @@ impl<'a> FnCompiler<'a> {
             self.extract_pattern(p, key_dst)?;
         } else if let Some(tgt) = assign_tgt {
             self.assign_target(tgt, key_dst)?;
+        } else if let Some(b) = &var_binding {
+            // `for (var x in …)` writing a non-register binding (catch-param
+            // cell / global slot / upvalue): plain assignment, NO fresh cell —
+            // `var` is function-scoped (one binding for the whole loop).
+            self.store_binding(b, key_dst);
         } else if var_is_cell {
             // Per-iteration binding: a FRESH cell each iteration (for-in let).
             self.emit(Instr::MakeCell { reg: var_reg });
@@ -6424,6 +6904,21 @@ impl<'a> FnCompiler<'a> {
     /// the array of cooked literal parts carrying a `.raw` array of the un-escaped
     /// parts. `String.raw` is handled inline (no real global exists).
     fn tagged_template(&mut self, tt: &ox::TaggedTemplateExpression, dst: Reg) -> R<Reg> {
+        self.tagged_template_impl(tt, dst, false)
+    }
+
+    /// `return tag`…`` in a proper-tail-call position: same lowering with the
+    /// `TailCall` frame-reuse prefix in front of the final plain `Call`.
+    fn tagged_template_tail(&mut self, tt: &ox::TaggedTemplateExpression, dst: Reg) -> R<Reg> {
+        self.tagged_template_impl(tt, dst, true)
+    }
+
+    fn tagged_template_impl(
+        &mut self,
+        tt: &ox::TaggedTemplateExpression,
+        dst: Reg,
+        tail: bool,
+    ) -> R<Reg> {
         let quasi = &tt.quasi;
         // `String.raw` template — concatenate the RAW parts with the values.
         if let ox::Expression::StaticMemberExpression(m) = &tt.tag {
@@ -6489,7 +6984,14 @@ impl<'a> FnCompiler<'a> {
         }
         let argc = (n + 1) as u16;
         match tag {
-            Tag::Plain(callee) => self.emit(Instr::Call { dst, callee, arg_base, argc }),
+            Tag::Plain(callee) => {
+                if tail {
+                    // Proper tail call (`return f`…``): reuse the frame for a
+                    // plain function tag; others fall through to the Call.
+                    self.emit(Instr::TailCall { callee, arg_base, argc });
+                }
+                self.emit(Instr::Call { dst, callee, arg_base, argc })
+            }
             Tag::Method(obj, name) => {
                 self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc })
             }
@@ -7356,6 +7858,51 @@ impl<'a> FnCompiler<'a> {
         end_jumps
     }
 
+    /// Emit the callee-resolution chain for a bare-identifier CALL inside a
+    /// `with`: probe each with-object (innermost first); the first hit reads
+    /// the callee via the GetBindingValue protocol (`WithGet`: HasProperty +
+    /// Get) and records the with-object as `this` (WithBaseObject); the
+    /// fall-through resolves the static binding with `this` = undefined.
+    /// Returns `(callee_reg, this_reg)` — two freshly-allocated registers the
+    /// caller must keep live across argument evaluation.
+    fn emit_with_callee_chain(&mut self, name: &str, objs: &[Reg]) -> (Reg, Reg) {
+        let nidx = self.string_name(name);
+        let callee_reg = self.alloc_reg();
+        let this_reg = self.alloc_reg();
+        let mut chain_done = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.next_reg -= 1; // reclaim the flag temp
+            self.emit(Instr::WithGet {
+                dst: callee_reg,
+                obj,
+                name: nidx,
+                strict: self.cx.in_strict,
+            });
+            self.emit(Instr::Move { dst: this_reg, src: obj });
+            let jd = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            chain_done.push(jd);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        // Fallback: the static binding, this = undefined.
+        let b = self.resolve(name);
+        let r = self.load_binding(&b, callee_reg);
+        if r != callee_reg {
+            self.emit(Instr::Move { dst: callee_reg, src: r });
+        }
+        self.emit(Instr::LoadUndefined { dst: this_reg });
+        let end = self.here();
+        for j in chain_done {
+            self.patch_jump(j, end);
+        }
+        (callee_reg, this_reg)
+    }
+
     /// Emit a `with`-aware read of `name` into `dst`: probe each with-object
     /// (innermost first) and read from the first that has the binding; otherwise
     /// fall back to the static (lexical/global) binding. Returns `dst`.
@@ -7525,7 +8072,16 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::Move { dst: *r, src });
                 }
             }
-            Binding::LocalCell(cell) => self.emit(Instr::CellSet { cell: *cell, src }),
+            Binding::LocalCell(cell) => {
+                // A block-entry pre-created lexical cell whose declaration has
+                // not yet been compiled: the assignment may run during its TDZ,
+                // so the checked store rejects an UNINITIALIZED cell.
+                if self.block_tdz_cells.contains(cell) {
+                    self.emit(Instr::CellSetChecked { cell: *cell, src });
+                } else {
+                    self.emit(Instr::CellSet { cell: *cell, src });
+                }
+            }
             Binding::Upvalue(idx) => {
                 // A sloppy contains-direct-eval function: SetMutableBinding
                 // resolves at store time — an eval-introduced shadow wins.
@@ -7574,20 +8130,238 @@ impl<'a> FnCompiler<'a> {
 
     /// Whether the call expression itself is tail-callable: a plain
     /// (non-optional, spread-free) call whose callee carries no receiver —
-    /// an identifier (except direct `eval`) or another plain call.
-    fn tail_callable(&self, c: &ox::CallExpression) -> bool {
+    /// an identifier or another plain call. An identifier `eval` qualifies
+    /// in all forms EXCEPT a with-shadowable site (the with-chain call binds
+    /// `this` to the with-object — not frame-reusable): a compile-time
+    /// direct eval gets the `DirectEval { tail }` form (frame reuse fires
+    /// only when `eval` is REBOUND at runtime), and a user-shadowed `eval`
+    /// is an ordinary call.
+    fn tail_callable(&mut self, c: &ox::CallExpression) -> bool {
         if c.optional || c.arguments.iter().any(|a| a.as_expression().is_none()) {
             return false;
         }
         fn callee_ok(e: &ox::Expression) -> bool {
             match e {
-                ox::Expression::Identifier(id) => id.name != "eval",
+                // An identifier — including `eval` (direct eval gets the
+                // DirectEval{tail} form; a shadowed/with-resolved `eval` is an
+                // ordinary call) and with-shadowable names (lowered through
+                // the with chain with a TailCallWithThis prefix).
+                ox::Expression::Identifier(_) => true,
                 ox::Expression::CallExpression(inner) => !inner.optional,
                 ox::Expression::ParenthesizedExpression(p) => callee_ok(&p.expression),
                 _ => false,
             }
         }
         callee_ok(&c.callee)
+    }
+
+    /// Whether `e` contains a tail-callable call in a spec TAIL POSITION:
+    /// the expression itself, a conditional's arms, a logical operator's
+    /// right operand, a sequence's final element, a parenthesized inner, or
+    /// a (plain-tag) tagged template. Pure predicate — mirrors exactly what
+    /// `emit_tail_return` lowers, so the return statement either emits the
+    /// whole tail-aware form or falls back to the ordinary path untouched.
+    fn expr_has_tail_call(&mut self, e: &ox::Expression) -> bool {
+        use ox::Expression as E;
+        match e {
+            E::ParenthesizedExpression(p) => self.expr_has_tail_call(&p.expression),
+            E::ConditionalExpression(c) => {
+                self.expr_has_tail_call(&c.consequent) || self.expr_has_tail_call(&c.alternate)
+            }
+            E::LogicalExpression(l) => self.expr_has_tail_call(&l.right),
+            E::SequenceExpression(s) => match s.expressions.last() {
+                Some(last) => self.expr_has_tail_call(last),
+                None => false,
+            },
+            E::CallExpression(c) => self.tail_callable(c),
+            E::TaggedTemplateExpression(tt) => self.tagged_tail_callable(tt),
+            _ => false,
+        }
+    }
+
+    /// A tagged template is tail-callable when its tag is a plain callee
+    /// (identifier / call / parenthesized of those — no member tag, whose
+    /// call binds `this` to the object; `String.raw` keeps its fast path).
+    fn tagged_tail_callable(&mut self, tt: &ox::TaggedTemplateExpression) -> bool {
+        match &tt.tag {
+            ox::Expression::Identifier(id) => {
+                self.with_objs_for(id.name.as_str()).is_empty()
+                    && !self.inherited_with_shadows.contains_key(id.name.as_str())
+            }
+            ox::Expression::CallExpression(inner) => !inner.optional,
+            ox::Expression::ParenthesizedExpression(p) => matches!(
+                &p.expression,
+                ox::Expression::Identifier(_) | ox::Expression::CallExpression(_)
+            ),
+            _ => false,
+        }
+    }
+
+    /// Lower `return e;` where `e` HAS a tail call in tail position (see
+    /// `expr_has_tail_call`): every control path ends in a `Return`, with the
+    /// `TailCall` frame-reuse prefix emitted in front of each tail-position
+    /// call. Only entered from a `tail_call_position()` context (strict, no
+    /// handlers / iterator closes / using scopes / generator / async).
+    fn emit_tail_return(&mut self, e: &ox::Expression) -> R<()> {
+        use ox::Expression as E;
+        match e {
+            E::ParenthesizedExpression(p) => self.emit_tail_return(&p.expression),
+            E::ConditionalExpression(c) => {
+                let save = self.next_reg;
+                let cond = self.expr(&c.test)?;
+                let jf = self.here();
+                self.emit(Instr::JumpIfFalse { cond, target: 0 });
+                self.next_reg = save;
+                self.emit_tail_return(&c.consequent)?; // every path returns
+                let alt = self.here();
+                self.patch_jump(jf, alt);
+                self.emit_tail_return(&c.alternate)
+            }
+            E::LogicalExpression(l) => {
+                use ox::LogicalOperator as Op;
+                let save = self.next_reg;
+                let v = self.alloc_reg();
+                let lv = self.expr_into(&l.left, v)?;
+                if lv != v {
+                    self.emit(Instr::Move { dst: v, src: lv });
+                }
+                // Short-circuit → return the LEFT value; else the right
+                // operand is in tail position.
+                let jshort = match l.operator {
+                    Op::And => {
+                        let j = self.here();
+                        self.emit(Instr::JumpIfFalse { cond: v, target: 0 });
+                        j
+                    }
+                    Op::Or => {
+                        let j = self.here();
+                        self.emit(Instr::JumpIfTrue { cond: v, target: 0 });
+                        j
+                    }
+                    Op::Coalesce => {
+                        let tsave = self.next_reg;
+                        let undef = self.alloc_reg();
+                        let isnull = self.alloc_reg();
+                        self.emit_is_nullish(v, isnull, undef);
+                        let j = self.here();
+                        // non-nullish → return v
+                        self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 });
+                        self.next_reg = tsave;
+                        // nullish: the right operand is the tail position
+                        self.emit_tail_return(&l.right)?;
+                        let keep = self.here();
+                        self.patch_jump(j, keep);
+                        self.emit(Instr::Return { src: v });
+                        self.next_reg = save;
+                        return Ok(());
+                    }
+                };
+                self.emit_tail_return(&l.right)?;
+                let short = self.here();
+                self.patch_jump(jshort, short);
+                self.emit(Instr::Return { src: v });
+                self.next_reg = save;
+                Ok(())
+            }
+            E::SequenceExpression(s) if !s.expressions.is_empty() => {
+                let n = s.expressions.len();
+                for ex in &s.expressions[..n - 1] {
+                    let save = self.next_reg;
+                    self.expr(ex)?;
+                    self.next_reg = save;
+                }
+                self.emit_tail_return(&s.expressions[n - 1])
+            }
+            E::CallExpression(c) if self.tail_callable(c) => {
+                // A with-shadowable identifier callee: the with-chain resolves
+                // the callee + `this` (= the with-object), then the frame is
+                // reused via TailCallWithThis (tco-non-eval-with).
+                if let E::Identifier(id) = &c.callee {
+                    let with_objs = self.with_obj_regs(id.name.as_str());
+                    if !with_objs.is_empty() {
+                        let save = self.next_reg;
+                        let (callee_reg, this_reg) =
+                            self.emit_with_callee_chain(id.name.as_str(), &with_objs);
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                        self.emit(Instr::TailCallWithThis {
+                            callee: callee_reg,
+                            this_v: this_reg,
+                            arg_base,
+                            argc,
+                        });
+                        let dst = self.alloc_reg();
+                        self.emit(Instr::CallWithThis {
+                            dst,
+                            callee: callee_reg,
+                            this_v: this_reg,
+                            arg_base,
+                            argc,
+                        });
+                        self.emit(Instr::Return { src: dst });
+                        self.next_reg = save;
+                        return Ok(());
+                    }
+                }
+                // A compile-time DIRECT eval in tail position: the DirectEval
+                // op itself frame-reuses only when `eval` is REBOUND at
+                // runtime (an ordinary call); the genuine-eval path is not a
+                // tail call per spec.
+                if let E::Identifier(id) = &c.callee {
+                    if id.name == "eval"
+                        && matches!(self.resolve("eval"), Binding::Global(_))
+                        && self.with_objs_for("eval").is_empty()
+                    {
+                        let save = self.next_reg;
+                        let dst = self.alloc_reg();
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                        let arg = if argc == 0 {
+                            let r = self.temp();
+                            self.emit(Instr::LoadUndefined { dst: r });
+                            r
+                        } else {
+                            arg_base
+                        };
+                        self.emit_direct_eval(arg, dst, true);
+                        self.emit(Instr::Return { src: dst });
+                        self.next_reg = save;
+                        return Ok(());
+                    }
+                }
+                let save = self.next_reg;
+                let ct = self.alloc_reg();
+                let cv = self.expr_into(&c.callee, ct)?;
+                if cv != ct {
+                    self.emit(Instr::Move { dst: ct, src: cv });
+                }
+                let exprs: Vec<&ox::Expression> =
+                    c.arguments.iter().filter_map(|a| a.as_expression()).collect();
+                let arg_base = self.eval_contiguous(&exprs)?;
+                let argc = exprs.len() as u16;
+                self.emit(Instr::TailCall { callee: ct, arg_base, argc });
+                let dst = self.alloc_reg();
+                self.emit(Instr::Call { dst, callee: ct, arg_base, argc });
+                self.emit(Instr::Return { src: dst });
+                self.next_reg = save;
+                Ok(())
+            }
+            E::TaggedTemplateExpression(tt) if self.tagged_tail_callable(tt) => {
+                let save = self.next_reg;
+                let dst = self.alloc_reg();
+                self.tagged_template_tail(tt, dst)?;
+                self.emit(Instr::Return { src: dst });
+                self.next_reg = save;
+                Ok(())
+            }
+            // A tail position that bottomed out in a non-tail-callable
+            // expression: ordinary evaluate + return.
+            other => {
+                let save = self.next_reg;
+                let v = self.expr(other)?;
+                self.emit(Instr::Return { src: v });
+                self.next_reg = save;
+                Ok(())
+            }
+        }
     }
 
     /// Assignment-reference SNAPSHOT for a sloppy direct-eval zone: PutValue
@@ -7970,7 +8744,7 @@ impl<'a> FnCompiler<'a> {
             let jdone = self.here();
             self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
             self.emit(Instr::LoadBool { dst: done, val: true });
-            self.emit(Instr::IterNext { value_dst: val, done_dst: dflag, iter: iter_reg, idx: idx_reg });
+            self.emit(Instr::IterNext { value_dst: val, done_dst: dflag, iter: iter_reg, idx: idx_reg, next: Reg::MAX });
             let jexh = self.here();
             self.emit(Instr::JumpIfTrue { cond: dflag, target: 0 });
             self.emit(Instr::LoadBool { dst: done, val: false });
@@ -8001,7 +8775,7 @@ impl<'a> FnCompiler<'a> {
             let jrest_done = self.here();
             self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
             self.emit(Instr::LoadBool { dst: done, val: true });
-            self.emit(Instr::IterNext { value_dst: v, done_dst: dflag, iter: iter_reg, idx: idx_reg });
+            self.emit(Instr::IterNext { value_dst: v, done_dst: dflag, iter: iter_reg, idx: idx_reg, next: Reg::MAX });
             let jout = self.here();
             self.emit(Instr::JumpIfTrue { cond: dflag, target: 0 });
             self.emit(Instr::LoadBool { dst: done, val: false });
@@ -8717,7 +9491,9 @@ impl<'a> FnCompiler<'a> {
         let nidx = self.string_name(name);
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond: found, target: 0 }); // → static read
-        self.emit(Instr::GetProp { dst, obj: tgt, name: nidx });
+        // GetBindingValue: HasProperty AGAIN, then Get (both observable
+        // through Proxy traps) — not a bare [[Get]].
+        self.emit(Instr::WithGet { dst, obj: tgt, name: nidx, strict: self.cx.in_strict });
         let je = self.here();
         self.emit(Instr::Jump { target: 0 });
         let stat = self.here();
@@ -9196,7 +9972,7 @@ impl<'a> FnCompiler<'a> {
                     let zero = self.alloc_reg();
                     self.emit(Instr::LoadInt { dst: zero, val: 0 });
                     self.emit(Instr::GetIndex { dst: arg, obj: args_arr, key: zero });
-                    self.emit_direct_eval(arg, dst);
+                    self.emit_direct_eval(arg, dst, false);
                     return Ok(dst);
                 }
             }
@@ -9297,6 +10073,36 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // Inside a `with`, a bare-identifier call resolves through the with
+        // chain FIRST — before any builtin special-case lowering, so
+        // `with (proxy) { Object() }` fires the `has` trap exactly like a
+        // user-function callee. The probe (HasBinding) and the read
+        // (GetBindingValue: HasProperty + Get) are both observable; a
+        // with-resolved callee is invoked with `this` = the with-object
+        // (WithBaseObject). Names no with-object carries fall back to the
+        // static binding with `this` = undefined (the dedicated builtin
+        // lowerings stay bypassed — the loaded global builtin VALUE is
+        // called instead, same semantics).
+        if let ox::Expression::Identifier(id) = &c.callee {
+            let with_objs = self.with_obj_regs(id.name.as_str());
+            if !with_objs.is_empty() {
+                let save = self.next_reg;
+                let (callee_reg, this_reg) =
+                    self.emit_with_callee_chain(id.name.as_str(), &with_objs);
+                // Arguments evaluate AFTER the callee reference resolved.
+                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                self.emit(Instr::CallWithThis {
+                    dst,
+                    callee: callee_reg,
+                    this_v: this_reg,
+                    arg_base,
+                    argc,
+                });
+                self.next_reg = save.max(dst + 1);
+                return Ok(dst);
+            }
+        }
+
         // Bare `Error("msg")` call (no `new`) → same Error object.
         if let ox::Expression::Identifier(id) = &c.callee {
             if let Some(kind) = error_ctor(&id.name) {
@@ -9324,7 +10130,7 @@ impl<'a> FnCompiler<'a> {
                 } else {
                     arg_base
                 };
-                self.emit_direct_eval(arg, dst);
+                self.emit_direct_eval(arg, dst, false);
                 return Ok(dst);
             }
         }
@@ -9591,6 +10397,20 @@ impl<'a> FnCompiler<'a> {
             let obj = self.expr(&m.object)?;
             if m.optional {
                 self.emit_optional_check(obj); // `obj?.method()` — short-circuit if obj nullish
+            } else if matches!(
+                &m.object,
+                ox::Expression::StaticMemberExpression(_)
+                    | ox::Expression::ComputedMemberExpression(_)
+                    | ox::Expression::PrivateFieldExpression(_)
+            ) {
+                // `o.bar.gar(args)`: the callee GET (`.gar` of a possibly-
+                // nullish `o.bar`) throws BEFORE the arguments evaluate (spec
+                // EvaluateCall: func = GetValue(ref) precedes ArgumentList-
+                // Evaluation). The fused CallMethod defers the get past the
+                // args, so reject a nullish receiver here. Kept off simple
+                // identifier/this receivers (hot path; their get cannot throw
+                // earlier than the fused op observes).
+                self.emit(Instr::CheckCoercible { src: obj });
             }
             let name = self.string_name(m.property.name.as_str());
             let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
@@ -9650,42 +10470,9 @@ impl<'a> FnCompiler<'a> {
             return Ok(dst);
         }
 
-        // Inside a `with`, a bare-identifier call whose callee is found on a
-        // with-object is invoked with `this` = that with-object (innermost first);
-        // otherwise it falls back to an ordinary call (this = undefined). Placed
-        // after the bare-id special-cases (print/Symbol/eval/RegExp/error-ctor) so
-        // their dedicated lowerings remain the fallback for names not on the object.
-        if let ox::Expression::Identifier(id) = &c.callee {
-            let with_objs = self.with_obj_regs(id.name.as_str());
-            if !with_objs.is_empty() {
-                let nidx = self.string_name(id.name.as_str());
-                // Args evaluated ONCE into a contiguous block, shared by the
-                // method-call (this = obj) and the fallback Call.
-                let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
-                let flag = self.temp(); // probe result + fallback callee scratch
-                let mut end_jumps = Vec::new();
-                for &obj in &with_objs {
-                    self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
-                    let jf = self.here();
-                    self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
-                    self.emit(Instr::CallMethod { dst, obj, name: nidx, arg_base, argc });
-                    let je = self.here();
-                    self.emit(Instr::Jump { target: 0 });
-                    end_jumps.push(je);
-                    let nxt = self.here();
-                    self.patch_jump(jf, nxt);
-                }
-                // Fallback: ordinary call with `this` = undefined.
-                let b = self.resolve(id.name.as_str());
-                let callee = self.load_binding(&b, flag);
-                self.emit(Instr::Call { dst, callee, arg_base, argc });
-                let end = self.here();
-                for je in end_jumps {
-                    self.patch_jump(je, end);
-                }
-                return Ok(dst);
-            }
-        }
+        // (Bare-identifier calls inside a `with` were already routed through the
+        // with chain near the top of this function — before the builtin
+        // special-cases — so nothing with-related remains here.)
 
         // General call: evaluate callee, then contiguous args.
         let callee = self.expr(&c.callee)?;
@@ -9706,13 +10493,15 @@ impl<'a> FnCompiler<'a> {
     /// temps to allocate ABOVE the block; we then reclaim them after each arg.
     /// Emit the `DirectEval` op for a direct `eval(<arg>)` call site:
     /// builds the visible-caller-bindings site map and the instruction.
-    fn emit_direct_eval(&mut self, arg: Reg, dst: Reg) {
+    /// `tail`: the site is a proper-tail-call return position, so a REBOUND
+    /// `eval` (ordinary call at runtime) reuses the frame.
+    fn emit_direct_eval(&mut self, arg: Reg, dst: Reg, tail: bool) {
                 // The visible caller bindings (boxed cells, innermost shadowing
         // first) — the eval program closes over them. An EVAL ROOT also
         // maps its own cell locals AND its seeded caller upvalues (kind
         // 1), so nested evals keep reaching the original caller scope.
         let eval_root = self.is_script && self.cx.eval_locals;
-        let site = if self.box_all_locals || eval_root {
+        let site = if self.box_all_locals || eval_root || self.script_eval_lexicals {
             let mut map: Vec<(String, u8, u16)> = Vec::new();
             let mut seen = std::collections::HashSet::new();
             for scope in self.scopes.iter().rev() {
@@ -9785,6 +10574,7 @@ impl<'a> FnCompiler<'a> {
             // caller-env lands).
             var_env_is_global: self.is_script,
             site,
+            tail,
         });
     }
 
@@ -10129,6 +10919,35 @@ fn collect_b33_block_fns(
         }
         S::LabeledStatement(l) => collect_b33_block_fns(&l.body, nested, blockers, out),
         _ => {}
+    }
+}
+
+/// Whether a statement (transitively, NOT descending into nested function
+/// bodies) contains a `with` statement — gates the pre-declare-all-vars pass.
+fn stmt_contains_with(s: &ox::Statement) -> bool {
+    use ox::Statement as S;
+    match s {
+        S::WithStatement(_) => true,
+        S::BlockStatement(b) => b.body.iter().any(stmt_contains_with),
+        S::IfStatement(i) => {
+            stmt_contains_with(&i.consequent)
+                || i.alternate.as_ref().is_some_and(stmt_contains_with)
+        }
+        S::WhileStatement(w) => stmt_contains_with(&w.body),
+        S::DoWhileStatement(d) => stmt_contains_with(&d.body),
+        S::ForStatement(f) => stmt_contains_with(&f.body),
+        S::ForOfStatement(f) => stmt_contains_with(&f.body),
+        S::ForInStatement(f) => stmt_contains_with(&f.body),
+        S::TryStatement(t) => {
+            t.block.body.iter().any(stmt_contains_with)
+                || t.handler.as_ref().is_some_and(|h| h.body.body.iter().any(stmt_contains_with))
+                || t.finalizer.as_ref().is_some_and(|f| f.body.iter().any(stmt_contains_with))
+        }
+        S::SwitchStatement(sw) => {
+            sw.cases.iter().any(|c| c.consequent.iter().any(stmt_contains_with))
+        }
+        S::LabeledStatement(l) => stmt_contains_with(&l.body),
+        _ => false,
     }
 }
 

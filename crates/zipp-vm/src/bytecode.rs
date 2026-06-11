@@ -246,7 +246,17 @@ pub enum Instr {
     /// the cursor in `idx`, or a generator via `.next()` ignoring `idx`). Writes
     /// the next element to `value_dst` and a bool to `done_dst`. Throws if `iter`
     /// is not iterable.
-    IterNext { value_dst: Reg, done_dst: Reg, iter: Reg, idx: Reg },
+    /// `next`: register holding the PROLOGUE-cached `next` method (from
+    /// `IterPrime`) — a mid-loop redefinition of `iterator.next` is not
+    /// observed (spec: the iterator record snapshots it). `Reg::MAX` = no
+    /// cache (destructuring sites): a user-object iterator's `next` is
+    /// re-fetched per step there.
+    IterNext { value_dst: Reg, done_dst: Reg, iter: Reg, idx: Reg, next: Reg },
+    /// Cache a USER-OBJECT iterator's `next` method into `dst` for the loop's
+    /// `IterNext` steps (one observable Get, per GetIterator). Built-in fast
+    /// iterables (array/string/Map/Set/generator) skip the get — `dst` is
+    /// undefined and the cursor fast path is unaffected.
+    IterPrime { dst: Reg, iter: Reg },
     /// IteratorClose: invoke `iter`'s `return()` (if present) — emitted on the
     /// abrupt `break` exit of a `for-of` so a not-yet-exhausted iterator is closed.
     IterClose { iter: Reg },
@@ -476,6 +486,11 @@ pub enum Instr {
     CellGet { dst: Reg, cell: Reg },
     /// `*<cell in reg> = src` — write a captured local's cell.
     CellSet { cell: Reg, src: Reg },
+    /// Like `CellSet` but the target is a lexical (`let`/`const`) cell that may
+    /// still be in its TDZ: writing while the cell holds UNINITIALIZED throws a
+    /// ReferenceError (an ASSIGNMENT before the declaration runs). The
+    /// declaration's own initializing store uses plain `CellSet`.
+    CellSetChecked { cell: Reg, src: Reg },
     /// `dst = *<upvalue[idx]>` — read one of this closure's captured cells.
     UpvalGet { dst: Reg, idx: u16 },
     /// `*<upvalue[idx]> = src` — write one of this closure's captured cells.
@@ -612,9 +627,19 @@ pub enum Instr {
     /// through; any other callee falls through to the ordinary Call+Return
     /// the compiler emits right after.
     TailCall { callee: Reg, arg_base: Reg, argc: u16 },
+    /// `TailCall` with an explicit `this` (register `this_v`): the tail-position
+    /// form of a `with`-resolved identifier call (this = the with-object).
+    /// Falls through to the `CallWithThis` emitted right after for non-plain
+    /// callees.
+    TailCallWithThis { callee: Reg, this_v: Reg, arg_base: Reg, argc: u16 },
     /// Call `callee` with `argc` arguments staged in registers
     /// `[arg_base, arg_base+argc)`. Result lands in `dst`.
     Call { dst: Reg, callee: Reg, arg_base: Reg, argc: u16 },
+    /// Like `Call` but with an explicit `this` value (register `this_v`):
+    /// a `with`-resolved identifier call binds `this` to the with-object
+    /// (spec WithBaseObject) — the callee value was already fetched by the
+    /// `WithGet` protocol, so no further property read happens here.
+    CallWithThis { dst: Reg, callee: Reg, this_v: Reg, arg_base: Reg, argc: u16 },
 
     /// `dst = eval(arg)` — a DIRECT eval call (the callee is the unshadowed global
     /// `eval` identifier) emitted only from STRICT-mode code, so the evaluated
@@ -629,7 +654,11 @@ pub enum Instr {
     /// lazily allocated by the VM (ordinary, extensible, null prototype).
     ImportMeta { dst: Reg },
 
-    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool, site: u16 },
+    /// `tail`: the call sits in a proper-tail-call RETURN position — when the
+    /// runtime identity check finds `eval` REBOUND (an ordinary call of that
+    /// value, not a direct eval), the frame is reused like `TailCall`
+    /// (tco-non-eval-global: `eval = f; return eval(n-1)` must be a PTC).
+    DirectEval { dst: Reg, arg: Reg, new_target_ok: bool, this_reg: Reg, home_class: u32, super_static: bool, ban_arguments: bool, strict_caller: bool, super_home_obj: bool, var_env_is_global: bool, site: u16, tail: bool },
 
     /// CreateDataPropertyOrThrow for a class FIELD initializer: an own
     /// {writable, enumerable, configurable} data property on the receiver —
