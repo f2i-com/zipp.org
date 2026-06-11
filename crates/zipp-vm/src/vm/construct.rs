@@ -205,6 +205,126 @@ impl<'p> Vm<'p> {
         Ok(completion)
     }
 
+    /// Allocate a promise rejected with a fresh TypeError — the async-method
+    /// "throw becomes rejection" shape (IfAbruptRejectPromise).
+    pub(crate) fn reject_with_type_error(&mut self, msg: &str) -> Value {
+        let m = self.alloc_str(msg.to_string());
+        let ev = self.make_error(1, Some(m));
+        let p = self.alloc_promise();
+        self.reject(p, ev);
+        Value::heap(p)
+    }
+
+    /// Drive an in-flight `disposeAsync` (state keyed by capability promise
+    /// `cap`): run disposers LIFO, AWAITING each result via DISPOSE_ASYNC_STEP
+    /// reactions; rejections/throws fold into the SuppressedError chain. On
+    /// exhaustion the capability settles — rejected with the chain (a single
+    /// error as-is), or resolved undefined after an extra Await(undefined)
+    /// tick when only nullish resources were recorded.
+    pub(crate) fn dispose_async_step(&mut self, cap: u32, rejection: Option<Value>) {
+        if let Some(reason) = rejection {
+            if let Some(st) = self.dispose_async_state.get_mut(&cap) {
+                let prior = st.error_chain.take();
+                let folded = match prior {
+                    Some(p) => self
+                        .build_suppressed_error(&[reason, p, Value::UNDEFINED])
+                        .unwrap_or(reason),
+                    None => reason,
+                };
+                if let Some(st) = self.dispose_async_state.get_mut(&cap) {
+                    st.error_chain = Some(folded);
+                }
+            }
+        }
+        self.dispose_async_drive(cap);
+    }
+
+    pub(crate) fn dispose_async_drive(&mut self, cap: u32) {
+        // Locals (the popped disposer, error values) cross allocating calls —
+        // hold GC for the synchronous stretch (dropped at each suspension).
+        let _gc = self.gc_lock_guard();
+        loop {
+            let Some(st) = self.dispose_async_state.get_mut(&cap) else { return };
+            match st.remaining.pop() {
+                None => {
+                    let st = self.dispose_async_state.remove(&cap).unwrap();
+                    match st.error_chain {
+                        Some(e) => self.reject(cap, e),
+                        None if st.needs_await && !st.has_awaited => {
+                            // Await(undefined): one reaction-job hop, then
+                            // resolve. then_internal(into: cap) chains it.
+                            let p = self.alloc_promise();
+                            self.resolve(p, Value::UNDEFINED);
+                            self.then_internal(
+                                p,
+                                Value::UNDEFINED,
+                                Value::UNDEFINED,
+                                Some(cap),
+                            );
+                        }
+                        None => self.resolve(cap, Value::UNDEFINED),
+                    }
+                    return;
+                }
+                Some(d) if d == Value::NULL => {
+                    st.needs_await = true;
+                    continue;
+                }
+                Some(d) => match self.call_value(d, Value::UNDEFINED, &[]) {
+                    Err(_) => {
+                        // Abrupt Call: NO Await (Dispose step 3a is skipped on
+                        // throw) — fold into the chain and continue the loop.
+                        let ev = self
+                            .pending_throw
+                            .take()
+                            .unwrap_or_else(|| self.make_error(1, None));
+                        let prior = self
+                            .dispose_async_state
+                            .get_mut(&cap)
+                            .and_then(|st| st.error_chain.take());
+                        let folded = match prior {
+                            Some(p) => self
+                                .build_suppressed_error(&[ev, p, Value::UNDEFINED])
+                                .unwrap_or(ev),
+                            None => ev,
+                        };
+                        if let Some(st) = self.dispose_async_state.get_mut(&cap) {
+                            st.error_chain = Some(folded);
+                        }
+                        continue;
+                    }
+                    Ok(r) => {
+                        if let Some(st) = self.dispose_async_state.get_mut(&cap) {
+                            st.has_awaited = true;
+                        }
+                        // Await(result): wrap in a promise (thenables adopt),
+                        // continue from its settlement.
+                        let p = self.alloc_promise();
+                        self.resolve(p, r);
+                        let step_t = Value::heap(
+                            self.heap.alloc(HeapObj::Native(native::DISPOSE_ASYNC_STEP)),
+                        );
+                        let on_ok = Value::heap(self.heap.alloc(HeapObj::Bound {
+                            target: step_t,
+                            this: Value::num(cap as f64),
+                            args: Vec::new(),
+                        }));
+                        let rej_t = Value::heap(self.heap.alloc(HeapObj::Native(
+                            native::DISPOSE_ASYNC_STEP_REJECT,
+                        )));
+                        let on_rej = Value::heap(self.heap.alloc(HeapObj::Bound {
+                            target: rej_t,
+                            this: Value::num(cap as f64),
+                            args: Vec::new(),
+                        }));
+                        self.then_internal(p, on_ok, on_rej, None);
+                        return;
+                    }
+                },
+            }
+        }
+    }
+
     /// Allocate a fresh `DisposableStack` instance (a plain object linked to
     /// %DisposableStack.prototype%, with an empty, not-yet-disposed disposer stack).
     pub(crate) fn alloc_disposable_stack(&mut self, is_async: bool) -> u32 {
@@ -425,11 +545,21 @@ impl<'p> Vm<'p> {
             _ => (op, None),
         };
         if !(this.is_heap() && self.dispose_stacks.contains_key(&this.heap_index())) {
+            // disposeAsync REJECTS its returned promise on a bad receiver
+            // (spec step 2 runs inside the async method); others throw.
+            if op == DISPOSABLE_DISPOSE_ASYNC {
+                return Ok(self.reject_with_type_error("receiver is not an AsyncDisposableStack"));
+            }
             return Err(Thrown("TypeError: receiver is not a DisposableStack".into()));
         }
         let ti = this.heap_index();
         if let Some(want) = want_async {
             if self.async_stacks.contains(&ti) != want {
+                if op == DISPOSABLE_DISPOSE_ASYNC {
+                    return Ok(
+                        self.reject_with_type_error("receiver is not an AsyncDisposableStack")
+                    );
+                }
                 return Err(Thrown(
                     "TypeError: receiver is the wrong kind of disposable stack".into(),
                 ));
@@ -446,6 +576,14 @@ impl<'p> Vm<'p> {
             DISPOSABLE_DISPOSED_GET => Ok(Value::bool(disposed)),
             DISPOSABLE_USE => {
                 if a0.is_nullish() {
+                    // An ASYNC stack still records the nullish resource: its
+                    // disposal contributes one Await(undefined) tick (the
+                    // NULL marker calls nothing in dispose_async_drive).
+                    if self.async_stacks.contains(&ti) {
+                        if let Some((d, _)) = self.dispose_stacks.get_mut(&ti) {
+                            d.push(Value::NULL);
+                        }
+                    }
                     return Ok(a0);
                 }
                 // Async stacks prefer @@asyncDispose, falling back to @@dispose.
@@ -506,23 +644,22 @@ impl<'p> Vm<'p> {
                     }
                     _ => return Ok(Value::UNDEFINED),
                 };
-                // Run disposers in LIFO order. Spec aggregates thrown errors into a
-                // SuppressedError; v1 runs them all and re-throws the last one.
-                let mut pending: Option<Thrown> = None;
-                for disposer in disposers.into_iter().rev() {
-                    if let Err(e) = self.call_value(disposer, Value::UNDEFINED, &[]) {
-                        pending = Some(e);
+                // DisposeResources: LIFO, each later error wraps the pending
+                // completion as SuppressedError{error: new, suppressed: prior}.
+                match self.dispose_resource_list(disposers, None)? {
+                    Some(v) => {
+                        let msg = self.throw_message(v);
+                        self.pending_throw = Some(v);
+                        Err(Thrown(msg))
                     }
-                }
-                match pending {
-                    Some(e) => Err(e),
                     None => Ok(Value::UNDEFINED),
                 }
             }
             DISPOSABLE_DISPOSE_ASYNC => {
-                // Idempotent; returns a Promise. v1 runs the disposers eagerly
-                // (LIFO) then settles the promise — true per-disposer awaiting is a
-                // follow-on. Errors reject the returned promise.
+                // Idempotent; returns a Promise. Each disposer's result is
+                // AWAITED before the next runs (spec Dispose step 3a), so the
+                // loop is a continuation-driven state machine keyed by the
+                // capability promise (see dispose_async_drive).
                 let already = self.dispose_stacks.get(&ti).map(|(_, d)| *d).unwrap_or(true);
                 let disposers = if already {
                     Vec::new()
@@ -532,21 +669,18 @@ impl<'p> Vm<'p> {
                 } else {
                     Vec::new()
                 };
-                let mut pending: Option<Thrown> = None;
-                for disposer in disposers.into_iter().rev() {
-                    if let Err(e) = self.call_value(disposer, Value::UNDEFINED, &[]) {
-                        pending = Some(e);
-                    }
-                }
-                let p = self.alloc_promise();
-                match pending {
-                    Some(e) => {
-                        let ev = self.alloc_error_from_message(&e.0);
-                        self.reject(p, ev);
-                    }
-                    None => self.resolve(p, Value::UNDEFINED),
-                }
-                Ok(Value::heap(p))
+                let cap = self.alloc_promise();
+                self.dispose_async_state.insert(
+                    cap,
+                    DisposeAsyncState {
+                        remaining: disposers,
+                        error_chain: None,
+                        has_awaited: false,
+                        needs_await: false,
+                    },
+                );
+                self.dispose_async_drive(cap);
+                Ok(Value::heap(cap))
             }
             DISPOSABLE_MOVE => {
                 let is_async = self.async_stacks.contains(&ti);
@@ -1455,6 +1589,21 @@ impl<'p> Vm<'p> {
             }
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
+            }
+            return Ok(true);
+        }
+        // `class D extends DisposableStack/AsyncDisposableStack`: the brand is
+        // purely the dispose_stacks (+ async_stacks) side-table entry — the
+        // instance stays a plain Object and the subclass prototype is already
+        // in place, so just install the empty, not-yet-disposed stack.
+        if cval.is_heap()
+            && cval.heap_index() != 0
+            && (cval.heap_index() == self.disposablestack_ctor
+                || cval.heap_index() == self.asyncdisposablestack_ctor)
+        {
+            self.dispose_stacks.insert(oidx, (Vec::new(), false));
+            if cval.heap_index() == self.asyncdisposablestack_ctor {
+                self.async_stacks.insert(oidx);
             }
             return Ok(true);
         }

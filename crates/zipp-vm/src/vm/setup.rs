@@ -2053,8 +2053,12 @@ impl<'p> Vm<'p> {
             self.proto_of.insert(p, Value::heap(obj_proto));
             let getter =
                 Value::heap(self.heap.alloc(HeapObj::Native(native::DISPOSABLE_DISPOSED_GET)));
-            let dispose_fn =
-                Value::heap(self.heap.alloc(HeapObj::Native(native::DISPOSABLE_DISPOSE)));
+            // [Symbol.dispose] is the SAME function object as `dispose`
+            // (spec: the property is an alias, not a fresh built-in).
+            let dispose_fn = match self.heap.get(p) {
+                HeapObj::Object(m) => m.get("dispose").unwrap_or(Value::UNDEFINED),
+                _ => Value::UNDEFINED,
+            };
             let acc = PropAttr {
                 writable: false,
                 enumerable: false,
@@ -2096,8 +2100,11 @@ impl<'p> Vm<'p> {
             self.proto_of.insert(p, Value::heap(obj_proto));
             let getter =
                 Value::heap(self.heap.alloc(HeapObj::Native(native::DISPOSABLE_DISPOSED_GET)));
-            let dispose_fn =
-                Value::heap(self.heap.alloc(HeapObj::Native(native::DISPOSABLE_DISPOSE_ASYNC)));
+            // [Symbol.asyncDispose] is the SAME function object as `disposeAsync`.
+            let dispose_fn = match self.heap.get(p) {
+                HeapObj::Object(m) => m.get("disposeAsync").unwrap_or(Value::UNDEFINED),
+                _ => Value::UNDEFINED,
+            };
             let acc = PropAttr {
                 writable: false,
                 enumerable: false,

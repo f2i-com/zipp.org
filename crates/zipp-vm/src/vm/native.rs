@@ -248,6 +248,12 @@ pub const UNWRAP_ITER_RESULT: u16 = 902;
 /// (null when the queue is empty) — and `$262.agent.sleep(ms)`.
 pub const AGENT_GET_REPORT: u16 = 903;
 pub const AGENT_SLEEP: u16 = 904;
+/// `AsyncDisposableStack.disposeAsync` continuations (`this` = the capability
+/// promise heap index as a number): STEP resumes the disposal loop after a
+/// disposer's Await settles; STEP_REJECT folds the rejection reason into the
+/// error chain first.
+pub const DISPOSE_ASYNC_STEP: u16 = 905;
+pub const DISPOSE_ASYNC_STEP_REJECT: u16 = 906;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

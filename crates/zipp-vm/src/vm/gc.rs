@@ -274,6 +274,18 @@ impl Vm<'_> {
                 root_val!(v);
             }
         }
+        // In-flight disposeAsync drivers: the capability promise (key), the
+        // not-yet-run disposers, and the accumulating error chain are live
+        // across reaction jobs.
+        for (&cap, st) in &self.dispose_async_state {
+            root_idx!(cap);
+            for &v in &st.remaining {
+                root_val!(v);
+            }
+            if let Some(e) = st.error_chain {
+                root_val!(e);
+            }
+        }
         for disposers in self.using_resources.values() {
             for &v in disposers {
                 root_val!(v);

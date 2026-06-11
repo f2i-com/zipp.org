@@ -124,6 +124,22 @@ pub(crate) struct ArgsMap {
     unmapped: u64,
 }
 
+/// One in-flight `AsyncDisposableStack.prototype.disposeAsync`: the spec's
+/// DisposeResources loop with an Await after EVERY disposer call. `remaining`
+/// is popped from the END (LIFO); a `Value::NULL` entry is the marker a
+/// nullish `use()` records (contributes the needs-await tick, calls nothing).
+pub(crate) struct DisposeAsyncState {
+    remaining: Vec<Value>,
+    /// The pending throw completion: a single error stays as-is; each later
+    /// error wraps it as SuppressedError{error: new, suppressed: prior}.
+    error_chain: Option<Value>,
+    /// Whether any real disposer ran (its result got a real Await).
+    has_awaited: bool,
+    /// Whether a nullish-resource marker was seen (spec still performs one
+    /// Await(undefined) before resolving when nothing else awaited).
+    needs_await: bool,
+}
+
 /// Which array higher-order method `array_each` is driving (callback args are
 /// `[element, index]` for all three; only the result handling differs).
 #[derive(Clone, Copy)]
@@ -700,6 +716,11 @@ pub struct Vm<'p> {
     asyncdisposablestack_ctor: u32,
     asyncdisposablestack_proto: u32,
     async_stacks: std::collections::HashSet<u32>,
+    /// In-flight `AsyncDisposableStack.prototype.disposeAsync` drivers, keyed
+    /// by the capability promise heap index. Each disposer's result is awaited
+    /// before the next runs (the DISPOSE_ASYNC_STEP reactions re-enter
+    /// `dispose_async_drive`). GC: keys + held Values are roots (gc.rs).
+    dispose_async_state: std::collections::HashMap<u32, DisposeAsyncState>,
     /// `SuppressedError` ctor + prototype (ES2026). Unlike the 8 standard errors,
     /// it carries `error` + `suppressed` own properties; its prototype chains to
     /// %Error.prototype% so `instanceof Error` holds.

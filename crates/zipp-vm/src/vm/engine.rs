@@ -207,6 +207,7 @@ impl<'p> Vm<'p> {
             disposablestack_ctor: 0,
             disposablestack_proto: 0,
             dispose_stacks: std::collections::HashMap::new(),
+            dispose_async_state: std::collections::HashMap::new(),
             asyncdisposablestack_ctor: 0,
             asyncdisposablestack_proto: 0,
             async_stacks: std::collections::HashSet::new(),

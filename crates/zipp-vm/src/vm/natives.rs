@@ -1309,6 +1309,17 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            DISPOSE_ASYNC_STEP => {
+                let cap = this.as_f64() as u32;
+                self.dispose_async_step(cap, None);
+                Value::UNDEFINED
+            }
+            DISPOSE_ASYNC_STEP_REJECT => {
+                let cap = this.as_f64() as u32;
+                let reason = args.first().copied().unwrap_or(Value::UNDEFINED);
+                self.dispose_async_step(cap, Some(reason));
+                Value::UNDEFINED
+            }
             AGENT_GET_REPORT => match self.agent_pop_report() {
                 Some(s) => self.alloc_str(s),
                 None => Value::NULL,
