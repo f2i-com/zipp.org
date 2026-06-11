@@ -125,6 +125,9 @@ impl Vm<'_> {
         for (v, _) in self.module_body_promise.values() {
             root_val!(*v);
         }
+        for &p in &self.module_body_results {
+            root_idx!(p);
+        }
         for v in self.typed_module_cache.values() {
             root_val!(*v);
         }
@@ -376,6 +379,7 @@ impl Vm<'_> {
         self.arguments_objs.retain(|&k, _| marks[k as usize]);
         self.fn_name_cells.retain(|&k| marks[k as usize]);
         self.gen_callee.retain(|&k, _| marks[k as usize]);
+        self.module_body_results.retain(|&k| marks[k as usize]);
         self.module_namespaces.retain(|&k, _| marks[k as usize]);
         self.closure_home.retain(|&k, _| marks[k as usize]);
         self.dispose_stacks.retain(|&k, _| marks[k as usize]);

@@ -122,6 +122,8 @@ impl<'p> Vm<'p> {
             module_loading: std::collections::HashSet::new(),
             pending_module_body: None,
             module_body_promise: std::collections::HashMap::new(),
+            pending_module_body_marker: false,
+            module_body_results: std::collections::HashSet::new(),
             link_pending_deps: Vec::new(),
             deferred_ns_cache: std::collections::HashMap::new(),
             deferred_ns_state: std::collections::HashMap::new(),
@@ -1863,6 +1865,7 @@ impl<'p> Vm<'p> {
                     };
                 }
                 self.executing_modules.insert(path.clone());
+                self.pending_module_body_marker = true;
                 let exec = self
                     .execute_eval_program(
                         base_func,

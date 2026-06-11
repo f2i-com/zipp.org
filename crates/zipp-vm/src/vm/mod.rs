@@ -517,6 +517,17 @@ pub struct Vm<'p> {
     /// cannot, being prototype-chain based); drives `Error.prototype.stack`'s
     /// getter. Pruned on GC sweep.
     error_data: std::collections::HashSet<u32>,
+    /// Set by the module loader just before executing a MODULE BODY: the
+    /// next alloc_async (the body's own activation) marks its result promise
+    /// in module_body_results. Consumed (mem::take) at alloc_async entry.
+    pending_module_body_marker: bool,
+    /// Result promises of MODULE BODY activations: they settle with
+    /// UNDEFINED, never the body's completion value — spec Evaluate()
+    /// resolves the capability with undefined, so a thenable completion
+    /// value (e.g. a promise-valued last statement) must NOT be adopted
+    /// (adoption makes a completed module look suspended and deadlocks its
+    /// importers). Entries are removed at settle; pruned on GC sweep.
+    module_body_results: std::collections::HashSet<u32>,
     /// Body promises of modules whose evaluation SUSPENDED (top-level await,
     /// or deps still pending): canonical path → the promise importers settle
     /// from. A LATER import of the same module (its namespace is already

@@ -644,6 +644,11 @@ impl<'p> Vm<'p> {
             regs[areg as usize] = arr;
         }
         let result = self.alloc_promise();
+        // A MODULE BODY activation: its result promise settles with undefined
+        // (spec Evaluate() capability), never the body's completion value.
+        if std::mem::take(&mut self.pending_module_body_marker) {
+            self.module_body_results.insert(result);
+        }
         let idx = self.heap.alloc(HeapObj::AsyncState(Box::new(AsyncStateData {
             func: func_id,
             closure,
@@ -1711,7 +1716,15 @@ impl<'p> Vm<'p> {
                     a.regs.clear();
                     a.handlers.clear();
                 }
-                self.resolve(result, ret);
+                if self.module_body_results.remove(&result) {
+                    // Module body: the capability resolves with undefined —
+                    // a thenable completion value must not be adopted
+                    // (adoption makes a completed module look suspended and
+                    // deadlocks its importers).
+                    self.resolve(result, Value::UNDEFINED);
+                } else {
+                    self.resolve(result, ret);
+                }
             }
             Err(_) => {
                 let e = match self.pending_throw.take() {
