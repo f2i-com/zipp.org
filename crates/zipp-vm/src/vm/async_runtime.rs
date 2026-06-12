@@ -118,8 +118,15 @@ impl<'p> Vm<'p> {
             // OrdinaryCreateFromConstructor: the instance's [[Prototype]] is
             // the callee's `prototype` object (a replaced g.prototype flows
             // through); the HeapObj::Generator fallback stays %GeneratorProto%.
+            // A REALM-BORN generator function with a NON-OBJECT `prototype`
+            // falls back to GetFunctionRealm's %GeneratorPrototype% image
+            // instead (the main realm keeps the dynamic fallback).
             if let Some(p) = self.prototype_of(gen_callee) {
                 self.proto_of.insert(g, p);
+            } else if !self.realm_global_objs.is_empty() {
+                if let Some(rp) = self.realm_proto_fallback(gen_callee, self.gen_proto) {
+                    self.proto_of.insert(g, Value::heap(rp));
+                }
             }
             if gen_callee != Value::UNDEFINED {
                 // Resumes re-bind this as Frame.callee (LoadCallee identity).
@@ -917,8 +924,14 @@ impl<'p> Vm<'p> {
         })));
         // OrdinaryCreateFromConstructor: honor the callee's `prototype`
         // object; the HeapObj::AsyncGenerator fallback stays %AsyncGenProto%.
+        // A REALM-BORN async generator function with a NON-OBJECT `prototype`
+        // falls back to GetFunctionRealm's %AsyncGeneratorPrototype% image.
         if let Some(p) = self.prototype_of(gen_callee) {
             self.proto_of.insert(ag, p);
+        } else if !self.realm_global_objs.is_empty() {
+            if let Some(rp) = self.realm_proto_fallback(gen_callee, self.asyncgen_proto) {
+                self.proto_of.insert(ag, Value::heap(rp));
+            }
         }
         if gen_callee != Value::UNDEFINED {
             // Resumes re-bind this as Frame.callee (LoadCallee identity).

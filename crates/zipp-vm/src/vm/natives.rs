@@ -322,6 +322,153 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // HIDDEN dynamic-function intrinsics: per-realm %GeneratorFunction% /
+        // %AsyncFunction% / %AsyncGeneratorFunction% facades, their `.prototype`
+        // images, and (for the generator kinds) the %GeneratorPrototype% /
+        // %AsyncGeneratorPrototype% instance-proto images. Not globals — reached
+        // via a realm function's `.constructor` — but GetPrototypeFromConstructor's
+        // realm fallback (newtarget_proto_override) and realm-born generator/async
+        // functions (callable_dynfn_proto, the lazy `.prototype` link) need
+        // per-realm identities. Placed AFTER the chain-mirroring block so the
+        // [[Prototype]] links set here are not overwritten: fn-proto image → the
+        // realm's %Function.prototype% image; %GeneratorPrototype% image → the
+        // realm's %Iterator.prototype% image; %AsyncGeneratorPrototype% image →
+        // the realm's %Object.prototype% image with %AsyncIteratorPrototype%'s
+        // own props flattened on (stage-1 single-level model).
+        {
+            let realm_obj_proto = self.realms[r as usize].get(&self.obj_proto).copied();
+            let realm_fn_proto = self.realms[r as usize].get(&self.fn_proto).copied();
+            let realm_iter_proto =
+                self.realms[r as usize].get(&self.iterator_proto_root).copied();
+            let async_iter_root = self
+                .proto_of
+                .get(&self.asyncgen_proto)
+                .and_then(|v| v.is_heap().then(|| v.heap_index()));
+            let kinds: [(&str, u32, u32, u32, Option<u32>, Option<u32>); 3] = [
+                (
+                    "GeneratorFunction",
+                    self.gen_fn_ctor,
+                    self.gen_fn_proto,
+                    self.gen_proto,
+                    realm_iter_proto.or(realm_obj_proto),
+                    None,
+                ),
+                ("AsyncFunction", self.async_fn_ctor, self.async_fn_proto, 0, None, None),
+                (
+                    "AsyncGeneratorFunction",
+                    self.asyncgen_fn_ctor,
+                    self.asyncgen_fn_proto,
+                    self.asyncgen_proto,
+                    realm_obj_proto,
+                    async_iter_root,
+                ),
+            ];
+            for (name, main_ctor, main_fn_proto, main_inst_proto, inst_chain, flatten) in kinds {
+                if main_ctor == 0 || main_fn_proto == 0 {
+                    continue;
+                }
+                // The `.prototype` image (%GeneratorFunction.prototype% etc.):
+                // main own props copied (fresh same-id natives / shared data),
+                // `constructor`/`prototype` re-pointed at the realm identities.
+                let fnp_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_fn_proto) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals.iter())
+                        .zip(mm.attrs.iter())
+                        .filter(|((k, _), _)| {
+                            k.as_str() != "constructor" && k.as_str() != "prototype"
+                        })
+                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(pm) = self.heap.get_mut(fnp_idx) {
+                        pm.define(&k, copy, a);
+                    }
+                }
+                if let Some(fp) = realm_fn_proto {
+                    self.proto_of.insert(fnp_idx, Value::heap(fp));
+                }
+                // The facade constructor (same shape as the visible facades).
+                let name_v = self.alloc_str(name.to_string());
+                let mut cmap = ObjMap::new();
+                cmap.is_ctor = true;
+                cmap.define("prototype", Value::heap(fnp_idx), proto_attr);
+                cmap.define("name", name_v, ne);
+                cmap.define("length", Value::int(1), ne);
+                let ctor_idx = self.heap.alloc(HeapObj::Object(cmap));
+                if let HeapObj::Object(pm) = self.heap.get_mut(fnp_idx) {
+                    pm.define("constructor", Value::heap(ctor_idx), ne);
+                }
+                // Route `Reflect.construct(facade, …)` / calls to the main
+                // ctor's logic with this realm ACTIVE (fn-like compile).
+                self.realm_ctor_main.insert(ctor_idx, main_ctor);
+                self.obj_realm.insert(ctor_idx, r);
+                self.obj_realm.insert(fnp_idx, r);
+                self.realms[r as usize].insert(main_fn_proto, fnp_idx);
+                // The instance-proto image (%GeneratorPrototype% /
+                // %AsyncGeneratorPrototype%): next/return/throw etc. as fresh
+                // same-id natives, plus the flattened %AsyncIteratorPrototype%
+                // props for the async kind; `prototype`/`constructor` linkage
+                // mirrors setup.rs (the OBJECT back-reference, w:f e:f c:t).
+                if main_inst_proto != 0 {
+                    let instp_idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                    let mut sources = vec![main_inst_proto];
+                    if let Some(f) = flatten {
+                        sources.push(f);
+                    }
+                    for srcp in sources {
+                        let props: Vec<(String, Value, PropAttr)> = match self.heap.get(srcp) {
+                            HeapObj::Object(mm) => mm
+                                .keys
+                                .iter()
+                                .zip(mm.vals.iter())
+                                .zip(mm.attrs.iter())
+                                .filter(|((k, _), _)| k.as_str() != "constructor")
+                                .map(|((k, v), a)| (k.clone(), *v, *a))
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        for (k, v, mut a) in props {
+                            let copy = self.realm_copy_value(v, r);
+                            if a.accessor {
+                                a.setter = self.realm_copy_value(a.setter, r);
+                            }
+                            if let HeapObj::Object(pm) = self.heap.get_mut(instp_idx) {
+                                if pm.pos(&k).is_none() {
+                                    pm.define(&k, copy, a);
+                                }
+                            }
+                        }
+                    }
+                    let link = PropAttr {
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    };
+                    if let HeapObj::Object(pm) = self.heap.get_mut(fnp_idx) {
+                        pm.define("prototype", Value::heap(instp_idx), link);
+                    }
+                    if let HeapObj::Object(pm) = self.heap.get_mut(instp_idx) {
+                        pm.define("constructor", Value::heap(fnp_idx), link);
+                    }
+                    if let Some(t) = inst_chain {
+                        self.proto_of.insert(instp_idx, Value::heap(t));
+                    }
+                    self.obj_realm.insert(instp_idx, r);
+                    self.realms[r as usize].insert(main_inst_proto, instp_idx);
+                }
+            }
+        }
         // Namespace objects: fresh per realm, with the main namespace's props
         // copied (fresh same-id Natives / shared data) so `other.Reflect.construct`
         // etc. are functional.

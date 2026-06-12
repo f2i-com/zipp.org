@@ -1003,14 +1003,25 @@ impl<'p> Vm<'p> {
             let r = self.build_function(args)?;
             return Ok(self.set_ctor_proto(r, over));
         }
+        // The dynamic-function intrinsics: GetPrototypeFromConstructor with the
+        // matching HIDDEN intrinsic default (%GeneratorFunction.prototype% etc.)
+        // — a foreign newTarget with a non-object `prototype` falls back to the
+        // NEWTARGET REALM's image of that intrinsic (realms map entries built by
+        // create_realm).
         if ci == self.gen_fn_ctor && ci != 0 {
-            return self.build_function_kind(args, 1);
+            let over = self.newtarget_proto_override(new_target, cv, self.gen_fn_proto)?;
+            let r = self.build_function_kind(args, 1)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.async_fn_ctor && ci != 0 {
-            return self.build_function_kind(args, 2);
+            let over = self.newtarget_proto_override(new_target, cv, self.async_fn_proto)?;
+            let r = self.build_function_kind(args, 2)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.asyncgen_fn_ctor && ci != 0 {
-            return self.build_function_kind(args, 3);
+            let over = self.newtarget_proto_override(new_target, cv, self.asyncgen_fn_proto)?;
+            let r = self.build_function_kind(args, 3)?;
+            return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.arraybuffer_ctor && ci != 0 {
             // The observable argument coercions run BEFORE newTarget.prototype

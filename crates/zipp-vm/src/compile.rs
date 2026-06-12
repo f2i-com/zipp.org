@@ -531,6 +531,49 @@ pub fn compile_eval(
         }
     }
     c.eval_caller_scope = caller_scope;
+    // DIRECT EVAL INSIDE `with`: the caller's eval-site map threads each active
+    // with-object's hidden cell binding (" with-object-N") along with the
+    // ordinary caller bindings, listed INNERMOST-FIRST. ResolveBinding for the
+    // eval program's identifiers must probe those objects (HasProperty —
+    // observable through a Proxy `has` trap) before the caller bindings /
+    // globals, so seed the eval ROOT's inherited_with_shadows exactly like a
+    // nested closure's: per free-or-var-declared name, the chain of with-objects
+    // that shadow it. Map ORDER encodes nesting — a with-object shadows
+    // precisely the caller bindings listed AFTER it; a name with no caller
+    // binding (a global, or a sloppy eval var that lives in the EvalScope) is
+    // shadowed by the entire chain. Names the eval binds LEXICALLY become root
+    // locals, and with_obj_regs' bound-here check skips their chains.
+    if !is_module {
+        let with_chain: Vec<(usize, String)> = c
+            .eval_caller_scope
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.starts_with(" with-object-"))
+            .map(|(i, n)| (i, n.clone()))
+            .collect();
+        if !with_chain.is_empty() {
+            let mut names = capture::free_vars(&[], &prog.body);
+            for n in eval_var_and_fn_names(prog) {
+                names.insert(n);
+            }
+            let mut map = std::collections::HashMap::new();
+            for name in names {
+                if name.starts_with(" with-object-") {
+                    continue;
+                }
+                let pos = c.eval_caller_scope.iter().position(|n| *n == name);
+                let chain: Vec<String> = with_chain
+                    .iter()
+                    .filter(|(i, _)| pos.map_or(true, |p| *i < p))
+                    .map(|(_, n)| n.clone())
+                    .collect();
+                if !chain.is_empty() {
+                    map.insert(name, chain);
+                }
+            }
+            c.pending_with_shadows = map;
+        }
+    }
     // A STRICT eval (strict caller or "use strict" source) gets its own
     // discarded variable environment: top-level var/function decls are frame
     // locals, never realm globals.
@@ -1083,11 +1126,14 @@ impl Compiler {
             // A nested arrow that reads `arguments` captures THIS function's
             // arguments object lexically: materialize it (uses_arguments) and box
             // its register into a cell so the arrow grabs the live cell as an upvalue.
+            // (No-op when a formal named `arguments` suppressed the binding — the
+            // arrow then captures the PARAMETER like any other name.)
             if capture::nested_uses_arguments(body) {
-                fc.uses_arguments = true;
-                let r = fc.arguments_reg.unwrap();
-                fc.emit(Instr::MakeCell { reg: r });
-                fc.cell_regs.insert(r);
+                if let Some(r) = fc.arguments_reg {
+                    fc.uses_arguments = true;
+                    fc.emit(Instr::MakeCell { reg: r });
+                    fc.cell_regs.insert(r);
+                }
             }
         }
         // A named function expression binds its own name to itself inside the body
@@ -1689,10 +1735,11 @@ impl Compiler {
         // A nested arrow reading `arguments` captures this method's arguments
         // object lexically — materialize + box it (see compile_function_body).
         if capture::nested_uses_arguments(body) {
-            fc.uses_arguments = true;
-            let r = fc.arguments_reg.unwrap();
-            fc.emit(Instr::MakeCell { reg: r });
-            fc.cell_regs.insert(r);
+            if let Some(r) = fc.arguments_reg {
+                fc.uses_arguments = true;
+                fc.emit(Instr::MakeCell { reg: r });
+                fc.cell_regs.insert(r);
+            }
         }
         if let Some(pa) = params_ast {
             fc.bind_params(pa)?;
@@ -2391,8 +2438,14 @@ impl<'a> FnCompiler<'a> {
     /// Reserve the `arguments` register (right after `this`/params/rest) for a
     /// non-arrow function and bind the name in scope, so a body reference to
     /// `arguments` resolves to it. Arrows/scripts don't call this (they inherit /
-    /// have no `arguments`).
+    /// have no `arguments`). A formal parameter (or rest) NAMED `arguments`
+    /// suppresses the binding entirely (FunctionDeclarationInstantiation:
+    /// argumentsObjectNeeded is false when parameterNames contains "arguments"
+    /// — sloppy only; strict code rejects the name at parse time).
     fn reserve_arguments(&mut self) {
+        if self.scopes[0].iter().any(|(n, _)| n == "arguments") {
+            return;
+        }
         let r = self.alloc_reg();
         self.scopes[0].push(("arguments".to_string(), r));
         self.arguments_reg = Some(r);
@@ -3296,14 +3349,19 @@ impl<'a> FnCompiler<'a> {
             {
                 let init = decl.init.as_ref().unwrap();
                 let save = self.next_reg;
-                let tmp = self.temp();
-                let v = self.compile_named_init(tmp, init, name)?;
+                // ResolveBinding BEFORE the initializer (two-phase; the probes
+                // are observable and the resolved base survives a delete).
                 let with_objs = self.with_obj_regs(name);
                 if with_objs.is_empty() {
+                    let tmp = self.temp();
+                    let v = self.compile_named_init(tmp, init, name)?;
                     let b = self.resolve(name);
                     self.store_binding(&b, v);
                 } else {
-                    self.store_with(name, &with_objs, v);
+                    let target = self.with_resolve_target(name, &with_objs);
+                    let tmp = self.temp();
+                    let v = self.compile_named_init(tmp, init, name)?;
+                    self.with_store_resolved(name, target, v);
                 }
                 self.next_reg = save;
                 continue;
@@ -3320,33 +3378,41 @@ impl<'a> FnCompiler<'a> {
                 if decl.init.is_none() && !d.kind.is_lexical() {
                     continue;
                 }
-                let tmp = self.temp();
-                let v = if let Some(init) = &decl.init {
-                    self.compile_named_init(tmp, init, name)?
-                } else {
-                    self.emit(Instr::LoadUndefined { dst: tmp });
-                    tmp
-                };
                 // `var x = init` inside a `with` whose object has `x`: the
                 // declaration's binding is hoisted (the global slot is already
-                // undefined), but the INITIALIZER is an assignment evaluated in the
-                // with-scope, so it targets the with-object. A bare `var x;` (no
-                // init) performs no assignment, so it never routes here.
+                // undefined), but the INITIALIZER is an assignment evaluated in
+                // the with-scope. TWO-PHASE: ResolveBinding (the observable
+                // HasProperty probe chain) runs BEFORE the initializer, and the
+                // store targets the base resolved THEN (`var x = delete o.x`
+                // re-creates `o.x`). A bare `var x;` (no init) performs no
+                // assignment, so it never routes here.
+                let save = self.next_reg;
                 let with_objs = if decl.init.is_some() {
                     self.with_obj_regs(name)
                 } else {
                     Vec::new()
                 };
                 if with_objs.is_empty() {
+                    let tmp = self.temp();
+                    let v = if let Some(init) = &decl.init {
+                        self.compile_named_init(tmp, init, name)?
+                    } else {
+                        self.emit(Instr::LoadUndefined { dst: tmp });
+                        tmp
+                    };
                     if self.box_all_locals || self.cx.dyn_global_zone {
                         self.emit(Instr::StoreGlobalDyn { idx: slot, src: v });
                     } else {
                         self.emit(Instr::StoreGlobal { idx: slot, src: v });
                     }
                 } else {
-                    self.store_with(name, &with_objs, v);
+                    let target = self.with_resolve_target(name, &with_objs);
+                    let tmp = self.temp();
+                    let v =
+                        self.compile_named_init(tmp, decl.init.as_ref().unwrap(), name)?;
+                    self.with_store_resolved(name, target, v);
                 }
-                self.next_reg -= 1; // reclaim tmp
+                self.next_reg = save;
                 continue;
             }
 
@@ -3375,12 +3441,17 @@ impl<'a> FnCompiler<'a> {
                     // declaration is hoisted (the function-scope slot is already
                     // undefined), but the initializer assignment targets the
                     // with-object (falling back to this slot if absent).
+                    // TWO-PHASE: the with-chain resolves BEFORE the initializer
+                    // evaluates (observable probes; a delete in the initializer
+                    // doesn't redirect the store).
+                    let save = self.next_reg;
                     let with_objs = self.with_obj_regs(name);
                     if !with_objs.is_empty() {
+                        let target = self.with_resolve_target(name, &with_objs);
                         let tmp = self.temp();
                         let v = self.compile_named_init(tmp, init, name)?;
-                        self.store_with(name, &with_objs, v);
-                        self.next_reg -= 1;
+                        self.with_store_resolved(name, target, v);
+                        self.next_reg = save;
                     } else if self.cell_regs.contains(&reg) {
                         let tmp = self.temp();
                         let v = self.compile_named_init(tmp, init, name)?;
@@ -3661,6 +3732,62 @@ impl<'a> FnCompiler<'a> {
                 }
                 for prop in &op.properties {
                     let save = self.next_reg;
+                    // KeyedBindingInitialization order for an IDENTIFIER leaf
+                    // inside a `with`: PropertyName evaluates first, then the
+                    // TARGET binding resolves (the with-chain HasProperty
+                    // probes — observable via a Proxy `has` trap), then GetV
+                    // reads the property, then a default. The store goes to
+                    // the base resolved UP FRONT (reference-record semantics —
+                    // it never re-probes the chain).
+                    let leaf: Option<(String, Option<&ox::Expression>)> = match &prop.value {
+                        P::BindingIdentifier(id) => Some((id.name.to_string(), None)),
+                        P::AssignmentPattern(ap) => match &ap.left {
+                            P::BindingIdentifier(id) => {
+                                Some((id.name.to_string(), Some(&ap.right)))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some((name, default)) = leaf {
+                        let with_objs = self.with_obj_regs(&name);
+                        if !with_objs.is_empty() {
+                            if prop.computed {
+                                // Evaluate + ToPropertyKey the key NOW, so the
+                                // later GetIndex coercion is a no-op (single
+                                // observable toString) and the target probes
+                                // run between them, per spec.
+                                let kreg = self.alloc_reg();
+                                let e = prop
+                                    .key
+                                    .as_expression()
+                                    .ok_or("unsupported computed destructuring key")?;
+                                let v = self.expr_into(e, kreg)?;
+                                if v != kreg {
+                                    self.emit(Instr::Move { dst: kreg, src: v });
+                                }
+                                self.emit(Instr::ToPropKey { dst: kreg, obj: src, src: kreg });
+                                let target = self.with_resolve_target(&name, &with_objs);
+                                let val = self.alloc_reg();
+                                self.emit(Instr::GetIndex { dst: val, obj: src, key: kreg });
+                                if let Some(d) = default {
+                                    self.apply_default_in_place_named(val, d, Some(&name))?;
+                                }
+                                self.with_store_resolved(&name, target, val);
+                            } else {
+                                let target = self.with_resolve_target(&name, &with_objs);
+                                let val = self.alloc_reg();
+                                self.extract_member(src, &prop.key, false, val)?;
+                                if let Some(d) = default {
+                                    self.apply_default_in_place_named(val, d, Some(&name))?;
+                                }
+                                self.with_store_resolved(&name, target, val);
+                            }
+                            self.next_reg = save;
+                            continue;
+                        }
+                        self.next_reg = save;
+                    }
                     let val = self.alloc_reg();
                     self.extract_member(src, &prop.key, prop.computed, val)?;
                     self.extract_pattern(&prop.value, val)?;
@@ -3886,6 +4013,31 @@ impl<'a> FnCompiler<'a> {
         let binding = name.as_deref().map(|n| self.resolve(n));
         let is_block_local =
             matches!(binding, Some(Binding::Local(_)) | Some(Binding::LocalCell(_)));
+        // EvalDeclarationInstantiation step 15.d (sloppy fn-context direct eval):
+        // a top-level function declaration whose name the CALLER's var scope
+        // already binds performs SetMutableBinding on the caller's EXISTING
+        // binding (the upvalue cell the eval root seeded) — never a realm global
+        // and never a fresh EvalScope binding. This runs at EVAL ENTRY
+        // (functionsToInitialize precede the body statements — see `entry_fns`),
+        // so `eval('initial = f; function f() {…}')` reads the new function.
+        if self.is_script
+            && self.cx.script_binds_globals
+            && self.cx.eval_fn_context
+            && !is_block_local
+        {
+            if let Some(ui) = name
+                .as_deref()
+                .filter(|n| self.cx.eval_caller_scope.iter().any(|c| c == n))
+                .and_then(|n| self.resolve_upvalue(n))
+            {
+                self.cx.functions.push(proto);
+                let tmp = self.temp();
+                self.emit_make_callable(tmp, id, has_upvalues);
+                self.emit(Instr::UpvalSet { idx: ui, src: tmp });
+                self.next_reg -= 1;
+                return Ok(());
+            }
+        }
         if self.is_script && self.cx.script_binds_globals && !is_block_local && !has_upvalues {
             // Top-level (or no-conflict block function) with no captures: bind the
             // name to a global; the VM materialises the function object at startup.
@@ -8253,6 +8405,60 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// Phase 1 of a reference-record-style with-aware assignment: probe each
+    /// with-object (innermost first) and capture the FIRST that has the binding
+    /// into a fresh register — `undefined` when none does (→ the static
+    /// binding). ResolveBinding's HasProperty probes (observable through a
+    /// Proxy `has` trap) run NOW, BEFORE the caller evaluates the initializer/
+    /// RHS; `with_store_resolved` then writes to the base captured here even if
+    /// the property was deleted in between (`var x = delete o.x` inside
+    /// `with (o)` re-creates `o.x`). The register stays live until the store —
+    /// callers reclaim it with their surrounding `next_reg` reset.
+    fn with_resolve_target(&mut self, name: &str, objs: &[Reg]) -> Reg {
+        let nidx = self.string_name(name);
+        let target = self.alloc_reg();
+        self.emit(Instr::LoadUndefined { dst: target });
+        let mut end_jumps = Vec::new();
+        for &obj in objs {
+            let flag = self.temp();
+            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            let jf = self.here();
+            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.next_reg -= 1;
+            self.emit(Instr::Move { dst: target, src: obj });
+            let je = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            end_jumps.push(je);
+            let nxt = self.here();
+            self.patch_jump(jf, nxt);
+        }
+        let end = self.here();
+        for je in end_jumps {
+            self.patch_jump(je, end);
+        }
+        target
+    }
+
+    /// Phase 2: PutValue to the base `with_resolve_target` picked — the captured
+    /// with-object (`WithSet` = the spec's object-env SetMutableBinding:
+    /// re-HasProperty + strict check + Set) or, when the register holds
+    /// `undefined` (objects are always truthy, so the test is unambiguous),
+    /// the static binding.
+    fn with_store_resolved(&mut self, name: &str, target: Reg, src: Reg) {
+        let nidx = self.string_name(name);
+        let jf = self.here();
+        self.emit(Instr::JumpIfFalse { cond: target, target: 0 });
+        self.emit(Instr::WithSet { obj: target, name: nidx, val: src, strict: self.cx.in_strict });
+        let je = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let stat = self.here();
+        self.patch_jump(jf, stat);
+        let b = self.resolve(name);
+        self.store_binding(&b, src);
+        let end = self.here();
+        self.patch_jump(je, end);
+    }
+
     /// Emit a `with`-aware `delete name` into `dst`: delete from the first
     /// with-object (innermost first) that has the binding, else fall back to the
     /// static-binding delete semantics (mirrors `delete_expr`'s identifier arm).
@@ -10485,6 +10691,76 @@ impl<'a> FnCompiler<'a> {
         if let ox::Expression::Identifier(id) = &c.callee {
             let with_objs = self.with_obj_regs(id.name.as_str());
             if !with_objs.is_empty() {
+                // `eval(...)` inside a `with` whose static binding is the
+                // unshadowed global %eval%: when NO with-object carries an
+                // `eval` binding, the IdentifierReference still resolves to
+                // %eval% (through the object envs) and the call IS a DIRECT
+                // eval — its program sees the caller's bindings AND the with
+                // chain (threaded through the eval-site map's hidden
+                // " with-object-N" cells). A with-object that DOES carry the
+                // name gets an ordinary call of that value with `this` = the
+                // with-object (accepted limit: a with-bound value that happens
+                // to BE %eval% is treated as indirect).
+                if id.name == "eval" && matches!(self.resolve("eval"), Binding::Global(_)) {
+                    let save = self.next_reg;
+                    let nidx = self.string_name("eval");
+                    let callee_reg = self.alloc_reg();
+                    let this_reg = self.alloc_reg();
+                    let found = self.alloc_reg();
+                    self.emit(Instr::LoadBool { dst: found, val: false });
+                    let mut hits = Vec::new();
+                    for &obj in &with_objs {
+                        let flag = self.temp();
+                        self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+                        let jf = self.here();
+                        self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+                        self.next_reg -= 1;
+                        self.emit(Instr::WithGet {
+                            dst: callee_reg,
+                            obj,
+                            name: nidx,
+                            strict: self.cx.in_strict,
+                        });
+                        self.emit(Instr::Move { dst: this_reg, src: obj });
+                        self.emit(Instr::LoadBool { dst: found, val: true });
+                        let jd = self.here();
+                        self.emit(Instr::Jump { target: 0 });
+                        hits.push(jd);
+                        let nxt = self.here();
+                        self.patch_jump(jf, nxt);
+                    }
+                    let resolved = self.here();
+                    for j in hits {
+                        self.patch_jump(j, resolved);
+                    }
+                    // Arguments evaluate AFTER the callee reference resolved.
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.arguments)?;
+                    let jf = self.here();
+                    self.emit(Instr::JumpIfFalse { cond: found, target: 0 });
+                    self.emit(Instr::CallWithThis {
+                        dst,
+                        callee: callee_reg,
+                        this_v: this_reg,
+                        arg_base,
+                        argc,
+                    });
+                    let je = self.here();
+                    self.emit(Instr::Jump { target: 0 });
+                    let direct = self.here();
+                    self.patch_jump(jf, direct);
+                    let arg = if argc == 0 {
+                        let r = self.temp();
+                        self.emit(Instr::LoadUndefined { dst: r });
+                        r
+                    } else {
+                        arg_base
+                    };
+                    self.emit_direct_eval(arg, dst, false);
+                    let end = self.here();
+                    self.patch_jump(je, end);
+                    self.next_reg = save.max(dst + 1);
+                    return Ok(dst);
+                }
                 let save = self.next_reg;
                 let (callee_reg, this_reg) =
                     self.emit_with_callee_chain(id.name.as_str(), &with_objs);

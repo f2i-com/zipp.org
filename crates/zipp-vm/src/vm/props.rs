@@ -1521,6 +1521,9 @@ impl<'p> Vm<'p> {
     /// dynamic-function intrinsic prototype (%GeneratorFunction.prototype% etc.) —
     /// its [[Prototype]] and the target for its method/`.constructor` lookups.
     /// `None` for plain functions (which use %Function.prototype%) and non-callables.
+    /// A REALM-BORN function starts at its realm's image of the intrinsic (a
+    /// hidden per-realm copy built by create_realm), so `.constructor` reaches
+    /// the realm's %GeneratorFunction% facade.
     pub(crate) fn callable_dynfn_proto(&self, idx: u32) -> Option<u32> {
         let fid = match self.heap.get(idx) {
             HeapObj::Func(f) => *f,
@@ -1528,12 +1531,21 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let p = self.func(fid as usize);
-        match (p.is_generator, p.is_async) {
+        let main = match (p.is_generator, p.is_async) {
             (true, true) => (self.asyncgen_fn_proto != 0).then_some(self.asyncgen_fn_proto),
             (true, false) => (self.gen_fn_proto != 0).then_some(self.gen_fn_proto),
             (false, true) => (self.async_fn_proto != 0).then_some(self.async_fn_proto),
             (false, false) => None,
+        }?;
+        if !self.realm_global_objs.is_empty() {
+            let r = self.get_function_realm(Value::heap(idx));
+            if r != 0 {
+                if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&main)) {
+                    return Some(rp);
+                }
+            }
         }
+        Some(main)
     }
 
     pub(crate) fn object_get_prototype_of(&mut self, obj: Value) -> Value {

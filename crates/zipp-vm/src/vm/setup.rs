@@ -151,7 +151,19 @@ impl<'p> Vm<'p> {
             let fp = self.func(fid);
             let (is_gen, is_async) = (fp.is_generator, fp.is_async);
             if is_gen {
-                let gp = if is_async { self.asyncgen_proto } else { self.gen_proto };
+                let mut gp = if is_async { self.asyncgen_proto } else { self.gen_proto };
+                // A REALM-BORN generator function's `prototype` chains to the
+                // realm's image of %GeneratorPrototype% / %AsyncGeneratorPrototype%
+                // (create_realm's hidden intrinsics), so its instances reach the
+                // realm's %Object.prototype% (`gen instanceof other.Object`).
+                if gp != 0 && !self.realm_global_objs.is_empty() {
+                    let r = self.get_function_realm(obj);
+                    if r != 0 {
+                        if let Some(&rp) = self.realms.get(r as usize).and_then(|m| m.get(&gp)) {
+                            gp = rp;
+                        }
+                    }
+                }
                 if gp != 0 {
                     self.proto_of.insert(p, Value::heap(gp));
                 }
