@@ -620,6 +620,12 @@ pub struct Vm<'p> {
     /// `[object Arguments]` toString tag and the Array-exotic carve-outs
     /// (ordinary `length`, no Vec growth). Pruned on GC sweep.
     arguments_objs: std::collections::HashMap<u32, Option<ArgsMap>>,
+    /// Generator/async-function activations with a MAPPED `arguments` object:
+    /// state heap index (HeapObj::Generator / AsyncState / AsyncGenState) → the
+    /// arguments object's heap index. Each resume re-links the [[ParameterMap]]
+    /// to the freshly spliced frame (`relink_mapped_args`), so the live aliasing
+    /// survives suspension. Pruned on GC sweep alongside `arguments_objs`.
+    gen_args_obj: std::collections::HashMap<u32, u32>,
     /// Directory the running script was loaded from, used to resolve a dynamic
     /// `import(specifier)` against the filesystem (relative + bare specifiers).
     /// `None` when running from a string (eval/embedding) — then `import()` has no
@@ -732,6 +738,13 @@ pub struct Vm<'p> {
     /// methods use the compile-time `home_class_id` path instead. Values are GC roots;
     /// dead closure keys are pruned on sweep.
     closure_home: std::collections::HashMap<u32, Value>,
+    /// Lexically-captured `new.target` for ARROW closures created inside a
+    /// constructed activation (and arrows nested in those), keyed by the
+    /// closure's heap index. An arrow's own frame has no [[NewTarget]];
+    /// `new.target` inside it must observe the enclosing function's. Only
+    /// non-undefined values are recorded. Values are GC roots; dead closure
+    /// keys are pruned on sweep (mirrors `closure_home`).
+    closure_new_target: std::collections::HashMap<u32, Value>,
     /// The lazily-compiled `Array.fromAsync` JS polyfill (an async function value).
     /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
     /// the first `Array.fromAsync(...)` invocation.

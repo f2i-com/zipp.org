@@ -949,6 +949,29 @@ impl Compiler {
                 }
             }
         }
+        // Early errors on a generator/async FormalParameterList: a generator's
+        // parameters may not contain a YieldExpression and an async function's
+        // may not contain an AwaitExpression (covers `function* g(x = yield)`
+        // and the dynamic `GeneratorFunction('x = yield', '')` forms; oxc
+        // parses these but defers the error to semantic analysis).
+        if is_generator || is_async {
+            if let Some(pa) = params_ast {
+                let bad = pa.items.iter().any(|item| {
+                    item.initializer
+                        .as_ref()
+                        .map_or(false, |init| expr_has_yield_or_await(init, is_generator, is_async))
+                        || pattern_has_yield_or_await(&item.pattern, is_generator, is_async)
+                }) || pa.rest.as_ref().map_or(false, |r| {
+                    pattern_has_yield_or_await(&r.rest.argument, is_generator, is_async)
+                });
+                if bad {
+                    return Err(
+                        "SyntaxError: yield/await expression not permitted in formal parameters"
+                            .into(),
+                    );
+                }
+            }
+        }
         // `new.target` is allowed inside an ordinary function, not at script/eval
         // top level; nested arrows inherit this. Restored at the end. A DIRECT eval
         // from inside a function/method/field initializer forces it on for the eval
@@ -1361,6 +1384,16 @@ impl Compiler {
                     if d.kind.is_lexical() {
                         for decl in &d.declarations {
                             if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
+                                // GlobalDeclarationInstantiation step 5: a top-level
+                                // lexical name colliding with a RESTRICTED global
+                                // property (the non-configurable value properties
+                                // undefined/NaN/Infinity) is a SyntaxError.
+                                if matches!(id.name.as_str(), "undefined" | "NaN" | "Infinity") {
+                                    return Err(format!(
+                                        "SyntaxError: lexical declaration of '{}' collides with a restricted global property",
+                                        id.name
+                                    ));
+                                }
                                 let slot = fc.cx.global_slot(id.name.as_str()) as u32;
                                 fc.cx.lexical_globals.insert(slot);
                             }
@@ -1488,7 +1521,12 @@ impl Compiler {
         // below (a function declaration has no textual side effects). Script-level
         // functions are materialised at VM startup, so this applies to nested
         // function bodies only.
-        if !is_script || !fc.cx.script_binds_globals {
+        // An EVAL program ALSO initializes its top-level function declarations at
+        // entry (EvalDeclarationInstantiation step 15 runs functionsToInitialize
+        // before the body): `eval('initial = f; function f(){}')` reads the
+        // function, not the caller's prior var value.
+        let entry_fns = !is_script || !fc.cx.script_binds_globals || fc.cx.eval_mode;
+        if entry_fns {
             for s in body {
                 if let ox::Statement::FunctionDeclaration(f) = s {
                     fc.func_decl(f)?;
@@ -1499,11 +1537,11 @@ impl Compiler {
         if FnCompiler::block_has_using(body) {
             // A function/generator/async body with a top-level `using` disposes its
             // resources on return/throw — same finally desugar as a block.
-            fc.compile_using_block(body, !is_script)?;
+            fc.compile_using_block(body, entry_fns)?;
         } else {
             for s in body {
                 // Top-level function declarations were materialised at entry above.
-                if !is_script || !fc.cx.script_binds_globals {
+                if entry_fns {
                     if let ox::Statement::FunctionDeclaration(_) = s {
                         continue;
                     }
@@ -2413,6 +2451,27 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// True iff `name` currently resolves to the PRISTINE global builtin of
+    /// that name: not shadowed by a param/local/upvalue/class binding, not
+    /// declared by the script itself (top-level var/function/let/const/class
+    /// create USER globals), and not inside a `with` whose object could shadow
+    /// it. The by-name builtin lowerings (`new TypeError(...)`,
+    /// `new Promise(...)`, bare `Error(...)`, …) fire only then; otherwise the
+    /// generic value path constructs/calls whatever the binding holds.
+    fn builtin_unshadowed(&mut self, name: &str) -> bool {
+        match self.resolve(name) {
+            Binding::Global(idx) => {
+                let i = idx as u32;
+                !self.cx.hoisted_globals.contains(&i)
+                    && !self.cx.decl_globals.contains(&i)
+                    && !self.cx.lexical_globals.contains(&i)
+                    && !self.cx.const_globals.contains(&i)
+                    && self.with_objs_for(name).is_empty()
+            }
+            _ => false,
+        }
+    }
+
     fn declare_local(&mut self, name: &str) -> Reg {
         let r = self.alloc_reg();
         self.scopes.last_mut().unwrap().push((name.to_string(), r));
@@ -2653,34 +2712,7 @@ impl<'a> FnCompiler<'a> {
                 // TDZ → ReferenceError) instead of resolving to a global. The
                 // textual declaration reuses the register, ending the TDZ.
                 // Non-captured names keep plain registers (no runtime cost).
-                for st in &b.body {
-                    let mut pre = |fc: &mut Self, name: &str| {
-                        if fc.captured.contains(name)
-                            && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
-                        {
-                            let r = fc.alloc_reg();
-                            fc.scopes.last_mut().unwrap().push((name.to_string(), r));
-                            fc.emit(Instr::MakeCellTdz { reg: r });
-                            fc.cell_regs.insert(r);
-                            fc.block_tdz_cells.insert(r);
-                        }
-                    };
-                    match st {
-                        S::VariableDeclaration(d) if d.kind.is_lexical() => {
-                            for decl in &d.declarations {
-                                if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
-                                    pre(self, id.name.as_str());
-                                }
-                            }
-                        }
-                        S::ClassDeclaration(c) => {
-                            if let Some(id) = &c.id {
-                                pre(self, id.name.as_str());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                self.predeclare_lexical_tdz(&b.body);
                 // Hoist block-level function declarations: declare each as a local
                 // in this block scope first, so `func_decl` binds it (and forward
                 // references / calls within the block resolve to the local rather
@@ -4083,7 +4115,11 @@ impl<'a> FnCompiler<'a> {
         // SOURCE order (spec ClassDefinitionEvaluation: one interleaved list; an
         // abrupt completion aborts the remaining elements). Initializers run
         // with `this` = the class, in strict mode, with the class's static
-        // super base.
+        // super base. The classScope's own-name binding (already initialized —
+        // MakeClass ran) shadows the still-TDZ outer declaration binding while
+        // these INLINE initializers compile, so `class C { static x = C }`
+        // inside a function resolves to the class value, not the dead local.
+        let static_self_name = class.id.as_ref().map(|id| id.name.to_string());
         for &(elem_kind, idx) in &static_order {
             match elem_kind {
                 0 => {
@@ -4095,6 +4131,10 @@ impl<'a> FnCompiler<'a> {
                     let (prev_sc, prev_ss) = (self.super_class, self.super_static);
                     self.super_class = Some(class_id);
                     self.super_static = true;
+                    let saved_hc = self.heritage_class.take();
+                    if let Some(n) = &static_self_name {
+                        self.heritage_class = Some((n.clone(), class_id));
+                    }
                     let v = match finit {
                         Some(e) => self.expr(e)?,
                         None => {
@@ -4103,6 +4143,7 @@ impl<'a> FnCompiler<'a> {
                             t
                         }
                     };
+                    self.heritage_class = saved_hc;
                     self.super_class = prev_sc;
                     self.super_static = prev_ss;
                     self.cx.in_strict = prev_strict;
@@ -4129,6 +4170,10 @@ impl<'a> FnCompiler<'a> {
                     let (prev_sc, prev_ss) = (self.super_class, self.super_static);
                     self.super_class = Some(class_id);
                     self.super_static = true;
+                    let saved_hc = self.heritage_class.take();
+                    if let Some(n) = &static_self_name {
+                        self.heritage_class = Some((n.clone(), class_id));
+                    }
                     let vr = match init {
                         Some(e) => self.expr(e)?,
                         None => {
@@ -4137,6 +4182,7 @@ impl<'a> FnCompiler<'a> {
                             t
                         }
                     };
+                    self.heritage_class = saved_hc;
                     self.super_class = prev_sc;
                     self.super_static = prev_ss;
                     self.cx.in_strict = prev_strict;
@@ -4404,6 +4450,27 @@ impl<'a> FnCompiler<'a> {
                     static_blocks.push(&b.body);
                     static_order.push((2, static_blocks.len() - 1));
                 }
+                // `accessor x = init` (decorators-proposal auto-accessor) —
+                // SUBSET lowering: an ordinary field with the same key/
+                // initializer timing. The synthesized private backing slot and
+                // prototype get/set pair are not modeled; reads/writes behave
+                // like a plain own data property.
+                ox::ClassElement::AccessorProperty(p) => match class_key_name(&p.key) {
+                    Ok(name) if p.r#static => {
+                        static_fields.push((name, p.value.as_ref()));
+                        static_order.push((0, static_fields.len() - 1));
+                    }
+                    Ok(name) => fields.push((name, p.value.as_ref())),
+                    Err(e) => {
+                        let key = p.key.as_expression().ok_or(e)?;
+                        computed_fields_ordered.push((key, p.value.as_ref(), p.r#static));
+                        if p.r#static {
+                            static_order.push((1, computed_fields_ordered.len() - 1));
+                        } else {
+                            instance_computed_inits.push(p.value.as_ref());
+                        }
+                    }
+                },
                 _ => return Err("unsupported class member in the zipp-vm subset".into()),
             }
         }
@@ -5096,6 +5163,11 @@ impl<'a> FnCompiler<'a> {
             }
             _ => Vec::new(),
         };
+        // CreatePerIterationEnvironment runs once BEFORE the first test (13.7.4.8
+        // step 2): a closure made in the INIT keeps the loop-head binding, which
+        // the test/body/update (operating on the first iteration's copy) never
+        // mutate.
+        self.emit_freshen_cells(&fresh_regs);
         let top = self.here();
         let jf = match &f.test {
             Some(t) => {
@@ -5186,6 +5258,7 @@ impl<'a> FnCompiler<'a> {
         // exiting it must pop the stale handler — see `emit_loop_jump`).
         self.handler_depth += 1;
         self.push_scope();
+        self.predeclare_lexical_tdz(&t.block.body);
         self.compile_stmt_list(&t.block.body, false)?;
         self.pop_scope();
         // After the try body the catch handler is no longer active (the catch body
@@ -5205,6 +5278,47 @@ impl<'a> FnCompiler<'a> {
         self.patch_jump(skip, after);
         let _ = catch_start;
         Ok(())
+    }
+
+    /// BlockDeclarationInstantiation's TDZ half for a block-like statement list:
+    /// pre-create TDZ cells for the list's CAPTURED simple-identifier lexical
+    /// (`let`/`const`/`class`) declarations in the CURRENT scope, so a closure
+    /// materialized before the textual declaration captures the block's binding
+    /// (in its TDZ) instead of resolving to an outer/global one. The textual
+    /// declaration reuses the register, ending the TDZ (see the lexical arm of
+    /// `var_decl`). Non-captured names keep plain registers (no runtime cost).
+    /// Shared by plain blocks, switch case-blocks, and try/catch/finally bodies
+    /// (a switch's CaseBlock calls it once per clause — the in-scope dedup makes
+    /// the clauses share one block-level binding).
+    fn predeclare_lexical_tdz(&mut self, stmts: &[ox::Statement]) {
+        for st in stmts {
+            let mut pre = |fc: &mut Self, name: &str| {
+                if fc.captured.contains(name)
+                    && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
+                {
+                    let r = fc.alloc_reg();
+                    fc.scopes.last_mut().unwrap().push((name.to_string(), r));
+                    fc.emit(Instr::MakeCellTdz { reg: r });
+                    fc.cell_regs.insert(r);
+                    fc.block_tdz_cells.insert(r);
+                }
+            };
+            match st {
+                ox::Statement::VariableDeclaration(d) if d.kind.is_lexical() => {
+                    for decl in &d.declarations {
+                        if let ox::BindingPattern::BindingIdentifier(id) = &decl.id {
+                            pre(self, id.name.as_str());
+                        }
+                    }
+                }
+                ox::Statement::ClassDeclaration(c) => {
+                    if let Some(id) = &c.id {
+                        pre(self, id.name.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// True iff `body` declares a top-level `using`/`await using` resource. Only
@@ -5388,6 +5502,7 @@ impl<'a> FnCompiler<'a> {
 
         // Try body.
         self.push_scope();
+        self.predeclare_lexical_tdz(&t.block.body);
         self.compile_stmt_list(&t.block.body, false)?;
         self.pop_scope();
 
@@ -5431,9 +5546,16 @@ impl<'a> FnCompiler<'a> {
         let saved_cmpl = self.completion_reg.map(|cr| {
             let r = self.alloc_reg();
             self.emit(Instr::Move { dst: r, src: cr });
+            // The finally body's own completion V starts EMPTY: an abrupt exit
+            // (break/continue) from inside it carries only the values its own
+            // statements produced — `finally { break }` yields undefined while
+            // `finally { 42; break }` yields 42 — never the try block's value.
+            // (The normal fall-through path below restores the saved value.)
+            self.emit(Instr::LoadUndefined { dst: cr });
             r
         });
         self.push_scope();
+        self.predeclare_lexical_tdz(&finalizer.body);
         for s in &finalizer.body {
             self.stmt(s)?;
         }
@@ -5502,6 +5624,10 @@ impl<'a> FnCompiler<'a> {
                 self.cell_regs.insert(e_reg);
             }
         }
+        // The catch BLOCK's captured lexicals get block-entry TDZ cells — after
+        // the parameter above, so a closure in a destructuring default captures
+        // the OUTER binding while closures in the block capture the block's.
+        self.predeclare_lexical_tdz(&handler.body.body);
         self.compile_stmt_list(&handler.body.body, false)?;
         self.pop_scope();
         Ok(())
@@ -5531,6 +5657,14 @@ impl<'a> FnCompiler<'a> {
     /// emit the case bodies consecutively so fall-through is natural; `break`
     /// (collected in a non-loop frame) jumps to the end.
     fn switch_stmt(&mut self, s: &ox::SwitchStatement) -> R<()> {
+        // CaseBlockEvaluation starts the completion V at undefined (a no-match /
+        // all-empty switch yields undefined, not the prior statement's value).
+        self.reset_loop_completion();
+        // The discriminant evaluates in the OUTER environment — before the
+        // CaseBlock's block scope opens (NewDeclarativeEnvironment happens after
+        // GetValue(exprRef)), so a closure in the discriminant captures outer
+        // bindings, not the case-block's.
+        let disc = self.expr(&s.discriminant)?;
         self.push_scope();
         // A switch CaseBlock is one block scope. Pre-declare its lexically-scoped
         // declarations as block-local so they don't leak past the switch:
@@ -5570,10 +5704,12 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
-        // CaseBlockEvaluation starts the completion V at undefined (a no-match / all-
-        // empty switch yields undefined, not the prior statement's value).
-        self.reset_loop_completion();
-        let disc = self.expr(&s.discriminant)?;
+        // BlockDeclarationInstantiation's TDZ half: captured `let`/`const` in any
+        // clause get block-entry TDZ cells, so a closure in a case selector or an
+        // earlier clause captures the CaseBlock's binding, not an outer one.
+        for c in &s.cases {
+            self.predeclare_lexical_tdz(&c.consequent);
+        }
 
         // Pass 1: comparison jumps (strict `===`, like JS). `default` is recorded
         // and dispatched after the others fail.
@@ -6271,6 +6407,21 @@ impl<'a> FnCompiler<'a> {
         use ox::Expression as E;
         match e {
             E::NumericLiteral(n) => {
+                // Strict-mode early error: a legacy octal (`01`) or non-octal
+                // leading-zero (`08`) integer literal is a SyntaxError — oxc
+                // parses leniently and defers this check to semantics, so
+                // enforce it here (covers strict direct eval too).
+                if self.cx.in_strict {
+                    if let Some(raw) = &n.raw {
+                        let b = raw.as_bytes();
+                        if b.len() >= 2 && b[0] == b'0' && b[1].is_ascii_digit() {
+                            return Err(
+                                "SyntaxError: legacy octal literals are not allowed in strict mode"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
                 self.load_number(dst, n.value);
                 Ok(dst)
             }
@@ -6512,8 +6663,18 @@ impl<'a> FnCompiler<'a> {
             E::NewExpression(n) => {
                 // `new Error(msg)` / `new TypeError(msg)` / `new RangeError(msg)`
                 // → a plain object {name, message}. Other constructors aren't in
-                // the subset yet.
-                if let ox::Expression::Identifier(id) = &n.callee {
+                // the subset yet. The by-name lowerings below fire only for the
+                // PRISTINE global builtin — a user binding of the same name
+                // (`function TypeError() {}`) takes the generic value path.
+                let id_opt = match &n.callee {
+                    ox::Expression::Identifier(id)
+                        if self.builtin_unshadowed(id.name.as_str()) =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                };
+                if let Some(id) = id_opt {
                     if let Some(kind) = error_ctor(&id.name) {
                         return self.build_error(kind, &n.arguments, dst);
                     }
@@ -6533,18 +6694,23 @@ impl<'a> FnCompiler<'a> {
                         }
                         return Ok(dst);
                     }
-                    // `new Promise(executor)`.
+                    // `new Promise(executor)`. A missing executor is a RUNTIME
+                    // TypeError (NewPromise validates callability), not a
+                    // compile error — `new Promise()` inside a never-taken
+                    // branch must still compile.
                     if id.name == "Promise" {
-                        let executor = match n.arguments.first().and_then(|a| a.as_expression()) {
-                            Some(e) => {
-                                let t = self.temp();
-                                let v = self.expr_into(e, t)?;
-                                if v != t {
-                                    self.emit(Instr::Move { dst: t, src: v });
+                        let executor = {
+                            let t = self.temp();
+                            match n.arguments.first().and_then(|a| a.as_expression()) {
+                                Some(e) => {
+                                    let v = self.expr_into(e, t)?;
+                                    if v != t {
+                                        self.emit(Instr::Move { dst: t, src: v });
+                                    }
                                 }
-                                t
+                                None => self.emit(Instr::LoadUndefined { dst: t }),
                             }
-                            None => return Err("new Promise requires an executor function".into()),
+                            t
                         };
                         self.emit(Instr::NewPromise { dst, executor });
                         self.next_reg -= 1; // reclaim executor temp
@@ -7405,7 +7571,10 @@ impl<'a> FnCompiler<'a> {
             let imm_ok = n.value.fract() == 0.0
                 && n.value >= i32::MIN as f64
                 && n.value <= i32::MAX as f64;
-            let eligible = matches!(b.operator, Op::Subtraction)
+            // `x - 0` must stay a real Sub: AddInt would compute `x + 0`, and
+            // IEEE `-0.0 + 0.0` is `+0.0` while `-0.0 - 0.0` is `-0.0`.
+            // (`x + 0` is the same operation either way, so it stays eligible.)
+            let eligible = (matches!(b.operator, Op::Subtraction) && n.value != 0.0)
                 || (matches!(b.operator, Op::Addition) && is_numeric_expr(&b.left));
             if imm_ok && eligible {
                 let a = self.expr(&b.left)?;
@@ -10307,10 +10476,14 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // Bare `Error("msg")` call (no `new`) → same Error object.
+        // Bare `Error("msg")` call (no `new`) → same Error object. Only for the
+        // pristine global builtin — a user binding named e.g. `TypeError` is an
+        // ordinary call.
         if let ox::Expression::Identifier(id) = &c.callee {
             if let Some(kind) = error_ctor(&id.name) {
-                return self.build_error(kind, &c.arguments, dst);
+                if self.builtin_unshadowed(id.name.as_str()) {
+                    return self.build_error(kind, &c.arguments, dst);
+                }
             }
         }
         // Direct `eval(code)`: the evaluated string runs with the caller's
@@ -11147,6 +11320,87 @@ fn collect_b33_block_fns(
 
 /// Whether a statement (transitively, NOT descending into nested function
 /// bodies) contains a `with` statement — gates the pre-declare-all-vars pass.
+/// Early-error scan: does this expression contain a YieldExpression
+/// (`want_yield`) / AwaitExpression (`want_await`) in ITS OWN grammar context?
+/// Used on generator/async FormalParameter initializers, where both are
+/// SyntaxErrors (also covering the dynamic `GeneratorFunction('x = yield','')`
+/// forms). A nested function/arrow/class body opens a fresh [Yield]/[Await]
+/// context, so unknown/function-like nodes conservatively contribute false.
+fn expr_has_yield_or_await(e: &ox::Expression, want_yield: bool, want_await: bool) -> bool {
+    use ox::Expression as E;
+    macro_rules! r {
+        ($x:expr) => {
+            expr_has_yield_or_await($x, want_yield, want_await)
+        };
+    }
+    match e {
+        E::YieldExpression(y) => {
+            want_yield || y.argument.as_ref().map_or(false, |a| r!(a))
+        }
+        E::AwaitExpression(a) => want_await || r!(&a.argument),
+        E::ParenthesizedExpression(p) => r!(&p.expression),
+        E::BinaryExpression(b) => r!(&b.left) || r!(&b.right),
+        E::LogicalExpression(l) => r!(&l.left) || r!(&l.right),
+        E::UnaryExpression(u) => r!(&u.argument),
+        E::ConditionalExpression(c) => r!(&c.test) || r!(&c.consequent) || r!(&c.alternate),
+        E::SequenceExpression(s) => s.expressions.iter().any(|x| r!(x)),
+        E::AssignmentExpression(a) => r!(&a.right),
+        E::CallExpression(c) => {
+            r!(&c.callee)
+                || c.arguments.iter().any(|a| a.as_expression().map_or(false, |x| r!(x)))
+        }
+        E::NewExpression(n) => {
+            r!(&n.callee)
+                || n.arguments.iter().any(|a| a.as_expression().map_or(false, |x| r!(x)))
+        }
+        E::TemplateLiteral(t) => t.expressions.iter().any(|x| r!(x)),
+        E::TaggedTemplateExpression(t) => {
+            r!(&t.tag) || t.quasi.expressions.iter().any(|x| r!(x))
+        }
+        E::StaticMemberExpression(m) => r!(&m.object),
+        E::ComputedMemberExpression(m) => r!(&m.object) || r!(&m.expression),
+        _ => false,
+    }
+}
+
+/// The [Yield]/[Await] early-error scan over a binding pattern's nested
+/// DEFAULT-VALUE expressions and computed keys (the FormalParameter space).
+fn pattern_has_yield_or_await(pat: &ox::BindingPattern, want_yield: bool, want_await: bool) -> bool {
+    use ox::BindingPattern as P;
+    match pat {
+        P::BindingIdentifier(_) => false,
+        P::AssignmentPattern(ap) => {
+            expr_has_yield_or_await(&ap.right, want_yield, want_await)
+                || pattern_has_yield_or_await(&ap.left, want_yield, want_await)
+        }
+        P::ObjectPattern(op) => {
+            op.properties.iter().any(|prop| {
+                (prop.computed
+                    && prop
+                        .key
+                        .as_expression()
+                        .map_or(false, |ke| expr_has_yield_or_await(ke, want_yield, want_await)))
+                    || pattern_has_yield_or_await(&prop.value, want_yield, want_await)
+            }) || op
+                .rest
+                .as_ref()
+                .map_or(false, |rest| pattern_has_yield_or_await(&rest.argument, want_yield, want_await))
+        }
+        P::ArrayPattern(arr) => {
+            arr.elements
+                .iter()
+                .flatten()
+                .any(|el| pattern_has_yield_or_await(el, want_yield, want_await))
+                || arr
+                    .rest
+                    .as_ref()
+                    .map_or(false, |rest| {
+                        pattern_has_yield_or_await(&rest.argument, want_yield, want_await)
+                    })
+        }
+    }
+}
+
 fn stmt_contains_with(s: &ox::Statement) -> bool {
     use ox::Statement as S;
     match s {

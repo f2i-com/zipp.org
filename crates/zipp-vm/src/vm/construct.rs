@@ -30,11 +30,14 @@ impl<'p> Vm<'p> {
         let (params, body) = if args.is_empty() {
             (String::new(), String::new())
         } else {
-            let body = self.to_js_string(args[args.len() - 1])?;
+            // CreateDynamicFunction coerces the PARAMETER strings in argument
+            // order first, then the body (a throwing toString surfaces in that
+            // order — observable).
             let mut parts: Vec<String> = Vec::with_capacity(args.len() - 1);
             for a in &args[..args.len() - 1] {
                 parts.push(self.to_js_string(*a)?);
             }
+            let body = self.to_js_string(args[args.len() - 1])?;
             (parts.join(","), body)
         };
         let prefix = match kind {
@@ -1348,9 +1351,13 @@ impl<'p> Vm<'p> {
                 return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.obj_proto && self.obj_proto != 0 {
-                // `Object(value)` with a non-nullish value ignores newTarget and
-                // returns ToObject(value); only `new Object()` / nullish honours it.
-                if over.is_some() && a0.is_nullish() {
+                // Object(value): when NewTarget is present and NOT the Object
+                // function itself (a subclass `new O(x)` / an explicit
+                // Reflect.construct newTarget), OrdinaryCreateFromConstructor
+                // builds a FRESH instance and the value argument is IGNORED
+                // (spec 20.1.1.1 step 1). Otherwise ToObject(value), with a
+                // nullish value yielding a fresh ordinary object.
+                if over.is_some() {
                     let r = Value::heap(self.heap.alloc(HeapObj::Object(ObjMap::new())));
                     return Ok(self.set_ctor_proto(r, over));
                 }
@@ -1960,7 +1967,7 @@ impl<'p> Vm<'p> {
 
     /// `v instanceof F` for a constructor FUNCTION `F`: true iff `F.prototype` is
     /// somewhere in `v`'s prototype chain.
-    pub(crate) fn instanceof_via_proto(&mut self, v: Value, ctor: Value) -> bool {
+    pub(crate) fn instanceof_via_proto(&mut self, v: Value, ctor: Value) -> Result<bool, Thrown> {
         // A bound function's instanceof uses the [[BoundTargetFunction]]'s
         // prototype (OrdinaryHasInstance step 2) — unwrap the bind chain.
         let mut ctor = ctor;
@@ -1972,19 +1979,23 @@ impl<'p> Vm<'p> {
         }
         let target = match self.prototype_of(ctor) {
             Some(p) => p,
-            None => return false,
+            None => return Ok(false),
         };
-        let mut cur = self.object_get_prototype_of(v);
+        // The chain walk uses the CHECKED [[GetPrototypeOf]] (identical to the
+        // infallible one for non-proxies): a Proxy link's trap invariants —
+        // revoked handler, non-object result, non-extensible-target mismatch —
+        // throw per OrdinaryHasInstance step 7.b instead of degrading to null.
+        let mut cur = self.get_prototype_of_checked(v)?;
         for _ in 0..10_000 {
             if !cur.is_heap() {
-                return false;
+                return Ok(false);
             }
             if cur == target {
-                return true;
+                return Ok(true);
             }
-            cur = self.object_get_prototype_of(cur);
+            cur = self.get_prototype_of_checked(cur)?;
         }
-        false
+        Ok(false)
     }
 
     /// OrdinaryHasInstance(C, O) — the algorithm behind both the default
@@ -2295,6 +2306,37 @@ impl<'p> Vm<'p> {
                 // representation so its methods work and it is a real instanceof. The
                 // instance keeps its own (subclass) prototype, recorded in proto_of.
                 if self.brand_builtin_subclass(cval, obj, args)? {
+                    return Ok(obj);
+                }
+                // `class X extends SuppressedError`: super(error, suppressed, msg)
+                // installs the three own props on the instance and brands the
+                // [[ErrorData]] slot (so Error.isError is true).
+                if cval.heap_index() == self.suppressederror_ctor
+                    && self.suppressederror_ctor != 0
+                {
+                    let error = args.first().copied().unwrap_or(Value::UNDEFINED);
+                    let suppressed = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                    let message = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                    let msg_val = if message != Value::UNDEFINED {
+                        Some(self.to_str_value(message)?)
+                    } else {
+                        None
+                    };
+                    let attr = PropAttr {
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    };
+                    if let HeapObj::Object(map) = self.heap.get_mut(obj.heap_index()) {
+                        if let Some(mv) = msg_val {
+                            map.define("message", mv, attr);
+                        }
+                        map.define("error", error, attr);
+                        map.define("suppressed", suppressed, attr);
+                    }
+                    self.error_data.insert(obj.heap_index());
                     return Ok(obj);
                 }
                 if let Some(k) = self.error_ctors.iter().position(|&c| c == cval.heap_index()) {
@@ -3135,6 +3177,19 @@ impl<'p> Vm<'p> {
                 let it = self.get_prop(v, "@@iterator")?;
                 self.is_callable(it)
             }
+            // Array destructuring's GetIterator reaches
+            // %TypedArray%.prototype.values, whose ValidateTypedArray throws for
+            // a detached or out-of-bounds view (a fixed-length view over a
+            // shrunk resizable buffer). The positional fast path below must
+            // surface the same TypeError instead of reading undefineds.
+            HeapObj::TypedArray { .. } => {
+                if self.ta_effective_len(v.heap_index()).is_none() {
+                    return Err(Thrown(
+                        "TypeError: TypedArray is detached or out of bounds".into(),
+                    ));
+                }
+                false
+            }
             // A plain array: fast-path the default iterator (direct indexing), but
             // honour a replaced Array.prototype[Symbol.iterator] by draining via
             // the iterator protocol (array destructuring uses it per spec).
@@ -3247,6 +3302,16 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn iterator_close(&mut self, iter: Value) -> Result<(), Thrown> {
         self.iterator_close_inner(iter, true)
+    }
+
+    /// IteratorClose on an ALREADY-failing path (IfAbruptCloseIterator): any
+    /// throw from `return()` is swallowed AND the original failure's
+    /// `pending_throw` VALUE is preserved, so the close's own error cannot
+    /// clobber the identity of the error being propagated.
+    pub(crate) fn iterator_close_quiet(&mut self, iter: Value) {
+        let saved = self.pending_throw.take();
+        let _ = self.iterator_close(iter);
+        self.pending_throw = saved;
     }
 
     /// `Object.fromEntries(iterable)` = AddEntriesFromIterable: RequireObjectCoercible,

@@ -494,8 +494,8 @@ impl<'p> Vm<'p> {
                 let comp = self.date_components(args)?;
                 Ok(match comp {
                     Some(mut c) => {
-                        c[0] = legacy_year(c[0]);
-                        time_clip(ms_from_utc(c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
+                        c[0] = legacy_year_f64(c[0]);
+                        time_clip(ms_from_utc_f64(c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
                     }
                     None => f64::NAN,
                 })
@@ -506,8 +506,11 @@ impl<'p> Vm<'p> {
     /// Coerce up to 7 Date component args (y, mo0, day, h, mi, s, ms) via ToNumber
     /// — invoking each arg's `valueOf` in ORDER (all coerced even if an earlier one
     /// is NaN, so side effects match spec). Returns `None` if any component is NaN.
-    fn date_components(&mut self, args: &[Value]) -> Result<Option<[i64; 7]>, Thrown> {
-        let mut comp = [0i64, 0, 1, 0, 0, 0, 0];
+    /// Components stay in the Number domain (ToInteger-truncated f64) — MakeTime/
+    /// MakeDay arithmetic is IEEE f64, and a value like 8e10 hours must not be
+    /// squeezed through i64 day/ms math.
+    fn date_components(&mut self, args: &[Value]) -> Result<Option<[f64; 7]>, Thrown> {
+        let mut comp = [0.0f64, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         let mut any_non_finite = false;
         for (i, &v) in args.iter().enumerate().take(7) {
             let n = self.to_number_coerce(v)?;
@@ -517,7 +520,7 @@ impl<'p> Vm<'p> {
             if !n.is_finite() {
                 any_non_finite = true;
             }
-            comp[i] = if n.is_finite() { n as i64 } else { 0 };
+            comp[i] = if n.is_finite() { n.trunc() } else { 0.0 };
         }
         Ok(if any_non_finite { None } else { Some(comp) })
     }
@@ -529,8 +532,8 @@ impl<'p> Vm<'p> {
         }
         Ok(match self.date_components(args)? {
             Some(mut c) => {
-                c[0] = legacy_year(c[0]);
-                time_clip(ms_from_utc(c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
+                c[0] = legacy_year_f64(c[0]);
+                time_clip(ms_from_utc_f64(c[0], c[1], c[2], c[3], c[4], c[5], c[6]))
             }
             None => f64::NAN,
         })

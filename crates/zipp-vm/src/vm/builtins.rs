@@ -333,9 +333,22 @@ impl<'p> Vm<'p> {
         } else {
             "Object"
         };
-        // A string @@toStringTag overrides the builtin tag.
-        if this.is_heap() {
-            let tag = self.get_prop(this, "@@toStringTag")?;
+        // A string @@toStringTag overrides the builtin tag. Step 15 reads it from
+        // ToObject(this), so a primitive number/boolean consults its wrapper
+        // prototype (`Boolean.prototype[Symbol.toStringTag] = 'x'` retags `true`).
+        // String/Symbol/BigInt primitives are heap values here and walk their
+        // prototype chain through get_prop directly.
+        let tag_src = if this.is_heap() {
+            Some(this)
+        } else if this.is_number() && self.num_proto != 0 {
+            Some(Value::heap(self.num_proto))
+        } else if this.is_bool() && self.bool_proto != 0 {
+            Some(Value::heap(self.bool_proto))
+        } else {
+            None
+        };
+        if let Some(src) = tag_src {
+            let tag = self.get_prop(src, "@@toStringTag")?;
             if tag.is_heap() && self.heap.is_str_like(tag.heap_index()) {
                 return Ok(self.display(tag));
             }

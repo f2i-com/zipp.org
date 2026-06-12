@@ -156,7 +156,10 @@ impl<'p> Vm<'p> {
     /// otherwise the value is spreadable iff it is an Array. Non-objects are never
     /// spreadable. Used by `Array.prototype.concat`.
     pub(crate) fn is_concat_spreadable(&mut self, v: Value) -> Result<bool, Thrown> {
-        if !v.is_heap() {
+        // Non-OBJECTS are never spreadable (step 1: If O is not an Object,
+        // return false) — including heap-allocated string/symbol/bigint
+        // PRIMITIVES, even when `String.prototype[@@isConcatSpreadable]` is set.
+        if !self.is_object_value(v) {
             return Ok(false);
         }
         let flag = self.get_prop(v, "@@isConcatSpreadable")?;

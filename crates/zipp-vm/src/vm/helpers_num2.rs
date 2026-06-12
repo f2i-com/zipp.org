@@ -218,68 +218,105 @@ pub(crate) fn sum_precise(nums: &[f64]) -> f64 {
     if has_neg_inf {
         return f64::NEG_INFINITY;
     }
-    let mut partials: Vec<f64> = Vec::new();
-    for &xi in nums {
-        let mut x = xi;
-        let mut i = 0usize;
-        for j in 0..partials.len() {
-            let mut y = partials[j];
-            if x.abs() < y.abs() {
-                std::mem::swap(&mut x, &mut y);
-            }
-            let hi = x + y;
-            // If combining would overflow to ±∞ while both are finite, keep `y` as a
-            // separate partial and carry `x` unchanged — so large same-sign values
-            // that later cancel (1e308 + 1e308 + … − 1e308 − 1e308) don't spuriously
-            // produce ∞/NaN.
-            if hi.is_infinite() && x.is_finite() {
-                partials[i] = y;
-                i += 1;
-                continue;
-            }
-            let lo = y - (hi - x);
-            if lo != 0.0 {
-                partials[i] = lo;
-                i += 1;
-            }
-            x = hi;
+    // Exact fixed-point accumulation: every finite f64 is ±m·2^E with m < 2^53
+    // and E ∈ [-1074, 971], so the exact sum of ANY number of them fits a
+    // ~2100-bit signed fixed-point accumulator (bit p holds weight 2^(p−1074)).
+    // Per-limb i128s defer carries (2^63 elements of headroom). The value is
+    // rounded ONCE at the end (to nearest, ties to even), so the result is
+    // correct even where intermediate f64 partial sums would overflow:
+    // MAX + MAX − tiny must round DOWN to MAX_F64, not blow up to Infinity.
+    const LIMBS: usize = 36; // 2304 bits ≥ top weight 2^1023 ⇒ bit 2097, + headroom
+    let mut acc = [0i128; LIMBS];
+    for &x in nums {
+        if x == 0.0 {
+            continue;
         }
-        partials.truncate(i);
-        partials.push(x);
+        let bits = x.to_bits();
+        let neg = bits >> 63 != 0;
+        let exp_field = ((bits >> 52) & 0x7ff) as i32;
+        let frac = bits & ((1u64 << 52) - 1);
+        let (m, e) = if exp_field == 0 {
+            (frac, -1074) // subnormal
+        } else {
+            (frac | (1u64 << 52), exp_field - 1075)
+        };
+        let pos = (e + 1074) as usize;
+        let (idx, sh) = (pos / 64, pos % 64);
+        let wide = (m as u128) << sh; // ≤ 116 bits — spans two limbs
+        let (lo, hi) = (wide as u64, (wide >> 64) as u64);
+        if neg {
+            acc[idx] -= lo as i128;
+            acc[idx + 1] -= hi as i128;
+        } else {
+            acc[idx] += lo as i128;
+            acc[idx + 1] += hi as i128;
+        }
     }
-    let n = partials.len();
-    if n == 0 {
-        return if all_neg_zero { -0.0 } else { 0.0 };
+    // Carry-normalize into a base-2^64 magnitude + sign. A final carry of −1
+    // means the whole number is negative — two's-complement it back.
+    let mut limbs = [0u64; LIMBS];
+    let mut carry: i128 = 0;
+    for i in 0..LIMBS {
+        let total = acc[i] + carry;
+        let rem = (total & 0xFFFF_FFFF_FFFF_FFFF_i128) as u64; // total mod 2^64 ∈ [0, 2^64)
+        carry = (total - rem as i128) >> 64;
+        limbs[i] = rem;
     }
-    // Correctly-rounded final summation (round-half-to-even), mirroring CPython's
-    // msum tail: add the (non-overlapping, increasing) partials from the largest
-    // down until the low part is non-zero, then resolve a halfway tie to even.
-    let mut hi = partials[n - 1];
-    let mut lo = 0.0;
-    let mut i = n - 1;
-    while i > 0 {
-        i -= 1;
-        let x = hi;
-        let y = partials[i];
-        hi = x + y;
-        lo = y - (hi - x);
-        if lo != 0.0 {
+    let negative = carry < 0;
+    if negative {
+        let mut c = 1u64;
+        for l in limbs.iter_mut() {
+            let (s, o) = (!*l).overflowing_add(c);
+            *l = s;
+            c = u64::from(o);
+        }
+    }
+    // Top set bit ⇒ the result's binade; round at its 53-bit ULP (clamped to
+    // bit 0 — everything at or below 2^-1074 is exact in a subnormal result).
+    let mut top: i64 = -1;
+    for i in (0..LIMBS).rev() {
+        if limbs[i] != 0 {
+            top = (i as i64) * 64 + (63 - limbs[i].leading_zeros() as i64);
             break;
         }
     }
-    if i > 0
-        && ((lo < 0.0 && partials[i - 1] < 0.0) || (lo > 0.0 && partials[i - 1] > 0.0))
-    {
-        let y = lo * 2.0;
-        let x = hi + y;
-        if y == x - hi {
-            hi = x;
-        }
+    if top < 0 {
+        return if all_neg_zero { -0.0 } else { 0.0 };
     }
-    if hi == 0.0 && all_neg_zero {
-        -0.0
+    let ulp = (top - 52).max(0); // bit position of the result's lowest kept bit
+    let bit_at = |p: i64| (limbs[(p / 64) as usize] >> (p % 64)) & 1 == 1;
+    // The 53 (or fewer) kept bits, as an integer.
+    let q0 = {
+        let (idx, sh) = ((ulp / 64) as usize, (ulp % 64) as u32);
+        let lo = limbs[idx] >> sh;
+        let hi = if sh > 0 && idx + 1 < LIMBS { limbs[idx + 1] << (64 - sh) } else { 0 };
+        lo | hi
+    };
+    let round = ulp > 0 && bit_at(ulp - 1);
+    let sticky = ulp > 1 && {
+        let (idx, sh) = (((ulp - 1) / 64) as usize, ((ulp - 1) % 64) as u32);
+        limbs[..idx].iter().any(|&l| l != 0) || (limbs[idx] & ((1u64 << sh) - 1)) != 0
+    };
+    let q = if round && (sticky || q0 & 1 == 1) { q0 + 1 } else { q0 };
+    // Exact power of two for the scale; q·2^(ulp−1074) is exact (≤ 53
+    // significant bits landing on representable weights), and a magnitude at
+    // or beyond 2^1024 overflows to Infinity in the multiply per IEEE 754 —
+    // which IS the correctly-rounded answer there.
+    let k = (ulp - 1074) as i32;
+    let scale = if k >= -1022 {
+        if k <= 1023 {
+            f64::from_bits(((k + 1023) as u64) << 52)
+        } else {
+            f64::INFINITY
+        }
     } else {
-        hi
+        f64::from_bits(1u64 << (k + 1074)) // subnormal power of two
+    };
+    let mag = (q as f64) * scale;
+    if negative {
+        -mag
+    } else {
+        mag
     }
 }
 
@@ -378,6 +415,37 @@ pub(crate) fn legacy_year(y: i64) -> i64 {
     } else {
         y
     }
+}
+
+/// f64 twin of `legacy_year` for the Number-domain constructor path.
+pub(crate) fn legacy_year_f64(y: f64) -> f64 {
+    if (0.0..=99.0).contains(&y) {
+        1900.0 + y
+    } else {
+        y
+    }
+}
+
+/// Epoch ms from UTC components as the SPEC's MakeDay/MakeTime/MakeDate over
+/// f64 NUMBERS — with the spec's exact IEEE-754 association, so huge component
+/// values round/overflow exactly like `day × msPerDay + time` requires
+/// (`Date.UTC(1970, 0, 213503982336, 0, 0, 0, -18446744073709552000)` is the
+/// FINITE 34447360 — the two ~1.8e19 terms cancel only if each is rounded the
+/// way the spec's operation order produces). Components must be ToInteger'd
+/// (truncated) finite Numbers; a year too large for the i64 civil-day math is
+/// NaN (it would TimeClip to NaN regardless).
+pub(crate) fn ms_from_utc_f64(y: f64, mo0: f64, d: f64, h: f64, mi: f64, s: f64, ms: f64) -> f64 {
+    // MakeDay: ym = y + floor(m / 12), month = m modulo 12.
+    let ym = y + (mo0 / 12.0).floor();
+    let mn = mo0.rem_euclid(12.0);
+    if !ym.is_finite() || ym.abs() > 1.0e9 {
+        return f64::NAN;
+    }
+    let day = days_from_civil(ym as i64, mn as i64 + 1, 1) as f64 + d - 1.0;
+    // MakeTime: ((h·msPerHour + m·msPerMinute) + s·msPerSecond) + milli.
+    let time = ((h * 3_600_000.0 + mi * 60_000.0) + s * 1_000.0) + ms;
+    // MakeDate: day × msPerDay + time.
+    day * 86_400_000.0 + time
 }
 
 /// JS TimeClip: NaN if non-finite or |t| > 8.64e15 (±100M days); else truncate
@@ -520,7 +588,7 @@ pub(crate) fn parse_date(s: &str) -> f64 {
     // The human/RFC forms (toString/toUTCString) start with a weekday name; the
     // ISO forms start with a digit or a sign. Date.parse must round-trip both.
     if s.chars().next().map_or(false, |c| c.is_ascii_alphabetic()) {
-        return parse_rfc_date(s);
+        return time_clip(parse_rfc_date(s));
     }
     let (date, time) = match s.split_once(['T', ' ']) {
         Some((d, t)) => (d, Some(t)),
@@ -572,8 +640,10 @@ pub(crate) fn parse_date(s: &str) -> f64 {
             msec = f3.parse::<i64>().unwrap_or(0);
         }
     }
-    // mo here is 1-based from the string; ms_from_utc wants 0-based.
-    ms_from_utc(year, mo - 1, day, h, mi, sec, msec)
+    // mo here is 1-based from the string; ms_from_utc wants 0-based. Date.parse
+    // returns a TIME VALUE: TimeClip bounds it to ±8.64e15 ms (±100M days) —
+    // one ms past either end is NaN, not a number.
+    time_clip(ms_from_utc(year, mo - 1, day, h, mi, sec, msec))
 }
 
 /// `Number.prototype.toFixed(f)`. JS rounds half AWAY from zero — `(0.5).toFixed(0)`

@@ -216,6 +216,11 @@ impl<'p> Vm<'p> {
         {
             return Value::bool(false);
         }
+        // A RegExp's `lastIndex` is a non-configurable own property (writable,
+        // but never configurable) — `delete re.lastIndex` fails (false).
+        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+            return Value::bool(false);
+        }
         // An Array's `length` is a non-configurable own property — `delete arr.length`
         // fails (false), leaving the length intact. An `arguments` exotic is
         // Array-backed but its `length` IS configurable, so exclude it.
@@ -1260,6 +1265,19 @@ impl<'p> Vm<'p> {
                 c.statics.set(key, val);
             }
             _ => {}
+        }
+        // The GLOBAL object's own data properties ARE the realm's var/builtin
+        // bindings: keep an already-initialized, non-lexical global slot in
+        // sync so a bare read observes `globalThis.Object = fake` /
+        // `this['__declared'] = v`. (A never-declared name's uninitialized
+        // slot stays own-prop-backed — LoadGlobal's fallback reads it; a
+        // lexical let/const binding is not an object property at all.)
+        if idx == self.global_this && self.global_this != 0 && !self.global_name_is_lexical(key) {
+            if let Some(slot) = self.program.global_names.iter().position(|n| n == key) {
+                if !self.globals[slot].is_uninitialized() {
+                    self.globals[slot] = val;
+                }
+            }
         }
         if added {
             self.heap.bump_version(idx); // invalidate any JIT inline cache (vals realloc)

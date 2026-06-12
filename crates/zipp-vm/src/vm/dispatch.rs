@@ -255,7 +255,21 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::LoadNewTarget { dst } => {
-                        let nt = self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
+                        let mut nt =
+                            self.frames.last().map(|f| f.new_target).unwrap_or(Value::UNDEFINED);
+                        if nt == Value::UNDEFINED {
+                            // An ARROW frame has no own [[NewTarget]] — read the
+                            // lexically-captured one of its closure (recorded at
+                            // MakeArrow inside a constructed activation).
+                            let callee =
+                                self.frames.last().map(|f| f.callee).unwrap_or(Value::UNDEFINED);
+                            if callee.is_heap() {
+                                if let Some(&v) = self.closure_new_target.get(&callee.heap_index())
+                                {
+                                    nt = v;
+                                }
+                            }
+                        }
                         self.set(base, dst, nt);
                         ip += 1;
                     }
@@ -1823,21 +1837,21 @@ impl<'p> Vm<'p> {
                                         None => break,
                                     };
                                     if !self.is_object_value(e) {
-                                        let _ = self.iterator_close(iter);
+                                        self.iterator_close_quiet(iter);
                                         return Err(Thrown(
                                             "TypeError: Map iterable entry is not an object".into(),
                                         ));
                                     }
                                     let k = match self.get_index(e, Value::int(0)) {
                                         Ok(k) => k,
-                                        Err(err) => { let _ = self.iterator_close(iter); return Err(err); }
+                                        Err(err) => { self.iterator_close_quiet(iter); return Err(err); }
                                     };
                                     let v = match self.get_index(e, Value::int(1)) {
                                         Ok(v) => v,
-                                        Err(err) => { let _ = self.iterator_close(iter); return Err(err); }
+                                        Err(err) => { self.iterator_close_quiet(iter); return Err(err); }
                                     };
                                     if let Err(err) = self.call_value(adder, m, &[k, v]) {
-                                        let _ = self.iterator_close(iter);
+                                        self.iterator_close_quiet(iter);
                                         return Err(err);
                                     }
                                 }
@@ -1863,7 +1877,7 @@ impl<'p> Vm<'p> {
                                         None => break,
                                     };
                                     if let Err(err) = self.call_value(adder, set_v, &[e]) {
-                                        let _ = self.iterator_close(iter);
+                                        self.iterator_close_quiet(iter);
                                         return Err(err);
                                     }
                                 }
@@ -2282,7 +2296,7 @@ impl<'p> Vm<'p> {
                             1 => {
                                 v.is_heap()
                                     && (self.instance_of_class(v, c.heap_index())
-                                        || self.instanceof_via_proto(v, c))
+                                        || self.instanceof_via_proto(v, c)?)
                             }
                             2 => {
                                 // OrdinaryHasInstance step 4: a non-object
@@ -2301,7 +2315,7 @@ impl<'p> Vm<'p> {
                                         "TypeError: Function has non-object prototype in instanceof check".into(),
                                     ));
                                 }
-                                self.instanceof_via_proto(v, c)
+                                self.instanceof_via_proto(v, c)?
                             }
                             // A plain callable RHS: spec OrdinaryHasInstance â€” reads
                             // `C.prototype` via [[Get]] (a getter runs; a non-object
@@ -2769,6 +2783,26 @@ impl<'p> Vm<'p> {
                             if let Some(&home) = self.closure_home.get(&callee.heap_index()) {
                                 self.closure_home.insert(v.heap_index(), home);
                             }
+                        }
+                        // ... and the defining activation's `new.target` (an arrow
+                        // has none of its own; `(_ => new.target)()` inside `new F()`
+                        // must see F). A nested arrow chains through the enclosing
+                        // arrow's captured value.
+                        let nt = {
+                            let fnt = self.frames[frame_idx].new_target;
+                            if fnt != Value::UNDEFINED {
+                                fnt
+                            } else if callee.is_heap() {
+                                self.closure_new_target
+                                    .get(&callee.heap_index())
+                                    .copied()
+                                    .unwrap_or(Value::UNDEFINED)
+                            } else {
+                                Value::UNDEFINED
+                            }
+                        };
+                        if nt != Value::UNDEFINED {
+                            self.closure_new_target.insert(v.heap_index(), nt);
                         }
                         // ... and any dynamic EvalScope of the defining frame.
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
@@ -3387,6 +3421,26 @@ impl<'p> Vm<'p> {
                                 if kind & 7 == 0 {
                                     // PrivateFieldAdd/Set: upsert (the add case
                                     // is the field initializer's first store).
+                                    // Adding a NEW entry to a non-extensible
+                                    // object is a TypeError, checked AT ADD time
+                                    // — the initializer itself may have sealed
+                                    // the instance (`#g = (Object.
+                                    // preventExtensions(this), v)`). Re-assigning
+                                    // an existing entry is PrivateFieldSet and
+                                    // unaffected.
+                                    if o.is_heap()
+                                        && !self
+                                            .private_fields
+                                            .get(&o.heap_index())
+                                            .is_some_and(|m| {
+                                                m.keys().any(|(b, n)| *b == b2 && n == &key)
+                                            })
+                                        && !self.target_is_extensible(o)
+                                    {
+                                        return Err(Thrown(
+                                            "TypeError: cannot define private elements on a non-extensible object".into(),
+                                        ));
+                                    }
                                     self.private_field_set(o, b2, &key, v, true);
                                 } else if kind & 4 != 0 {
                                     let s = self
@@ -3423,6 +3477,21 @@ impl<'p> Vm<'p> {
                                         .get(&own)
                                         .is_some_and(|ns| ns.iter().any(|(n, k)| n == &key && *k == 8));
                                     if declares {
+                                        // PrivateFieldAdd on the class object:
+                                        // the initializer may have sealed it
+                                        // (preventExtensions(C) before the add).
+                                        if !self
+                                            .private_fields
+                                            .get(&o.heap_index())
+                                            .is_some_and(|m| {
+                                                m.keys().any(|(b, n)| *b == own && n == &key)
+                                            })
+                                            && !self.target_is_extensible(o)
+                                        {
+                                            return Err(Thrown(
+                                                "TypeError: cannot define private elements on a non-extensible object".into(),
+                                            ));
+                                        }
                                         self.private_field_set(o, own, &key, v, true);
                                         ip += 1;
                                         continue;
@@ -5005,8 +5074,15 @@ impl<'p> Vm<'p> {
                                         "TypeError: iterator result is not an object".into(),
                                     ));
                                 }
+                                // IteratorStep reads only `done`; IteratorValue (the
+                                // `value` Get — observable via a getter) happens ONLY
+                                // when the iterator is not done.
                                 let done = self.get_prop(res, "done")?;
-                                let val = self.get_prop(res, "value")?;
+                                let val = if self.truthy(done) {
+                                    Value::UNDEFINED
+                                } else {
+                                    self.get_prop(res, "value")?
+                                };
                                 self.set(base, value_dst, val);
                                 self.set(base, done_dst, done);
                                 ip += 1;

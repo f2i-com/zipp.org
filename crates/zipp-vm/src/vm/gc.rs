@@ -162,6 +162,9 @@ impl Vm<'_> {
         for v in self.closure_home.values() {
             root_val!(*v);
         }
+        for v in self.closure_new_target.values() {
+            root_val!(*v);
+        }
         for v in self.gen_callee.values() {
             root_val!(*v);
         }
@@ -414,11 +417,13 @@ impl Vm<'_> {
         self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.error_data.retain(|&k| marks[k as usize]);
         self.arguments_objs.retain(|&k, _| marks[k as usize]);
+        self.gen_args_obj.retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
         self.fn_name_cells.retain(|&k| marks[k as usize]);
         self.gen_callee.retain(|&k, _| marks[k as usize]);
         self.module_body_results.retain(|&k| marks[k as usize]);
         self.module_namespaces.retain(|&k, _| marks[k as usize]);
         self.closure_home.retain(|&k, _| marks[k as usize]);
+        self.closure_new_target.retain(|&k, _| marks[k as usize]);
         self.dispose_stacks.retain(|&k, _| marks[k as usize]);
         // Pure-bytes side table (no Values to trace): hygiene-retain only, so a
         // recycled RegExp slot can't inherit a dead pattern's exact source.

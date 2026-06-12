@@ -359,6 +359,22 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // %String.prototype% is itself a String exotic object whose [[StringData]]
+        // is the empty String, so it owns `length: 0` (non-writable, non-enumerable,
+        // non-configurable) — `typeof String.prototype.length === "number"`.
+        if let HeapObj::Object(p) = self.heap.get_mut(str_proto) {
+            p.define(
+                "length",
+                Value::int(0),
+                PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                },
+            );
+        }
         let num_proto = build(self, &num_methods, None);
         let set_proto = build(self, &set_methods, None);
         // `Set.prototype.keys` IS `%Set.prototype.values%` — the SAME function object

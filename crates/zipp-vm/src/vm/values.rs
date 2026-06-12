@@ -324,6 +324,25 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Infallible extensibility of a plain heap target (no proxy traps): an
+    /// Object's flag; string/symbol/bigint primitives are never extensible
+    /// targets; everything else (Array/Class/Date/…) keeps its flag in the
+    /// arr_props side table (where preventExtensions stores it).
+    pub(crate) fn target_is_extensible(&self, v: Value) -> bool {
+        if !v.is_heap() {
+            return true;
+        }
+        match self.heap.get(v.heap_index()) {
+            HeapObj::Object(m) => m.extensible,
+            HeapObj::Str(_)
+            | HeapObj::Cons { .. }
+            | HeapObj::Symbol { .. }
+            | HeapObj::BigInt(_)
+            | HeapObj::BigIntBig(_) => false,
+            _ => self.arr_props.get(&v.heap_index()).map_or(true, |m| m.extensible),
+        }
+    }
+
     /// Checked InitializeInstanceElements / PrivateBrandAdd / PrivateFieldAdd
     /// entry: adding `classval`'s private elements to `inst` (when the class
     /// declares any) throws TypeError if `inst` ALREADY carries this class's
@@ -968,7 +987,10 @@ impl<'p> Vm<'p> {
         &mut self,
         args: Vec<Value>,
         callee: Value,
-        is_strict: bool,
+        // Strictness no longer changes the shape directly — every UNMAPPED
+        // arguments object (strict, or sloppy with non-simple params) gets the
+        // %ThrowTypeError% callee; kept for call-site readability.
+        _is_strict: bool,
         mapinfo: Option<(usize, usize, usize)>,
     ) -> Value {
         let obj_proto = self.obj_proto;
@@ -977,8 +999,11 @@ impl<'p> Vm<'p> {
         // function's strict arguments object gets the CHILD's per-realm
         // singleton (stable within the realm, distinct across realms). Fall
         // back to a fresh thrower only in the unlikely event a strict
-        // arguments object is built pre-setup.
-        let thrower = if is_strict {
+        // arguments object is built pre-setup. EVERY unmapped arguments object
+        // gets the poison pill — strict functions AND sloppy ones with a
+        // non-simple parameter list (CreateUnmappedArgumentsObject step 8).
+        let unmapped = mapinfo.is_none();
+        let thrower = if unmapped {
             let r =
                 if self.realm_global_objs.is_empty() { 0 } else { self.get_function_realm(callee) };
             if r != 0 {
@@ -1030,7 +1055,7 @@ impl<'p> Vm<'p> {
                 setter: Value::UNDEFINED,
             },
         );
-        if is_strict {
+        if unmapped {
             m.define(
                 "callee",
                 thrower,
@@ -1056,6 +1081,23 @@ impl<'p> Vm<'p> {
             );
         }
         Value::heap(idx)
+    }
+
+    /// Re-link a resumed generator/async activation's MAPPED `arguments`
+    /// object (recorded in `gen_args_obj` at allocation) to the frame just
+    /// pushed at `frame_idx`/`base`, so its [[ParameterMap]] aliases the live
+    /// register window again for this resumption. While suspended, the
+    /// liveness check in `args_mapped_get`/`_set` fails and the dense store
+    /// (the escape snapshot) answers instead.
+    pub(crate) fn relink_mapped_args(&mut self, state_idx: u32, frame_idx: usize, base: usize) {
+        let Some(&aidx) = self.gen_args_obj.get(&state_idx) else { return };
+        if let Some(Some(m)) = self.arguments_objs.get_mut(&aidx) {
+            m.frame_idx = frame_idx;
+            m.base = base;
+            if let Some(f) = self.frames.get_mut(frame_idx) {
+                f.args_obj = aidx;
+            }
+        }
     }
 
     /// Mapped-arguments [[Get]]: if `idx` is a LIVE mapped arguments object

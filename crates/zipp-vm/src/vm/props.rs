@@ -192,14 +192,16 @@ impl<'p> Vm<'p> {
         match self.proxy_trap(handler, "ownKeys")? {
             Some(trap) => {
                 let r = self.call_value(trap, handler, &[target])?;
-                let items = match r.is_heap().then(|| self.heap.get(r.heap_index())) {
-                    Some(HeapObj::Array(items)) => items.clone(),
-                    _ => {
-                        return Err(Thrown(
-                            "TypeError: proxy [[OwnPropertyKeys]] must return an Array".into(),
-                        ))
-                    }
-                };
+                // CreateListFromArrayLike: ANY object with a length is accepted
+                // (its indexed Gets — possibly getters — are observable); only a
+                // non-object trap result is a TypeError.
+                if !self.is_object_value(r) {
+                    return Err(Thrown(
+                        "TypeError: proxy [[OwnPropertyKeys]] must return an array-like object"
+                            .into(),
+                    ));
+                }
+                let items = self.create_list_from_array_like(r)?;
                 // CreateListFromArrayLike with «String, Symbol» element-type check
                 // and the no-duplicate-entries invariant (spec 10.5.11 steps 8-9).
                 let mut seen: Vec<String> = Vec::with_capacity(items.len());
@@ -803,6 +805,14 @@ impl<'p> Vm<'p> {
                 // ToPropertyDescriptor (read_descriptor) requires an object, then we
                 // re-emit a COMPLETE descriptor (missing fields take their defaults).
                 let (value, get, set, wr, en, cf) = self.read_descriptor(r)?;
+                // IsCompatiblePropertyDescriptor's extensibility clause: the trap
+                // cannot report a property the target lacks when the target is
+                // non-extensible (10.5.5 steps 20-21 with targetDesc undefined).
+                if ordinary && !t_own && !t_ext {
+                    return Err(Thrown(
+                        "TypeError: proxy getOwnPropertyDescriptor reported a new property on a non-extensible target".into(),
+                    ));
+                }
                 // A non-configurable reported descriptor requires a matching
                 // non-configurable target property (and, for a non-writable data
                 // descriptor, a non-writable target).
@@ -1657,9 +1667,17 @@ impl<'p> Vm<'p> {
         if o.is_heap() && o.heap_index() == self.obj_proto {
             return Ok(false);
         }
+        // Non-Object heap kinds (Array/TypedArray/Date/…) keep their extensible
+        // flag in the arr_props side table; primitive-like heap objects are never
+        // extensible targets here.
         let extensible = match self.heap.get(o.heap_index()) {
             HeapObj::Object(m) => m.extensible,
-            _ => true,
+            HeapObj::Str(_)
+            | HeapObj::Cons { .. }
+            | HeapObj::Symbol { .. }
+            | HeapObj::BigInt(_)
+            | HeapObj::BigIntBig(_) => false,
+            _ => self.arr_props.get(&o.heap_index()).map_or(true, |m| m.extensible),
         };
         if !extensible {
             return Ok(false);
@@ -2858,8 +2876,14 @@ impl<'p> Vm<'p> {
         }
         // A global LEXICAL is not a global-object property: invisible to
         // property reflection (gopd / hasOwnProperty / `globalThis.x` reads),
-        // though the bare identifier still reads its slot.
+        // though the bare identifier still reads its slot. A PRE-EXISTING
+        // builtin property of the same name (`let Array` shadowing %Array%)
+        // remains an own property of the global object, so fall through to the
+        // builtin table for those.
         if self.global_name_is_lexical(name) {
+            if let Some(&idx) = self.builtin_globals.get(name) {
+                return Some(Value::heap(idx));
+            }
             return None;
         }
         if let Some(slot) = self.program.global_names.iter().position(|n| n == name) {
@@ -3642,6 +3666,47 @@ impl<'p> Vm<'p> {
             // observed (e.g. by `@@match`/`@@replace`, which read Get(rx,"flags")),
             // rather than synthesizing from the internal flag string.
             if key == "flags" {
+                // Spec Get resolves to %RegExp.prototype%'s `flags` accessor.
+                // When that slot was REPLACED (a defineProperty'd getter or data
+                // property, possibly on a custom prototype chain), defer to it —
+                // only the intrinsic accessor synthesizes from the per-flag
+                // getters below (`''.matchAll(/a/g)` must observe a redefined
+                // RegExp.prototype.flags returning undefined).
+                let mut p = self.proto_of.get(&obj.heap_index()).copied().unwrap_or(
+                    if self.regexp_proto != 0 {
+                        Value::heap(self.regexp_proto)
+                    } else {
+                        Value::NULL
+                    },
+                );
+                for _ in 0..32 {
+                    if !p.is_heap() {
+                        break;
+                    }
+                    let pi = p.heap_index();
+                    let entry = match self.heap.get(pi) {
+                        HeapObj::Object(m) => m.pos("flags").map(|i| (m.vals[i], m.attrs[i])),
+                        _ => None,
+                    };
+                    if let Some((raw, attr)) = entry {
+                        let intrinsic = raw.is_heap()
+                            && matches!(self.heap.get(raw.heap_index()),
+                                HeapObj::Native(id) if *id == native::REGEXP_GET_FLAGS);
+                        if intrinsic {
+                            break;
+                        }
+                        return if attr.accessor {
+                            if raw == Value::UNDEFINED {
+                                Ok(Value::UNDEFINED)
+                            } else {
+                                self.call_value(raw, receiver, &[])
+                            }
+                        } else {
+                            Ok(raw)
+                        };
+                    }
+                    p = self.proto_of.get(&pi).copied().unwrap_or(Value::NULL);
+                }
                 let mut out = String::new();
                 for (prop, ch) in [
                     ("hasIndices", 'd'),

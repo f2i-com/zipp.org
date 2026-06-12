@@ -60,11 +60,23 @@ impl<'p> Vm<'p> {
             let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
             regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
         }
-        // `arguments` (a generator that references it): an array of ALL actual args,
-        // built here at call time like the ordinary frame setup does.
+        // `arguments` (a generator that references it) — the spec-shaped object,
+        // MAPPED for a sloppy callee with simple params (aliases the formal
+        // registers; re-linked to the live window on every resume).
+        let (is_strict, simple) = {
+            let p = self.func(func_id as usize);
+            (p.is_strict, p.simple_params)
+        };
+        let new_base = self.regs.len();
+        let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+            let mapinfo =
+                (!is_strict && simple).then(|| (self.frames.len(), new_base, param_count));
+            let arr = self.build_arguments_object(args.to_vec(), gen_callee, is_strict, mapinfo);
             regs[areg as usize] = arr;
+            if mapinfo.is_some() {
+                args_obj = arr.heap_index();
+            }
         }
         // FunctionDeclarationInstantiation runs eagerly at CALL time: splice the
         // window onto the live register file and run the parameter prologue
@@ -72,7 +84,6 @@ impl<'p> Vm<'p> {
         // destructuring throw or a default's side effect therefore happens at the
         // call, per spec — not at the first `.next()`. The generator is then parked
         // AT the marker; the first `.next()` resumes just past it to run the body.
-        let new_base = self.regs.len();
         if self.regs_would_overflow(new_base + reg_count) {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
@@ -81,7 +92,7 @@ impl<'p> Vm<'p> {
             self.regs_hw = new_base + reg_count;
         }
         let stop = self.frames.len();
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX,
+        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX,
             func: func_id,
             base: new_base,
             ip: 0,
@@ -113,6 +124,11 @@ impl<'p> Vm<'p> {
             if gen_callee != Value::UNDEFINED {
                 // Resumes re-bind this as Frame.callee (LoadCallee identity).
                 self.gen_callee.insert(g, gen_callee);
+            }
+            if args_obj != u32::MAX {
+                // Mapped arguments: each resume re-links the [[ParameterMap]]
+                // to the freshly spliced window.
+                self.gen_args_obj.insert(g, args_obj);
             }
             // A param-prologue direct eval created a dynamic EvalScope on the
             // (now-parked) frame: keep it resolvable across suspensions.
@@ -160,8 +176,13 @@ impl<'p> Vm<'p> {
                 GenState::Suspended(ip) => self.gen_resume(idx, fid, closure, ip, GenResumeMode::Return(arg0)),
             },
             "throw" => match state {
-                // Throwing into a completed generator just re-throws at the call site.
-                GenState::Completed => Err(Thrown(self.throw_message(arg0))),
+                // Throwing into a completed generator re-throws the EXACT value at
+                // the call site (pending_throw preserves its identity — `iter.throw(
+                // new E())` must surface that E instance, not a synthesized Error).
+                GenState::Completed => {
+                    self.pending_throw = Some(arg0);
+                    Err(Thrown(self.throw_message(arg0)))
+                }
                 GenState::Running => Err(Thrown("TypeError: generator is already running".into())),
                 // Resume the suspended body, injecting the throw at the yield point so
                 // an enclosing `try`/`catch` (whose handlers we parked) can catch it.
@@ -231,6 +252,8 @@ impl<'p> Vm<'p> {
         if let Some(&sc) = self.closure_eval_scope.get(&idx) {
             self.frames[stop].eval_scope = sc;
         }
+        // A mapped `arguments` object aliases this resumption's register window.
+        self.relink_mapped_args(idx, stop, new_base);
         // A `yield*` suspension point (YieldDelegate) consumes ALL three resume
         // modes by DELIVERING (mode-code, value) into the loop's registers — the
         // loop then forwards next/throw/return to the inner iterator. This must NOT
@@ -752,10 +775,22 @@ impl<'p> Vm<'p> {
             let extra: Vec<Value> = args.get(param_count..).unwrap_or(&[]).to_vec();
             regs[rr as usize] = Value::heap(self.heap.alloc(HeapObj::Array(extra)));
         }
-        // `arguments` (an async function that references it).
+        // `arguments` (an async function that references it) — the spec-shaped
+        // object, MAPPED for a sloppy callee with simple params. No frame exists
+        // yet (drive_async pushes one per resumption and re-links), so the map
+        // starts parked on a dead frame index.
+        let mut args_obj = u32::MAX;
         if let Some(areg) = arguments_reg {
-            let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
+            let (is_strict, simple) = {
+                let p = self.func(func_id as usize);
+                (p.is_strict, p.simple_params)
+            };
+            let mapinfo = (!is_strict && simple).then(|| (usize::MAX, 0usize, param_count));
+            let arr = self.build_arguments_object(args.to_vec(), gen_callee, is_strict, mapinfo);
             regs[areg as usize] = arr;
+            if mapinfo.is_some() {
+                args_obj = arr.heap_index();
+            }
         }
         let result = self.alloc_promise();
         // A MODULE BODY activation: its result promise settles with undefined
@@ -777,6 +812,11 @@ impl<'p> Vm<'p> {
         if gen_callee != Value::UNDEFINED {
             // Every drive/resume binds this as Frame.callee (LoadCallee identity).
             self.gen_callee.insert(idx, gen_callee);
+        }
+        if args_obj != u32::MAX {
+            // Mapped arguments: every drive re-links the [[ParameterMap]] to
+            // the freshly spliced window.
+            self.gen_args_obj.insert(idx, args_obj);
         }
         // Run from the top until the first await suspends it (or it finishes —
         // settling `result` either way).
@@ -1883,6 +1923,8 @@ impl<'p> Vm<'p> {
             // self-name identity survives suspension).
             callee: self.gen_callee.get(&idx).copied().unwrap_or(Value::UNDEFINED),
         });
+        // A mapped `arguments` object aliases this resumption's register window.
+        self.relink_mapped_args(idx, stop, new_base);
         // Position the resume point and deliver the awaited value / rejection.
         let outcome = if resume_ip == usize::MAX {
             self.run_loop(stop)
