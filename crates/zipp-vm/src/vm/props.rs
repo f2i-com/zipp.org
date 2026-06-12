@@ -1715,6 +1715,10 @@ impl<'p> Vm<'p> {
             p = next;
         }
         self.proto_of.insert(o.heap_index(), proto);
+        // Replacing a live object's [[Prototype]] changes what every chain
+        // lookup THROUGH it resolves — bump its version so version-guarded
+        // caches (the interpreter property/call ICs' chain hops) miss.
+        self.heap.bump_version(o.heap_index());
         Ok(true)
     }
 

@@ -182,6 +182,11 @@ pub struct IcEntry {
     slot: u32,
 }
 
+/// Dense function-tier states (see `Jit::fn_state`).
+pub const FN_COLD: u8 = 0;
+pub const FN_COMPILED: u8 = 1;
+pub const FN_DEAD: u8 = 2;
+
 /// Per-function JIT state: call counts, compiled code, and a blacklist of
 /// functions that aren't eligible (so we don't re-attempt them every tick).
 /// The `region_*` maps mirror this for OSR loop regions, keyed by
@@ -191,6 +196,11 @@ pub struct Jit {
     counts: FxHashMap<u32, u32>,
     compiled: FxHashMap<u32, JitFn>,
     blacklist: FxHashSet<u32>,
+    /// Dense per-func_id tier state ([`FN_COLD`]/[`FN_COMPILED`]/[`FN_DEAD`]),
+    /// grown on demand. One array read on EVERY interpreted frame entry
+    /// replaces the 2-3 hash probes (`compiled` miss + `blacklist` hit) that
+    /// otherwise tax each call to a never-compiled function.
+    fn_state: Vec<u8>,
     regions: FxHashMap<(u32, u32), Region>,
     region_counts: FxHashMap<(u32, u32), u32>,
     region_blacklist: FxHashSet<(u32, u32)>,
@@ -257,6 +267,20 @@ impl Jit {
         *c == JIT_THRESHOLD
     }
 
+    /// Dense tier state of `func_id` — the frame-entry fast path.
+    #[inline]
+    pub fn fn_state(&self, func_id: u32) -> u8 {
+        self.fn_state.get(func_id as usize).copied().unwrap_or(FN_COLD)
+    }
+
+    fn set_fn_state(&mut self, func_id: u32, s: u8) {
+        let i = func_id as usize;
+        if self.fn_state.len() <= i {
+            self.fn_state.resize(i + 1, FN_COLD);
+        }
+        self.fn_state[i] = s;
+    }
+
     /// Attempt to compile `proto` (id `func_id`). On success it becomes
     /// available via `get`; on failure the id is blacklisted and never retried.
     /// `self_call_helper` is the address of the depth-guarded Rust trampoline
@@ -274,9 +298,11 @@ impl Jit {
         match compile_proto(proto, func_id, self_call_helper, self_val_bits) {
             Some(f) => {
                 self.compiled.insert(func_id, f);
+                self.set_fn_state(func_id, FN_COMPILED);
             }
             None => {
                 self.blacklist.insert(func_id);
+                self.set_fn_state(func_id, FN_DEAD);
             }
         }
     }
@@ -331,12 +357,26 @@ impl Jit {
     /// compiled nor blacklisted — the caller should then attempt `compile_region`.
     pub fn record_region(&mut self, func_id: u32, entry_ip: u32) -> bool {
         let key = (func_id, entry_ip);
-        if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
+        // Called only after a `get_region` miss on the same back-edge, so
+        // `regions` cannot contain the key — only the blacklist gates. This
+        // keeps the per-back-edge cost of a permanently-rejected loop to one
+        // hash probe (plus the counter bump until it is blacklisted).
+        if self.region_blacklist.contains(&key) {
             return false;
         }
         let c = self.region_counts.entry(key).or_insert(0);
         *c += 1;
         *c == OSR_THRESHOLD
+    }
+
+    /// Undo the threshold trip reported by [`Jit::record_region`]: the caller
+    /// found the region not YET safe to compile (an uninitialized global in
+    /// the body) but expects it to become safe — re-arm so a later back-edge
+    /// re-trips the threshold and re-checks.
+    pub fn region_defer(&mut self, func_id: u32, entry_ip: u32) {
+        if let Some(c) = self.region_counts.get_mut(&(func_id, entry_ip)) {
+            *c -= 1;
+        }
     }
 
     /// Attempt to compile the loop region `[start, end]` of `func_id` (entered at

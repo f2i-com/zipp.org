@@ -76,6 +76,7 @@ impl<'p> Vm<'p> {
             eval_global_next: program.global_count + FIELD_POOL as u32,
             builtin_globals: std::collections::HashMap::new(),
             class_values: vec![None; program.classes.len()],
+            site_ics: Vec::new(),
             heap,
             globals,
             regs: Vec::new(),

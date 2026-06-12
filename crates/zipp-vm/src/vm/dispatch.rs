@@ -181,6 +181,9 @@ impl<'p> Vm<'p> {
                 // indexes `program.functions` directly, so never JIT them â€” they
                 // always interpret.
                 && (func_id as usize) < self.main_func_count
+                // Dense tier check first: a known-ineligible (FN_DEAD) function
+                // pays ONE array read per call here, not 2-3 hash probes.
+                && self.jit.fn_state(func_id) != crate::codegen::FN_DEAD
                 && !self.func(func_id as usize).is_generator
                 && !self.func(func_id as usize).is_async
             {
@@ -1565,6 +1568,25 @@ impl<'p> Vm<'p> {
                         // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
+                        // ── interpreter super-call IC ── `super.m()` is
+                        // receiver-independent (home class + its prototype
+                        // chain, version-guarded): a hit frame-calls the
+                        // resolved method with `this` = the current receiver,
+                        // skipping super_base + the chain walk + call_value's
+                        // nested run_loop (and its per-call args Vec).
+                        {
+                            let is_static = self.func(func_id as usize).super_static;
+                            if let Some((fid, closure, callee)) = self
+                                .ic_super_method(func_id, ip, home_class_id, is_static, key)
+                            {
+                                let this = self.get(base, 0);
+                                self.setup_call(
+                                    fid, closure, this, base, arg_base, argc, dst,
+                                    ip + 1, callee,
+                                )?;
+                                break;
+                            }
+                        }
                         // super.m() resolves m via the super base (the home object's
                         // [[Prototype]]) with `this` = the receiver â€” like a normal
                         // property get + call (and like SuperMethodComputed). This
@@ -1634,6 +1656,28 @@ impl<'p> Vm<'p> {
                         // %Object.prototype%.
                         let key =
                             self.func(func_id as usize).string_constants[name as usize].as_str();
+                        // ── interpreter super-property IC ── data reads hit
+                        // directly; a cached plain GETTER frame-calls with
+                        // `this` = the current receiver and ret_dst = dst.
+                        {
+                            let is_static = self.func(func_id as usize).super_static;
+                            match self.ic_super_get(func_id, ip, home_class_id, is_static, key)
+                            {
+                                GetAct::Value(v) => {
+                                    self.set(base, dst, v);
+                                    ip += 1;
+                                    continue;
+                                }
+                                GetAct::Accessor { fid, closure, getter } => {
+                                    let this = self.get(base, 0);
+                                    self.setup_call(
+                                        fid, closure, this, base, 0, 0, dst, ip + 1, getter,
+                                    )?;
+                                    break;
+                                }
+                                GetAct::None => {}
+                            }
+                        }
                         let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
@@ -1680,6 +1724,19 @@ impl<'p> Vm<'p> {
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
                         let is_static = self.func(func_id as usize).super_static;
+                        // ── interpreter super-property IC ── a cached plain
+                        // SETTER on the super chain frame-calls with `this` =
+                        // the receiver and ret_dst = RET_DISCARD; data writes
+                        // (which go to the RECEIVER) stay on the slow path.
+                        if let SetAct::Setter { fid, closure, setter } =
+                            self.ic_super_set(func_id, ip, home_class_id, is_static, key)
+                        {
+                            self.setup_call(
+                                fid, closure, this, base, val, 1, RET_DISCARD,
+                                ip + 1, setter,
+                            )?;
+                            break;
+                        }
                         // PutValue strictness comes from the reference site (the
                         // enclosing function) — class methods are always strict.
                         let strict = self.func(func_id as usize).is_strict;
@@ -2524,24 +2581,34 @@ impl<'p> Vm<'p> {
                             // A global op whose slot is still UNINITIALIZED may
                             // be own-prop-backed (eval-created / `this.x` bindings):
                             // raw JIT slot accesses would bypass the own property.
-                            // Don't record/compile yet — once the slot holds a real
-                            // value it can never go back, so a later attempt is safe.
-                            let region_globals_ok = {
-                                let proto = self.func(func_id as usize);
-                                let s = t as usize;
-                                let e = (ip as usize).min(proto.code.len() - 1);
-                                proto.code[s..=e].iter().all(|ins| {
-                                    let slot = match *ins {
-                                        Instr::LoadGlobal { idx, .. } => Some(idx),
-                                        Instr::LoadGlobalOrUndefined { idx, .. } => Some(idx),
-                                        Instr::StoreGlobal { idx, .. } => Some(idx),
-                                        Instr::StoreGlobalStrict { idx, .. } => Some(idx),
-                                        _ => None,
-                                    };
-                                    slot.map_or(true, |i| !self.globals[i as usize].is_uninitialized())
-                                })
-                            };
-                            if region_globals_ok && self.jit.record_region(func_id, t as u32) {
+                            // Don't compile yet — once the slot holds a real value
+                            // it can never go back, so a later attempt is safe
+                            // (region_defer re-arms the threshold). Checked ONLY
+                            // when the back-edge counter trips, so a rejected /
+                            // still-counting loop never pays the body scan.
+                            if self.jit.record_region(func_id, t as u32) {
+                                let region_globals_ok = {
+                                    let proto = self.func(func_id as usize);
+                                    let s = t as usize;
+                                    let e = (ip as usize).min(proto.code.len() - 1);
+                                    proto.code[s..=e].iter().all(|ins| {
+                                        let slot = match *ins {
+                                            Instr::LoadGlobal { idx, .. } => Some(idx),
+                                            Instr::LoadGlobalOrUndefined { idx, .. } => Some(idx),
+                                            Instr::StoreGlobal { idx, .. } => Some(idx),
+                                            Instr::StoreGlobalStrict { idx, .. } => Some(idx),
+                                            _ => None,
+                                        };
+                                        slot.map_or(true, |i| !self.globals[i as usize].is_uninitialized())
+                                    })
+                                };
+                                if !region_globals_ok {
+                                    // Re-arm: a later back-edge re-checks once
+                                    // the global slot is initialized.
+                                    self.jit.region_defer(func_id, t as u32);
+                                    ip = t;
+                                    continue;
+                                }
                                 let proto: *const crate::bytecode::FuncProto =
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
@@ -3458,6 +3525,24 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         }
+                        // ── interpreter property IC ── own/chain data reads
+                        // resolve through the per-site cache; a cached class /
+                        // own / chain GETTER frame-calls on THIS dispatch loop
+                        // (ret_dst = dst) instead of a nested run_loop.
+                        match self.ic_get_prop(func_id, ip, o, &key) {
+                            GetAct::Value(v) => {
+                                self.set(base, dst, v);
+                                ip += 1;
+                                continue;
+                            }
+                            GetAct::Accessor { fid, closure, getter } => {
+                                self.setup_call(
+                                    fid, closure, o, base, 0, 0, dst, ip + 1, getter,
+                                )?;
+                                break;
+                            }
+                            GetAct::None => {}
+                        }
                         let r = self.get_prop(o, &key)?;
                         self.set(base, dst, r);
                         ip += 1;
@@ -3573,6 +3658,24 @@ impl<'p> Vm<'p> {
                                 ip += 1;
                                 continue;
                             }
+                        }
+                        // ── interpreter property IC ── an existing own data
+                        // slot writes directly; a cached class/own SETTER
+                        // frame-calls on THIS dispatch loop with the value as
+                        // its argument and ret_dst = RET_DISCARD.
+                        match self.ic_set_prop(func_id, ip, o, &key, v) {
+                            SetAct::Done => {
+                                ip += 1;
+                                continue;
+                            }
+                            SetAct::Setter { fid, closure, setter } => {
+                                self.setup_call(
+                                    fid, closure, o, base, val, 1, RET_DISCARD,
+                                    ip + 1, setter,
+                                )?;
+                                break;
+                            }
+                            SetAct::None => {}
                         }
                         let strict = self.func(func_id as usize).is_strict;
                         self.set_prop(o, &key, v, strict)?;
@@ -4000,6 +4103,24 @@ impl<'p> Vm<'p> {
                     }
                     Instr::Call { dst, callee, arg_base, argc } => {
                         let callee_v = self.get(base, callee);
+                        // ── interpreter call IC ── a repeat callee (identity +
+                        // heap-version guarded) resolved to a plain user
+                        // function skips the Proxy/native/bound/ctor probes
+                        // and the generator/async flag loads.
+                        if let Some((fid, closure)) = self.ic_call(func_id, ip, callee_v) {
+                            self.setup_call(
+                                fid,
+                                closure,
+                                Value::UNDEFINED,
+                                base,
+                                arg_base,
+                                argc,
+                                dst,
+                                ip + 1,
+                                callee_v,
+                            )?;
+                            break;
+                        }
                         // A callable Proxy: route through call_value (apply trap).
                         if callee_v.is_heap()
                             && matches!(self.heap.get(callee_v.heap_index()), HeapObj::Proxy { .. })
@@ -4176,6 +4297,22 @@ impl<'p> Vm<'p> {
                                     )));
                                 }
                                 private_callee = self.private_field_scan(recv, key);
+                            }
+                        }
+                        // ── interpreter method-call IC ── a monomorphic /
+                        // low-polymorphic `obj.method()` resolves through the
+                        // per-site cache (validated; see vm/ic.rs), skipping
+                        // the builtin probe, the class/proto chain walk, and
+                        // resolve_callable — straight to the frame push.
+                        if private_callee.is_none() {
+                            if let Some((fid, closure, callee)) =
+                                self.ic_call_method(func_id, ip, recv, key)
+                            {
+                                self.setup_call(
+                                    fid, closure, recv, base, arg_base, argc, dst,
+                                    ip + 1, callee,
+                                )?;
+                                break;
                             }
                         }
                         // Hot fast path: `arr.push(x)` â€” the most common
@@ -5560,8 +5697,12 @@ impl<'p> Vm<'p> {
         if self.frames.len() == stop_depth {
             return true;
         }
-        let caller_base = self.frames.last().unwrap().base;
-        self.regs[caller_base + finished.ret_dst as usize] = ret;
+        // RET_DISCARD marks a frame whose return value is dropped (an
+        // IC-pushed setter activation — assignment doesn't observe it).
+        if finished.ret_dst != RET_DISCARD {
+            let caller_base = self.frames.last().unwrap().base;
+            self.regs[caller_base + finished.ret_dst as usize] = ret;
+        }
         false
     }
 
@@ -5726,11 +5867,20 @@ impl<'p> Vm<'p> {
         if self.frames.len() >= MAX_FRAMES {
             return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
         }
-        let proto = self.func(func_id as usize);
-        let callee_regs = (proto.reg_count as usize).max(1);
-        let callee_params = proto.param_count as usize;
-        let is_strict = proto.is_strict;
-        let lexical_this = proto.lexical_this;
+        // ONE proto fetch for every layout field this call needs (each
+        // `func()` is a bounds-checked double index; this runs per call).
+        let (callee_regs, callee_params, is_strict, lexical_this, rest_reg, arguments_reg, simple) = {
+            let proto = self.func(func_id as usize);
+            (
+                (proto.reg_count as usize).max(1),
+                proto.param_count as usize,
+                proto.is_strict,
+                proto.lexical_this,
+                proto.rest_reg,
+                proto.arguments_reg,
+                proto.simple_params,
+            )
+        };
         // An arrow binds the `this` it captured lexically (ignoring the supplied
         // one) and skips OrdinaryCallBindThis. Otherwise OrdinaryCallBindThis:
         // a sloppy callee invoked with a nullish `this` (e.g. a bare `f()`) binds
@@ -5767,7 +5917,7 @@ impl<'p> Vm<'p> {
             self.regs[new_base + 1 + i] = v;
         }
         // Rest parameter: collect args beyond the fixed params into a fresh array.
-        if let Some(rreg) = self.func(func_id as usize).rest_reg {
+        if let Some(rreg) = rest_reg {
             let extra: Vec<Value> = ((arg_base as usize + callee_params)
                 ..(arg_base as usize + argc as usize))
                 .map(|i| self.regs[caller_base + i])
@@ -5777,14 +5927,10 @@ impl<'p> Vm<'p> {
         }
         // `arguments`: an array of ALL actual args (a function that references it).
         let mut args_obj = u32::MAX;
-        if let Some(areg) = self.func(func_id as usize).arguments_reg {
+        if let Some(areg) = arguments_reg {
             let argsv: Vec<Value> = (0..argc as usize)
                 .map(|i| self.regs[caller_base + arg_base as usize + i])
                 .collect();
-            let (is_strict, simple) = {
-                let p = self.func(func_id as usize);
-                (p.is_strict, p.simple_params)
-            };
             // Sloppy + simple params ⇒ MAPPED: aliases the formal registers of
             // the frame about to be pushed (frames.len() is its index).
             let mapinfo =

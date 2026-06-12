@@ -236,6 +236,12 @@ pub struct Vm<'p> {
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
     /// `super` call can reach its lexical superclass value at runtime.
     class_values: Vec<Option<Value>>,
+    /// Interpreter inline caches: per MAIN-program function (outer index =
+    /// func_id), per instruction (inner index = ip), a lazily-allocated
+    /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the
+    /// guard model; intentionally NOT a GC root (entries are validated or
+    /// re-read against live, guard-checked objects before any use).
+    site_ics: Vec<Option<Box<[Option<Box<ic::SiteIc>>]>>>,
     heap: Heap,
     globals: Vec<Value>,
     /// One contiguous register file shared by all live frames; each frame owns
@@ -1066,8 +1072,10 @@ mod helpers_numeric;
 mod helpers_json;
 pub(crate) mod helpers_num2;
 mod gc;
+mod ic;
 
 pub(crate) use bigint::*;
+pub(crate) use ic::{GetAct, SetAct, RET_DISCARD};
 pub(crate) use helpers_misc::*;
 pub(crate) use helpers_datetime::*;
 pub(crate) use helpers_numeric::*;
