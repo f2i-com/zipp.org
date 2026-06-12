@@ -73,8 +73,8 @@ impl<'p> Vm<'p> {
         if key.is_heap() {
             let oidx = obj.heap_index();
             if !(oidx == self.global_this && self.global_this != 0)
-                && !self.module_namespaces.contains_key(&oidx)
-                && !self.deferred_ns_state.contains_key(&oidx)
+                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oidx))
+                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oidx))
             {
                 if let Some(std::borrow::Cow::Borrowed(b)) =
                     self.heap.str_wtf8_cow(key.heap_index())
@@ -288,6 +288,52 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Whether creating a NEW own data property `key` on the plain object
+    /// `start` is provably unobservable through its prototype chain — per
+    /// OrdinarySet, an inherited ACCESSOR must fire its setter (or reject)
+    /// and an inherited NON-WRITABLE data property must reject, while an
+    /// inherited writable data property just gets shadowed. Walks only
+    /// plain class-less object levels (mirroring object_get_prototype_of's
+    /// resolution for them); anything exotic — Proxy, class chain, the
+    /// global, a namespace, a constructor object — answers `false` and the
+    /// caller falls back to the generic set_prop. `&self` only: no traps run.
+    fn plain_add_chain_clear(&self, start: u32, key: &str) -> bool {
+        let mut lidx = start;
+        for _ in 0..1000 {
+            let proto = match self.proto_of.get(&lidx) {
+                Some(p) => *p,
+                None if lidx == self.obj_proto => Value::NULL,
+                None if self.obj_proto != 0 => Value::heap(self.obj_proto),
+                None => Value::NULL,
+            };
+            if !proto.is_heap() {
+                return true; // chain bottom: nothing intercepts the add
+            }
+            let pidx = proto.heap_index();
+            if (pidx == self.global_this && self.global_this != 0)
+                || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&pidx))
+                || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&pidx))
+            {
+                return false;
+            }
+            match self.heap.get(pidx) {
+                HeapObj::Object(pm) => {
+                    if pm.class.is_some() || pm.is_ctor {
+                        return false; // class accessors / constructor exotica
+                    }
+                    if let Some(j) = pm.pos(key) {
+                        // A writable data property on the chain is merely
+                        // shadowed; an accessor or non-writable data blocks.
+                        return !pm.attrs[j].accessor && pm.attrs[j].writable;
+                    }
+                }
+                _ => return false, // exotic level: let set_prop decide
+            }
+            lidx = pidx;
+        }
+        false
+    }
+
     pub(crate) fn set_index(
         &mut self,
         obj: Value,
@@ -303,31 +349,61 @@ impl<'p> Vm<'p> {
         // FAST PATH: a plain-object computed write whose flat string key hits an
         // own WRITABLE DATA property stores straight into the ObjMap slot — the
         // twin of get_index's fast read (no key String materialization, no shape
-        // change, so no IC/version traffic). Object.prototype is excluded so its
-        // index-key bookkeeping (note_array_proto_index) always runs; adds,
-        // accessors, non-writable hits, the global, and namespaces stay generic.
+        // change, so no IC/version traffic). An own MISS on an extensible
+        // class-less object whose prototype chain provably can't intercept the
+        // write (no same-named accessor / non-writable data / exotic level —
+        // see plain_add_chain_clear) appends the new data property directly,
+        // skipping set_prop's special-case gauntlet. Object.prototype is
+        // excluded so its index-key bookkeeping (note_array_proto_index)
+        // always runs; everything else stays generic.
         if key.is_heap()
             && !(idx == self.global_this && self.global_this != 0)
             && idx != self.obj_proto
-            && !self.module_namespaces.contains_key(&idx)
-            && !self.deferred_ns_state.contains_key(&idx)
+            && self.realm_global_objs.is_empty()
+            && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+            && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx))
         {
-            let hit = match self.heap.str_wtf8_cow(key.heap_index()) {
+            // hit: own writable data slot; add: proven-clean new key.
+            let (hit, add) = match self.heap.str_wtf8_cow(key.heap_index()) {
                 Some(std::borrow::Cow::Borrowed(b)) => {
                     match (std::str::from_utf8(b), self.heap.get(idx)) {
-                        (Ok(k), HeapObj::Object(m)) => match m.pos(k) {
-                            Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => Some(i),
-                            _ => None,
+                        (Ok(k), HeapObj::Object(m)) if k != "__proto__" => match m.pos(k) {
+                            Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => {
+                                (Some(i), false)
+                            }
+                            Some(_) => (None, false),
+                            None => (
+                                None,
+                                m.extensible
+                                    && m.class.is_none()
+                                    && !m.is_ctor
+                                    && self.plain_add_chain_clear(idx, k),
+                            ),
                         },
-                        _ => None,
+                        _ => (None, false),
                     }
                 }
-                _ => None,
+                _ => (None, false),
             };
             if let Some(i) = hit {
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                     m.vals[i] = val;
                     return Ok(());
+                }
+            }
+            if add {
+                let ks: Option<String> = match self.heap.str_wtf8_cow(key.heap_index()) {
+                    Some(std::borrow::Cow::Borrowed(b)) => {
+                        std::str::from_utf8(b).ok().map(|s| s.to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(ks) = ks {
+                    if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                        m.push_data(ks, val);
+                        self.heap.bump_version(idx); // key add reallocs vals (IC)
+                        return Ok(());
+                    }
                 }
             }
         }

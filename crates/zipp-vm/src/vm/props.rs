@@ -711,8 +711,8 @@ impl<'p> Vm<'p> {
             // bindings, TDZ checks) take the generic path below.
             let plain = matches!(self.heap.get(idx), HeapObj::Object(_))
                 && !(idx == self.global_this && self.global_this != 0)
-                && !self.module_namespaces.contains_key(&idx)
-                && !self.deferred_ns_state.contains_key(&idx);
+                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&idx))
+                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&idx));
             if plain {
                 // Slots to yield, in spec own-key order, while the map is borrowed.
                 let (emit, visible) = match self.heap.get(idx) {

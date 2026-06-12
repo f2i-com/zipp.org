@@ -347,6 +347,16 @@ impl ObjMap {
         }
     }
 
+    /// Append a NEW data property the caller has already proven absent (via
+    /// `pos`); consumes the key, skipping `set`'s re-lookup and re-clone. The
+    /// caller MUST bump the object's version (a key add reallocs `vals`).
+    pub fn push_data(&mut self, key: String, val: Value) {
+        self.keys.push(key);
+        self.vals.push(val);
+        self.attrs.push(PropAttr::data());
+        self.index_appended();
+    }
+
     /// Remove `key`'s own property; returns whether it existed. Shifts later
     /// slots, so the caller MUST bump the object's version (a JIT inline cache
     /// may have recorded a now-stale slot index for another key).
