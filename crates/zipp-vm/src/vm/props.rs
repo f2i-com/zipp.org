@@ -3502,6 +3502,122 @@ impl<'p> Vm<'p> {
     /// delegation `obj` advances up the chain while `receiver` stays the original,
     /// so an INHERITED accessor's getter is invoked with the correct `this`.
     pub(crate) fn get_member(&mut self, obj: Value, key: &str, receiver: Value) -> Result<Value, Thrown> {
+        // FAST PATH: walk plain-Object own maps + the `proto_of` chain directly.
+        // A read on a plain (non-constructor, non-global, non-namespace) Object —
+        // the overwhelmingly common case — pays NONE of the exotic machinery in
+        // the slow path (deferred-namespace trigger, realm globals, boxed-string
+        // indices, callable name/length/prototype intrinsics, the RegExp/
+        // TypedArray/Temporal/Intl discriminant probe chain: all vacuous for
+        // it). Every condition that could make one of those branches fire for
+        // an Object receiver BAILS to the slow path, and the walk performs no
+        // side effects, so a mid-chain bail delegates the CURRENT chain object
+        // to the slow path exactly like the Object arm's own recursion would.
+        let mut cur = obj;
+        if self.deferred_ns_state.is_empty() {
+            while cur.is_heap() {
+                let ci = cur.heap_index();
+                // The global object and realm/namespace exotics have LIVE slot
+                // semantics layered over their ObjMap, and %Array.prototype% is
+                // an Array exotic Object with a synthesized virtual `length` —
+                // slow path for all of them.
+                if (ci == self.global_this && self.global_this != 0)
+                    || (ci == self.arr_proto && self.arr_proto != 0)
+                    || (!self.module_namespaces.is_empty()
+                        && self.module_namespaces.contains_key(&ci))
+                    || (!self.realm_global_objs.is_empty()
+                        && self.realm_global_objs.contains_key(&ci))
+                {
+                    break;
+                }
+                // Ok(hit) | Err(class of the instance on an own miss).
+                let step = {
+                    let m = match self.heap.get(ci) {
+                        // A builtin-constructor Object synthesizes `prototype`
+                        // ahead of its own map — slow path.
+                        HeapObj::Object(m) if !m.is_ctor => m,
+                        _ => break,
+                    };
+                    match m.pos(key) {
+                        Some(i) => Ok((m.attrs[i], m.vals[i])),
+                        None => Err(m.class),
+                    }
+                };
+                match step {
+                    Ok((a, raw)) => {
+                        if a.accessor {
+                            // `raw` is the getter (UNDEFINED ⇒ no getter ⇒ undefined).
+                            return if raw == Value::UNDEFINED {
+                                Ok(Value::UNDEFINED)
+                            } else {
+                                self.call_value(raw, receiver, &[])
+                            };
+                        }
+                        return Ok(raw);
+                    }
+                    Err(Some(class)) => {
+                        // Class-INSTANCE own miss: resolve an inherited method/
+                        // getter on the class chain inline — identical to the
+                        // Object arm's resolution in the slow path, which would
+                        // otherwise charge the whole exotic preamble to every
+                        // hot `obj.method()` / class-getter read. A chain miss
+                        // (or a non-Class link) bails to the slow path.
+                        let (mut method, mut getter) = (None, None);
+                        let mut c2 = Some(class);
+                        while let Some(cidx) = c2 {
+                            match self.heap.get(cidx) {
+                                HeapObj::Class(c) => {
+                                    if let Some((_, v)) =
+                                        c.methods.iter().find(|(k, _)| k == key)
+                                    {
+                                        method = Some(*v);
+                                        break;
+                                    }
+                                    if let Some((_, v)) =
+                                        c.getters.iter().find(|(k, _)| k == key)
+                                    {
+                                        getter = Some(*v);
+                                        break;
+                                    }
+                                    c2 = c.parent;
+                                }
+                                _ => break,
+                            }
+                        }
+                        if let Some(mv) = method {
+                            return Ok(mv);
+                        }
+                        if let Some(g) = getter {
+                            return self.call_value(g, receiver, &[]);
+                        }
+                        break;
+                    }
+                    Err(None) => {}
+                }
+                // [[Prototype]] step — the Object arm's resolution for a plain
+                // object: an explicit proto_of entry, else %Object.prototype%.
+                match self.proto_of.get(&ci) {
+                    Some(&p) => {
+                        if !p.is_heap() {
+                            return Ok(Value::UNDEFINED); // null-prototype chain end
+                        }
+                        cur = p;
+                    }
+                    None => {
+                        if self.obj_proto == 0 || ci == self.obj_proto {
+                            return Ok(Value::UNDEFINED);
+                        }
+                        cur = Value::heap(self.obj_proto);
+                    }
+                }
+            }
+        }
+        self.get_member_slow(cur, key, receiver)
+    }
+
+    /// The full (exotic-aware) property GET — see [`Vm::get_member`], whose
+    /// fast path handles the plain-Object chain and delegates everything else
+    /// (and every chain object it bails on) here.
+    fn get_member_slow(&mut self, obj: Value, key: &str, receiver: Value) -> Result<Value, Thrown> {
         self.defer_check(obj, key)?; // a deferred-namespace Get may evaluate
         // Inside a ShadowRealm's evaluate, `globalThis.x` reads the REALM's
         // own binding for x when one exists (bare `x` and `globalThis.x`

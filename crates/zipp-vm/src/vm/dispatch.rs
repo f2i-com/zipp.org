@@ -1633,7 +1633,7 @@ impl<'p> Vm<'p> {
                         // (so a getter sees it). For a base class the base is
                         // %Object.prototype%.
                         let key =
-                            self.func(func_id as usize).string_constants[name as usize].clone();
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         let proto = self.super_base(home_class_id, self.func(func_id as usize).super_static);
                         // MakeSuperPropertyReference: RequireObjectCoercible(base).
                         self.require_object_coercible(proto)?;
@@ -1676,7 +1676,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperSet { home_class_id, name, val } => {
                         let key =
-                            self.func(func_id as usize).string_constants[name as usize].clone();
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
                         let is_static = self.func(func_id as usize).super_static;
@@ -1707,7 +1707,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperGetObj { dst, name } => {
                         let key =
-                            self.func(func_id as usize).string_constants[name as usize].clone();
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -1728,7 +1728,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperSetObj { name, val } => {
                         let key =
-                            self.func(func_id as usize).string_constants[name as usize].clone();
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
                         let this = self.get(base, 0);
                         let v = self.get(base, val);
@@ -1751,7 +1751,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::SuperMethodObj { dst, name, arg_base, argc } => {
                         let key =
-                            self.func(func_id as usize).string_constants[name as usize].clone();
+                            self.func(func_id as usize).string_constants[name as usize].as_str();
                         let proto = self.obj_super_base(self.frames[frame_idx].callee);
                         self.require_object_coercible(proto)?;
                         let this = self.get(base, 0);
@@ -2117,6 +2117,22 @@ impl<'p> Vm<'p> {
                     Instr::HasProp { dst, key, obj, brand } => {
                         let k = self.get(base, key);
                         let o = self.get(base, obj);
+                        // Fast path: `i in arr` PRESENT on a dense array — the hot
+                        // hole-aware iteration pattern. A numeric key needs no
+                        // ToPropertyKey, and a non-hole in-range dense element is
+                        // an own property regardless of side tables/prototypes.
+                        // Misses (hole / out of range / overlay) take the full path.
+                        if !brand && k.is_number() && o.is_heap() {
+                            if let HeapObj::Array(items) = self.heap.get(o.heap_index()) {
+                                if let Some(i) = array_index(k) {
+                                    if i < items.len() && !items[i].is_hole() {
+                                        self.set(base, dst, Value::bool(true));
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         // The `in` operator (and `#x in`) require an Object right
                         // operand â€” a primitive RHS is a TypeError (checked before
                         // ToPropertyKey on the key, per spec order).
@@ -2169,7 +2185,7 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
-                            .clone();
+                            .as_str();
                         // HasBindingFor a with environment: [[HasProperty]] (own or
                         // inherited), then the @@unscopables filter â€” an own/inherited
                         // `@@unscopables` object whose `key` entry is truthy hides the
@@ -2196,7 +2212,7 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
-                            .clone();
+                            .as_str();
                         // GetBindingValue: HasProperty AGAIN (the WithHas
                         // @@unscopables getter may have deleted the binding).
                         let kv = self.key_to_value(&key);
@@ -2217,7 +2233,7 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
-                            .clone();
+                            .as_str();
                         // SetMutableBinding step 2 re-checks HasProperty
                         // UNCONDITIONALLY (observable through a Proxy `has`
                         // trap, even in sloppy mode); strict mode then throws
@@ -3370,7 +3386,7 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
-                            .clone();
+                            .as_str();
                         // PrivateFieldGet brand check: reading a private member
                         // (`obj.#x`) from an object whose class did not declare it
                         // is a TypeError (has_property_str walks instance own fields
@@ -3451,7 +3467,7 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
-                            .clone();
+                            .as_str();
                         self.define_field(o, &key, v)?;
                         ip += 1;
                     }
@@ -3460,7 +3476,7 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
-                            .clone();
+                            .as_str();
                         // Private stores route to the side table / accessors
                         // (field-init emission, compound/update writes). One
                         // byte-compare on the hot path.
@@ -3571,7 +3587,7 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
-                            .clone();
+                            .as_str();
                         if let Some((b, kind, owner)) = self.resolve_private(&key) {
                             // Declaring-class-resolved, KIND-aware write (spec
                             // PrivateSet).
@@ -3690,7 +3706,7 @@ impl<'p> Vm<'p> {
                         self.require_object_coercible(o)?;
                         let key = self.func(func_id as usize)
                             .string_constants[name as usize]
-                            .clone();
+                            .as_str();
                         let r = self.delete_property(o, &key)?;
                         // Strict mode: a delete that evaluates to false throws.
                         if strict && r == Value::bool(false) {
@@ -5477,7 +5493,7 @@ impl<'p> Vm<'p> {
             for &(name_idx, slot) in &p.fields {
                 let key = self.func(p.func_id as usize).string_constants
                     [name_idx as usize]
-                    .clone();
+                    .as_str();
                 let v = self.get_prop(obj, &key).unwrap_or(Value::UNDEFINED);
                 self.globals[slot as usize] = v;
             }
@@ -5497,7 +5513,7 @@ impl<'p> Vm<'p> {
             for &(name_idx, slot) in &p.fields {
                 let key = self.func(p.func_id as usize).string_constants
                     [name_idx as usize]
-                    .clone();
+                    .as_str();
                 let v = self.globals[slot as usize];
                 let _ = self.set_prop(obj, &key, v, false);
             }

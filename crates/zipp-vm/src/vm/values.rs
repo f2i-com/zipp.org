@@ -747,11 +747,55 @@ impl<'p> Vm<'p> {
         // inert. Check the own properties (dense index / length / arr_props),
         // then recurse dynamically up the ACTUAL chain.
         if matches!(self.heap.get(idx), HeapObj::Array(_)) {
+            // NUMERIC-key fast path: resolve the index straight off the Value —
+            // `key_of` would allocate a fresh key String per probe, which
+            // dominated the hot hole-aware `i in arr` iteration. The canonical
+            // string is built only for the (rare) side-table check, and the
+            // answers are identical to the general path below (key_of of a
+            // canonical numeric Value IS i.to_string()).
+            if let Some(i) = array_index(key) {
+                if matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole())
+                {
+                    return Ok(true);
+                }
+                if let Some(m) = self.arr_props.get(&idx) {
+                    if m.pos(&i.to_string()).is_some() {
+                        return Ok(true);
+                    }
+                }
+                let proto = match self.proto_of.get(&idx) {
+                    Some(&p) => p,
+                    None if self.arr_proto != 0 => Value::heap(self.arr_proto),
+                    None => Value::NULL,
+                };
+                // Default-chain MISS shortcut: the receiver chains to the PLAIN
+                // %Array.prototype% → %Object.prototype% (neither re-prototyped),
+                // no integer index was ever defined on either (every such write
+                // sets `array_proto_has_index` — note_array_proto_index), and
+                // %Array.prototype%'s dense store is empty (a direct
+                // `Array.prototype[i] = x` lands there) — the index is
+                // definitively absent: skip the recursive walk and its
+                // per-probe key-string allocations (the hot hole-aware
+                // `i in arr` loop spends its time there).
+                if !self.array_proto_has_index
+                    && proto.is_heap()
+                    && proto.heap_index() == self.arr_proto
+                    && !self.proto_of.contains_key(&self.arr_proto)
+                    && !self.proto_of.contains_key(&self.obj_proto)
+                    && matches!(self.heap.get(self.arr_proto), HeapObj::Array(items) if items.is_empty())
+                {
+                    return Ok(false);
+                }
+                return match proto.is_heap() {
+                    true => self.has_property_dyn(proto, key),
+                    false => Ok(false),
+                };
+            }
             let k = self.key_of(key);
-            let int_index = array_index(key).or_else(|| match k.parse::<u32>() {
+            let int_index = match k.parse::<u32>() {
                 Ok(n) if n != u32::MAX && n.to_string() == k => Some(n as usize),
                 _ => None,
-            });
+            };
             let own = if let Some(i) = int_index {
                 matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole())
                     || self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some())

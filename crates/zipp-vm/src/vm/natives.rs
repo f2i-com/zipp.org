@@ -3074,15 +3074,17 @@ impl<'p> Vm<'p> {
                 let mut m = crate::heap::ObjMap::new();
                 m.is_raw_json = true;
                 m.extensible = false;
-                m.keys.push("rawJSON".to_string());
-                m.vals.push(sval);
-                m.attrs.push(crate::heap::PropAttr {
-                    writable: false,
-                    enumerable: true,
-                    configurable: false,
-                    accessor: false,
-                    setter: Value::UNDEFINED,
-                });
+                m.define(
+                    "rawJSON",
+                    sval,
+                    crate::heap::PropAttr {
+                        writable: false,
+                        enumerable: true,
+                        configurable: false,
+                        accessor: false,
+                        setter: Value::UNDEFINED,
+                    },
+                );
                 let idx = self.heap.alloc(HeapObj::Object(m));
                 self.proto_of.insert(idx, Value::NULL); // OrdinaryObjectCreate(null)
                 Value::heap(idx)

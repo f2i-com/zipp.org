@@ -510,7 +510,7 @@ impl<'p> Vm<'p> {
         // %Promise%[@@species] must still be the intrinsic getter (the species
         // lookup inside `then` would observably call a replacement).
         match self.heap.get(self.promise_ctor_intrinsic) {
-            HeapObj::Object(m) => match m.keys.iter().position(|k| k == "@@species") {
+            HeapObj::Object(m) => match m.pos("@@species") {
                 None => true,
                 Some(i) => {
                     let v = m.vals[i];

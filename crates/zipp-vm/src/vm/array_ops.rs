@@ -1488,24 +1488,30 @@ impl<'p> Vm<'p> {
         // (non-native) JS-callback branch reads each element live, so a callback's
         // mid-iteration mutation is still observed; only the non-mutating native
         // numeric kernel snapshots.
-        if (self.arr_props.contains_key(&idx)
+        // (The cheap NAME match runs first: `array_has_holes` is an O(len) scan,
+        // which must not be paid by every other method call on a big clean array.)
+        if matches!(
+            name,
+            "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
+        ) && (self.arr_props.contains_key(&idx)
             || self.array_js_len.contains_key(&idx)
             || self.array_has_holes(idx))
-            && matches!(
-                name,
-                "map" | "filter" | "forEach" | "every" | "some" | "reduce" | "reduceRight"
-            )
         {
             return self.array_like_iterate(Value::heap(idx), name, args);
         }
         // Likewise route the SEARCH methods off the dense fast path when the array
         // carries a side table (a defineProperty'd index accessor must have its getter
-        // invoked), a virtual (sparse) length, OR has holes (indexOf/lastIndexOf skip
-        // holes via HasProperty).
-        if (self.arr_props.contains_key(&idx)
-            || self.array_js_len.contains_key(&idx)
-            || self.array_has_holes(idx))
-            && matches!(name, "indexOf" | "lastIndexOf" | "includes")
+        // invoked) or a virtual (sparse) length. HOLES only matter when a prototype
+        // could supply the missing index (indexOf/lastIndexOf consult HasProperty,
+        // includes Gets the chain): gate the O(len) hole scan behind the cheap
+        // proto-index flags — the plain-chain dense scans below handle holes
+        // in place (skip for indexOf/lastIndexOf, read-as-undefined for includes),
+        // instead of paying a full-array hole pre-scan on EVERY call.
+        if matches!(name, "indexOf" | "lastIndexOf" | "includes")
+            && (self.arr_props.contains_key(&idx)
+                || self.array_js_len.contains_key(&idx)
+                || ((self.array_proto_has_index || self.proto_of.contains_key(&idx))
+                    && self.array_has_holes(idx)))
         {
             return self.array_like_search(Value::heap(idx), name, args);
         }
@@ -1662,8 +1668,15 @@ impl<'p> Vm<'p> {
                 Ok(Some(v))
             }
             "indexOf" => {
-                let snapshot = self.array_snapshot(idx);
-                let len = snapshot.len() as i64;
+                // In-place scan over the live Vec — array_snapshot would COPY the
+                // whole array per call (an O(len) memcpy that dominates repeated
+                // searches on big arrays). Safe here: this dense path is hole-free
+                // (holey/side-table arrays were routed to array_like_search above)
+                // and `===` runs no user code, so the Vec cannot change mid-scan.
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len() as i64,
+                    _ => 0,
+                };
                 // len === 0 short-circuits to -1 BEFORE ToIntegerOrInfinity(fromIndex),
                 // so a throwing fromIndex.valueOf must not run (spec step 2).
                 if len == 0 {
@@ -1676,12 +1689,23 @@ impl<'p> Vm<'p> {
                 } else {
                     0
                 } as usize;
-                let pos = (from..snapshot.len()).find(|&i| self.values_strict_eq(snapshot[i], arg0));
+                let pos = match self.heap.get(idx) {
+                    HeapObj::Array(items) => (from..items.len()).find(|&i| {
+                        // A hole fails HasProperty (no proto index can cover it
+                        // on this gated plain-chain path) — spec skips it.
+                        !items[i].is_hole() && self.values_strict_eq(items[i], arg0)
+                    }),
+                    _ => None,
+                };
                 Ok(Some(Value::int(pos.map(|p| p as i32).unwrap_or(-1))))
             }
             "includes" => {
-                let snapshot = self.array_snapshot(idx);
-                let len = snapshot.len() as i64;
+                // In-place scan (no snapshot copy) — see "indexOf" for why this
+                // is safe on the hole-free dense path.
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len() as i64,
+                    _ => 0,
+                };
                 // len === 0 short-circuits to false BEFORE ToIntegerOrInfinity(fromIndex),
                 // so a throwing fromIndex.valueOf must not run (spec step 2).
                 if len == 0 {
@@ -1696,20 +1720,27 @@ impl<'p> Vm<'p> {
                     0
                 };
                 // SameValueZero (NaN matches NaN; +0/-0 equal) — not strict `===`.
-                let mut found = false;
-                let mut k = from;
-                while k < len {
-                    if self.same_value_zero(snapshot[k as usize], arg0) {
-                        found = true;
-                        break;
+                let found = match self.heap.get(idx) {
+                    HeapObj::Array(items) => {
+                        let from = (from.max(0) as usize).min(items.len());
+                        items[from..].iter().any(|&v| {
+                            // includes Gets each index: a hole reads as undefined
+                            // (so `[,].includes(undefined)` is true).
+                            let v = if v.is_hole() { Value::UNDEFINED } else { v };
+                            self.same_value_zero(v, arg0)
+                        })
                     }
-                    k += 1;
-                }
+                    _ => false,
+                };
                 Ok(Some(Value::bool(found)))
             }
             "lastIndexOf" => {
-                let snapshot = self.array_snapshot(idx);
-                let len = snapshot.len() as i64;
+                // In-place scan (no snapshot copy) — see "indexOf" for why this
+                // is safe on the hole-free dense path.
+                let len = match self.heap.get(idx) {
+                    HeapObj::Array(items) => items.len() as i64,
+                    _ => 0,
+                };
                 // len === 0 short-circuits to -1 BEFORE ToIntegerOrInfinity(fromIndex),
                 // so a throwing fromIndex.valueOf must not run (spec step 2).
                 if len == 0 {
@@ -1724,12 +1755,18 @@ impl<'p> Vm<'p> {
                     len - 1
                 };
                 let mut result = -1i32;
-                if from >= 0 && !snapshot.is_empty() {
-                    let hi = (from as usize).min(snapshot.len() - 1);
-                    for i in (0..=hi).rev() {
-                        if self.values_strict_eq(snapshot[i], arg0) {
-                            result = i as i32;
-                            break;
+                if from >= 0 {
+                    if let HeapObj::Array(items) = self.heap.get(idx) {
+                        if !items.is_empty() {
+                            let hi = (from as usize).min(items.len() - 1);
+                            for i in (0..=hi).rev() {
+                                // A hole fails HasProperty on this plain-chain
+                                // path — spec skips it (see "indexOf").
+                                if !items[i].is_hole() && self.values_strict_eq(items[i], arg0) {
+                                    result = i as i32;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

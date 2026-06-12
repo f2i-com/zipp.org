@@ -347,7 +347,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     let prog = vm.program; // &'p Program, independent of `vm`'s borrow
     let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
     let (val, vals_ptr, slot) = match vm.heap.get(idx) {
-        HeapObj::Object(map) => match map.keys.iter().position(|k| k == key) {
+        HeapObj::Object(map) => match map.pos(key) {
             Some(s) => (map.vals[s], map.vals.as_ptr() as u64, s as u32),
             // Missing own key: a class instance may resolve it as a method, so
             // defer to the interpreter; a plain object yields undefined.
@@ -411,7 +411,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         HeapObj::Object(map) => {
             let added = map.set(key, Value::from_bits(val_bits));
             // Position AFTER the set (existing key: unchanged; new key: appended).
-            let s = map.keys.iter().position(|k| k == key).unwrap() as u32;
+            let s = map.pos(key).unwrap() as u32;
             (added, map.vals.as_ptr() as u64, s)
         }
         // `arr.length = n` truncates/grows — deopt so the interpreter's set_prop

@@ -16,6 +16,117 @@ use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Number of keys at which an [`ObjMap`] builds its hash [`PropIndex`].
+/// Measured on 2M-op probes (interpreter): LOOKUPS through the index win
+/// from ~4 keys up (n=12: -17%, n=64: -42%), but mass CONSTRUCTION
+/// (allocate-read-once, the JSON.parse shape) pays the per-object build —
+/// +40% at 2 keys, +5% at 8-12, break-even at 16, a WIN from ~24 (the
+/// linear pos() per set() turns quadratic). 12 balances the two: small
+/// literals never pay, read-heavy/dictionary maps index early, worst-case
+/// mass-build loss is ~5% in the narrow 12-15 band. Maintained on append,
+/// rebuilt (or dropped back below the threshold) on remove.
+pub const PROP_INDEX_THRESHOLD: usize = 12;
+
+/// Slot sentinel for an empty [`PropIndex`] bucket (a real slot is a `keys`
+/// position, far below `u32::MAX`).
+const PROP_EMPTY: u32 = u32::MAX;
+
+/// The table hash of a property key: FNV-1a over the bytes, finished with a
+/// splitmix64-style avalanche; the HIGH half is the stored tag and also picks
+/// the bucket (`tag & mask`), so growth rehashes straight from stored tags —
+/// no key re-reads (same scheme as vm/collections.rs' CollIndex).
+#[inline]
+fn prop_tag(key: &str) -> u32 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for &b in key.as_bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h = (h ^ (h >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((h ^ (h >> 31)) >> 32) as u32
+}
+
+/// Hash index over an [`ObjMap`]'s `keys`: a flat open-addressing table of
+/// `(tag, slot)` pairs with linear probing (the CollIndex shape — 8-byte
+/// entries pack eight to a cache line, so a lookup is typically one random
+/// line plus one confirming key read). A tag hit is always CONFIRMED with a
+/// real compare against `keys[slot]` (the 32-bit tag is lossy). The index is
+/// pure acceleration: the `keys`/`vals`/`attrs` Vecs stay authoritative
+/// (insertion order — for-in/Object.keys — is untouched), it holds no
+/// `Value`s (nothing for the GC to trace), and `None` = linear scan
+/// (correct by default). No tombstones: a key removal rebuilds or drops the
+/// whole index (`ObjMap::remove` — deletes shift slots anyway).
+#[derive(Clone, Debug)]
+pub struct PropIndex {
+    table: Vec<(u32, u32)>,
+    mask: usize,
+    /// Occupied entries (== the owning map's key count).
+    len: usize,
+}
+
+impl PropIndex {
+    fn with_capacity(n: usize) -> PropIndex {
+        // Capacity for `n` entries at < 3/4 load, minimum 32, power of two.
+        let cap = (n * 4 / 3 + 1).next_power_of_two().max(32);
+        PropIndex { table: vec![(0, PROP_EMPTY); cap], mask: cap - 1, len: 0 }
+    }
+
+    fn build(keys: &[String]) -> Box<PropIndex> {
+        let mut ix = PropIndex::with_capacity(keys.len());
+        for (i, k) in keys.iter().enumerate() {
+            ix.insert(k, i as u32);
+        }
+        Box::new(ix)
+    }
+
+    /// Position in `keys` of the entry equal to `key`, confirmed by compare.
+    #[inline]
+    fn find(&self, keys: &[String], key: &str) -> Option<usize> {
+        let tag = prop_tag(key);
+        let mut i = tag as usize & self.mask;
+        loop {
+            let (st, ss) = self.table[i];
+            if ss == PROP_EMPTY {
+                return None;
+            }
+            if st == tag && keys[ss as usize] == key {
+                return Some(ss as usize);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// Record `slot` under `key`. The caller guarantees the key is absent
+    /// (every insertion path misses in `pos()` first).
+    fn insert(&mut self, key: &str, slot: u32) {
+        if (self.len + 1) * 4 >= self.table.len() * 3 {
+            self.grow();
+        }
+        self.insert_raw(prop_tag(key), slot);
+        self.len += 1;
+    }
+
+    fn insert_raw(&mut self, tag: u32, slot: u32) {
+        let mut i = tag as usize & self.mask;
+        while self.table[i].1 != PROP_EMPTY {
+            i = (i + 1) & self.mask;
+        }
+        self.table[i] = (tag, slot);
+    }
+
+    /// Double and rehash from the stored tags (bucket = `tag & mask`).
+    fn grow(&mut self) {
+        let cap = self.table.len() * 2;
+        let old = std::mem::replace(&mut self.table, vec![(0, PROP_EMPTY); cap]);
+        self.mask = cap - 1;
+        for (tag, slot) in old {
+            if slot != PROP_EMPTY {
+                self.insert_raw(tag, slot);
+            }
+        }
+    }
+}
+
 /// A JS object: insertion-ordered string-keyed properties.
 #[derive(Clone, Debug, Default)]
 pub struct ObjMap {
@@ -49,6 +160,14 @@ pub struct ObjMap {
     /// buffer) has no per-element attrs, so seal/freeze on it is recorded here.
     pub sealed: bool,
     pub frozen: bool,
+    /// Lazy hash index over `keys` (see [`PropIndex`]): `None` (linear scan)
+    /// until the map reaches [`PROP_INDEX_THRESHOLD`] keys, maintained by
+    /// `set`/`define` on append and rebuilt/dropped by `remove`. PRIVATE so
+    /// the keys⇄index invariant is owned entirely by this impl block — code
+    /// that mutates `keys` structurally must go through these methods.
+    /// `Clone` clones the table verbatim, which is valid because the clone
+    /// has identical keys at identical slots.
+    index: Option<Box<PropIndex>>,
 }
 
 /// One property's attributes — the ECMAScript property-descriptor flags plus an
@@ -84,6 +203,7 @@ impl ObjMap {
             is_raw_json: false,
             sealed: false,
             frozen: false,
+            index: None,
         }
     }
 
@@ -119,8 +239,25 @@ impl ObjMap {
         }
     }
 
+    #[inline]
     pub fn pos(&self, key: &str) -> Option<usize> {
-        self.keys.iter().position(|k| k == key)
+        match &self.index {
+            Some(ix) => ix.find(&self.keys, key),
+            None => self.keys.iter().position(|k| k == key),
+        }
+    }
+
+    /// Maintain the index across the append of `keys`' LAST entry: insert it
+    /// when the index exists, build the index when the map just reached the
+    /// threshold. Every structural append (set/define) funnels through here.
+    #[inline]
+    fn index_appended(&mut self) {
+        if let Some(ix) = &mut self.index {
+            let slot = self.keys.len() - 1;
+            ix.insert(&self.keys[slot], slot as u32);
+        } else if self.keys.len() >= PROP_INDEX_THRESHOLD {
+            self.index = Some(PropIndex::build(&self.keys));
+        }
     }
 
     /// The raw stored value for `key` (a data value, or an accessor's getter).
@@ -142,6 +279,7 @@ impl ObjMap {
             self.keys.push(key.to_string());
             self.vals.push(val);
             self.attrs.push(PropAttr::data());
+            self.index_appended();
             true
         }
     }
@@ -158,6 +296,7 @@ impl ObjMap {
             self.keys.push(key.to_string());
             self.vals.push(val);
             self.attrs.push(attr);
+            self.index_appended();
             true
         }
     }
@@ -170,6 +309,12 @@ impl ObjMap {
             self.keys.remove(i);
             self.vals.remove(i);
             self.attrs.remove(i);
+            if self.index.is_some() {
+                // Every slot past `i` shifted down: rebuild (same O(n) as the
+                // Vec shifts above), or drop back below the threshold.
+                self.index = (self.keys.len() >= PROP_INDEX_THRESHOLD)
+                    .then(|| PropIndex::build(&self.keys));
+            }
             true
         } else {
             false
@@ -1747,3 +1892,4 @@ impl Heap {
         }
     }
 }
+
