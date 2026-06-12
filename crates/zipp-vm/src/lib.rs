@@ -58,6 +58,16 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, src, SourceType::unambiguous()).parse();
     if !ret.errors.is_empty() {
+        // Annex B web compat ("Runtime Errors for Function Call Assignment
+        // Targets"): in sloppy code `f() = 1`, `f() += 1`, `f()++`, `++f()` and
+        // `for (f() in/of x)` must PARSE and throw a ReferenceError at runtime,
+        // but oxc's AssignmentTarget AST cannot represent a CallExpression
+        // target, so it fatal-errors. When EVERY diagnostic is exactly that
+        // error, rewrite the offending call targets and re-run (the rewrite
+        // declines for anything else, so ordinary syntax errors are untouched).
+        if let Some(fixed) = annexb_call_target_rewrite(src) {
+            return run_with_base(&fixed, base_dir);
+        }
         return Err(format!("SyntaxError: {}", ret.errors[0]));
     }
     let program = compile::compile_program(&ret.program, src)?;
@@ -80,6 +90,107 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
             errput: std::mem::take(&mut vm.errput),
             error: Some(thrown.0),
         }),
+    }
+}
+
+/// Annex B "Runtime Errors for Function Call Assignment Targets": when every
+/// parse diagnostic is oxc's invalid-assignment-target error ("Cannot assign to
+/// this expression") and every flagged span is a plain CallExpression, rewrite
+/// each call target `f(…)` into `((f(…)), __zipp_annexb_ref_error__())[0]` — a
+/// valid MemberExpression assignment target whose base first evaluates the call
+/// (per the web-compat spec order), then throws the ReferenceError BEFORE any
+/// RHS evaluation, old-value read, or ToNumeric coercion. One shape covers all
+/// five contexts (`=`, `op=`, prefix/postfix `++`/`--`, and for-in/of heads —
+/// where the error correctly fires per iteration, only after enumeration
+/// yields a value). Returns the rewritten source only when it re-parses clean;
+/// any other diagnostic (a real syntax error, a non-call target like `1 = 2`,
+/// or strict code, where the early SyntaxError must stand) declines with None.
+fn annexb_call_target_rewrite(src: &str) -> Option<String> {
+    // IsStrict(target) must be false for the web-compat carve-out. Without an
+    // AST only whole-source strictness is detectable: a `"use strict"`
+    // directive prologue keeps the early SyntaxError. (A strict FUNCTION inside
+    // a sloppy script slips through, but the parse-retry then yields a runtime
+    // ReferenceError rather than running broken code.)
+    if has_use_strict_prologue(src) {
+        return None;
+    }
+    let mut cur = src.to_string();
+    // oxc stops at the FIRST fatal cover-grammar error, so a source with N
+    // offending targets converges over N rounds (bounded: error paths only).
+    for _ in 0..16 {
+        let allocator = Allocator::default();
+        let ret = Parser::new(&allocator, &cur, SourceType::unambiguous()).parse();
+        if ret.errors.is_empty() {
+            return Some(cur);
+        }
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for e in &ret.errors {
+            if e.message != "Cannot assign to this expression" {
+                return None;
+            }
+            // The diagnostic labels exactly one span: the invalid target,
+            // as BYTE offsets into the current source.
+            let labels = e.labels.as_deref()?;
+            let [label] = labels else { return None };
+            let (off, len) = (label.offset(), label.len());
+            let text = cur.get(off..off + len)?;
+            if !is_plain_call_expression(text) {
+                return None;
+            }
+            spans.push((off, len));
+        }
+        // Rewrite back-to-front so earlier offsets stay valid.
+        spans.sort_unstable();
+        spans.dedup();
+        for &(off, len) in spans.iter().rev() {
+            let call = &cur[off..off + len];
+            let patched =
+                format!("(({call}), {}())[0]", vm::native::ANNEXB_REF_ERROR_NAME);
+            cur.replace_range(off..off + len, &patched);
+        }
+    }
+    None
+}
+
+/// Does `text` parse standalone as exactly one CallExpression statement? That
+/// is the only target shape the Annex B web-compat carve-out covers (an
+/// optional chain `a?.b()` parses as a ChainExpression and is rejected).
+fn is_plain_call_expression(text: &str) -> bool {
+    let allocator = Allocator::default();
+    let ret = Parser::new(&allocator, text, SourceType::script()).parse();
+    if !ret.errors.is_empty() || ret.program.body.len() != 1 {
+        return false;
+    }
+    let oxc_ast::ast::Statement::ExpressionStatement(stmt) = &ret.program.body[0] else {
+        return false;
+    };
+    matches!(stmt.expression, oxc_ast::ast::Expression::CallExpression(_))
+}
+
+/// Does the source open with a `"use strict"` directive prologue? (Leading
+/// whitespace, comments, and other string directives may precede it.)
+fn has_use_strict_prologue(src: &str) -> bool {
+    let mut rest = src;
+    loop {
+        rest = rest.trim_start();
+        if let Some(r) = rest.strip_prefix("//") {
+            rest = r.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            match r.split_once("*/") {
+                Some((_, tail)) => rest = tail,
+                None => return false,
+            }
+        } else if rest.starts_with("\"use strict\"") || rest.starts_with("'use strict'") {
+            return true;
+        } else if let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+            // Another directive ("use asm", …): skip the string literal and a
+            // trailing semicolon, then keep scanning the prologue.
+            let Some(end) = rest[1..].find(q) else { return false };
+            rest = rest[1 + end + 1..].trim_start();
+            rest = rest.strip_prefix(';').unwrap_or(rest);
+        } else {
+            return false;
+        }
     }
 }
 

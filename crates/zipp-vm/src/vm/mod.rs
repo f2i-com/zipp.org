@@ -1032,7 +1032,7 @@ mod array_ops;
 mod string_ops;
 mod coerce;
 pub(crate) mod bigint;
-mod native;
+pub(crate) mod native;
 mod agents;
 mod helpers_misc;
 mod helpers_datetime;

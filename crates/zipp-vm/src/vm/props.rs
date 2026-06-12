@@ -1147,6 +1147,7 @@ impl<'p> Vm<'p> {
                                 self.globals.get(i).copied().unwrap_or(Value::UNINITIALIZED);
                             if v.is_uninitialized()
                                 || is_hidden_key(name)
+                                || name == crate::vm::native::ANNEXB_REF_ERROR_NAME
                                 || self.program.lexical_globals.contains(&(i as u32))
                                 || self.deleted_globals.contains(name)
                             {
@@ -1156,12 +1157,16 @@ impl<'p> Vm<'p> {
                                 keys.push(name.clone());
                             }
                         }
-                        // Builtins the program never referenced (no slot).
+                        // Builtins the program never referenced (no slot). The
+                        // Annex-B internal helper is reserved, not a spec
+                        // global — it never reflects.
                         let mut extra: Vec<String> = self
                             .builtin_globals
                             .keys()
                             .filter(|n| {
-                                !self.deleted_globals.contains(*n) && !seen.contains(*n)
+                                !self.deleted_globals.contains(*n)
+                                    && !seen.contains(*n)
+                                    && *n != crate::vm::native::ANNEXB_REF_ERROR_NAME
                             })
                             .cloned()
                             .collect();

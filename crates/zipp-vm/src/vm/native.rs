@@ -287,6 +287,14 @@ pub const CAP_REACTION: u16 = 915;
 /// dynamic import that was DEFERRED to a microtask because a static module
 /// link DFS was in flight (the DFS evaluation order must not be preempted).
 pub const MODULE_DYN_IMPORT: u16 = 916;
+/// Annex B "Runtime Errors for Function Call Assignment Targets" helper: the
+/// parse-retry rewrite in lib.rs turns a sloppy-mode call target (`f() = 1`,
+/// `f()++`, `for (f() in x)` …) into `((f()), __zipp_annexb_ref_error__())[0]`;
+/// this native always throws the deferred ReferenceError. Resolvable only
+/// under the reserved name below — registered in `builtin_globals` but hidden
+/// from globalThis reflection (own-keys listing skips it; see props.rs).
+pub const ANNEXB_REF_ERROR: u16 = 917;
+pub const ANNEXB_REF_ERROR_NAME: &str = "__zipp_annexb_ref_error__";
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -1065,6 +1073,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         U8_FROM_BASE64 => ("fromBase64", 1),
         FN_HAS_INSTANCE => ("[Symbol.hasInstance]", 1),
         FN_THROW_TYPE_ERROR => ("", 0),
+        ANNEXB_REF_ERROR => ("", 0),
         GLOBAL_IS_NAN => ("isNaN", 1),
         GLOBAL_IS_FINITE => ("isFinite", 1),
         GLOBAL_EVAL => ("eval", 1),

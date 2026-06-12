@@ -18,11 +18,65 @@ Positive tests pass on clean exit; async tests pass when the harness prints
 `Test262:AsyncTestComplete`; negative tests pass when the run errors (matching the
 error type when we can read it from stderr).
 """
-import argparse, os, re, subprocess, sys, tempfile, concurrent.futures, collections
+import argparse, os, re, subprocess, sys, tempfile, threading, concurrent.futures, collections
 
 FM = re.compile(r"/\*---(.*?)---\*/", re.S)
 
+# ---- byte-faithful source reading -------------------------------------------
+# Function.prototype.toString must reproduce a function's ORIGINAL line
+# terminators, so test sources have to reach the engine byte-faithful (the old
+# text-mode reads folded \r and \r\n to \n via universal newlines). But a
+# core.autocrlf=true checkout writes LF-stored files to disk as CRLF, so raw
+# bytes alone would feed the engine \r\n for almost every test. Undo exactly
+# that mangle: a file the git INDEX stores as LF is normalised back to \n;
+# anything else (genuine CRLF/CR-authored sources like the line-terminator-
+# normalisation tests, or a non-checkout tree) keeps its on-disk bytes.
+_EOL_MAPS = {}
+_EOL_LOCK = threading.Lock()
+
+def _eol_index_map(root):
+    """abs path -> git index eol kind ('lf', 'crlf', '-text', …) for every file
+    under the checkout at `root`; empty when git/checkout is unavailable
+    (on-disk bytes are then trusted as authentic)."""
+    try:
+        out = subprocess.run(["git", "-C", root, "ls-files", "--eol", "-z"],
+                             capture_output=True, timeout=120).stdout
+    except Exception:
+        return {}
+    m = {}
+    for ent in out.split(b"\0"):
+        if b"\t" not in ent:
+            continue
+        info, rel = ent.split(b"\t", 1)
+        fields = info.split()
+        if not fields or not fields[0].startswith(b"i/"):
+            continue
+        p = os.path.normcase(os.path.normpath(os.path.join(root, rel.decode("utf-8", "replace"))))
+        m[p] = fields[0][2:].decode("ascii", "replace")
+    return m
+
+def _eol_map_for(root):
+    root = os.path.normcase(os.path.abspath(root))
+    with _EOL_LOCK:
+        if root not in _EOL_MAPS:
+            _EOL_MAPS[root] = _eol_index_map(root)
+        return _EOL_MAPS[root]
+
+def read_source(path, t262_root):
+    """Read a test/harness file byte-faithfully (modulo the autocrlf undo)."""
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        src = f.read()
+    if "\r" in src:
+        kind = _eol_map_for(t262_root).get(os.path.normcase(os.path.abspath(path)))
+        if kind == "lf":
+            src = src.replace("\r\n", "\n")
+    return src
+# -----------------------------------------------------------------------------
+
 def parse_frontmatter(src):
+    # Metadata regexes are line-based (`^flags:` under re.M only matches after
+    # \n) — parse a newline-normalised COPY; the engine still gets `src`.
+    src = src.replace("\r\n", "\n").replace("\r", "\n")
     m = FM.search(src)
     meta = {"flags": [], "includes": [], "negative": None}
     if not m:
@@ -46,10 +100,10 @@ def parse_frontmatter(src):
 
 def load_harness(h):
     cache = {}
+    root = os.path.dirname(os.path.abspath(h))  # the test262 checkout
     def get(name):
         if name not in cache:
-            with open(os.path.join(h, name), encoding="utf-8") as f:
-                cache[name] = f.read()
+            cache[name] = read_source(os.path.join(h, name), root)
         return cache[name]
     return get
 
@@ -76,8 +130,7 @@ def classify(meta, code, out, err):
 
 def run_one(args, get_harness, path):
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            src = f.read()
+        src = read_source(path, args.t262)
     except Exception as e:
         return ("SKIP", f"read-error {e}", path)
     meta = parse_frontmatter(src)

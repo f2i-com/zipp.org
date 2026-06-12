@@ -1994,6 +1994,13 @@ impl<'p> Vm<'p> {
             // Marks the worker done; its thread may linger parked on the
             // broadcast channel (process exit reaps it — one test per process).
             AGENT_LEAVING => Value::UNDEFINED,
+            // The Annex-B call-assignment-target rewrite's deferred PutValue
+            // error (see lib.rs annexb_call_target_rewrite): always throws.
+            ANNEXB_REF_ERROR => {
+                return Err(Thrown(
+                    "ReferenceError: Invalid left-hand side in assignment".into(),
+                ))
+            }
             GLOBAL_PRINT => {
                 // Mirrors the Print instruction (console.log): inspect each
                 // argument, join with spaces, append one stdout line.
