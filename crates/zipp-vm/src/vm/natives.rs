@@ -1869,6 +1869,63 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
+            // A dynamic import DEFERRED off a static module-link DFS (the
+            // ImportCall op queued this microtask): `this` is the import()
+            // promise, args = [specifier, type?]. Performs the load now and
+            // settles the promise exactly like the inline path (including
+            // chaining on a still-pending TLA body promise).
+            MODULE_DYN_IMPORT => {
+                let p = this.heap_index();
+                let spec = self.display(args.first().copied().unwrap_or(Value::UNDEFINED));
+                // Trailing slot: the reaction's settled value (always
+                // undefined here) follows the bound [specifier, type?] args —
+                // only a real string is a type attribute.
+                let mtype = args
+                    .get(1)
+                    .copied()
+                    .filter(|t| !t.is_undefined())
+                    .map(|t| self.display(t));
+                let res: Result<Value, Value> =
+                    match self.module_base_dir.as_ref().map(|d| d.join(&spec)) {
+                        None => Err(self.make_error(1, None)),
+                        Some(path) => match self.import_module(&path, mtype.as_deref()) {
+                            Ok(ns) => Ok(ns),
+                            Err(Thrown(msg)) => Err(self
+                                .pending_throw
+                                .take()
+                                .unwrap_or_else(|| self.error_from_thrown(&msg))),
+                        },
+                    };
+                match res {
+                    Ok(ns) => {
+                        let body = self.pending_module_body.take();
+                        match body {
+                            Some(bp) if bp.is_heap() => {
+                                // Still-evaluating TLA module: settle FROM its
+                                // body promise (fulfill → the namespace).
+                                let _gc = self.gc_lock_guard();
+                                let ret_ns = Value::heap(
+                                    self.heap.alloc(HeapObj::Native(native::SPECIES_GET)),
+                                );
+                                let cb = Value::heap(self.heap.alloc(HeapObj::Bound {
+                                    target: ret_ns,
+                                    this: ns,
+                                    args: Vec::new(),
+                                }));
+                                self.then_internal(
+                                    bp.heap_index(),
+                                    cb,
+                                    Value::UNDEFINED,
+                                    Some(p),
+                                );
+                            }
+                            _ => self.resolve(p, ns),
+                        }
+                    }
+                    Err(e) => self.reject(p, e),
+                }
+                Value::UNDEFINED
+            }
             TA_GET_TOSTRINGTAG => {
                 match this.is_heap().then(|| self.heap.get(this.heap_index())) {
                     Some(HeapObj::TypedArray { kind, .. }) => {

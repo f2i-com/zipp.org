@@ -651,8 +651,34 @@ pub struct Vm<'p> {
     /// `export *` sources): excluded from the namespace; resolving one by name
     /// through `export {x} from` / `import {x}` is a SyntaxError.
     module_ambiguous: std::collections::HashMap<u32, std::collections::HashSet<String>>,
-    /// The lazily-created `import.meta` object (one per Vm; host-defined,
-    /// ordinary extensible null-proto). 0 = not yet allocated.
+    /// CANONICAL live global slot of each module's NAMESPACE binding
+    /// (canonical path → slot into `globals`, which is a GC root). Every
+    /// `import * as ns from M` local and `export * as n from M` entry aliases
+    /// THIS slot, so (a) the binding identity matches the spec's
+    /// (module, ~namespace~) ResolvedBinding — two star-export routes to the
+    /// same module's namespace are UNAMBIGUOUS — and (b) the namespace object
+    /// is trivially identical everywhere. Slot indices only — no rooting.
+    module_ns_slots: std::collections::HashMap<std::path::PathBuf, u32>,
+    /// CANONICAL live global slot of each module's ModuleSource binding
+    /// (`import source x from M`; the synthetic `<module source>` host module
+    /// included). The slot holds the target's %AbstractModuleSource%-linked
+    /// source object; aliasing it gives source re-exports the spec's
+    /// (module, ~source~) binding identity. Slot indices only — no rooting.
+    module_source_slots: std::collections::HashMap<std::path::PathBuf, u32>,
+    /// Per-module `import.meta` objects (module key = its namespace heap index
+    /// → the lazily-created meta object). Values are GC ROOTS (gc.rs).
+    module_metas: std::collections::HashMap<u32, u32>,
+    /// Unified-function-id ranges owned by loader-loaded modules:
+    /// (start, end, namespace heap index). The `ImportMeta` op resolves the
+    /// CURRENT module as the one whose range contains the executing frame's
+    /// func id (each module's functions install contiguously at prepare time);
+    /// ids outside every range (entry script / eval code) use the Vm-wide
+    /// `import_meta` singleton.
+    module_func_ranges: Vec<(u32, u32, u32)>,
+    /// The lazily-created `import.meta` object (for NON-loader code: the entry
+    /// script / direct `run_module` pipeline; host-defined, ordinary extensible
+    /// null-proto). 0 = not yet allocated. Loader-loaded modules each get a
+    /// DISTINCT object via `module_metas`.
     import_meta: u32,
     /// AgentCanSuspend: false when launched with ZIPP_CAN_BLOCK=0 (the
     /// test262 CanBlockIsFalse harness mode) — Atomics.wait then throws.
@@ -725,12 +751,18 @@ pub struct Vm<'p> {
     /// guards static-import cycles (self-imports alias instead).
     module_loading: std::collections::HashSet<std::path::PathBuf>,
     /// Static `export … from` (exported, imported, specifier) + `export *`
-    /// specifiers + base dir of modules whose LINK is in flight: a cyclic
-    /// resolve_export back into one walks these statically (spec
-    /// ResolveExport through a cycle) instead of failing or re-evaluating.
+    /// specifiers + `export * as name from` (exported, specifier) entries +
+    /// base dir of modules whose LINK is in flight: a cyclic resolve_export
+    /// back into one walks these statically (spec ResolveExport through a
+    /// cycle) instead of failing or re-evaluating.
     module_pending_reexports: std::collections::HashMap<
         std::path::PathBuf,
-        (Vec<(String, String, String)>, Vec<String>, Option<std::path::PathBuf>),
+        (
+            Vec<(String, String, String)>,
+            Vec<String>,
+            Vec<(String, String)>,
+            Option<std::path::PathBuf>,
+        ),
     >,
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined

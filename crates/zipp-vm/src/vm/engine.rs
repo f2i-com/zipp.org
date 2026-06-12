@@ -120,6 +120,10 @@ impl<'p> Vm<'p> {
             eval_fn_idx: 0,
             closure_eval_scope: std::collections::HashMap::new(),
             module_ambiguous: std::collections::HashMap::new(),
+            module_ns_slots: std::collections::HashMap::new(),
+            module_source_slots: std::collections::HashMap::new(),
+            module_metas: std::collections::HashMap::new(),
+            module_func_ranges: Vec::new(),
             import_meta: 0,
             can_block: std::env::var("ZIPP_CAN_BLOCK").map_or(true, |v| v != "0"),
             module_loading: std::collections::HashSet::new(),
@@ -1525,6 +1529,79 @@ impl<'p> Vm<'p> {
         Ok(f)
     }
 
+    /// Allocate a fresh live global slot from the eval pool (UNINITIALIZED),
+    /// for module-loader bookkeeping (canonical namespace/source binding slots).
+    fn alloc_module_shared_slot(&mut self) -> Result<u32, Thrown> {
+        let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
+        if self.eval_global_next >= cap {
+            return Err(Thrown(
+                "EvalError: too many distinct globals introduced by eval".into(),
+            ));
+        }
+        let s = self.eval_global_next;
+        self.eval_global_next += 1;
+        self.globals[s as usize] = Value::UNINITIALIZED;
+        Ok(s)
+    }
+
+    /// The CANONICAL live slot of `canon`'s namespace binding, created on
+    /// demand (the VALUE fills in when the namespace is registered/imported).
+    /// One slot per module ⇒ slot identity == the spec's (module, ~namespace~)
+    /// ResolvedBinding identity, which the `export *` ambiguity check compares.
+    fn module_ns_slot(&mut self, canon: &std::path::Path) -> Result<u32, Thrown> {
+        if let Some(&s) = self.module_ns_slots.get(canon) {
+            return Ok(s);
+        }
+        let s = self.alloc_module_shared_slot()?;
+        self.module_ns_slots.insert(canon.to_path_buf(), s);
+        Ok(s)
+    }
+
+    /// The CANONICAL live slot of `key`'s ModuleSource binding (`import
+    /// source`), creating the %AbstractModuleSource%-prototype-linked source
+    /// object on first request. `key` is the canonical target path, or the
+    /// synthetic `<module source>` host-module key (test262: every
+    /// `<module source>` request resolves to ONE shared module record).
+    fn module_source_slot(&mut self, key: &std::path::Path) -> Result<u32, Thrown> {
+        if let Some(&s) = self.module_source_slots.get(key) {
+            return Ok(s);
+        }
+        let s = self.alloc_module_shared_slot()?;
+        let idx = self.heap.alloc(HeapObj::Object(crate::heap::ObjMap::new()));
+        if self.abstractmodulesource_proto != 0 {
+            self.proto_of
+                .insert(idx, Value::heap(self.abstractmodulesource_proto));
+        }
+        self.globals[s as usize] = Value::heap(idx);
+        self.module_source_slots.insert(key.to_path_buf(), s);
+        Ok(s)
+    }
+
+    /// OWN exports (exported name → live slot) of a PREPARED module program,
+    /// in source order; registers the namespace's name→slot map and the
+    /// in-flight own-exports map (cycle resolution reads both).
+    fn register_module_own(
+        &mut self,
+        ns_idx: u32,
+        path: &std::path::Path,
+        exports: &[(String, String)],
+        names: &[String],
+        gmap: &[u32],
+    ) -> Vec<(String, u32)> {
+        let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
+        let mut own_map: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for (exported, local) in exports {
+            if let Some(i) = names.iter().position(|n| n == local) {
+                full.push((exported.clone(), gmap[i]));
+                own_map.insert(exported.clone(), gmap[i]);
+            }
+        }
+        self.module_namespaces.insert(ns_idx, own_map.clone());
+        self.module_own.insert(path.to_path_buf(), own_map);
+        full
+    }
+
     /// Recursively load + LINK a MODULE file for a dynamic `import()`, returning its
     /// (fully-linked) Module Namespace exotic. Cached by canonical path so a re-import
     /// (or a cycle) yields the SAME namespace. Steps: (1) cache hit → return; (2) read
@@ -1697,22 +1774,97 @@ impl<'p> Vm<'p> {
             std::collections::HashMap::new();
         let mut self_aliases: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let mut ns_writes: Vec<(u32, Value)> = Vec::new();
-        let mut self_ns_locals: Vec<u32> = Vec::new();
         // Own (exported name -> compile slot), for self-import aliasing.
         let own_cslot = |name: &str| -> Option<u32> {
-            prog.module_exports.iter().find(|(e, _)| e == name).and_then(|(_, local)| {
-                prog.global_names
+            exports.iter().find(|(e, _)| e == name).and_then(|(_, local)| {
+                names
                     .iter()
                     .position(|n| n == local)
                     .map(|i| i as u32)
             })
         };
-        // PRE-REGISTER this module BEFORE any dependency loads: live slots for
-        // its declared exports are PRE-ALLOCATED (prepare reuses them), so a
-        // CYCLIC re-export back into this module (a dependency doing
-        // `export { x } from './me'` while we are mid-load) resolves to the
-        // real binding instead of re-evaluating this module as a second
-        // instance. An export whose local is itself an IMPORT binding resolves
+        // Pre-resolved canonical target of an import specifier. The
+        // self/in-flight classification below is STABLE for the whole
+        // dependency loop: `module_loading` holds exactly the in-flight
+        // ancestors throughout it.
+        let canon_of = |dir: Option<&std::path::Path>, spec: &str| -> std::path::PathBuf {
+            let raw = match dir {
+                Some(d) => d.join(spec),
+                None => std::path::PathBuf::from(spec),
+            };
+            std::fs::canonicalize(&raw).unwrap_or(raw)
+        };
+        use crate::bytecode::ImportName as IN;
+        // EARLY-PREPARE eligibility: every Named/Default import resolves
+        // WITHOUT loading a dependency (i.e. is a self-import of an own
+        // export). Such a module's environment instantiates BEFORE its
+        // dependencies evaluate — the spec links the whole cycle before any
+        // evaluation — so a cycle dependency that calls one of our hoisted
+        // functions mid-evaluation (verify-dfs) finds the real binding.
+        // Modules with external Named/Default imports keep the
+        // resolve-then-prepare order (their live-slot aliases need the
+        // dependency loaded first); cycle members calling THEIR hoisted
+        // functions before they prepare stay a known limit.
+        let early_prepare = imports.iter().all(|e| match &e.import {
+            IN::Named(n) => {
+                e.mtype.is_none()
+                    && canon_of(dir.as_deref(), &e.specifier) == path
+                    && own_cslot(n).is_some()
+            }
+            IN::Default => {
+                e.mtype.is_none()
+                    && canon_of(dir.as_deref(), &e.specifier) == path
+                    && own_cslot("default").is_some()
+            }
+            _ => true,
+        });
+        // Aliases resolvable BEFORE any dependency loads: a SELF-import of an
+        // own export aliases the module's own compile slot (prepare's second
+        // pass maps both onto ONE live slot); `import * as ns` and
+        // `import source x` locals alias the target's CANONICAL shared slot
+        // (slot identity == spec binding identity; the VALUES fill in below).
+        for e in &imports {
+            match &e.import {
+                IN::Named(n)
+                    if e.mtype.is_none()
+                        && canon_of(dir.as_deref(), &e.specifier) == path =>
+                {
+                    if let Some(c) = own_cslot(n) {
+                        self_aliases.insert(e.local_slot, c);
+                    }
+                }
+                IN::Default
+                    if e.mtype.is_none()
+                        && canon_of(dir.as_deref(), &e.specifier) == path =>
+                {
+                    if let Some(c) = own_cslot("default") {
+                        self_aliases.insert(e.local_slot, c);
+                    }
+                }
+                IN::Namespace if e.mtype.is_none() => {
+                    let canon = canon_of(dir.as_deref(), &e.specifier);
+                    let slot = self.module_ns_slot(&canon)?;
+                    import_aliases.insert(e.local_slot, slot);
+                }
+                IN::Source => {
+                    let key = if e.specifier == "<module source>" {
+                        std::path::PathBuf::from("<module source>")
+                    } else {
+                        canon_of(dir.as_deref(), &e.specifier)
+                    };
+                    let slot = self.module_source_slot(&key)?;
+                    import_aliases.insert(e.local_slot, slot);
+                }
+                _ => {}
+            }
+        }
+        // PRE-REGISTER this module BEFORE any dependency loads (a CYCLIC
+        // re-export back into this module — a dependency doing
+        // `export { x } from './me'` while we are mid-load — must resolve to
+        // the real binding instead of re-evaluating this module as a second
+        // instance). EARLY mode prepares the whole environment now; LATE mode
+        // pre-allocates live slots for the declared exports (prepare reuses
+        // them). An export whose local is itself an IMPORT binding resolves
         // through its dependency; its map entry is patched after prepare.
         let import_locals: std::collections::HashSet<u32> = imports
             .iter()
@@ -1726,36 +1878,77 @@ impl<'p> Vm<'p> {
             std::collections::HashMap::new();
         let mut own_pre: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
-        for (exported, local) in &exports {
-            if let Some(i) = names.iter().position(|n| n == local) {
-                let c = i as u32;
-                if import_locals.contains(&c) || !decl_set.contains(&c) {
-                    continue;
-                }
-                if let Some(&live) = prealloc.get(&c) {
+        if !early_prepare {
+            for (exported, local) in &exports {
+                if let Some(i) = names.iter().position(|n| n == local) {
+                    let c = i as u32;
+                    if import_locals.contains(&c) || !decl_set.contains(&c) {
+                        continue;
+                    }
+                    if let Some(&live) = prealloc.get(&c) {
+                        own_pre.insert(exported.clone(), live);
+                        continue;
+                    }
+                    if self.eval_global_next >= cap {
+                        return Err(Thrown(
+                            "EvalError: too many distinct globals introduced by eval".into(),
+                        ));
+                    }
+                    let live = self.eval_global_next;
+                    self.eval_global_next += 1;
+                    self.globals[live as usize] = Value::UNINITIALIZED;
+                    prealloc.insert(c, live);
                     own_pre.insert(exported.clone(), live);
-                    continue;
                 }
-                if self.eval_global_next >= cap {
-                    return Err(Thrown(
-                        "EvalError: too many distinct globals introduced by eval".into(),
-                    ));
-                }
-                let live = self.eval_global_next;
-                self.eval_global_next += 1;
-                self.globals[live as usize] = Value::UNINITIALIZED;
-                prealloc.insert(c, live);
-                own_pre.insert(exported.clone(), live);
             }
         }
+        let mut prog_opt = Some(prog);
         let ns_idx = self.alloc_empty_namespace();
-        self.module_namespaces.insert(ns_idx, own_pre.clone());
         self.module_cache.insert(path.clone(), Value::heap(ns_idx));
-        self.module_own.insert(path.clone(), own_pre);
         self.module_pending_reexports.insert(
             path.clone(),
-            (reexports.clone(), star_reexports.clone(), dir.clone()),
+            (
+                reexports.clone(),
+                star_reexports.clone(),
+                ns_reexports.clone(),
+                dir.clone(),
+            ),
         );
+        // EARLY mode: instantiate the environment (per-module slots, function/
+        // class install, hoisting) NOW — cycle dependencies see the real
+        // bindings; LATE mode registers the pre-allocated own-export slots.
+        let mut gmap_base: Option<(Vec<u32>, u32)> = None;
+        let mut full: Vec<(String, u32)> = Vec::new();
+        if early_prepare {
+            let prog = prog_opt.take().expect("module program");
+            let prepared = self.prepare_eval_program(
+                prog,
+                true,
+                None,
+                false,
+                None,
+                if import_aliases.is_empty() { None } else { Some(&import_aliases) },
+                if self_aliases.is_empty() { None } else { Some(&self_aliases) },
+                None,
+            );
+            match prepared {
+                Ok((gmap, base_func)) => {
+                    let end = (self.main_func_count + self.eval_funcs.len()) as u32;
+                    self.module_func_ranges.push((base_func, end, ns_idx));
+                    full = self.register_module_own(ns_idx, &path, &exports, &names, &gmap);
+                    gmap_base = Some((gmap, base_func));
+                }
+                Err(e) => {
+                    self.module_cache.remove(&path);
+                    self.module_namespaces.remove(&ns_idx);
+                    self.module_pending_reexports.remove(&path);
+                    return Err(e);
+                }
+            }
+        } else {
+            self.module_namespaces.insert(ns_idx, own_pre.clone());
+            self.module_own.insert(path.clone(), own_pre);
+        }
         // Dependencies that suspend at top-level await get collected past this
         // mark (nested links use their own marks via the same discipline).
         let lp_mark = self.link_pending_deps.len();
@@ -1766,6 +1959,10 @@ impl<'p> Vm<'p> {
             // A failure here is a HOST error (TypeError) — it takes precedence
             // over any link-time SyntaxError a sibling request would raise.
             for e in &imports {
+                // The synthetic `<module source>` host module has no file.
+                if matches!(e.import, IN::Source) && e.specifier == "<module source>" {
+                    continue;
+                }
                 let dep_raw = match dir.as_deref() {
                     Some(d) => d.join(&e.specifier),
                     None => std::path::PathBuf::from(&e.specifier),
@@ -1792,13 +1989,23 @@ impl<'p> Vm<'p> {
                 let is_self = dep_canon == path && e.mtype.is_none();
                 let in_flight =
                     !is_self && e.mtype.is_none() && self.module_loading.contains(&dep_canon);
-                use crate::bytecode::ImportName as IN;
                 match &e.import {
                     IN::LoadOnly => {
                         // A phase import's dep is LOADED (recursively — its own
                         // requests resolve eagerly per LoadRequestedModules)
                         // but never linked or evaluated.
                         if !is_self && !in_flight {
+                            let mut seen = std::collections::HashSet::new();
+                            self.prescan_module_requests(&dep_canon, &mut seen)?;
+                        }
+                    }
+                    IN::Source => {
+                        // Slot + ModuleSource object were created in the
+                        // pre-pass. The LOADING phase still applies to a REAL
+                        // target (its request graph must resolve); the
+                        // synthetic `<module source>` host module needs
+                        // nothing further.
+                        if e.specifier != "<module source>" && !is_self && !in_flight {
                             let mut seen = std::collections::HashSet::new();
                             self.prescan_module_requests(&dep_canon, &mut seen)?;
                         }
@@ -1815,9 +2022,9 @@ impl<'p> Vm<'p> {
                     IN::Named(n) => {
                         if is_self {
                             match own_cslot(n) {
-                                Some(c) => {
-                                    self_aliases.insert(e.local_slot, c);
-                                }
+                                // An own-export self-import was aliased in
+                                // the pre-pass.
+                                Some(_) => {}
                                 None => {
                                     // Not an own local: an INDIRECT export of
                                     // ourselves (`export {x as n} from dep`) —
@@ -1869,9 +2076,8 @@ impl<'p> Vm<'p> {
                     IN::Default => {
                         if is_self {
                             match own_cslot("default") {
-                                Some(c) => {
-                                    self_aliases.insert(e.local_slot, c);
-                                }
+                                // Aliased in the pre-pass.
+                                Some(_) => {}
                                 None => {
                                     let mut seen = std::collections::HashSet::new();
                                     match self.resolve_pending_export(&path, "default", &mut seen)? {
@@ -1915,13 +2121,27 @@ impl<'p> Vm<'p> {
                         }
                     }
                     IN::Namespace => {
-                        if is_self || in_flight {
-                            // Our own namespace: pre-registered below; written
-                            // after it exists.
-                            self_ns_locals.push(e.local_slot);
-                        } else {
-                            let ns = self.import_module_sync(&dep_raw, e.mtype.as_deref())?;
+                        if let Some(t) = e.mtype.as_deref() {
+                            // A TYPED namespace import is a DISTINCT module
+                            // record (even of the importing file itself):
+                            // per-local value write after prepare.
+                            let ns = self.import_module_sync(&dep_raw, Some(t))?;
                             ns_writes.push((e.local_slot, ns));
+                        } else {
+                            // The local aliases the dependency's CANONICAL
+                            // namespace slot (pre-pass); here we ensure the
+                            // slot's VALUE: a self/in-flight target's
+                            // namespace is already pre-registered in the
+                            // cache, anything else imports (evaluates) now.
+                            let slot = self.module_ns_slot(&dep_canon)?;
+                            let nsv = if is_self || in_flight {
+                                self.module_cache.get(&dep_canon).copied()
+                            } else {
+                                Some(self.import_module_sync(&dep_raw, None)?)
+                            };
+                            if let Some(v) = nsv {
+                                self.globals[slot as usize] = v;
+                            }
                         }
                     }
                 }
@@ -1941,51 +2161,50 @@ impl<'p> Vm<'p> {
             return Err(e);
         }
         // PREPARE the module's environment (declared globals → fresh per-module slots,
-        // install funcs/classes, hoist) WITHOUT running the body yet. `gmap[i]` is the
-        // live slot for compile-time global slot `i`.
-        let prepared = self.prepare_eval_program(
-            prog,
-            true,
-            None,
-            false,
-            None,
-            if import_aliases.is_empty() { None } else { Some(&import_aliases) },
-            if self_aliases.is_empty() { None } else { Some(&self_aliases) },
-            if prealloc.is_empty() { None } else { Some(&prealloc) },
-        );
-        let (gmap, base_func) = match prepared {
-            Ok(p) => p,
-            Err(e) => {
-                cleanup_on_err(self);
-                return Err(e);
+        // install funcs/classes, hoist) WITHOUT running the body yet — unless the
+        // EARLY path already did, before the dependency loop. `gmap[i]` is the
+        // live slot for compile-time global slot `i`. The post-prepare
+        // registration REFRESHES the pre-registered maps with the final own
+        // exports (an export whose local is an import binding now has its real
+        // aliased slot; the namespace itself was registered before the
+        // dependency loop, so cyclic re-exports already resolved against the
+        // pre-allocated slots).
+        let (gmap, base_func) = match gmap_base {
+            Some(p) => p,
+            None => {
+                let prog = prog_opt.take().expect("module program");
+                let prepared = self.prepare_eval_program(
+                    prog,
+                    true,
+                    None,
+                    false,
+                    None,
+                    if import_aliases.is_empty() { None } else { Some(&import_aliases) },
+                    if self_aliases.is_empty() { None } else { Some(&self_aliases) },
+                    if prealloc.is_empty() { None } else { Some(&prealloc) },
+                );
+                match prepared {
+                    Ok((gmap, base_func)) => {
+                        let end = (self.main_func_count + self.eval_funcs.len()) as u32;
+                        self.module_func_ranges.push((base_func, end, ns_idx));
+                        full =
+                            self.register_module_own(ns_idx, &path, &exports, &names, &gmap);
+                        (gmap, base_func)
+                    }
+                    Err(e) => {
+                        cleanup_on_err(self);
+                        return Err(e);
+                    }
+                }
             }
         };
-        // Namespace import locals are initialized PRIOR to evaluation.
+        // Typed/deferred namespace import locals are initialized PRIOR to
+        // evaluation (plain namespace locals alias their canonical shared
+        // slot, written during the dependency loop).
         for (cslot, ns) in ns_writes {
             let live = gmap[cslot as usize] as usize;
             self.globals[live] = ns;
         }
-        // OWN exports (exported name → live slot), in source order.
-        let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
-        let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        for (exported, local) in exports {
-            if let Some(i) = names.iter().position(|n| *n == local) {
-                full.push((exported.clone(), gmap[i]));
-                own_map.insert(exported, gmap[i]);
-            }
-        }
-        // REFRESH the pre-registered maps with the final own exports (an export
-        // whose local is an import binding now has its real aliased slot; the
-        // namespace itself was registered before the dependency loop, so cyclic
-        // re-exports already resolved against the pre-allocated slots).
-        self.module_namespaces.insert(ns_idx, own_map.clone());
-        // A self-imported `import * as ns from './me'` local gets OUR OWN
-        // pre-registered namespace object.
-        for cslot in &self_ns_locals {
-            let live = gmap[*cslot as usize] as usize;
-            self.globals[live] = Value::heap(ns_idx);
-        }
-        self.module_own.insert(path.clone(), own_map);
         // Re-exports LINK (and their dependencies evaluate) BEFORE this body
         // runs — the namespace must be complete at evaluation start (a TDZ
         // read of an indirect export during the body must find its binding).
@@ -2150,17 +2369,20 @@ impl<'p> Vm<'p> {
         dir: Option<&std::path::Path>,
     ) -> Result<(Vec<(String, u32)>, std::collections::HashSet<String>), Thrown> {
         // `export * as name from`: import the dependency and export its
-        // NAMESPACE object under `name` (a fresh runtime global slot holds the
-        // value; `self.globals` is a GC root). Cycles resolve through the
-        // loader's pre-registered cache entry.
+        // NAMESPACE object under `name` through the dependency's CANONICAL
+        // namespace slot (`self.globals` is a GC root) — the same slot every
+        // `import * as` of that module aliases, so the binding identity
+        // matches the spec's (module, ~namespace~) ResolvedBinding. Cycles
+        // resolve through the loader's pre-registered cache entry.
         for (exported, spec) in ns_reexports {
             let dep = match dir {
                 Some(d) => d.join(spec),
                 None => std::path::PathBuf::from(spec),
             };
+            let canon = std::fs::canonicalize(&dep).unwrap_or_else(|_| dep.clone());
+            let slot = self.module_ns_slot(&canon)?;
             let ns = self.import_module_sync(&dep, None)?;
-            self.globals.push(ns);
-            let slot = (self.globals.len() - 1) as u32;
+            self.globals[slot as usize] = ns;
             full.push((exported.clone(), slot));
         }
         for (exported, imported, spec) in reexports {
@@ -2508,6 +2730,11 @@ impl<'p> Vm<'p> {
                 _ => None,
             };
             if let Some(spec) = spec {
+                // The synthetic `<module source>` host module (source-phase
+                // imports) has no file and never evaluates — not a request.
+                if spec == "<module source>" {
+                    continue;
+                }
                 let raw = match dir.as_deref() {
                     Some(d) => d.join(&spec),
                     None => std::path::PathBuf::from(&spec),
@@ -2619,7 +2846,9 @@ impl<'p> Vm<'p> {
         if let Some(slot) = self.module_own.get(dep).and_then(|m| m.get(name).copied()) {
             return Ok(Some(slot));
         }
-        let Some((reex, stars, pdir)) = self.module_pending_reexports.get(dep).cloned() else {
+        let Some((reex, stars, nsreex, pdir)) =
+            self.module_pending_reexports.get(dep).cloned()
+        else {
             // Completed (or never in-flight): normal resolution.
             return self.resolve_export(dep, name, None);
         };
@@ -2634,6 +2863,15 @@ impl<'p> Vm<'p> {
             if exported == name {
                 let target = join(pdir.as_deref(), spec);
                 return self.resolve_pending_export(&target, imported, seen);
+            }
+        }
+        // `export * as name from spec`: an INDIRECT export whose binding is
+        // the dependency's namespace — its canonical shared slot (created on
+        // demand; the value fills in when the dependency links).
+        for (exported, spec) in &nsreex {
+            if exported == name {
+                let target = join(pdir.as_deref(), spec);
+                return Ok(Some(self.module_ns_slot(&target)?));
             }
         }
         if name != "default" {

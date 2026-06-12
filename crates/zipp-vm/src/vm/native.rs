@@ -282,6 +282,11 @@ pub const ABSTRACT_MODULE_SOURCE_TAG_GET: u16 = 914;
 /// same job. Bound args: [handler, capResolve, capReject, isRejectReaction];
 /// the reaction's settled value/reason arrives as the trailing call argument.
 pub const CAP_REACTION: u16 = 915;
+/// Internal dynamic-import plumbing (never user-visible): a Bound carrying the
+/// import() promise as `this` and [specifier, type?] as args — performs a
+/// dynamic import that was DEFERRED to a microtask because a static module
+/// link DFS was in flight (the DFS evaluation order must not be preempted).
+pub const MODULE_DYN_IMPORT: u16 = 916;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;

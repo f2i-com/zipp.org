@@ -822,9 +822,13 @@ pub enum ImportName {
     Namespace,
     /// `import './m'` — evaluate for side effects only.
     SideEffect,
-    /// A phase import (`import source x from`): the request is LOADED (an
-    /// unresolvable specifier is a host error) but never linked/evaluated.
+    /// A bindingless phase import: the request is LOADED (an unresolvable
+    /// specifier is a host error) but never linked/evaluated.
     LoadOnly,
+    /// `import source x from` — the local binds the target module's
+    /// ModuleSource object (%AbstractModuleSource%-prototype-linked); the
+    /// target is loaded but never linked/evaluated.
+    Source,
     /// `import defer * as ns from` — the local binds the module's DEFERRED
     /// namespace: the graph loads at link time but evaluates on first
     /// (triggering) namespace access.

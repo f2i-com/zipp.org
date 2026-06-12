@@ -183,6 +183,11 @@ impl Vm<'_> {
         if self.import_meta != 0 {
             root_idx!(self.import_meta);
         }
+        // Per-module import.meta objects (persist for the Vm's lifetime, like
+        // the module cache itself).
+        for &m in self.module_metas.values() {
+            root_idx!(m);
+        }
         if let Some((v, _, _)) = &self.pending_await {
             root_val!(*v);
         }

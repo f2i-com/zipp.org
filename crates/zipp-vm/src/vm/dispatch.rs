@@ -3140,6 +3140,7 @@ impl<'p> Vm<'p> {
                         // BEFORE the promise is allocated; the settle value is rooted
                         // in `dst` across alloc_promise (the iter-169 GC invariant).
                         let spec_val = self.get(base, spec);
+                        let mut deferred = false;
                         let settle: Result<Value, Value> = match self.to_js_string(spec_val) {
                             Err(_) => Err(self
                                 .pending_throw
@@ -3216,6 +3217,55 @@ impl<'p> Vm<'p> {
                                                 .unwrap_or_else(|| self.error_from_thrown(&msg))),
                                         },
                                     }
+                                } else if !self.module_loading.is_empty() {
+                                    // A dynamic import issued WHILE a static
+                                    // module link DFS is in flight (a
+                                    // dependency body evaluating inside an
+                                    // ancestor's import loop) must NOT preempt
+                                    // the spec's DFS evaluation order
+                                    // (verify-dfs): defer the whole load to a
+                                    // microtask — by the time it runs, the DFS
+                                    // has completed (the target then usually
+                                    // sits in the cache already).
+                                    match self.module_base_dir.as_ref() {
+                                        None => Err(self.make_error(1, None)),
+                                        Some(_) => {
+                                            let p = self.alloc_promise();
+                                            // Root the promise in dst across the
+                                            // allocations below.
+                                            self.set(base, dst, Value::heap(p));
+                                            let _gc = self.gc_lock_guard();
+                                            let sv = self.alloc_str(spec_str.clone());
+                                            let mut bargs = vec![sv];
+                                            if let Some(t) = &mtype {
+                                                let tv = self.alloc_str(t.clone());
+                                                bargs.push(tv);
+                                            }
+                                            let tgt = Value::heap(self.heap.alloc(
+                                                HeapObj::Native(native::MODULE_DYN_IMPORT),
+                                            ));
+                                            let cb =
+                                                Value::heap(self.heap.alloc(HeapObj::Bound {
+                                                    target: tgt,
+                                                    this: Value::heap(p),
+                                                    args: bargs,
+                                                }));
+                                            // The reaction's dependent is a fresh
+                                            // dummy — the native settles the REAL
+                                            // promise itself (it may need to chain
+                                            // on a TLA body promise).
+                                            let dummy = self.alloc_promise();
+                                            self.microtasks.push_back(Microtask::Reaction {
+                                                callback: cb,
+                                                arg: Value::UNDEFINED,
+                                                dependent: dummy,
+                                                kind: ReactionKind::Fulfill,
+                                                finally: false,
+                                            });
+                                            deferred = true;
+                                            Ok(Value::heap(p))
+                                        }
+                                    }
                                 } else {
                                     match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
                                         None => Err(self.make_error(1, None)),
@@ -3237,7 +3287,10 @@ impl<'p> Vm<'p> {
                                 }
                             }
                         };
+                        // A DEFERRED load already parked its promise in dst;
+                        // the microtask settles it.
                         match settle {
+                            _ if deferred => {}
                             Ok(v) => {
                                 // A TLA module still evaluating published its
                                 // body promise: the import() promise settles
@@ -3666,12 +3719,40 @@ impl<'p> Vm<'p> {
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
                     Instr::ImportMeta { dst } => {
-                        if self.import_meta == 0 {
-                            let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
-                            self.proto_of.insert(idx, Value::NULL);
-                            self.import_meta = idx;
-                        }
-                        self.set(base, dst, Value::heap(self.import_meta));
+                        // import.meta is DISTINCT per module: the executing
+                        // frame's func id falls in exactly one loader module's
+                        // installed range (closures keep their module's ids);
+                        // outside every range (entry script / run_module /
+                        // eval) the Vm-wide singleton applies.
+                        let fid = func_id;
+                        let mkey = self
+                            .module_func_ranges
+                            .iter()
+                            .find(|&&(s, e, _)| fid >= s && fid < e)
+                            .map(|&(_, _, k)| k);
+                        let idx = match mkey {
+                            Some(k) => match self.module_metas.get(&k) {
+                                Some(&m) => m,
+                                None => {
+                                    // Lazily created, host-defined: ordinary
+                                    // extensible null-proto object (GC-rooted
+                                    // via module_metas).
+                                    let m = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                                    self.proto_of.insert(m, Value::NULL);
+                                    self.module_metas.insert(k, m);
+                                    m
+                                }
+                            },
+                            None => {
+                                if self.import_meta == 0 {
+                                    let idx = self.heap.alloc(HeapObj::Object(ObjMap::new()));
+                                    self.proto_of.insert(idx, Value::NULL);
+                                    self.import_meta = idx;
+                                }
+                                self.import_meta
+                            }
+                        };
+                        self.set(base, dst, Value::heap(idx));
                         ip += 1;
                     }
                     Instr::DirectEval { dst, arg, new_target_ok, this_reg, home_class, super_static, ban_arguments, strict_caller, super_home_obj, var_env_is_global, site, tail } => {

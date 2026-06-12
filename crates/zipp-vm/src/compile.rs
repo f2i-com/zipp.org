@@ -1270,8 +1270,9 @@ impl Compiler {
                 match s {
                     ox::Statement::ImportDeclaration(d) => {
                         // `import defer * as ns` binds the module's DEFERRED
-                        // namespace; `import source` (and other phase forms)
-                        // stay load-only.
+                        // namespace; `import source x` binds the target's
+                        // ModuleSource object; a bindingless phase form stays
+                        // load-only.
                         if !matches!(d.phase, None) {
                             let defer_ns_local = if matches!(d.phase, Some(ox::ImportPhase::Defer))
                             {
@@ -1286,7 +1287,32 @@ impl Compiler {
                             } else {
                                 None
                             };
-                            if let Some(local) = defer_ns_local {
+                            // `import source x from '…'` parses as phase Source
+                            // with a default-shaped binding specifier.
+                            let source_local = if matches!(d.phase, Some(ox::ImportPhase::Source))
+                            {
+                                d.specifiers.as_ref().and_then(|specs| {
+                                    specs.iter().find_map(|sp| match sp {
+                                        ox::ImportDeclarationSpecifier::ImportDefaultSpecifier(
+                                            i,
+                                        ) => Some(i.local.name.to_string()),
+                                        _ => None,
+                                    })
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(local) = source_local {
+                                let slot = fc.cx.global_slot(&local) as u32;
+                                fc.cx.decl_globals.insert(slot);
+                                fc.cx.const_globals.insert(slot);
+                                fc.cx.module_imports.push(ImportEntry {
+                                    local_slot: slot,
+                                    import: ImportName::Source,
+                                    specifier: d.source.value.to_string(),
+                                    mtype: with_clause_type(&d.with_clause),
+                                });
+                            } else if let Some(local) = defer_ns_local {
                                 let slot = fc.cx.global_slot(&local) as u32;
                                 fc.cx.decl_globals.insert(slot);
                                 fc.cx.const_globals.insert(slot);

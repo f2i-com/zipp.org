@@ -596,6 +596,12 @@ impl<'p> Vm<'p> {
         // prototype chain are all observed, e.g. a deleted element reads its inherited
         // value).
         let val = self.json_get(holder, key)?;
+        // json-parse-with-source correspondence (proposal InternalizeJSONProperty
+        // step 3): the parse node applies only while the CURRENT value still
+        // SameValue-matches the value it produced. A reviver that forward-modified
+        // this holder entry invalidates the snapshot — its `context` carries no
+        // `source` and its children no longer correspond.
+        let src = src.filter(|s| self.same_value(s.snapshot(), val));
         // 2. If Type(val) is Object: recurse into its elements / enumerable props
         // using REAL object operations so a reviver that mutates the holder (changing
         // length, replacing a value with a Proxy, making a prop non-configurable, …)
@@ -614,12 +620,10 @@ impl<'p> Vm<'p> {
                 while i < len {
                     let k = i.to_string();
                     // Source tracking only applies to the ORIGINAL parsed element at
-                    // this position; a reviver-replaced value has no source (the kind
-                    // check below falls to None for a replaced array/object, and a
-                    // replaced primitive keeps the positional node — matching the
-                    // common unmodified case without a value snapshot).
+                    // this position; the snapshot check at the child's own entry
+                    // drops a reviver-replaced value's source.
                     let child = match src {
-                        Some(JsonSrc::Arr(v)) => v.get(i as usize),
+                        Some(JsonSrc::Arr(v, _)) => v.get(i as usize),
                         _ => None,
                     };
                     let nv = self.internalize_json(val, &k, reviver, child)?;
@@ -640,7 +644,7 @@ impl<'p> Vm<'p> {
                 };
                 for k in keys {
                     let child = match src {
-                        Some(JsonSrc::Obj(pairs)) => {
+                        Some(JsonSrc::Obj(pairs, _)) => {
                             pairs.iter().find(|(pk, _)| pk == &k).map(|(_, s)| s)
                         }
                         _ => None,
@@ -664,7 +668,7 @@ impl<'p> Vm<'p> {
     /// An array/object node yields an empty context.
     fn make_json_context(&mut self, src: Option<&JsonSrc>) -> Value {
         let ctx = Value::heap(self.heap.alloc(HeapObj::Object(crate::heap::ObjMap::new())));
-        if let Some(JsonSrc::Prim(s)) = src {
+        if let Some(JsonSrc::Prim(s, _)) = src {
             let sv = self.alloc_str(s.clone());
             if let HeapObj::Object(m) = self.heap.get_mut(ctx.heap_index()) {
                 m.set("source", sv);
@@ -701,7 +705,7 @@ impl<'p> Vm<'p> {
                 let v = self.json_parse_value(src, i)?;
                 // `context.source` is a Rust String — LOSSY if the span holds
                 // a raw lone surrogate (documented limit; escapes round-trip).
-                Ok((v, JsonSrc::Prim(crate::heap::wtf8_to_lossy_string(&src[start..*i]))))
+                Ok((v, JsonSrc::Prim(crate::heap::wtf8_to_lossy_string(&src[start..*i]), v)))
             }
         }
     }
@@ -732,7 +736,7 @@ impl<'p> Vm<'p> {
         }
         *i += 1; // ']'
         let av = Value::heap(self.heap.alloc(HeapObj::Array(items)));
-        Ok((av, JsonSrc::Arr(srcs)))
+        Ok((av, JsonSrc::Arr(srcs, av)))
     }
 
     fn json_parse_object_src(
@@ -775,15 +779,29 @@ impl<'p> Vm<'p> {
             map.set(&k, v);
         }
         let ov = Value::heap(self.heap.alloc(HeapObj::Object(map)));
-        Ok((ov, JsonSrc::Obj(srcs)))
+        Ok((ov, JsonSrc::Obj(srcs, ov)))
     }
 }
 
-/// A parallel tree to a parsed JSON value recording each node's raw source text,
-/// for the ES2025 parse-with-source reviver `context.source`.
+/// A parallel tree to a parsed JSON value recording each node's raw source text
+/// AND the value the node produced (its snapshot), for the ES2025
+/// parse-with-source reviver `context.source`. The snapshot drives the spec's
+/// SameValue correspondence check: a holder entry the reviver forward-modified
+/// no longer matches its parse node, so its `context` loses `source` and its
+/// children stop corresponding. Snapshot `Value`s are held across reviver
+/// callbacks — safe because the whole walk runs under a `gc_lock_guard`.
 pub(crate) enum JsonSrc {
     /// A primitive leaf — the exact JSON text that produced it (e.g. `"1.1"`).
-    Prim(String),
-    Arr(Vec<JsonSrc>),
-    Obj(Vec<(String, JsonSrc)>),
+    Prim(String, Value),
+    Arr(Vec<JsonSrc>, Value),
+    Obj(Vec<(String, JsonSrc)>, Value),
+}
+
+impl JsonSrc {
+    /// The value this parse node produced at parse time.
+    pub(crate) fn snapshot(&self) -> Value {
+        match self {
+            JsonSrc::Prim(_, v) | JsonSrc::Arr(_, v) | JsonSrc::Obj(_, v) => *v,
+        }
+    }
 }
