@@ -399,6 +399,9 @@ impl Jit {
         // double/memory path.
         if !self.region_int_blacklist.contains(&key) {
             if let Some(code) = compile_region_int(proto, start, end, globals_base_helper) {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
+                }
                 self.regions
                     .insert(key, Region { code, start, end, deopts: 0, is_int: true, field_plan: None });
                 return;
@@ -427,10 +430,16 @@ impl Jit {
         };
         match compile_region(proto, start, end, globals_base_helper, helpers) {
             Some(code) => {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[jit] DOUBLE/MEM region fn{func_id} [{start},{end}] compiled");
+                }
                 self.regions
                     .insert(key, Region { code, start, end, deopts: 0, is_int: false, field_plan: None });
             }
             None => {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[jit] region fn{func_id} [{start},{end}] DECLINED (blacklisted)");
+                }
                 self.region_blacklist.insert(key);
             }
         }
@@ -456,6 +465,9 @@ impl Jit {
             (false, false)
         };
         if evict {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!("[jit] region fn{} [{}] EVICTED (retry={retry})", key.0, key.1);
+            }
             self.regions.remove(&key);
             if retry {
                 // Don't blacklist the loop — let it recompile on a more general
@@ -973,7 +985,7 @@ enum BinOp {
     Mul,
     Mod,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Cmp {
     Lt,
     Le,
@@ -2119,6 +2131,26 @@ struct RegionPlan {
     /// ~7 dead ops/iteration in the object benchmark, and dropping them also frees
     /// their xmm homes (often taking the loop off the slower home-reuse path).
     dead: FxHashSet<u16>,
+    /// Arithmetic region ips whose 2^53 overflow guard is PROVABLY unnecessary
+    /// (interval analysis showed the result always lands in `[-2^53, 2^53]`, e.g.
+    /// a loop counter bounded by the loop condition's constant). INT path only;
+    /// for a `Mul` it also licenses dropping the i64-overflow `jo` check.
+    elide_guard: FxHashSet<usize>,
+    /// Guard-elided `Mul` ips whose one operand is a single-def constant power of
+    /// two: `(value operand reg, shift)` — emitted as `psllq` instead of an
+    /// imul gpr round-trip. INT path only (f64 keeps `mulsd`).
+    mul_shift: FxHashMap<usize, (u16, u8)>,
+    /// `AddInt` immediates hoisted into spare xmm const homes (filled once in the
+    /// prologue; the int path stores the i64, the double path the f64 bits).
+    addint_imm_home: FxHashMap<i32, u8>,
+    /// Hoisted integer-constant registers mirrored in a spare (otherwise unused)
+    /// bool gpr, so int-path compares read `cmp rax, Rq(g)` instead of a second
+    /// `movq` from the constant's xmm home. `(gpr, value)` per const reg.
+    gpr_const: FxHashMap<u16, (u8, i64)>,
+    /// In-region jump-target ips (any branch lands there, incl. the loop header).
+    /// Used to gate the compare+branch flag-fusion peephole: a branch that is
+    /// itself a jump target can't rely on flags from the preceding compare.
+    jump_targets: FxHashSet<usize>,
 }
 
 /// First xmm index usable as a value home (xmm0/xmm1 are scratch for the few ops
@@ -2174,6 +2206,550 @@ impl XmmAlloc {
         self.active.push((end, x));
         Some(x)
     }
+}
+
+// ── region home unification (copy coalescing) ───────────────────────────────
+//
+// A region temp that only ever shuttles a global's value (`LoadGlobal r ← g` /
+// `<arith> r; StoreGlobal g ← r` pairs) can share the GLOBAL's xmm home, which
+// deletes the `movdqa`/`movaps` copies from the loop body (the same effect as
+// V8's copy coalescing). Soundness hinges on the exit-flush: an aliased reg's
+// slot is flushed FROM THE SHARED HOME, so it must be provable that wherever the
+// interpreter can resume, it never reads the reg before re-executing a def —
+// hence the dominance (no jump target into a def's use window) and no-store
+// (the global isn't redefined inside the window) conditions below.
+
+/// In-region jump-target ips of `[s, e]` (branch targets that stay inside the
+/// region, plus the OSR entry header `s` which the prologue jumps to).
+fn region_jump_targets(code: &[Instr], s: usize, e: usize) -> FxHashSet<usize> {
+    let mut t: FxHashSet<usize> = FxHashSet::default();
+    t.insert(s);
+    for instr in &code[s..=e] {
+        let target = match *instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => target as usize,
+            _ => continue,
+        };
+        if target >= s && target <= e {
+            t.insert(target);
+        }
+    }
+    t
+}
+
+/// Detect regs that can share a GLOBAL's home: every def of `r` is either
+/// `LoadGlobal g` (same `g` for all defs) or an op immediately followed by
+/// `StoreGlobal g ← r`; per def, the use window contains no other store to `g`
+/// and no jump target. Returns `reg → global` for each unifiable reg.
+#[allow(clippy::too_many_arguments)]
+fn unify_homes_with_globals(
+    code: &[Instr],
+    s: usize,
+    e: usize,
+    ty: &FxHashMap<u16, VTy>,
+    first_seen: &FxHashMap<u16, bool>,
+    dead: &FxHashSet<u16>,
+    hoisted: &FxHashSet<u16>,
+    jump_targets: &FxHashSet<usize>,
+) -> FxHashMap<u16, u32> {
+    // defs / uses per reg, in ascending ip order. An operand read at a def ip
+    // (e.g. `Add r = r + x`) is attributed to the PREVIOUS def's window.
+    let mut defs: FxHashMap<u16, Vec<usize>> = FxHashMap::default();
+    let mut uses: FxHashMap<u16, Vec<usize>> = FxHashMap::default();
+    let mut g_stores: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    for ip in s..=e {
+        for u in instr_uses(&code[ip]) {
+            uses.entry(u).or_default().push(ip);
+        }
+        if let Some(d) = writes_reg(&code[ip]) {
+            defs.entry(d).or_default().push(ip);
+        }
+        if let Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } = code[ip] {
+            g_stores.entry(idx).or_default().push(ip);
+        }
+    }
+
+    let mut alias: FxHashMap<u16, u32> = FxHashMap::default();
+    'cand: for (&r, def_ips) in &defs {
+        if ty.get(&r) != Some(&VTy::Num)
+            || first_seen.get(&r) != Some(&true) // live-in regs keep their own home
+            || dead.contains(&r)
+            || hoisted.contains(&r) // hoisted consts materialise in the prologue
+        {
+            continue;
+        }
+        let use_ips = match uses.get(&r) {
+            Some(u) if !u.is_empty() => u,
+            _ => continue, // no uses: nothing to win
+        };
+        // All defs must agree on one global `g`.
+        let mut g: Option<u32> = None;
+        // The def ips whose form is `<arith>; StoreGlobal g ← r` (the store ip is
+        // exempt from the window's "no store to g" rule — it WRITES r's value).
+        let mut adj_store_ips: FxHashSet<usize> = FxHashSet::default();
+        for &d in def_ips {
+            let gd = match code[d] {
+                Instr::LoadGlobal { idx, .. } => idx,
+                _ => {
+                    // Must be immediately followed by `StoreGlobal g ← r`, and a
+                    // path must not be able to enter AT the store (jump target).
+                    match code.get(d + 1) {
+                        Some(&Instr::StoreGlobal { idx, src })
+                        | Some(&Instr::StoreGlobalStrict { idx, src })
+                            if src == r && d + 1 <= e && !jump_targets.contains(&(d + 1)) =>
+                        {
+                            adj_store_ips.insert(d + 1);
+                            idx
+                        }
+                        _ => continue 'cand,
+                    }
+                }
+            };
+            match g {
+                None => g = Some(gd),
+                Some(prev) if prev == gd => {}
+                Some(_) => continue 'cand,
+            }
+        }
+        let g = match g {
+            Some(g) => g,
+            None => continue,
+        };
+        // Per-def window check: (d, u_last] must contain no foreign store to `g`
+        // and no jump target. A use AT the next def ip (operand of the redefining
+        // op) belongs to THIS window.
+        for (k, &d) in def_ips.iter().enumerate() {
+            let next_d = def_ips.get(k + 1).copied().unwrap_or(usize::MAX);
+            let u_last = use_ips
+                .iter()
+                .copied()
+                .filter(|&u| u > d && (u < next_d || u == next_d))
+                .max();
+            let u_last = match u_last {
+                Some(u) => u,
+                None => continue,
+            };
+            if let Some(stores) = g_stores.get(&g) {
+                if stores
+                    .iter()
+                    .any(|&sip| sip > d && sip <= u_last && !adj_store_ips.contains(&sip))
+                {
+                    continue 'cand;
+                }
+            }
+            if jump_targets.iter().any(|&t| t > d && t <= u_last) {
+                continue 'cand;
+            }
+        }
+        alias.insert(r, g);
+    }
+    alias
+}
+
+/// Detect `Move dst ← src` temps that can share a LIVE-IN reg's home (`src` is
+/// loop-carried so its home spans the whole region in both allocation modes).
+/// Conditions mirror `unify_homes_with_globals`: dst single-def, src not
+/// redefined and no jump target inside dst's use window.
+fn unify_move_homes(
+    code: &[Instr],
+    s: usize,
+    e: usize,
+    ty: &FxHashMap<u16, VTy>,
+    first_seen: &FxHashMap<u16, bool>,
+    dead: &FxHashSet<u16>,
+    hoisted: &FxHashSet<u16>,
+    jump_targets: &FxHashSet<usize>,
+    glob_alias: &FxHashMap<u16, u32>,
+) -> FxHashMap<u16, u16> {
+    let mut defs: FxHashMap<u16, Vec<usize>> = FxHashMap::default();
+    let mut uses: FxHashMap<u16, Vec<usize>> = FxHashMap::default();
+    for ip in s..=e {
+        for u in instr_uses(&code[ip]) {
+            uses.entry(u).or_default().push(ip);
+        }
+        if let Some(d) = writes_reg(&code[ip]) {
+            defs.entry(d).or_default().push(ip);
+        }
+    }
+    let mut alias: FxHashMap<u16, u16> = FxHashMap::default();
+    for ip in s..=e {
+        let (dst, src) = match code[ip] {
+            Instr::Move { dst, src } => (dst, src),
+            _ => continue,
+        };
+        if ty.get(&dst) != Some(&VTy::Num)
+            || ty.get(&src) != Some(&VTy::Num)
+            || first_seen.get(&dst) != Some(&true)
+            || dead.contains(&dst)
+            || hoisted.contains(&dst)
+            || glob_alias.contains_key(&dst) // already unified with a global
+            || defs.get(&dst).map(|d| d.len()) != Some(1)
+            // src must be live-in (whole-region home) and not itself re-homed.
+            || first_seen.get(&src) != Some(&false)
+            || glob_alias.contains_key(&src)
+        {
+            continue;
+        }
+        let u_last = match uses.get(&dst).and_then(|u| u.iter().copied().max()) {
+            Some(u) => u,
+            None => continue,
+        };
+        // src not redefined and no jump target in (ip, u_last].
+        let src_redef = defs
+            .get(&src)
+            .map_or(false, |d| d.iter().any(|&di| di > ip && di <= u_last));
+        if src_redef || jump_targets.iter().any(|&t| t > ip && t <= u_last) {
+            continue;
+        }
+        alias.insert(dst, src);
+    }
+    alias
+}
+
+// ── int-region interval analysis (overflow-guard elision) ───────────────────
+//
+// Forward abstract interpretation over the region's small CFG with an interval
+// domain on regs + globals. Live-in values are Int-tagged at entry (i32 range),
+// constants are exact, guarded arithmetic clamps its result to [-2^53, 2^53]
+// (the guard bails otherwise), and the loop-bound compare refines the counter's
+// interval on the fall-through edge. Any arithmetic whose UNCLAMPED result is
+// proven inside [-2^53, 2^53] keeps the invariant without a runtime check, so
+// its guard is elided (and a Mul's i64-overflow `jo` with it).
+
+type Iv = (i64, i64);
+const IV_FULL: Iv = (-TWO_POW_53, TWO_POW_53);
+const IV_I32: Iv = (i32::MIN as i64, i32::MAX as i64);
+/// Sentinel bound for out-of-range mul products (keeps i64 math safe).
+const IV_BIG: i64 = TWO_POW_54;
+
+fn iv_join(a: Iv, b: Iv) -> Iv {
+    (a.0.min(b.0), a.1.max(b.1))
+}
+fn iv_clamp(a: Iv) -> Iv {
+    (a.0.max(-TWO_POW_53), a.1.min(TWO_POW_53))
+}
+fn iv_in_bounds(a: Iv) -> bool {
+    a.0 >= -TWO_POW_53 && a.1 <= TWO_POW_53
+}
+fn iv_add(a: Iv, b: Iv) -> Iv {
+    // Operands are clamped to ±2^53 (invariant), so sums stay well inside i64.
+    (a.0 + b.0, a.1 + b.1)
+}
+fn iv_sub(a: Iv, b: Iv) -> Iv {
+    (a.0 - b.1, a.1 - b.0)
+}
+fn iv_mul(a: Iv, b: Iv) -> Iv {
+    let c = [
+        (a.0 as i128) * (b.0 as i128),
+        (a.0 as i128) * (b.1 as i128),
+        (a.1 as i128) * (b.0 as i128),
+        (a.1 as i128) * (b.1 as i128),
+    ];
+    let lo = *c.iter().min().unwrap();
+    let hi = *c.iter().max().unwrap();
+    (
+        lo.clamp(-(IV_BIG as i128), IV_BIG as i128) as i64,
+        hi.clamp(-(IV_BIG as i128), IV_BIG as i128) as i64,
+    )
+}
+
+/// Abstract state at a program point: intervals for numeric regs/globals (a
+/// missing key means "unknown" = `IV_FULL`), the `reg == global` copy facts used
+/// to propagate branch refinements to the source global, and the most recent
+/// compare (for refining at an immediately following conditional branch).
+#[derive(Clone, PartialEq)]
+struct AbsState {
+    regs: FxHashMap<u16, Iv>,
+    globs: FxHashMap<u32, Iv>,
+    alias: FxHashMap<u16, u32>,
+    cmp: Option<(u16, u16, u16, Cmp, usize)>, // (cond, a, b, op, ip)
+}
+
+impl AbsState {
+    fn reg(&self, r: u16) -> Iv {
+        self.regs.get(&r).copied().unwrap_or(IV_FULL)
+    }
+    fn glob(&self, g: u32) -> Iv {
+        self.globs.get(&g).copied().unwrap_or(IV_FULL)
+    }
+    /// Pointwise join into `self`; returns true if `self` changed. `widen`
+    /// pushes any growing bound straight to its 2^53 extreme (fast convergence).
+    fn join_from(&mut self, other: &AbsState, widen: bool) -> bool {
+        let mut changed = false;
+        // A key missing on either side means FULL; FULL is absorbing, so keep
+        // only keys present in BOTH (others drop to the implicit FULL).
+        let keys: Vec<u16> = self.regs.keys().copied().collect();
+        for r in keys {
+            let a = self.regs[&r];
+            let j = match other.regs.get(&r) {
+                Some(&b) => iv_join(a, b),
+                None => IV_FULL,
+            };
+            let j = if widen && j != a {
+                (
+                    if j.0 < a.0 { -TWO_POW_53 } else { j.0 },
+                    if j.1 > a.1 { TWO_POW_53 } else { j.1 },
+                )
+            } else {
+                j
+            };
+            if j != a {
+                self.regs.insert(r, j);
+                changed = true;
+            }
+        }
+        let keys: Vec<u32> = self.globs.keys().copied().collect();
+        for g in keys {
+            let a = self.globs[&g];
+            let j = match other.globs.get(&g) {
+                Some(&b) => iv_join(a, b),
+                None => IV_FULL,
+            };
+            let j = if widen && j != a {
+                (
+                    if j.0 < a.0 { -TWO_POW_53 } else { j.0 },
+                    if j.1 > a.1 { TWO_POW_53 } else { j.1 },
+                )
+            } else {
+                j
+            };
+            if j != a {
+                self.globs.insert(g, j);
+                changed = true;
+            }
+        }
+        let before = self.alias.len();
+        self.alias.retain(|r, g| other.alias.get(r) == Some(g));
+        if self.alias.len() != before {
+            changed = true;
+        }
+        if self.cmp != other.cmp && self.cmp.is_some() {
+            self.cmp = None;
+            changed = true;
+        }
+        changed
+    }
+    /// Narrow reg `r` (and, via the copy fact, its source global) to `iv`.
+    fn refine_reg(&mut self, r: u16, iv: Iv) {
+        let cur = self.reg(r);
+        let n = (cur.0.max(iv.0), cur.1.min(iv.1));
+        self.regs.insert(r, n);
+        if let Some(&g) = self.alias.get(&r) {
+            let cg = self.glob(g);
+            self.globs.insert(g, (cg.0.max(iv.0), cg.1.min(iv.1)));
+        }
+    }
+    /// Is any tracked interval empty (an infeasible path)?
+    fn infeasible(&self) -> bool {
+        self.regs.values().any(|&(lo, hi)| lo > hi) || self.globs.values().any(|&(lo, hi)| lo > hi)
+    }
+}
+
+/// Refine `a <cmp> b == truth` into `st` (both operands, alias-propagated).
+fn refine_cmp(st: &mut AbsState, a: u16, b: u16, cmp: Cmp, truth: bool) {
+    let (ia, ib) = (st.reg(a), st.reg(b));
+    // Normalise to a "less" relation: a < b / a <= b (swapping for Gt/Ge).
+    let (l, r, il, ir, le, holds) = match (cmp, truth) {
+        (Cmp::Lt, t) => (a, b, ia, ib, false, t),
+        (Cmp::Le, t) => (a, b, ia, ib, true, t),
+        (Cmp::Gt, t) => (b, a, ib, ia, false, t),
+        (Cmp::Ge, t) => (b, a, ib, ia, true, t),
+        (Cmp::Eq, true) | (Cmp::Ne, false) => {
+            let m = (ia.0.max(ib.0), ia.1.min(ib.1));
+            st.refine_reg(a, m);
+            st.refine_reg(b, m);
+            return;
+        }
+        (Cmp::Eq, false) | (Cmp::Ne, true) => return,
+    };
+    if holds {
+        // l < r (or <=): l_hi ≤ r_hi (-1), r_lo ≥ l_lo (+1).
+        let adj = if le { 0 } else { 1 };
+        st.refine_reg(l, (i64::MIN, ir.1 - adj));
+        st.refine_reg(r, (il.0 + adj, i64::MAX));
+    } else {
+        // !(l < r) ⇔ l ≥ r (or l > r for !(<=)).
+        let adj = if le { 1 } else { 0 };
+        st.refine_reg(l, (ir.0 + adj, i64::MAX));
+        st.refine_reg(r, (i64::MIN, il.1 - adj));
+    }
+}
+
+/// Run the interval analysis over the (int-eligible) region `[s, e]` and return
+/// the set of arithmetic ips whose 2^53 guard can be elided. `entry` carries the
+/// live-in i32 facts and hoisted-constant values. Returns an empty set on any
+/// op outside the modelled subset or non-convergence (all guards kept).
+fn analyze_int_guards(proto: &FuncProto, s: usize, e: usize, entry: AbsState) -> FxHashSet<usize> {
+    let n = e - s + 1;
+    if n > 512 {
+        return FxHashSet::default();
+    }
+    // states[i] = abstract state BEFORE executing ip s+i.
+    let mut states: Vec<Option<AbsState>> = vec![None; n];
+    states[0] = Some(entry);
+
+    // Transfer of one op. Returns (fallthrough_state, optional (target, state)).
+    // `elide` (when Some) collects guard-elidable arithmetic ips on a final pass.
+    #[allow(clippy::type_complexity)]
+    fn step(
+        proto: &FuncProto,
+        ip: usize,
+        st: &AbsState,
+        elide: Option<&mut FxHashSet<usize>>,
+    ) -> Option<(Option<AbsState>, Option<(usize, AbsState)>)> {
+        let code = &proto.code;
+        let mut out = st.clone();
+        out.cmp = None;
+        let mut arith = |out: &mut AbsState, dst: u16, iv: Iv, elide: Option<&mut FxHashSet<usize>>| {
+            if iv_in_bounds(iv) {
+                if let Some(set) = elide {
+                    set.insert(ip);
+                }
+            }
+            out.regs.insert(dst, iv_clamp(iv));
+            out.alias.remove(&dst);
+        };
+        match code[ip] {
+            Instr::LoadInt { dst, val } => {
+                out.regs.insert(dst, (val as i64, val as i64));
+                out.alias.remove(&dst);
+            }
+            Instr::LoadConst { dst, idx } => {
+                let c = proto.constants[idx as usize];
+                if !c.is_int() {
+                    return None;
+                }
+                let v = (c.bits() as u32 as i32) as i64;
+                out.regs.insert(dst, (v, v));
+                out.alias.remove(&dst);
+            }
+            Instr::Move { dst, src } => {
+                out.regs.insert(dst, st.reg(src));
+                match st.alias.get(&src).copied() {
+                    Some(g) => {
+                        out.alias.insert(dst, g);
+                    }
+                    None => {
+                        out.alias.remove(&dst);
+                    }
+                }
+            }
+            Instr::LoadGlobal { dst, idx } => {
+                out.regs.insert(dst, st.glob(idx));
+                out.alias.insert(dst, idx);
+            }
+            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+                out.globs.insert(idx, st.reg(src));
+                out.alias.retain(|_, g| *g != idx);
+                out.alias.insert(src, idx);
+            }
+            Instr::AddInt { dst, a, imm, .. } => {
+                arith(&mut out, dst, iv_add(st.reg(a), (imm as i64, imm as i64)), elide);
+            }
+            Instr::Add { dst, a, b } => arith(&mut out, dst, iv_add(st.reg(a), st.reg(b)), elide),
+            Instr::Sub { dst, a, b } => arith(&mut out, dst, iv_sub(st.reg(a), st.reg(b)), elide),
+            Instr::Mul { dst, a, b } => arith(&mut out, dst, iv_mul(st.reg(a), st.reg(b)), elide),
+            Instr::Neg { dst, a } => {
+                let (lo, hi) = st.reg(a);
+                arith(&mut out, dst, (-hi, -lo), elide);
+            }
+            Instr::Mod { dst, .. } => {
+                // |rem| < |b| ≤ 2^53; never guarded (see the Mod emitter).
+                out.regs.insert(dst, (-(TWO_POW_53 - 1), TWO_POW_53 - 1));
+                out.alias.remove(&dst);
+            }
+            Instr::Lt { dst, a, b } => out.cmp = Some((dst, a, b, Cmp::Lt, ip)),
+            Instr::Le { dst, a, b } => out.cmp = Some((dst, a, b, Cmp::Le, ip)),
+            Instr::Gt { dst, a, b } => out.cmp = Some((dst, a, b, Cmp::Gt, ip)),
+            Instr::Ge { dst, a, b } => out.cmp = Some((dst, a, b, Cmp::Ge, ip)),
+            Instr::Eq { dst, a, b } => out.cmp = Some((dst, a, b, Cmp::Eq, ip)),
+            Instr::Ne { dst, a, b } => out.cmp = Some((dst, a, b, Cmp::Ne, ip)),
+            Instr::Jump { target } => {
+                return Some((None, Some((target as usize, out))));
+            }
+            Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
+                let if_false = matches!(code[ip], Instr::JumpIfFalse { .. });
+                let mut fall = out.clone();
+                let mut jump = out;
+                if let Some((c, a, b, op, cip)) = st.cmp {
+                    if c == cond && cip + 1 == ip {
+                        // fall-through executes when cond == !if_false… i.e. the
+                        // branch is NOT taken: JumpIfFalse falls through on TRUE.
+                        refine_cmp(&mut fall, a, b, op, if_false);
+                        refine_cmp(&mut jump, a, b, op, !if_false);
+                    }
+                }
+                return Some((Some(fall), Some((target as usize, jump))));
+            }
+            Instr::JumpIfNotLt { a, b, target } | Instr::JumpIfNotLe { a, b, target } => {
+                let op = if matches!(code[ip], Instr::JumpIfNotLt { .. }) { Cmp::Lt } else { Cmp::Le };
+                let mut fall = out.clone();
+                let mut jump = out;
+                refine_cmp(&mut fall, a, b, op, true);
+                refine_cmp(&mut jump, a, b, op, false);
+                return Some((Some(fall), Some((target as usize, jump))));
+            }
+            Instr::Return { .. } | Instr::ReturnUndefined => return Some((None, None)),
+            _ => return None, // outside the modelled subset
+        }
+        Some((Some(out), None))
+    }
+
+    // Fixpoint with widening after a few passes; cap the pass count hard.
+    let mut pass = 0usize;
+    loop {
+        pass += 1;
+        if pass > 40 {
+            return FxHashSet::default(); // no convergence — keep all guards
+        }
+        let widen = pass > 8;
+        let mut changed = false;
+        for ip in s..=e {
+            let st = match &states[ip - s] {
+                Some(st) if !st.infeasible() => st.clone(),
+                _ => continue,
+            };
+            let (fall, jump) = match step(proto, ip, &st, None) {
+                Some(r) => r,
+                None => return FxHashSet::default(),
+            };
+            let mut merge = |tip: usize, ns: AbsState, states: &mut Vec<Option<AbsState>>| {
+                if tip < s || tip > e || ns.infeasible() {
+                    return false; // exits the region (or a dead edge)
+                }
+                match &mut states[tip - s] {
+                    Some(old) => old.join_from(&ns, widen),
+                    slot @ None => {
+                        *slot = Some(ns);
+                        true
+                    }
+                }
+            };
+            if let Some(f) = fall {
+                changed |= merge(ip + 1, f, &mut states);
+            }
+            if let Some((t, j)) = jump {
+                changed |= merge(t, j, &mut states);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Final pass over the stable states: collect provably-in-bounds arithmetic.
+    let mut elide: FxHashSet<usize> = FxHashSet::default();
+    for ip in s..=e {
+        if let Some(st) = &states[ip - s] {
+            if !st.infeasible() {
+                let _ = step(proto, ip, st, Some(&mut elide));
+            }
+        }
+    }
+    elide
 }
 
 /// Plan register homes for `[start, end]`, or `None` to decline (use mem path).
@@ -2369,6 +2945,85 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
     }
     hoist_ips.sort_unstable();
 
+    // Exact values of single-def integer-constant regs (hoisted or not): used by
+    // the analysis entry state, the Mul strength reduction and the gpr mirrors.
+    let mut const_vals: FxHashMap<u16, i64> = FxHashMap::default();
+    for (&r, &ip) in &const_def_ip {
+        if def_count.get(&r) != Some(&1) {
+            continue;
+        }
+        match code[ip] {
+            Instr::LoadInt { val, .. } => {
+                const_vals.insert(r, val as i64);
+            }
+            Instr::LoadConst { idx, .. } => {
+                if let Some(c) = proto.constants.get(idx as usize) {
+                    if c.is_int() {
+                        const_vals.insert(r, (c.bits() as u32 as i32) as i64);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── home unification (copy coalescing) ── temps that only shuttle a global's
+    // (or a live-in reg's) value share that value's home; the body copies vanish.
+    let jump_targets = region_jump_targets(code, s, e);
+    let glob_alias =
+        unify_homes_with_globals(code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets);
+    let move_alias = unify_move_homes(
+        code, s, e, &ty, &first_seen, &dead, &hoisted, &jump_targets, &glob_alias,
+    );
+    // Aliased regs don't consume an xmm home of their own.
+    reg_order.retain(|r| !glob_alias.contains_key(r) && !move_alias.contains_key(r));
+
+    // ── overflow-guard elision (INT path) ── interval analysis proves which
+    // arithmetic results always stay inside [-2^53, 2^53].
+    let mut elide_guard: FxHashSet<usize> = FxHashSet::default();
+    let mut mul_shift: FxHashMap<usize, (u16, u8)> = FxHashMap::default();
+    if region_is_int(proto, start, end) {
+        let mut entry = AbsState {
+            regs: FxHashMap::default(),
+            globs: FxHashMap::default(),
+            alias: FxHashMap::default(),
+            cmp: None,
+        };
+        for (&r, &def_first) in &first_seen {
+            if !def_first && ty.get(&r) == Some(&VTy::Num) {
+                entry.regs.insert(r, IV_I32); // live-in reg: entry-guarded Int
+            }
+        }
+        for (&g, &read_first) in &glob_first_read {
+            if read_first {
+                entry.globs.insert(g, IV_I32); // live-in global: entry-guarded Int
+            }
+        }
+        for &r in &hoisted {
+            if let Some(&v) = const_vals.get(&r) {
+                entry.regs.insert(r, (v, v)); // materialised in the prologue
+            }
+        }
+        elide_guard = analyze_int_guards(proto, s, e, entry);
+        // Strength-reduce a guard-elided `Mul` by a constant power of two into a
+        // left shift (`psllq`), skipping the imul gpr round-trip.
+        for ip in s..=e {
+            if !elide_guard.contains(&ip) {
+                continue;
+            }
+            if let Instr::Mul { a, b, .. } = code[ip] {
+                let (val_reg, k) = match (const_vals.get(&a), const_vals.get(&b)) {
+                    (_, Some(&k)) => (a, k),
+                    (Some(&k), _) => (b, k),
+                    _ => continue,
+                };
+                if k >= 2 && (k as u64).is_power_of_two() {
+                    mul_shift.insert(ip, (val_reg, (k as u64).trailing_zeros() as u8));
+                }
+            }
+        }
+    }
+
     // Per-register live range [first_ip, last_ip] within the region (for linear-
     // scan reuse). A live-in reg (used before defined) is loop-carried, so its
     // value spans the whole region [s, e]; otherwise it lives from its first
@@ -2411,6 +3066,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
     // ── allocate xmm/gpr homes ──
     let mut reg_home: FxHashMap<u16, Home> = FxHashMap::default();
     let mut glob_home: FxHashMap<u32, u8> = FxHashMap::default();
+    let first_free_xmm: u8;
     if reuse {
         // Linear-scan: numeric values (regs + globals) by ascending range start,
         // reusing a home once a value's range ends. Loop-carried values (globals
@@ -2438,6 +3094,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
                 }
             }
         }
+        first_free_xmm = alloc.next; // never-touched homes are free for constants
     } else {
         // One distinct home per numeric value (best ILP — what loop.js relies on).
         let mut next_xmm = HOME_XMM_FIRST;
@@ -2457,6 +3114,7 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
             glob_home.insert(gi, next_xmm);
             next_xmm += 1;
         }
+        first_free_xmm = next_xmm;
     }
     // Bools (both modes): gpr homes; a live-in bool is unsupported.
     let mut next_bool = 0usize;
@@ -2468,6 +3126,71 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
             reg_home.insert(r, Home::Gpr(BOOL_GPRS[next_bool]));
             next_bool += 1;
         }
+    }
+
+    // ── spare-home constants ──
+    // Distinct `AddInt` immediates get a permanent xmm const home when the pool
+    // has room (saves a per-iteration materialise+convert in the loop body).
+    let mut addint_imm_home: FxHashMap<i32, u8> = FxHashMap::default();
+    {
+        let mut imms: Vec<i32> = Vec::new();
+        for instr in &code[s..=e] {
+            if let Instr::AddInt { imm, .. } = *instr {
+                if !imms.contains(&imm) {
+                    imms.push(imm);
+                }
+            }
+        }
+        let mut next = first_free_xmm;
+        for imm in imms {
+            if next > HOME_XMM_LAST {
+                break;
+            }
+            addint_imm_home.insert(imm, next);
+            next += 1;
+        }
+    }
+    // Hoisted integer constants used as compare operands get a spare bool-gpr
+    // mirror so int-path compares avoid a second `movq` from the xmm home.
+    let mut gpr_const: FxHashMap<u16, (u8, i64)> = FxHashMap::default();
+    {
+        let mut cand: Vec<u16> = Vec::new();
+        for instr in &code[s..=e] {
+            let (a, b) = match *instr {
+                Instr::Lt { a, b, .. }
+                | Instr::Le { a, b, .. }
+                | Instr::Gt { a, b, .. }
+                | Instr::Ge { a, b, .. }
+                | Instr::Eq { a, b, .. }
+                | Instr::Ne { a, b, .. }
+                | Instr::JumpIfNotLt { a, b, .. }
+                | Instr::JumpIfNotLe { a, b, .. } => (a, b),
+                _ => continue,
+            };
+            for r in [a, b] {
+                if hoisted.contains(&r) && const_vals.contains_key(&r) && !cand.contains(&r) {
+                    cand.push(r);
+                }
+            }
+        }
+        let mut nb = next_bool;
+        for r in cand {
+            if nb >= BOOL_GPRS.len() {
+                break;
+            }
+            gpr_const.insert(r, (BOOL_GPRS[nb], const_vals[&r]));
+            nb += 1;
+        }
+    }
+
+    // ── apply home unification ── aliased regs share their value's home; their
+    // own slots are still flushed (from the shared home) on every exit.
+    for (&r, &g) in &glob_alias {
+        reg_home.insert(r, Home::Xmm(glob_home[&g]));
+    }
+    for (&r, &src) in &move_alias {
+        let h = reg_home[&src];
+        reg_home.insert(r, h);
     }
 
     // ── derived lists from the final homes (unified for both modes) ──
@@ -2486,6 +3209,16 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
                 }
             }
             Home::Gpr(g) => bool_regs.push((r, g)),
+        }
+    }
+    // Home-unified regs aren't in reg_order; they're flushed from the SHARED home
+    // (never live-in: unification requires the first occurrence to be a def).
+    for (&r, &g) in &glob_alias {
+        num_regs.push((r, glob_home[&g]));
+    }
+    for (&r, _) in &move_alias {
+        if let Home::Xmm(x) = reg_home[&r] {
+            num_regs.push((r, x));
         }
     }
     let mut globs = Vec::new();
@@ -2509,6 +3242,11 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
         hoist_ips,
         hoisted,
         dead,
+        elide_guard,
+        mul_shift,
+        addint_imm_home,
+        gpr_const,
+        jump_targets,
     })
 }
 
@@ -2722,11 +3460,28 @@ fn compile_region_regalloc(
     for &hip in &plan.hoist_ips {
         emit_load_const(&mut ops, &plan, &proto.code[hip], proto);
     }
+    // AddInt immediates as f64 const homes (an i32 converts to f64 exactly).
+    {
+        let mut imms: Vec<(i32, u8)> = plan.addint_imm_home.iter().map(|(&i, &h)| (i, h)).collect();
+        imms.sort_unstable();
+        for (imm, h) in imms {
+            let bits = (imm as f64).to_bits();
+            dynasm!(ops ; mov rax, QWORD bits as i64 ; movq Rx(h), rax);
+        }
+    }
     dynasm!(ops ; jmp => lbl(start, &in_region));
 
     // ── body ──
+    // Compare→branch flag fusion (ordered f64 compares only — Eq/Ne need the
+    // parity fix-up, so they keep the boxed-bool `test` path).
+    let mut flag_cmp: Option<(usize, u16, Cmp)> = None;
+    // Redundant-copy tracker (see `LastCopy`).
+    let mut lc: LastCopy = None;
     for ip in s..=e {
         dynasm!(ops ; => lbl(ip as u32, &in_region));
+        if plan.jump_targets.contains(&ip) {
+            lc = None; // control may arrive here with different home contents
+        }
         // A hoisted constant's home was filled in the prologue; the body op is a
         // no-op (fall through to the next ip, its label preserved for jumps).
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
@@ -2741,14 +3496,28 @@ fn compile_region_regalloc(
                 continue;
             }
         }
+        let prev_flag = flag_cmp.take();
         match proto.code[ip] {
             Instr::LoadInt { .. } | Instr::LoadConst { .. } => {
                 emit_load_const(&mut ops, &plan, &proto.code[ip], proto);
+                if let Some(d) = writes_reg(&proto.code[ip]) {
+                    copy_clobber(&mut lc, xh(&plan, d));
+                }
             }
+            // Register copies use movaps (a FULL-register copy): unlike
+            // `movsd xmm, xmm`, it has no false dependency on the destination's
+            // old value and is eliminated at rename — this keeps the loop's
+            // carried dependency chains down to the actual addsd/mulsd.
             Instr::Move { dst, src } => match home(&plan, dst) {
                 Home::Xmm(d) => {
                     let srx = xh(&plan, src);
-                    dynasm!(ops ; movsd Rx(d), Rx(srx));
+                    if d != srx && !copy_is_noop(lc, d, srx) {
+                        dynasm!(ops ; movaps Rx(d), Rx(srx));
+                        copy_clobber(&mut lc, d);
+                        lc = Some((d, srx));
+                    } else {
+                        flag_cmp = prev_flag; // nothing emitted; flags still live
+                    }
                 }
                 Home::Gpr(d) => {
                     let sg = gh(&plan, src);
@@ -2758,28 +3527,50 @@ fn compile_region_regalloc(
             Instr::LoadGlobal { dst, idx } => {
                 let d = xh(&plan, dst);
                 let g = plan.glob_home[&idx];
-                dynasm!(ops ; movsd Rx(d), Rx(g));
+                if d != g && !copy_is_noop(lc, d, g) {
+                    dynasm!(ops ; movaps Rx(d), Rx(g));
+                    copy_clobber(&mut lc, d);
+                    lc = Some((d, g));
+                } else {
+                    flag_cmp = prev_flag;
+                }
             }
             Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
                 let g = plan.glob_home[&idx];
                 let srx = xh(&plan, src);
-                dynasm!(ops ; movsd Rx(g), Rx(srx));
+                if g != srx && !copy_is_noop(lc, g, srx) {
+                    dynasm!(ops ; movaps Rx(g), Rx(srx));
+                    copy_clobber(&mut lc, g);
+                    lc = Some((g, srx));
+                } else {
+                    flag_cmp = prev_flag;
+                }
             }
-            Instr::Add { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Add),
-            Instr::Sub { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Sub),
-            Instr::Mul { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Mul),
-            Instr::Div { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Div),
+            Instr::Add { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Add, &mut lc),
+            Instr::Sub { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Sub, &mut lc),
+            Instr::Mul { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Mul, &mut lc),
+            Instr::Div { dst, a, b } => emit_dbin(&mut ops, &plan, dst, a, b, DOp::Div, &mut lc),
             Instr::AddInt { dst, a, imm, .. } => {
                 let d = xh(&plan, dst);
                 let ax = xh(&plan, a);
-                dynasm!(ops
-                    ; mov eax, imm
-                    ; cvtsi2sd xmm0, eax
-                );
-                if d != ax {
-                    dynasm!(ops ; movsd Rx(d), Rx(ax));
+                let skip_copy = d == ax || copy_is_noop(lc, d, ax);
+                if let Some(&ch) = plan.addint_imm_home.get(&imm) {
+                    // The immediate sits (as f64) in a prologue-filled const home.
+                    if !skip_copy {
+                        dynasm!(ops ; movaps Rx(d), Rx(ax));
+                    }
+                    dynasm!(ops ; addsd Rx(d), Rx(ch));
+                } else {
+                    // Materialise the immediate's f64 bits via a gpr: `movq` writes
+                    // the full register (no cvtsi2sd false dependency on xmm0).
+                    let bits = (imm as f64).to_bits();
+                    dynasm!(ops ; mov rax, QWORD bits as i64 ; movq xmm0, rax);
+                    if !skip_copy {
+                        dynasm!(ops ; movaps Rx(d), Rx(ax));
+                    }
+                    dynasm!(ops ; addsd Rx(d), xmm0);
                 }
-                dynasm!(ops ; addsd Rx(d), xmm0);
+                copy_clobber(&mut lc, d);
             }
             Instr::Neg { dst, a } => {
                 let d = xh(&plan, dst);
@@ -2787,28 +3578,71 @@ fn compile_region_regalloc(
                 dynasm!(ops
                     ; xorps xmm0, xmm0
                     ; subsd xmm0, Rx(ax)
-                    ; movsd Rx(d), xmm0
+                    ; movaps Rx(d), xmm0
                 );
+                copy_clobber(&mut lc, d);
             }
-            Instr::Lt { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Lt),
-            Instr::Le { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Le),
-            Instr::Gt { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Gt),
-            Instr::Ge { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Ge),
+            Instr::Lt { dst, a, b } => {
+                emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Lt);
+                flag_cmp = Some((ip, dst, Cmp::Lt));
+            }
+            Instr::Le { dst, a, b } => {
+                emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Le);
+                flag_cmp = Some((ip, dst, Cmp::Le));
+            }
+            Instr::Gt { dst, a, b } => {
+                emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Gt);
+                flag_cmp = Some((ip, dst, Cmp::Gt));
+            }
+            Instr::Ge { dst, a, b } => {
+                emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Ge);
+                flag_cmp = Some((ip, dst, Cmp::Ge));
+            }
             Instr::Eq { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Eq),
             Instr::Ne { dst, a, b } => emit_dcmp(&mut ops, &plan, dst, a, b, Cmp::Ne),
             Instr::Jump { target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
                 dynasm!(ops ; jmp => t);
             }
-            Instr::JumpIfFalse { cond, target } => {
-                let c = gh(&plan, cond);
+            Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
+                let if_false = matches!(proto.code[ip], Instr::JumpIfFalse { .. });
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                dynasm!(ops ; test Rq(c), Rq(c) ; jz => t);
-            }
-            Instr::JumpIfTrue { cond, target } => {
-                let c = gh(&plan, cond);
-                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                dynasm!(ops ; test Rq(c), Rq(c) ; jnz => t);
+                // Flag fusion off the preceding ucomisd (ordered compares only).
+                // emit_dcmp computed `Lt/Le` as `ucomisd b, a` (seta/setae) and
+                // `Gt/Ge` as `ucomisd a, b` — the unsigned-style jcc below mirror
+                // that operand order, and NaN (CF=ZF=PF=1) makes every ordered
+                // comparison FALSE: the `if_false` jcc is then taken, exactly as
+                // the interpreter's NaN comparison semantics demand.
+                let fused = match prev_flag {
+                    Some((cip, creg, op))
+                        if creg == cond
+                            && !(cip + 1..=ip).any(|p| plan.jump_targets.contains(&p)) =>
+                    {
+                        Some(op)
+                    }
+                    _ => None,
+                };
+                match fused {
+                    Some(op) => match (op, if_false) {
+                        (Cmp::Lt, true) => dynasm!(ops ; jbe => t),  // !(b > a)
+                        (Cmp::Le, true) => dynasm!(ops ; jb => t),   // !(b >= a)
+                        (Cmp::Gt, true) => dynasm!(ops ; jbe => t),  // !(a > b)
+                        (Cmp::Ge, true) => dynasm!(ops ; jb => t),   // !(a >= b)
+                        (Cmp::Lt, false) => dynasm!(ops ; ja => t),
+                        (Cmp::Le, false) => dynasm!(ops ; jae => t),
+                        (Cmp::Gt, false) => dynasm!(ops ; ja => t),
+                        (Cmp::Ge, false) => dynasm!(ops ; jae => t),
+                        _ => unreachable!("flag fusion records ordered compares only"),
+                    },
+                    None => {
+                        let c = gh(&plan, cond);
+                        if if_false {
+                            dynasm!(ops ; test Rq(c), Rq(c) ; jz => t);
+                        } else {
+                            dynasm!(ops ; test Rq(c), Rq(c) ; jnz => t);
+                        }
+                    }
+                }
             }
             Instr::JumpIfNotLt { a, b, target } => {
                 let (ax, bx) = (xh(&plan, a), xh(&plan, b));
@@ -2999,11 +3833,33 @@ fn compile_region_int(
     for &hip in &plan.hoist_ips {
         emit_int_const(&mut ops, &plan, &proto.code[hip], proto);
     }
+    // Spare-home constants: AddInt immediates as i64 xmm homes, and gpr mirrors
+    // of hoisted compare constants (both filled once; the body reads them).
+    {
+        let mut imms: Vec<(i32, u8)> = plan.addint_imm_home.iter().map(|(&i, &h)| (i, h)).collect();
+        imms.sort_unstable();
+        for (imm, h) in imms {
+            dynasm!(ops ; mov rax, QWORD imm as i64 ; movq Rx(h), rax);
+        }
+        let mut gcs: Vec<(u8, i64)> = plan.gpr_const.values().copied().collect();
+        gcs.sort_unstable();
+        for (g, v) in gcs {
+            dynasm!(ops ; mov Rq(g), QWORD v);
+        }
+    }
     dynasm!(ops ; jmp => lbl(start, &in_region));
 
     // ── body ──
+    // Compare→branch flag fusion: the last EMITTED op being a compare leaves its
+    // flags live for an immediately following conditional jump (no re-`test`).
+    let mut flag_cmp: Option<(usize, u16, Cmp)> = None;
+    // Redundant-copy tracker (see `LastCopy`).
+    let mut lc: LastCopy = None;
     for ip in s..=e {
         dynasm!(ops ; => lbl(ip as u32, &in_region));
+        if plan.jump_targets.contains(&ip) {
+            lc = None; // control may arrive here with different home contents
+        }
         if let Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } = proto.code[ip] {
             if plan.hoisted.contains(&dst) {
                 continue;
@@ -3019,14 +3875,24 @@ fn compile_region_int(
                 continue;
             }
         }
+        let prev_flag = flag_cmp.take();
         match proto.code[ip] {
             Instr::LoadInt { .. } | Instr::LoadConst { .. } => {
                 emit_int_const(&mut ops, &plan, &proto.code[ip], proto);
+                if let Some(d) = writes_reg(&proto.code[ip]) {
+                    copy_clobber(&mut lc, xh(&plan, d));
+                }
             }
             Instr::Move { dst, src } => match home(&plan, dst) {
                 Home::Xmm(d) => {
                     let srx = xh(&plan, src);
-                    dynasm!(ops ; movdqa Rx(d), Rx(srx));
+                    if d != srx && !copy_is_noop(lc, d, srx) {
+                        dynasm!(ops ; movdqa Rx(d), Rx(srx));
+                        copy_clobber(&mut lc, d);
+                        lc = Some((d, srx));
+                    } else {
+                        flag_cmp = prev_flag; // nothing emitted; flags still live
+                    }
                 }
                 Home::Gpr(d) => {
                     let sg = gh(&plan, src);
@@ -3036,37 +3902,75 @@ fn compile_region_int(
             Instr::LoadGlobal { dst, idx } => {
                 let d = xh(&plan, dst);
                 let g = plan.glob_home[&idx];
-                dynasm!(ops ; movdqa Rx(d), Rx(g));
+                if d != g && !copy_is_noop(lc, d, g) {
+                    dynasm!(ops ; movdqa Rx(d), Rx(g));
+                    copy_clobber(&mut lc, d);
+                    lc = Some((d, g));
+                } else {
+                    flag_cmp = prev_flag;
+                }
             }
             Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
                 let g = plan.glob_home[&idx];
                 let srx = xh(&plan, src);
-                dynasm!(ops ; movdqa Rx(g), Rx(srx));
+                if g != srx && !copy_is_noop(lc, g, srx) {
+                    dynasm!(ops ; movdqa Rx(g), Rx(srx));
+                    copy_clobber(&mut lc, g);
+                    lc = Some((g, srx));
+                } else {
+                    flag_cmp = prev_flag;
+                }
             }
-            Instr::Add { dst, a, b } => emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, true),
-            Instr::Sub { dst, a, b } => emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, false),
+            Instr::Add { dst, a, b } => {
+                emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, true, &mut lc);
+            }
+            Instr::Sub { dst, a, b } => {
+                emit_ibin(&mut ops, &plan, ip, flush_exit, dst, a, b, false, &mut lc);
+            }
             Instr::Mul { dst, a, b } => {
-                // i64 multiply via imul (gpr). On i64 OVERFLOW (product ≥ 2^63)
-                // the result wrapped → bail at THIS ip WITHOUT storing dst, so the
-                // interpreter redoes it in f64 (reading the flushed operands). On a
-                // representable-but-large product the 2^53 guard handles it (like
-                // add): flush via cvtsi2sd (== JS's rounded product) + resume ip+1.
-                let (d, ax, bx) = (xh(&plan, dst), xh(&plan, a), xh(&plan, b));
-                let ovf = ops.new_dynamic_label();
-                let done = ops.new_dynamic_label();
-                dynasm!(ops
-                    ; movq rax, Rx(ax)
-                    ; movq rcx, Rx(bx)
-                    ; imul rax, rcx
-                    ; jo => ovf            // i64 overflow → can't represent; redo in interp
-                    ; movq Rx(d), rax
-                    ; jmp => done
-                    ; => ovf
-                    ; mov DWORD [rsi], ip as i32 // resume at THIS op (dst not written)
-                    ; jmp => flush_exit
-                    ; => done
-                );
-                emit_i53_guard(&mut ops, d, ip, flush_exit);
+                let d = xh(&plan, dst);
+                copy_clobber(&mut lc, d);
+                if let Some(&(val_reg, shift)) = plan.mul_shift.get(&ip) {
+                    // Guard-elided multiply by a constant power of two: a left
+                    // shift (logical == arithmetic for the proven-in-range i64).
+                    let vx = xh(&plan, val_reg);
+                    if d != vx {
+                        dynasm!(ops ; movdqa Rx(d), Rx(vx));
+                    }
+                    dynasm!(ops ; psllq Rx(d), shift as i8);
+                } else if plan.elide_guard.contains(&ip) {
+                    // Result proven within ±2^53 ⇒ no i64 overflow possible and
+                    // no 2^53 guard needed; bare imul through the gprs.
+                    let (ax, bx) = (xh(&plan, a), xh(&plan, b));
+                    dynasm!(ops
+                        ; movq rax, Rx(ax)
+                        ; movq rcx, Rx(bx)
+                        ; imul rax, rcx
+                        ; movq Rx(d), rax
+                    );
+                } else {
+                    // i64 multiply via imul (gpr). On i64 OVERFLOW (product ≥ 2^63)
+                    // the result wrapped → bail at THIS ip WITHOUT storing dst, so the
+                    // interpreter redoes it in f64 (reading the flushed operands). On a
+                    // representable-but-large product the 2^53 guard handles it (like
+                    // add): flush via cvtsi2sd (== JS's rounded product) + resume ip+1.
+                    let (ax, bx) = (xh(&plan, a), xh(&plan, b));
+                    let ovf = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; movq rax, Rx(ax)
+                        ; movq rcx, Rx(bx)
+                        ; imul rax, rcx
+                        ; jo => ovf            // i64 overflow → can't represent; redo in interp
+                        ; movq Rx(d), rax
+                        ; jmp => done
+                        ; => ovf
+                        ; mov DWORD [rsi], ip as i32 // resume at THIS op (dst not written)
+                        ; jmp => flush_exit
+                        ; => done
+                    );
+                    emit_i53_guard(&mut ops, d, ip, flush_exit);
+                }
             }
             Instr::Mod { dst, a, b } => {
                 // i64 remainder via idiv (gpr): `rem = a % b`, truncated toward
@@ -3079,6 +3983,7 @@ fn compile_region_int(
                 // i53 guard needed). rcx/rdx are scratch here (bool homes live in
                 // r8..r11, never rcx/rdx).
                 let (d, ax, bx) = (xh(&plan, dst), xh(&plan, a), xh(&plan, b));
+                copy_clobber(&mut lc, d);
                 let zbail = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 dynasm!(ops
@@ -3099,13 +4004,38 @@ fn compile_region_int(
             Instr::AddInt { dst, a, imm, .. } => {
                 let d = xh(&plan, dst);
                 let ax = xh(&plan, a);
-                // Materialise the (sign-extended) immediate as i64 in xmm0.
-                dynasm!(ops ; mov rax, QWORD imm as i64 ; movq xmm0, rax);
-                if d != ax {
-                    dynasm!(ops ; movdqa Rx(d), Rx(ax));
+                if imm == 0 {
+                    // `a + 0` over i64 is the identity (`AddInt` is `Add`, and the
+                    // region is integer-only — no -0.0 to preserve): a pure copy,
+                    // never able to overflow.
+                    if d != ax && !copy_is_noop(lc, d, ax) {
+                        dynasm!(ops ; movdqa Rx(d), Rx(ax));
+                        copy_clobber(&mut lc, d);
+                        lc = Some((d, ax));
+                    } else {
+                        flag_cmp = prev_flag;
+                    }
+                } else {
+                    let skip_copy = d == ax || copy_is_noop(lc, d, ax);
+                    if let Some(&ch) = plan.addint_imm_home.get(&imm) {
+                        // The immediate sits in a prologue-filled const home.
+                        if !skip_copy {
+                            dynasm!(ops ; movdqa Rx(d), Rx(ax));
+                        }
+                        dynasm!(ops ; paddq Rx(d), Rx(ch));
+                    } else {
+                        // Materialise the (sign-extended) immediate as i64 in xmm0.
+                        dynasm!(ops ; mov rax, QWORD imm as i64 ; movq xmm0, rax);
+                        if !skip_copy {
+                            dynasm!(ops ; movdqa Rx(d), Rx(ax));
+                        }
+                        dynasm!(ops ; paddq Rx(d), xmm0);
+                    }
+                    copy_clobber(&mut lc, d);
+                    if !plan.elide_guard.contains(&ip) {
+                        emit_i53_guard(&mut ops, d, ip, flush_exit);
+                    }
                 }
-                dynasm!(ops ; paddq Rx(d), xmm0);
-                emit_i53_guard(&mut ops, d, ip, flush_exit);
             }
             Instr::Neg { dst, a } => {
                 let d = xh(&plan, dst);
@@ -3115,39 +4045,95 @@ fn compile_region_int(
                     ; psubq xmm0, Rx(ax)
                     ; movdqa Rx(d), xmm0
                 );
-                emit_i53_guard(&mut ops, d, ip, flush_exit);
+                copy_clobber(&mut lc, d);
+                if !plan.elide_guard.contains(&ip) {
+                    emit_i53_guard(&mut ops, d, ip, flush_exit);
+                }
             }
-            Instr::Lt { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Lt),
-            Instr::Le { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Le),
-            Instr::Gt { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Gt),
-            Instr::Ge { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Ge),
-            Instr::Eq { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Eq),
-            Instr::Ne { dst, a, b } => emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Ne),
+            Instr::Lt { dst, a, b } => {
+                emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Lt);
+                flag_cmp = Some((ip, dst, Cmp::Lt));
+            }
+            Instr::Le { dst, a, b } => {
+                emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Le);
+                flag_cmp = Some((ip, dst, Cmp::Le));
+            }
+            Instr::Gt { dst, a, b } => {
+                emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Gt);
+                flag_cmp = Some((ip, dst, Cmp::Gt));
+            }
+            Instr::Ge { dst, a, b } => {
+                emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Ge);
+                flag_cmp = Some((ip, dst, Cmp::Ge));
+            }
+            Instr::Eq { dst, a, b } => {
+                emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Eq);
+                flag_cmp = Some((ip, dst, Cmp::Eq));
+            }
+            Instr::Ne { dst, a, b } => {
+                emit_icmp(&mut ops, &plan, dst, a, b, Cmp::Ne);
+                flag_cmp = Some((ip, dst, Cmp::Ne));
+            }
             Instr::Jump { target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
                 dynasm!(ops ; jmp => t);
             }
-            Instr::JumpIfFalse { cond, target } => {
-                let c = gh(&plan, cond);
+            Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
+                let if_false = matches!(proto.code[ip], Instr::JumpIfFalse { .. });
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                dynasm!(ops ; test Rq(c), Rq(c) ; jz => t);
-            }
-            Instr::JumpIfTrue { cond, target } => {
-                let c = gh(&plan, cond);
-                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                dynasm!(ops ; test Rq(c), Rq(c) ; jnz => t);
+                // Flag fusion: the integer compare that produced `cond` was the
+                // last emitted op, so its flags directly drive this branch. The
+                // setcc/movzx that boxed the bool home don't touch flags. Any ip
+                // in (cmp_ip, ip] being a jump target would let a path arrive
+                // here with foreign flags — bail out to the generic `test`.
+                let fused = match prev_flag {
+                    Some((cip, creg, op))
+                        if creg == cond
+                            && !(cip + 1..=ip).any(|p| plan.jump_targets.contains(&p)) =>
+                    {
+                        Some(op)
+                    }
+                    _ => None,
+                };
+                match fused {
+                    Some(op) => {
+                        // Jump when the comparison is false (JumpIfFalse) / true.
+                        match (op, if_false) {
+                            (Cmp::Lt, true) => dynasm!(ops ; jge => t),
+                            (Cmp::Le, true) => dynasm!(ops ; jg => t),
+                            (Cmp::Gt, true) => dynasm!(ops ; jle => t),
+                            (Cmp::Ge, true) => dynasm!(ops ; jl => t),
+                            (Cmp::Eq, true) => dynasm!(ops ; jne => t),
+                            (Cmp::Ne, true) => dynasm!(ops ; je => t),
+                            (Cmp::Lt, false) => dynasm!(ops ; jl => t),
+                            (Cmp::Le, false) => dynasm!(ops ; jle => t),
+                            (Cmp::Gt, false) => dynasm!(ops ; jg => t),
+                            (Cmp::Ge, false) => dynasm!(ops ; jge => t),
+                            (Cmp::Eq, false) => dynasm!(ops ; je => t),
+                            (Cmp::Ne, false) => dynasm!(ops ; jne => t),
+                        }
+                    }
+                    None => {
+                        let c = gh(&plan, cond);
+                        if if_false {
+                            dynasm!(ops ; test Rq(c), Rq(c) ; jz => t);
+                        } else {
+                            dynasm!(ops ; test Rq(c), Rq(c) ; jnz => t);
+                        }
+                    }
+                }
             }
             Instr::JumpIfNotLt { a, b, target } => {
-                let (ax, bx) = (xh(&plan, a), xh(&plan, b));
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                emit_icmp_flags(&mut ops, &plan, a, b);
                 // !(a<b) ⇔ a>=b (SIGNED).
-                dynasm!(ops ; movq rax, Rx(ax) ; movq rcx, Rx(bx) ; cmp rax, rcx ; jge => t);
+                dynasm!(ops ; jge => t);
             }
             Instr::JumpIfNotLe { a, b, target } => {
-                let (ax, bx) = (xh(&plan, a), xh(&plan, b));
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                emit_icmp_flags(&mut ops, &plan, a, b);
                 // !(a<=b) ⇔ a>b (SIGNED).
-                dynasm!(ops ; movq rax, Rx(ax) ; movq rcx, Rx(bx) ; cmp rax, rcx ; jg => t);
+                dynasm!(ops ; jg => t);
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 dynasm!(ops ; mov DWORD [rsi], ip as i32 ; jmp => flush_exit);
@@ -3238,20 +4224,46 @@ fn emit_i53_guard(ops: &mut dynasmrt::x64::Assembler, h: u8, ip: usize, flush_ex
     );
 }
 
+/// Tracker for the most recent register-to-register home copy along the linear
+/// emission path: `Some((d, s))` means homes `d` and `s` currently hold the SAME
+/// value, so a pending `mov* d2, s2` over the same pair (either order) is a
+/// no-op and can be skipped — this typically deletes the `tmp ← g; g ← tmp + x`
+/// round-trip from a loop's carried dependency chain. Reset at every jump-target
+/// ip (control may arrive with different contents) and invalidated whenever
+/// either home is rewritten.
+type LastCopy = Option<(u8, u8)>;
+
+/// Would `movdqa/movaps Rx(d), Rx(s)` be a no-op given the tracked copy?
+#[inline]
+fn copy_is_noop(lc: LastCopy, d: u8, s: u8) -> bool {
+    lc == Some((d, s)) || lc == Some((s, d))
+}
+
+/// Invalidate the tracker after home `h` is rewritten.
+#[inline]
+fn copy_clobber(lc: &mut LastCopy, h: u8) {
+    if let Some((a, b)) = *lc {
+        if a == h || b == h {
+            *lc = None;
+        }
+    }
+}
+
 /// `home[dst] = home[a] <±> home[b]` as i64 (paddq/psubq), with aliasing handled
-/// and a 2^53 guard. `add = true` ⇒ paddq (commutative); else psubq.
+/// and a 2^53 guard (skipped when the interval analysis proved the result is
+/// always in range). `add = true` ⇒ paddq (commutative); else psubq.
 #[allow(clippy::too_many_arguments)]
-fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, ip: usize, flush_exit: dynasmrt::DynamicLabel, dst: u16, a: u16, b: u16, add: bool) {
+fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, ip: usize, flush_exit: dynasmrt::DynamicLabel, dst: u16, a: u16, b: u16, add: bool, lc: &mut LastCopy) {
     let (d, ax, bx) = (xh(plan, dst), xh(plan, a), xh(plan, b));
     if add {
-        if d == ax {
+        if d == ax || copy_is_noop(*lc, d, ax) {
             dynasm!(ops ; paddq Rx(d), Rx(bx));
-        } else if d == bx {
+        } else if d == bx || copy_is_noop(*lc, d, bx) {
             dynasm!(ops ; paddq Rx(d), Rx(ax)); // commutative
         } else {
             dynasm!(ops ; movdqa Rx(d), Rx(ax) ; paddq Rx(d), Rx(bx));
         }
-    } else if d == ax {
+    } else if d == ax || copy_is_noop(*lc, d, ax) {
         dynasm!(ops ; psubq Rx(d), Rx(bx));
     } else if d == bx {
         // dst == b (and ≠ a): use xmm0 to avoid clobbering b before reading it.
@@ -3259,14 +4271,32 @@ fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, ip: usize, f
     } else {
         dynasm!(ops ; movdqa Rx(d), Rx(ax) ; psubq Rx(d), Rx(bx));
     }
-    emit_i53_guard(ops, d, ip, flush_exit);
+    copy_clobber(lc, d);
+    if !plan.elide_guard.contains(&ip) {
+        emit_i53_guard(ops, d, ip, flush_exit);
+    }
+}
+
+/// Set the integer flags for `home[a] <cmp> home[b]` (SIGNED). Reads `b` from
+/// its prologue-filled gpr mirror when it is a hoisted constant (one `movq`
+/// fewer in the loop body); symmetric for a constant `a`.
+fn emit_icmp_flags(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, a: u16, b: u16) {
+    if let Some(&(g, _)) = plan.gpr_const.get(&b) {
+        let ax = xh(plan, a);
+        dynasm!(ops ; movq rax, Rx(ax) ; cmp rax, Rq(g));
+    } else if let Some(&(g, _)) = plan.gpr_const.get(&a) {
+        let bx = xh(plan, b);
+        dynasm!(ops ; movq rax, Rx(bx) ; cmp Rq(g), rax);
+    } else {
+        let (ax, bx) = (xh(plan, a), xh(plan, b));
+        dynasm!(ops ; movq rax, Rx(ax) ; movq rcx, Rx(bx) ; cmp rax, rcx);
+    }
 }
 
 /// `bool_home[dst] = (home[a] <cmp> home[b])` as SIGNED i64 comparison.
 fn emit_icmp(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, cmp: Cmp) {
-    let (ax, bx) = (xh(plan, a), xh(plan, b));
     let d = gh(plan, dst);
-    dynasm!(ops ; movq rax, Rx(ax) ; movq rcx, Rx(bx) ; cmp rax, rcx);
+    emit_icmp_flags(ops, plan, a, b);
     match cmp {
         Cmp::Lt => dynasm!(ops ; setl al),
         Cmp::Le => dynasm!(ops ; setle al),
@@ -3383,25 +4413,27 @@ fn home(plan: &RegionPlan, r: u16) -> Home {
 }
 
 /// Emit a register-to-register f64 binop into the dst home, handling aliasing.
-fn emit_dbin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, op: DOp) {
+fn emit_dbin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, op: DOp, lc: &mut LastCopy) {
     let (d, ax, bx) = (xh(plan, dst), xh(plan, a), xh(plan, b));
     let commutative = matches!(op, DOp::Add | DOp::Mul);
     // Arrange operands so the accumulator is `d`. For non-commutative ops where
     // d == b (and d != a), use xmm0 as a temp to avoid clobbering b.
-    if d == ax {
+    if d == ax || copy_is_noop(*lc, d, ax) {
         emit_dop(ops, d, bx, op);
-    } else if d == bx {
+    } else if d == bx || (commutative && copy_is_noop(*lc, d, bx)) {
         if commutative {
             emit_dop(ops, d, ax, op); // d holds b; d = b op a == a op b
         } else {
-            dynasm!(ops ; movsd xmm0, Rx(ax));
+            // movaps: full-register copies (rename-eliminated, no false dep).
+            dynasm!(ops ; movaps xmm0, Rx(ax));
             emit_dop_xmm0(ops, bx, op); // xmm0 = a op b
-            dynasm!(ops ; movsd Rx(d), xmm0);
+            dynasm!(ops ; movaps Rx(d), xmm0);
         }
     } else {
-        dynasm!(ops ; movsd Rx(d), Rx(ax));
+        dynasm!(ops ; movaps Rx(d), Rx(ax));
         emit_dop(ops, d, bx, op);
     }
+    copy_clobber(lc, d);
 }
 
 /// `xmm[d] <op>= xmm[src]`.
