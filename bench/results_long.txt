@@ -1,0 +1,20 @@
+=== correctness (zipp stdout must equal node stdout; engine=js-vm) ===
+fib: OK (39088169)
+loop: OK (125000000067108900)
+array: OK (8333331666666)
+string: OK (2000000 200000)
+object: OK (1600000040000000)
+sort: OK (0 1000000 1999999)
+ALL_CORRECT=1
+
+startup(ms): node=49  zipp=22   (best of 7)
+
+bench        node_cmp     zipp_cmp      ratio       node_e2e       zipp_e2e
+--------      -------      -------      -----        -------        -------
+fib             229ms        215ms      0.94x          278ms          237ms
+loop            248ms        855ms      3.45x          297ms          877ms
+array           133ms         99ms      0.74x          182ms          121ms
+string           68ms         40ms      0.59x          117ms           62ms
+object           22ms         59ms      2.68x           71ms           81ms
+sort            255ms        208ms      0.82x          304ms          230ms
+DONE
