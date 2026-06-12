@@ -689,19 +689,104 @@ impl<'p> Vm<'p> {
         // re-enter and allocate — suspend GC for the scope.
         let _gc = self.gc_lock_guard();
         let mut out: Vec<Value> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // The shadow set (a nearer level's own key — enumerable or not — hides
+        // the same name on farther prototypes) is built LAZILY: the dominant
+        // chain shape (own keys, then prototypes whose properties are all
+        // non-enumerable) never materialises it. `plain_levels` records the
+        // fast levels already walked so the set can be reconstructed exactly
+        // when a farther level first wants to emit (or goes exotic).
+        let mut seen: Option<std::collections::HashSet<String>> = None;
+        let mut plain_levels: Vec<u32> = Vec::new();
         let mut cur = obj;
         for _ in 0..100_000 {
             if !cur.is_heap() {
                 break;
             }
-            // Emit this level's enumerable string keys not already shadowed
-            // (object_enum_own is Proxy-aware: ownKeys trap + per-key gopd check).
+            let idx = cur.heap_index();
+            // FAST level: an ordinary plain object, whose own keys live in its
+            // ObjMap alone — emit straight from the map, one key-string alloc
+            // per YIELDED key. Exotic own-key carriers (Proxy / Array /
+            // TypedArray / boxed String / Class statics) are other HeapObj
+            // variants; the slot-backed global and module namespaces (live
+            // bindings, TDZ checks) take the generic path below.
+            let plain = matches!(self.heap.get(idx), HeapObj::Object(_))
+                && !(idx == self.global_this && self.global_this != 0)
+                && !self.module_namespaces.contains_key(&idx)
+                && !self.deferred_ns_state.contains_key(&idx);
+            if plain {
+                // Slots to yield, in spec own-key order, while the map is borrowed.
+                let (emit, visible) = match self.heap.get(idx) {
+                    HeapObj::Object(m) => {
+                        let mut emit: Vec<usize> = Vec::new();
+                        let mut visible = false;
+                        for i in spec_key_order(&m.keys) {
+                            if is_hidden_key(&m.keys[i]) {
+                                continue;
+                            }
+                            visible = true;
+                            if m.attrs[i].enumerable {
+                                emit.push(i);
+                            }
+                        }
+                        (emit, visible)
+                    }
+                    _ => (Vec::new(), false),
+                };
+                if !emit.is_empty() && seen.is_none() && !plain_levels.is_empty() {
+                    seen = Some(self.shadow_set_of(&plain_levels));
+                }
+                for i in emit {
+                    let k = match self.heap.get(idx) {
+                        HeapObj::Object(m) => match m.keys.get(i) {
+                            Some(k) => k.clone(),
+                            None => continue,
+                        },
+                        _ => continue,
+                    };
+                    if let Some(s) = &mut seen {
+                        if !s.insert(k.clone()) {
+                            continue;
+                        }
+                    }
+                    let kv = self.alloc_str(k);
+                    out.push(kv);
+                }
+                // With the shadow set live, this level's NON-emitted own keys
+                // must still hide farther same-named keys; without it, the
+                // level is recorded for a later lazy build instead.
+                match &mut seen {
+                    Some(s) if visible => {
+                        let ks: Vec<String> = match self.heap.get(idx) {
+                            HeapObj::Object(m) => m
+                                .keys
+                                .iter()
+                                .filter(|k| !is_hidden_key(k))
+                                .cloned()
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        s.extend(ks);
+                    }
+                    Some(_) => {}
+                    None => plain_levels.push(idx),
+                }
+                cur = self.object_get_prototype_of(cur);
+                if cur == Value::NULL {
+                    break;
+                }
+                continue;
+            }
+            // GENERIC level: the trap- and exotic-aware walk (object_enum_own
+            // is Proxy-aware: ownKeys trap + per-key gopd check). Shadow
+            // bookkeeping becomes eager from here on.
+            if seen.is_none() {
+                seen = Some(self.shadow_set_of(&plain_levels));
+            }
             let enum_keys = self.object_enum_own(cur, EnumWhat::Keys)?;
             let enum_snap = self.array_snapshot(enum_keys.heap_index());
             for k in &enum_snap {
                 let ks = self.display(*k);
-                if seen.insert(ks) {
+                if seen.as_mut().is_some_and(|s| s.insert(ks)) {
                     out.push(*k);
                 }
             }
@@ -710,7 +795,10 @@ impl<'p> Vm<'p> {
             let all_names = self.object_own_property_names(cur)?;
             let all_snap = self.array_snapshot(all_names.heap_index());
             for k in &all_snap {
-                seen.insert(self.display(*k));
+                let ks = self.display(*k);
+                if let Some(s) = &mut seen {
+                    s.insert(ks);
+                }
             }
             cur = self.object_get_prototype_of(cur);
             if cur == Value::NULL {
@@ -718,6 +806,22 @@ impl<'p> Vm<'p> {
             }
         }
         Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+    }
+
+    /// Reconstruct the for-in shadow set from already-walked PLAIN levels:
+    /// every visible own key (enumerable or not) of each recorded ObjMap.
+    fn shadow_set_of(&self, plain_levels: &[u32]) -> std::collections::HashSet<String> {
+        let mut s = std::collections::HashSet::new();
+        for &pl in plain_levels {
+            if let HeapObj::Object(m) = self.heap.get(pl) {
+                for k in &m.keys {
+                    if !is_hidden_key(k) {
+                        s.insert(k.clone());
+                    }
+                }
+            }
+        }
+        s
     }
 
     /// Build a data property descriptor object `{value, writable, enumerable,

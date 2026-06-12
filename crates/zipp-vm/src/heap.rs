@@ -23,8 +23,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// +40% at 2 keys, +5% at 8-12, break-even at 16, a WIN from ~24 (the
 /// linear pos() per set() turns quadratic). 12 balances the two: small
 /// literals never pay, read-heavy/dictionary maps index early, worst-case
-/// mass-build loss is ~5% in the narrow 12-15 band. Maintained on append,
-/// rebuilt (or dropped back below the threshold) on remove.
+/// mass-build loss is ~5% in the narrow 12-15 band. Maintained on append
+/// and on remove (backward-shift delete + flat slot sweep — no key bytes
+/// re-hashed); dropped only when the map shrinks to half the threshold,
+/// the hysteresis keeping a map oscillating at the boundary from
+/// rebuilding every time it crosses.
 pub const PROP_INDEX_THRESHOLD: usize = 12;
 
 /// Slot sentinel for an empty [`PropIndex`] bucket (a real slot is a `keys`
@@ -54,8 +57,11 @@ fn prop_tag(key: &str) -> u32 {
 /// pure acceleration: the `keys`/`vals`/`attrs` Vecs stay authoritative
 /// (insertion order — for-in/Object.keys — is untouched), it holds no
 /// `Value`s (nothing for the GC to trace), and `None` = linear scan
-/// (correct by default). No tombstones: a key removal rebuilds or drops the
-/// whole index (`ObjMap::remove` — deletes shift slots anyway).
+/// (correct by default). No tombstones: a removal backward-shift-deletes
+/// its table entry (probe chains stay contiguous) and then decrements
+/// every stored slot above the removed one in a flat integer sweep — the
+/// owning map's `Vec::remove` shifted those positions down. Both passes
+/// touch only this table; no key is re-hashed (see [`PropIndex::remove_slot`]).
 #[derive(Clone, Debug)]
 pub struct PropIndex {
     table: Vec<(u32, u32)>,
@@ -112,6 +118,46 @@ impl PropIndex {
             i = (i + 1) & self.mask;
         }
         self.table[i] = (tag, slot);
+    }
+
+    /// Unrecord `slot` (whose key hashes to `tag`) after the owning map's
+    /// `Vec::remove(slot)`: backward-shift-delete its table entry, then
+    /// decrement every stored slot above `slot` (those keys all shifted
+    /// down one position). The caller guarantees the entry exists — `pos()`
+    /// just found the key through this very index.
+    fn remove_slot(&mut self, tag: u32, slot: u32) {
+        // Walk the probe chain to the entry recording `slot` (tags can
+        // collide; slot values are unique across the table).
+        let mut j = tag as usize & self.mask;
+        while self.table[j].1 != slot {
+            debug_assert!(self.table[j].1 != PROP_EMPTY, "remove_slot: entry missing");
+            j = (j + 1) & self.mask;
+        }
+        // Backward-shift deletion: free j, then pull forward any later
+        // chain entry whose probe path runs through j (an entry at k with
+        // ideal bucket b may move iff j ∈ [b, k) cyclically — otherwise a
+        // find() probing from b would stop at the new hole before reaching it).
+        self.table[j] = (0, PROP_EMPTY);
+        let mut k = (j + 1) & self.mask;
+        loop {
+            let (kt, ks) = self.table[k];
+            if ks == PROP_EMPTY {
+                break;
+            }
+            let ideal = kt as usize & self.mask;
+            if (j.wrapping_sub(ideal) & self.mask) < (k.wrapping_sub(ideal) & self.mask) {
+                self.table[j] = (kt, ks);
+                self.table[k] = (0, PROP_EMPTY);
+                j = k;
+            }
+            k = (k + 1) & self.mask;
+        }
+        self.len -= 1;
+        for e in &mut self.table {
+            if e.1 != PROP_EMPTY && e.1 > slot {
+                e.1 -= 1;
+            }
+        }
     }
 
     /// Double and rehash from the stored tags (bucket = `tag & mask`).
@@ -309,11 +355,12 @@ impl ObjMap {
             self.keys.remove(i);
             self.vals.remove(i);
             self.attrs.remove(i);
-            if self.index.is_some() {
-                // Every slot past `i` shifted down: rebuild (same O(n) as the
-                // Vec shifts above), or drop back below the threshold.
-                self.index = (self.keys.len() >= PROP_INDEX_THRESHOLD)
-                    .then(|| PropIndex::build(&self.keys));
+            if let Some(ix) = &mut self.index {
+                if self.keys.len() < PROP_INDEX_THRESHOLD / 2 {
+                    self.index = None;
+                } else {
+                    ix.remove_slot(prop_tag(key), i as u32);
+                }
             }
             true
         } else {
@@ -1900,6 +1947,90 @@ impl Heap {
     pub fn cell_set(&mut self, idx: u32, v: Value) {
         if let HeapObj::Cell(slot) = self.get_mut(idx) {
             *slot = v;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every key the map claims to hold must be found by `pos()` at the slot
+    /// that actually stores it, and absent keys must miss — checked through
+    /// whatever lookup mode (index or linear) the map is currently in.
+    fn assert_map_consistent(m: &ObjMap) {
+        for (i, k) in m.keys.iter().enumerate() {
+            assert_eq!(m.pos(k), Some(i), "key {k:?} not found at its slot");
+        }
+        assert_eq!(m.pos("missing-key-never-inserted"), None);
+    }
+
+    #[test]
+    fn prop_index_survives_removals_in_every_order() {
+        // 200 keys force a dense, collision-bearing table; three removal
+        // orders exercise backward-shift across fresh holes (front-to-back),
+        // shrinking tails (back-to-front), and scattered chains (stride).
+        let n = 200usize;
+        for order in 0..3 {
+            let mut m = ObjMap::new();
+            for i in 0..n {
+                m.set(&format!("key_{i}"), Value::num(i as f64));
+            }
+            assert_map_consistent(&m);
+            let victims: Vec<usize> = match order {
+                0 => (0..n).collect(),
+                1 => (0..n).rev().collect(),
+                _ => (0..n).map(|i| (i * 7) % n).collect(),
+            };
+            for (removed, v) in victims.iter().enumerate() {
+                assert!(m.remove(&format!("key_{v}")));
+                assert!(!m.remove(&format!("key_{v}")), "double remove succeeded");
+                assert_map_consistent(&m);
+                assert_eq!(m.keys.len(), n - removed - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn prop_index_remove_then_readd_keeps_lookups_exact() {
+        // The dictionary-churn shape: build past the threshold, delete every
+        // other key, re-add them, and verify values land where pos() says.
+        let mut m = ObjMap::new();
+        for i in 0..60 {
+            m.set(&format!("prop_{i}"), Value::num(i as f64));
+        }
+        for i in (0..60).step_by(2) {
+            assert!(m.remove(&format!("prop_{i}")));
+        }
+        assert_map_consistent(&m);
+        for i in (0..60).step_by(2) {
+            m.set(&format!("prop_{i}"), Value::num((i * 100) as f64));
+        }
+        assert_map_consistent(&m);
+        for i in 0..60 {
+            let want = if i % 2 == 0 { (i * 100) as f64 } else { i as f64 };
+            let got = m.get(&format!("prop_{i}")).expect("key vanished");
+            assert_eq!(got.as_f64(), want, "prop_{i} wrong value");
+        }
+    }
+
+    #[test]
+    fn prop_index_drops_at_half_threshold_and_rebuilds() {
+        let mut m = ObjMap::new();
+        for i in 0..PROP_INDEX_THRESHOLD {
+            m.set(&format!("k{i}"), Value::num(i as f64));
+        }
+        // Shrink through the hysteresis band down to empty; lookups must stay
+        // exact across the index-drop boundary (THRESHOLD/2) and below.
+        for i in (0..PROP_INDEX_THRESHOLD).rev() {
+            assert!(m.remove(&format!("k{i}")));
+            assert_map_consistent(&m);
+        }
+        assert_eq!(m.keys.len(), 0);
+        // And grow straight back through the build boundary.
+        for i in 0..PROP_INDEX_THRESHOLD + 4 {
+            m.set(&format!("k{i}"), Value::num(i as f64));
+            assert_map_consistent(&m);
         }
     }
 }

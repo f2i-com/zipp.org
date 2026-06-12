@@ -2734,7 +2734,23 @@ impl<'p> Vm<'p> {
                         // builtin bindings all stay visited.
                         let o = self.get(base, obj);
                         let kv = self.get(base, key);
-                        let live = if !o.is_heap() {
+                        // Own-hit fast probe, alloc-free: view the snapshotted
+                        // key's bytes in place (a flat ASCII/UTF-8 string —
+                        // surrogate-bearing keys take the generic path) and ask
+                        // the receiver's own map directly. has_property below
+                        // re-derives the key as a fresh String per chain level.
+                        let own_hit = o.is_heap()
+                            && kv.is_heap()
+                            && match self.heap.str_wtf8_cow(kv.heap_index()) {
+                                Some(std::borrow::Cow::Borrowed(b)) => {
+                                    match (std::str::from_utf8(b), self.heap.get(o.heap_index())) {
+                                        (Ok(k), HeapObj::Object(m)) => m.pos(k).is_some(),
+                                        _ => false,
+                                    }
+                                }
+                                _ => false,
+                            };
+                        let live = if own_hit || !o.is_heap() {
                             true
                         } else if self.has_property(o, kv) {
                             true

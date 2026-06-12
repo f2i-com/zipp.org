@@ -63,6 +63,37 @@ impl<'p> Vm<'p> {
             let k = self.key_of(key);
             return self.get_prop(obj, &k);
         }
+        // FAST PATH: a plain-object computed read whose flat string key hits an
+        // own DATA property answers straight from the ObjMap, with the key's
+        // bytes viewed in place — key_of below materializes a fresh String per
+        // call, which parse-/JSON-shaped workloads pay millions of times.
+        // Exotic own-key carriers are other HeapObj variants; the slot-backed
+        // global and module namespaces (live bindings, defer triggers) stay
+        // generic, as do accessor hits and misses (proto/class chain).
+        if key.is_heap() {
+            let oidx = obj.heap_index();
+            if !(oidx == self.global_this && self.global_this != 0)
+                && !self.module_namespaces.contains_key(&oidx)
+                && !self.deferred_ns_state.contains_key(&oidx)
+            {
+                if let Some(std::borrow::Cow::Borrowed(b)) =
+                    self.heap.str_wtf8_cow(key.heap_index())
+                {
+                    if let (Ok(k), HeapObj::Object(m)) =
+                        (std::str::from_utf8(b), self.heap.get(oidx))
+                    {
+                        if let Some(i) = m.pos(k) {
+                            if !m.attrs[i].accessor {
+                                let v = m.vals[i];
+                                if !v.is_uninitialized() {
+                                    return Ok(v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // A boxed String indexes its wrapped string (chars / length); a boxed
         // Number/Boolean has no index, so computed access goes through the prototype.
         if let HeapObj::Boxed { kind, .. } = self.heap.get(obj.heap_index()) {
@@ -269,6 +300,37 @@ impl<'p> Vm<'p> {
         }
         let key = self.coerce_index_key(key)?;
         let idx = obj.heap_index();
+        // FAST PATH: a plain-object computed write whose flat string key hits an
+        // own WRITABLE DATA property stores straight into the ObjMap slot — the
+        // twin of get_index's fast read (no key String materialization, no shape
+        // change, so no IC/version traffic). Object.prototype is excluded so its
+        // index-key bookkeeping (note_array_proto_index) always runs; adds,
+        // accessors, non-writable hits, the global, and namespaces stay generic.
+        if key.is_heap()
+            && !(idx == self.global_this && self.global_this != 0)
+            && idx != self.obj_proto
+            && !self.module_namespaces.contains_key(&idx)
+            && !self.deferred_ns_state.contains_key(&idx)
+        {
+            let hit = match self.heap.str_wtf8_cow(key.heap_index()) {
+                Some(std::borrow::Cow::Borrowed(b)) => {
+                    match (std::str::from_utf8(b), self.heap.get(idx)) {
+                        (Ok(k), HeapObj::Object(m)) => match m.pos(k) {
+                            Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => Some(i),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(i) = hit {
+                if let HeapObj::Object(m) = self.heap.get_mut(idx) {
+                    m.vals[i] = val;
+                    return Ok(());
+                }
+            }
+        }
         // A TypedArray: a canonical numeric index writes the element (coerced +
         // out-of-bounds is a silent no-op); other keys go to set_prop.
         if matches!(self.heap.get(idx), HeapObj::TypedArray { .. }) {
