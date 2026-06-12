@@ -4965,15 +4965,23 @@ impl<'p> Vm<'p> {
                         let v = if v.is_heap()
                             && matches!(self.heap.get(v.heap_index()), HeapObj::Promise { .. })
                         {
-                            let c = self.get_prop(v, "constructor")?;
-                            let intrinsic =
-                                self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
-                            if c == intrinsic {
+                            // PLAIN promise (intrinsic proto, no own
+                            // `constructor`, pristine prototype `constructor`):
+                            // the Get is unobservable and yields the realm
+                            // %Promise% — pass through with no Get at all.
+                            if self.promise_plain_unobservable(v.heap_index()) {
                                 v
                             } else {
-                                let p = self.alloc_promise();
-                                self.resolve(p, v);
-                                Value::heap(p)
+                                let c = self.get_prop(v, "constructor")?;
+                                let intrinsic =
+                                    self.global_by_name("Promise").unwrap_or(Value::UNDEFINED);
+                                if c == intrinsic {
+                                    v
+                                } else {
+                                    let p = self.alloc_promise();
+                                    self.resolve(p, v);
+                                    Value::heap(p)
+                                }
                             }
                         } else {
                             v
@@ -5164,6 +5172,23 @@ impl<'p> Vm<'p> {
                                 self.get_prop(it, "next")?
                             };
                             if self.is_callable(next) {
+                                // A %RegExpStringIterator% stepped by the PRISTINE
+                                // intrinsic `next`: run the step inline. The
+                                // {value, done} result object the intrinsic would
+                                // build is engine-internal and its `done`/`value`
+                                // Gets are unobservable — skip both.
+                                if next.is_heap()
+                                    && matches!(self.heap.get(next.heap_index()),
+                                                HeapObj::Native(n) if *n == crate::vm::native::ITER_NEXT)
+                                {
+                                    if let Some(step) = self.regexp_string_iter_step(it.heap_index()) {
+                                        let (val, done) = step?;
+                                        self.set(base, value_dst, val);
+                                        self.set(base, done_dst, Value::bool(done));
+                                        ip += 1;
+                                        continue;
+                                    }
+                                }
                                 let res = self.call_value(next, it, &[])?;
                                 // IteratorNext step 3: a non-Object result is a TypeError.
                                 if !self.is_object_value(res) {

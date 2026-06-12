@@ -481,6 +481,14 @@ impl<'p> Vm<'p> {
     /// builtin RegExpBuiltinExec. The `@@match`/`@@search` (non-global) cores route
     /// through this so a custom `re.exec` governs the result.
     pub(crate) fn regexp_exec_abstract(&mut self, re: u32, input: Value) -> Result<Value, Thrown> {
+        // PLAIN regexp (a REAL RegExp whose intrinsic `exec` is reached
+        // through %RegExp.prototype%): the Get(R,"exec") is unobservable and
+        // the call dispatch is the intrinsic — run RegExpBuiltinExec
+        // directly. (`re` may be any object here — the protocol is generic —
+        // so the real-RegExp check guards the arr_props own-props model.)
+        if matches!(self.heap.get(re), HeapObj::RegExp { .. }) && self.regexp_exec_fast_ok(re) {
+            return self.regexp_exec(re, input);
+        }
         let re_v = Value::heap(re);
         let exec = self.get_prop(re_v, "exec")?;
         if self.is_callable(exec) {
@@ -716,7 +724,32 @@ impl<'p> Vm<'p> {
     /// capture ranges) is a unit index, identical to JS string indexing
     /// engine-wide: `lastIndex` seeds the search directly and `.index` /
     /// `indices` / `lastIndex` writes take the ranges verbatim.
+    ///
+    /// ASCII FAST PATH: an all-ASCII subject (the `JsStr::is_ascii` flag) is
+    /// matched in place over its bytes with regress `find_from_ascii` — no
+    /// per-exec `Vec<u16>` encode. Byte offsets == unit offsets for ASCII, so
+    /// every reported range is a valid unit index verbatim. This is
+    /// semantically identical to the UCS-2/UTF-16 run: regress folds pattern
+    /// chars and closes bracket sets at COMPILE time (full Unicode folding),
+    /// so a non-ASCII `CharICase` insn can never match an ASCII element on
+    /// either backend, and runtime folding only ever compares two SUBJECT
+    /// chars (backrefs) — both ASCII here, where ASCII and Unicode simple
+    /// folding agree.
     pub(crate) fn regexp_exec(&mut self, re_idx: u32, input_v: Value) -> Result<Value, Thrown> {
+        self.regexp_exec_impl(re_idx, input_v, true)
+    }
+
+    /// `regexp_exec` with `build = false` for `RegExp.prototype.test`: the
+    /// IDENTICAL protocol (lastIndex Get/ToLength + the stateful Sets, in spec
+    /// order), but the unobservable match-result materialization (array +
+    /// capture strings + groups/indices objects) is skipped — returns
+    /// `Value::TRUE` instead of the array. `Value::NULL` still means no match.
+    pub(crate) fn regexp_exec_impl(
+        &mut self,
+        re_idx: u32,
+        input_v: Value,
+        build: bool,
+    ) -> Result<Value, Thrown> {
         // ToString(string) — IDENTITY for a string value (exact WTF-8 content:
         // a lone-surrogate subject keeps its surrogate rather than decaying to
         // U+FFFD, so `/\uD800/` can match it).
@@ -737,18 +770,49 @@ impl<'p> Vm<'p> {
                 ))
             }
         };
-        // ToLength(Get(R,"lastIndex")) — invokes a user `lastIndex.valueOf` (a throw
-        // propagates); read UNCONDITIONALLY per RegExpBuiltinExec, but used as the
-        // search start only for a global/sticky regex (otherwise the start is 0).
-        let li_v = self.get_prop(Value::heap(re_idx), "lastIndex")?;
+        // ToLength(Get(R,"lastIndex")) — read UNCONDITIONALLY per
+        // RegExpBuiltinExec, but used as the search start only for a
+        // global/sticky regex (otherwise the start is 0). On a real RegExp the
+        // Get itself can never run user code: `lastIndex` is a non-configurable
+        // own DATA property whose value's source of truth is the heap slot
+        // (defineProperty writes the value through; only attrs live in
+        // arr_props) — so read the slot directly. ToLength still invokes a
+        // user `lastIndex.valueOf` (a throw propagates).
+        let li_v = match self.heap.get(re_idx) {
+            HeapObj::RegExp { last_index, .. } => *last_index,
+            _ => Value::int(0),
+        };
         let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
         let stateful = global || sticky;
         let start = if stateful { li } else { 0 };
-        // Encode the subject ONCE per exec; `lastIndex` is already a unit
-        // index engine-wide, so it is the search start with no conversion.
-        let u16s: Vec<u16> = self.value_units(input_val);
-        let found = if start > u16s.len() {
+        // ASCII subjects match in place over the heap bytes (offsets == unit
+        // indices); anything else encodes the subject ONCE per exec.
+        // `lastIndex` is already a unit index engine-wide, so it is the
+        // search start with no conversion either way.
+        let s_idx = input_val.heap_index();
+        self.heap.flatten(s_idx);
+        let is_ascii = matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii());
+        let u16s: Vec<u16> = if is_ascii { Vec::new() } else { self.value_units(input_val) };
+        let subj_units = if is_ascii {
+            self.heap.str_units(s_idx).unwrap_or(0)
+        } else {
+            u16s.len()
+        };
+        let found = if start > subj_units {
             None
+        } else if is_ascii {
+            self.ensure_regexp_ascii_twin(re_idx);
+            let subj: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => "",
+            };
+            match self.regexp_ascii.get(&re_idx).and_then(|o| o.as_deref()) {
+                Some(twin) => twin.find_from_ascii(subj, start).next(),
+                None => match self.heap.get(re_idx) {
+                    HeapObj::RegExp { regex, .. } => regex.find_from_ascii(subj, start).next(),
+                    _ => None,
+                },
+            }
         } else {
             match self.heap.get(re_idx) {
                 HeapObj::RegExp { regex, .. } => {
@@ -769,17 +833,34 @@ impl<'p> Vm<'p> {
                 if stateful {
                     // RegExpBuiltinExec Set(R,"lastIndex",0,true): a non-writable
                     // lastIndex makes a failed global/sticky exec throw.
-                    self.set_prop(Value::heap(re_idx), "lastIndex", Value::int(0), true)?;
+                    self.regexp_write_last_index(re_idx, Value::int(0))?;
                 }
                 return Ok(Value::NULL);
             }
         };
         let (mstart, mend) = (m.start(), m.end());
-        let whole = self.units_value(&u16s[mstart..mend]);
+        if stateful {
+            // RegExpBuiltinExec Set(R,"lastIndex",e,true) — spec step 15, BEFORE
+            // the (unobservable) result construction; throws if non-writable.
+            self.regexp_write_last_index(re_idx, Value::num(mend as f64))?;
+        }
+        if !build {
+            return Ok(Value::TRUE);
+        }
+        // A unit-range slice of the subject: a byte slice of the heap string
+        // for an ASCII subject, else a slice of the encoded unit buffer.
+        let mk = |vm: &mut Self, r: std::ops::Range<usize>| -> Value {
+            if is_ascii {
+                vm.ascii_slice_value(s_idx, r)
+            } else {
+                vm.units_value(&u16s[r])
+            }
+        };
+        let whole = mk(self, mstart..mend);
         let mut elems = vec![whole];
         for cap in &m.captures {
             let v = match cap {
-                Some(r) => self.units_value(&u16s[r.clone()]),
+                Some(r) => mk(self, r.clone()),
                 None => Value::UNDEFINED,
             };
             elems.push(v);
@@ -792,7 +873,7 @@ impl<'p> Vm<'p> {
             let mut gm = ObjMap::new();
             for (name, r) in &named {
                 let v = match r {
-                    Some(r) => self.units_value(&u16s[r.clone()]),
+                    Some(r) => mk(self, r.clone()),
                     None => Value::UNDEFINED,
                 };
                 gm.set(name, v);
@@ -861,11 +942,117 @@ impl<'p> Vm<'p> {
         if has_indices {
             m.define("indices", indices_v, attr);
         }
-        if stateful {
-            // RegExpBuiltinExec Set(R,"lastIndex",e,true): throws if non-writable.
-            self.set_prop(Value::heap(re_idx), "lastIndex", Value::num(mend as f64), true)?;
-        }
         Ok(Value::heap(arr_idx))
+    }
+
+    /// Allocate the string for a byte-range slice of the (all-ASCII, flat)
+    /// subject string at `s_idx` — for ASCII, byte offsets are unit offsets.
+    pub(crate) fn ascii_slice_value(&mut self, s_idx: u32, r: std::ops::Range<usize>) -> Value {
+        let bytes: Vec<u8> = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => js.as_bytes()[r].to_vec(),
+            _ => Vec::new(),
+        };
+        Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(bytes)))
+    }
+
+    /// `Set(R, "lastIndex", v, true)` on a real RegExp. Fast path writes the
+    /// heap slot directly when nothing can make the Set observable or fail:
+    /// no arr_props entry for the object (so no attr override and no freeze
+    /// marker) or one without a `lastIndex` key and not frozen. Otherwise the
+    /// full set_prop runs (a non-writable lastIndex must throw).
+    pub(crate) fn regexp_write_last_index(&mut self, re_idx: u32, v: Value) -> Result<(), Thrown> {
+        let fast = match self.arr_props.get(&re_idx) {
+            None => true,
+            Some(m) => !m.frozen && m.pos("lastIndex").is_none(),
+        };
+        if fast {
+            if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(re_idx) {
+                *last_index = v;
+            }
+            Ok(())
+        } else {
+            self.set_prop(Value::heap(re_idx), "lastIndex", v, true)?;
+            Ok(())
+        }
+    }
+
+    /// True when the RegExpExec PROTOCOL's `Get(R, "exec")` is UNOBSERVABLE
+    /// and yields the intrinsic for instance `re`: its [[Prototype]] is
+    /// exactly %RegExp.prototype%, it has no own `exec`, and the prototype's
+    /// `exec` is still the intrinsic native data property. The drivers
+    /// (@@match/@@replace/@@split/matchAll/exec_abstract) may then call
+    /// `regexp_exec` directly, skipping the Get + generic call dispatch.
+    pub(crate) fn regexp_exec_fast_ok(&self, re: u32) -> bool {
+        match self.proto_of.get(&re) {
+            None => {}
+            Some(p) if p.is_heap() && p.heap_index() == self.regexp_proto => {}
+            _ => return false,
+        }
+        if self.arr_props.get(&re).is_some_and(|m| m.pos("exec").is_some()) {
+            return false;
+        }
+        match self.heap.get(self.regexp_proto) {
+            HeapObj::Object(m) => m.pos("exec").is_some_and(|i| {
+                !m.attrs[i].accessor
+                    && m.vals[i].is_heap()
+                    && matches!(self.heap.get(m.vals[i].heap_index()),
+                                HeapObj::Native(n) if *n == native::REGEXP_EXEC)
+            }),
+            _ => false,
+        }
+    }
+
+    /// Ensure the BYTE-OPTIMIZED twin compile (`regexp_ascii` side table) for
+    /// the RegExp at `re_idx` exists — built once, lazily, from the SAME
+    /// pattern characters and flags as the heap regex (mirrors
+    /// `build_regexp`, incl. the exact-bytes lone-surrogate form). A failed
+    /// compile is recorded as `None` so it isn't retried; callers fall back
+    /// to `find_from_ascii` on the unoptimized program (also byte-safe).
+    fn ensure_regexp_ascii_twin(&mut self, re_idx: u32) {
+        if self.regexp_ascii.contains_key(&re_idx) {
+            return;
+        }
+        let (source, flags) = match self.heap.get(re_idx) {
+            HeapObj::RegExp { source, flags, .. } => (source.clone(), flags.clone()),
+            _ => return,
+        };
+        let rflags: String = flags.chars().filter(|c| "imsuv".contains(*c)).collect();
+        let unicode_mode = flags.contains('u') || flags.contains('v');
+        let compile_cps: Vec<u32> = match (self.regexp_exact_source.get(&re_idx), unicode_mode) {
+            (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
+            (Some(b), false) => nonunicode_pattern_chars(
+                &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
+            ),
+            (None, true) => source.chars().map(u32::from).collect(),
+            (None, false) => nonunicode_pattern_chars(
+                &source.encode_utf16().collect::<Vec<u16>>(),
+            ),
+        };
+        // Through the byteopt half of the compile cache (species clones of
+        // the same pattern share one twin too).
+        let cache_key = self
+            .regexp_exact_source
+            .get(&re_idx)
+            .is_none()
+            .then(|| (source.clone(), rflags.clone(), true));
+        let twin: Option<std::sync::Arc<regress::Regex>> =
+            match cache_key.as_ref().and_then(|k| self.regex_compile_cache.get(k)) {
+                Some(rc) => Some(rc.clone()),
+                None => {
+                    let compiled =
+                        regress::Regex::from_unicode_byteopt(compile_cps.iter().copied(), rflags.as_str())
+                            .ok()
+                            .map(std::sync::Arc::new);
+                    if let (Some(k), Some(rc)) = (cache_key, compiled.as_ref()) {
+                        if self.regex_compile_cache.len() >= 512 {
+                            self.regex_compile_cache.clear();
+                        }
+                        self.regex_compile_cache.insert(k, rc.clone());
+                    }
+                    compiled
+                }
+            };
+        self.regexp_ascii.insert(re_idx, twin);
     }
 
     /// The string's UTF-16 code units — EXACT: an astral scalar yields its two
@@ -892,6 +1079,69 @@ impl<'p> Vm<'p> {
         let mut out: Vec<u8> = Vec::with_capacity(units.len() * 3);
         push_units(&mut out, units);
         Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out)))
+    }
+
+    /// One %RegExpStringIterator%.next step for the iterator at `it_idx`:
+    /// `Some((value, done))` when it IS a lazy regexp-string iterator (else
+    /// `None` — not one). Runs ONE RegExpExec (via the abstract protocol,
+    /// honouring a user `exec`). A null result, or the single match of a
+    /// non-global regex, latches done; a global empty match advances
+    /// lastIndex (spec AdvanceStringIndex: +1 unit, +2 over an astral
+    /// surrogate pair when the iterator's fullUnicode bit is set) so the
+    /// next step makes progress. Shared by the ITER_NEXT native (which wraps
+    /// the pair in a `{value, done}` object) and the `IterNext` for-of fast
+    /// path (which consumes the pair directly — the result object an
+    /// intrinsic `next` would build is engine-internal and its `done`/`value`
+    /// Gets are unobservable).
+    pub(crate) fn regexp_string_iter_step(
+        &mut self,
+        it_idx: u32,
+    ) -> Option<Result<(Value, bool), Thrown>> {
+        let &(regexp, string, fbits, done) = self.regexp_string_iters.get(&it_idx)?;
+        Some(self.regexp_string_iter_step_inner(it_idx, regexp, string, fbits, done))
+    }
+
+    fn regexp_string_iter_step_inner(
+        &mut self,
+        it_idx: u32,
+        regexp: u32,
+        string: Value,
+        fbits: u8,
+        done: bool,
+    ) -> Result<(Value, bool), Thrown> {
+        let global = fbits & 1 != 0;
+        let full_unicode = fbits & 2 != 0;
+        let (value, ret_done, latch) = if done {
+            (Value::UNDEFINED, true, true)
+        } else {
+            let r = self.regexp_exec_abstract(regexp, string)?;
+            if r == Value::NULL {
+                (Value::UNDEFINED, true, true)
+            } else if !global {
+                (r, false, true)
+            } else {
+                let m0 = self.get_index(r, Value::int(0))?;
+                // ToString(Get(match,"0")) — IDENTITY for a string value (no
+                // copy); only a non-string coerces.
+                let m0v = self.to_str_value(m0)?;
+                if self.heap.str_units(m0v.heap_index()) == Some(0) {
+                    let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
+                    // ToLength(Get(R,"lastIndex")) — a throwing
+                    // lastIndex.valueOf must propagate, not be swallowed; the
+                    // 2^53-1 clamp applies BEFORE the advance.
+                    let cur = self.to_integer_or_zero(cur_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+                    let next = self.advance_index_on_value(string, cur, full_unicode);
+                    self.set_regexp_last_index(regexp, next);
+                }
+                (r, false, false)
+            }
+        };
+        if latch != done {
+            if let Some(e) = self.regexp_string_iters.get_mut(&it_idx) {
+                e.3 = latch;
+            }
+        }
+        Ok((value, ret_done))
     }
 
     /// AdvanceStringIndex reading the units from heap string `s` (for the lazy
@@ -922,6 +1172,13 @@ impl<'p> Vm<'p> {
         repl: Value,
         global: bool,
     ) -> Result<Value, Thrown> {
+        // ASCII subject: match in place over the bytes (offsets == unit
+        // indices), no Vec<u16> encode — see `regexp_exec` for why the ASCII
+        // backend is semantically identical here.
+        self.heap.flatten(s_idx);
+        if matches!(self.heap.get(s_idx), HeapObj::Str(js) if js.is_ascii()) {
+            return self.regex_replace_ascii(s_idx, re, repl, global);
+        }
         // Encode the subject ONCE; every regress range below indexes into it.
         let u16s: Vec<u16> = self.value_units(Value::heap(s_idx));
         let matches: Vec<regress::Match> = match self.heap.get(re) {
@@ -1012,6 +1269,126 @@ impl<'p> Vm<'p> {
             last = en;
         }
         push_units(&mut out, &u16s[last..]);
+        Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out))))
+    }
+
+    /// `regex_replace` for an all-ASCII subject: regress `find_from_ascii`
+    /// over the heap bytes in place (byte offsets == unit offsets), output
+    /// assembled from byte slices. Functional replacements still append their
+    /// EXACT WTF-8 bytes (a replacer may return lone surrogates), so the
+    /// output buffer stays WTF-8.
+    fn regex_replace_ascii(
+        &mut self,
+        s_idx: u32,
+        re: u32,
+        repl: Value,
+        global: bool,
+    ) -> Result<Value, Thrown> {
+        self.ensure_regexp_ascii_twin(re);
+        let matches: Vec<regress::Match> = {
+            let subj: &str = match self.heap.get(s_idx) {
+                HeapObj::Str(js) => js.as_str_wf(),
+                _ => "",
+            };
+            let regex: Option<&regress::Regex> =
+                match self.regexp_ascii.get(&re).and_then(|o| o.as_deref()) {
+                    Some(twin) => Some(twin),
+                    None => match self.heap.get(re) {
+                        HeapObj::RegExp { regex, .. } => Some(regex),
+                        _ => None,
+                    },
+                };
+            match regex {
+                Some(regex) => {
+                    if global {
+                        regex.find_from_ascii(subj, 0).collect()
+                    } else {
+                        regex.find_from_ascii(subj, 0).next().into_iter().collect()
+                    }
+                }
+                None => Vec::new(),
+            }
+        };
+        let callable = repl.is_heap() && self.heap.as_callable(repl.heap_index()).is_some();
+        let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
+        // Own the subject (one memcpy) so the heap allocs below can't
+        // invalidate the borrow; ASCII ⇒ valid UTF-8, sliceable as &str.
+        let subject: String = match self.heap.get(s_idx) {
+            HeapObj::Str(js) => js.as_str_wf().to_string(),
+            _ => String::new(),
+        };
+        let mut out: Vec<u8> = Vec::with_capacity(subject.len() + 16);
+        let mut last = 0usize;
+        for m in &matches {
+            let (st, en) = (m.start(), m.end());
+            if st < last {
+                continue;
+            }
+            out.extend_from_slice(subject[last..st].as_bytes());
+            if callable {
+                let whole = self.alloc_str(subject[m.range()].to_string());
+                let mut argv = vec![whole];
+                for cap in &m.captures {
+                    argv.push(match cap {
+                        Some(r) => self.alloc_str(subject[r.clone()].to_string()),
+                        None => Value::UNDEFINED,
+                    });
+                }
+                argv.push(Value::num(st as f64));
+                argv.push(Value::heap(s_idx));
+                // RegExp.prototype[@@replace] step 14.k.iv: a `groups` object
+                // (OrdinaryObjectCreate(null)) as the FINAL replacer argument
+                // when the regex has named capture groups.
+                let named: Vec<(String, Option<std::ops::Range<usize>>)> =
+                    m.named_groups().map(|(n, r)| (n.to_string(), r)).collect();
+                if !named.is_empty() {
+                    let mut gm = ObjMap::new();
+                    for (name, r) in &named {
+                        let v = match r {
+                            Some(r) => self.alloc_str(subject[r.clone()].to_string()),
+                            None => Value::UNDEFINED,
+                        };
+                        gm.set(name, v);
+                    }
+                    let gidx = self.heap.alloc(HeapObj::Object(gm));
+                    self.proto_of.insert(gidx, Value::NULL);
+                    argv.push(Value::heap(gidx));
+                }
+                let r = self.call_value(repl, Value::UNDEFINED, &argv)?;
+                // ToString(result) — exact bytes (a returned lone-surrogate
+                // string keeps its surrogate; `wtf8_push` canonicalizes the seam).
+                let rv = self.to_str_value(r)?;
+                let bytes = self
+                    .heap
+                    .str_wtf8_cow(rv.heap_index())
+                    .map(|c| c.into_owned())
+                    .unwrap_or_default();
+                crate::heap::wtf8_push(&mut out, &bytes);
+            } else {
+                // GetSubstitution directly over &str slices of the subject.
+                let groups: Vec<Option<String>> = m
+                    .captures
+                    .iter()
+                    .map(|c| c.as_ref().map(|r| subject[r.clone()].to_string()))
+                    .collect();
+                let named: Vec<(String, Option<String>)> = m
+                    .named_groups()
+                    .map(|(n, r)| (n.to_string(), r.map(|r| subject[r].to_string())))
+                    .collect();
+                let rep = self.expand_replacement(
+                    &repl_str,
+                    &subject[m.range()],
+                    &groups,
+                    &named,
+                    !named.is_empty(),
+                    &subject[..st],
+                    &subject[en..],
+                );
+                crate::heap::wtf8_push(&mut out, rep.as_bytes());
+            }
+            last = en;
+        }
+        out.extend_from_slice(subject[last..].as_bytes());
         Ok(Value::heap(self.heap.alloc_js(crate::heap::JsStr::from_wtf8(out))))
     }
 

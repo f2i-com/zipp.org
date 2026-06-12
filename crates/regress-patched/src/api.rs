@@ -423,6 +423,26 @@ impl Regex {
         Ok(Regex { cr })
     }
 
+    /// PATCH (see VENDORED.md): like `from_unicode`, but additionally runs the
+    /// byte-literal optimization passes (literal `ByteSeq` instructions and
+    /// byte-set start predicates), which the `utf16` feature otherwise
+    /// disables. The resulting `Regex` matches correctly ONLY against
+    /// byte-element inputs (`find_from` over `&str` / `find_from_ascii`) —
+    /// never use it with `find_from_utf16` / `find_from_ucs2`.
+    pub fn from_unicode_byteopt<I, F>(pattern: I, flags: F) -> Result<Regex, Error>
+    where
+        I: Iterator<Item = u32> + Clone,
+        F: Into<Flags>,
+    {
+        let flags = flags.into();
+        let mut ire = parse::try_parse(pattern, flags)?;
+        if !flags.no_opt {
+            optimizer::optimize_bytes(&mut ire);
+        }
+        let cr = emit::emit(&ire);
+        Ok(Regex { cr })
+    }
+
     /// Searches `text` to find the first match.
     #[inline]
     pub fn find(&self, text: &str) -> Option<Match> {

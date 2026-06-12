@@ -524,6 +524,76 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// %Promise.prototype%'s `then`/`constructor` are still the pristine
+    /// intrinsic data properties, and %Promise%[@@species] is still the
+    /// intrinsic getter — the shared half of the plain-promise fast-lane
+    /// gates (instance-independent).
+    pub(crate) fn promise_proto_pristine(&self) -> bool {
+        if self.promise_proto == 0 || self.promise_ctor_intrinsic == 0 {
+            return false;
+        }
+        let proto_ok = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => {
+                let intrinsic = |key: &str, target: u32| {
+                    m.pos(key).is_some_and(|i| {
+                        !m.attrs[i].accessor
+                            && m.vals[i].is_heap()
+                            && m.vals[i].heap_index() == target
+                    })
+                };
+                intrinsic("then", self.promise_then_intrinsic)
+                    && intrinsic("constructor", self.promise_ctor_intrinsic)
+            }
+            _ => false,
+        };
+        if !proto_ok {
+            return false;
+        }
+        match self.heap.get(self.promise_ctor_intrinsic) {
+            HeapObj::Object(m) => match m.pos("@@species") {
+                None => true,
+                Some(i) => {
+                    let v = m.vals[i];
+                    m.attrs[i].accessor
+                        && v.is_heap()
+                        && matches!(self.heap.get(v.heap_index()),
+                                    HeapObj::Native(id) if *id == native::SPECIES_GET)
+                }
+            },
+            _ => false,
+        }
+    }
+
+    /// True when promise `idx` is PLAIN for the TICK-NEUTRAL fast lanes
+    /// (PerformPromiseThen's SpeciesConstructor skip, Await's PromiseResolve
+    /// pass-through, the Promise.all element lane): a native HeapObj::Promise
+    /// whose [[Prototype]] is exactly %Promise.prototype% (the heap default,
+    /// or an explicit proto_of entry pointing there), with no own
+    /// `then`/`constructor`, on a pristine prototype/constructor
+    /// (`promise_proto_pristine`). Every Get those paths would perform is
+    /// then unobservable and yields the intrinsic. NOTE: unlike the (defunct)
+    /// resolve-adoption skip, the fast lanes gated on THIS predicate perform
+    /// the same number of ticks as the generic paths.
+    pub(crate) fn promise_plain_unobservable(&self, idx: u32) -> bool {
+        if !matches!(self.heap.get(idx), HeapObj::Promise { .. }) {
+            return false;
+        }
+        match self.proto_of.get(&idx) {
+            // Absent ⇒ the HeapObj::Promise default, %Promise.prototype%.
+            None => {}
+            Some(p) if p.is_heap() && p.heap_index() == self.promise_proto => {}
+            _ => return false,
+        }
+        if self
+            .arr_props
+            .get(&idx)
+            .is_some_and(|m| m.pos("then").is_some() || m.pos("constructor").is_some())
+        {
+            return false;
+        }
+        self.promise_proto_pristine()
+    }
+
     /// JS `[[Resolve]]`: a thenable/Promise value is ADOPTED (p forwards when it
     /// settles); a self-resolution rejects with a TypeError; else fulfill.
     pub(crate) fn resolve(&mut self, p: u32, value: Value) {
@@ -640,6 +710,19 @@ impl<'p> Vm<'p> {
         on_f: Value,
         on_r: Value,
     ) -> Result<Value, Thrown> {
+        // PLAIN promise fast lane: when the receiver's [[Prototype]] is
+        // exactly %Promise.prototype% with no own `constructor`, and the
+        // prototype's `constructor` / %Promise%[@@species] are the pristine
+        // intrinsics, SpeciesConstructor(promise, %Promise%) is %Promise%
+        // with every Get unobservable — skip the two Gets + the species
+        // getter call and build the plain native dependent directly
+        // (tick-identical to the generic path below).
+        if self.promise_plain_unobservable(idx) {
+            let on_f = if self.is_callable(on_f) { on_f } else { Value::UNDEFINED };
+            let on_r = if self.is_callable(on_r) { on_r } else { Value::UNDEFINED };
+            let dep = self.then_internal(idx, on_f, on_r, None);
+            return Ok(Value::heap(dep));
+        }
         let c = self.promise_species_constructor(Value::heap(idx))?;
         // PerformPromiseThen steps 3-4: a NON-CALLABLE handler is Identity /
         // Thrower — `then_internal`'s undefined callback is exactly that
@@ -1574,14 +1657,8 @@ impl<'p> Vm<'p> {
         // (not the array fast-path, which `get_iterator` returns un-stepped) so the
         // lazy step + IteratorClose below work. A non-callable @@iterator / abrupt →
         // reject (IfAbruptRejectPromise).
-        let iter = match self.get_prop(iterable, "@@iterator") {
-            Ok(m) if self.is_callable(m) => match self.call_value(m, iterable, &[]) {
-                Ok(it) => it,
-                Err(Thrown(msg)) => {
-                    self.reject_with_thrown(result, &msg);
-                    return Ok(Value::heap(result));
-                }
-            },
+        let iter_method = match self.get_prop(iterable, "@@iterator") {
+            Ok(m) if self.is_callable(m) => m,
             Ok(_) => {
                 let disp = self.display(iterable);
                 let e = self.alloc_error_from_message(&format!("TypeError: {disp} is not iterable"));
@@ -1593,6 +1670,45 @@ impl<'p> Vm<'p> {
                 return Ok(Value::heap(result));
             }
         };
+        // FAST ITERATION lane: a REAL Array whose @@iterator Get yielded the
+        // PRISTINE intrinsic (and %ArrayIteratorPrototype%.next is untouched)
+        // is stepped INLINE — mirroring the intrinsic live-array iterator
+        // exactly (length re-read per step, holes skipped) with no iterator /
+        // iterator-result allocations. While inline, NO user code can run
+        // between steps (any per-element path that could call out DEMOTES to
+        // a real iterator object first), so these gates can't be invalidated
+        // mid-iteration. `fast_pos = None` ⇒ `iter` drives via the protocol.
+        let arr_fast = iterable.is_heap()
+            && matches!(self.heap.get(iterable.heap_index()), HeapObj::Array(_))
+            && iter_method.bits() == self.default_array_iter.bits()
+            && match self.heap.get(self.array_iter_proto) {
+                HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
+                _ => false,
+            };
+        let mut fast_pos: Option<usize> = if arr_fast { Some(0) } else { None };
+        let mut iter = Value::UNDEFINED;
+        if !arr_fast {
+            iter = match self.call_value(iter_method, iterable, &[]) {
+                Ok(it) => it,
+                Err(Thrown(msg)) => {
+                    self.reject_with_thrown(result, &msg);
+                    return Ok(Value::heap(result));
+                }
+            };
+        }
+        // Per-element intrinsic gates: Call(promiseResolve, C, val) and
+        // Invoke(nextPromise, "then") collapse to their intrinsic native
+        // behavior only when C IS the intrinsic %Promise%, `promiseResolve`
+        // IS the intrinsic Promise.resolve, and the prototype/constructor
+        // pair is pristine.
+        let intrinsic_resolve = ctor.is_heap()
+            && ctor.heap_index() == self.promise_ctor_intrinsic
+            && promise_resolve.is_some_and(|pr| {
+                pr.is_heap()
+                    && matches!(self.heap.get(pr.heap_index()),
+                                HeapObj::Native(n) if *n == native::PROMISE_RESOLVE)
+            })
+            && self.promise_proto_pristine();
         // remainingElementsCount starts at 1 (the iteration itself); each element
         // bumps it, each settling element decrements it, and completing the
         // iteration decrements it — when it hits 0 the combinator resolves/rejects.
@@ -1610,14 +1726,63 @@ impl<'p> Vm<'p> {
         });
         loop {
             // IteratorStep; a throwing next() leaves the iterator done → no close.
-            let val = match self.iterator_step(iter) {
-                Ok(Some(v)) => v,
-                Ok(None) => break,
-                Err(Thrown(msg)) => {
-                    self.reject_with_thrown(result, &msg);
-                    return Ok(Value::heap(result));
+            let val = if let Some(pos) = fast_pos {
+                // Inline intrinsic array-iterator step (live length, holes
+                // skipped) — exactly ITER_NEXT's live-array kind=1 walk.
+                let mut ai = pos;
+                let stepped = loop {
+                    match self.heap.get(iterable.heap_index()) {
+                        HeapObj::Array(items) => {
+                            if ai >= items.len() {
+                                break None;
+                            }
+                            let v = items[ai];
+                            ai += 1;
+                            if v.is_hole() {
+                                continue;
+                            }
+                            break Some(v);
+                        }
+                        _ => break None,
+                    }
+                };
+                fast_pos = Some(ai);
+                match stepped {
+                    Some(v) => v,
+                    None => break,
+                }
+            } else {
+                match self.iterator_step(iter) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => break,
+                    Err(Thrown(msg)) => {
+                        self.reject_with_thrown(result, &msg);
+                        return Ok(Value::heap(result));
+                    }
                 }
             };
+            // DEMOTE before any per-element path that could run user code: a
+            // non-intrinsic resolve/constructor, or a heap OBJECT value that
+            // is not a plain promise (its constructor Get / thenable `then`
+            // Get may invoke an accessor). The replacement is a real live
+            // array iterator parked at the current position, so any user
+            // code that patches the iterator protocol from here on is
+            // honoured by the generic loop.
+            if let Some(pos) = fast_pos {
+                let inert = !val.is_heap()
+                    || !self.is_object_value(val)
+                    || (matches!(self.heap.get(val.heap_index()), HeapObj::Promise { .. })
+                        && self.promise_plain_unobservable(val.heap_index()));
+                if !intrinsic_resolve || !inert {
+                    iter = Value::heap(self.heap.alloc(HeapObj::Iterator {
+                        items: Vec::new(),
+                        index: pos,
+                        proto: self.array_iter_proto,
+                        live: Some((iterable.heap_index(), 1)),
+                    }));
+                    fast_pos = None;
+                }
+            }
             let index = match self.heap.get_mut(comb) {
                 HeapObj::Combinator { results, settled, remaining, .. } => {
                     let i = results.len() as u32;
@@ -1631,21 +1796,36 @@ impl<'p> Vm<'p> {
             // nextPromise = Call(promiseResolve, C, «val») — OBSERVABLE. An abrupt
             // here closes the (still-open) iterator, then rejects with the ORIGINAL
             // error (IteratorClose preserves the throw).
-            let next = match promise_resolve {
-                Some(pr) => match self.call_value(pr, ctor, &[val]) {
-                    Ok(v) => v,
-                    Err(Thrown(msg)) => {
-                        let err = self.take_thrown(&msg);
-                        let _ = self.iterator_close(iter);
-                        // IfAbruptRejectPromise: settle through the capability's
-                        // observable [[Reject]] (a custom constructor's reject is
-                        // visibly invoked), not the internal reject.
-                        self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
-                        return Ok(Value::heap(result));
-                    }
-                },
-                // No usable constructor: coerce to a native promise for the Invoke.
-                None => Value::heap(self.to_promise(val)),
+            let next = if fast_pos.is_some() {
+                // Intrinsic PromiseResolve(%Promise%, val) with an INERT val
+                // (gates above): a PLAIN promise passes through (its
+                // constructor Get is unobservable and yields %Promise%); a
+                // non-object coerces to a fresh fulfilled native promise (a
+                // primitive can never be a thenable — no callout).
+                if val.is_heap()
+                    && matches!(self.heap.get(val.heap_index()), HeapObj::Promise { .. })
+                {
+                    val
+                } else {
+                    Value::heap(self.to_promise(val))
+                }
+            } else {
+                match promise_resolve {
+                    Some(pr) => match self.call_value(pr, ctor, &[val]) {
+                        Ok(v) => v,
+                        Err(Thrown(msg)) => {
+                            let err = self.take_thrown(&msg);
+                            let _ = self.iterator_close(iter);
+                            // IfAbruptRejectPromise: settle through the capability's
+                            // observable [[Reject]] (a custom constructor's reject is
+                            // visibly invoked), not the internal reject.
+                            self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
+                            return Ok(Value::heap(result));
+                        }
+                    },
+                    // No usable constructor: coerce to a native promise for the Invoke.
+                    None => Value::heap(self.to_promise(val)),
+                }
             };
             // onFulfilled / onRejected per PerformPromise{All,AllSettled,Race,Any}: a
             // per-index "resolveElement"/"rejectElement" (CombinatorResolver) is used
@@ -1671,9 +1851,24 @@ impl<'p> Vm<'p> {
             };
             // Invoke(nextPromise, "then", «res_f, res_r») — OBSERVABLE; abrupt →
             // close + reject with the original error.
-            let outcome = match self.get_prop(next, "then") {
-                Ok(then_fn) => self.call_value(then_fn, next, &[res_f, res_r]),
-                Err(e) => Err(e),
+            let outcome = if fast_pos.is_some() {
+                // `next` is a PLAIN promise on a pristine prototype (gates
+                // above): Get(next,"then") is unobservable and yields the
+                // intrinsic, whose PerformPromiseThen takes the plain-
+                // dependent lane — infallible. Tick-identical: the reactions
+                // are registered synchronously either way. The dependent
+                // promise is unobservable AND unused — both handlers are
+                // native resolver objects (CombinatorResolver/BoundResolver),
+                // whose reaction dispatch never touches `dependent` — so the
+                // combinator's own result promise stands in as an inert
+                // placeholder rather than allocating a throwaway promise.
+                self.then_internal(next.heap_index(), res_f, res_r, Some(result));
+                Ok(Value::UNDEFINED)
+            } else {
+                match self.get_prop(next, "then") {
+                    Ok(then_fn) => self.call_value(then_fn, next, &[res_f, res_r]),
+                    Err(e) => Err(e),
+                }
             };
             if let Err(Thrown(msg)) = outcome {
                 let err = self.take_thrown(&msg);

@@ -1360,7 +1360,7 @@ pub enum HeapObj {
     /// is the writable `lastIndex` own data property — stored as a raw `Value` (not a
     /// coerced offset) so an assigned object survives until `exec`/the @@-methods
     /// apply ToLength, invoking its `valueOf` at the spec-mandated time.
-    RegExp { regex: Box<regress::Regex>, source: String, flags: String, last_index: Value },
+    RegExp { regex: std::sync::Arc<regress::Regex>, source: String, flags: String, last_index: Value },
     /// A JS `ArrayBuffer` — a raw byte buffer backing TypedArrays/DataViews.
     /// `detached` is set by transfer (we never detach via GC); `data` is the bytes
     /// ([`AbData`]: per-VM `Local` for ArrayBuffers, `Shared` for SharedArrayBuffers).
@@ -1557,10 +1557,21 @@ impl Heap {
 
     /// Record the post-sweep live count and grow the next threshold to ~2x it
     /// (amortising collection cost), clearing the request flag.
+    ///
+    /// The threshold is also floored at half the TOTAL slot count: a sweep
+    /// walks `0..objs.len()` (tombstones included — the slot Vec never
+    /// shrinks), so once a burst has grown the heap to N slots, collecting
+    /// every `2*live` allocs on a small live set costs O(N) per O(live)
+    /// allocations — quadratic for alloc-heavy, low-retention phases (e.g. a
+    /// 3M-promise `Promise.all` workload). Requiring ~N/2 allocations between
+    /// sweeps keeps the amortized cost O(1) per alloc; the reused slots come
+    /// from the free list, so peak memory is unchanged.
     #[inline]
     pub fn note_gc_done(&mut self, live: usize) {
         self.live = live;
-        self.gc_threshold = (live.saturating_mul(2)).max(GC_MIN_THRESHOLD);
+        self.gc_threshold = (live.saturating_mul(2))
+            .max(GC_MIN_THRESHOLD)
+            .max(self.objs.len() / 2);
         self.gc_requested = false;
     }
 

@@ -408,9 +408,11 @@ fn promote_1char_loops(n: &mut Node, _w: &Walk) -> PassAction {
 
 /// Replace Cat(Char) with ByteSeq.
 /// Also replace chars with literal bytes.
-/// Don't do this in utf16 mode because UTF-16 should never match against bytes.
+/// PATCH (see VENDORED.md): no longer cfg'd out under `utf16` — instead it is
+/// only RUN for programs that will match BYTE inputs (`optimize` without the
+/// `utf16` feature, or `optimize_bytes`), because UTF-16 inputs must never
+/// match against bytes.
 /// TODO: this seems to do too much; consider breaking this up.
-#[cfg(not(feature = "utf16"))]
 fn form_literal_bytes(n: &mut Node, walk: &Walk) -> PassAction {
     // Helper to return a mutable reference to the nodes of a literal bytes.
     fn get_literal_bytes(n: &mut Node) -> Option<&mut Vec<u8>> {
@@ -525,6 +527,18 @@ fn simplify_brackets(n: &mut Node, _walk: &Walk) -> PassAction {
 }
 
 pub fn optimize(r: &mut Regex) {
+    optimize_impl(r, cfg!(not(feature = "utf16")));
+}
+
+/// PATCH (see VENDORED.md): `optimize` INCLUDING the byte-literal passes.
+/// The resulting program matches correctly ONLY against byte-element inputs
+/// (`find_from` over `&str` / `find_from_ascii`) — never run it over
+/// UTF-16/UCS-2 input.
+pub fn optimize_bytes(r: &mut Regex) {
+    optimize_impl(r, true);
+}
+
+fn optimize_impl(r: &mut Regex, byte_input: bool) {
     run_pass(r, &mut simplify_brackets);
     loop {
         let mut changed = false;
@@ -534,8 +548,7 @@ pub fn optimize(r: &mut Regex) {
         }
         changed |= run_pass(r, &mut unroll_loops);
         changed |= run_pass(r, &mut promote_1char_loops);
-        #[cfg(not(feature = "utf16"))]
-        {
+        if byte_input {
             changed |= run_pass(r, &mut form_literal_bytes);
         }
         changed |= run_pass(r, &mut remove_empties);

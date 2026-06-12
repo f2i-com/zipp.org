@@ -316,6 +316,23 @@ pub struct Vm<'p> {
     /// lone-surrogate pattern round-trips exactly. Holds no `Value`s (pure
     /// bytes, idx-keyed): GC only needs the sweep-time retain in gc.rs.
     regexp_exact_source: std::collections::HashMap<u32, Vec<u8>>,
+    /// RegExp heap idx → its BYTE-OPTIMIZED twin compile (regress
+    /// `from_unicode_byteopt`: literal ByteSeq insns + byte start predicates),
+    /// built lazily on the first exec against an all-ASCII subject and used
+    /// ONLY for ASCII subjects (`find_from_ascii`). Same pattern/flags as the
+    /// heap regex — `None` records a failed twin compile so it isn't retried.
+    /// Invalidated by `RegExp.prototype.compile`. Holds no `Value`s (pure
+    /// program, idx-keyed): GC only needs the sweep-time retain in gc.rs.
+    regexp_ascii: rustc_hash::FxHashMap<u32, Option<std::sync::Arc<regress::Regex>>>,
+    /// Compiled-pattern cache, keyed by (source text, regress flags, byteopt):
+    /// `RegExp.prototype[@@matchAll]` / `@@split` CONSTRUCT a species clone of
+    /// the regex per call (per spec), which would re-parse + re-compile the
+    /// same pattern on every iteration of a hot loop. The compiled program is
+    /// immutable, so identical (source, flags) share one `Arc`.
+    /// Lone-surrogate patterns (exact-bytes side channel) bypass the cache.
+    /// Holds no `Value`s; cleared wholesale when it exceeds a small cap.
+    regex_compile_cache:
+        rustc_hash::FxHashMap<(String, String, bool), std::sync::Arc<regress::Regex>>,
     /// Lazy SameValueZero hash index over a Map/Set/WeakMap/WeakSet's backing
     /// Vec, keyed by the collection's heap index (see vm/collections.rs). An
     /// ABSENT entry means linear-scan behavior (always correct); an entry is
@@ -358,17 +375,17 @@ pub struct Vm<'p> {
     prototypes: std::collections::HashMap<u32, u32>,
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
-    proto_of: std::collections::HashMap<u32, Value>,
+    proto_of: rustc_hash::FxHashMap<u32, Value>,
     /// Own properties set on a function value (`fn.x = y`, e.g. `assert.sameValue`),
     /// keyed by the callable's heap index. Functions can't carry an inline ObjMap,
     /// so their (rare) own props live here.
-    fn_props: std::collections::HashMap<u32, ObjMap>,
+    fn_props: rustc_hash::FxHashMap<u32, ObjMap>,
     /// Non-index string-keyed own properties of an Array (`arr.foo = 1`, and a
     /// regex match-result's `index`/`input`/`groups`), keyed by the array's heap
     /// index. `HeapObj::Array` is a dense `Vec<Value>` with no inline property
     /// map, so its (rare) named own properties live here — exactly mirroring
     /// `fn_props` for callables. Numeric indices + `length` stay in the Vec.
-    arr_props: std::collections::HashMap<u32, ObjMap>,
+    arr_props: rustc_hash::FxHashMap<u32, ObjMap>,
     /// Resizable ArrayBuffers: heap idx → maxByteLength. Presence marks a buffer
     /// as resizable (a side table avoids changing the ArrayBuffer heap variant).
     ab_max: std::collections::HashMap<u32, usize>,

@@ -433,6 +433,7 @@ impl Vm<'_> {
         // Pure-bytes side table (no Values to trace): hygiene-retain only, so a
         // recycled RegExp slot can't inherit a dead pattern's exact source.
         self.regexp_exact_source.retain(|&k, _| marks[k as usize]);
+        self.regexp_ascii.retain(|&k, _| marks[k as usize]);
         // Collection hash index (u32 hash tags -> u32 slots, no Values): drop
         // a dead Map/Set's index so a recycled slot can't inherit a stale one.
         self.collection_index.retain(|&k, _| marks[k as usize]);

@@ -1462,11 +1462,32 @@ impl<'p> Vm<'p> {
                 &source.encode_utf16().collect::<Vec<u16>>(),
             ),
         };
-        let regex = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
-            .map_err(|e| Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}")))?;
+        // Compile, through the (source, flags) cache: @@matchAll/@@split
+        // construct a species clone per call, so hot loops re-build the same
+        // pattern — share the immutable compiled program instead.
+        // Lone-surrogate patterns (exact bytes ≠ lossy source) bypass it.
+        let cache_key = exact_bytes.is_none().then(|| (source.clone(), rflags.clone(), false));
+        let regex: std::sync::Arc<regress::Regex> =
+            match cache_key.as_ref().and_then(|k| self.regex_compile_cache.get(k)) {
+                Some(rc) => rc.clone(),
+                None => {
+                    let r = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
+                        .map_err(|e| {
+                            Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
+                        })?;
+                    let rc = std::sync::Arc::new(r);
+                    if let Some(k) = cache_key {
+                        if self.regex_compile_cache.len() >= 512 {
+                            self.regex_compile_cache.clear();
+                        }
+                        self.regex_compile_cache.insert(k, rc.clone());
+                    }
+                    rc
+                }
+            };
         let idx = self
             .heap
-            .alloc(HeapObj::RegExp { regex: Box::new(regex), source, flags, last_index: Value::int(0) });
+            .alloc(HeapObj::RegExp { regex, source, flags, last_index: Value::int(0) });
         // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
         // the side table (the struct's `source: String` is lossy) so the
         // `source` getter / `toString` round-trip the surrogates. The heap

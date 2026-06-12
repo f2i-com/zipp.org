@@ -1206,7 +1206,9 @@ impl<'p> Vm<'p> {
                         "TypeError: RegExp.prototype.test called on a non-RegExp".into(),
                     ));
                 }
-                let r = self.regexp_exec(this.heap_index(), a0)?;
+                // Same protocol as exec (lastIndex Get + stateful Sets), but the
+                // unobservable match-array materialization is skipped.
+                let r = self.regexp_exec_impl(this.heap_index(), a0, false)?;
                 Value::bool(r != Value::NULL)
             }
             REGEXP_COMPILE => {
@@ -1299,10 +1301,13 @@ impl<'p> Vm<'p> {
                 if let HeapObj::RegExp { regex: r, source: s, flags: fl, .. } =
                     self.heap.get_mut(this.heap_index())
                 {
-                    *r = Box::new(regex);
+                    *r = std::sync::Arc::new(regex);
                     *s = source;
                     *fl = flags;
                 }
+                // The byte-optimized ASCII twin compiled the OLD pattern —
+                // drop it (rebuilt lazily on the next ASCII-subject exec).
+                self.regexp_ascii.remove(&this.heap_index());
                 // Move the exact-source entry onto the receiver — or clear a
                 // stale one when the new pattern is well-formed.
                 match exact {
@@ -3212,42 +3217,9 @@ impl<'p> Vm<'p> {
                         ))
                     }
                 };
-                // A lazy %RegExpStringIterator%: run ONE RegExpExec (via the abstract
-                // protocol, honouring a user `exec`) per next(). A null result, or the
-                // single match of a non-global regex, latches done; a global empty
-                // match advances lastIndex (spec AdvanceStringIndex: +1 unit, +2 over
-                // an astral surrogate pair when the iterator's fullUnicode bit is set)
-                // so the next step makes progress.
-                if let Some(&(regexp, string, fbits, done)) = self.regexp_string_iters.get(&it_idx) {
-                    let global = fbits & 1 != 0;
-                    let full_unicode = fbits & 2 != 0;
-                    let (value, ret_done, latch) = if done {
-                        (Value::UNDEFINED, true, true)
-                    } else {
-                        let r = self.regexp_exec_abstract(regexp, string)?;
-                        if r == Value::NULL {
-                            (Value::UNDEFINED, true, true)
-                        } else if !global {
-                            (r, false, true)
-                        } else {
-                            let m0 = self.get_index(r, Value::int(0))?;
-                            let m0s = self.to_js_string(m0)?;
-                            if m0s.is_empty() {
-                                let cur_v = self.get_prop(Value::heap(regexp), "lastIndex")?;
-                                // ToLength(Get(R,"lastIndex")) — a throwing
-                                // lastIndex.valueOf must propagate, not be swallowed;
-                                // the 2^53-1 clamp applies BEFORE the advance.
-                                let cur = self
-                                    .to_integer_or_zero(cur_v)?
-                                    .clamp(0, (1i64 << 53) - 1)
-                                    as usize;
-                                let next = self.advance_index_on_value(string, cur, full_unicode);
-                                self.set_regexp_last_index(regexp, next);
-                            }
-                            (r, false, false)
-                        }
-                    };
-                    self.regexp_string_iters.insert(it_idx, (regexp, string, fbits, latch));
+                // A lazy %RegExpStringIterator%: one RegExpExec per next().
+                if let Some(step) = self.regexp_string_iter_step(it_idx) {
+                    let (value, ret_done) = step?;
                     let mut m = ObjMap::new();
                     m.set("value", value);
                     m.set("done", Value::bool(ret_done));
