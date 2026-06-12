@@ -316,6 +316,14 @@ pub struct Vm<'p> {
     /// lone-surrogate pattern round-trips exactly. Holds no `Value`s (pure
     /// bytes, idx-keyed): GC only needs the sweep-time retain in gc.rs.
     regexp_exact_source: std::collections::HashMap<u32, Vec<u8>>,
+    /// Lazy SameValueZero hash index over a Map/Set/WeakMap/WeakSet's backing
+    /// Vec, keyed by the collection's heap index (see vm/collections.rs). An
+    /// ABSENT entry means linear-scan behavior (always correct); an entry is
+    /// built once a collection crosses the size threshold and maintained by
+    /// the coll_* helpers every mutation routes through. Holds NO `Value`s
+    /// (u32 hash tags -> u32 slot positions): GC only needs the sweep-time
+    /// hygiene retain in gc.rs.
+    collection_index: rustc_hash::FxHashMap<u32, collections::CollIndex>,
     /// Monotone counter minting a fresh private brand per class evaluation (1 = first;
     /// 0 = unbranded).
     next_private_brand: u64,
@@ -1031,6 +1039,7 @@ mod misc_methods;
 mod array_ops;
 mod string_ops;
 mod coerce;
+mod collections;
 pub(crate) mod bigint;
 pub(crate) mod native;
 mod agents;

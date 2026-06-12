@@ -7,6 +7,38 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Largest combined length (UTF-16 units) that `a + b` builds as an immediate
+/// FLAT string instead of a rope node. A small rope costs MORE than the copy:
+/// the Cons allocation now plus a flatten allocation + objs write-back on
+/// first content access (and Map/Set keys, property names, comparisons all
+/// access content immediately) — the same reasoning as V8's ConsString
+/// minimum length (13). `s += part` loops building LONG strings still get
+/// O(1) rope appends (their combined length exceeds this almost immediately).
+const SMALL_CONCAT_FLAT_UNITS: usize = 24;
+
+/// Decimal ASCII form of an i32 written into a stack buffer: the digits live
+/// in `buf[start..]` of the returned `(buf, start)`. No allocation — the
+/// string⊕int concat fast path copies them straight into its result buffer.
+#[inline]
+fn fmt_i32_buf(n: i32) -> ([u8; 12], usize) {
+    let mut buf = [0u8; 12];
+    let mut i = buf.len();
+    let mut m = (n as i64).unsigned_abs(); // i64: |i32::MIN| representable
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    if n < 0 {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    (buf, i)
+}
+
 impl<'p> Vm<'p> {
     /// Clone an array's current elements out of the heap. Used before invoking
     /// callbacks so a heap reallocation during the call can't dangle a borrow.
@@ -383,38 +415,15 @@ impl<'p> Vm<'p> {
         self.same_value_zero(a, b)
     }
 
+    // The single implementations live in vm/collections.rs (free functions
+    // over &Heap) so the collection hash index can share them exactly — its
+    // SameValueZero hash must never diverge from this equality.
     pub(crate) fn same_value_zero(&self, a: Value, b: Value) -> bool {
-        if a.is_number() && b.is_number() {
-            let (na, nb) = (a.as_f64(), b.as_f64());
-            return na == nb || (na.is_nan() && nb.is_nan());
-        }
-        self.values_strict_eq(a, b)
+        super::collections::svz_eq(&self.heap, a, b)
     }
 
     pub(crate) fn values_strict_eq(&self, a: Value, b: Value) -> bool {
-        if a.bits() == b.bits() {
-            if a.is_double() && a.as_f64().is_nan() {
-                return false;
-            }
-            return true;
-        }
-        if a.is_number() && b.is_number() {
-            return a.as_f64() == b.as_f64();
-        }
-        if a.is_heap() && b.is_heap() {
-            let (ai, bi) = (a.heap_index(), b.heap_index());
-            if self.heap.is_str_like(ai) && self.heap.is_str_like(bi) {
-                return self.heap.str_eq(ai, bi);
-            }
-            // BigInts compare by VALUE; canonical form means a Small (i128) and
-            // a Big (beyond-i128) can never be equal, so same-tier suffices.
-            match (self.heap.get(ai), self.heap.get(bi)) {
-                (HeapObj::BigInt(x), HeapObj::BigInt(y)) => return x == y,
-                (HeapObj::BigIntBig(x), HeapObj::BigIntBig(y)) => return x == y,
-                _ => {}
-            }
-        }
-        false
+        super::collections::strict_eq(&self.heap, a, b)
     }
 
     /// JS loose equality `==` (the Abstract Equality Comparison). Same-type
@@ -562,7 +571,40 @@ impl<'p> Vm<'p> {
             let (li, ri) = (va.heap_index(), vb.heap_index());
             let llen = self.heap.str_units(li).unwrap_or(0);
             let rlen = self.heap.str_units(ri).unwrap_or(0);
+            // A SMALL result is built flat eagerly (one alloc, no flatten
+            // later); only a large one pays for a rope node.
+            if llen + rlen <= SMALL_CONCAT_FLAT_UNITS {
+                return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, llen + rlen)));
+            }
             return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
+        }
+        // Fast path: string + int (the `"key_" + i` map-key shape; both sides are
+        // primitives, so skipping ToPrimitive is unobservable). A SMALL result is
+        // built flat in ONE allocation with the int's decimal form written
+        // straight into the buffer — no intermediate heap string for the number.
+        if vb.is_int() && va.is_heap() {
+            if let Some(lu) = self.heap.str_units(va.heap_index()) {
+                let (buf, start) = fmt_i32_buf(vb.as_int());
+                if lu + (buf.len() - start) <= SMALL_CONCAT_FLAT_UNITS {
+                    if let Some(idx) =
+                        self.heap.alloc_concat_str_ascii(va.heap_index(), &buf[start..])
+                    {
+                        return Ok(Value::heap(idx));
+                    }
+                }
+            }
+        }
+        if va.is_int() && vb.is_heap() {
+            if let Some(ru) = self.heap.str_units(vb.heap_index()) {
+                let (buf, start) = fmt_i32_buf(va.as_int());
+                if (buf.len() - start) + ru <= SMALL_CONCAT_FLAT_UNITS {
+                    if let Some(idx) =
+                        self.heap.alloc_concat_ascii_str(&buf[start..], vb.heap_index())
+                    {
+                        return Ok(Value::heap(idx));
+                    }
+                }
+            }
         }
         // ToPrimitive(default hint) each operand IN ORDER — objects (including
         // boxed wrappers like `Object(1n)` / `new Number(5)`) run the
@@ -591,6 +633,10 @@ impl<'p> Vm<'p> {
             let ri = self.to_str_idx(pb);
             let llen = self.heap.str_units(li).unwrap_or(0);
             let rlen = self.heap.str_units(ri).unwrap_or(0);
+            // Small result → flat eagerly (see the string+string fast path).
+            if llen + rlen <= SMALL_CONCAT_FLAT_UNITS {
+                return Ok(Value::heap(self.heap.alloc_concat_flat(li, ri, llen + rlen)));
+            }
             return Ok(Value::heap(self.heap.alloc_cons(li, ri, llen + rlen)));
         }
         // Numeric `+`: both BigInt → BigInt addition; BigInt + non-BigInt →

@@ -2474,18 +2474,25 @@ impl<'p> Vm<'p> {
                 } else {
                     let mut keys: Vec<Value> = Vec::new();
                     let mut vals: Vec<Value> = Vec::new();
+                    // Key lookup via the incremental SameValueZero finder
+                    // (linear for few groups, hash-indexed past the threshold).
+                    let mut finder = super::collections::LocalFinder::new();
                     for (i, item) in items.into_iter().enumerate() {
                         let mut key = self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
                         if key.is_number() && key.as_f64() == 0.0 {
                             key = Value::int(0); // Map normalizes -0 to +0
                         }
-                        match keys.iter().position(|k| self.same_value_zero(*k, key)) {
+                        if key.is_heap() {
+                            self.heap.flatten(key.heap_index()); // flat keys hash/compare cheaply
+                        }
+                        match finder.find(&self.heap, &keys, key) {
                             Some(pos) => {
                                 if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index()) {
                                     a.push(item);
                                 }
                             }
                             None => {
+                                finder.record_push(&self.heap, &keys, key);
                                 keys.push(key);
                                 vals.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![item]))));
                             }

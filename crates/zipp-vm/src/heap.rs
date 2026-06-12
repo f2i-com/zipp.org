@@ -1493,6 +1493,81 @@ impl Heap {
         self.alloc(HeapObj::Cons { left, right, len })
     }
 
+    /// Concatenate two string-likes into a fresh FLAT string. Used by `+` for
+    /// SMALL results (a rope node + the inevitable flatten on first access
+    /// costs two allocations and an objs write-back; a small copy is cheaper —
+    /// same reasoning as V8's ConsString minimum length). `write_wtf8` appends
+    /// leaf-by-leaf through `wtf8_push`, so a surrogate pair joining at the
+    /// seam canonicalizes exactly as the rope's flatten would.
+    pub fn alloc_concat_flat(&mut self, left: u32, right: u32, units: usize) -> u32 {
+        // Both children flat and well-formed (the overwhelmingly common case):
+        // plain byte concat — no seam canonicalization is possible (a
+        // well-formed string cannot end/start mid-surrogate) and the cached
+        // metadata composes, so neither scan nor `write_wtf8`'s walk runs.
+        if let (HeapObj::Str(l), HeapObj::Str(r)) =
+            (&self.objs[left as usize], &self.objs[right as usize])
+        {
+            if l.wellformed && r.wellformed {
+                debug_assert_eq!(l.units + r.units, units);
+                let mut bytes = Vec::with_capacity(l.bytes.len() + r.bytes.len());
+                bytes.extend_from_slice(&l.bytes);
+                bytes.extend_from_slice(&r.bytes);
+                let ascii = l.ascii && r.ascii;
+                return self.alloc(HeapObj::Str(JsStr { bytes, units, ascii, wellformed: true }));
+            }
+        }
+        let mut out = Vec::with_capacity(units * 3); // ≤ 3 WTF-8 bytes per UTF-16 unit
+        self.write_wtf8(left, &mut out);
+        self.write_wtf8(right, &mut out);
+        self.alloc(HeapObj::Str(JsStr::from_wtf8(out)))
+    }
+
+    /// `left + tail` / `head + right` where the raw side is ASCII bytes (an
+    /// int's decimal form): ONE flat allocation, the bytes written straight
+    /// into the result buffer — no intermediate heap string for the number.
+    /// The heap side must be FLAT (`Str`) — `None` falls back to the general
+    /// path. An ASCII seam can never canonicalize (merging needs a surrogate
+    /// half on EACH side), so plain byte concat is exact even when the string
+    /// side holds lone surrogates.
+    pub fn alloc_concat_str_ascii(&mut self, left: u32, tail: &[u8]) -> Option<u32> {
+        debug_assert!(tail.is_ascii());
+        let js = match &self.objs[left as usize] {
+            HeapObj::Str(l) => {
+                let mut bytes = Vec::with_capacity(l.bytes.len() + tail.len());
+                bytes.extend_from_slice(&l.bytes);
+                bytes.extend_from_slice(tail);
+                JsStr {
+                    bytes,
+                    units: l.units + tail.len(),
+                    ascii: l.ascii,
+                    wellformed: l.wellformed,
+                }
+            }
+            _ => return None,
+        };
+        Some(self.alloc(HeapObj::Str(js)))
+    }
+
+    /// See `alloc_concat_str_ascii` — the mirrored `head + right` order.
+    pub fn alloc_concat_ascii_str(&mut self, head: &[u8], right: u32) -> Option<u32> {
+        debug_assert!(head.is_ascii());
+        let js = match &self.objs[right as usize] {
+            HeapObj::Str(r) => {
+                let mut bytes = Vec::with_capacity(head.len() + r.bytes.len());
+                bytes.extend_from_slice(head);
+                bytes.extend_from_slice(&r.bytes);
+                JsStr {
+                    bytes,
+                    units: head.len() + r.units,
+                    ascii: r.ascii,
+                    wellformed: r.wellformed,
+                }
+            }
+            _ => return None,
+        };
+        Some(self.alloc(HeapObj::Str(js)))
+    }
+
     /// Is this heap object a string — flat `Str` or rope `Cons`?
     #[inline]
     pub fn is_str_like(&self, idx: u32) -> bool {

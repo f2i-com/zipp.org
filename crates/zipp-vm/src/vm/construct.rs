@@ -1813,6 +1813,8 @@ impl<'p> Vm<'p> {
         // adder (honouring a subclass override) — modeled on the Map/Set arms.
         if pidx == self.weakmap_proto && self.weakmap_proto != 0 {
             *self.heap.get_mut(oidx) = HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() };
+            // Re-branded in place: no stale collection index may key this slot.
+            self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
@@ -1832,6 +1834,8 @@ impl<'p> Vm<'p> {
         }
         if pidx == self.weakset_proto && self.weakset_proto != 0 {
             *self.heap.get_mut(oidx) = HeapObj::WeakSet(Vec::new());
+            // Re-branded in place: no stale collection index may key this slot.
+            self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
@@ -1851,13 +1855,23 @@ impl<'p> Vm<'p> {
             let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
             let mut items: Vec<Value> = Vec::new();
             if !a0.is_nullish() {
+                // SameValueZero dedup via the incremental finder (linear for a
+                // small source, hash-indexed past the threshold).
+                let mut finder = super::collections::LocalFinder::new();
                 for e in self.iterate_to_vec(a0)? {
-                    if !items.iter().any(|v| self.same_value_zero(*v, e)) {
+                    if e.is_heap() {
+                        self.heap.flatten(e.heap_index()); // flat keys hash/compare cheaply
+                    }
+                    if finder.find(&self.heap, &items, e).is_none() {
+                        finder.record_push(&self.heap, &items, e);
                         items.push(e);
                     }
                 }
             }
             *self.heap.get_mut(oidx) = HeapObj::Set(items);
+            // The instance slot is re-branded in place: make sure no stale
+            // collection index can be keyed by it.
+            self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
@@ -1880,6 +1894,8 @@ impl<'p> Vm<'p> {
             // Brand first so the `set` adder operates on a real Map, then add entries
             // via the adder resolved off the instance (honouring a subclass override).
             *self.heap.get_mut(oidx) = HeapObj::Map { keys: Vec::new(), vals: Vec::new() };
+            // Re-branded in place: no stale collection index may key this slot.
+            self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }

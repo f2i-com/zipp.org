@@ -96,6 +96,7 @@ impl<'p> Vm<'p> {
             template_cache: std::collections::HashMap::new(),
             regexp_string_iters: std::collections::HashMap::new(),
             regexp_exact_source: std::collections::HashMap::new(),
+            collection_index: rustc_hash::FxHashMap::default(),
             next_private_brand: 1,
             method_brand: std::collections::HashMap::new(),
             instance_brand: std::collections::HashMap::new(),

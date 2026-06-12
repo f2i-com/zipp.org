@@ -1617,37 +1617,30 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
             "get" => {
-                let v = match self.heap.get(idx) {
-                    HeapObj::Map { keys, vals } => keys
-                        .iter()
-                        .position(|k| self.same_value_zero(*k, a0))
-                        .map(|i| vals[i]),
-                    _ => None,
-                };
+                let v = self.coll_find(idx, a0).map(|i| match self.heap.get(idx) {
+                    HeapObj::Map { vals, .. } => vals[i],
+                    _ => Value::UNDEFINED,
+                });
                 Ok(Some(v.unwrap_or(Value::UNDEFINED)))
             }
-            "has" => {
-                let found = match self.heap.get(idx) {
-                    HeapObj::Map { keys, .. } => keys.iter().any(|k| self.same_value_zero(*k, a0)),
-                    _ => false,
-                };
-                Ok(Some(Value::bool(found)))
-            }
+            "has" => Ok(Some(Value::bool(self.coll_find(idx, a0).is_some()))),
             "set" => {
                 let key = normalize_zero(a0);
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let pos = match self.heap.get(idx) {
-                    HeapObj::Map { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, key)),
-                    _ => None,
-                };
+                let pos = self.coll_find(idx, key);
+                let mut pushed = None;
                 if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => vals[i] = val, // update in place, keep position
                         None => {
+                            pushed = Some(keys.len());
                             keys.push(key);
                             vals.push(val);
                         }
                     }
+                }
+                if let Some(p) = pushed {
+                    self.coll_index_insert(idx, key, p);
                 }
                 Ok(Some(recv)) // chainable
             }
@@ -1655,18 +1648,19 @@ impl<'p> Vm<'p> {
                 // Existing value wins; otherwise insert `value` and return it.
                 let key = normalize_zero(a0);
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let existing = match self.heap.get(idx) {
-                    HeapObj::Map { keys, vals } => {
-                        keys.iter().position(|k| self.same_value_zero(*k, key)).map(|i| vals[i])
+                if let Some(i) = self.coll_find(idx, key) {
+                    if let HeapObj::Map { vals, .. } = self.heap.get(idx) {
+                        return Ok(Some(vals[i]));
                     }
-                    _ => None,
-                };
-                if let Some(v) = existing {
-                    return Ok(Some(v));
                 }
+                let mut pushed = None;
                 if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                    pushed = Some(keys.len());
                     keys.push(key);
                     vals.push(val);
+                }
+                if let Some(p) = pushed {
+                    self.coll_index_insert(idx, key, p);
                 }
                 Ok(Some(val))
             }
@@ -1678,46 +1672,42 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let key = normalize_zero(a0);
-                let existing = match self.heap.get(idx) {
-                    HeapObj::Map { keys, vals } => {
-                        keys.iter().position(|k| self.same_value_zero(*k, key)).map(|i| vals[i])
+                if let Some(i) = self.coll_find(idx, key) {
+                    if let HeapObj::Map { vals, .. } = self.heap.get(idx) {
+                        return Ok(Some(vals[i]));
                     }
-                    _ => None,
-                };
-                if let Some(v) = existing {
-                    return Ok(Some(v));
                 }
                 // Compute (may re-enter and mutate the map), then set key -> value
                 // (overwriting if the callback inserted it) and return value.
                 let val = self.call_value(cb, Value::UNDEFINED, &[key])?;
-                let pos = match self.heap.get(idx) {
-                    HeapObj::Map { keys, .. } => {
-                        keys.iter().position(|k| self.same_value_zero(*k, key))
-                    }
-                    _ => None,
-                };
+                let pos = self.coll_find(idx, key);
+                let mut pushed = None;
                 if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => vals[i] = val,
                         None => {
+                            pushed = Some(keys.len());
                             keys.push(key);
                             vals.push(val);
                         }
                     }
                 }
+                if let Some(p) = pushed {
+                    self.coll_index_insert(idx, key, p);
+                }
                 Ok(Some(val))
             }
             "delete" => {
-                let pos = match self.heap.get(idx) {
-                    HeapObj::Map { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),
-                    _ => None,
-                };
-                if let (Some(i), HeapObj::Map { keys, vals }) = (pos, self.heap.get_mut(idx)) {
-                    // Tombstone (don't shift): a live forEach / iterator holds an index
-                    // cursor. A tombstoned key (HOLE) is filtered out everywhere the
-                    // entries are enumerated.
-                    keys[i] = Value::HOLE;
-                    vals[i] = Value::UNDEFINED;
+                if let Some(i) = self.coll_find(idx, a0) {
+                    if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                        // Tombstone (don't shift): a live forEach / iterator holds an index
+                        // cursor. A tombstoned key (HOLE) is filtered out everywhere the
+                        // entries are enumerated.
+                        keys[i] = Value::HOLE;
+                        vals[i] = Value::UNDEFINED;
+                    }
+                    // Positions don't shift, so only the dead key leaves the index.
+                    self.coll_index_remove(idx, a0, i);
                     return Ok(Some(Value::bool(true)));
                 }
                 Ok(Some(Value::bool(false)))
@@ -1727,6 +1717,8 @@ impl<'p> Vm<'p> {
                     keys.clear();
                     vals.clear();
                 }
+                // Every slot position died: drop the index (rebuilds lazily).
+                self.coll_index_invalidate(idx);
                 Ok(Some(Value::UNDEFINED))
             }
             "forEach" => {
@@ -1799,38 +1791,32 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
             "get" => {
-                let v = match self.heap.get(idx) {
-                    HeapObj::WeakMap { keys, vals } => {
-                        keys.iter().position(|k| self.same_value_zero(*k, a0)).map(|i| vals[i])
-                    }
-                    _ => None,
-                };
+                let v = self.coll_find(idx, a0).map(|i| match self.heap.get(idx) {
+                    HeapObj::WeakMap { vals, .. } => vals[i],
+                    _ => Value::UNDEFINED,
+                });
                 Ok(v.unwrap_or(Value::UNDEFINED))
             }
-            "has" => {
-                let found = match self.heap.get(idx) {
-                    HeapObj::WeakMap { keys, .. } => keys.iter().any(|k| self.same_value_zero(*k, a0)),
-                    _ => false,
-                };
-                Ok(Value::bool(found))
-            }
+            "has" => Ok(Value::bool(self.coll_find(idx, a0).is_some())),
             "set" => {
                 if !self.can_be_held_weakly(a0) {
                     return Err(Thrown("TypeError: Invalid value used as weak map key".into()));
                 }
                 let val = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                let pos = match self.heap.get(idx) {
-                    HeapObj::WeakMap { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),
-                    _ => None,
-                };
+                let pos = self.coll_find(idx, a0);
+                let mut pushed = None;
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => vals[i] = val,
                         None => {
+                            pushed = Some(keys.len());
                             keys.push(a0);
                             vals.push(val);
                         }
                     }
+                }
+                if let Some(p) = pushed {
+                    self.coll_index_insert(idx, a0, p);
                 }
                 Ok(this) // chainable
             }
@@ -1845,14 +1831,10 @@ impl<'p> Vm<'p> {
                 if computed && !self.is_callable(cb) {
                     return Err(Thrown("TypeError: the callback argument must be a function".into()));
                 }
-                let existing = match self.heap.get(idx) {
-                    HeapObj::WeakMap { keys, vals } => {
-                        keys.iter().position(|k| self.same_value_zero(*k, a0)).map(|i| vals[i])
+                if let Some(i) = self.coll_find(idx, a0) {
+                    if let HeapObj::WeakMap { vals, .. } = self.heap.get(idx) {
+                        return Ok(vals[i]);
                     }
-                    _ => None,
-                };
-                if let Some(v) = existing {
-                    return Ok(v);
                 }
                 let val = if computed {
                     // The callback may re-enter and mutate; re-find after.
@@ -1860,29 +1842,32 @@ impl<'p> Vm<'p> {
                 } else {
                     cb // getOrInsert's `value` argument
                 };
-                let pos = match self.heap.get(idx) {
-                    HeapObj::WeakMap { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),
-                    _ => None,
-                };
+                let pos = self.coll_find(idx, a0);
+                let mut pushed = None;
                 if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
                     match pos {
                         Some(i) => vals[i] = val,
                         None => {
+                            pushed = Some(keys.len());
                             keys.push(a0);
                             vals.push(val);
                         }
                     }
                 }
+                if let Some(p) = pushed {
+                    self.coll_index_insert(idx, a0, p);
+                }
                 Ok(val)
             }
             "delete" => {
-                let pos = match self.heap.get(idx) {
-                    HeapObj::WeakMap { keys, .. } => keys.iter().position(|k| self.same_value_zero(*k, a0)),
-                    _ => None,
-                };
-                if let (Some(i), HeapObj::WeakMap { keys, vals }) = (pos, self.heap.get_mut(idx)) {
-                    keys.remove(i);
-                    vals.remove(i);
+                if let Some(i) = self.coll_find(idx, a0) {
+                    if let HeapObj::WeakMap { keys, vals } = self.heap.get_mut(idx) {
+                        keys.remove(i);
+                        vals.remove(i);
+                    }
+                    // Vec::remove SHIFTS every later position: drop the whole
+                    // index (rebuilds lazily) rather than patch it.
+                    self.coll_index_invalidate(idx);
                     return Ok(Value::bool(true));
                 }
                 Ok(Value::bool(false))
@@ -1901,35 +1886,31 @@ impl<'p> Vm<'p> {
         let idx = this.heap_index();
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "has" => {
-                let found = match self.heap.get(idx) {
-                    HeapObj::WeakSet(items) => items.iter().any(|v| self.same_value_zero(*v, a0)),
-                    _ => false,
-                };
-                Ok(Value::bool(found))
-            }
+            "has" => Ok(Value::bool(self.coll_find(idx, a0).is_some())),
             "add" => {
                 if !self.can_be_held_weakly(a0) {
                     return Err(Thrown("TypeError: Invalid value used in weak set".into()));
                 }
-                let present = match self.heap.get(idx) {
-                    HeapObj::WeakSet(items) => items.iter().any(|v| self.same_value_zero(*v, a0)),
-                    _ => true,
-                };
-                if !present {
+                if self.coll_find(idx, a0).is_none() {
+                    let mut pushed = None;
                     if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
+                        pushed = Some(items.len());
                         items.push(a0);
+                    }
+                    if let Some(p) = pushed {
+                        self.coll_index_insert(idx, a0, p);
                     }
                 }
                 Ok(this) // chainable
             }
             "delete" => {
-                let pos = match self.heap.get(idx) {
-                    HeapObj::WeakSet(items) => items.iter().position(|v| self.same_value_zero(*v, a0)),
-                    _ => None,
-                };
-                if let (Some(i), HeapObj::WeakSet(items)) = (pos, self.heap.get_mut(idx)) {
-                    items.remove(i);
+                if let Some(i) = self.coll_find(idx, a0) {
+                    if let HeapObj::WeakSet(items) = self.heap.get_mut(idx) {
+                        items.remove(i);
+                    }
+                    // Vec::remove SHIFTS every later position: drop the whole
+                    // index (rebuilds lazily) rather than patch it.
+                    self.coll_index_invalidate(idx);
                     return Ok(Value::bool(true));
                 }
                 Ok(Value::bool(false))
@@ -2002,36 +1983,31 @@ impl<'p> Vm<'p> {
         let recv = Value::heap(idx);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         match name {
-            "has" => {
-                let found = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.iter().any(|v| self.same_value_zero(*v, a0)),
-                    _ => false,
-                };
-                Ok(Some(Value::bool(found)))
-            }
+            "has" => Ok(Some(Value::bool(self.coll_find(idx, a0).is_some()))),
             "add" => {
                 let val = normalize_zero(a0);
-                let present = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.iter().any(|v| self.same_value_zero(*v, val)),
-                    _ => true,
-                };
-                if !present {
+                if self.coll_find(idx, val).is_none() {
+                    let mut pushed = None;
                     if let HeapObj::Set(items) = self.heap.get_mut(idx) {
+                        pushed = Some(items.len());
                         items.push(val);
+                    }
+                    if let Some(p) = pushed {
+                        self.coll_index_insert(idx, val, p);
                     }
                 }
                 Ok(Some(recv)) // chainable
             }
             "delete" => {
-                let pos = match self.heap.get(idx) {
-                    HeapObj::Set(items) => items.iter().position(|v| self.same_value_zero(*v, a0)),
-                    _ => None,
-                };
-                if let (Some(i), HeapObj::Set(items)) = (pos, self.heap.get_mut(idx)) {
-                    // Tombstone (don't shift): a live forEach / iterator holds an index
-                    // cursor, so removing the slot would skip the next element. The
-                    // slot is filtered out by size / has / iteration / set algebra.
-                    items[i] = Value::HOLE;
+                if let Some(i) = self.coll_find(idx, a0) {
+                    if let HeapObj::Set(items) = self.heap.get_mut(idx) {
+                        // Tombstone (don't shift): a live forEach / iterator holds an index
+                        // cursor, so removing the slot would skip the next element. The
+                        // slot is filtered out by size / has / iteration / set algebra.
+                        items[i] = Value::HOLE;
+                    }
+                    // Positions don't shift, so only the dead value leaves the index.
+                    self.coll_index_remove(idx, a0, i);
                     return Ok(Some(Value::bool(true)));
                 }
                 Ok(Some(Value::bool(false)))
@@ -2040,6 +2016,8 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Set(items) = self.heap.get_mut(idx) {
                     items.clear();
                 }
+                // Every slot position died: drop the index (rebuilds lazily).
+                self.coll_index_invalidate(idx);
                 Ok(Some(Value::UNDEFINED))
             }
             "forEach" => {
