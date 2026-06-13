@@ -377,6 +377,7 @@ impl<'p> Vm<'p> {
                 | Instr::Ne { dst, .. }
                 | Instr::GetProp { dst, .. }
                 | Instr::GetIndex { dst, .. }
+                | Instr::HasProp { dst, .. }
                 | Instr::StrConcat { dst, .. }
                 | Instr::StrAppendInPlace { dst, .. }
                 | Instr::Call { dst, .. }
@@ -397,8 +398,10 @@ impl<'p> Vm<'p> {
                 stored_globals.insert(idx);
             }
         }
-        // Per-access pin selector: a TA element access (kind taken from the live
-        // TypedArray), a DataView `get*`, or a flat-ASCII `charCodeAt` string.
+        // Per-access pin selector: a TA-or-dense-Array element access (kind
+        // taken from the LIVE receiver — a TypedArray's element kind, or
+        // ARR_PIN_KIND for a dense Array), a DataView `get*`, or a flat-ASCII
+        // `charCodeAt` string.
         enum Recv {
             Ta,
             Dv,
@@ -406,7 +409,15 @@ impl<'p> Vm<'p> {
         }
         for aip in s..=e {
             let (obj, recv) = match proto.code[aip] {
+                // `arr[i]` (GetIndex), `arr[i]=v` (SetIndex), and `i in arr`
+                // (HasProp, brand=false) all pin their receiver the same way; the
+                // LIVE heap object decides TA-kind vs ARR_PIN_KIND. SetIndex pins
+                // only a TypedArray (its inline store path); a dense-Array store
+                // is left to the generic helper (it can grow/realloc), but its
+                // receiver is still observed here and resolves to ARR_PIN_KIND
+                // only when the inline GetIndex/HasProp can use it.
                 Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => (obj, Recv::Ta),
+                Instr::HasProp { obj, brand: false, .. } => (obj, Recv::Ta),
                 // A whitelisted DataView `get*` receiver pins the same way
                 // (snapshot: data+byteOffset / byteLength).
                 Instr::CallMethod { obj, name, argc, .. }
@@ -459,6 +470,19 @@ impl<'p> Vm<'p> {
             }
             let kind = match (self.heap.get(live.heap_index()), &recv) {
                 (HeapObj::TypedArray { kind, .. }, Recv::Ta) if *kind < 9 => *kind,
+                // A dense Array pins for inline `arr[i]` / `i in arr`. Decline
+                // when it carries an `arr_props` overlay (defineProperty'd /
+                // sparse-overlay index) or is a mapped-`arguments` object — both
+                // need the interpreter's override-aware path, so a pin would be
+                // wasted (the snapshot helper also declines at runtime → all-zero
+                // → identity miss → generic helper, so this is an optimisation,
+                // never a soundness gate).
+                (HeapObj::Array(_), Recv::Ta)
+                    if !self.arr_props.contains_key(&live.heap_index())
+                        && !self.arguments_objs.contains_key(&live.heap_index()) =>
+                {
+                    crate::codegen::ARR_PIN_KIND
+                }
                 (HeapObj::DataView { .. }, Recv::Dv) => crate::codegen::DV_PIN_KIND,
                 // Pin only a FLAT ASCII string — the inline byte load needs
                 // byte i == UTF-16 unit i (a rope/non-ASCII string snapshots

@@ -514,6 +514,28 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
                 _ => None,
             };
         }
+        if kind == crate::codegen::ARR_PIN_KIND as u32 {
+            // Dense-Array pin: base = the `Vec<Value>` storage pointer, len =
+            // its element count. DECLINE (→ None → all-zero slot → the region's
+            // per-access identity guard misses → generic helper) when the array
+            // carries an `arr_props` overlay (a defineProperty'd / sparse-overlay
+            // index whose value/accessor is NOT in the dense Vec) or is a mapped
+            // `arguments` object (a live index reads a formal's register) — both
+            // need the interpreter's override-aware get_index. The base goes
+            // stale on any Vec growth/realloc; the region re-derives it after
+            // every such op (push / generic SetIndex / user-code helper).
+            if vm.arr_props.contains_key(&idx) || vm.arguments_objs.contains_key(&idx) {
+                return None;
+            }
+            return match vm.heap.get(idx) {
+                HeapObj::Array(items) => Some(TaSnap {
+                    obj_bits: ta_bits,
+                    base: items.as_ptr() as u64,
+                    len: items.len() as u64,
+                }),
+                _ => None,
+            };
+        }
         if kind == crate::codegen::DV_PIN_KIND as u32 {
             // DataView pin: base = data + byteOffset, len = byteLength; the
             // view must be attached and (on a shrunk resizable buffer) still

@@ -84,6 +84,18 @@ const USER_OBJ_START: i32 = 129;
 /// raw TypedArray bytes can never alias a NaN-box tag). Mirror of value.rs QNAN.
 const QNAN_BITS: u64 = 0x7FF8_0000_0000_0000;
 
+/// The internal array-HOLE sentinel bits — `Value::HOLE` = `TAG_UNDEFINED | 2`
+/// = `QNAN | (4 << 48) | 2`. A pinned dense-Array element load compares against
+/// this to route an absent index to the generic helper (prototype walk), never
+/// returning the sentinel to user code. Mirror of value.rs `Value::HOLE`.
+const ARR_HOLE_BITS: u64 = 0x7FFC_0000_0000_0002;
+
+/// `Value::TRUE` bits — `TAG_BOOL | 1` = `QNAN | (2 << 48) | 1`. The pinned
+/// dense-Array `HasProp` (`i in arr`) inline writes this for an in-range,
+/// non-HOLE element (an own property → unconditionally present). Mirror of
+/// value.rs `Value::TRUE`.
+const BOOL_TRUE_BITS: u64 = 0x7FFA_0000_0000_0001;
+
 /// Where a pinned TypedArray's live Value is RE-READ from at region entry and
 /// after every user-code helper: a global slot (`g` never stored in the region)
 /// or a frame register (never written in the region). The static choice is only
@@ -114,6 +126,22 @@ pub const DV_PIN_KIND: u8 = 255;
 /// access takes the generic `jit_char_code_at` helper — full flatten/surrogate
 /// semantics). ASCII-only is the correctness gate: byte i == UTF-16 unit i.
 pub const STR_PIN_KIND: u8 = 254;
+
+/// `TaPin::kind` marker for a pinned dense `HeapObj::Array` receiver (not a TA
+/// element kind). Snapshot: `base = items.as_ptr()` (the `Vec<Value>` storage),
+/// `len = items.len()`, for inlining `arr[i]` (`GetIndex`) and `i in arr`
+/// (`HasProp`) as a direct `Value` load. ⚠️ Unlike a TypedArray's fixed buffer,
+/// an Array's `Vec` REALLOCATES on growth (push / SetIndex extend / splice /
+/// length=), so the pinned base is re-derived (`emit_refetch_ta`) after every
+/// op that can grow/replace it — exactly the same discipline as a detach/resize
+/// for a TA. A snapshot DECLINES (all-zero → identity guard misses → generic
+/// helper) when the array carries an `arr_props` overlay (a defineProperty'd /
+/// sparse-overlay index, whose value/accessor lives off the dense Vec) or is a
+/// mapped-`arguments` object (a live index reads the formal's register). The
+/// inline answers only the in-range, non-HOLE case; a HOLE / out-of-range /
+/// non-int key routes to the generic `jit_get_index` / `jit_has_property`
+/// helper (full prototype-walk / `in` semantics) — never a new answer.
+pub const ARR_PIN_KIND: u8 = 253;
 
 /// Compile-time plan for inline TypedArray element access in a memory-path
 /// region: the pins (each gets a 32-byte stack snapshot slot `{obj_bits, base,
@@ -6228,6 +6256,52 @@ fn compile_region_mem(
             }
             Instr::HasProp { dst, key, obj, brand: _ } => {
                 // `key in obj` (region_can_compile admitted only brand=false).
+                // ── pinned dense-Array fast path ── when the OSR plan pinned
+                // this receiver (ARR_PIN_KIND): identity-guard, then an INTEGER
+                // key in `[0, len)` whose element is NOT a HOLE answers `true`
+                // call-free (an in-range present element is unconditionally an
+                // own property — the prototype chain is irrelevant). Every other
+                // case (guard miss / declined-snapshot all-zero slot / non-Int
+                // key / OOB / a HOLE) routes to the generic `jit_has_property`
+                // helper, which walks the real prototype chain (an OOB/hole index
+                // can still be inherited) — so the inline never INVENTS a `false`.
+                // This is the 80%-present hot path of the hole-iter `if (i in
+                // packed)` loop; the read-only inline neither allocates nor moves
+                // the Vec, so no refetch.
+                let pinned = ta_plan
+                    .access
+                    .get(&ip)
+                    .map(|&j| (j as usize, ta_plan.pins[j as usize].kind))
+                    .filter(|&(_, kind)| kind == ARR_PIN_KIND);
+                let hp_slow = ops.new_dynamic_label();
+                let hp_done = ops.new_dynamic_label();
+                if let Some((slot, _)) = pinned {
+                    let off = ta_slot_off(slot);
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(obj)]      // receiver bits
+                        ; cmp rax, [rsp + off]            // identity vs snapshot
+                        ; jne => hp_slow                  // miss/declined → helper
+                        // Int-tag key only (a double / heap / other key → helper,
+                        // which runs the full coercion / chain walk).
+                        ; mov rcx, [rbx + dreg(key)]
+                        ; mov r10, rcx
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => hp_slow                  // non-Int key → helper
+                        ; movsxd rcx, ecx                 // Int payload (may be < 0)
+                        ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
+                        ; jae => hp_slow                  // OOB/negative → helper (proto walk)
+                        ; mov rdx, [rsp + off + 8]        // pinned items base
+                        ; mov rax, [rdx + rcx * 8]        // items[i] (Value bits)
+                        ; mov r10, QWORD ARR_HOLE_BITS as i64
+                        ; cmp rax, r10
+                        ; je => hp_slow                   // HOLE (absent own) → helper (proto walk)
+                        ; mov r10, QWORD BOOL_TRUE_BITS as i64
+                        ; mov [rbx + dreg(dst)], r10      // in-range present → true
+                        ; jmp => hp_done
+                        ; => hp_slow
+                    );
+                }
                 // The read-only `jit_has_property` helper returns the BOOL Value
                 // bits, or SELF_CALL_DEOPT → bail (the interpreter re-executes the
                 // op: throws on a non-object RHS, runs an object-key ToString, or
@@ -6244,6 +6318,9 @@ fn compile_region_mem(
                     ; je => bail                         // proxy / coercion / throw → interp
                     ; mov [rbx + dreg(dst)], rax         // Bool Value bits
                 );
+                if pinned.is_some() {
+                    dynasm!(ops ; => hp_done);
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Lt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Lt),
@@ -6518,6 +6595,44 @@ fn compile_region_mem(
                 let (ta_slow, ta_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
                 if let Some((slot, kind)) = pinned {
                     let off = ta_slot_off(slot);
+                    if kind == ARR_PIN_KIND {
+                        // ── pinned dense-Array fast path ── identity guard, int
+                        // key, bounds check against the snapshot len (==
+                        // items.len()), then a DIRECT `Value` load (8 bytes — the
+                        // element is already a NaN-boxed Value, so its bits store
+                        // straight into the dst with no re-encoding / forgery
+                        // risk). A HOLE element (an absent index) routes to the
+                        // generic helper, EXACTLY mirroring `jit_get_index` (which
+                        // deopts on a hole so the interpreter walks the prototype
+                        // chain); OOB / non-int key likewise. A guard miss (the
+                        // array variable was reassigned, or the snapshot DECLINED
+                        // for an arr_props/arguments array → all-zero slot →
+                        // rax never equals 0 for a real heap Value) → generic
+                        // helper. The base is re-derived after every Vec-growth
+                        // op (push / generic SetIndex / user-code helper), so a
+                        // realloc cannot leave it stale across iterations.
+                        let hole = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rax, [rbx + dreg(obj)]      // receiver bits
+                            ; cmp rax, [rsp + off]            // identity vs snapshot
+                            ; jne => ta_slow                  // miss/declined → helper
+                        );
+                        emit_ta_key(&mut ops, key, bail);     // rcx = i64 index
+                        dynasm!(ops
+                            ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
+                            ; jae => ta_slow                  // OOB/negative → helper
+                            ; mov rdx, [rsp + off + 8]        // pinned items base
+                            ; mov rax, [rdx + rcx * 8]        // items[i] (Value bits)
+                            ; mov r10, QWORD ARR_HOLE_BITS as i64
+                            ; cmp rax, r10
+                            ; je => hole                      // HOLE → helper (proto walk)
+                            ; mov [rbx + dreg(dst)], rax
+                            ; jmp => ta_done
+                            ; => hole                         // HOLE lands here, then
+                            ; => ta_slow                      // guard-miss/OOB join → generic helper
+                        );
+                        // Fall through to the generic helper (hole/miss/OOB).
+                    } else {
                     dynasm!(ops
                         ; mov rax, [rbx + dreg(obj)]      // receiver bits
                         ; cmp rax, [rsp + off]            // identity vs snapshot
@@ -6570,6 +6685,7 @@ fn compile_region_mem(
                         }
                     }
                     dynasm!(ops ; jmp => ta_done ; => ta_slow);
+                    } // end TA-kind branch
                 }
                 // Generic element read `a[i]` via a win64 helper (dense arrays,
                 // flat-ASCII strings, and unpinned TypedArrays). Returns the
@@ -6598,10 +6714,20 @@ fn compile_region_mem(
                 // anything else deopts, because ToNumber coercion is observable
                 // user code the interpreter must run. OOB stores deopt (the
                 // interpreter performs the spec'd coerce-then-silent-no-op).
+                //
+                // A dense-Array pin (`ARR_PIN_KIND`) has NO inline store path: a
+                // store can append/grow (reallocating the Vec) and a hole-fill /
+                // length-extend has bespoke semantics — so a SetIndex on a pinned
+                // Array takes the generic `jit_set_index` helper (which then
+                // re-derives the snapshot). Filter the ARR kind out of `pinned`
+                // here so the TA store-encoding match below NEVER sees it (kind
+                // 253 would otherwise fall into the int-dtype arm and write a
+                // 4-byte int over an 8-byte Value — heap corruption).
                 let pinned = ta_plan
                     .access
                     .get(&ip)
-                    .map(|&j| (j as usize, ta_plan.pins[j as usize].kind));
+                    .map(|&j| (j as usize, ta_plan.pins[j as usize].kind))
+                    .filter(|&(_, kind)| kind != ARR_PIN_KIND);
                 let (ta_slow, ta_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
                 if let Some((slot, kind)) = pinned {
                     let off = ta_slot_off(slot);
@@ -6704,6 +6830,15 @@ fn compile_region_mem(
                     ; cmp rax, r10
                     ; je => bail
                 );
+                // The generic `jit_set_index` can GROW a dense Array's `Vec`
+                // (an in-bounds store never moves it, but an append at `i==len`
+                // does, reallocating the storage) — invalidating any pinned
+                // Array base in this region. Re-derive every snapshot, exactly
+                // as for a detach/resize. (Cheap when there are no array pins;
+                // `ta_refetch` is None then.)
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
                 if pinned.is_some() {
                     dynasm!(ops ; => ta_done);
                 }
@@ -6909,6 +7044,17 @@ fn compile_region_mem(
                         ; je => bail
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    // `arr.push(x)` GROWS the array's `Vec` (reallocating its
+                    // storage) — invalidating any pinned dense-Array base in this
+                    // region. Re-derive the snapshots (charCodeAt never grows an
+                    // array, so the refetch is push-only). The str-pin fast path
+                    // above jumps to `cc_done` before this call, so it correctly
+                    // skips the refetch.
+                    if key == "push" {
+                        if let Some((snap, plan)) = ta_refetch {
+                            emit_refetch_ta(&mut ops, snap, plan);
+                        }
+                    }
                     if str_pin.is_some() {
                         dynasm!(ops ; => cc_done);
                     }
