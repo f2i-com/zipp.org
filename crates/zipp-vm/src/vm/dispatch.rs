@@ -2754,6 +2754,14 @@ impl<'p> Vm<'p> {
                                 // built before the &proto borrow below).
                                 let leaf_plan =
                                     self.build_leaf_inline_plan(func_id, t as u32, region_end as u32);
+                                // Q7 method-call inline plan (reads the live receiver
+                                // exemplar at each CallMethod's obj reg — needs `base`).
+                                let method_plan = self.build_method_inline_plan(
+                                    func_id,
+                                    t as u32,
+                                    region_end as u32,
+                                    base,
+                                );
                                 let proto: *const crate::bytecode::FuncProto =
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
@@ -2797,6 +2805,7 @@ impl<'p> Vm<'p> {
                                     &const_strs,
                                     &ta_plan,
                                     &leaf_plan,
+                                    &method_plan,
                                 );
                                 if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                     if self.pending_throw.is_some() {

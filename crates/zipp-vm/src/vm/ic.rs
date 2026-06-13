@@ -1084,6 +1084,23 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Read-only: the resolved class-method `fid` for a `CallMethod` site whose
+    /// receiver belongs to `class`, taken from a FILLED `ClassMethod` IC way. For
+    /// the Q7 method-inline planner (`build_method_inline_plan`). `None` if no
+    /// such way exists yet (unfilled site, or the class resolves a different
+    /// entry kind / a different class). Performs no fill / side effect.
+    pub(crate) fn ic_class_method_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
+        let site = self.ic_site(func_id, ip)?;
+        for e in &site.entries[..site.n as usize] {
+            if let IcEntry::ClassMethod { class: c, fid, .. } = *e {
+                if c == class {
+                    return Some(fid);
+                }
+            }
+        }
+        None
+    }
+
     /// IC for a `Call` site: callee identity (+ slot version) → (fid,
     /// closure) for a plain user function, skipping the Proxy/native/bound/
     /// ctor probes and flag loads. `None` ⇒ slow path.

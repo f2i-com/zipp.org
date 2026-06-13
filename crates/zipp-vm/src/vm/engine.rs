@@ -612,6 +612,185 @@ impl<'p> Vm<'p> {
         plan
     }
 
+    /// Q7 method-inline plan: in-region `CallMethod` sites whose LIVE receiver is
+    /// a class instance with a trivial NO-`super` method body (own-`this` field
+    /// reads + numeric arithmetic). Read-only — built (like the leaf plan) BEFORE
+    /// the `&proto` borrow at the OSR-compile site. `base` is the caller frame
+    /// base, used to read the live receiver exemplar from `self.regs` (the
+    /// class-keyed IC doesn't record receiver instances). The emitted code guards
+    /// the receiver identity+version and falls to the helper on ANY miss, so a
+    /// stale/partial/wrong-shape plan is always safe (just slower). v1 is
+    /// monomorphic per site (one exemplar receiver baked); other receivers /
+    /// shapes miss to the helper. See [`crate::codegen::MethodInlinePlan`].
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_method_inline_plan(
+        &self,
+        func_id: u32,
+        start: u32,
+        end: u32,
+        base: usize,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::MethodInlinePlan> {
+        use crate::codegen::MethodInlinePlan;
+        use crate::heap::HeapObj;
+        let mut plan = rustc_hash::FxHashMap::default();
+        if std::env::var_os("ZIPP_NO_METHOD_INLINE").is_some() {
+            return plan; // kill-switch (live through all stages)
+        }
+        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let caller = self.func(func_id as usize);
+        let reg_window = caller.reg_count;
+        for ip in start as usize..=end as usize {
+            let Instr::CallMethod { obj, name, .. } = caller.code[ip] else {
+                continue;
+            };
+            // Live receiver exemplar at the obj reg (the last iteration's value).
+            let recv = match self.regs.get(base + obj as usize) {
+                Some(&v) if v.is_heap() => v,
+                _ => continue,
+            };
+            let ridx = recv.heap_index();
+            if !self.ic_obj_ok(ridx) {
+                continue;
+            }
+            // Receiver must be a plain (non-ctor) class instance.
+            let (recv_class, vals_ptr) = match self.heap.get(ridx) {
+                HeapObj::Object(m) if !m.is_ctor => match m.class {
+                    Some(c) => (c, m.vals.as_ptr() as u64),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let key = &caller.string_constants[name as usize];
+            // G3b: an own property shadowing the method name makes the call
+            // resolve to the own prop, not the class method — decline.
+            if let HeapObj::Object(m) = self.heap.get(ridx) {
+                if m.pos(key).is_some() {
+                    continue;
+                }
+            }
+            // Resolve the class method `fid` from the filled IC for recv's class.
+            let Some(fid) = self.ic_class_method_fid(func_id, ip, recv_class) else {
+                if log {
+                    eprintln!("[method] fn{func_id}@{ip} no ClassMethod IC way for class {recv_class}");
+                }
+                continue;
+            };
+            let callee = self.func(fid as usize);
+            let Some(body_len) = Self::method_inline_body_ok(callee) else {
+                if log {
+                    eprintln!("[method] fn{func_id}@{ip} callee fn{fid} body not no-super-inlinable");
+                }
+                continue;
+            };
+            let body: Vec<Instr> = callee.code[..body_len].to_vec();
+            // Bake each `this.<field>` read's own DATA slot from the live receiver
+            // (valid behind the runtime recv-version guard).
+            let mut field_slots = rustc_hash::FxHashMap::default();
+            let mut ok = true;
+            if let HeapObj::Object(m) = self.heap.get(ridx) {
+                for instr in &body {
+                    if let Instr::GetProp { obj: 0, name: fname, .. } = *instr {
+                        let fkey = &callee.string_constants[fname as usize];
+                        match m.pos(fkey) {
+                            Some(s) if !m.attrs[s].accessor => {
+                                field_slots.insert(fname, s as u32);
+                            }
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                ok = false;
+            }
+            if !ok {
+                if log {
+                    eprintln!("[method] fn{func_id}@{ip} a this.<field> is not an own data slot on recv");
+                }
+                continue;
+            }
+            // Pre-resolve numeric constants the body reads.
+            let mut consts = rustc_hash::FxHashMap::default();
+            for instr in &body {
+                if let Instr::LoadConst { idx, .. } = *instr {
+                    if let Some(c) = callee.constants.get(idx as usize) {
+                        consts.insert(idx, c.bits());
+                    }
+                }
+            }
+            let recv_ver = self.heap.version_of(ridx);
+            if log {
+                eprintln!(
+                    "[method] fn{func_id}@{ip} callee fn{fid} INLINE (class={recv_class} \
+                     body_ops={} fields={} regs={})",
+                    body.len(),
+                    field_slots.len(),
+                    callee.reg_count
+                );
+            }
+            plan.insert(
+                ip,
+                MethodInlinePlan {
+                    recv_bits: recv.bits(),
+                    recv_ver,
+                    vals_ptr,
+                    field_slots,
+                    reg_window,
+                    callee_reg_count: callee.reg_count,
+                    param_count: callee.param_count,
+                    body,
+                    consts,
+                },
+            );
+        }
+        plan
+    }
+
+    /// No-`super` subset of `method_body_inlinable_scan` for the Q7 in-region
+    /// method emitter (v1 emits no super body). Returns the body length (ops up
+    /// to and incl. the first `Return`/`ReturnUndefined`), or `None` to decline.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn method_inline_body_ok(p: &crate::bytecode::FuncProto) -> Option<usize> {
+        use crate::bytecode::Instr as I;
+        if p.is_generator || p.is_async {
+            return None;
+        }
+        if p.rest_reg.is_some() || p.arguments_reg.is_some() {
+            return None;
+        }
+        // Bound the scratch window (≤16, matching the leaf inliner's headroom).
+        if p.reg_count > 16 {
+            return None;
+        }
+        let code = &p.code;
+        let term = code
+            .iter()
+            .position(|i| matches!(i, I::Return { .. } | I::ReturnUndefined))?;
+        for instr in &code[..term] {
+            match *instr {
+                I::LoadInt { .. } | I::LoadBool { .. } | I::Move { .. } => {}
+                I::LoadConst { idx, .. } => match p.constants.get(idx as usize) {
+                    Some(c) if c.is_number() => {}
+                    _ => return None,
+                },
+                I::GetProp { obj: 0, .. } => {}
+                I::Add { .. }
+                | I::Sub { .. }
+                | I::Mul { .. }
+                | I::Div { .. }
+                | I::Mod { .. }
+                | I::AddInt { .. }
+                | I::Neg { .. }
+                | I::Bitwise { .. } => {}
+                // Rejects Super*/MathOp/GetIndex/SetProp/calls/branches/etc.
+                _ => return None,
+            }
+        }
+        Some(term + 1)
+    }
+
     /// Would growing `self.regs` to `needed` slots exceed the pinned capacity?
     /// (Interpreter-only builds: never — there is no pinned native pointer to
     /// protect, so the Vec may grow/reallocate freely.)
