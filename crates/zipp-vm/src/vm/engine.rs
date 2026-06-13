@@ -329,6 +329,134 @@ impl<'p> Vm<'p> {
         self.jit_enabled = on;
     }
 
+    /// Build the TypedArray pin plan for the OSR region `[start, end]` from
+    /// LIVE VM state (called right before `compile_region`, frame `base` on
+    /// top): for each `GetIndex`/`SetIndex`, find the receiver's nearest
+    /// preceding in-region writer — a `LoadGlobal g` with `g` never stored in
+    /// the region pins via `Global(g)`; a receiver register never written in
+    /// the region pins via `Reg(r)`; anything else is left to the generic
+    /// helper. A source qualifies only if it holds a non-BigInt TypedArray
+    /// RIGHT NOW (the emitted code is kind-specialised). The hint is purely an
+    /// OPTIMISATION: every fast-path access re-checks receiver identity against
+    /// the snapshot at runtime, and the snapshot helper re-validates kind /
+    /// detach / bounds — a wrong or stale hint degrades to the helper path,
+    /// never to a wrong answer.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_ta_pin_plan(
+        &self,
+        func_id: u32,
+        start: u32,
+        end: u32,
+        base: usize,
+    ) -> crate::codegen::TaPinPlan {
+        use crate::codegen::{TaPin, TaPinPlan, TaPinSrc};
+        // Conservative "does this instruction write register r" cover. An op
+        // missing here only weakens the hint (see above) — never soundness.
+        fn writes(i: &Instr, r: u16) -> bool {
+            let dst = match *i {
+                Instr::LoadInt { dst, .. }
+                | Instr::LoadConst { dst, .. }
+                | Instr::Move { dst, .. }
+                | Instr::LoadGlobal { dst, .. }
+                | Instr::LoadGlobalOrUndefined { dst, .. }
+                | Instr::AddInt { dst, .. }
+                | Instr::Add { dst, .. }
+                | Instr::Sub { dst, .. }
+                | Instr::Mul { dst, .. }
+                | Instr::Div { dst, .. }
+                | Instr::Mod { dst, .. }
+                | Instr::Neg { dst, .. }
+                | Instr::Not { dst, .. }
+                | Instr::Bitwise { dst, .. }
+                | Instr::Lt { dst, .. }
+                | Instr::Le { dst, .. }
+                | Instr::Gt { dst, .. }
+                | Instr::Ge { dst, .. }
+                | Instr::Eq { dst, .. }
+                | Instr::Ne { dst, .. }
+                | Instr::GetProp { dst, .. }
+                | Instr::GetIndex { dst, .. }
+                | Instr::StrConcat { dst, .. }
+                | Instr::StrAppendInPlace { dst, .. }
+                | Instr::Call { dst, .. }
+                | Instr::CallMethod { dst, .. } => dst,
+                _ => return false,
+            };
+            dst == r
+        }
+        let mut plan = TaPinPlan::default();
+        let proto = self.func(func_id as usize);
+        let (s, e) = (start as usize, end as usize);
+        if e <= s || e >= proto.code.len() {
+            return plan;
+        }
+        let mut stored_globals: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+        for ins in &proto.code[s..=e] {
+            if let Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } = *ins {
+                stored_globals.insert(idx);
+            }
+        }
+        for aip in s..=e {
+            let (obj, is_dv) = match proto.code[aip] {
+                Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => (obj, false),
+                // A whitelisted DataView `get*` receiver pins the same way
+                // (snapshot: data+byteOffset / byteLength).
+                Instr::CallMethod { obj, name, argc, .. }
+                    if (argc == 1 || argc == 2)
+                        && proto
+                            .string_constants
+                            .get(name as usize)
+                            .is_some_and(|k| crate::codegen::dv_get_kind(k).is_some()) =>
+                {
+                    (obj, true)
+                }
+                _ => continue,
+            };
+            let writer = (s..aip).rev().find(|&wip| writes(&proto.code[wip], obj));
+            let src = match writer.map(|wip| &proto.code[wip]) {
+                Some(&Instr::LoadGlobal { idx, .. }) if !stored_globals.contains(&idx) => {
+                    TaPinSrc::Global(idx)
+                }
+                Some(_) => continue,
+                None => {
+                    // Live-in receiver: pin only if NOTHING in the region
+                    // writes it (so the prologue/refetch reg read stays the
+                    // value the accesses see).
+                    if proto.code[s..=e].iter().any(|i| writes(i, obj)) {
+                        continue;
+                    }
+                    TaPinSrc::Reg(obj)
+                }
+            };
+            let live = match src {
+                TaPinSrc::Global(g) => {
+                    self.globals.get(g as usize).copied().unwrap_or(Value::UNDEFINED)
+                }
+                TaPinSrc::Reg(r) => self.get(base, r),
+            };
+            if !live.is_heap() {
+                continue;
+            }
+            let kind = match self.heap.get(live.heap_index()) {
+                HeapObj::TypedArray { kind, .. } if !is_dv && *kind < 9 => *kind,
+                HeapObj::DataView { .. } if is_dv => crate::codegen::DV_PIN_KIND,
+                _ => continue,
+            };
+            let slot = match plan.pins.iter().position(|p| p.src == src && p.kind == kind) {
+                Some(j) => j,
+                None => {
+                    if plan.pins.len() >= 8 {
+                        continue; // slot budget — extra accesses use the helper
+                    }
+                    plan.pins.push(TaPin { src, kind });
+                    plan.pins.len() - 1
+                }
+            };
+            plan.access.insert(aip, slot as u8);
+        }
+        plan
+    }
+
     /// Would growing `self.regs` to `needed` slots exceed the pinned capacity?
     /// (Interpreter-only builds: never — there is no pinned native pointer to
     /// protect, so the Vec may grow/reallocate freely.)

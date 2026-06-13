@@ -2647,6 +2647,13 @@ impl<'p> Vm<'p> {
                                                 {
                                                     continue; // dedicated helpers
                                                 }
+                                                if (*argc == 1 || *argc == 2)
+                                                    && key.is_some_and(|k| {
+                                                        crate::codegen::dv_get_kind(k).is_some()
+                                                    })
+                                                {
+                                                    continue; // dedicated DataView get* helper
+                                                }
                                             }
                                             Instr::Call { .. } => {}
                                             _ => continue,
@@ -2705,6 +2712,14 @@ impl<'p> Vm<'p> {
                                     self.jit_const_strings.push(v); // GC root
                                     const_strs.insert(idx, v.bits());
                                 }
+                                // ── TypedArray pin plan ── from LIVE state: tie
+                                // each GetIndex/SetIndex to a pinned-TA snapshot
+                                // when its receiver re-reads from a stable
+                                // source (un-stored global / never-written reg)
+                                // that holds a non-BigInt TypedArray NOW. The
+                                // hint is verified per access by an identity
+                                // guard, so a stale/wrong hint is always safe.
+                                let ta_plan = self.build_ta_pin_plan(func_id, t as u32, ip as u32, base);
                                 let proto: *const crate::bytecode::FuncProto =
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
@@ -2732,10 +2747,14 @@ impl<'p> Vm<'p> {
                                         set_prop_slow: jit_set_prop_slow as usize,
                                         strict_eq: jit_strict_eq as usize,
                                         truthy: jit_truthy as usize,
+                                        ta_snapshot: jit_ta_snapshot as usize,
+                                        ta_clamp_store: jit_ta_clamp_store as usize,
+                                        dv_get: jit_dv_get as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
                                     &const_strs,
+                                    &ta_plan,
                                 );
                                 if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                     if self.pending_throw.is_some() {

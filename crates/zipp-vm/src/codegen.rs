@@ -80,6 +80,44 @@ const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// value `>=` this needs full `strict_eq` (the region bits-compare bails on it).
 const USER_OBJ_START: i32 = 129;
 
+/// Canonical NaN bits (`Value::num` canonicalises every NaN to this pattern so
+/// raw TypedArray bytes can never alias a NaN-box tag). Mirror of value.rs QNAN.
+const QNAN_BITS: u64 = 0x7FF8_0000_0000_0000;
+
+/// Where a pinned TypedArray's live Value is RE-READ from at region entry and
+/// after every user-code helper: a global slot (`g` never stored in the region)
+/// or a frame register (never written in the region). The static choice is only
+/// a HINT — every fast-path access re-checks object identity at runtime.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaPinSrc {
+    Global(u32),
+    Reg(u16),
+}
+
+/// One pinned TypedArray: its live-Value source and the element kind the inline
+/// code was specialised for (the snapshot helper re-validates the kind).
+/// `kind == DV_PIN_KIND` pins a DataView instead (snapshot: `base = data +
+/// byteOffset`, `len = byteLength`) for the whitelisted `get*` methods.
+#[derive(Clone, Copy)]
+pub struct TaPin {
+    pub src: TaPinSrc,
+    pub kind: u8,
+}
+
+/// `TaPin::kind` marker for a pinned DataView receiver (not a TA element kind).
+pub const DV_PIN_KIND: u8 = 255;
+
+/// Compile-time plan for inline TypedArray element access in a memory-path
+/// region: the pins (each gets a 32-byte stack snapshot slot `{obj_bits, base,
+/// len}` filled by `jit_ta_snapshot`) and, per GetIndex/SetIndex ip, which pin
+/// it should guard against. Built in dispatch.rs from LIVE VM state at OSR
+/// compile time; empty for non-TA regions.
+#[derive(Default)]
+pub struct TaPinPlan {
+    pub pins: Vec<TaPin>,
+    pub access: FxHashMap<usize, u8>,
+}
+
 /// Win64 addresses of the heap helpers (vm.rs), passed from the interpreter into
 /// `Jit::compile_region`. The inline-cache base site index is assigned inside
 /// `compile_region` (not here), then bundled into `HeapHelpers` for codegen.
@@ -124,6 +162,15 @@ pub struct HeapHelperAddrs {
     /// Helper for a region truthiness test on a non-Int/Bool value (`!x`,
     /// `JumpIfFalse/True` conditions): full `truthy` (read-only; 0/1).
     pub truthy: usize,
+    /// Helper that (re)derives a pinned TypedArray's `{obj_bits, base, len}`
+    /// snapshot into a region stack slot (no alloc, no user code).
+    pub ta_snapshot: usize,
+    /// Helper for a Uint8Clamped store of a DOUBLE value: round-half-even
+    /// clamp + byte store (pure — no vm, no alloc).
+    pub ta_clamp_store: usize,
+    /// Helper for a whitelisted `dv.get*(pos[, le])` DataView read (no alloc,
+    /// no user code; anything unusual returns the deopt sentinel).
+    pub dv_get: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -496,6 +543,7 @@ impl Jit {
         field_pool_base: u32,
         field_pool_size: u32,
         const_strs: &FxHashMap<u32, u64>,
+        ta_plan: &TaPinPlan,
     ) {
         let key = (func_id, start);
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
@@ -574,9 +622,12 @@ impl Jit {
             set_prop_slow: heap_helpers.set_prop_slow,
             strict_eq: heap_helpers.strict_eq,
             truthy: heap_helpers.truthy,
+            ta_snapshot: heap_helpers.ta_snapshot,
+            ta_clamp_store: heap_helpers.ta_clamp_store,
+            dv_get: heap_helpers.dv_get,
             ic_base_idx,
         };
-        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs) {
+        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan) {
             Some(code) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] DOUBLE/MEM region fn{func_id} [{start},{end}] compiled");
@@ -2066,6 +2117,10 @@ fn region_can_compile(
             // MEMORY path via win64 helpers (the int/regalloc paths decline).
             | Instr::GetIndex { .. }
             | Instr::SetIndex { .. }
+            // Read-modify-write key coercion (`o[k] += v`, `o[k]++`): a NUMBER
+            // key on a non-nullish base is a plain move (the MEMORY path's
+            // inline case); anything else bails to the interpreter.
+            | Instr::ToPropKey { .. }
             // String concat (`s += …`) — handled by the MEMORY path via the
             // `jit_concat` / `jit_str_append` win64 helpers (the numeric
             // int/regalloc paths don't list them, so they decline → mem path).
@@ -2237,6 +2292,12 @@ struct HeapHelpers {
     strict_eq: usize,
     /// Full truthiness for non-Int/Bool conditions (read-only, 0/1).
     truthy: usize,
+    /// TypedArray pin snapshot helper (see `HeapHelperAddrs::ta_snapshot`).
+    ta_snapshot: usize,
+    /// Uint8Clamped double-store helper (pure).
+    ta_clamp_store: usize,
+    /// Whitelisted DataView `get*` helper.
+    dv_get: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -2255,11 +2316,12 @@ fn compile_region(
     globals_base_helper: usize,
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
+    ta_plan: &TaPinPlan,
 ) -> Option<JitFn> {
     if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper) {
         return Some(f);
     }
-    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs)
+    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan)
 }
 
 /// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
@@ -4738,6 +4800,109 @@ fn emit_refetch_pinned(
     }
 }
 
+/// Byte offset (from the post-prologue rsp) of pinned-TypedArray snapshot slot
+/// `j`: the frame reserves 32 bytes per pin ABOVE the 32B shadow space + 8B
+/// 5th-arg slot. Layout within a slot: `obj_bits @0`, `base @8`, `len @16`
+/// (8 bytes pad — keeps rsp 16-aligned for helper calls).
+fn ta_slot_off(j: usize) -> i32 {
+    40 + 32 * j as i32
+}
+
+/// (Re)derive every pinned TypedArray snapshot: re-read the live Value from its
+/// source (global slot / frame register) and call `jit_ta_snapshot`, which
+/// re-validates kind/detach/resize and writes `{obj_bits, base, len}` into the
+/// pin's stack slot (`{0,0,0}` when ineligible — the per-access identity guard
+/// then never matches and the access takes the generic-helper fallback).
+/// Emitted in the prologue and AFTER every helper that can run user code
+/// (which may detach/resize a buffer or reassign the source) — the same
+/// discipline as the r13/r14 re-fetch. Clobbers only volatile registers.
+fn emit_refetch_ta(ops: &mut dynasmrt::x64::Assembler, snapshot_helper: usize, plan: &TaPinPlan) {
+    for (j, pin) in plan.pins.iter().enumerate() {
+        match pin.src {
+            TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
+            TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        }
+        dynasm!(ops
+            ; mov rcx, rdi                      // vm
+            ; mov r8d, pin.kind as i32          // expected element kind
+            ; lea r9, [rsp + ta_slot_off(j)]    // out: snapshot slot
+            ; mov rax, QWORD snapshot_helper as i64
+            ; call rax
+        );
+    }
+}
+
+/// Materialise a TypedArray element index from `regs[key]` into `rcx` (i64):
+/// an Int tag sign-extends its payload; a double must be exactly integral
+/// (cvttsd2si round-trip — NaN/±Inf/huge yield the 0x8000… sentinel, which
+/// fails the round-trip) or the op DEOPTS; any other tag deopts. A negative or
+/// huge index survives here and is caught by the caller's unsigned bounds
+/// check (len < 2^31, so any negative i64 compares above it).
+/// Clobbers rcx/r10/xmm0/xmm1.
+fn emit_ta_key(ops: &mut dynasmrt::x64::Assembler, key: u16, bail: dynasmrt::DynamicLabel) {
+    let key_dbl = ops.new_dynamic_label();
+    let key_ok = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rcx, [rbx + dreg(key)]
+        ; mov r10, rcx
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; jne => key_dbl
+        ; movsxd rcx, ecx                       // Int payload (may be negative)
+        ; jmp => key_ok
+        ; => key_dbl
+        ; sub r10d, (INT_TAG_HI + 1) as i32
+        ; cmp r10d, 3                           // Bool/Null/Undefined/Heap → deopt
+        ; jbe => bail
+        ; movq xmm0, rcx
+        ; cvttsd2si rcx, xmm0                   // i64 trunc (NaN/±Inf → sentinel)
+        ; cvtsi2sd xmm1, rcx
+        ; ucomisd xmm1, xmm0
+        ; jne => bail                           // fractional / sentinel
+        ; jp => bail                            // NaN
+        ; => key_ok
+    );
+}
+
+/// Box the u32 in `eax` into `regs[dst]`: Int when it fits i32 (mirrors
+/// `Value::num`'s narrowing), else the exact double (the `>>>` boxing pattern).
+fn emit_box_u32(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+    let as_dbl = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; test eax, eax
+        ; js => as_dbl
+    );
+    box_eax(ops, dst);
+    dynasm!(ops
+        ; jmp => done
+        ; => as_dbl
+        ; mov eax, eax                // zero-extend u32
+        ; cvtsi2sd xmm0, rax          // exact (< 2^32)
+        ; movq rax, xmm0
+        ; mov [rbx + dreg(dst)], rax
+        ; => done
+    );
+}
+
+/// Box the double in `xmm0` into `regs[dst]`, CANONICALISING any NaN — raw
+/// TypedArray/DataView bytes could otherwise alias a NaN-box tag (heap-index
+/// forgery). Not int-narrowed (the f64 mem tier's established representation).
+fn emit_box_f64_canon(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+    let canon = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; ucomisd xmm0, xmm0
+        ; jp => canon                 // NaN → canonical
+        ; movq rax, xmm0
+        ; jmp => done
+        ; => canon
+        ; mov rax, QWORD QNAN_BITS as i64
+        ; => done
+        ; mov [rbx + dreg(dst)], rax
+    );
+}
+
 /// Emit a generic `CallMethod` / `Call` region op as a `jit_call_method_ic` /
 /// `jit_call_ic` helper call (vm/helpers_misc.rs). The helper consults the
 /// interpreter's per-site inline cache, frame-calls the resolved plain user
@@ -4761,6 +4926,7 @@ fn emit_region_call_ic(
     argc: u16,
     dst: u16,
     refetch: Option<(usize, usize)>,
+    ta_refetch: Option<(usize, &TaPinPlan)>,
 ) {
     dynasm!(ops
         ; mov rcx, rdi                          // vm
@@ -4781,6 +4947,11 @@ fn emit_region_call_ic(
     if let Some((vb, icb)) = refetch {
         emit_refetch_pinned(ops, vb, Some(icb));
     }
+    // The call ran user code, which may have detached/resized a pinned
+    // TypedArray's buffer (or reassigned its source) — re-derive the snapshots.
+    if let Some((snap, plan)) = ta_refetch {
+        emit_refetch_ta(ops, snap, plan);
+    }
     emit_region_bail(ops, ip, bail, epilogue);
 }
 
@@ -4796,6 +4967,7 @@ fn compile_region_mem(
     globals_base_helper: usize,
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
+    ta_plan: &TaPinPlan,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end, Some(const_strs)) {
         return None;
@@ -4815,6 +4987,24 @@ fn compile_region_mem(
     let has_prop = proto.code[s..=e]
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
+    // Pinned-TypedArray snapshot slots: 32 bytes each, above the 32B shadow +
+    // 8B 5th-arg slot. 32*n keeps the frame's 16-alignment.
+    let n_ta = ta_plan.pins.len();
+    let frame = 40 + 32 * n_ta as i32;
+    // Re-derive the pins after any helper that can run user code.
+    let ta_refetch = (n_ta > 0).then_some((heap.ta_snapshot, ta_plan));
+    // Registers fed by a DOUBLE constant (`x * 1.5`, `i * 2654435761`): their
+    // arithmetic skips the Int+Int fast path (it would fail every iteration).
+    // Pure perf heuristic — a multiply-defined reg merely keeps the check.
+    let mut const_dbl_regs: FxHashSet<u16> = FxHashSet::default();
+    for instr in &proto.code[s..=e] {
+        if let Instr::LoadConst { dst, idx } = *instr {
+            if proto.constants.get(idx as usize).is_some_and(|c| c.is_double()) {
+                const_dbl_regs.insert(dst);
+            }
+        }
+    }
+    let int_hint = |a: u16, b: u16| !const_dbl_regs.contains(&a) && !const_dbl_regs.contains(&b);
 
     // One label per in-region ip (offset by `start`). Out-of-region jump targets
     // resolve to lazily-created exit stubs.
@@ -4835,7 +5025,7 @@ fn compile_region_mem(
         ; push r12
         ; push r13
         ; push r14
-        ; sub rsp, 40                     // 32B shadow + an 8B 5th-arg slot ⇒ rsp 16-aligned
+        ; sub rsp, frame                  // 32B shadow + 8B 5th-arg slot + 32B/TA pin ⇒ rsp 16-aligned
         ; mov rbx, rcx                    // regs base
         ; mov rsi, rdx                    // resume_ip out-pointer
         ; mov rdi, r8                     // vm
@@ -4852,6 +5042,10 @@ fn compile_region_mem(
         ; call rax
         ; mov r14, rax                    // pinned inline-cache table base
     );
+    // Pin each TypedArray's `{obj_bits, base, len}` snapshot (entry derivation).
+    if let Some((snap, plan)) = ta_refetch {
+        emit_refetch_ta(&mut ops, snap, plan);
+    }
 
     // ── loop-invariant `g.length` hoist ── compute it ONCE here (reusing the
     // GetProp miss helper, which returns string/array `.length` directly) instead
@@ -4940,13 +5134,35 @@ fn compile_region_mem(
                 );
             }
             Instr::Add { dst, a, b } => {
-                // Numeric fast path; non-number operands (strings, objects)
-                // fall back to `jit_concat` — the SAME `add_values` the
-                // interpreter's Add runs (concat / numeric / coercion). The
-                // helper may allocate or run user coercion code, so the pinned
-                // pointers are re-derived when the region reads them.
+                // Int+Int fast path (32-bit add + overflow check, Int result —
+                // the interpreter's `checked_add`), then the numeric f64 path;
+                // non-number operands (strings, objects) fall back to
+                // `jit_concat` — the SAME `add_values` the interpreter's Add
+                // runs (concat / numeric / coercion). The helper may allocate
+                // or run user coercion code, so the pinned pointers are
+                // re-derived when the region reads them.
                 let slow = ops.new_dynamic_label();
+                let f64_path = ops.new_dynamic_label();
                 let done_a = ops.new_dynamic_label();
+                if int_hint(a, b) {
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(a)]
+                        ; mov rcx, [rbx + dreg(b)]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => f64_path
+                        ; mov r10, rcx
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => f64_path
+                        ; add eax, ecx
+                        ; jo => f64_path          // overflow → f64 (reloads operands)
+                    );
+                    box_eax(&mut ops, dst);
+                    dynasm!(ops ; jmp => done_a);
+                }
+                dynasm!(ops ; => f64_path);
                 load_num_xmm(&mut ops, a, 0, slow);
                 load_num_xmm(&mut ops, b, 1, slow);
                 dynasm!(ops ; addsd xmm0, xmm1);
@@ -4967,12 +5183,23 @@ fn compile_region_mem(
                 if has_prop {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
+                // `add_values` can run user coercion code (valueOf) — re-derive
+                // the pinned TypedArray snapshots.
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
                 dynasm!(ops ; => done_a);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::Sub { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Sub),
-            Instr::Mul { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Mul),
-            Instr::Div { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div),
+            Instr::Sub { dst, a, b } => {
+                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Sub, int_hint(a, b))
+            }
+            Instr::Mul { dst, a, b } => {
+                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Mul, int_hint(a, b))
+            }
+            Instr::Div { dst, a, b } => {
+                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div, false)
+            }
             Instr::Mod { dst, a, b } => {
                 // `a % b` for INTEGER-valued operands via i64 idiv (exact, and the
                 // remainder takes the dividend's sign — JS `%` for integers).
@@ -5016,7 +5243,22 @@ fn compile_region_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::AddInt { dst, a, imm, .. } => {
-                // a + imm in f64: load a, materialise imm as a double, addsd.
+                // Int fast path (the interpreter's `checked_add` — keeps loop
+                // counters Int so element-access keys stay on their cheap
+                // path), f64 fallback otherwise / on overflow.
+                let f64_path = ops.new_dynamic_label();
+                let done_ai = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(a)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, INT_TAG_HI as i32
+                    ; jne => f64_path
+                    ; add eax, imm
+                    ; jo => f64_path
+                );
+                box_eax(&mut ops, dst);
+                dynasm!(ops ; jmp => done_ai ; => f64_path);
                 load_num_xmm(&mut ops, a, 0, bail);
                 dynasm!(ops
                     ; mov eax, imm
@@ -5024,6 +5266,7 @@ fn compile_region_mem(
                     ; addsd xmm0, xmm1
                 );
                 store_xmm(&mut ops, dst);
+                dynasm!(ops ; => done_ai);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Neg { dst, a } => {
@@ -5269,6 +5512,11 @@ fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                // The slow helper may have frame-called user code (accessor) —
+                // re-derive the pinned TypedArray snapshots too.
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
                 dynasm!(ops ; => cont);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
@@ -5334,17 +5582,115 @@ fn compile_region_mem(
                     ; je => bail
                 );
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                // The slow helper may have frame-called user code (accessor) —
+                // re-derive the pinned TypedArray snapshots too.
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
                 dynasm!(ops ; => cont);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
+            Instr::ToPropKey { dst, obj, src } => {
+                // `dst = ToPropertyKey(src)` for `o[k] op= v` / `o[k]++`: a
+                // NUMBER key (Int or double) coerces to itself, so the op is a
+                // move once the base is known non-nullish (the interpreter's
+                // RequireObjectCoercible order). A nullish base (throw) or a
+                // non-number key (observable toString/valueOf, or a heap
+                // string/Symbol — rare in hot loops) bails to the interpreter.
+                let tpk_ok = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(obj)]
+                    ; shr rax, 48
+                    ; cmp eax, (INT_TAG_HI + 2) as i32     // 0x7FFB Null
+                    ; je => bail
+                    ; cmp eax, (INT_TAG_HI + 3) as i32     // 0x7FFC Undefined
+                    ; je => bail
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, INT_TAG_HI as i32          // Int key
+                    ; je => tpk_ok
+                    ; sub r10d, (INT_TAG_HI + 1) as i32
+                    ; cmp r10d, 3                          // Bool/Null/Undef/Heap
+                    ; jbe => bail                          //  → interpreter
+                    ; => tpk_ok                            // double key
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::GetIndex { dst, obj, key } => {
-                // Dense-array element read `a[i]` via a win64 helper. The helper
-                // returns the element bits, `undefined` for out-of-range (a later
-                // numeric op then guard-bails on it, matching the interpreter), or
-                // the deopt sentinel for a non-array / non-int key. No inline
-                // cache: arrays carry no shape, so the read is a direct
-                // bounds-checked `vals[i]` inside the helper.
+                // ── pinned-TypedArray fast path ── when the OSR-time plan tied
+                // this access to a pin: identity-guard the receiver against the
+                // pin's snapshot, bounds-check against the snapshot len, then a
+                // DIRECT machine load + dtype conversion (no call). Guard miss →
+                // the generic helper below; OOB / non-integer key / invalidated
+                // snapshot → DEOPT (the interpreter re-executes this op with
+                // full semantics — OOB reads are rare in real code).
+                let pinned = ta_plan
+                    .access
+                    .get(&ip)
+                    .map(|&j| (j as usize, ta_plan.pins[j as usize].kind));
+                let (ta_slow, ta_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+                if let Some((slot, kind)) = pinned {
+                    let off = ta_slot_off(slot);
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(obj)]      // receiver bits
+                        ; cmp rax, [rsp + off]            // identity vs snapshot
+                        ; jne => ta_slow
+                    );
+                    emit_ta_key(&mut ops, key, bail);     // rcx = i64 index
+                    dynasm!(ops
+                        ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
+                        ; jae => bail                     // OOB/negative → deopt
+                        ; mov rdx, [rsp + off + 8]        // pinned data base
+                    );
+                    match kind {
+                        0 => {
+                            dynasm!(ops ; movsx eax, BYTE [rdx + rcx]);
+                            box_eax(&mut ops, dst);
+                        }
+                        1 | 2 => {
+                            dynasm!(ops ; movzx eax, BYTE [rdx + rcx]);
+                            box_eax(&mut ops, dst);
+                        }
+                        3 => {
+                            dynasm!(ops ; movsx eax, WORD [rdx + rcx * 2]);
+                            box_eax(&mut ops, dst);
+                        }
+                        4 => {
+                            dynasm!(ops ; movzx eax, WORD [rdx + rcx * 2]);
+                            box_eax(&mut ops, dst);
+                        }
+                        5 => {
+                            dynasm!(ops ; mov eax, [rdx + rcx * 4]);
+                            box_eax(&mut ops, dst);
+                        }
+                        6 => {
+                            // u32: Int when it fits i32 (mirrors Value::num),
+                            // else the exact double (same as the `>>>` boxing).
+                            dynasm!(ops ; mov eax, [rdx + rcx * 4]);
+                            emit_box_u32(&mut ops, dst);
+                        }
+                        _ => {
+                            // 7/8 (f32/f64): box the double, NaN-canonicalised.
+                            if kind == 7 {
+                                dynasm!(ops
+                                    ; movss xmm0, [rdx + rcx * 4]
+                                    ; cvtss2sd xmm0, xmm0
+                                );
+                            } else {
+                                dynasm!(ops ; movsd xmm0, [rdx + rcx * 8]);
+                            }
+                            emit_box_f64_canon(&mut ops, dst);
+                        }
+                    }
+                    dynasm!(ops ; jmp => ta_done ; => ta_slow);
+                }
+                // Generic element read `a[i]` via a win64 helper (dense arrays,
+                // flat-ASCII strings, and unpinned TypedArrays). Returns the
+                // element bits, `undefined` for out-of-range, or the deopt
+                // sentinel for receivers/keys needing interpreter semantics.
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(obj)]          // array bits
@@ -5356,13 +5702,113 @@ fn compile_region_mem(
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
                 );
+                if pinned.is_some() {
+                    dynasm!(ops ; => ta_done);
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::SetIndex { obj, key, val } => {
-                // Dense-array element write `a[i] = v` via a win64 helper, which
-                // stores in place or grows (matching the interpreter). Returns 0
-                // (ok) or the deopt sentinel (non-array / negative / fractional /
-                // non-numeric key → interpreter applies the no-op fallback).
+                // ── pinned-TypedArray fast path ── mirror of GetIndex: identity
+                // guard, integer key, bounds check, then a direct dtype-encoded
+                // store. The VALUE must already be a number (Int or double) —
+                // anything else deopts, because ToNumber coercion is observable
+                // user code the interpreter must run. OOB stores deopt (the
+                // interpreter performs the spec'd coerce-then-silent-no-op).
+                let pinned = ta_plan
+                    .access
+                    .get(&ip)
+                    .map(|&j| (j as usize, ta_plan.pins[j as usize].kind));
+                let (ta_slow, ta_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+                if let Some((slot, kind)) = pinned {
+                    let off = ta_slot_off(slot);
+                    let val_int = ops.new_dynamic_label();
+                    let sdone = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(obj)]      // receiver bits
+                        ; cmp rax, [rsp + off]            // identity vs snapshot
+                        ; jne => ta_slow
+                    );
+                    emit_ta_key(&mut ops, key, bail);     // rcx = i64 index
+                    dynasm!(ops
+                        ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
+                        ; jae => bail                     // OOB store → deopt
+                        ; mov rdx, [rsp + off + 8]        // pinned data base
+                        ; mov rax, [rbx + dreg(val)]      // value bits
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; je => val_int
+                        ; sub r10d, (INT_TAG_HI + 1) as i32
+                        ; cmp r10d, 3                     // tagged non-number →
+                        ; jbe => bail                     // observable coercion
+                    );
+                    // ── double value (raw f64 bits in rax) ──
+                    match kind {
+                        8 => dynasm!(ops ; mov [rdx + rcx * 8], rax),
+                        7 => dynasm!(ops
+                            ; movq xmm0, rax
+                            ; cvtsd2ss xmm0, xmm0
+                            ; movss [rdx + rcx * 4], xmm0
+                        ),
+                        2 => {
+                            // Uint8Clamped: round-half-even clamp via the pure
+                            // helper (stores the byte itself; clobbers only
+                            // volatile regs, and the store is the op's end).
+                            dynasm!(ops
+                                ; lea rcx, [rdx + rcx]        // element address
+                                ; mov rdx, rax                // f64 bits
+                                ; mov rax, QWORD heap.ta_clamp_store as i64
+                                ; call rax
+                            );
+                        }
+                        _ => {
+                            // Int dtypes: JS modular wrap = the low bits of the
+                            // i64 truncation. NaN/±Inf/|x|≥2^63 hit the 0x8000…
+                            // sentinel → deopt (interpreter wraps/zeroes).
+                            dynasm!(ops
+                                ; movq xmm0, rax
+                                ; cvttsd2si r10, xmm0
+                                ; mov r11, QWORD i64::MIN
+                                ; cmp r10, r11
+                                ; je => bail
+                            );
+                            match kind {
+                                0 | 1 => dynasm!(ops ; mov [rdx + rcx], r10b),
+                                3 | 4 => dynasm!(ops ; mov [rdx + rcx * 2], r10w),
+                                _ => dynasm!(ops ; mov [rdx + rcx * 4], r10d),
+                            }
+                        }
+                    }
+                    dynasm!(ops ; jmp => sdone ; => val_int);
+                    // ── Int value (i32 payload in eax) ──
+                    match kind {
+                        8 => dynasm!(ops
+                            ; cvtsi2sd xmm0, eax
+                            ; movsd [rdx + rcx * 8], xmm0
+                        ),
+                        7 => dynasm!(ops
+                            ; cvtsi2ss xmm0, eax
+                            ; movss [rdx + rcx * 4], xmm0
+                        ),
+                        2 => dynasm!(ops
+                            // Integer clamp to [0,255] (no rounding needed).
+                            ; xor r10d, r10d
+                            ; test eax, eax
+                            ; cmovs eax, r10d
+                            ; mov r10d, 255
+                            ; cmp eax, r10d
+                            ; cmova eax, r10d
+                            ; mov [rdx + rcx], al
+                        ),
+                        0 | 1 => dynasm!(ops ; mov [rdx + rcx], al),
+                        3 | 4 => dynasm!(ops ; mov [rdx + rcx * 2], ax),
+                        _ => dynasm!(ops ; mov [rdx + rcx * 4], eax),
+                    }
+                    dynasm!(ops ; => sdone ; jmp => ta_done ; => ta_slow);
+                }
+                // Generic element write `a[i] = v` via a win64 helper (dense
+                // arrays — store/grow — and unpinned TypedArrays with number
+                // values). Returns 0 (ok) or the deopt sentinel.
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(obj)]          // array bits
@@ -5374,11 +5820,145 @@ fn compile_region_mem(
                     ; cmp rax, r10
                     ; je => bail
                 );
+                if pinned.is_some() {
+                    dynasm!(ops ; => ta_done);
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::CallMethod { dst, obj, name, arg_base, argc } => {
                 let key = proto.string_constants[name as usize].as_str();
-                if argc == 1 && matches!(key, "push" | "charCodeAt") {
+                if (argc == 1 || argc == 2) && dv_get_kind(key).is_some() {
+                    // Whitelisted DataView `get*(pos[, littleEndian])`.
+                    // ── pinned-DataView fast path ── when the OSR plan pinned
+                    // this receiver: identity guard, integral number pos,
+                    // signed bounds check vs the pinned byteLength, then a
+                    // direct (optionally byte-swapped) load. A double/heap
+                    // littleEndian falls to the helper (full ToBoolean).
+                    let kindid = dv_get_kind(key).unwrap();
+                    let pinned = ta_plan
+                        .access
+                        .get(&ip)
+                        .filter(|&&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND)
+                        .map(|&j| j as usize);
+                    let (dv_slow, dv_done) =
+                        (ops.new_dynamic_label(), ops.new_dynamic_label());
+                    if let Some(slot) = pinned {
+                        let off = ta_slot_off(slot);
+                        let size = [1i32, 1, 1, 2, 2, 4, 4, 4, 8][kindid as usize];
+                        dynasm!(ops
+                            ; mov rax, [rbx + dreg(obj)]      // receiver bits
+                            ; cmp rax, [rsp + off]            // identity vs snapshot
+                            ; jne => dv_slow
+                        );
+                        emit_ta_key(&mut ops, arg_base, bail); // rcx = i64 pos
+                        dynasm!(ops
+                            ; test rcx, rcx
+                            ; js => bail                      // negative → RangeError
+                            ; mov r10, [rsp + off + 16]       // byteLength
+                            ; sub r10, size
+                            ; cmp rcx, r10                    // signed: pos > len-size
+                            ; jg => bail                      //  (incl. len < size)
+                            ; mov rdx, [rsp + off + 8]        // pinned data base
+                        );
+                        // littleEndian: only multi-byte kinds look at it. The
+                        // inline path accepts Int/Bool/Null/Undefined (payload
+                        // ≠ 0 ⇔ true — exactly ToBoolean for those tags);
+                        // a double/heap flag falls to the helper.
+                        let le_big = ops.new_dynamic_label();
+                        let loaded = ops.new_dynamic_label();
+                        if size > 1 {
+                            if argc == 2 {
+                                dynasm!(ops
+                                    ; mov rax, [rbx + dreg(arg_base + 1)]
+                                    ; mov r10, rax
+                                    ; shr r10, 48
+                                    ; sub r10d, INT_TAG_HI as i32
+                                    ; cmp r10d, 3             // Int/Bool/Null/Undef
+                                    ; ja => dv_slow           // double/heap → helper
+                                    ; test eax, eax           // payload ≠ 0 ⇔ true
+                                    ; jz => le_big            // falsy → big-endian
+                                );
+                            } else {
+                                // Absent flag = undefined = big-endian.
+                                dynasm!(ops ; jmp => le_big);
+                            }
+                        }
+                        // ── little-endian load ──
+                        match kindid {
+                            0 => dynasm!(ops ; movsx eax, BYTE [rdx + rcx]),
+                            1 => dynasm!(ops ; movzx eax, BYTE [rdx + rcx]),
+                            3 => dynasm!(ops ; movsx eax, WORD [rdx + rcx]),
+                            4 => dynasm!(ops ; movzx eax, WORD [rdx + rcx]),
+                            5 | 6 => dynasm!(ops ; mov eax, [rdx + rcx]),
+                            7 => dynasm!(ops ; movss xmm0, [rdx + rcx] ; cvtss2sd xmm0, xmm0),
+                            _ => dynasm!(ops ; movsd xmm0, [rdx + rcx]),
+                        }
+                        if size > 1 {
+                            dynasm!(ops ; jmp => loaded ; => le_big);
+                            // ── big-endian load (byte-swapped) ──
+                            match kindid {
+                                3 => dynasm!(ops
+                                    ; movzx eax, WORD [rdx + rcx]
+                                    ; rol ax, 8
+                                    ; movsx eax, ax
+                                ),
+                                4 => dynasm!(ops
+                                    ; movzx eax, WORD [rdx + rcx]
+                                    ; rol ax, 8
+                                ),
+                                5 | 6 => dynasm!(ops
+                                    ; mov eax, [rdx + rcx]
+                                    ; bswap eax
+                                ),
+                                7 => dynasm!(ops
+                                    ; mov eax, [rdx + rcx]
+                                    ; bswap eax
+                                    ; movd xmm0, eax
+                                    ; cvtss2sd xmm0, xmm0
+                                ),
+                                _ => dynasm!(ops
+                                    ; mov rax, [rdx + rcx]
+                                    ; bswap rax
+                                    ; movq xmm0, rax
+                                ),
+                            }
+                            dynasm!(ops ; => loaded);
+                        }
+                        match kindid {
+                            6 => emit_box_u32(&mut ops, dst),
+                            7 | 8 => emit_box_f64_canon(&mut ops, dst),
+                            _ => box_eax(&mut ops, dst),
+                        }
+                        dynasm!(ops ; jmp => dv_done ; => dv_slow);
+                    }
+                    // Generic path: the dedicated win64 helper (receiver + pos
+                    // + le bits in, element kind via the 5th-arg slot; result
+                    // bits out, deopt sentinel → bail). No alloc, no user code
+                    // — no re-fetch.
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; mov r8, [rbx + dreg(arg_base)]      // pos bits
+                    );
+                    if argc == 2 {
+                        dynasm!(ops ; mov r9, [rbx + dreg(arg_base + 1)]);
+                    } else {
+                        dynasm!(ops ; mov r9, QWORD Value::UNDEFINED.bits() as i64);
+                    }
+                    dynasm!(ops
+                        ; mov QWORD [rsp + 32], kindid as i32 // 5th arg: kind
+                        ; mov rax, QWORD heap.dv_get as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if pinned.is_some() {
+                        dynasm!(ops ; => dv_done);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else if argc == 1 && matches!(key, "push" | "charCodeAt") {
                     // The whitelisted 1-arg builtins keep their dedicated win64
                     // helpers: receiver + arg0 bits in, result bits out, deopt
                     // sentinel → bail. Neither allocates a heap OBJECT (push
@@ -5418,6 +5998,7 @@ fn compile_region_mem(
                         argc,
                         dst,
                         has_prop.then_some((heap.versions_base, heap.ic_base)),
+                        ta_refetch,
                     );
                 }
             }
@@ -5437,6 +6018,7 @@ fn compile_region_mem(
                     argc,
                     dst,
                     has_prop.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
                 );
             }
             Instr::StrConcat { dst, a, b } => {
@@ -5461,6 +6043,9 @@ fn compile_region_mem(
                 if has_prop {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::StrAppendInPlace { dst, a, b } => {
@@ -5478,6 +6063,9 @@ fn compile_region_mem(
                 );
                 if has_prop {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                if let Some((snap, plan)) = ta_refetch {
+                    emit_refetch_ta(&mut ops, snap, plan);
                 }
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
@@ -5514,7 +6102,7 @@ fn compile_region_mem(
     // ── epilogue ── restore and return; [rsi] already holds the resume ip.
     dynasm!(ops
         ; => epilogue
-        ; add rsp, 40
+        ; add rsp, frame
         ; pop r14
         ; pop r13
         ; pop r12
@@ -5607,6 +6195,7 @@ fn load_num_xmm(ops: &mut dynasmrt::x64::Assembler, reg: u16, which: u8, bail: d
         ; movq Rx(which), rax                    // double: raw f64 bits
         ; jmp => done
         ; => int_path
+        ; xorps Rx(which), Rx(which)             // break cvtsi2sd's false dep
         ; cvtsi2sd Rx(which), eax                 // int: low-32 i32 payload
         ; => done
     );
@@ -5620,7 +6209,13 @@ fn store_xmm(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
     );
 }
 
-/// `regs[dst] = regs[a] <op> regs[b]` in f64. Guards both operands are numbers.
+/// `regs[dst] = regs[a] <op> regs[b]`. Add/Sub/Mul take an INT fast path when
+/// both operands are Int-tagged (32-bit op + overflow check, result boxed Int —
+/// exactly the interpreter's `checked_add/sub/mul` fast path), falling to the
+/// f64 path on a non-Int operand or overflow. Keeping Int results Int matters
+/// downstream: `(x+y)|0` accumulators and `a[i+1]` keys then take their cheap
+/// Int paths instead of the double→int round-trip. Div is always f64 (JS `/`
+/// has no integer form — mirrors the interpreter). Guards operands are numbers.
 #[allow(clippy::too_many_arguments)]
 fn dbinop(
     ops: &mut dynasmrt::x64::Assembler,
@@ -5631,7 +6226,38 @@ fn dbinop(
     a: u16,
     b: u16,
     op: DOp,
+    int_hint: bool,
 ) {
+    let f64_path = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    // Mul is EXCLUDED from the int fast path: hot integer multiplies (hash
+    // mixing `i * 40503`) overflow i32 after a few thousand iterations and
+    // would then pay the failed int attempt PLUS the f64 redo every time.
+    let int_ok = int_hint && matches!(op, DOp::Add | DOp::Sub);
+    if int_ok {
+        dynasm!(ops
+            ; mov rax, [rbx + dreg(a)]
+            ; mov rcx, [rbx + dreg(b)]
+            ; mov r10, rax
+            ; shr r10, 48
+            ; cmp r10d, INT_TAG_HI as i32
+            ; jne => f64_path
+            ; mov r10, rcx
+            ; shr r10, 48
+            ; cmp r10d, INT_TAG_HI as i32
+            ; jne => f64_path
+        );
+        match op {
+            DOp::Add => dynasm!(ops ; add eax, ecx ; jo => f64_path),
+            DOp::Sub => dynasm!(ops ; sub eax, ecx ; jo => f64_path),
+            DOp::Mul => dynasm!(ops ; imul eax, ecx ; jo => f64_path),
+            DOp::Div => unreachable!(),
+        }
+        box_eax(ops, dst);
+        // f64 fallback re-loads both operands from the register file, so the
+        // clobbered eax (wrapped overflow value) is irrelevant.
+        dynasm!(ops ; jmp => done ; => f64_path);
+    }
     load_num_xmm(ops, a, 0, bail);
     load_num_xmm(ops, b, 1, bail);
     match op {
@@ -5641,6 +6267,9 @@ fn dbinop(
         DOp::Div => dynasm!(ops ; divsd xmm0, xmm1),
     }
     store_xmm(ops, dst);
+    if int_ok {
+        dynasm!(ops ; => done);
+    }
     emit_region_bail(ops, ip, bail, epilogue);
 }
 
@@ -5654,6 +6283,23 @@ fn dbinop(
 /// lets the region materialise `"7"` as the same boxed value `s[i]` yields, so
 /// `s[i] === "7"` is a bits compare. Returns `None` for numeric / multi-char /
 /// non-ASCII / non-string constants (the region handles numbers; others decline).
+/// Element-kind id for a whitelisted DataView `get*` method name (the kinds the
+/// `jit_dv_get` helper decodes without allocating). `None` for everything else
+/// (set*, BigInt64/BigUint64 and Float16 getters stay on the generic path).
+pub fn dv_get_kind(key: &str) -> Option<u8> {
+    match key {
+        "getInt8" => Some(0),
+        "getUint8" => Some(1),
+        "getInt16" => Some(3),
+        "getUint16" => Some(4),
+        "getInt32" => Some(5),
+        "getUint32" => Some(6),
+        "getFloat32" => Some(7),
+        "getFloat64" => Some(8),
+        _ => None,
+    }
+}
+
 fn single_char_const_bits(proto: &FuncProto, c: Value) -> Option<u64> {
     if !c.is_heap() {
         return None;

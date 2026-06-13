@@ -266,6 +266,17 @@ pub(crate) extern "win64" fn jit_get_index(
     }
     // SAFETY: read-only view; the running region holds no conflicting borrow.
     let vm = unsafe { &*(vm as *const Vm) };
+    // A TypedArray element read mirrors the interpreter's get_index TA arm
+    // EXACTLY (which never consults arr_props for element keys): a numeric
+    // integer index → ta_element_get semantics (undefined for OOB/detached);
+    // a fractional/huge numeric key or a BigInt element kind → interpreter.
+    if matches!(vm.heap.get(arr.heap_index()), HeapObj::TypedArray { .. }) {
+        return match array_index(key) {
+            Some(i) => ta_fast_get_bits(vm, arr.heap_index(), i)
+                .unwrap_or(crate::codegen::SELF_CALL_DEOPT),
+            None => crate::codegen::SELF_CALL_DEOPT,
+        };
+    }
     // An array with a side table may carry a defineProperty'd index whose value or
     // accessor lives in arr_props — deopt so the interpreter's override-aware
     // get_index runs (keeps JIT/interpreter parity).
@@ -336,6 +347,14 @@ pub(crate) extern "win64" fn jit_set_index(
     // SAFETY: exclusive view; the running region holds no conflicting borrow and
     // pins only the register file (not the array's Vec, which may reallocate).
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // A TypedArray element write with a NUMBER value mirrors ta_element_set
+    // (coercion of a plain number is unobservable; bounds re-check, silent OOB
+    // no-op). A non-number value (observable ToNumber/ToBigInt), a BigInt
+    // element kind, or a fractional/huge key (caught by array_index above for
+    // the fractional case → deopt) defers to the interpreter.
+    if matches!(vm.heap.get(arr.heap_index()), HeapObj::TypedArray { .. }) {
+        return ta_fast_set(vm, arr.heap_index(), i, Value::from_bits(val_bits));
+    }
     // A side table may hold a special index (accessor / non-writable / arr_props
     // value) — deopt to the interpreter's override-aware set_prop for parity.
     if arr.is_heap() && vm.arr_props.contains_key(&arr.heap_index()) {
@@ -359,6 +378,265 @@ pub(crate) extern "win64" fn jit_set_index(
         }
         _ => crate::codegen::SELF_CALL_DEOPT, // non-array → interpreter
     }
+}
+
+/// Read-only mirror of `ta_element_get` for the non-BigInt element kinds:
+/// returns the element's Value bits (undefined for OOB / detached / shrunk
+/// views, exactly like the interpreter), or `None` for a BigInt kind (whose
+/// result would allocate — the caller deopts).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn ta_fast_get_bits(vm: &Vm, ta_idx: u32, i: usize) -> Option<u64> {
+    let (buffer, kind, byte_offset) = match vm.heap.get(ta_idx) {
+        HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+        _ => return None,
+    };
+    if kind >= 9 {
+        return None; // BigInt64/BigUint64 → interpreter (allocates)
+    }
+    if i >= vm.ta_effective_len(ta_idx).unwrap_or(0) {
+        return Some(Value::UNDEFINED.bits());
+    }
+    let size = native::TA_KINDS[kind as usize].1;
+    let data = match vm.heap.get(buffer) {
+        HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+        _ => return Some(Value::UNDEFINED.bits()),
+    };
+    let off = byte_offset + i * size;
+    if off + size > data.len() {
+        return Some(Value::UNDEFINED.bits());
+    }
+    let mut b = [0u8; 8];
+    b[..size].copy_from_slice(&data[off..off + size]);
+    Some(
+        match kind {
+            0 => Value::num(b[0] as i8 as f64),
+            1 | 2 => Value::num(b[0] as f64),
+            3 => Value::num(i16::from_le_bytes([b[0], b[1]]) as f64),
+            4 => Value::num(u16::from_le_bytes([b[0], b[1]]) as f64),
+            5 => Value::num(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+            6 => Value::num(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+            7 => Value::num(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+            _ => Value::num(f64::from_le_bytes(b)),
+        }
+        .bits(),
+    )
+}
+
+/// Mirror of `ta_element_set` for a NUMBER value on a non-BigInt element kind
+/// (a plain number's ToNumber coercion is unobservable, so the interpreter's
+/// coerce-then-recheck order collapses to this): bounds-check against the
+/// effective length, encode, store; OOB / detached is the spec'd silent no-op.
+/// Returns 0 (done) or `SELF_CALL_DEOPT` (BigInt kind / non-number value).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn ta_fast_set(vm: &mut Vm, ta_idx: u32, i: usize, val: Value) -> u64 {
+    let (buffer, kind, byte_offset) = match vm.heap.get(ta_idx) {
+        HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    if kind >= 9 || !val.is_number() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let f = if val.is_int() { val.as_int() as f64 } else { val.as_f64() };
+    if i >= vm.ta_effective_len(ta_idx).unwrap_or(0) {
+        return 0; // silent OOB no-op (matches ta_element_set after coercion)
+    }
+    let size = native::TA_KINDS[kind as usize].1;
+    let bytes = crate::vm::helpers_numeric::ta_encode(kind, f);
+    if let HeapObj::ArrayBuffer { data, detached } = vm.heap.get_mut(buffer) {
+        if !*detached {
+            let off = byte_offset + i * size;
+            if off + size <= data.len() {
+                data[off..off + size].copy_from_slice(&bytes[..size]);
+            }
+        }
+    }
+    0
+}
+
+/// A pinned-TypedArray region snapshot: receiver identity bits, raw element
+/// base pointer (buffer data + byteOffset) and element count. `repr(C)` with
+/// the fixed layout the region's stack slot uses (`obj_bits @0, base @8,
+/// len @16`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+pub struct TaSnap {
+    pub obj_bits: u64,
+    pub base: u64,
+    pub len: u64,
+}
+
+/// Win64 helper: (re)derive a pinned TypedArray's `{obj_bits, base, len}` into
+/// a region stack slot. Validates: heap TypedArray of the EXPECTED kind, buffer
+/// attached and the view in bounds (`ta_effective_len`); ineligible → all-zero
+/// (the region's per-access identity guard then never matches and the access
+/// takes the generic-helper fallback — full interpreter semantics, no deopt
+/// storm). The base points into `AbData`: a Local Vec's heap allocation (moves
+/// only on resize/detach — user code, after which the region re-derives) or a
+/// SharedMem allocation (FIXED for the Arc's lifetime; concurrent `grow` moves
+/// only the visible length, so a stale `len` is a conservative lower bound).
+/// Runs no user code and never allocates.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `out` points to a writable 24-byte slot.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_ta_snapshot(
+    vm: *mut core::ffi::c_void,
+    ta_bits: u64,
+    kind: u32,
+    out: *mut TaSnap,
+) {
+    // SAFETY: exclusive view (mutable only to derive *mut data pointers).
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let v = Value::from_bits(ta_bits);
+    let snap = (|| {
+        if !v.is_heap() {
+            return None;
+        }
+        let idx = v.heap_index();
+        if kind == crate::codegen::DV_PIN_KIND as u32 {
+            // DataView pin: base = data + byteOffset, len = byteLength; the
+            // view must be attached and (on a shrunk resizable buffer) still
+            // in bounds — mirroring dataview_method's IsViewOutOfBounds.
+            let (buffer, byte_offset, byte_length) = match vm.heap.get(idx) {
+                HeapObj::DataView { buffer, byte_offset, byte_length } => {
+                    (*buffer, *byte_offset, *byte_length)
+                }
+                _ => return None,
+            };
+            let base = match vm.heap.get_mut(buffer) {
+                HeapObj::ArrayBuffer { data, detached }
+                    if !*detached && byte_offset + byte_length <= data.len() =>
+                {
+                    match data {
+                        crate::heap::AbData::Local(v) => v.as_mut_ptr(),
+                        crate::heap::AbData::Shared(m) => m.base_ptr(),
+                    }
+                }
+                _ => return None,
+            };
+            return Some(TaSnap {
+                obj_bits: ta_bits,
+                base: unsafe { base.add(byte_offset) } as u64,
+                len: byte_length as u64,
+            });
+        }
+        let (buffer, k, byte_offset) = match vm.heap.get(idx) {
+            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => {
+                (*buffer, *kind, *byte_offset)
+            }
+            _ => return None,
+        };
+        if k as u32 != kind || k >= 9 {
+            return None;
+        }
+        let len = vm.ta_effective_len(idx)?;
+        let base = match vm.heap.get_mut(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => match data {
+                crate::heap::AbData::Local(v) => v.as_mut_ptr(),
+                crate::heap::AbData::Shared(m) => m.base_ptr(),
+            },
+            _ => return None,
+        };
+        // ta_effective_len guarantees byte_offset + len*size fits the live
+        // buffer, and an empty view has byte_offset 0 — the add stays in
+        // (or one-past) the allocation.
+        Some(TaSnap {
+            obj_bits: ta_bits,
+            base: unsafe { base.add(byte_offset) } as u64,
+            len: len as u64,
+        })
+    })()
+    .unwrap_or(TaSnap { obj_bits: 0, base: 0, len: 0 });
+    // SAFETY: caller passes a valid slot pointer.
+    unsafe { core::ptr::write(out, snap) };
+}
+
+/// Win64 helper for a pinned Uint8Clamped store of a DOUBLE value: JS
+/// ToUint8Clamp (clamp to [0,255], round-half-to-even) then the byte store.
+/// Pure — no vm, no allocation, no user code (the caller already bounds-checked
+/// `addr` against the pinned snapshot).
+///
+/// # Safety
+/// `addr` is in-bounds for the pinned buffer (caller-checked).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_ta_clamp_store(addr: *mut u8, val_bits: u64) {
+    let b = crate::vm::helpers_numeric::clamp_u8(f64::from_bits(val_bits));
+    // SAFETY: caller-checked bounds.
+    unsafe { *addr = b };
+}
+
+/// Win64 helper for a whitelisted region `dv.get*(pos[, littleEndian])`
+/// (DataView read). Mirrors `dataview_method`'s get path for the non-BigInt,
+/// non-Float16 kinds: integral non-negative number `pos` (anything needing
+/// ToIndex coercion/throws → deopt), ToBoolean(le) via the read-only `truthy`,
+/// detached / shrunk-OOB view or out-of-range read → deopt (the interpreter
+/// re-executes and throws the spec'd TypeError/RangeError). No allocation, no
+/// user code. `kind` arrives via the 5th-arg stack slot.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_dv_get(
+    vm: *mut core::ffi::c_void,
+    dv_bits: u64,
+    pos_bits: u64,
+    le_bits: u64,
+    kind: u32,
+) -> u64 {
+    let dv = Value::from_bits(dv_bits);
+    let posv = Value::from_bits(pos_bits);
+    if !dv.is_heap() || !posv.is_number() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: read-only view; the running region holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    let (buffer, byte_offset, byte_length) = match vm.heap.get(dv.heap_index()) {
+        HeapObj::DataView { buffer, byte_offset, byte_length } => {
+            (*buffer, *byte_offset, *byte_length)
+        }
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    let pos = match array_index(posv) {
+        Some(i) => i,
+        // Fractional (ToIndex truncates) or huge → interpreter's to_index.
+        None => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    let kind = kind as u8;
+    let size = native::TA_KINDS[kind as usize].1;
+    let le = vm.truthy(Value::from_bits(le_bits));
+    // IsViewOutOfBounds (detached or shrunk under the view) → TypeError in the
+    // interpreter; failed bounds → RangeError. Both deopt.
+    let data = match vm.heap.get(buffer) {
+        HeapObj::ArrayBuffer { data, detached }
+            if !*detached && byte_offset + byte_length <= data.len() =>
+        {
+            data
+        }
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    if !(size <= byte_length && pos <= byte_length - size) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let abs = byte_offset + pos;
+    if size > data.len() || abs > data.len() - size {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let mut b = [0u8; 8];
+    b[..size].copy_from_slice(&data[abs..abs + size]);
+    if !le {
+        b[..size].reverse();
+    }
+    (match kind {
+        0 => Value::num(b[0] as i8 as f64),
+        1 => Value::num(b[0] as f64),
+        3 => Value::num(i16::from_le_bytes([b[0], b[1]]) as f64),
+        4 => Value::num(u16::from_le_bytes([b[0], b[1]]) as f64),
+        5 => Value::num(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        6 => Value::num(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        7 => Value::num(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+        _ => Value::num(f64::from_le_bytes(b)),
+    })
+    .bits()
 }
 
 /// Win64 helper for a JIT'd `arr.push(x)` in a region. Appends and returns the
