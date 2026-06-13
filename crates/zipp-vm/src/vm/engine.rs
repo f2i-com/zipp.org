@@ -1243,7 +1243,17 @@ impl<'p> Vm<'p> {
         let term = code
             .iter()
             .position(|i| matches!(i, I::Return { .. } | I::ReturnUndefined))?;
-        for instr in &code[..term] {
+        for (ix, instr) in code[..term].iter().enumerate() {
+            // A `SuperSet` is the evaluator's ONLY committing side effect. To keep
+            // the "DEOPT only before any side effect" guarantee airtight, it may be
+            // followed ONLY by the terminator (Return/RetU) — never by another op
+            // that could itself decline at run time (which, after the super-set had
+            // committed, would double-run it on the frame-call fallback). A trivial
+            // `set x(v){ super.x = … }` always has this shape; anything else
+            // declines the whole body here, before any execution.
+            if matches!(instr, I::SuperSet { .. }) && ix + 1 != term {
+                return None;
+            }
             match *instr {
                 // Pure value ops the evaluator implements.
                 I::LoadInt { .. } | I::LoadBool { .. } | I::Move { .. } => {}
@@ -1272,6 +1282,17 @@ impl<'p> Vm<'p> {
                 | I::Bitwise { .. } => {}
                 // `super.m(args)` — resolved + evaluated at run time.
                 I::SuperMethod { .. } => {}
+                // `super.<name>` read — resolved + read off-frame at run time via
+                // `ic_super_get` (live, version-guarded). Pure (a read), so admitting
+                // it anywhere in the straight-line prefix is effect-free.
+                I::SuperGet { .. } => {}
+                // `super.<name> = val` write — the body's ONLY off-frame side
+                // effect. Resolved via `ic_super_set` and committed exactly once at
+                // run time (an inherited trivial setter over an own data slot); the
+                // run-time arm commits ONLY on a known-trivial target, else declines
+                // BEFORE committing. The check above guarantees this op is the LAST
+                // before the terminator, so no later op can decline post-commit.
+                I::SuperSet { .. } => {}
                 _ => return None,
             }
         }
@@ -1447,6 +1468,17 @@ impl<'p> Vm<'p> {
                     }
                     regs[dst as usize] = Value::from_bits(bits);
                 }
+                I::SuperGet { dst, home_class_id, name } => {
+                    let v = self.mi_super_get(fid, body_ip, home_class_id, name, recv)?;
+                    regs[dst as usize] = v;
+                }
+                I::SuperSet { home_class_id, name, val } => {
+                    // The body's only off-frame side effect. Commits exactly once
+                    // (an inherited trivial setter over recv's own data slot) or
+                    // declines BEFORE committing (None).
+                    let value = regs[val as usize];
+                    self.mi_super_set(fid, body_ip, home_class_id, name, recv, value)?;
+                }
                 I::Return { src } => return Some(regs[src as usize].bits()),
                 I::ReturnUndefined => return Some(Value::UNDEFINED.bits()),
                 // Unreachable: pass 1 admitted only the ops above.
@@ -1587,6 +1619,107 @@ impl<'p> Vm<'p> {
             return Some(SELF_CALL_DEOPT);
         }
         self.run_method_inline(fid, recv, 0, 0, 0, blen, depth + 1)
+    }
+
+    /// Resolve + read a nested `super.<name>` (a `SuperGet` op) for the off-frame
+    /// accessor/method evaluator. Resolution uses the SAME `ic_super_get` cache the
+    /// interpreter's `SuperGet` arm uses (live home-class value + version-guarded
+    /// hop chain via `ic_super_chain_ok`), keyed by the ACTUAL `(home_fid,
+    /// super_ip)` of this op. Serves the read OFF-FRAME only when the resolved super
+    /// property is:
+    ///   * a DATA slot on the super chain (`GetAct::Value` — byte-identical), or
+    ///   * an ACCESSOR whose getter is the trivial `return this.<field>` shape over
+    ///     `recv`'s own data slot (`accessor_fast_get`, evaluated with the SAME
+    ///     `this = recv` the interpreter's `GetAct::Accessor` frame-call would use).
+    /// Returns the value, or `None` to DECLINE the whole accessor/method to a clean
+    /// frame call (resolution miss / a non-trivial getter / a non-instance recv).
+    /// A `SuperGet` is a pure read — declining commits nothing.
+    ///
+    /// SOUNDNESS: a `super` reference ALWAYS reads from the home object's prototype
+    /// (the super base), never the receiver, so an own property of `recv` cannot
+    /// shadow it — correctness comes entirely from the version-guarded `ic_super_get`
+    /// chain (e.g. `Object.setPrototypeOf(C.prototype, X)` bumps the anchor hop's
+    /// version → the cached entry is rejected → re-resolved). The receiver-side G3b
+    /// own-shadow guard on the OUTER accessor name was already enforced by
+    /// `ic_get_prop`/`ic_call_method` before this evaluator ran.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_super_get(
+        &mut self,
+        home_fid: u32,
+        super_ip: usize,
+        home_class_id: u32,
+        name: u32,
+        recv: Value,
+    ) -> Option<Value> {
+        use crate::vm::ic::GetAct;
+        let hp = self.func(home_fid as usize);
+        let is_static = hp.super_static;
+        let key: &'p str = &hp.string_constants[name as usize];
+        match self.ic_super_get(home_fid, super_ip, home_class_id, is_static, key) {
+            // Inherited DATA slot — byte-identical to the interpreter's data read.
+            GetAct::Value(v) => Some(v),
+            // Inherited ACCESSOR resolved to a plain getter: serve it off-frame ONLY
+            // if it is the trivial `return this.<field>` shape over recv's own data
+            // slot. The interpreter frame-calls it with `this = recv`, so reading
+            // recv's own field is byte-identical. Anything else → decline (the whole
+            // accessor frame-calls; nothing committed).
+            GetAct::Accessor { fid, .. } => {
+                self.accessor_fast_get(fid, recv).map(Value::from_bits)
+            }
+            // No usable resolution (the interpreter would take its own slow path
+            // which can differ) → decline. Nothing committed.
+            GetAct::None => None,
+        }
+    }
+
+    /// Resolve + perform a nested `super.<name> = value` (a `SuperSet` op) for the
+    /// off-frame accessor/method evaluator — the body's ONLY off-frame side effect.
+    /// Resolution uses the SAME `ic_super_set` cache the interpreter's `SuperSet`
+    /// arm uses (live + version-guarded). Commits the write OFF-FRAME exactly once,
+    /// and ONLY when the super chain exposes an inherited SETTER whose body is the
+    /// trivial `this.<field> = arg` / `this.<field> = (arg | 0)` shape over `recv`'s
+    /// own writable data slot (`accessor_fast_set`, with `this = recv` — exactly the
+    /// interpreter's `SetAct::Setter` frame-call). Returns `Some(())` on the served
+    /// write, or `None` to DECLINE to a clean frame call (resolution miss / a non-
+    /// trivial setter / a non-number value where `arg | 0` would coerce / the spec's
+    /// write-to-RECEIVER case where no inherited setter exists — that goes through
+    /// full `set_prop` semantics).
+    ///
+    /// SOUNDNESS: `accessor_fast_set` declines (`None`) BEFORE any store when the
+    /// field isn't an own writable data slot or when `arg | 0` would coerce a non-
+    /// number (observable `valueOf`) — so the only committing path is an in-place
+    /// data store, byte-identical to the frame-called setter, and a decline leaves
+    /// the world untouched (the caller frame-calls the whole accessor once). `Done`
+    /// from `ic_super_set` never happens for a write (only `Setter`/`None`): a super
+    /// data write targets the RECEIVER, which `ic_super_set` reports as `None`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_super_set(
+        &mut self,
+        home_fid: u32,
+        super_ip: usize,
+        home_class_id: u32,
+        name: u32,
+        recv: Value,
+        value: Value,
+    ) -> Option<()> {
+        use crate::vm::ic::SetAct;
+        let hp = self.func(home_fid as usize);
+        let is_static = hp.super_static;
+        let key: &'p str = &hp.string_constants[name as usize];
+        match self.ic_super_set(home_fid, super_ip, home_class_id, is_static, key) {
+            SetAct::Setter { fid, .. } => {
+                // Trivial inherited setter over recv's own data slot only; else
+                // decline. `accessor_fast_set` is the SAME single-commit helper the
+                // non-super setter fast path uses (in-place store, no shape change).
+                self.accessor_fast_set(fid, recv, value).map(|_| ())
+            }
+            // `Done` (an own data slot was written) never occurs for a SUPER set:
+            // ic_super_set only caches inherited SETTERS; a data write goes to the
+            // receiver and is reported as `None`. `None` → the receiver-write slow
+            // path (could add a slot / hit a receiver setter / no-op when frozen) —
+            // decline to the frame call. Nothing committed.
+            SetAct::Done | SetAct::None => None,
+        }
     }
 
     /// Recognise a trivial getter body `return this.<field>` and return the
@@ -1753,6 +1886,23 @@ impl<'p> Vm<'p> {
                     if let Some(r) = self.accessor_fast_set(fid, recv, val) {
                         return r;
                     }
+                    // S2 SUPER-ACC: a trivial setter body whose only effect is a
+                    // `super.<name> = …` over an inherited trivial setter (e.g.
+                    // `set v(x){ super.v = x }`) runs off-frame via the two-pass
+                    // method-inline evaluator (pass 1 validates the WHOLE body before
+                    // pass 2 commits the single super-set). `argc = 1`, the value in
+                    // `val_reg`. `None` ⇒ a non-trivial body ⇒ frame-call below.
+                    match self.try_method_inline(fid, recv, base, val_reg, 1) {
+                        Some(CALL_THREW) | Some(SELF_CALL_DEOPT) => {
+                            // A nested super target threw / declined mid-flight.
+                            // CALL_THREW: a committed throw — propagate (region
+                            // exits). SELF_CALL_DEOPT cannot escape try_method_inline
+                            // (its arms convert it to None), but propagate defensively.
+                            return CALL_THREW;
+                        }
+                        Some(_) => return 0, // served — the setter's return is discarded
+                        None => {}           // not inlinable — fall through to frame call
+                    }
                     let r = self.jit_frame_call(fid, closure, recv, base, val_reg, 1, ip, setter);
                     if r == CALL_THREW || r == SELF_CALL_DEOPT {
                         r
@@ -1771,6 +1921,15 @@ impl<'p> Vm<'p> {
                     // Q7 S-ACC: a trivial `return this.field` getter over an own
                     // data slot is served off-frame (no setup_call / run_loop).
                     if let Some(bits) = self.accessor_fast_get(fid, recv) {
+                        return bits;
+                    }
+                    // S2 SUPER-ACC: a trivial getter body containing a `super.<name>`
+                    // read (e.g. `get v(){ return super.v * 2 }`) runs off-frame via
+                    // the two-pass method-inline evaluator (`argc = 0`). It resolves
+                    // the super read with the version-guarded `ic_super_get` and reads
+                    // an inherited data slot / trivial super-getter field directly.
+                    // `None` ⇒ a non-trivial body ⇒ frame-call below.
+                    if let Some(bits) = self.try_method_inline(fid, recv, base, 0, 0) {
                         return bits;
                     }
                     self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, getter)
