@@ -881,9 +881,19 @@ impl<'p> Vm<'p> {
         // interpreter's `has_property_dyn` skips `#`-prefixed class members, but
         // `has_property` (which this helper delegates to) does NOT (its class-chain
         // walk matches them for legacy brand checks). DEOPT so the interpreter
-        // computes the correct (false) answer. (Number keys never start with '#'.)
-        if self.key_of(key).starts_with('#') {
-            return None;
+        // computes the correct (false) answer. ONLY a heap STRING key can be a
+        // private name, so a numeric key (the hot `i in arr` path) skips this
+        // entirely — checking the key's FIRST BYTE in place (Cow::Borrowed for a
+        // flat string) avoids the per-probe `key_of` allocation that this check
+        // originally introduced into the hot loop.
+        if key.is_heap() {
+            let is_private = self
+                .heap
+                .str_wtf8_cow(key.heap_index())
+                .is_some_and(|b| b.first() == Some(&b'#'));
+            if is_private {
+                return None;
+            }
         }
         // A Proxy anywhere in the chain (or a deferred namespace) dispatches user
         // code / a trigger — let the interpreter run it. The walk mirrors
