@@ -1031,6 +1031,14 @@ pub struct Vm<'p> {
     /// number of string constants across compiled regions.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_const_strings: Vec<Value>,
+    /// Method-inlining (MI) eligibility memo, indexed by unified `func_id`:
+    /// `i32::MIN` = not yet computed; `-1` = ineligible (the off-frame evaluator
+    /// declines this body's SHAPE — fall to the frame call); `≥ 0` = the
+    /// straight-line body length to evaluate. Filled once per fid by
+    /// `method_body_inlinable`, so the hot per-call path skips the body re-scan.
+    /// Sound because a FuncProto's code is immutable for the program's life.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    mi_cache: Vec<i32>,
     /// Pinned register-file capacity: `self.regs` is reserved to this at startup
     /// and NEVER allowed to grow past it (every call/recursion site checks),
     /// so the Vec never reallocates while native JIT code holds a raw pointer

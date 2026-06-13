@@ -2278,6 +2278,13 @@ fn region_can_compile(
             // store; call-free, pure). Unblocks loops carrying a bool literal
             // (parser flags, `done=false`).
             Instr::LoadBool { .. } => {}
+            // `CheckCoercible` — RequireObjectCoercible before a member access
+            // (`objs[i&3].area()` emits one). MEM path: a null/undefined operand
+            // bails to the interpreter (which throws the TypeError); any other
+            // value is a pure no-op. Pure, call-free, no alloc — unblocks the
+            // class-method-call loops (the GetIndex'd receiver is coerced before
+            // the CallMethod).
+            Instr::CheckCoercible { .. } => {}
             // Closure-cell / upvalue READS — MEM path via the pure `jit_cell_get`
             // / `jit_upval_get` helpers (a single heap LOAD of the cell's inner
             // Value; a TDZ cell → deopt sentinel → interpreter throws). Emitted
@@ -6115,6 +6122,21 @@ fn compile_region_mem(
                     ; mov rax, QWORD bits as i64
                     ; mov [rbx + dreg(dst)], rax
                 );
+            }
+            Instr::CheckCoercible { src } => {
+                // RequireObjectCoercible: a null/undefined operand bails to the
+                // interpreter (which throws the TypeError exactly); every other
+                // value is a no-op. Pure, call-free, no alloc.
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov r10, QWORD Value::NULL.bits() as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD Value::UNDEFINED.bits() as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::MathOp { dst, op, arg_base, argc } => {
                 // Pure `Math.<op>`. Operands are loaded as numbers (Int/double);

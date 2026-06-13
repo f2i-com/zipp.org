@@ -310,6 +310,8 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_const_strings: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            mi_cache: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regs_hw: 0,
@@ -948,6 +950,19 @@ impl<'p> Vm<'p> {
             }
         };
 
+        // MI (method inlining): for a `CallMethod` whose resolved target is a
+        // trivial straight-line body over `this` + params (incl. nested
+        // `super.m()`), evaluate it OFF-FRAME — no `setup_call`, no `run_loop`,
+        // no per-call args Vec. This collapses the dominant class-method call
+        // floor (`objs[i&3].area()` over `super.area()*k`). `None` falls through
+        // to the full frame call (any non-trivial body / non-numeric operand /
+        // non-instance receiver). Only for method calls — `this = recv` is
+        // load-bearing; a plain `Call` binds `this = undefined`.
+        if is_method {
+            if let Some(bits) = self.try_method_inline(fid, this_v, base, arg_base, argc) {
+                return bits;
+            }
+        }
         // Push the callee frame exactly like the interpreter's Call/CallMethod
         // IC-hit path, and run it to completion.
         self.jit_frame_call(fid, closure, this_v, base, arg_base, argc, ip, callee_v)
@@ -1104,6 +1119,470 @@ impl<'p> Vm<'p> {
             }
             _ => None,
         }
+    }
+
+    /// Maximum nested `super.m()` hops the off-frame method evaluator follows
+    /// before deopting to the full frame call. Class hierarchies deeper than
+    /// this are rare; the bound keeps the recursion (a plain Rust call per hop)
+    /// trivially safe and bounds the validation cost.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    const METHOD_INLINE_MAX_SUPER: u32 = 6;
+
+    /// Capacity of the off-frame method evaluator's STACK register window. A body
+    /// with `reg_count` above this declines to the frame call. Trivial method
+    /// bodies are tiny; the cap keeps the per-call stack array small and avoids
+    /// any heap allocation on the hot path.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    const MI_MAX_REGS: usize = 24;
+
+    /// MI (method inlining): if the resolved class/own/proto METHOD `fid` is a
+    /// "trivial" straight-line body over `this`(=`recv`) + its formal params —
+    /// arithmetic on numbers, own-data `this.<field>` reads, and nested
+    /// `super.m(args)` calls — evaluate it DIRECTLY (no `setup_call`, no
+    /// `run_loop`, no frame push, no per-call args Vec) and return the result
+    /// bits. Returns `None` to fall back to the full frame call (any other body
+    /// shape, an unrecognised op, a non-numeric arithmetic operand, a missing /
+    /// accessor / inherited field, a non-instance receiver) and `Some(CALL_THREW)`
+    /// when a nested super target threw.
+    ///
+    /// This is the call-floor collapse for the class-method benches: every
+    /// `objs[i&3].area()` body is `return super.area() * k + …`, and `super.area()`
+    /// resolves to `return this._v + 1` — so the whole two-deep call chain runs
+    /// as a handful of Rust ops over `recv`'s own slots, no frame machinery.
+    ///
+    /// SOUNDNESS:
+    /// * Reached ONLY from `jit_region_call_impl` (a JIT region helper), so the
+    ///   interpreter / `ZIPP_NOJIT` path is byte-identical (never calls this).
+    /// * `ic_call_method` ALREADY resolved `fid` with the full guard set incl.
+    ///   the G3b own-shadow guard (its `ClassMethod` arm requires `own.is_none()`)
+    ///   and the class-version guard — so an instance own-write `inst.m = fn`
+    ///   misses the IC and never reaches here, and a stale class misses too. We
+    ///   only need to evaluate the resolved body faithfully.
+    /// * NO partial side effect before a `None`: a two-pass shape — pass 1
+    ///   (`method_body_inlinable`) validates the ENTIRE straight-line body is
+    ///   executable WITHOUT running anything; pass 2 executes. So an unsupported
+    ///   op declines (pass 1) before any super call commits, and once pass 2
+    ///   starts every op is known-executable.
+    /// * Arithmetic delegates to the SAME value-level helpers the interpreter's
+    ///   ops use (`add_values`, `numeric_binop`) so results are byte-identical;
+    ///   it is admitted only on operands that are ALREADY numbers (else pass 1
+    ///   declines), so no observable `valueOf`/`ToPrimitive` ever runs off-frame.
+    /// * A nested `super.m()` is resolved via the SAME `ic_super_method` cache
+    ///   the interpreter uses (live home-class value + version-guarded chain),
+    ///   then evaluated off-frame recursively (depth-bounded) or, if its target
+    ///   isn't trivial, by a real `jit_frame_call` — identical observable effect.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn try_method_inline(
+        &mut self,
+        fid: u32,
+        recv: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> Option<u64> {
+        // Pass 1: validate the body shape without executing anything.
+        let body_len = self.method_body_inlinable(fid)?;
+        // Pass 2: execute over a local register window.
+        self.run_method_inline(fid, recv, caller_base, arg_base, argc, body_len, 0)
+    }
+
+    /// Pass 1 of method inlining: is `fid`'s body a straight-line prefix of ops
+    /// the off-frame evaluator implements, ending at the FIRST `Return`/
+    /// `ReturnUndefined`? Returns the body length (ops up to and incl. that
+    /// terminator), or `None` to decline. Performs NO execution / side effect.
+    /// Mirrors the eligibility of `callee_leaf_ok` (no generator/async, simple
+    /// params, no rest/arguments, bounded regs) but ADDS own-`this` GetProp and
+    /// `super.m()` to the admitted op set and binds `this = recv` (a class method
+    /// is strict and uses its receiver — never the global-leaf `this=undefined`).
+    ///
+    /// MEMOIZED in `self.mi_cache` (a FuncProto's code is immutable for life), so
+    /// the hot per-call path pays the body scan ONCE per fid.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn method_body_inlinable(&mut self, fid: u32) -> Option<usize> {
+        let i = fid as usize;
+        if i < self.mi_cache.len() {
+            match self.mi_cache[i] {
+                v if v == i32::MIN => {}        // not yet computed
+                -1 => return None,              // memoized ineligible
+                v => return Some(v as usize),   // memoized body length
+            }
+        } else {
+            self.mi_cache.resize(i + 1, i32::MIN);
+        }
+        let res = self.method_body_inlinable_scan(fid);
+        self.mi_cache[i] = match res {
+            Some(len) => len as i32,
+            None => -1,
+        };
+        res
+    }
+
+    /// The uncached body-shape scan behind `method_body_inlinable`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn method_body_inlinable_scan(&self, fid: u32) -> Option<usize> {
+        use crate::bytecode::Instr as I;
+        let p = self.func(fid as usize);
+        if p.is_generator || p.is_async {
+            return None;
+        }
+        // No rest/`arguments` object (binding past `param_count` must not be
+        // observable). We do NOT require `simple_params`: that flag is purely
+        // about a SLOPPY function's MAPPED arguments object and is deliberately
+        // false for every (strict) class method. A default/destructuring
+        // parameter prologue would emit a `Jump`/unsupported op before the first
+        // `Return`, which the straight-line whitelist below rejects — so plain
+        // positional binding is the only param shape that survives here.
+        if p.rest_reg.is_some() || p.arguments_reg.is_some() {
+            return None;
+        }
+        // A bounded local register window (kept small — these are tiny bodies;
+        // the executor uses a fixed `[Value; MI_MAX_REGS]` stack array).
+        if p.reg_count as usize > Self::MI_MAX_REGS {
+            return None;
+        }
+        let code = &p.code;
+        let term = code
+            .iter()
+            .position(|i| matches!(i, I::Return { .. } | I::ReturnUndefined))?;
+        for instr in &code[..term] {
+            match *instr {
+                // Pure value ops the evaluator implements.
+                I::LoadInt { .. } | I::LoadBool { .. } | I::Move { .. } => {}
+                I::LoadConst { idx, .. } => {
+                    // Only numeric constants (the arithmetic ops require numbers;
+                    // a string/heap const would only be a `+` concat operand,
+                    // which we decline — `add_values` on a heap operand could run
+                    // user `valueOf`).
+                    match p.constants.get(idx as usize) {
+                        Some(c) if c.is_number() => {}
+                        _ => return None,
+                    }
+                }
+                // `this.<field>` (and ONLY `this`): an own-data read at run time
+                // (validated per-execution); any other `obj` declines.
+                I::GetProp { obj: 0, .. } => {}
+                // Arithmetic — admitted; per-execution the evaluator declines to
+                // a frame call if an operand isn't already a number.
+                I::Add { .. }
+                | I::Sub { .. }
+                | I::Mul { .. }
+                | I::Div { .. }
+                | I::Mod { .. }
+                | I::AddInt { .. }
+                | I::Neg { .. }
+                | I::Bitwise { .. } => {}
+                // `super.m(args)` — resolved + evaluated at run time.
+                I::SuperMethod { .. } => {}
+                _ => return None,
+            }
+        }
+        Some(term + 1)
+    }
+
+    /// Pass 2 of method inlining: execute `fid`'s validated trivial body over a
+    /// fresh local register window (`reg 0 = recv`, formals in `1..`, the rest
+    /// undefined). `depth` bounds nested `super` recursion. Returns the result
+    /// bits, `None` (a per-execution decline — an op's operand wasn't the
+    /// expected number / own-data slot; the caller frame-calls the WHOLE method,
+    /// and since no super op had committed yet this is effect-free), or
+    /// `Some(CALL_THREW)` (a nested super target threw).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn run_method_inline(
+        &mut self,
+        fid: u32,
+        recv: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        body_len: usize,
+        depth: u32,
+    ) -> Option<u64> {
+        use crate::bytecode::Instr as I;
+        use crate::vm::helpers_misc::BigOp;
+        let p = self.func(fid as usize);
+        // Local register window on the STACK — NO heap allocation per call (the
+        // frame-call path it replaces reuses the pinned reg file; an allocation
+        // here would be far slower than the frame call it elides). `reg_count`
+        // is bounded ≤ MI_MAX_REGS in pass 1. this in reg 0, positional args in
+        // 1.., the rest undefined (mirrors setup_call's zero-fill). `code`/
+        // `constants`/`string_constants` are `&'p` — they outlive `&mut self`.
+        let code: &'p [Instr] = &p.code;
+        let consts = &p.constants;
+        let mut regs = [Value::UNDEFINED; Self::MI_MAX_REGS];
+        regs[0] = recv;
+        let nargs = (argc as usize).min(p.param_count as usize);
+        for i in 0..nargs {
+            regs[1 + i] = self.get(caller_base, arg_base + i as u16);
+        }
+        // Helper: numeric fast paths matching the interpreter ops EXACTLY; a
+        // non-numeric operand declines (None) so no observable coercion runs.
+        for (body_ip, instr) in code[..body_len].iter().enumerate() {
+            match *instr {
+                I::LoadInt { dst, val } => regs[dst as usize] = Value::int(val),
+                I::LoadBool { dst, val } => regs[dst as usize] = Value::bool(val),
+                I::LoadConst { dst, idx } => {
+                    regs[dst as usize] = *consts.get(idx as usize)?;
+                }
+                I::Move { dst, src } => regs[dst as usize] = regs[src as usize],
+                I::GetProp { dst, obj: _, name } => {
+                    // `this.<field>` — own DATA slot only (a missing / accessor /
+                    // inherited field needs full get_member semantics → decline).
+                    if !recv.is_heap() || !self.ic_obj_ok(recv.heap_index()) {
+                        return None;
+                    }
+                    let key = &p.string_constants[name as usize];
+                    let m = match self.heap.get(recv.heap_index()) {
+                        HeapObj::Object(m) if !m.is_ctor => m,
+                        _ => return None,
+                    };
+                    let s = m.pos(key)?;
+                    if m.attrs[s].accessor {
+                        return None;
+                    }
+                    regs[dst as usize] = m.vals[s];
+                }
+                I::Add { dst, a, b } => {
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    regs[dst as usize] = self.mi_add(va, vb)?;
+                }
+                I::Sub { dst, a, b } => {
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    regs[dst as usize] = self.mi_num_binop(BigOp::Sub, va, vb)?;
+                }
+                I::Mul { dst, a, b } => {
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    regs[dst as usize] = self.mi_num_binop(BigOp::Mul, va, vb)?;
+                }
+                I::Div { dst, a, b } => {
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    regs[dst as usize] = self.mi_num_binop(BigOp::Div, va, vb)?;
+                }
+                I::Mod { dst, a, b } => {
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    regs[dst as usize] = self.mi_num_binop(BigOp::Mod, va, vb)?;
+                }
+                I::Neg { dst, a } => {
+                    let va = regs[a as usize];
+                    regs[dst as usize] = if va.is_int() {
+                        let i = va.as_int();
+                        if i == 0 {
+                            Value::num(-0.0)
+                        } else {
+                            match i.checked_neg() {
+                                Some(v) => Value::int(v),
+                                None => Value::num(-(i as f64)),
+                            }
+                        }
+                    } else if va.is_double() {
+                        Value::num(-va.as_f64())
+                    } else {
+                        return None;
+                    };
+                }
+                I::AddInt { dst, a, imm, .. } => {
+                    let va = regs[a as usize];
+                    regs[dst as usize] = if va.is_int() {
+                        match va.as_int().checked_add(imm) {
+                            Some(v) => Value::int(v),
+                            None => Value::num(va.as_int() as f64 + imm as f64),
+                        }
+                    } else if va.is_double() {
+                        Value::num(va.as_f64() + imm as f64)
+                    } else {
+                        return None;
+                    };
+                }
+                I::Bitwise { dst, a, b, op } => {
+                    use crate::bytecode::BitwiseOp as B;
+                    let (va, vb) = (regs[a as usize], regs[b as usize]);
+                    // Int fast path only — a non-int operand needs ToNumeric
+                    // (observable on objects / BigInt) → decline to the frame call.
+                    if !va.is_int() || !vb.is_int() {
+                        return None;
+                    }
+                    let (x, y) = (va.as_int(), vb.as_int());
+                    regs[dst as usize] = match op {
+                        B::And => Value::int(x & y),
+                        B::Or => Value::int(x | y),
+                        B::Xor => Value::int(x ^ y),
+                        B::Shl => Value::int(x.wrapping_shl((y as u32) & 31)),
+                        B::Shr => Value::int(x >> ((y as u32) & 31)),
+                        B::Ushr => {
+                            let u = (x as u32) >> ((y as u32) & 31);
+                            if u <= i32::MAX as u32 {
+                                Value::int(u as i32)
+                            } else {
+                                Value::num(u as f64)
+                            }
+                        }
+                    };
+                }
+                I::SuperMethod { dst, home_class_id, name, argc: sargc, .. } => {
+                    let bits = self.mi_super_call(
+                        fid, body_ip, home_class_id, name, sargc, recv, depth,
+                    )?;
+                    // A nested super target threw — propagate (the region exits;
+                    // never re-executed). `CALL_THREW`/`SELF_CALL_DEOPT` are NaN-
+                    // tagged sentinels never produced as a real result.
+                    if bits == crate::codegen::CALL_THREW
+                        || bits == crate::codegen::SELF_CALL_DEOPT
+                    {
+                        // DEOPT here would re-run the WHOLE method (incl. the
+                        // super call) in the interpreter — but a super target that
+                        // declined off-frame was ALREADY run by a real frame call
+                        // (a committed effect), so we must NOT redo it. The only
+                        // SELF_CALL_DEOPT path inside mi_super_call is BEFORE it
+                        // runs anything (resolution miss / depth cap), so a
+                        // SELF_CALL_DEOPT here means nothing committed → safe to
+                        // decline the whole method.
+                        if bits == crate::codegen::SELF_CALL_DEOPT {
+                            return None;
+                        }
+                        return Some(crate::codegen::CALL_THREW);
+                    }
+                    regs[dst as usize] = Value::from_bits(bits);
+                }
+                I::Return { src } => return Some(regs[src as usize].bits()),
+                I::ReturnUndefined => return Some(Value::UNDEFINED.bits()),
+                // Unreachable: pass 1 admitted only the ops above.
+                _ => return None,
+            }
+        }
+        // The body ended without an explicit Return op (terminator was the last
+        // op handled above) — defensively return undefined.
+        Some(Value::UNDEFINED.bits())
+    }
+
+    /// `+` for the off-frame method evaluator: the interpreter's `Add` number
+    /// fast paths EXACTLY (int+int with overflow → double; double+double). A
+    /// non-number operand declines (None) — full `add_values` would run
+    /// observable `ToPrimitive`/`valueOf` / build a string, which belongs on the
+    /// frame call (so a later op declining can never double-apply it).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_add(&mut self, va: Value, vb: Value) -> Option<Value> {
+        if va.is_int() && vb.is_int() {
+            return Some(match va.as_int().checked_add(vb.as_int()) {
+                Some(v) => Value::int(v),
+                None => Value::num(va.as_int() as f64 + vb.as_int() as f64),
+            });
+        }
+        if va.is_number() && vb.is_number() {
+            return Some(Value::num(va.as_f64() + vb.as_f64()));
+        }
+        None
+    }
+
+    /// `Sub`/`Mul`/`Div`/`Mod` for the off-frame evaluator: the interpreter's
+    /// number fast paths EXACTLY. A non-number operand declines (None) — its
+    /// `numeric_binop` slow path can run observable coercion, so it belongs on
+    /// the frame call.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_num_binop(&mut self, op: crate::vm::helpers_misc::BigOp, va: Value, vb: Value) -> Option<Value> {
+        use crate::vm::helpers_misc::BigOp;
+        match op {
+            BigOp::Sub => {
+                if va.is_int() && vb.is_int() {
+                    Some(match va.as_int().checked_sub(vb.as_int()) {
+                        Some(v) => Value::int(v),
+                        None => Value::num(va.as_int() as f64 - vb.as_int() as f64),
+                    })
+                } else if va.is_number() && vb.is_number() {
+                    Some(Value::num(va.as_f64() - vb.as_f64()))
+                } else {
+                    None
+                }
+            }
+            BigOp::Mul => {
+                if va.is_int() && vb.is_int() {
+                    Some(match va.as_int().checked_mul(vb.as_int()) {
+                        Some(v) => Value::int(v),
+                        None => Value::num(va.as_int() as f64 * vb.as_int() as f64),
+                    })
+                } else if va.is_number() && vb.is_number() {
+                    Some(Value::num(va.as_f64() * vb.as_f64()))
+                } else {
+                    None
+                }
+            }
+            BigOp::Div => {
+                if va.is_number() && vb.is_number() {
+                    Some(Value::num(va.as_f64() / vb.as_f64()))
+                } else {
+                    None
+                }
+            }
+            BigOp::Mod => {
+                if va.is_number() && vb.is_number() {
+                    Some(Value::num(va.as_f64() % vb.as_f64()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve + evaluate a nested `super.m(args)` for the off-frame method
+    /// evaluator. Resolution uses the SAME `ic_super_method` cache the
+    /// interpreter uses; the resolved target runs off-frame (recursively,
+    /// depth-bounded) when trivial, else via a real `jit_frame_call`. `home_fid`
+    /// is the function whose body contains this `super` (its `super_static`
+    /// flag + `string_constants` drive resolution). Returns result bits,
+    /// `SELF_CALL_DEOPT` (resolution miss / depth cap — NOTHING committed, the
+    /// caller may decline the whole method), or `CALL_THREW`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    fn mi_super_call(
+        &mut self,
+        home_fid: u32,
+        super_ip: usize,
+        home_class_id: u32,
+        name: u32,
+        s_argc: u16,
+        recv: Value,
+        depth: u32,
+    ) -> Option<u64> {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if depth >= Self::METHOD_INLINE_MAX_SUPER {
+            return Some(SELF_CALL_DEOPT);
+        }
+        let hp = self.func(home_fid as usize);
+        let is_static = hp.super_static;
+        let key: &'p str = &hp.string_constants[name as usize];
+        // Same per-site IC the interpreter's SuperMethod arm uses, keyed by the
+        // ACTUAL `(home_fid, super_ip)` of this `super.m()` op — so it shares the
+        // exact cache the interpreter fills when it runs this op via run_loop
+        // (no synthetic-key collision with another site in the same function).
+        // `ic_super_method` re-validates the full home-value + version-guarded
+        // chain on every hit, so a miss/stale entry resolves correctly.
+        let (fid, closure, _callee) =
+            match self.ic_super_method(home_fid, super_ip, home_class_id, is_static, key) {
+                Some(t) => t,
+                // Resolution miss / not a plain user fn (accessor/builtin/native):
+                // NOTHING committed yet — signal the caller to decline the whole
+                // method to a clean frame call.
+                None => return Some(SELF_CALL_DEOPT),
+            };
+        let _ = closure;
+        // The super target MUST itself be inline-eligible, or we DECLINE the whole
+        // method (SELF_CALL_DEOPT, nothing committed) so the caller frame-calls it
+        // ONCE — we never commit a partial super effect off-frame and then risk a
+        // later op declining (which would double-run the super target). 0-arg
+        // super calls dominate (every `super.area()`); a target with formal args
+        // is supported via the local args window.
+        let blen = match self.method_body_inlinable(fid) {
+            Some(b) => b,
+            None => return Some(SELF_CALL_DEOPT),
+        };
+        // Only 0-arg super targets run off-frame (every `super.area()` is 0-arg).
+        // A super call WITH arguments declines the whole method to a clean frame
+        // call (nothing committed) rather than staging args into the pinned
+        // register file (which could realloc near capacity). Rare in practice.
+        if s_argc != 0 {
+            return Some(SELF_CALL_DEOPT);
+        }
+        self.run_method_inline(fid, recv, 0, 0, 0, blen, depth + 1)
     }
 
     /// Recognise a trivial getter body `return this.<field>` and return the
