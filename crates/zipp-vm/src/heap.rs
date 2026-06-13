@@ -1417,7 +1417,21 @@ pub enum HeapObj {
     /// is the writable `lastIndex` own data property — stored as a raw `Value` (not a
     /// coerced offset) so an assigned object survives until `exec`/the @@-methods
     /// apply ToLength, invoking its `valueOf` at the spec-mandated time.
-    RegExp { regex: std::sync::Arc<regress::Regex>, source: String, flags: String, last_index: Value },
+    ///
+    /// `ascii_twin` is the lazily-built BYTE-OPTIMIZED twin compile (regress
+    /// `from_unicode_byteopt`) used by the ASCII-subject fast path, cached
+    /// inline so a hot exec reads it with one `heap.get` instead of a per-exec
+    /// side-table probe: `None` = not yet computed, `Some(None)` = compile
+    /// failed (fall back to `regex`), `Some(Some(arc))` = the twin. Reset to
+    /// `None` by `RegExp.prototype.compile`. Holds no `Value`s (an
+    /// `Arc<regress::Regex>` is a pure compiled program), so GC need not trace it.
+    RegExp {
+        regex: std::sync::Arc<regress::Regex>,
+        source: String,
+        flags: String,
+        last_index: Value,
+        ascii_twin: Option<Option<std::sync::Arc<regress::Regex>>>,
+    },
     /// A JS `ArrayBuffer` — a raw byte buffer backing TypedArrays/DataViews.
     /// `detached` is set by transfer (we never detach via GC); `data` is the bytes
     /// ([`AbData`]: per-VM `Local` for ArrayBuffers, `Shared` for SharedArrayBuffers).

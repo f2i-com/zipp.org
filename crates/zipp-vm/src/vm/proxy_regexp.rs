@@ -757,12 +757,19 @@ impl<'p> Vm<'p> {
         // `input_val` + the result pieces below live in Rust locals across a
         // possible `lastIndex.valueOf` re-entry — hold GC off until we return.
         let _gc = self.gc_lock_guard();
-        let (global, sticky, has_indices, unicode) = match self.heap.get(re_idx) {
-            HeapObj::RegExp { flags, .. } => (
+        // ONE heap.get for both the flag-derived bits AND the lastIndex slot
+        // (they share the same RegExp object). On a real RegExp the
+        // Get(R,"lastIndex") can never run user code: `lastIndex` is a
+        // non-configurable own DATA property whose value's source of truth is
+        // the heap slot (defineProperty writes the value through; only attrs
+        // live in arr_props) — so read the slot directly.
+        let (global, sticky, has_indices, unicode, li_v) = match self.heap.get(re_idx) {
+            HeapObj::RegExp { flags, last_index, .. } => (
                 flags.contains('g'),
                 flags.contains('y'),
                 flags.contains('d'),
                 flags.contains('u') || flags.contains('v'),
+                *last_index,
             ),
             _ => {
                 return Err(Thrown(
@@ -770,21 +777,26 @@ impl<'p> Vm<'p> {
                 ))
             }
         };
-        // ToLength(Get(R,"lastIndex")) — read UNCONDITIONALLY per
-        // RegExpBuiltinExec, but used as the search start only for a
-        // global/sticky regex (otherwise the start is 0). On a real RegExp the
-        // Get itself can never run user code: `lastIndex` is a non-configurable
-        // own DATA property whose value's source of truth is the heap slot
-        // (defineProperty writes the value through; only attrs live in
-        // arr_props) — so read the slot directly. ToLength still invokes a
-        // user `lastIndex.valueOf` (a throw propagates).
-        let li_v = match self.heap.get(re_idx) {
-            HeapObj::RegExp { last_index, .. } => *last_index,
-            _ => Value::int(0),
-        };
-        let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
         let stateful = global || sticky;
-        let start = if stateful { li } else { 0 };
+        // ToLength(Get(R,"lastIndex")) — read UNCONDITIONALLY per
+        // RegExpBuiltinExec, but used as the search START only for a
+        // global/sticky regex (a non-stateful regex always starts at 0).
+        // When NOT stateful AND lastIndex already holds a plain Number (the
+        // common case — we wrote it, or `re.lastIndex = n` stored a number),
+        // ToLength is a pure arithmetic clamp whose RESULT is discarded: skip
+        // it. A non-Number lastIndex (e.g. `{valueOf(){throw}}` or a string)
+        // still runs ToLength so its observable coercion / throw fires exactly
+        // as before — only the unobservable numeric clamp is elided.
+        let start = if !stateful && li_v.is_number() {
+            0
+        } else {
+            let li = self.to_integer_or_zero(li_v)?.clamp(0, (1i64 << 53) - 1) as usize;
+            if stateful {
+                li
+            } else {
+                0
+            }
+        };
         // ASCII subjects match in place over the heap bytes (offsets == unit
         // indices); anything else encodes the subject ONCE per exec.
         // `lastIndex` is already a unit index engine-wide, so it is the
@@ -802,16 +814,19 @@ impl<'p> Vm<'p> {
             None
         } else if is_ascii {
             self.ensure_regexp_ascii_twin(re_idx);
+            // Both the subject string and the regex/twin are shared borrows of
+            // `self.heap` — they coexist. Prefer the byte-optimized twin; fall
+            // back to the base program when the twin compile failed.
             let subj: &str = match self.heap.get(s_idx) {
                 HeapObj::Str(js) => js.as_str_wf(),
                 _ => "",
             };
-            match self.regexp_ascii.get(&re_idx).and_then(|o| o.as_deref()) {
-                Some(twin) => twin.find_from_ascii(subj, start).next(),
-                None => match self.heap.get(re_idx) {
-                    HeapObj::RegExp { regex, .. } => regex.find_from_ascii(subj, start).next(),
-                    _ => None,
-                },
+            match self.heap.get(re_idx) {
+                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => {
+                    twin.find_from_ascii(subj, start).next()
+                }
+                HeapObj::RegExp { regex, .. } => regex.find_from_ascii(subj, start).next(),
+                _ => None,
             }
         } else {
             match self.heap.get(re_idx) {
@@ -1002,17 +1017,16 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Ensure the BYTE-OPTIMIZED twin compile (`regexp_ascii` side table) for
-    /// the RegExp at `re_idx` exists — built once, lazily, from the SAME
+    /// Ensure the BYTE-OPTIMIZED twin compile (`HeapObj::RegExp::ascii_twin`)
+    /// for the RegExp at `re_idx` exists — built once, lazily, from the SAME
     /// pattern characters and flags as the heap regex (mirrors
     /// `build_regexp`, incl. the exact-bytes lone-surrogate form). A failed
-    /// compile is recorded as `None` so it isn't retried; callers fall back
-    /// to `find_from_ascii` on the unoptimized program (also byte-safe).
+    /// compile is recorded as `Some(None)` so it isn't retried; callers fall
+    /// back to `find_from_ascii` on the unoptimized program (also byte-safe).
     fn ensure_regexp_ascii_twin(&mut self, re_idx: u32) {
-        if self.regexp_ascii.contains_key(&re_idx) {
-            return;
-        }
         let (source, flags) = match self.heap.get(re_idx) {
+            // Already computed (twin or recorded failure): nothing to do.
+            HeapObj::RegExp { ascii_twin: Some(_), .. } => return,
             HeapObj::RegExp { source, flags, .. } => (source.clone(), flags.clone()),
             _ => return,
         };
@@ -1052,7 +1066,9 @@ impl<'p> Vm<'p> {
                     compiled
                 }
             };
-        self.regexp_ascii.insert(re_idx, twin);
+        if let HeapObj::RegExp { ascii_twin, .. } = self.heap.get_mut(re_idx) {
+            *ascii_twin = Some(twin);
+        }
     }
 
     /// The string's UTF-16 code units — EXACT: an astral scalar yields its two
@@ -1290,14 +1306,11 @@ impl<'p> Vm<'p> {
                 HeapObj::Str(js) => js.as_str_wf(),
                 _ => "",
             };
-            let regex: Option<&regress::Regex> =
-                match self.regexp_ascii.get(&re).and_then(|o| o.as_deref()) {
-                    Some(twin) => Some(twin),
-                    None => match self.heap.get(re) {
-                        HeapObj::RegExp { regex, .. } => Some(regex),
-                        _ => None,
-                    },
-                };
+            let regex: Option<&regress::Regex> = match self.heap.get(re) {
+                HeapObj::RegExp { ascii_twin: Some(Some(twin)), .. } => Some(twin),
+                HeapObj::RegExp { regex, .. } => Some(regex),
+                _ => None,
+            };
             match regex {
                 Some(regex) => {
                     if global {

@@ -322,14 +322,6 @@ pub struct Vm<'p> {
     /// lone-surrogate pattern round-trips exactly. Holds no `Value`s (pure
     /// bytes, idx-keyed): GC only needs the sweep-time retain in gc.rs.
     regexp_exact_source: std::collections::HashMap<u32, Vec<u8>>,
-    /// RegExp heap idx → its BYTE-OPTIMIZED twin compile (regress
-    /// `from_unicode_byteopt`: literal ByteSeq insns + byte start predicates),
-    /// built lazily on the first exec against an all-ASCII subject and used
-    /// ONLY for ASCII subjects (`find_from_ascii`). Same pattern/flags as the
-    /// heap regex — `None` records a failed twin compile so it isn't retried.
-    /// Invalidated by `RegExp.prototype.compile`. Holds no `Value`s (pure
-    /// program, idx-keyed): GC only needs the sweep-time retain in gc.rs.
-    regexp_ascii: rustc_hash::FxHashMap<u32, Option<std::sync::Arc<regress::Regex>>>,
     /// Compiled-pattern cache, keyed by (source text, regress flags, byteopt):
     /// `RegExp.prototype[@@matchAll]` / `@@split` CONSTRUCT a species clone of
     /// the regex per call (per spec), which would re-parse + re-compile the

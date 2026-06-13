@@ -1591,7 +1591,7 @@ impl<'p> Vm<'p> {
             };
         let idx = self
             .heap
-            .alloc(HeapObj::RegExp { regex, source, flags, last_index: Value::int(0) });
+            .alloc(HeapObj::RegExp { regex, source, flags, last_index: Value::int(0), ascii_twin: None });
         // Lone-surrogate pattern: record the EXACT [[OriginalSource]] bytes in
         // the side table (the struct's `source: String` is lossy) so the
         // `source` getter / `toString` round-trip the surrogates. The heap

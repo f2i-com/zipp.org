@@ -1298,16 +1298,16 @@ impl<'p> Vm<'p> {
                     .map_err(|e| {
                         Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
                     })?;
-                if let HeapObj::RegExp { regex: r, source: s, flags: fl, .. } =
+                if let HeapObj::RegExp { regex: r, source: s, flags: fl, ascii_twin, .. } =
                     self.heap.get_mut(this.heap_index())
                 {
                     *r = std::sync::Arc::new(regex);
                     *s = source;
                     *fl = flags;
+                    // The byte-optimized ASCII twin compiled the OLD pattern —
+                    // drop it (rebuilt lazily on the next ASCII-subject exec).
+                    *ascii_twin = None;
                 }
-                // The byte-optimized ASCII twin compiled the OLD pattern —
-                // drop it (rebuilt lazily on the next ASCII-subject exec).
-                self.regexp_ascii.remove(&this.heap_index());
                 // Move the exact-source entry onto the receiver — or clear a
                 // stale one when the new pattern is well-formed.
                 match exact {
