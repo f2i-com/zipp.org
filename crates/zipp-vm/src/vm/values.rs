@@ -91,9 +91,15 @@ impl<'p> Vm<'p> {
                     // be overridden (a defineProperty'd index in arr_props) or inherited
                     // from the prototype chain — [[HasProperty]] must keep walking (an
                     // out-of-range `i` was previously reported absent without this check).
-                    let k = self.key_of(key);
-                    if self.arr_props.get(&idx).map_or(false, |m| m.pos(&k).is_some()) {
-                        return true;
+                    // Only materialize the index-key string when there IS an arr_props
+                    // overlay to probe: a packed array with delete-punched holes has none,
+                    // so a hole/OOB `i in arr` skips the per-probe key alloc entirely (the
+                    // hot hole-aware-iteration path) and goes straight to the prototype.
+                    if let Some(m) = self.arr_props.get(&idx) {
+                        let k = self.key_of(key);
+                        if m.pos(&k).is_some() {
+                            return true;
+                        }
                     }
                     // Walk the ACTUAL [[Prototype]] (a setPrototypeOf custom proto
                     // carries inherited indices), else %Array.prototype%.
