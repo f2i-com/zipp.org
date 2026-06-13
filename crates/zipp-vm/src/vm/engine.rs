@@ -970,6 +970,164 @@ impl<'p> Vm<'p> {
         crate::codegen::CALL_THREW
     }
 
+    /// Q7 S-ACC: if the getter `fid` is the trivial shape `return this.<field>`
+    /// AND `<field>` is a plain own writable/non-accessor DATA slot of `recv`,
+    /// serve the read DIRECTLY (no frame push, no `setup_call`, no `run_loop`) —
+    /// returning the slot's Value bits. Returns `None` to fall back to the full
+    /// frame call (any other body shape, a non-instance receiver, a missing /
+    /// accessor / inherited field).
+    ///
+    /// SOUNDNESS: the trivial body `[GetProp{obj:0, name:N}, Return{src}]` reads
+    /// exactly `this.<field>` with `this == recv`. We only take the fast path
+    /// when `recv.<field>` is an OWN DATA slot (so the read is a pure slot load
+    /// with no further accessor / proto-chain semantics — byte-identical to what
+    /// the frame-called getter would compute). Reg numbers are irrelevant: the
+    /// body's single observable effect is the field load it returns. No side
+    /// effect, so no deopt/re-execution hazard. The outer own-shadow guard (G3b)
+    /// is ALREADY enforced by `ic_get_prop` (the `ClassGetter` validate arm
+    /// requires `own.is_none()`), which ran before this — so a same-name instance
+    /// own-write correctly never reaches here.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn accessor_fast_get(&self, fid: u32, recv: Value) -> Option<u64> {
+        let field = self.simple_getter_field(fid)?;
+        if !recv.is_heap() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        if !self.ic_obj_ok(idx) {
+            return None;
+        }
+        let m = match self.heap.get(idx) {
+            HeapObj::Object(m) if !m.is_ctor => m,
+            _ => return None,
+        };
+        let s = m.pos(field)?;
+        // OWN, DATA (non-accessor) slot only — a nested accessor / inherited
+        // field would need real semantics; defer those to the frame call.
+        if m.attrs[s].accessor {
+            return None;
+        }
+        Some(m.vals[s].bits())
+    }
+
+    /// Q7 S-ACC: if the setter `fid` is the trivial shape `this.<field> = arg`
+    /// or `this.<field> = (arg | 0)` AND `<field>` is a plain own writable
+    /// non-accessor DATA slot of `recv`, perform the write DIRECTLY (no frame).
+    /// Returns `Some(0)` on a served write, or `None` to fall back to the frame
+    /// call (any other shape, or a field that is missing / an accessor / non-
+    /// writable / inherited — those need full `set_prop` semantics).
+    ///
+    /// SOUNDNESS: the body writes `this.<field>` with `this == recv`, optionally
+    /// applying `ToInt32` (`x | 0`) to the value first. We serve it ONLY when the
+    /// field is already an OWN WRITABLE DATA slot of `recv`, so the write is a
+    /// pure in-place slot store — byte-identical to the frame-called setter. The
+    /// slot value changes but the OBJECT SHAPE does not (no add/delete/redefine),
+    /// so NO version bump is needed (mirrors the JIT SetProp IC fast write, which
+    /// also stores in place without a bump). The outer own-shadow guard (G3b) is
+    /// already enforced by `ic_set_prop`'s `ClassSetter` validate arm
+    /// (`own.is_none()`), which ran before this.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn accessor_fast_set(&mut self, fid: u32, recv: Value, val: Value) -> Option<u64> {
+        let (field, to_int32) = self.simple_setter_field(fid)?;
+        if !recv.is_heap() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        if !self.ic_obj_ok(idx) {
+            return None;
+        }
+        // The stored value: optionally ToInt32 (`x | 0`). ToInt32 of a plain
+        // number is unobservable (no user code), so it is safe off-frame; a
+        // non-number value would need ToNumber (potentially observable
+        // valueOf) — defer that to the frame call.
+        let stored = if to_int32 {
+            if !val.is_number() {
+                return None;
+            }
+            let f = if val.is_int() { val.as_int() as f64 } else { val.as_f64() };
+            Value::int(crate::vm::helpers_num2::to_int32(f))
+        } else {
+            val
+        };
+        // Re-borrow mutably and verify the field is an own writable data slot.
+        match self.heap.get_mut(idx) {
+            HeapObj::Object(m) if !m.is_ctor => {
+                let s = m.pos(field)?;
+                if m.attrs[s].accessor || !m.attrs[s].writable {
+                    return None;
+                }
+                m.vals[s] = stored; // in-place data store — shape unchanged
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
+    /// Recognise a trivial getter body `return this.<field>` and return the
+    /// field name (a `'p`-lived string constant). The shape is exactly a single
+    /// `GetProp` of register-0 (`this`) followed by its `Return`, optionally with
+    /// the compiler's trailing dead `ReturnUndefined`. Anything else → `None`
+    /// (the caller frame-calls). Excludes generators/async/non-strict-irrelevant
+    /// — a class getter is always a concise method (strict, no rest/arguments).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn simple_getter_field(&self, fid: u32) -> Option<&'p str> {
+        let p = self.func(fid as usize);
+        if p.is_generator || p.is_async || p.param_count != 0 {
+            return None;
+        }
+        let c = &p.code;
+        // [GetProp{dst, obj:0, name:N}, Return{src:dst}, ...]
+        let (dst0, name) = match c.first()? {
+            Instr::GetProp { dst, obj: 0, name } => (*dst, *name),
+            _ => return None,
+        };
+        match c.get(1)? {
+            Instr::Return { src } if *src == dst0 => {}
+            _ => return None,
+        }
+        Some(&p.string_constants[name as usize])
+    }
+
+    /// Recognise a trivial setter body `this.<field> = arg` or
+    /// `this.<field> = (arg | 0)` (the `x | 0` int-coercion the bench uses) and
+    /// return `(field_name, applies_ToInt32)`. The recognised shapes are exactly:
+    ///   * `[SetProp{obj:0, name:N, val:1}, ReturnUndefined?]`        (plain)
+    ///   * `[LoadInt{dst:D, val:0}, Bitwise{dst:S, a:1, b:D, op:Or},
+    ///      SetProp{obj:0, name:N, val:S}, ReturnUndefined?]`         (`arg | 0`)
+    /// where register 1 is the single formal parameter (`arg`). Anything else →
+    /// `None`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn simple_setter_field(&self, fid: u32) -> Option<(&'p str, bool)> {
+        use crate::bytecode::BitwiseOp;
+        let p = self.func(fid as usize);
+        if p.is_generator || p.is_async || p.param_count != 1 {
+            return None;
+        }
+        let c = &p.code;
+        // Plain `this.field = arg` (val register == the formal param, reg 1).
+        if let Instr::SetProp { obj: 0, name, val: 1 } = c.first()? {
+            return Some((&p.string_constants[*name as usize], false));
+        }
+        // `this.field = (arg | 0)`: LoadInt 0 → Bitwise Or(arg, 0) → SetProp.
+        let (zero_dst, zero_val) = match c.first()? {
+            Instr::LoadInt { dst, val } => (*dst, *val),
+            _ => return None,
+        };
+        if zero_val != 0 {
+            return None;
+        }
+        let or_dst = match c.get(1)? {
+            Instr::Bitwise { dst, a: 1, b, op: BitwiseOp::Or } if *b == zero_dst => *dst,
+            _ => return None,
+        };
+        match c.get(2)? {
+            Instr::SetProp { obj: 0, name, val } if *val == or_dst => {
+                Some((&p.string_constants[*name as usize], true))
+            }
+            _ => None,
+        }
+    }
+
     /// Frame-call a resolved plain user function FROM NATIVE REGION CODE and
     /// run it to completion: the shared tail of the region call helpers and the
     /// property-slow helpers (getters/setters). Returns the result bits,
@@ -1063,6 +1221,12 @@ impl<'p> Vm<'p> {
             match self.ic_set_prop(func_id, ip, recv, key, val) {
                 SetAct::Done => 0,
                 SetAct::Setter { fid, closure, setter } => {
+                    // Q7 S-ACC: a trivial `this.field = arg|0` setter over an own
+                    // writable data slot is served off-frame (no setup_call /
+                    // run_loop) — the dominant cost of the rt loop.
+                    if let Some(r) = self.accessor_fast_set(fid, recv, val) {
+                        return r;
+                    }
                     let r = self.jit_frame_call(fid, closure, recv, base, val_reg, 1, ip, setter);
                     if r == CALL_THREW || r == SELF_CALL_DEOPT {
                         r
@@ -1078,6 +1242,11 @@ impl<'p> Vm<'p> {
             match self.ic_get_prop(func_id, ip, recv, key) {
                 GetAct::Value(v) => v.bits(),
                 GetAct::Accessor { fid, closure, getter } => {
+                    // Q7 S-ACC: a trivial `return this.field` getter over an own
+                    // data slot is served off-frame (no setup_call / run_loop).
+                    if let Some(bits) = self.accessor_fast_get(fid, recv) {
+                        return bits;
+                    }
                     self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, getter)
                 }
                 GetAct::None => SELF_CALL_DEOPT,
