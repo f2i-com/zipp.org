@@ -205,6 +205,47 @@ impl<'p> Vm<'p> {
                     None => Value::UNDEFINED,
                 }));
             }
+            // No-clone substring/slice: produce the O(slice) result by borrowing
+            // the receiver and slicing its WTF-8 directly — skipping the two
+            // full-receiver copies (`js.clone()` + `to_lossy_string()`) the generic
+            // path below makes. Hot in string-rendering / scanning loops.
+            "slice" => {
+                // Negative indices count from the end (i64 so a saturated
+                // ±Infinity clamps correctly); absent/undefined end -> length.
+                let len = self.heap_str_units(idx) as i64;
+                let norm = |i: i64| if i < 0 { len.saturating_add(i).max(0) } else { i.min(len) };
+                let start = if args.is_empty() { 0 } else { norm(self.to_integer_strict(arg0)?) };
+                let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
+                    len
+                } else {
+                    norm(self.to_integer_strict(args[1])?)
+                };
+                // Arg coercion (valueOf) is complete; borrow the receiver, slice,
+                // and DROP the borrow before alloc_js (which may GC). `idx` is the
+                // rooted receiver and stays valid across the coercion above.
+                let out = match self.heap.get(idx) {
+                    HeapObj::Str(js) => js.slice_units(start as usize, end as usize),
+                    _ => return Ok(None),
+                };
+                return Ok(Some(Value::heap(self.heap.alloc_js(out))));
+            }
+            "substring" => {
+                // Each index clamps to [0,len] (negatives -> 0), then start/end
+                // swap so start <= end (distinct from slice's negative-from-end).
+                let len = self.heap_str_units(idx) as i64;
+                let s0 = if args.is_empty() { 0 } else { self.to_integer_strict(arg0)?.clamp(0, len) };
+                let e0 = if args.len() < 2 || args[1] == Value::UNDEFINED {
+                    len
+                } else {
+                    self.to_integer_strict(args[1])?.clamp(0, len)
+                };
+                let (from, to) = if s0 <= e0 { (s0, e0) } else { (e0, s0) };
+                let out = match self.heap.get(idx) {
+                    HeapObj::Str(js) => js.slice_units(from as usize, to as usize),
+                    _ => return Ok(None),
+                };
+                return Ok(Some(Value::heap(self.heap.alloc_js(out))));
+            }
             _ => {}
         }
         // Other methods need owned content (slice/replace/split/…): the exact
@@ -284,38 +325,8 @@ impl<'p> Vm<'p> {
             }
             "toUpperCase" => Ok(Some(self.alloc_str(s.to_uppercase()))),
             "toLowerCase" => Ok(Some(self.alloc_str(s.to_lowercase()))),
-            "slice" => {
-                // Negative indices count from the end; computed in i64 so a
-                // saturated ±Infinity (i64::MIN/MAX) clamps correctly (an `as i32`
-                // would wrap Infinity to -1).
-                let len = unit_len(&s) as i64;
-                let norm = |i: i64| if i < 0 { len.saturating_add(i).max(0) } else { i.min(len) };
-                let start = if args.is_empty() { 0 } else { norm(self.to_integer_strict(arg0)?) };
-                // An absent OR explicitly-`undefined` end defaults to the string
-                // length (ToIntegerOrInfinity is only applied to a defined end).
-                let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
-                    len
-                } else {
-                    norm(self.to_integer_strict(args[1])?)
-                };
-                let out = subu(start as usize, end as usize);
-                Ok(Some(Value::heap(self.heap.alloc_js(out))))
-            }
-            "substring" => {
-                // Each index clamps to [0,len] (negatives -> 0), then start/end swap
-                // so start <= end (distinct from slice's negative-from-end mapping).
-                let len = unit_len(&s) as i64;
-                let s0 = if args.is_empty() { 0 } else { self.to_integer_strict(arg0)?.clamp(0, len) };
-                // An absent OR explicitly-`undefined` end defaults to the length.
-                let e0 = if args.len() < 2 || args[1] == Value::UNDEFINED {
-                    len
-                } else {
-                    self.to_integer_strict(args[1])?.clamp(0, len)
-                };
-                let (from, to) = if s0 <= e0 { (s0, e0) } else { (e0, s0) };
-                let out = subu(from as usize, to as usize);
-                Ok(Some(Value::heap(self.heap.alloc_js(out))))
-            }
+            // NB: `slice` / `substring` are handled by the no-clone fast path in
+            // the early match above (before the receiver is copied).
             "repeat" => {
                 // ToIntegerOrInfinity(count): a NEGATIVE or +Infinity count is a
                 // RangeError — checked on the coerced number BEFORE the empty-string
