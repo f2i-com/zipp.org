@@ -484,8 +484,10 @@ impl<'p> Vm<'p> {
             let Instr::Call { argc, .. } = caller.code[ip] else {
                 continue;
             };
-            // Monomorphic plain-callee from the live IC.
-            let Some((callee_bits, fid, closure)) = self.ic_call_mono(func_id, ip) else {
+            // Monomorphic plain-callee from the live IC (with the cached slot
+            // version — the inline guard re-checks it to defeat GC slot-reuse ABA).
+            let Some((callee_bits, callee_ver, fid, closure)) = self.ic_call_mono(func_id, ip)
+            else {
                 if log {
                     eprintln!("[leaf] fn{func_id}@{ip} NOT-MONO (no single Callee IC way)");
                 }
@@ -498,6 +500,22 @@ impl<'p> Vm<'p> {
             if closure != NO_CLOSURE && !callee.upvalues.is_empty() {
                 if log {
                     eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (closure w/ upvalues)");
+                }
+                continue;
+            }
+            // The inline emitter forces `this = undefined` for the callee window.
+            // That is ONLY correct for a STRICT, NON-ARROW leaf (its `this` is
+            // genuinely undefined when called as `f(args)`). An arrow captures
+            // `this` lexically (stored in the Closure, NOT undefined); a sloppy
+            // function substitutes the global object (OrdinaryCallBindThis). Both
+            // would observe the wrong `this` if inlined — decline them.
+            if callee.lexical_this || !callee.is_strict {
+                if log {
+                    eprintln!(
+                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                         (lexical_this={} strict={})",
+                        callee.lexical_this, callee.is_strict
+                    );
                 }
                 continue;
             }
@@ -533,6 +551,7 @@ impl<'p> Vm<'p> {
                 ip,
                 LeafInlinePlan {
                     callee_bits,
+                    callee_ver,
                     reg_window,
                     callee_reg_count: callee.reg_count,
                     param_count: callee.param_count,

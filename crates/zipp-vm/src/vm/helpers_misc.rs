@@ -730,7 +730,13 @@ pub(crate) extern "win64" fn jit_concat(
     let vm = unsafe { &mut *(vm as *mut Vm) };
     match vm.add_values(a, b) {
         Ok(v) => v.bits(),
-        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+        // `add_values` can run user coercion code (an object operand's
+        // `valueOf`/`toString`) that has SIDE EFFECTS before it throws. Returning
+        // the "redo" sentinel (`SELF_CALL_DEOPT`) would re-execute the whole `+`
+        // in the interpreter — running those side effects a SECOND time. Instead
+        // materialize the throw into `pending_throw` and return `CALL_THREW`, so
+        // the region exits and the interpreter UNWINDS (the throw surfaces once).
+        Err(t) => vm.jit_thrown_to_sentinel(t),
     }
 }
 

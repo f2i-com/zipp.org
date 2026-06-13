@@ -141,6 +141,14 @@ pub struct TaPinPlan {
 pub struct LeafInlinePlan {
     /// Guard: the caller's callee register must hold exactly these Value bits.
     pub callee_bits: u64,
+    /// Guard: the callee heap slot's live VERSION must still equal this baked
+    /// value. Heap Value bits are pure `TAG_HEAP|idx`; the parallel `versions[]`
+    /// array is the only ABA discriminator. A GC'd + reused slot keeps identical
+    /// bits but bumps its version, so the bits-only guard would pass and run the
+    /// STALE old callee body. The emitter checks `versions[idx] == callee_ver`
+    /// AFTER the bits compare — restoring the exact `(bits, version)` tuple the
+    /// interpreter's `ic_call` checks.
+    pub callee_ver: u32,
     /// Offset (in registers) of the carved callee scratch window above the
     /// caller frame's window: callee reg `r` lives at caller reg `reg_window+r`.
     pub reg_window: u16,
@@ -2235,7 +2243,11 @@ fn region_can_compile(
             // re-fetch is needed.
             Instr::MathOp { op, argc, .. } => {
                 let ok = match argc {
-                    1 => true,
+                    // `Math.imul(x)` (one arg) diverges: the unary helper returns
+                    // NaN, but the interpreter coerces the missing 2nd arg to
+                    // `to_uint32(NaN)==0` and yields 0. Decline so the interpreter
+                    // runs it (every other unary op agrees at argc==1).
+                    1 => !matches!(op, MathFn::Imul),
                     2 => matches!(
                         op,
                         MathFn::Pow
@@ -2401,7 +2413,9 @@ pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
                     return None;
                 }
                 let ok = match argc {
-                    1 => true,
+                    // See region_can_compile: `Math.imul(x)` (one arg) diverges
+                    // (unary helper → NaN, interpreter → 0). Decline this leaf.
+                    1 => !matches!(op, MathFn::Imul),
                     2 => matches!(
                         op,
                         MathFn::Pow
@@ -5350,6 +5364,21 @@ fn emit_inline_leaf_call(
         ; mov r10, QWORD plan.callee_bits as i64
         ; cmp rax, r10
         ; jne => fallback
+        // ── version guard ── heap Value bits are pure `TAG_HEAP|idx`; a GC'd +
+        // reused callee slot keeps IDENTICAL bits but bumps its `versions[idx]`.
+        // The bits compare alone would then PASS and run the STALE old callee
+        // body. Re-check the live slot version against the baked one (exactly the
+        // `(bits, version)` tuple `ic_call` checks) — a mismatch falls to the
+        // helper, which re-resolves the call correctly. `rax` still holds the
+        // callee bits; its low 32 bits are the heap index. r13 = pinned heap
+        // version-array base (re-derived after any allocating helper because the
+        // region inlines a call — see `refetch_pinned`). The read is in-bounds:
+        // the index came from a live heap Value (the bits matched) and `versions`
+        // never shrinks; staleness is caught by this very compare.
+        ; mov ecx, eax                          // recv heap idx (low 32 of bits)
+        ; mov edx, [r13 + rcx*4]                // live slot version
+        ; cmp edx, DWORD plan.callee_ver as i32
+        ; jne => fallback
         // ── headroom flag ── 0 ⇒ the scratch window might overflow the pinned
         // register file (near-MAX_FRAMES recursion) → take the helper.
         ; cmp QWORD [rsp + leaf_flag_off], 0
@@ -5374,6 +5403,21 @@ fn emit_inline_leaf_call(
                 ; mov rax, QWORD Value::UNDEFINED.bits() as i64
                 ; mov [rbx + dreg(w + 1 + i)], rax
             );
+        }
+    }
+    // ── zero-fill the callee's LOCALS (regs past `this`+params) to undefined ──
+    // exactly as `setup_call` resizes the whole callee window to UNDEFINED. The
+    // leaf body may read a local before writing it (e.g. `var x; return a + x;`
+    // reads the uninitialized `x`); without this, that read would pick up a
+    // STALE Value left in the carved scratch window by a prior call's expansion.
+    {
+        let undef = Value::UNDEFINED.bits() as i64;
+        let first_local = 1 + plan.param_count; // reg index past `this` + params
+        if first_local < plan.callee_reg_count {
+            dynasm!(ops ; mov rax, QWORD undef);
+            for r in first_local..plan.callee_reg_count {
+                dynasm!(ops ; mov [rbx + dreg(w + r)], rax);
+            }
         }
     }
     // ── inline the body over the scratch window ── every register `r` maps to
@@ -5646,6 +5690,14 @@ fn compile_region_mem(
     // ONCE at entry by `jit_regs_fits`; the result gates each inlined Call (a
     // tight-headroom run falls back to the per-call helper for every site).
     let do_leaf = !leaf_plan.is_empty();
+    // The Q4 leaf-inline identity guard re-checks the callee slot's live version
+    // (read from r13, the pinned heap version-array base) to defeat GC slot-reuse
+    // ABA. r13 is pinned at the prologue, but any intervening ALLOCATING / user-
+    // code helper (jit_concat, a fallback call, …) can reallocate the versions
+    // Vec and leave r13 STALE. So whenever the region inlines a call, the version
+    // base must be re-derived after such helpers too — exactly where a GetProp/
+    // SetProp region re-derives it. Fold `do_leaf` into the refetch gate.
+    let refetch_pinned = has_prop || do_leaf;
     let max_scratch_top: u64 = leaf_plan
         .values()
         .map(|p| p.reg_window as u64 + p.callee_reg_count as u64)
@@ -5860,10 +5912,13 @@ fn compile_region_mem(
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
-                    ; je => bail                          // threw inside `+` → redo in interp
+                    ; je => bail                          // IC-style redo (nothing ran)
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
                     ; mov [rbx + dreg(dst)], rax
                 );
-                if has_prop {
+                if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
                 // `add_values` can run user coercion code (valueOf) — re-derive
@@ -6137,7 +6192,7 @@ fn compile_region_mem(
                     ; call rax
                     ; mov [rbx + dreg(dst)], rax         // Bool Value bits
                 );
-                if has_prop {
+                if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
             }
@@ -6796,7 +6851,7 @@ fn compile_region_mem(
                         packed_args,
                         argc,
                         dst,
-                        has_prop.then_some((heap.versions_base, heap.ic_base)),
+                        refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                         ta_refetch,
                     );
                 }
@@ -6825,7 +6880,7 @@ fn compile_region_mem(
                         heap.call_ic,
                         packed_fip,
                         packed_args,
-                        has_prop.then_some((heap.versions_base, heap.ic_base)),
+                        refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                         ta_refetch,
                     );
                 } else {
@@ -6839,7 +6894,7 @@ fn compile_region_mem(
                         packed_args,
                         argc,
                         dst,
-                        has_prop.then_some((heap.versions_base, heap.ic_base)),
+                        refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                         ta_refetch,
                     );
                 }
@@ -6861,9 +6916,12 @@ fn compile_region_mem(
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // threw (pending_throw set) → unwind, NOT redo
                     ; mov [rbx + dreg(dst)], rax
                 );
-                if has_prop {
+                if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
                 if let Some((snap, plan)) = ta_refetch {
@@ -6884,7 +6942,7 @@ fn compile_region_mem(
                     ; call rax
                     ; mov [rbx + dreg(dst)], rax
                 );
-                if has_prop {
+                if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
                 if let Some((snap, plan)) = ta_refetch {

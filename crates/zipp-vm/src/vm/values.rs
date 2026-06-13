@@ -877,6 +877,14 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
+        // A private-name string key ("#m") must NOT leak via plain `in`: the
+        // interpreter's `has_property_dyn` skips `#`-prefixed class members, but
+        // `has_property` (which this helper delegates to) does NOT (its class-chain
+        // walk matches them for legacy brand checks). DEOPT so the interpreter
+        // computes the correct (false) answer. (Number keys never start with '#'.)
+        if self.key_of(key).starts_with('#') {
+            return None;
+        }
         // A Proxy anywhere in the chain (or a deferred namespace) dispatches user
         // code / a trigger — let the interpreter run it. The walk mirrors
         // has_property/has_property_dyn's proto resolution (explicit proto_of, then
