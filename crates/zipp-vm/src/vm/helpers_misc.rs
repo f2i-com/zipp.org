@@ -1216,6 +1216,36 @@ pub(crate) extern "win64" fn jit_forin_live(
     Value::bool(live).bits()
 }
 
+/// Win64 helper: the `in` operator (`HasProp`, brand=false) in a region. `key`/
+/// `obj` are the operand Value bits — returns the BOOL Value bits (`i in arr`)
+/// or `SELF_CALL_DEOPT` when the answer needs user code / a throw (non-object
+/// RHS, an object/Symbol key, a Proxy or deferred-namespace anywhere in the
+/// chain) so the region bails and the interpreter re-executes the op with full
+/// `in` semantics. Delegates to the READ-ONLY, infallible `Vm::has_property_jit`,
+/// which on the pure path is byte-identical to the interpreter's `has_property_dyn`
+/// (the routine `in` dispatches to). PURE: `&self` heap reads only — no VM-heap
+/// alloc, no user code, no GC safe point, so the TypedArray pin snapshots and the
+/// r13/r14 IC pointers are unaffected (no post-call refetch needed). A
+/// `gc_lock_guard` is taken belt-and-suspenders so a future alloc inside the walk
+/// could not collect while `obj`/`key` are held only as helper-local bit copies.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `key_bits`/`obj_bits` are valid Value bits whose
+/// heap objects (if any) are rooted in the caller's frame registers.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_has_property(
+    vm: *mut core::ffi::c_void,
+    key_bits: u64,
+    obj_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let _guard = vm.gc_lock_guard();
+    match vm.has_property_jit(Value::from_bits(obj_bits), Value::from_bits(key_bits)) {
+        Some(present) => Value::bool(present).bits(),
+        None => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Normalise a (possibly negative) slice index into `[0, len]`. Negative
 /// indices count from the end; out-of-range clamps. Matches JS slice/substring.
 pub(crate) fn norm_index(i: i32, len: i32) -> i32 {

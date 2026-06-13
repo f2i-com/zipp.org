@@ -843,6 +843,86 @@ impl<'p> Vm<'p> {
         Ok(self.has_property(obj, key))
     }
 
+    /// READ-ONLY, infallible `in` for the JIT region helper (`jit_has_property`).
+    /// Returns `Some(present)` when the answer is computable WITHOUT running user
+    /// code (no Proxy `has` trap, no object-key ToString coercion) and WITHOUT a
+    /// TypeError, so it matches the interpreter's `in` (HasProp, brand=false) arm
+    /// bit-for-bit; returns `None` (deopt) for every case the interpreter would
+    /// handle by throwing or by re-entering user code, so the region bails and the
+    /// interpreter re-executes the op with full semantics.
+    ///
+    /// Deopt cases (the interpreter path that the helper declines to replicate):
+    ///   - RHS not an Object — `in` throws a TypeError.
+    ///   - key is a heap value that is NOT a flat string (an object/Symbol key:
+    ///     `coerce_index_key` runs ToString / ToPrimitive = user code, or maps a
+    ///     Symbol to its key form). A Number or String/Cons key needs none.
+    ///   - the receiver, or ANY node on its prototype chain, is a Proxy (the `has`
+    ///     trap is user code) or carries deferred-namespace state (a getter-like
+    ///     trigger). Proxies are vanishingly rare in hot `i in arr` loops.
+    /// Everything else is a pure read-only chain walk, so it delegates to the
+    /// infallible `has_property` — identical to what `has_property_dyn` computes
+    /// for a non-Proxy chain. `has_property` is `&self`: it performs no VM-heap
+    /// allocation (only a transient Rust `key_of` String for the rare arr_props
+    /// overlay probe), so no GC safe point and no pinned-pointer concern.
+    pub(crate) fn has_property_jit(&self, obj: Value, key: Value) -> Option<bool> {
+        // RHS must be an Object (else `in` throws).
+        if !self.is_object_value(obj) {
+            return None;
+        }
+        // A heap key that is not a flat string would need ToPropertyKey coercion
+        // (user code) or Symbol handling — interpreter only. A Number or a
+        // String/Cons key is taken verbatim (matches coerce_index_key's no-op).
+        if key.is_heap()
+            && !matches!(self.heap.get(key.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
+        {
+            return None;
+        }
+        // A Proxy anywhere in the chain (or a deferred namespace) dispatches user
+        // code / a trigger — let the interpreter run it. The walk mirrors
+        // has_property/has_property_dyn's proto resolution (explicit proto_of, then
+        // the intrinsic prototype for the receiver's kind), capped defensively.
+        let mut cur = obj.heap_index();
+        for _ in 0..64 {
+            if matches!(self.heap.get(cur), HeapObj::Proxy { .. })
+                || (!self.deferred_ns_state.is_empty()
+                    && self.deferred_ns_state.contains_key(&cur))
+            {
+                return None;
+            }
+            let proto = if let Some(&p) = self.proto_of.get(&cur) {
+                if p.is_heap() { p.heap_index() } else { 0 }
+            } else {
+                match self.heap.get(cur) {
+                    HeapObj::Object(_) => {
+                        if self.obj_proto != 0 && cur != self.obj_proto {
+                            self.obj_proto
+                        } else {
+                            0
+                        }
+                    }
+                    HeapObj::Array(_) | HeapObj::Cons { .. } => self.arr_proto,
+                    HeapObj::TypedArray { .. } => 0, // no intrinsic in proto_of → end
+                    HeapObj::Func(_)
+                    | HeapObj::Closure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Native(_) => self.fn_proto,
+                    HeapObj::Boxed { kind: 0, .. } => self.str_proto,
+                    HeapObj::Boxed { kind: 1, .. } => self.num_proto,
+                    HeapObj::Boxed { kind: 2, .. } => self.bool_proto,
+                    HeapObj::Date(_) => self.date_proto,
+                    HeapObj::Promise { .. } => self.promise_proto,
+                    HeapObj::RegExp { .. } => self.regexp_proto,
+                    _ => 0,
+                }
+            };
+            if proto == 0 || proto == cur {
+                break;
+            }
+            cur = proto;
+        }
+        Some(self.has_property(obj, key))
+    }
+
     /// `val instanceof <built-in ctor>`. With no user prototype chain the result
     /// is structural: by heap kind for Array/Object/Function, and by the `name`
     /// field for the Error family (any error subtype satisfies `instanceof

@@ -2755,6 +2755,7 @@ impl<'p> Vm<'p> {
                                         cell_get: jit_cell_get as usize,
                                         upval_get: jit_upval_get as usize,
                                         forin_live: jit_forin_live as usize,
+                                        has_property: jit_has_property as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,

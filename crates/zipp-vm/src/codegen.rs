@@ -191,6 +191,10 @@ pub struct HeapHelperAddrs {
     /// May allocate transiently (key re-derivation) — GC-guarded internally.
     /// Returns the BOOL Value bits.
     pub forin_live: usize,
+    /// Helper for `HasProp` (the `in` operator, brand=false) over a non-Proxy
+    /// chain: read-only `Vm::has_property_jit`. Returns the BOOL Value bits, or
+    /// `SELF_CALL_DEOPT` when the op needs user code / a throw (interpreter only).
+    pub has_property: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -650,6 +654,7 @@ impl Jit {
             cell_get: heap_helpers.cell_get,
             upval_get: heap_helpers.upval_get,
             forin_live: heap_helpers.forin_live,
+            has_property: heap_helpers.has_property,
             ic_base_idx,
         };
         match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan) {
@@ -2217,6 +2222,22 @@ fn region_can_compile(
             // Emitted per-op (re-derives the live shape each execution). Lets
             // `for (k in obj)` loops over plain objects compile.
             Instr::ForInLive { .. } => {}
+            // `HasProp` — the `in` operator — MEM path via the `jit_has_property`
+            // helper (read-only `Vm::has_property_jit`, byte-identical to the
+            // interpreter's `has_property_dyn` on a non-Proxy chain). Only a plain
+            // `in` (`brand: false`) is admitted; the `#x in obj` ergonomic brand
+            // check needs the private machinery → keeps declining. The helper runs
+            // no user code and never allocates on the VM heap (a Proxy/exotic/
+            // throwing case returns the deopt sentinel and the interpreter takes
+            // over), so no r13/r14/TA refetch. Unblocks sparse-array's 8M
+            // hole-aware `if (i in packed)` loops.
+            Instr::HasProp { brand: false, .. } => {}
+            Instr::HasProp { brand: true, .. } => {
+                if std::env::var_os("ZIPP_JITDUMP").is_some() {
+                    eprintln!("[decline] HasProp brand-check at region [{start},{end}]");
+                }
+                return false;
+            }
             Instr::LoadConst { idx, .. } => {
                 // Numeric constants run in the f64 region; a single-ASCII-char
                 // string constant is resolvable to its interned slot (for
@@ -2384,6 +2405,8 @@ struct HeapHelpers {
     upval_get: usize,
     /// `ForInLive` helper (obj bits, key bits → Bool Value bits).
     forin_live: usize,
+    /// `HasProp` (`in`) helper (key bits, obj bits → Bool Value bits / deopt).
+    has_property: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -5591,6 +5614,26 @@ fn compile_region_mem(
                 if has_prop {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
+            }
+            Instr::HasProp { dst, key, obj, brand: _ } => {
+                // `key in obj` (region_can_compile admitted only brand=false).
+                // The read-only `jit_has_property` helper returns the BOOL Value
+                // bits, or SELF_CALL_DEOPT → bail (the interpreter re-executes the
+                // op: throws on a non-object RHS, runs an object-key ToString, or
+                // dispatches a Proxy `has` trap). PURE — no alloc, no user code,
+                // so no r13/r14/TA refetch.
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(key)]         // key bits (arg1)
+                    ; mov r8, [rbx + dreg(obj)]          // obj bits (arg2)
+                    ; mov rax, QWORD heap.has_property as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // proxy / coercion / throw → interp
+                    ; mov [rbx + dreg(dst)], rax         // Bool Value bits
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Lt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Lt),
             Instr::Le { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Le),
