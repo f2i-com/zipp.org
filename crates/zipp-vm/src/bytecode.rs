@@ -946,7 +946,12 @@ pub struct FuncProto {
 
 /// Where a closure's upvalue is sourced from, evaluated in the defining frame.
 /// A builtin `Math` function, resolved at compile time from `Math.<name>(…)`.
+/// `#[repr(u8)]`: the JIT passes `op as u32` to the pure `jit_math_unary` /
+/// `jit_math_two` win64 helpers, which `transmute` the discriminant back. This
+/// is sound ONLY because every variant is fieldless and the declaration order is
+/// fixed — DO NOT reorder or remove variants without updating both helpers.
 #[derive(Clone, Copy, Debug)]
+#[repr(u8)]
 pub enum MathFn {
     Abs, Floor, Ceil, Round, Trunc, Sign, Sqrt, Cbrt,
     Exp, Log, Log2, Log10, Expm1, Log1p,

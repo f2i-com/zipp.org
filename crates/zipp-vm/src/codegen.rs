@@ -41,7 +41,7 @@ use std::mem;
 use dynasmrt::{dynasm, DynasmApi, DynasmLabelApi, ExecutableBuffer};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::bytecode::{FuncProto, Instr};
+use crate::bytecode::{FuncProto, Instr, MathFn};
 use crate::value::Value;
 
 /// Number of interpreter calls before a function is offered to the JIT.
@@ -171,6 +171,26 @@ pub struct HeapHelperAddrs {
     /// Helper for a whitelisted `dv.get*(pos[, le])` DataView read (no alloc,
     /// no user code; anything unusual returns the deopt sentinel).
     pub dv_get: usize,
+    /// Helper for a UNARY `Math.<op>` over an already-numeric arg (pure: the
+    /// region guards the arg numeric and passes its raw f64 bits). Returns the
+    /// result's f64 bits. No vm, no alloc, no user code.
+    pub math_unary: usize,
+    /// Helper for a TWO-ARG `Math.<op>` (Pow/Atan2/Imul/Min/Max/Hypot) over
+    /// already-numeric args (pure, same constraints). Returns f64 bits.
+    pub math_two: usize,
+    /// Helper for `CellGet` / `UpvalGet` reading a captured-local cell: a pure
+    /// heap LOAD of the cell's inner Value (no alloc, no user code). Returns the
+    /// inner Value bits, or `SELF_CALL_DEOPT` for a still-uninitialized (TDZ)
+    /// cell so the region bails and the interpreter throws.
+    pub cell_get: usize,
+    /// Helper for `UpvalGet` (resolves the running closure's k-th upvalue cell,
+    /// then loads it). Same purity/TDZ contract as `cell_get`.
+    pub upval_get: usize,
+    /// Helper for `ForInLive` (per-iteration for-in liveness). Delegates to the
+    /// shared `Vm::forin_live`, so it matches the interpreter byte-for-byte.
+    /// May allocate transiently (key re-derivation) — GC-guarded internally.
+    /// Returns the BOOL Value bits.
+    pub forin_live: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -625,6 +645,11 @@ impl Jit {
             ta_snapshot: heap_helpers.ta_snapshot,
             ta_clamp_store: heap_helpers.ta_clamp_store,
             dv_get: heap_helpers.dv_get,
+            math_unary: heap_helpers.math_unary,
+            math_two: heap_helpers.math_two,
+            cell_get: heap_helpers.cell_get,
+            upval_get: heap_helpers.upval_get,
+            forin_live: heap_helpers.forin_live,
             ic_base_idx,
         };
         match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan) {
@@ -2141,6 +2166,57 @@ fn region_can_compile(
             // Logical `!` — MEM path (Bool flips natively; anything else goes
             // through the `jit_truthy` helper).
             Instr::Not { .. } => {}
+            // `Math.<op>(args…)` — MEM path. A 1-arg unary op (`abs`/`sqrt`/
+            // `floor`/`sin`/…) loads its arg as a number (bails to the
+            // interpreter — which runs ToNumber coercion — if not) and calls the
+            // PURE `jit_math_unary` helper (the interpreter's exact `math_unary`,
+            // so every JS quirk matches). A 2-arg op (`pow`/`atan2`/`imul`/
+            // `min`/`max`/`hypot` with EXACTLY two args) uses `jit_math_two`.
+            // Any other arity (variadic min/max/hypot, a 0-arg call) declines —
+            // the interpreter handles it. The helpers run no user code and never
+            // allocate (a non-numeric arg already bailed), so no pinned-pointer
+            // re-fetch is needed.
+            Instr::MathOp { op, argc, .. } => {
+                let ok = match argc {
+                    1 => true,
+                    2 => matches!(
+                        op,
+                        MathFn::Pow
+                            | MathFn::Atan2
+                            | MathFn::Imul
+                            | MathFn::Min
+                            | MathFn::Max
+                            | MathFn::Hypot
+                    ),
+                    _ => false,
+                };
+                if !ok {
+                    if std::env::var_os("ZIPP_JITDUMP").is_some() {
+                        eprintln!("[decline] MathOp arity {argc} op {op:?} at region [{start},{end}]");
+                    }
+                    return false;
+                }
+            }
+            // `LoadBool` — materialise the boolean Value bits inline (a single
+            // store; call-free, pure). Unblocks loops carrying a bool literal
+            // (parser flags, `done=false`).
+            Instr::LoadBool { .. } => {}
+            // Closure-cell / upvalue READS — MEM path via the pure `jit_cell_get`
+            // / `jit_upval_get` helpers (a single heap LOAD of the cell's inner
+            // Value; a TDZ cell → deopt sentinel → interpreter throws). Emitted
+            // PER-OP (never hoisted across a Call/CallMethod), so a value an inner
+            // closure mutated via a call in the SAME region is re-read on the next
+            // execution. The helpers allocate nothing and run no user code, so no
+            // pinned-pointer (r13/r14/TA) re-fetch is needed. Writes (`CellSet`,
+            // `CellSetChecked`, `UpvalSet`) are NOT admitted — they keep declining.
+            Instr::CellGet { .. } | Instr::UpvalGet { .. } => {}
+            // `ForInLive` — the per-iteration for-in liveness check — MEM path via
+            // the `jit_forin_live` helper (the shared `Vm::forin_live`; no getter
+            // / Proxy trap fires, never re-enters the dispatch loop, so no GC safe
+            // point — and it is GC-locked internally for belt-and-suspenders).
+            // Emitted per-op (re-derives the live shape each execution). Lets
+            // `for (k in obj)` loops over plain objects compile.
+            Instr::ForInLive { .. } => {}
             Instr::LoadConst { idx, .. } => {
                 // Numeric constants run in the f64 region; a single-ASCII-char
                 // string constant is resolvable to its interned slot (for
@@ -2298,6 +2374,16 @@ struct HeapHelpers {
     ta_clamp_store: usize,
     /// Whitelisted DataView `get*` helper.
     dv_get: usize,
+    /// Pure unary `Math.<op>` helper (MathFn code, f64 bits → f64 bits).
+    math_unary: usize,
+    /// Pure two-arg `Math.<op>` helper (MathFn code, f64 bits, f64 bits → f64 bits).
+    math_two: usize,
+    /// Pure `CellGet` helper (cell bits → inner Value bits / TDZ-deopt sentinel).
+    cell_get: usize,
+    /// `UpvalGet` helper (upvalue idx → inner Value bits / TDZ-deopt sentinel).
+    upval_get: usize,
+    /// `ForInLive` helper (obj bits, key bits → Bool Value bits).
+    forin_live: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -4885,6 +4971,54 @@ fn emit_box_u32(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
     );
 }
 
+/// Box the double in `xmm0` into `regs[dst]` EXACTLY as `Value::num` does:
+/// an exact-integer in [i32::MIN, i32::MAX] (but NOT -0.0) narrows to an Int
+/// tag; NaN canonicalises to the QNAN double; everything else (incl. -0.0,
+/// ±Inf, non-integral, out-of-range integers) stays the raw f64 bits. Used for
+/// `MathOp` results, whose interpreter arm stores `Value::num(r)` — so a
+/// `Math.floor(x)===3` downstream bits-compare against Int(3) matches.
+/// Clobbers rax/rcx/r10/xmm1.
+fn emit_box_num(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
+    let as_dbl = ops.new_dynamic_label();
+    let store_int = ops.new_dynamic_label();
+    let canon = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    // Every path computes the final boxed bits into `rax`, then falls through to
+    // the single store at `done`.
+    dynasm!(ops
+        // Truncate-to-i32; cvttsd2si yields 0x8000_0000 for NaN / |x|>=2^31 /
+        // ±Inf — those all fail the exact round-trip below, so they fall to the
+        // double path. (i32::MIN itself round-trips and narrows correctly.)
+        ; cvttsd2si ecx, xmm0
+        ; xorps xmm1, xmm1
+        ; cvtsi2sd xmm1, ecx               // back to f64 (exact for any i32)
+        ; ucomisd xmm1, xmm0
+        ; jp => as_dbl                     // NaN operand → not integral
+        ; jne => as_dbl                    // non-integral / out-of-range → double
+        // Integral and in i32 range. Reject -0.0 (its int form 0 loses the sign):
+        // -0.0 narrows to ecx==0 but has the original sign bit set.
+        ; test ecx, ecx
+        ; jnz => store_int                 // non-zero int: narrows
+        ; movq rax, xmm0                   // zero: inspect the original sign bit
+        ; bt rax, 63
+        ; jc => as_dbl                     // -0.0 → keep as double
+        ; => store_int
+        ; mov eax, ecx                     // zero-extend the i32 payload
+        ; mov r10, QWORD INT_TAG as i64
+        ; or rax, r10                      // rax = INT_TAG | (payload as u32)
+        ; jmp => done
+        ; => as_dbl
+        ; ucomisd xmm0, xmm0
+        ; jp => canon                      // NaN → canonical QNAN
+        ; movq rax, xmm0                   // finite/±Inf/-0 → raw f64 bits
+        ; jmp => done
+        ; => canon
+        ; mov rax, QWORD QNAN_BITS as i64
+        ; => done
+        ; mov [rbx + dreg(dst)], rax
+    );
+}
+
 /// Box the double in `xmm0` into `regs[dst]`, CANONICALISING any NaN — raw
 /// TypedArray/DataView bytes could otherwise alias a NaN-box tag (heap-index
 /// forgery). Not int-narrowed (the f64 mem tier's established representation).
@@ -5361,6 +5495,102 @@ fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                     ; => done_n
                 );
+            }
+            Instr::LoadBool { dst, val } => {
+                // Materialise the boolean Value bits (BOOL_TAG | 0/1) inline.
+                let bits = BOOL_TAG | (val as u64);
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::MathOp { dst, op, arg_base, argc } => {
+                // Pure `Math.<op>`. Operands are loaded as numbers (Int/double);
+                // a non-numeric operand BAILS to the interpreter, which runs the
+                // full ToNumber coercion (a user valueOf). So the helpers below
+                // never run user code and never allocate — no r13/r14/TA refetch.
+                // Result boxed via `emit_box_num` (mirrors the interpreter's
+                // `Value::num(r)` exactly: exact-int narrows, -0/NaN preserved).
+                if argc == 1 {
+                    load_num_xmm(&mut ops, arg_base, 0, bail);
+                    dynasm!(ops
+                        ; movq rdx, xmm0                  // arg f64 bits (arg1)
+                        ; mov ecx, op as i32              // MathFn code (repr(u8), arg0)
+                        ; mov rax, QWORD heap.math_unary as i64
+                        ; call rax
+                        ; movq xmm0, rax                  // result f64 bits
+                    );
+                    emit_box_num(&mut ops, dst);
+                } else {
+                    // EXACTLY two args (region_can_compile gated the op set).
+                    load_num_xmm(&mut ops, arg_base, 0, bail);
+                    load_num_xmm(&mut ops, arg_base + 1, 1, bail);
+                    dynasm!(ops
+                        ; movq rdx, xmm0                  // arg0 f64 bits (arg1)
+                        ; movq r8, xmm1                   // arg1 f64 bits (arg2)
+                        ; mov ecx, op as i32              // MathFn code (arg0)
+                        ; mov rax, QWORD heap.math_two as i64
+                        ; call rax
+                        ; movq xmm0, rax
+                    );
+                    emit_box_num(&mut ops, dst);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::CellGet { dst, cell } => {
+                // Per-op captured-cell read (jit_cell_get). NEVER hoisted: a
+                // Call/CallMethod earlier in the region may have run an inner
+                // closure that mutated the cell, so the live value is re-read
+                // here every execution. A TDZ cell returns SELF_CALL_DEOPT → bail
+                // (the interpreter then throws the ReferenceError at this ip).
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(cell)]        // cell Value bits
+                    ; mov rax, QWORD heap.cell_get as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // TDZ → interpreter throws
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::UpvalGet { dst, idx } => {
+                // Per-op upvalue read (jit_upval_get resolves the running closure
+                // from the TOP frame). Same no-hoist soundness as CellGet.
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov edx, idx as i32                // upvalue index
+                    ; mov rax, QWORD heap.upval_get as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                         // TDZ / malformed → interp
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::ForInLive { dst, obj, key } => {
+                // Per-op for-in liveness check (jit_forin_live → Vm::forin_live).
+                // Re-reads the live shape each execution. Stores the Bool Value
+                // bits the helper returns (matches the interpreter's
+                // `Value::bool(live)`). Never deopts. The helper does no VM-heap
+                // alloc on the common path, but `key_of`/proto-walk could grow the
+                // heap in principle — so when the region also has GetProp/SetProp
+                // (the only r13/r14 consumers), re-derive those pinned pointers
+                // afterward (the StrConcat discipline). It runs NO user code, so
+                // the TypedArray snapshots are unaffected.
+                dynasm!(ops
+                    ; mov rcx, rdi                       // vm
+                    ; mov rdx, [rbx + dreg(obj)]         // obj bits
+                    ; mov r8, [rbx + dreg(key)]          // key bits
+                    ; mov rax, QWORD heap.forin_live as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax         // Bool Value bits
+                );
+                if has_prop {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
             }
             Instr::Lt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Lt),
             Instr::Le { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Le),

@@ -1053,6 +1053,169 @@ pub(crate) extern "win64" fn jit_globals_base(vm: *mut core::ffi::c_void) -> *mu
     vm.globals.as_mut_ptr() as *mut u64
 }
 
+/// Win64 helper: a UNARY `Math.<op>` over an already-numeric argument. `code` is
+/// `MathFn as u32` (`#[repr(u8)]`, fixed declaration order); `x_bits` is the
+/// operand's raw f64 bits (the region loaded it as a double after guarding it
+/// numeric). PURE — no vm, no allocation, no user code (the region bails to the
+/// interpreter on a non-numeric arg, where the observable ToNumber coercion
+/// runs). Returns the result's f64 bits. Delegates to the SHARED `math_unary`,
+/// so JS quirks (Round half-up, Sign ±0, Clz32/Fround) match the interpreter
+/// byte-for-byte.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_math_unary(code: u32, x_bits: u64) -> u64 {
+    let op: crate::bytecode::MathFn = unsafe { core::mem::transmute(code as u8) };
+    crate::vm::helpers_num2::math_unary(op, f64::from_bits(x_bits)).to_bits()
+}
+
+/// Win64 helper: a TWO-ARG `Math.<op>` (`Pow`/`Atan2`/`Imul`/`Min`/`Max`/
+/// `Hypot`) over already-numeric arguments (raw f64 bits). PURE — mirrors the
+/// `eval_math_args` arms for exactly two operands (Pow's magnitude-1 /
+/// NaN|Inf-exponent → NaN deviation; Atan2; Imul's ToUint32×ToUint32 → i32;
+/// Min/Max NaN-sticky + −0<+0 ordering; Hypot's ±Inf-forces-+Inf). Returns the
+/// result's f64 bits.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_math_two(code: u32, a_bits: u64, b_bits: u64) -> u64 {
+    use crate::bytecode::MathFn as M;
+    let op: M = unsafe { core::mem::transmute(code as u8) };
+    let a = f64::from_bits(a_bits);
+    let b = f64::from_bits(b_bits);
+    let r = match op {
+        M::Pow => {
+            if (a == 1.0 || a == -1.0) && (b.is_nan() || b.is_infinite()) {
+                f64::NAN
+            } else {
+                a.powf(b)
+            }
+        }
+        M::Atan2 => a.atan2(b),
+        M::Imul => {
+            (crate::vm::helpers_num2::to_uint32(a)
+                .wrapping_mul(crate::vm::helpers_num2::to_uint32(b)) as i32) as f64
+        }
+        // Min/Max over exactly two already-numeric args (NaN-sticky; −0<+0, so
+        // Min prefers −0 and Max prefers +0 on a tie). Matches eval_math_args.
+        M::Min => {
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else if a == b {
+                // tie (incl. ±0): prefer the negative-signed operand
+                if a.is_sign_negative() { a } else { b }
+            } else {
+                a.min(b)
+            }
+        }
+        M::Max => {
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else if a == b {
+                if a.is_sign_positive() { a } else { b }
+            } else {
+                a.max(b)
+            }
+        }
+        // Hypot over exactly two args: a ±Inf operand forces +Inf even with a NaN
+        // partner (eval_math_args sets hypot_inf and returns +Inf). Otherwise the
+        // reduction is acc=0; acc += a*a; acc += b*b; then sqrt — i.e.
+        // sqrt(a*a + b*b), evaluated in that order.
+        M::Hypot => {
+            if a.is_infinite() || b.is_infinite() {
+                f64::INFINITY
+            } else {
+                (a * a + b * b).sqrt()
+            }
+        }
+        // Unary ops never reach here (codegen routes argc==1 to jit_math_unary).
+        _ => f64::NAN,
+    };
+    r.to_bits()
+}
+
+/// Win64 helper: read a captured local's cell (`CellGet`). `cell_bits` is the
+/// register's Value (a Heap-tagged cell); returns the cell's inner Value bits,
+/// or `SELF_CALL_DEOPT` when the cell is still UNINITIALIZED (TDZ) so the region
+/// bails and the interpreter throws the ReferenceError. PURE read: a single heap
+/// load, NO allocation, NO user code, NO GC safe point. The returned bits are
+/// stored straight into a frame register (a GC root) by the caller, so nothing
+/// is held un-rooted. SOUNDNESS: a closure invoked by a Call/CallMethod earlier
+/// in the SAME region can mutate the cell — but this helper is emitted as a
+/// per-op load (never hoisted across a call), so each execution re-reads the
+/// live value.
+///
+/// # Safety
+/// `vm` is a valid `*const Vm`; `cell_bits` is a Heap-tagged cell Value.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_cell_get(vm: *mut core::ffi::c_void, cell_bits: u64) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    let idx = Value::from_bits(cell_bits).heap_index();
+    let v = vm.heap.cell_get(idx);
+    if v.is_uninitialized() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    v.bits()
+}
+
+/// Win64 helper: read one of the running closure's captured cells (`UpvalGet`).
+/// Resolves the closure from the TOP frame — the OSR region runs in place in
+/// that frame, and every helper call returns/pops before the next region op, so
+/// `frames.last()` is always the region's frame (matching the interpreter's
+/// `cur_closure = frames[len-1].closure`). Returns the inner Value bits, or
+/// `SELF_CALL_DEOPT` for a TDZ cell or a malformed-closure edge (interpreter
+/// handles it). PURE: heap loads only, no alloc, no user code, no GC safe point.
+/// Same per-op no-hoist soundness as `jit_cell_get`.
+///
+/// # Safety
+/// `vm` is a valid `*const Vm`; the region runs inside a frame with a closure.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_upval_get(vm: *mut core::ffi::c_void, idx: u32) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    let cur_closure = match vm.frames.last() {
+        Some(f) => f.closure,
+        None => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    // Guard the closure is a real Closure (the interpreter would panic on a
+    // malformed one; across an FFI boundary we must NOT unwind — bail instead).
+    let cell = match vm.heap.get(cur_closure) {
+        crate::heap::HeapObj::Closure { upvalues, .. } => match upvalues.get(idx as usize) {
+            Some(&c) => c,
+            None => return crate::codegen::SELF_CALL_DEOPT,
+        },
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    let v = vm.heap.cell_get(cell);
+    if v.is_uninitialized() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    v.bits()
+}
+
+/// Win64 helper: the per-iteration for-in liveness re-check (`ForInLive`). `obj`
+/// is the receiver, `key` the snapshotted key — returns the BOOL Value bits (so
+/// the region stores it straight into dst, matching `Value::bool(live)`).
+/// Delegates to the SHARED `Vm::forin_live`, so it is byte-identical to the
+/// interpreter arm. NON-observable: no getter / Proxy trap fires, and the
+/// `&self`/`&mut self` callees (`has_property`/`has_own_property`/`key_of`/the
+/// proto walk) never re-enter the dispatch loop. `key_of` may allocate a Rust
+/// `String`, which is NOT a VM-heap allocation and cannot trigger the VM GC.
+/// We additionally take a `gc_lock_guard` so that even if a future change adds a
+/// VM-heap alloc inside the liveness walk, no collection can run while `obj`/
+/// `key` are held only as helper-local bit copies. SOUNDNESS: emitted per-op, so
+/// a shape change by an earlier user-code helper is reflected next execution.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `obj_bits`/`key_bits` are valid Value bits whose
+/// heap objects (if any) are rooted in the caller's frame registers.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_forin_live(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    key_bits: u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let _guard = vm.gc_lock_guard();
+    let live = vm.forin_live(Value::from_bits(obj_bits), Value::from_bits(key_bits));
+    Value::bool(live).bits()
+}
+
 /// Normalise a (possibly negative) slice index into `[0, len]`. Negative
 /// indices count from the end; out-of-range clamps. Matches JS slice/substring.
 pub(crate) fn norm_index(i: i32, len: i32) -> i32 {

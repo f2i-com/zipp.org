@@ -2750,6 +2750,11 @@ impl<'p> Vm<'p> {
                                         ta_snapshot: jit_ta_snapshot as usize,
                                         ta_clamp_store: jit_ta_clamp_store as usize,
                                         dv_get: jit_dv_get as usize,
+                                        math_unary: jit_math_unary as usize,
+                                        math_two: jit_math_two as usize,
+                                        cell_get: jit_cell_get as usize,
+                                        upval_get: jit_upval_get as usize,
+                                        forin_live: jit_forin_live as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
@@ -2852,60 +2857,9 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::ForInLive { dst, obj, key } => {
-                        // EnumerateObjectProperties: a snapshotted key deleted (or
-                        // otherwise removed) before its visit is skipped. The check
-                        // must be NON-observable, so it errs on "live": a primitive
-                        // receiver, a Proxy anywhere on the chain (its has/ownKeys
-                        // traps must not fire here — the snapshot already ran the
-                        // spec'd ownKeys/gopd protocol), and globalThis' reserved
-                        // builtin bindings all stay visited.
                         let o = self.get(base, obj);
                         let kv = self.get(base, key);
-                        // Own-hit fast probe, alloc-free: view the snapshotted
-                        // key's bytes in place (a flat ASCII/UTF-8 string —
-                        // surrogate-bearing keys take the generic path) and ask
-                        // the receiver's own map directly. has_property below
-                        // re-derives the key as a fresh String per chain level.
-                        let own_hit = o.is_heap()
-                            && kv.is_heap()
-                            && match self.heap.str_wtf8_cow(kv.heap_index()) {
-                                Some(std::borrow::Cow::Borrowed(b)) => {
-                                    match (std::str::from_utf8(b), self.heap.get(o.heap_index())) {
-                                        (Ok(k), HeapObj::Object(m)) => m.pos(k).is_some(),
-                                        _ => false,
-                                    }
-                                }
-                                _ => false,
-                            };
-                        let live = if own_hit || !o.is_heap() {
-                            true
-                        } else if self.has_property(o, kv) {
-                            true
-                        } else {
-                            let k = self.key_of(kv);
-                            if self.has_own_property(o, &k) {
-                                true
-                            } else {
-                                // Absent per the ordinary walk — but a Proxy on the
-                                // chain is opaque to it, so treat that as live.
-                                let mut cur = o;
-                                let mut saw_proxy = false;
-                                for _ in 0..100_000 {
-                                    if !cur.is_heap() {
-                                        break;
-                                    }
-                                    if matches!(
-                                        self.heap.get(cur.heap_index()),
-                                        HeapObj::Proxy { .. }
-                                    ) {
-                                        saw_proxy = true;
-                                        break;
-                                    }
-                                    cur = self.object_get_prototype_of(cur);
-                                }
-                                saw_proxy
-                            }
-                        };
+                        let live = self.forin_live(o, kv);
                         self.set(base, dst, Value::bool(live));
                         ip += 1;
                     }
@@ -5935,6 +5889,60 @@ impl<'p> Vm<'p> {
         match self.heap.get(closure) {
             HeapObj::Closure { upvalues, .. } => upvalues[idx as usize],
             _ => panic!("UpvalGet/Set in a frame without a closure"),
+        }
+    }
+
+    /// The per-iteration for-in liveness re-check (EnumerateObjectProperties): is
+    /// the snapshotted key `kv` still present on `o`? Shared by the interpreter
+    /// `ForInLive` arm and the JIT `jit_forin_live` helper so both are byte-
+    /// identical. NON-observable, so it errs on "live": a primitive receiver, a
+    /// Proxy anywhere on the chain (its has/ownKeys traps must NOT fire here — the
+    /// snapshot already ran the spec'd ownKeys/gopd protocol), and globalThis'
+    /// reserved builtin bindings all stay visited. No getter / Proxy trap fires
+    /// and the call does not re-enter the dispatch loop, so it never runs a GC
+    /// safe point (`key_of`'s transient `String` is a Rust alloc, not a VM-heap
+    /// one).
+    pub(crate) fn forin_live(&mut self, o: Value, kv: Value) -> bool {
+        // Own-hit fast probe, alloc-free: view the snapshotted key's bytes in
+        // place (a flat ASCII/UTF-8 string — surrogate-bearing keys take the
+        // generic path) and ask the receiver's own map directly. has_property
+        // below re-derives the key as a fresh String per chain level.
+        let own_hit = o.is_heap()
+            && kv.is_heap()
+            && match self.heap.str_wtf8_cow(kv.heap_index()) {
+                Some(std::borrow::Cow::Borrowed(b)) => {
+                    match (std::str::from_utf8(b), self.heap.get(o.heap_index())) {
+                        (Ok(k), HeapObj::Object(m)) => m.pos(k).is_some(),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+        if own_hit || !o.is_heap() {
+            true
+        } else if self.has_property(o, kv) {
+            true
+        } else {
+            let k = self.key_of(kv);
+            if self.has_own_property(o, &k) {
+                true
+            } else {
+                // Absent per the ordinary walk — but a Proxy on the chain is
+                // opaque to it, so treat that as live.
+                let mut cur = o;
+                let mut saw_proxy = false;
+                for _ in 0..100_000 {
+                    if !cur.is_heap() {
+                        break;
+                    }
+                    if matches!(self.heap.get(cur.heap_index()), HeapObj::Proxy { .. }) {
+                        saw_proxy = true;
+                        break;
+                    }
+                    cur = self.object_get_prototype_of(cur);
+                }
+                saw_proxy
+            }
         }
     }
 
