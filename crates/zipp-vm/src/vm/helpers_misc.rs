@@ -493,6 +493,27 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             return None;
         }
         let idx = v.heap_index();
+        if kind == crate::codegen::STR_PIN_KIND as u32 {
+            // String pin: snapshot a FLAT ASCII string's byte buffer (ptr + units).
+            // ASCII guarantees byte i == UTF-16 unit i, so `charCodeAt(i)` is a
+            // direct byte load. A rope / non-ASCII / non-string snapshots zero
+            // (the region's identity guard then misses → generic helper, which
+            // flattens / handles surrogates). Strings are immutable in this VM, so
+            // the (ptr, len) only goes stale if the object is replaced (different
+            // bits → guard miss) or GC frees it (only across a user-code helper,
+            // after which the region re-snapshots).
+            return match vm.heap.get(idx) {
+                HeapObj::Str(js) if js.is_ascii() => {
+                    let bytes = js.as_bytes();
+                    Some(TaSnap {
+                        obj_bits: ta_bits,
+                        base: bytes.as_ptr() as u64,
+                        len: js.units() as u64,
+                    })
+                }
+                _ => None,
+            };
+        }
         if kind == crate::codegen::DV_PIN_KIND as u32 {
             // DataView pin: base = data + byteOffset, len = byteLength; the
             // view must be attached and (on a shrunk resizable buffer) still

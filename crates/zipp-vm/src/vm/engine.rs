@@ -396,9 +396,16 @@ impl<'p> Vm<'p> {
                 stored_globals.insert(idx);
             }
         }
+        // Per-access pin selector: a TA element access (kind taken from the live
+        // TypedArray), a DataView `get*`, or a flat-ASCII `charCodeAt` string.
+        enum Recv {
+            Ta,
+            Dv,
+            Str,
+        }
         for aip in s..=e {
-            let (obj, is_dv) = match proto.code[aip] {
-                Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => (obj, false),
+            let (obj, recv) = match proto.code[aip] {
+                Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => (obj, Recv::Ta),
                 // A whitelisted DataView `get*` receiver pins the same way
                 // (snapshot: data+byteOffset / byteLength).
                 Instr::CallMethod { obj, name, argc, .. }
@@ -408,7 +415,19 @@ impl<'p> Vm<'p> {
                             .get(name as usize)
                             .is_some_and(|k| crate::codegen::dv_get_kind(k).is_some()) =>
                 {
-                    (obj, true)
+                    (obj, Recv::Dv)
+                }
+                // A `str.charCodeAt(i)` receiver pins as a flat-ASCII string
+                // (snapshot: bytes ptr + units), so the access inlines to a
+                // direct byte load instead of the per-op `jit_char_code_at` call.
+                Instr::CallMethod { obj, name, argc, .. }
+                    if argc == 1
+                        && proto
+                            .string_constants
+                            .get(name as usize)
+                            .is_some_and(|k| k == "charCodeAt") =>
+                {
+                    (obj, Recv::Str)
                 }
                 _ => continue,
             };
@@ -437,9 +456,14 @@ impl<'p> Vm<'p> {
             if !live.is_heap() {
                 continue;
             }
-            let kind = match self.heap.get(live.heap_index()) {
-                HeapObj::TypedArray { kind, .. } if !is_dv && *kind < 9 => *kind,
-                HeapObj::DataView { .. } if is_dv => crate::codegen::DV_PIN_KIND,
+            let kind = match (self.heap.get(live.heap_index()), &recv) {
+                (HeapObj::TypedArray { kind, .. }, Recv::Ta) if *kind < 9 => *kind,
+                (HeapObj::DataView { .. }, Recv::Dv) => crate::codegen::DV_PIN_KIND,
+                // Pin only a FLAT ASCII string — the inline byte load needs
+                // byte i == UTF-16 unit i (a rope/non-ASCII string snapshots
+                // zero and falls to the generic helper, so a wrong pin is safe;
+                // we just skip pinning it here when it can't help).
+                (HeapObj::Str(js), Recv::Str) if js.is_ascii() => crate::codegen::STR_PIN_KIND,
                 _ => continue,
             };
             let slot = match plan.pins.iter().position(|p| p.src == src && p.kind == kind) {

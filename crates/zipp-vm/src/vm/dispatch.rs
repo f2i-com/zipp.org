@@ -2598,10 +2598,39 @@ impl<'p> Vm<'p> {
                             // when the back-edge counter trips, so a rejected /
                             // still-counting loop never pays the body scan.
                             if self.jit.record_region(func_id, t as u32) {
+                                // ── whole-loop region end ── a loop whose body has
+                                // several `continue`s compiles to MANY back-edges
+                                // `Jump{target==header}`. The back-edge that heats
+                                // up first (this `ip`) may be a MIDDLE one, leaving
+                                // the branches below it (a later `if`/`else` arm)
+                                // outside the region — the native code would then
+                                // exit to the interpreter on every iteration that
+                                // takes one of those arms and re-enter (death by
+                                // OSR churn). Extend the region to the LAST back-edge
+                                // to this header (`Jump{target==t}` at the highest
+                                // ip): that is the loop's textual bottom, so the
+                                // region spans the whole body. Every intermediate
+                                // back-edge becomes an in-region jump to the header
+                                // label (region_target handles it), and the only
+                                // out-of-region transfer stays the loop-exit jump
+                                // (an exit stub). A nested loop has its OWN header,
+                                // so its back-edges don't target `t` and don't
+                                // extend us past this loop.
+                                let region_end = {
+                                    let proto = self.func(func_id as usize);
+                                    let last = proto.code.len() - 1;
+                                    let mut e = (ip as usize).min(last);
+                                    for p in (ip as usize + 1)..=last {
+                                        if matches!(proto.code[p], Instr::Jump { target } if target as usize == t) {
+                                            e = p;
+                                        }
+                                    }
+                                    e
+                                };
                                 let region_globals_ok = {
                                     let proto = self.func(func_id as usize);
                                     let s = t as usize;
-                                    let e = (ip as usize).min(proto.code.len() - 1);
+                                    let e = region_end;
                                     proto.code[s..=e].iter().all(|ins| {
                                         let slot = match *ins {
                                             Instr::LoadGlobal { idx, .. } => Some(idx),
@@ -2633,7 +2662,7 @@ impl<'p> Vm<'p> {
                                 let region_call_mix_ok = {
                                     let proto = self.func(func_id as usize);
                                     let s = t as usize;
-                                    let e = (ip as usize).min(proto.code.len() - 1);
+                                    let e = region_end;
                                     let mut fallback = 0usize;
                                     for (off, ins) in proto.code[s..=e].iter().enumerate() {
                                         match ins {
@@ -2684,7 +2713,7 @@ impl<'p> Vm<'p> {
                                 // traced by the GC).
                                 let pending: Vec<u32> = {
                                     let proto = self.func(func_id as usize);
-                                    proto.code[t..=ip as usize]
+                                    proto.code[t..=region_end]
                                         .iter()
                                         .filter_map(|ins| match *ins {
                                             Instr::LoadConst { idx, .. } => {
@@ -2719,12 +2748,12 @@ impl<'p> Vm<'p> {
                                 // that holds a non-BigInt TypedArray NOW. The
                                 // hint is verified per access by an identity
                                 // guard, so a stale/wrong hint is always safe.
-                                let ta_plan = self.build_ta_pin_plan(func_id, t as u32, ip as u32, base);
+                                let ta_plan = self.build_ta_pin_plan(func_id, t as u32, region_end as u32, base);
                                 // Q4 leaf-call inline plan: monomorphic plain-leaf
                                 // callees at this region's Call sites (read-only —
                                 // built before the &proto borrow below).
                                 let leaf_plan =
-                                    self.build_leaf_inline_plan(func_id, t as u32, ip as u32);
+                                    self.build_leaf_inline_plan(func_id, t as u32, region_end as u32);
                                 let proto: *const crate::bytecode::FuncProto =
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
@@ -2733,7 +2762,7 @@ impl<'p> Vm<'p> {
                                     func_id,
                                     proto_ref,
                                     t as u32,
-                                    ip as u32,
+                                    region_end as u32,
                                     jit_globals_base as usize,
                                     crate::codegen::HeapHelperAddrs {
                                         get_prop_miss: jit_get_prop_miss as usize,

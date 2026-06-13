@@ -107,6 +107,14 @@ pub struct TaPin {
 /// `TaPin::kind` marker for a pinned DataView receiver (not a TA element kind).
 pub const DV_PIN_KIND: u8 = 255;
 
+/// `TaPin::kind` marker for a pinned flat-ASCII STRING receiver (not a TA element
+/// kind). Snapshot: `base = bytes.as_ptr()`, `len = units` (== byte len for ASCII),
+/// for inlining `str.charCodeAt(i)` as a direct byte load. A non-ASCII / rope /
+/// non-string snapshots all-zero (the per-access identity guard then misses and the
+/// access takes the generic `jit_char_code_at` helper — full flatten/surrogate
+/// semantics). ASCII-only is the correctness gate: byte i == UTF-16 unit i.
+pub const STR_PIN_KIND: u8 = 254;
+
 /// Compile-time plan for inline TypedArray element access in a memory-path
 /// region: the pins (each gets a 32-byte stack snapshot slot `{obj_bits, base,
 /// len}` filled by `jit_ta_snapshot`) and, per GetIndex/SetIndex ip, which pin
@@ -6822,6 +6830,52 @@ fn compile_region_mem(
                         "push" => heap.array_push,
                         _ => heap.char_code_at,
                     };
+                    // ── pinned-string charCodeAt fast path ── when the OSR plan
+                    // pinned this receiver as a flat ASCII string (snapshot
+                    // {obj_bits, bytes_ptr, units}): identity-guard the receiver,
+                    // materialise the index, then a DIRECT byte load (byte i ==
+                    // UTF-16 unit i for ASCII). Out of range → NaN (charCodeAt
+                    // OOB semantics, == the helper's `unit_at None → NaN`). A
+                    // guard miss / non-integral index / a re-snapshot that found
+                    // the string non-ASCII (slot {0,0,0} → identity miss) falls
+                    // through to the UNCHANGED generic helper below.
+                    let str_pin = (key == "charCodeAt")
+                        .then(|| ta_plan.access.get(&ip))
+                        .flatten()
+                        .filter(|&&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
+                        .map(|&j| j as usize);
+                    let cc_done = ops.new_dynamic_label();
+                    if let Some(slot) = str_pin {
+                        let off = ta_slot_off(slot);
+                        let cc_slow = ops.new_dynamic_label();
+                        let cc_oob = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rax, [rbx + dreg(obj)]      // receiver bits
+                            ; cmp rax, [rsp + off]            // identity vs snapshot
+                            ; jne => cc_slow                  // miss → generic helper
+                        );
+                        // Index → rcx (signed i64). Non-int/fractional/NaN bails to
+                        // the interpreter — exactly the helper's deopt for those.
+                        emit_ta_key(&mut ops, arg_base, bail);
+                        dynasm!(ops
+                            ; test rcx, rcx
+                            ; js => cc_slow                   // negative → helper (array_index None → deopt)
+                            ; mov r10, [rsp + off + 16]       // units (== ASCII byte len)
+                            ; cmp rcx, r10
+                            ; jae => cc_oob                   // i >= len → NaN
+                            ; mov rdx, [rsp + off + 8]        // pinned bytes base
+                            ; movzx eax, BYTE [rdx + rcx]     // ASCII code unit
+                        );
+                        box_eax(&mut ops, dst);
+                        dynasm!(ops
+                            ; jmp => cc_done
+                            ; => cc_oob
+                            ; mov rax, QWORD QNAN_BITS as i64 // charCodeAt OOB → NaN
+                            ; mov [rbx + dreg(dst)], rax
+                            ; jmp => cc_done
+                            ; => cc_slow
+                        );
+                    }
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits
@@ -6833,6 +6887,9 @@ fn compile_region_mem(
                         ; je => bail
                         ; mov [rbx + dreg(dst)], rax
                     );
+                    if str_pin.is_some() {
+                        dynasm!(ops ; => cc_done);
+                    }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 } else {
                     // Generic `obj.m(args…)`: the interpreter-IC call helper
