@@ -164,6 +164,8 @@ impl<'p> Vm<'p> {
                     if let HeapObj::Object(m) = self.heap.get_mut(ti) {
                         m.extensible = false;
                     }
+                    // In-place attrs change: invalidate JIT inline caches.
+                    self.heap.bump_version(ti);
                 } else if !matches!(
                     self.heap.get(ti),
                     HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)

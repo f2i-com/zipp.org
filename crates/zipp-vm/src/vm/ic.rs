@@ -184,8 +184,9 @@ fn builtin_object_method(key: &str) -> bool {
 impl<'p> Vm<'p> {
     /// Exclusions shared with `get_member`'s fast path: objects with live /
     /// exotic slot semantics layered over their ObjMap never take IC paths.
+    /// (Also consulted by the JIT region prop-miss helpers in helpers_misc.rs.)
     #[inline]
-    fn ic_obj_ok(&self, idx: u32) -> bool {
+    pub(crate) fn ic_obj_ok(&self, idx: u32) -> bool {
         !(idx == self.global_this && self.global_this != 0)
             && !(idx == self.arr_proto && self.arr_proto != 0)
             && (self.module_namespaces.is_empty()

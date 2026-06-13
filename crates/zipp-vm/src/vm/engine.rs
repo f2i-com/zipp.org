@@ -7,6 +7,14 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// Cached `ZIPP_CALLLOG` flag (an env read per call-site miss would dominate
+/// the miss path — Windows scans the whole environment block per query).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_call_log() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("ZIPP_CALLLOG").is_some())
+}
+
 impl<'p> Vm<'p> {
     /// Resolve a (unified) function id to its FuncProto: a compile-time program
     /// function for `id < main_func_count`, else a runtime `eval`/`new Function`
@@ -296,6 +304,12 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_recurse_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_call_depth: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            osr_deopt_exempt: false,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_const_strings: Vec::new(),
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             reg_capacity: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regs_hw: 0,
@@ -559,6 +573,291 @@ impl<'p> Vm<'p> {
             // Threw (e.g. RangeError): leave it in pending_throw and signal the
             // native caller to unwind; the top-level interpreter re-raises it.
             Err(_) => crate::codegen::SELF_CALL_DEOPT,
+        }
+    }
+
+    /// The implementation behind the region call helpers `jit_call_method_ic` /
+    /// `jit_call_ic` (`is_method` selects which). A compiled OSR region reached
+    /// a `CallMethod`/`Call` op: consult the SAME per-site inline cache the
+    /// interpreter uses, push the resolved plain user function with FULL
+    /// `setup_call` semantics (this-binding, rest, arguments object,
+    /// MAX_FRAMES), and run it to completion via `run_loop`. Three-state
+    /// result (see the helper docs): result bits / `SELF_CALL_DEOPT` /
+    /// `CALL_THREW`.
+    ///
+    /// Reentrancy contract (what the calling region may rely on):
+    /// * `self.regs` never reallocates (pinned by `reserve_jit_regs`; every
+    ///   growth site checks `regs_would_overflow`) — the region's window base
+    ///   (rbx) stays valid. The callee windows are appended above the region's
+    ///   frame and truncated back before this returns.
+    /// * `self.globals` never reallocates — r12 stays valid.
+    /// * The heap's versions array and the JIT IC table MAY move (the callee
+    ///   can allocate, and can trigger a nested region compile — nested
+    ///   execution runs at `jit_recurse_depth == 0`, so the JIT gates are
+    ///   open) — the region RE-FETCHES r13/r14 after this helper returns.
+    /// * A nested deopt can EVICT the (still-running) calling region; evicted
+    ///   regions are parked in `Jit::retired`, never dropped mid-run.
+    /// * No `Value` is held in native registers across this call (the memory
+    ///   path stores every result to the reg file before the next op), and
+    ///   this function holds no `Vec<Value>` across the callee run — all live
+    ///   values sit in regs/frames/heap, the GC root set.
+    ///
+    /// Depth: each level nests `run_loop` on the Rust stack, so recursion
+    /// through region call sites is capped at `JIT_REGION_CALL_MAX`; past it
+    /// the call deopts to the interpreter's flat frames (and sets
+    /// `osr_deopt_exempt` so the region isn't punished for legal recursion).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_call_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+        argc: u16,
+        is_method: bool,
+    ) -> u64 {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            // Legal-but-deep recursion: not a region-quality signal — don't
+            // count it toward eviction.
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = (packed_fip as u32) as usize;
+        let arg_base = (packed_args & 0xFFFF) as u16;
+        // Caller window base as a slot index (the region tracks it by raw
+        // pointer; the buffer is pinned, so the offset is stable).
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+
+        // Resolve through the interpreter's per-site IC — IDENTICAL resolution
+        // order to the interpreter (which consults the IC first; everything the
+        // IC won't claim, incl. '#private' names, builtins, natives, accessors,
+        // generators/async, exotic receivers, deopts to the interpreter).
+        let (fid, closure, this_v, callee_v) = if is_method {
+            let obj = ((packed_args >> 16) & 0xFFFF) as u16;
+            let name = (packed_args >> 32) as u32;
+            let recv = self.get(base, obj);
+            // `func()` borrows &'p (program lifetime) — outlives `&mut self`.
+            let key: &str = &self.func(func_id as usize).string_constants[name as usize];
+            match self.ic_call_method(func_id, ip, recv, key) {
+                Some((fid, closure, callee)) => (fid, closure, recv, callee),
+                None => {
+                    if jit_call_log() {
+                        eprintln!("[call] METHOD MISS fn{func_id}@{ip} key={key}");
+                    }
+                    // Builtin fallback: the EXACT paths the interpreter runs
+                    // next for this op (`try_builtin_method`, then a
+                    // ctor-object native like `Math.floor`) — run to
+                    // completion, never deopting after a side effect.
+                    return self.jit_method_builtin_fallback(recv, key, base, arg_base, argc);
+                }
+            }
+        } else {
+            let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
+            let cv = self.get(base, callee_reg);
+            match self.ic_call(func_id, ip, cv) {
+                Some((fid, closure)) => (fid, closure, Value::UNDEFINED, cv),
+                None => {
+                    if jit_call_log() {
+                        eprintln!("[call] CALL MISS fn{func_id}@{ip}");
+                    }
+                    // A plain NATIVE callee (parseInt, …): invoke via
+                    // call_value with this=undefined, exactly like the
+                    // interpreter's Call op. Everything else deopts.
+                    if cv.is_heap()
+                        && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
+                    {
+                        let argv: Vec<Value> =
+                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                        return match self.call_value(cv, Value::UNDEFINED, &argv) {
+                            Ok(v) => v.bits(),
+                            Err(t) => self.jit_thrown_to_sentinel(t),
+                        };
+                    }
+                    return SELF_CALL_DEOPT;
+                }
+            }
+        };
+
+        // Push the callee frame exactly like the interpreter's Call/CallMethod
+        // IC-hit path, and run it to completion.
+        self.jit_frame_call(fid, closure, this_v, base, arg_base, argc, ip, callee_v)
+    }
+
+    /// The interpreter's post-IC `CallMethod` fallbacks, run from a region call
+    /// helper TO COMPLETION (a path that has side effects must never deopt
+    /// afterwards): `try_builtin_method` (array/string/… builtins, exactly the
+    /// interpreter's next step), then a ctor-object data prop holding a NATIVE
+    /// (`Math.floor`, `JSON.parse`, … — a side-effect-free resolution) invoked
+    /// via `call_value`. Anything else deopts BEFORE doing anything.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_method_builtin_fallback(
+        &mut self,
+        recv: Value,
+        key: &str,
+        base: usize,
+        arg_base: u16,
+        argc: u16,
+    ) -> u64 {
+        match self.try_builtin_method(recv, key, base, arg_base, argc) {
+            Ok(Some(v)) => return v.bits(),
+            Ok(None) => {}
+            Err(t) => return self.jit_thrown_to_sentinel(t),
+        }
+        if recv.is_heap() {
+            if let HeapObj::Object(m) = self.heap.get(recv.heap_index()) {
+                if m.is_ctor {
+                    if let Some(i) = m.pos(key) {
+                        if !m.attrs[i].accessor {
+                            let f = m.vals[i];
+                            if f.is_heap()
+                                && matches!(self.heap.get(f.heap_index()), HeapObj::Native(_))
+                            {
+                                let argv: Vec<Value> =
+                                    (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                                return match self.call_value(f, recv, &argv) {
+                                    Ok(v) => v.bits(),
+                                    Err(t) => self.jit_thrown_to_sentinel(t),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        crate::codegen::SELF_CALL_DEOPT
+    }
+
+    /// Materialize a `Thrown` from a region-helper-run operation exactly like
+    /// `run_loop`'s Err path does (synthesize the Error object if no JS value
+    /// is pending), then signal `CALL_THREW` so the region exits and the
+    /// interpreter unwinds. Exempt from deopt accounting (a throw is not a
+    /// region-quality signal).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_thrown_to_sentinel(&mut self, t: Thrown) -> u64 {
+        if self.pending_throw.is_none() {
+            let v = self.alloc_error_from_message(&t.0);
+            self.realm_adopt_error(v);
+            self.pending_throw = Some(v);
+        }
+        self.osr_deopt_exempt = true;
+        crate::codegen::CALL_THREW
+    }
+
+    /// Frame-call a resolved plain user function FROM NATIVE REGION CODE and
+    /// run it to completion: the shared tail of the region call helpers and the
+    /// property-slow helpers (getters/setters). Returns the result bits,
+    /// `SELF_CALL_DEOPT` (setup failed without materializing a JS error — the
+    /// interpreter re-executes the op), or `CALL_THREW` (`pending_throw` set;
+    /// the region exits and the interpreter unwinds). `dst` = 0 is never
+    /// written: `run_loop` returns the stop frame's value BEFORE delivering to
+    /// `ret_dst`; the native caller stores/discards it itself.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn jit_frame_call(
+        &mut self,
+        fid: u32,
+        closure: u32,
+        this_v: Value,
+        caller_base: usize,
+        arg_base: u16,
+        argc: u16,
+        ip: usize,
+        callee_v: Value,
+    ) -> u64 {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        if self
+            .setup_call(fid, closure, this_v, caller_base, arg_base, argc, 0, ip + 1, callee_v)
+            .is_err()
+        {
+            // MAX_FRAMES / regs overflow / this-boxing error. If a JS error
+            // value was already materialized, unwind (never re-execute);
+            // otherwise let the interpreter re-execute the op and surface the
+            // identical error itself.
+            return if self.pending_throw.is_some() {
+                self.osr_deopt_exempt = true;
+                CALL_THREW
+            } else {
+                SELF_CALL_DEOPT
+            };
+        }
+        let stop = self.frames.len() - 1;
+        self.jit_call_depth += 1;
+        let r = self.run_loop(stop);
+        self.jit_call_depth -= 1;
+        match r {
+            Ok(v) => v.bits(),
+            Err(_) => {
+                // The callee threw and nothing below `stop` handled it:
+                // `pending_throw` is set, the callee frames are unwound, and the
+                // region must EXIT so the interpreter unwinds the region's own
+                // frame (its try handlers were pushed before the loop). A throw
+                // is not a region-quality signal — exempt the deopt counter.
+                self.osr_deopt_exempt = true;
+                CALL_THREW
+            }
+        }
+    }
+
+    /// The implementation behind `jit_get_prop_slow` / `jit_set_prop_slow`: a
+    /// region's prop-miss helper found a resolution only the interpreter's
+    /// per-site IC machinery can serve (an accessor needing a frame call, or a
+    /// class-instance receiver). Consults `ic_get_prop` / `ic_set_prop` — the
+    /// SAME caches the interpreter uses — and frame-calls plain getters and
+    /// setters to completion. Returns the value bits (get) or 0 (set),
+    /// `SELF_CALL_DEOPT` (no IC resolution — the interpreter re-executes the
+    /// op), or `CALL_THREW`. Reentrancy contract: as `jit_region_call_impl`
+    /// (the calling region re-derives r13/r14 after this helper).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_prop_slow_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed2: u64,
+        is_set: bool,
+    ) -> u64 {
+        use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        use crate::vm::ic::{GetAct, SetAct};
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = (packed_fip as u32) as usize;
+        let name = (packed2 >> 32) as u32;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: caller_base_ptr lies within self.regs' pinned buffer.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let key: &str = &self.func(func_id as usize).string_constants[name as usize];
+        if is_set {
+            let obj_reg = ((packed2 >> 16) & 0xFFFF) as u16;
+            let val_reg = (packed2 & 0xFFFF) as u16;
+            let recv = self.get(base, obj_reg);
+            let val = self.get(base, val_reg);
+            match self.ic_set_prop(func_id, ip, recv, key, val) {
+                SetAct::Done => 0,
+                SetAct::Setter { fid, closure, setter } => {
+                    let r = self.jit_frame_call(fid, closure, recv, base, val_reg, 1, ip, setter);
+                    if r == CALL_THREW || r == SELF_CALL_DEOPT {
+                        r
+                    } else {
+                        0 // the setter's return value is discarded
+                    }
+                }
+                SetAct::None => SELF_CALL_DEOPT,
+            }
+        } else {
+            let obj_reg = (packed2 & 0xFFFF) as u16;
+            let recv = self.get(base, obj_reg);
+            match self.ic_get_prop(func_id, ip, recv, key) {
+                GetAct::Value(v) => v.bits(),
+                GetAct::Accessor { fid, closure, getter } => {
+                    self.jit_frame_call(fid, closure, recv, base, 0, 0, ip, getter)
+                }
+                GetAct::None => SELF_CALL_DEOPT,
+            }
         }
     }
 
@@ -2632,6 +2931,9 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
                     *slot = m;
                 }
+                // Whole-map replacement: invalidate any JIT inline cache that
+                // captured the old vals pointer.
+                self.heap.bump_version(idx);
             }
         }
     }

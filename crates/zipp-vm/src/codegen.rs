@@ -103,6 +103,27 @@ pub struct HeapHelperAddrs {
     pub concat: usize,
     /// Helper for in-place `a + b` (`StrAppendInPlace`) — returns the result bits.
     pub str_append: usize,
+    /// Helper for a generic `obj.m(args…)` (`CallMethod`) in a region: consults
+    /// the interpreter's per-site inline cache and frame-calls the resolved
+    /// plain user function to completion. Returns the result bits,
+    /// `SELF_CALL_DEOPT` (IC miss / megamorphic / depth limit → re-execute the
+    /// op in the interpreter), or `CALL_THREW` (exception pending → the region
+    /// exits and the interpreter unwinds WITHOUT re-executing the call).
+    pub call_method_ic: usize,
+    /// Helper for a generic `f(args…)` (`Call`) in a region (same protocol).
+    pub call_ic: usize,
+    /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
+    /// class-instance receiver): interpreter-IC resolution + getter frame
+    /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
+    pub get_prop_slow: usize,
+    /// The `SetProp` sibling of `get_prop_slow` (setter frame call; 0 = done).
+    pub set_prop_slow: usize,
+    /// Helper for a region `===`/`!==` whose operands are non-interned heap
+    /// values: full `strict_eq` (read-only; returns 0/1, never deopts).
+    pub strict_eq: usize,
+    /// Helper for a region truthiness test on a non-Int/Bool value (`!x`,
+    /// `JumpIfFalse/True` conditions): full `truthy` (read-only; 0/1).
+    pub truthy: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -166,20 +187,79 @@ pub struct FieldSyncPlan {
     pub func_id: u32,
 }
 
-/// One monomorphic inline-cache slot for a JIT'd `GetProp`/`SetProp` site.
-/// `repr(C)` with a fixed layout the native code indexes directly:
-/// `obj_bits @0`, `vals_ptr @8`, `version @16`, `slot @20` (stride 24). A native
-/// fast path checks `obj_bits` (object identity) AND the live object `version`
-/// (read from the heap's parallel version array) against the cache; on a hit it
-/// reads/writes `vals_ptr[slot]` with NO call (slots never move — keys are
-/// append-only). `obj_bits == 0` means empty (no real object Value is 0).
+/// Ways per JIT inline-cache site (matches the interpreter's `IC_WAYS`): a
+/// region `GetProp`/`SetProp` probes up to this many entries natively before
+/// falling to the miss helper, so polymorphic shape-cycling loops stay call-free.
+pub const JIT_IC_WAYS: usize = 8;
+/// Byte stride of one [`IcEntry`] (`size_of`, kept explicit for the emitter).
+pub const JIT_IC_STRIDE: usize = 64;
+/// Maximum proto-chain hops one [`IcEntry`] can guard (the interpreter's
+/// `IC_MAX_HOPS` is 6; 5 fits the 64-byte entry and covers depth-5 chains —
+/// the deepest the real-world benches walk).
+pub const JIT_IC_MAX_HOPS: usize = 5;
+
+/// One way of a JIT'd `GetProp`/`SetProp` site's inline cache. `repr(C)` with a
+/// fixed layout the native code indexes directly: `obj_bits @0`, `vals_ptr @8`,
+/// `version @16`, `slot|nhops<<24 @20`, then `nhops` pairs `(hop_idx @24+8k,
+/// hop_ver @28+8k)` (stride 64). The native probe checks `obj_bits` (receiver
+/// identity) AND the receiver's live `version` (read from the heap's parallel
+/// version array — catches own key add/remove/redefine, freeze, and
+/// setPrototypeOf, all of which bump it) — then, for a PROTO-CHAIN entry
+/// (`nhops > 0`), the live version of each chain hop down to the holder (whose
+/// `vals_ptr`/`slot` the hit reads); any chain mutation bumps a guarded hop.
+/// Writes only ever fill OWN entries (`nhops == 0`). On a full match it
+/// reads/writes `vals_ptr[slot]` with NO call (slots never move without a
+/// version bump). `obj_bits == 0` means empty (no real object Value is 0).
+/// `slot` is packed into 24 bits (an ObjMap with 16M+ keys is unreachable —
+/// fills exceeding it are skipped defensively).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct IcEntry {
-    obj_bits: u64,
-    vals_ptr: u64,
-    version: u32,
-    slot: u32,
+    pub obj_bits: u64,
+    pub vals_ptr: u64,
+    pub version: u32,
+    pub slot_nhops: u32,
+    pub hops: [(u32, u32); JIT_IC_MAX_HOPS],
+}
+
+impl IcEntry {
+    /// An OWN-property way (receiver == holder; no hop guards). `None` if the
+    /// slot doesn't fit the 24-bit packing (never in practice).
+    pub fn own(obj_bits: u64, vals_ptr: u64, version: u32, slot: u32) -> Option<IcEntry> {
+        if slot > 0x00FF_FFFF {
+            return None;
+        }
+        Some(IcEntry {
+            obj_bits,
+            vals_ptr,
+            version,
+            slot_nhops: slot,
+            hops: [(0, 0); JIT_IC_MAX_HOPS],
+        })
+    }
+
+    /// A PROTO-CHAIN way: the holder is `hops.len()` (1..=5) hops from the
+    /// receiver; every hop is version-guarded.
+    pub fn chain(
+        obj_bits: u64,
+        vals_ptr: u64,
+        version: u32,
+        slot: u32,
+        hops: &[(u32, u32)],
+    ) -> Option<IcEntry> {
+        if slot > 0x00FF_FFFF || hops.is_empty() || hops.len() > JIT_IC_MAX_HOPS {
+            return None;
+        }
+        let mut h = [(0u32, 0u32); JIT_IC_MAX_HOPS];
+        h[..hops.len()].copy_from_slice(hops);
+        Some(IcEntry {
+            obj_bits,
+            vals_ptr,
+            version,
+            slot_nhops: slot | ((hops.len() as u32) << 24),
+            hops: h,
+        })
+    }
 }
 
 /// Dense function-tier states (see `Jit::fn_state`).
@@ -207,11 +287,14 @@ pub struct Jit {
     /// Loop headers where the INTEGER path was tried and deoptimised; the next
     /// compile for the key skips int and uses the double path instead.
     region_int_blacklist: FxHashSet<(u32, u32)>,
-    /// Inline-cache slots for heap-op JIT sites, indexed by a global site id
-    /// assigned at compile time. Grows only at compile time (never during a
-    /// native run), so a base pointer fetched in a region prologue stays valid
-    /// for that run; a `*_miss` helper only UPDATES an existing entry (no growth).
+    /// Inline-cache ways for heap-op JIT sites: site `k` owns the contiguous
+    /// entries `[k*JIT_IC_WAYS, (k+1)*JIT_IC_WAYS)`. Grows only at compile time
+    /// (never during a native run, EXCEPT through a region call helper — after
+    /// which the region re-derives its pinned base pointer); a `*_miss` helper
+    /// only UPDATES existing ways (no growth).
     ic_table: Vec<IcEntry>,
+    /// Round-robin fill cursor per site (parallel to `ic_table` / JIT_IC_WAYS).
+    ic_rot: Vec<u8>,
     /// One-entry cache of the most recent self-call target `(func_id, native
     /// entry)`. A self-recursive function (e.g. `fib`) always recurses into the
     /// SAME `func_id`, so this hits on every call and skips the `compiled`
@@ -228,6 +311,14 @@ pub struct Jit {
     reduce_kernels: FxHashMap<u32, Option<JitFn>>,
     /// Compiled fused `filter` kernels, keyed by predicate `func_id` (as above).
     filter_kernels: FxHashMap<u32, Option<JitFn>>,
+    /// Evicted regions parked here instead of being dropped. A region can be
+    /// evicted REENTRANTLY (its `jit_call_*_ic` helper runs user code, which can
+    /// loop back into the SAME region and deopt it past the limit) while an
+    /// outer activation of that region is still executing on the native stack —
+    /// dropping the `ExecutableBuffer` then would unmap code we're inside.
+    /// Parked regions are freed only when the VM drops. Bounded: each loop key
+    /// evicts at most twice (int retry, then blacklist).
+    retired: Vec<Region>,
 }
 
 impl Jit {
@@ -369,6 +460,16 @@ impl Jit {
         *c == OSR_THRESHOLD
     }
 
+    /// Permanently blacklist the region headed at `entry_ip` (the dispatch-side
+    /// call-mix gate found it would lose to the interpreter — e.g. dominated by
+    /// always-fallback native-callee sites).
+    pub fn blacklist_region(&mut self, func_id: u32, entry_ip: u32) {
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!("[jit] region fn{func_id} [{entry_ip}] DECLINED (call-mix gate)");
+        }
+        self.region_blacklist.insert((func_id, entry_ip));
+    }
+
     /// Undo the threshold trip reported by [`Jit::record_region`]: the caller
     /// found the region not YET safe to compile (an uninitialized global in
     /// the body) but expects it to become safe — re-arm so a later back-edge
@@ -394,6 +495,7 @@ impl Jit {
         heap_helpers: HeapHelperAddrs,
         field_pool_base: u32,
         field_pool_size: u32,
+        const_strs: &FxHashMap<u32, u64>,
     ) {
         let key = (func_id, start);
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
@@ -466,9 +568,15 @@ impl Jit {
             char_code_at: heap_helpers.char_code_at,
             concat: heap_helpers.concat,
             str_append: heap_helpers.str_append,
+            call_method_ic: heap_helpers.call_method_ic,
+            call_ic: heap_helpers.call_ic,
+            get_prop_slow: heap_helpers.get_prop_slow,
+            set_prop_slow: heap_helpers.set_prop_slow,
+            strict_eq: heap_helpers.strict_eq,
+            truthy: heap_helpers.truthy,
             ic_base_idx,
         };
-        match compile_region(proto, start, end, globals_base_helper, helpers) {
+        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs) {
             Some(code) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] DOUBLE/MEM region fn{func_id} [{start},{end}] compiled");
@@ -494,6 +602,9 @@ impl Jit {
         let (evict, retry) = if let Some(r) = self.regions.get_mut(&key) {
             if resume_ip >= r.start && resume_ip <= r.end {
                 r.deopts += 1;
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[jit] region fn{} [{}] deopt at ip {}", key.0, key.1, resume_ip);
+                }
                 // Retry on a SIMPLER path if this was an int region (value grew
                 // past 2^53 → double handles it) or a SROA region (a field turned
                 // non-numeric → the inline-cache mem path handles any type).
@@ -508,7 +619,12 @@ impl Jit {
             if std::env::var_os("ZIPP_JITLOG").is_some() {
                 eprintln!("[jit] region fn{} [{}] EVICTED (retry={retry})", key.0, key.1);
             }
-            self.regions.remove(&key);
+            // Park, don't drop: an outer activation of this region may still be
+            // running (a call helper re-entered the interpreter, which looped
+            // back into the region and deopted it) — see `retired`.
+            if let Some(r) = self.regions.remove(&key) {
+                self.retired.push(r);
+            }
             if retry {
                 // Don't blacklist the loop — let it recompile on a more general
                 // path (region_int_blacklist also gates the SROA + int attempts).
@@ -521,12 +637,14 @@ impl Jit {
         }
     }
 
-    /// Reserve `n` fresh inline-cache slots (one per heap-op site in a region),
-    /// returning the base global site id. The slots start empty (`obj_bits == 0`
-    /// ⇒ always miss on first use).
+    /// Reserve `n` fresh inline-cache sites (one per heap-op site in a region;
+    /// `JIT_IC_WAYS` ways each), returning the base global site id. The ways
+    /// start empty (`obj_bits == 0` ⇒ always miss on first use).
     pub fn reserve_ic_sites(&mut self, n: usize) -> u32 {
-        let base = self.ic_table.len() as u32;
-        self.ic_table.resize(self.ic_table.len() + n, IcEntry::default());
+        let base = (self.ic_table.len() / JIT_IC_WAYS) as u32;
+        self.ic_table
+            .resize(self.ic_table.len() + n * JIT_IC_WAYS, IcEntry::default());
+        self.ic_rot.resize(self.ic_rot.len() + n, 0);
         base
     }
 
@@ -535,25 +653,39 @@ impl Jit {
         self.ic_table.as_ptr()
     }
 
-    /// Fill inline-cache slot `site` after a miss (called by the `*_miss` helpers).
-    /// Never grows the table (the slot was reserved at compile time), so a pinned
-    /// base pointer in a running region stays valid.
-    pub fn set_ic(&mut self, site: u32, obj_bits: u64, vals_ptr: u64, version: u32, slot: u32) {
-        if let Some(e) = self.ic_table.get_mut(site as usize) {
-            *e = IcEntry { obj_bits, vals_ptr, version, slot };
+    /// Fill one way of inline-cache site `site` after a miss (called by the
+    /// `*_miss` helpers): an existing way for the same receiver identity is
+    /// updated in place, else the next empty way, else round-robin eviction.
+    /// Never grows the table (the site was reserved at compile time), so a
+    /// pinned base pointer in a running region stays valid. `site == u32::MAX`
+    /// (the hoisted-`.length` pseudo-site) is ignored.
+    pub fn set_ic(&mut self, site: u32, e: IcEntry) {
+        let base = (site as usize).wrapping_mul(JIT_IC_WAYS);
+        let Some(ways) = self.ic_table.get_mut(base..base + JIT_IC_WAYS) else {
+            return;
+        };
+        if let Some(w) = ways.iter_mut().find(|w| w.obj_bits == e.obj_bits) {
+            *w = e;
+            return;
         }
+        if let Some(w) = ways.iter_mut().find(|w| w.obj_bits == 0) {
+            *w = e;
+            return;
+        }
+        let r = &mut self.ic_rot[site as usize];
+        ways[*r as usize % JIT_IC_WAYS] = e;
+        *r = r.wrapping_add(1);
     }
 }
 
 impl Region {
-    /// Run this region's native code over the register window `regs` (vm pointer
-    /// `vm`). Returns the ip to resume interpreting at. See `JitFn::run`.
-    ///
-    /// # Safety
-    /// Same contract as [`JitFn::run`].
-    pub unsafe fn run(&self, regs: *mut u64, vm: *mut core::ffi::c_void) -> u32 {
-        let (_result, resume) = self.code.run(regs, vm);
-        resume
+    /// Raw native entry pointer (into the region's mmap'd `ExecutableBuffer`,
+    /// which never moves — stable across `regions`-map rehashes and, via
+    /// `Jit::retired`, even across an eviction of a still-running region).
+    /// The caller invokes it with the `JitFn::run` ABI; the returned bail slot
+    /// is the ip to resume interpreting at.
+    pub fn entry(&self) -> *const u8 {
+        self.code.entry()
     }
 
     /// The object scalar-replacement sync plan, if this region was field-promoted.
@@ -713,6 +845,7 @@ fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::GetProp { dst, .. }
         | Instr::StrConcat { dst, .. }
         | Instr::StrAppendInPlace { dst, .. }
+        | Instr::Bitwise { dst, .. }
         | Instr::Call { dst, .. } => Some(dst),
         _ => None,
     }
@@ -1204,6 +1337,26 @@ fn jump_if_not_cmp(
 /// retried through the normal interpreter path. Chosen as a quiet-NaN tag value
 /// no real `Value` produces (it is NOT a valid boxed Value).
 pub const SELF_CALL_DEOPT: u64 = 0x7FFE_DEAD_BEEF_0000;
+
+/// THREW sentinel the region call helpers (`jit_call_method_ic` / `jit_call_ic`)
+/// return when the frame-called function THREW: the call's side effects already
+/// happened and `pending_throw` is set, so the region must exit and the
+/// interpreter must UNWIND (never re-execute the call op). Distinct from
+/// `SELF_CALL_DEOPT`, which means "nothing happened yet — redo in the
+/// interpreter". Like the deopt sentinel, a quiet-NaN pattern no boxed `Value`
+/// produces.
+pub const CALL_THREW: u64 = 0x7FFE_DEAD_BEEF_0001;
+
+/// Sentinel the `*_prop_miss` helpers return when the access resolves to
+/// something only the interpreter's per-site IC machinery can serve — an
+/// ACCESSOR that must frame-call user code, or a CLASS-INSTANCE receiver
+/// (method/getter/setter on the class chain). The region then calls the
+/// `jit_get_prop_slow` / `jit_set_prop_slow` helper (which consults
+/// `ic_get_prop`/`ic_set_prop` and frame-calls plain getters/setters), and
+/// re-derives its pinned r13/r14 afterwards (user code may have run). Nothing
+/// has happened yet when this is returned — the slow helper (or, after ITS
+/// deopt, the interpreter) performs the access.
+pub const PROP_VIA_IC: u64 = 0x7FFE_DEAD_BEEF_0002;
 
 /// Emit a self-recursive call: `regs[dst] = self(regs[arg_base..arg_base+argc])`.
 ///
@@ -1849,9 +2002,16 @@ fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
 const BOOL_TAG: u64 = INT_TAG + (1u64 << 48);
 
 /// Can the loop region `[start, end]` be compiled in the double subset? Every op
-/// in range must be numeric/control-flow with no call/heap/closure op, and any
-/// `LoadConst` must reference a numeric constant.
-fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
+/// in range must be numeric/control-flow with no closure op, and any `LoadConst`
+/// must reference a numeric constant, a single-ASCII-char string, or (MEM path
+/// only — `const_strs` is `Some`) a string constant pre-interned at compile time
+/// whose bits the emitter embeds (`const_strs` maps constant index → bits).
+fn region_can_compile(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    const_strs: Option<&FxHashMap<u32, u64>>,
+) -> bool {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
     if e <= s || e >= code.len() {
@@ -1881,6 +2041,11 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::Mod { .. }
             | Instr::AddInt { .. }
             | Instr::Neg { .. }
+            // Bitwise ops (`|`/`&`/`^`/`<<`/`>>`/`>>>`) — handled by the MEMORY
+            // path (Int or exactly-integral-double operands; anything else
+            // bails). The `(x + y) | 0` / `i & 7` idioms gate most real
+            // object/method loops, so regions must admit them.
+            | Instr::Bitwise { .. }
             | Instr::Lt { .. }
             | Instr::Le { .. }
             | Instr::Gt { .. }
@@ -1894,7 +2059,7 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::JumpIfNotLe { .. }
             // Heap property ops — handled by the MEMORY path via win64 helper
             // calls (the int/regalloc paths decline, so heap regions take the
-            // mem path). A `Print`/`Call`/etc. anywhere still rejects the region.
+            // mem path). A `Print`/etc. anywhere still rejects the region.
             | Instr::GetProp { .. }
             | Instr::SetProp { .. }
             // Dense-array element read/write `a[i]` / `a[i]=v` — handled by the
@@ -1908,42 +2073,52 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
             | Instr::StrAppendInPlace { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
-            // A whitelist of cheap, fixed-arity builtin method calls — handled by
-            // the MEMORY path via a dedicated win64 helper (jit_array_push /
-            // jit_char_code_at). Anything else (a user method, an unlisted builtin,
-            // wrong arity) rejects the region.
-            Instr::CallMethod { name, argc, .. } => {
-                let key = proto.string_constants.get(name as usize).map(|s| s.as_str());
-                if !(argc == 1 && matches!(key, Some("push") | Some("charCodeAt"))) {
-                    return false;
-                }
-            }
+            // Method calls — handled by the MEMORY path. `arr.push(x)` /
+            // `str.charCodeAt(i)` keep their dedicated win64 helpers; every
+            // other `obj.m(…)` compiles to a `jit_call_method_ic` helper call
+            // that consults the interpreter's per-site inline cache and
+            // frame-calls the resolved plain user function (IC miss /
+            // megamorphic / native callee → deopt to the interpreter at this
+            // op; repeated deopts evict the region).
+            Instr::CallMethod { .. } => {}
+            // Plain calls `f(…)` — same protocol via `jit_call_ic`.
+            Instr::Call { .. } => {}
+            // Logical `!` — MEM path (Bool flips natively; anything else goes
+            // through the `jit_truthy` helper).
+            Instr::Not { .. } => {}
             Instr::LoadConst { idx, .. } => {
                 // Numeric constants run in the f64 region; a single-ASCII-char
                 // string constant is resolvable to its interned slot (for
-                // `s[i] === "x"` scans). Anything else (multi-char / non-ASCII
-                // string, etc.) rejects the region.
+                // `s[i] === "x"` scans); a multi-char string constant is
+                // accepted on the MEM path when its pre-interned bits are in
+                // `const_strs`. Anything else rejects the region.
                 match proto.constants.get(idx as usize) {
                     Some(c) if c.is_number() => {}
                     Some(&c) if single_char_const_bits(proto, c).is_some() => {}
-                    _ => return false,
+                    Some(_) if const_strs.is_some_and(|m| m.contains_key(&idx)) => {}
+                    _ => {
+                        if std::env::var_os("ZIPP_JITDUMP").is_some() {
+                            eprintln!("[decline] non-region LoadConst at region [{start},{end}]");
+                        }
+                        return false;
+                    }
                 }
             }
-            _ => return false,
+            ref other => {
+                if std::env::var_os("ZIPP_JITDUMP").is_some() {
+                    eprintln!("[decline] {other:?} at region [{start},{end}]");
+                }
+                return false;
+            }
         }
     }
-    // `StrConcat`'s helper allocates (growing the heap's parallel version array),
-    // which would invalidate the pinned version-array pointer (`r13`) that a
-    // `GetProp`/`SetProp` inline cache relies on. Forbid the two in one region.
-    let has_concat = code[s..=e]
-        .iter()
-        .any(|i| matches!(i, Instr::StrConcat { .. } | Instr::StrAppendInPlace { .. }));
-    let has_prop = code[s..=e]
-        .iter()
-        .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
-    if has_concat && has_prop {
-        return false;
-    }
+    // NOTE: helpers that can allocate (`StrConcat`/`StrAppendInPlace`) or run
+    // user code (`Call`/`CallMethod`) USED to be forbidden alongside
+    // GetProp/SetProp because the inline cache pins the heap version-array
+    // pointer (r13) and the IC table pointer (r14), which an allocation /
+    // a nested region compile can move. The memory path now RE-FETCHES those
+    // pinned pointers after every such helper call instead (see
+    // `emit_refetch_pinned`), so the mix is allowed.
     true
 }
 
@@ -1958,12 +2133,18 @@ fn region_can_compile(proto: &FuncProto, start: u32, end: u32) -> bool {
 fn hoistable_length(proto: &FuncProto, start: u32, end: u32) -> Option<(usize, u16, u32, u32)> {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
-    // The region must not change any container's length.
+    // The region must not change any container's length. A generic call
+    // (`Call`, or any `CallMethod` other than the read-only `charCodeAt`)
+    // can run ARBITRARY user code — which may mutate the container's length
+    // or reassign the global holding it — so it rejects the hoist outright
+    // (the per-iteration miss-helper read stays correct, just not hoisted).
     for instr in &code[s..=e] {
         match instr {
-            Instr::SetIndex { .. } | Instr::SetProp { .. } => return None,
+            Instr::SetIndex { .. } | Instr::SetProp { .. } | Instr::Call { .. } => return None,
             Instr::CallMethod { name, .. } => {
-                if proto.string_constants.get(*name as usize).map(|s| s.as_str()) == Some("push") {
+                if proto.string_constants.get(*name as usize).map(|s| s.as_str())
+                    != Some("charCodeAt")
+                {
                     return None;
                 }
             }
@@ -2044,6 +2225,18 @@ struct HeapHelpers {
     concat: usize,
     /// Helper for in-place `a + b` (`StrAppendInPlace`).
     str_append: usize,
+    /// Helper for a generic `obj.m(args…)` via the interpreter's per-site IC.
+    call_method_ic: usize,
+    /// Helper for a generic `f(args…)` via the interpreter's per-site IC.
+    call_ic: usize,
+    /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).
+    get_prop_slow: usize,
+    /// `PROP_VIA_IC` continuation for SetProp.
+    set_prop_slow: usize,
+    /// Full `===` for non-interned heap operands (read-only, 0/1).
+    strict_eq: usize,
+    /// Full truthiness for non-Int/Bool conditions (read-only, 0/1).
+    truthy: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -2061,11 +2254,12 @@ fn compile_region(
     end: u32,
     globals_base_helper: usize,
     heap: HeapHelpers,
+    const_strs: &FxHashMap<u32, u64>,
 ) -> Option<JitFn> {
     if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper) {
         return Some(f);
     }
-    compile_region_mem(proto, start, end, globals_base_helper, heap)
+    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs)
 }
 
 /// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
@@ -2821,13 +3015,18 @@ fn plan_region(proto: &FuncProto, start: u32, end: u32) -> Option<RegionPlan> {
     // type (from defs) and first-occurrence (def vs use). Operand type
     // requirements are validated in a second loop once types are known.
     for instr in &code[s..=e] {
-        // A dense-array element access or a builtin method call can't be
-        // register-allocated (their operands/result are boxed Values handled by a
-        // helper, not known-type scalars) — decline so the region takes the memory
-        // path that emits the helper call.
+        // A dense-array element access, any call, or a bitwise op can't be
+        // register-allocated (their operands/result are boxed Values handled by
+        // a helper / int32 lanes, not the planner's f64-or-bool scalars — and a
+        // call can run arbitrary user code) — decline so the region takes the
+        // memory path that emits the helper call / inline int32 sequence.
         if matches!(
             instr,
-            Instr::GetIndex { .. } | Instr::SetIndex { .. } | Instr::CallMethod { .. }
+            Instr::GetIndex { .. }
+                | Instr::SetIndex { .. }
+                | Instr::CallMethod { .. }
+                | Instr::Call { .. }
+                | Instr::Bitwise { .. }
         ) {
             return None;
         }
@@ -3303,6 +3502,7 @@ fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::Mod { a, b, .. }
         | Instr::StrConcat { a, b, .. }
         | Instr::StrAppendInPlace { a, b, .. }
+        | Instr::Bitwise { a, b, .. }
         | Instr::Lt { a, b, .. }
         | Instr::Le { a, b, .. }
         | Instr::Gt { a, b, .. }
@@ -3446,7 +3646,7 @@ fn compile_region_regalloc(
     end: u32,
     globals_base_helper: usize,
 ) -> Option<JitFn> {
-    if !region_can_compile(proto, start, end) {
+    if !region_can_compile(proto, start, end, None) {
         return None;
     }
     let plan = plan_region(proto, start, end)?;
@@ -3757,7 +3957,7 @@ const TWO_POW_54: i64 = 18_014_398_509_481_984;
 /// IS allowed, via integer `idiv`), and every `LoadConst` must be an Int-tagged
 /// constant (a double constant would be misread as i64).
 fn region_is_int(proto: &FuncProto, start: u32, end: u32) -> bool {
-    if !region_can_compile(proto, start, end) {
+    if !region_can_compile(proto, start, end, None) {
         return false;
     }
     let (s, e) = (start as usize, end as usize);
@@ -4510,6 +4710,80 @@ fn emit_dcmp(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a:
     dynasm!(ops ; movzx Rq(d), al);
 }
 
+/// Re-derive the region's pinned heap pointers after a helper call that can
+/// move them: r13 (heap version-array base — `heap.alloc` pushes to the
+/// parallel versions Vec, which can reallocate) and, when `ic_base` is given,
+/// r14 (JIT IC-table base — a NESTED region compile triggered by user code the
+/// helper ran grows `ic_table`). rbx (register file) and r12 (globals) are
+/// pinned to capacity for the VM's lifetime and never need re-deriving.
+/// Clobbers only volatile registers — emit AFTER storing the helper's result.
+fn emit_refetch_pinned(
+    ops: &mut dynasmrt::x64::Assembler,
+    versions_base: usize,
+    ic_base: Option<usize>,
+) {
+    dynasm!(ops
+        ; mov rcx, rdi
+        ; mov rax, QWORD versions_base as i64
+        ; call rax
+        ; mov r13, rax
+    );
+    if let Some(icb) = ic_base {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rax, QWORD icb as i64
+            ; call rax
+            ; mov r14, rax
+        );
+    }
+}
+
+/// Emit a generic `CallMethod` / `Call` region op as a `jit_call_method_ic` /
+/// `jit_call_ic` helper call (vm/helpers_misc.rs). The helper consults the
+/// interpreter's per-site inline cache, frame-calls the resolved plain user
+/// function to completion, and returns the result bits — or `SELF_CALL_DEOPT`
+/// (nothing happened: IC miss / megamorphic / depth limit → the interpreter
+/// re-executes this op) or `CALL_THREW` (the call ran and THREW:
+/// `pending_throw` is set; the OSR caller unwinds instead of resuming). Both
+/// sentinels bail at this ip. ABI: rcx=vm, rdx=caller window base (rbx),
+/// r8=(func_id<<32)|ip, r9=op-specific packing, [rsp+32]=argc (5th arg).
+/// After a successful call, `refetch` re-derives r13/r14 (only needed when the
+/// region has GetProp/SetProp sites — the only r13/r14 consumers).
+#[allow(clippy::too_many_arguments)]
+fn emit_region_call_ic(
+    ops: &mut dynasmrt::x64::Assembler,
+    ip: usize,
+    bail: dynasmrt::DynamicLabel,
+    epilogue: dynasmrt::DynamicLabel,
+    helper: usize,
+    packed_fip: u64,
+    packed_args: u64,
+    argc: u16,
+    dst: u16,
+    refetch: Option<(usize, usize)>,
+) {
+    dynasm!(ops
+        ; mov rcx, rdi                          // vm
+        ; mov rdx, rbx                          // caller window base ptr
+        ; mov r8, QWORD packed_fip as i64       // (func_id << 32) | ip
+        ; mov r9, QWORD packed_args as i64      // name/callee/obj/arg_base packing
+        ; mov DWORD [rsp + 32], argc as i32     // 5th arg: argc
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, r10
+        ; je => bail                            // IC miss/depth → redo in interp
+        ; mov r10, QWORD CALL_THREW as i64
+        ; cmp rax, r10
+        ; je => bail                            // threw → exit; caller unwinds
+        ; mov [rbx + dreg(dst)], rax
+    );
+    if let Some((vb, icb)) = refetch {
+        emit_refetch_pinned(ops, vb, Some(icb));
+    }
+    emit_region_bail(ops, ip, bail, epilogue);
+}
+
 /// Memory-based region codegen: every op loads operands from the register file
 /// (with a type guard) and stores results back, globals via the pinned base
 /// pointer. Correct and simple; ~4x faster than the interpreter but leaves
@@ -4521,12 +4795,26 @@ fn compile_region_mem(
     end: u32,
     globals_base_helper: usize,
     heap: HeapHelpers,
+    const_strs: &FxHashMap<u32, u64>,
 ) -> Option<JitFn> {
-    if !region_can_compile(proto, start, end) {
+    if !region_can_compile(proto, start, end, Some(const_strs)) {
         return None;
     }
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let (s, e) = (start as usize, end as usize);
+
+    if std::env::var_os("ZIPP_JITDUMP").is_some() {
+        for ip in s..=e {
+            eprintln!("[dump] {ip}: {:?}", proto.code[ip]);
+        }
+    }
+
+    // Does the region use the r13/r14 inline-cache pointers at all? Only
+    // GetProp/SetProp read them; when absent, allocating/user-code helpers
+    // skip the post-call re-fetch entirely.
+    let has_prop = proto.code[s..=e]
+        .iter()
+        .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
 
     // One label per in-region ip (offset by `start`). Out-of-region jump targets
     // resolve to lazily-created exit stubs.
@@ -4576,11 +4864,18 @@ fn compile_region_mem(
         dynasm!(ops
             ; mov rdx, [r12 + (g as i32) * 8]     // obj bits = globals[g]
             ; mov rcx, rdi                         // vm
-            ; mov r8d, 0                           // site_idx (unused for .length)
+            // Pseudo-site: u32::MAX makes any fill a no-op (`set_ic` ignores
+            // it). A real site id here could cross-pollute another site's ways
+            // with a DIFFERENT KEY's slot (same receiver identity → wrong slot).
+            ; mov r8d, -1                          // site_idx = u32::MAX
+
             ; mov r9, QWORD packed as i64
             ; mov rax, QWORD heap.get_prop_miss as i64
             ; call rax
             ; mov r10, QWORD SELF_CALL_DEOPT as i64
+            ; cmp rax, r10
+            ; je => entry_len_bail
+            ; mov r10, QWORD PROP_VIA_IC as i64       // accessor `length` etc.
             ; cmp rax, r10
             ; je => entry_len_bail
             ; mov [rbx + dreg(dst)], rax
@@ -4614,9 +4909,13 @@ fn compile_region_mem(
             Instr::LoadConst { dst, idx } => {
                 // A single-ASCII-char string constant materialises as its
                 // INTERNED slot (the same boxed Value `s[i]` yields), so a later
-                // `=== "x"` is a bits compare; numeric/other consts use raw bits.
+                // `=== "x"` is a bits compare; a multi-char string constant uses
+                // the bits interned at REGION-COMPILE time (rooted for the VM's
+                // life in `jit_const_strings`); numeric consts use raw bits.
                 let c = proto.constants[idx as usize];
-                let bits = single_char_const_bits(proto, c).unwrap_or_else(|| c.bits());
+                let bits = single_char_const_bits(proto, c)
+                    .or_else(|| const_strs.get(&idx).copied())
+                    .unwrap_or_else(|| c.bits());
                 dynasm!(ops
                     ; mov rax, QWORD bits as i64
                     ; mov [rbx + dreg(dst)], rax
@@ -4640,7 +4939,37 @@ fn compile_region_mem(
                     ; mov [r12 + (idx as i32) * 8], rax
                 );
             }
-            Instr::Add { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Add),
+            Instr::Add { dst, a, b } => {
+                // Numeric fast path; non-number operands (strings, objects)
+                // fall back to `jit_concat` — the SAME `add_values` the
+                // interpreter's Add runs (concat / numeric / coercion). The
+                // helper may allocate or run user coercion code, so the pinned
+                // pointers are re-derived when the region reads them.
+                let slow = ops.new_dynamic_label();
+                let done_a = ops.new_dynamic_label();
+                load_num_xmm(&mut ops, a, 0, slow);
+                load_num_xmm(&mut ops, b, 1, slow);
+                dynasm!(ops ; addsd xmm0, xmm1);
+                store_xmm(&mut ops, dst);
+                dynasm!(ops
+                    ; jmp => done_a
+                    ; => slow
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov r8, [rbx + dreg(b)]
+                    ; mov rax, QWORD heap.concat as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail                          // threw inside `+` → redo in interp
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if has_prop {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
+                dynasm!(ops ; => done_a);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::Sub { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Sub),
             Instr::Mul { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Mul),
             Instr::Div { dst, a, b } => dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div),
@@ -4707,6 +5036,89 @@ fn compile_region_mem(
                 store_xmm(&mut ops, dst);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::Bitwise { dst, a, b, op } => {
+                // ToInt32 both operands (Int payloads or exactly-integral
+                // i32-range doubles — see `load_toint32`; everything else
+                // bails), then the 32-bit op. x86 32-bit shifts mask the count
+                // to 5 bits — exactly JS's `& 31`. Results always fit i32
+                // (boxed Int) except `>>>`, whose u32 result may exceed
+                // i32::MAX and is then boxed as an (exact) double.
+                use crate::bytecode::BitwiseOp as B;
+                load_toint32(&mut ops, a, bail);
+                dynasm!(ops ; mov r8d, eax);             // stash a
+                load_toint32(&mut ops, b, bail);
+                dynasm!(ops ; mov ecx, eax ; mov eax, r8d); // eax = a, ecx = b
+                match op {
+                    B::And => {
+                        dynasm!(ops ; and eax, ecx);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Or => {
+                        dynasm!(ops ; or eax, ecx);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Xor => {
+                        dynasm!(ops ; xor eax, ecx);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Shl => {
+                        dynasm!(ops ; shl eax, cl);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Shr => {
+                        dynasm!(ops ; sar eax, cl);
+                        box_eax(&mut ops, dst);
+                    }
+                    B::Ushr => {
+                        let as_dbl = ops.new_dynamic_label();
+                        let done_u = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; shr eax, cl
+                            ; test eax, eax
+                            ; js => as_dbl                // u32 > i32::MAX → double
+                        );
+                        box_eax(&mut ops, dst);
+                        dynasm!(ops
+                            ; jmp => done_u
+                            ; => as_dbl
+                            ; mov eax, eax                // zero-extend u32 into rax
+                            ; cvtsi2sd xmm0, rax          // exact (< 2^32)
+                            ; movq rax, xmm0
+                            ; mov [rbx + dreg(dst)], rax
+                            ; => done_u
+                        );
+                    }
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::Not { dst, a } => {
+                // `!x`: a Bool flips its payload bit in place (the tag survives
+                // the xor); anything else asks the read-only `jit_truthy`
+                // helper (handles Int/double/heap incl. empty strings and
+                // [[IsHTMLDDA]]) and flips its 0/1.
+                let slow = ops.new_dynamic_label();
+                let done_n = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(a)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, (INT_TAG_HI + 1) as i32   // Bool tag 0x7FFA
+                    ; jne => slow
+                    ; xor rax, 1                          // flip the payload bit
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => done_n
+                    ; => slow
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, rax                        // value bits
+                    ; mov rax, QWORD heap.truthy as i64
+                    ; call rax
+                    ; xor rax, 1                          // !truthy
+                    ; mov r8, QWORD BOOL_TAG as i64
+                    ; or rax, r8
+                    ; mov [rbx + dreg(dst)], rax
+                    ; => done_n
+                );
+            }
             Instr::Lt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Lt),
             Instr::Le { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Le),
             Instr::Gt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Gt),
@@ -4714,31 +5126,44 @@ fn compile_region_mem(
             // `===` / `!==` are polymorphic: numeric operands compare as f64,
             // interned single-char strings / Int / Bool / Null / Undefined
             // compare by bits, non-interned heap operands bail to the interpreter.
-            Instr::Eq { dst, a, b } => region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, false),
-            Instr::Ne { dst, a, b } => region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, true),
+            Instr::Eq { dst, a, b } => {
+                region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, false, heap.strict_eq)
+            }
+            Instr::Ne { dst, a, b } => {
+                region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, true, heap.strict_eq)
+            }
             Instr::Jump { target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
                 dynasm!(ops ; jmp => t);
             }
-            Instr::JumpIfFalse { cond, target } => {
-                guard_int_or_bool(&mut ops, cond, bail);
+            Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
+                // An Int/Bool condition tests its payload directly; anything
+                // else (double/heap/undefined/null) asks the read-only
+                // `jit_truthy` helper — `while (obj)` / `if (!s)` loop shapes
+                // stay native instead of deopting every iteration.
+                let if_false = matches!(proto.code[ip], Instr::JumpIfFalse { .. });
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
+                let testit = ops.new_dynamic_label();
                 dynasm!(ops
-                    ; mov eax, [rbx + dreg(cond)]
+                    ; mov rax, [rbx + dreg(cond)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, INT_TAG_HI as i32          // Int
+                    ; je => testit
+                    ; cmp r10d, (INT_TAG_HI + 1) as i32    // Bool
+                    ; je => testit
+                    ; mov rcx, rdi                         // vm
+                    ; mov rdx, rax                         // value bits
+                    ; mov rax, QWORD heap.truthy as i64
+                    ; call rax                             // rax = 0/1
+                    ; => testit
                     ; test eax, eax
-                    ; jz => t
                 );
-                emit_region_bail(&mut ops, ip, bail, epilogue);
-            }
-            Instr::JumpIfTrue { cond, target } => {
-                guard_int_or_bool(&mut ops, cond, bail);
-                let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
-                dynasm!(ops
-                    ; mov eax, [rbx + dreg(cond)]
-                    ; test eax, eax
-                    ; jnz => t
-                );
-                emit_region_bail(&mut ops, ip, bail, epilogue);
+                if if_false {
+                    dynasm!(ops ; jz => t);
+                } else {
+                    dynasm!(ops ; jnz => t);
+                }
             }
             Instr::JumpIfNotLt { a, b, target } => {
                 let t = region_target(target, start, end, &in_region, &mut exit_stubs, &mut ops);
@@ -4749,77 +5174,140 @@ fn compile_region_mem(
                 djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Le, t);
             }
             Instr::GetProp { dst, obj, name } => {
-                // ── monomorphic inline cache (CALL-FREE on hit) ──
-                // Identity (obj_bits) + version match ⇒ read cached vals_ptr[slot]
-                // directly. Miss ⇒ a lean helper that re-fills the cache. r14 =
-                // IC table base, r13 = heap version-array base. IcEntry layout:
-                // obj_bits@0, vals_ptr@8, version@16, slot@20 (stride 24).
+                // ── 8-way inline cache (CALL-FREE on hit) ── probe the site's
+                // ways: receiver identity (obj_bits) + live receiver version,
+                // then (for proto-chain ways) the live version of each guarded
+                // hop; a full match reads the HOLDER's `vals_ptr[slot]`
+                // directly. All ways miss ⇒ the helper re-fills one way. r14 =
+                // IC table base, r13 = heap version-array base. See `IcEntry`
+                // for the layout (stride 40, hops at +24/+32, u32::MAX = none).
                 //
-                // SAFETY (versions[heap_idx] read is in-bounds): the read at
-                // `[r13 + heap_idx*4]` is reached ONLY after `jne miss` fails —
-                // i.e. only when obj_bits == the CACHED obj_bits. `set_ic` only
-                // ever caches a validated heap Object's bits, so a match implies
-                // obj is that same valid object ⇒ heap_idx < heap.versions.len()
-                // (== objs.len()). Likewise vals[slot]: slots are append-only so
-                // a once-valid slot stays valid, and a version match proves vals
-                // hasn't reallocated. (Verifier lenses that flagged an OOB here
-                // analysed the read in isolation, missing the identity gate.)
-                let o = (ic_site * 24) as i32;
+                // SAFETY (`[r13 + idx*4]` reads are in-bounds): the receiver
+                // version is read only after the identity match against a
+                // FILLED way, whose obj_bits the helper validated as a live
+                // heap Object ⇒ heap_idx < versions.len() (which never
+                // shrinks). Hop indices were likewise valid heap indices at
+                // fill. Staleness is harmless for the LOADS (in-bounds) and
+                // caught by the version compares before any vals deref.
+                let off = (ic_site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
                 let packed = ((heap.func_id as u64) << 32) | name as u64;
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let probe = ops.new_dynamic_label();
+                let next = ops.new_dynamic_label();
+                let hit = ops.new_dynamic_label();
                 let miss = ops.new_dynamic_label();
+                let via_ic = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
+                let hop = ops.new_dynamic_label();
                 dynasm!(ops
-                    ; mov rax, [rbx + dreg(obj)]          // obj_bits
-                    ; cmp rax, [r14 + o]                  // cached obj_bits (identity)
-                    ; jne => miss
-                    ; mov ecx, eax                        // heap_idx = low 32 of obj_bits
-                    ; mov edx, [r13 + rcx*4]              // live version
-                    ; cmp edx, [r14 + o + 16]             // cached version
-                    ; jne => miss
-                    ; mov rcx, [r14 + o + 8]              // vals_ptr
-                    ; mov edx, [r14 + o + 20]             // slot
+                    ; mov rax, [rbx + dreg(obj)]          // receiver bits (probe-invariant)
+                    ; lea r9, [r14 + off]                 // way 0 of this site
+                    ; mov r8d, JIT_IC_WAYS as i32
+                    ; => probe
+                    ; cmp rax, [r9]                       // identity (empty 0 never matches)
+                    ; jne => next
+                    ; mov ecx, eax                        // recv heap idx (low 32)
+                    ; mov edx, [r13 + rcx*4]              // live recv version
+                    ; cmp edx, [r9 + 16]
+                    ; jne => next
+                    ; mov ecx, [r9 + 20]
+                    ; shr ecx, 24                         // nhops (0 = own)
+                    ; test ecx, ecx
+                    ; jz => hit
+                    ; lea r10, [r9 + 24]                  // hop cursor
+                    ; => hop
+                    ; mov edx, [r10]                      // hop heap idx
+                    ; mov r11d, [r13 + rdx*4]             // live hop version
+                    ; cmp r11d, [r10 + 4]
+                    ; jne => next
+                    ; add r10, 8
+                    ; dec ecx
+                    ; jnz => hop
+                    ; => hit
+                    ; mov rcx, [r9 + 8]                   // holder vals_ptr
+                    ; mov edx, [r9 + 20]
+                    ; and edx, 0x00FF_FFFF                // slot (low 24)
                     ; mov rax, [rcx + rdx*8]              // vals[slot] (CALL-FREE)
                     ; mov [rbx + dreg(dst)], rax
                     ; jmp => cont
+                    ; => next
+                    ; add r9, JIT_IC_STRIDE as i32
+                    ; dec r8d
+                    ; jnz => probe
+                    ; jmp => miss
                     ; => miss
                     ; mov rcx, rdi                        // vm
-                    ; mov rdx, rax                        // obj_bits (still in rax)
-                    ; mov r8d, ic_site as i32            // site_idx
+                    ; mov rdx, rax                        // obj_bits (rax survives the probe)
+                    ; mov r8d, ic_site as i32             // site_idx
                     ; mov r9, QWORD packed as i64         // (func_id<<32)|name_idx
                     ; mov rax, QWORD heap.get_prop_miss as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
+                    ; mov r10, QWORD PROP_VIA_IC as i64
+                    ; cmp rax, r10
+                    ; je => via_ic
                     ; mov [rbx + dreg(dst)], rax
-                    ; => cont
+                    ; jmp => cont
+                    // ── accessor / class receiver: the interpreter-IC slow
+                    // helper resolves it (and may frame-call a getter — user
+                    // code, so r13/r14 are re-derived afterwards).
+                    ; => via_ic
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, rbx                        // caller window base
+                    ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                    ; mov r9, QWORD (((name as u64) << 32) | obj as u64) as i64
+                    ; mov rax, QWORD heap.get_prop_slow as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
                 );
+                emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                dynasm!(ops ; => cont);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
             Instr::SetProp { obj, name, val } => {
-                // ── monomorphic inline cache (CALL-FREE write on hit) ──
-                let o = (ic_site * 24) as i32;
+                // ── 8-way inline cache (CALL-FREE write on hit) ── like
+                // GetProp, but the helper only ever fills OWN ways here
+                // (identity + receiver version fully guard an own writable
+                // data slot: any redefinition/freeze/delete/proto change bumps
+                // the version), so the probe skips the hop checks.
+                let off = (ic_site as usize * JIT_IC_WAYS * JIT_IC_STRIDE) as i32;
                 let packed = ((heap.func_id as u64) << 32) | name as u64;
-                let miss = ops.new_dynamic_label();
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let probe = ops.new_dynamic_label();
+                let next = ops.new_dynamic_label();
                 let cont = ops.new_dynamic_label();
                 dynasm!(ops
-                    ; mov rax, [rbx + dreg(obj)]          // obj_bits
-                    ; cmp rax, [r14 + o]                  // cached obj_bits
-                    ; jne => miss
-                    ; mov ecx, eax                        // heap_idx
-                    ; mov edx, [r13 + rcx*4]              // live version
-                    ; cmp edx, [r14 + o + 16]             // cached version
-                    ; jne => miss
-                    ; mov rcx, [r14 + o + 8]              // vals_ptr
-                    ; mov edx, [r14 + o + 20]             // slot
-                    ; mov r8, [rbx + dreg(val)]          // val_bits
-                    ; mov [rcx + rdx*8], r8               // vals[slot] = val (CALL-FREE)
+                    ; mov rax, [rbx + dreg(obj)]          // receiver bits
+                    ; lea r9, [r14 + off]
+                    ; mov r8d, JIT_IC_WAYS as i32
+                    ; => probe
+                    ; cmp rax, [r9]                       // identity
+                    ; jne => next
+                    ; mov ecx, eax                        // recv heap idx
+                    ; mov edx, [r13 + rcx*4]              // live recv version
+                    ; cmp edx, [r9 + 16]
+                    ; jne => next
+                    ; mov rcx, [r9 + 8]                   // vals_ptr
+                    ; mov edx, [r9 + 20]                  // slot
+                    ; mov r10, [rbx + dreg(val)]          // val_bits
+                    ; mov [rcx + rdx*8], r10              // vals[slot] = val (CALL-FREE)
                     ; jmp => cont
-                    ; => miss
+                    ; => next
+                    ; add r9, JIT_IC_STRIDE as i32
+                    ; dec r8d
+                    ; jnz => probe
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits
-                    ; mov r8, [rbx + dreg(val)]          // val_bits
+                    ; mov r8, [rbx + dreg(val)]           // val_bits
                     ; mov r9, QWORD packed as i64         // (func_id<<32)|name_idx
                     ; mov QWORD [rsp + 32], ic_site as i32 // 5th arg: site_idx (stack)
                     ; mov rax, QWORD heap.set_prop_miss as i64
@@ -4827,8 +5315,26 @@ fn compile_region_mem(
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
-                    ; => cont
+                    ; mov r10, QWORD PROP_VIA_IC as i64
+                    ; cmp rax, r10
+                    ; jne => cont
+                    // ── setter / class receiver: interpreter-IC slow helper
+                    // (may frame-call a setter — re-derive r13/r14 after).
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, rbx                        // caller window base
+                    ; mov r8, QWORD packed_fip as i64     // (func_id<<32)|ip
+                    ; mov r9, QWORD (((name as u64) << 32) | ((obj as u64) << 16) | val as u64) as i64
+                    ; mov rax, QWORD heap.set_prop_slow as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD CALL_THREW as i64
+                    ; cmp rax, r10
+                    ; je => bail
                 );
+                emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                dynasm!(ops ; => cont);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 ic_site += 1;
             }
@@ -4870,35 +5376,77 @@ fn compile_region_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::CallMethod { dst, obj, name, arg_base, .. } => {
-                // A whitelisted 1-arg builtin (`arr.push(x)` / `str.charCodeAt(i)`)
-                // via a dedicated win64 helper: receiver + arg0 bits in, result
-                // bits out, deopt sentinel → bail. region_can_compile gated this.
-                let helper = match proto.string_constants[name as usize].as_str() {
-                    "push" => heap.array_push,
-                    "charCodeAt" => heap.char_code_at,
-                    _ => return None, // defensive (gated)
-                };
-                dynasm!(ops
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, [rbx + dreg(obj)]          // receiver bits
-                    ; mov r8, [rbx + dreg(arg_base)]      // arg0 bits
-                    ; mov rax, QWORD helper as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
+            Instr::CallMethod { dst, obj, name, arg_base, argc } => {
+                let key = proto.string_constants[name as usize].as_str();
+                if argc == 1 && matches!(key, "push" | "charCodeAt") {
+                    // The whitelisted 1-arg builtins keep their dedicated win64
+                    // helpers: receiver + arg0 bits in, result bits out, deopt
+                    // sentinel → bail. Neither allocates a heap OBJECT (push
+                    // grows the array's own Vec; the versions array is
+                    // untouched), so no pinned-pointer re-fetch is needed.
+                    let helper = match key {
+                        "push" => heap.array_push,
+                        _ => heap.char_code_at,
+                    };
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                        ; mov r8, [rbx + dreg(arg_base)]      // arg0 bits
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else {
+                    // Generic `obj.m(args…)`: the interpreter-IC call helper
+                    // (see `emit_region_call_ic`). Packing: r9 = (name<<32) |
+                    // (obj<<16) | arg_base; argc via the stack.
+                    let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                    let packed_args =
+                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        heap.call_method_ic,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        has_prop.then_some((heap.versions_base, heap.ic_base)),
+                    );
+                }
+            }
+            Instr::Call { dst, callee, arg_base, argc } => {
+                // Generic `f(args…)` with `this = undefined`: the interpreter-IC
+                // call helper. Packing: r9 = (callee<<16) | arg_base.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let packed_args = ((callee as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    heap.call_ic,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    has_prop.then_some((heap.versions_base, heap.ic_base)),
                 );
-                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::StrConcat { dst, a, b } => {
                 // `dst = a + b` via the win64 `jit_concat` helper (rope concat or
                 // numeric add). Same ABI as the method helpers: vm + two operand
                 // bits in, result bits out, deopt sentinel → bail. The helper
-                // allocates, so the version-array pointer (r13) may move — safe
-                // here because region_can_compile forbids GetProp/SetProp (the
-                // only r13 users) alongside StrConcat.
+                // ALLOCATES (a rope node grows the heap's parallel version
+                // array, which may reallocate) — so when the region also has
+                // GetProp/SetProp (the r13 users), re-derive r13 after the
+                // call. It never runs user code, so the IC table (r14) is safe.
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(a)]            // a bits
@@ -4910,13 +5458,16 @@ fn compile_region_mem(
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
                 );
+                if has_prop {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::StrAppendInPlace { dst, a, b } => {
                 // In-place `dst = a + b` via `jit_str_append` (mutates a's buffer
                 // when uniquely owned — the emitter proved linearity). Never
                 // deopts, but uses the same ABI; allocates/grows the heap, so
-                // (like StrConcat) region_can_compile keeps GetProp/SetProp out.
+                // (like StrConcat) re-derive r13 when the region reads it.
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(a)]            // a (accumulator) bits
@@ -4925,6 +5476,9 @@ fn compile_region_mem(
                     ; call rax
                     ; mov [rbx + dreg(dst)], rax
                 );
+                if has_prop {
+                    emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                }
             }
             Instr::Return { .. } | Instr::ReturnUndefined => {
                 // Resume interpreting at this ip so the interpreter performs the
@@ -4998,6 +5552,42 @@ enum DOp {
     Sub,
     Mul,
     Div,
+}
+
+/// Load `regs[reg]` as ToInt32 into `eax` for the region's `Bitwise` ops: an
+/// Int-tagged payload directly, or a DOUBLE that is exactly integral in
+/// (-2^63, 2^63) — for which ToInt32 is simply the low 32 bits of the i64
+/// (modulo-2^32 wrap, signed), exactly what `(x + y) | 0` accumulators rely on
+/// when the f64 sum crosses i32 range. Anything else — fractional / NaN / Inf /
+/// |x| ≥ 2^63 (rare; ToInt32 still defined but not via i64) / bool / null /
+/// undefined / heap — jumps to `bail` so the interpreter applies complete
+/// ToInt32 semantics. Clobbers rax/r10/xmm0/xmm1.
+fn load_toint32(ops: &mut dynasmrt::x64::Assembler, reg: u16, bail: dynasmrt::DynamicLabel) {
+    let int_path = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(reg)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, INT_TAG_HI as i32
+        ; je => int_path
+        ; sub r10d, (INT_TAG_HI + 1) as i32      // 0x7FFA (bool tag)
+        ; cmp r10d, 3                            // high16 ∈ [0x7FFA,0x7FFD] ⇒ not a number
+        ; jbe => bail
+        // A double: accept an exact integral value; eax (the i64's low 32) IS
+        // its ToInt32. NaN/±Inf/|x|≥2^63 fail the round-trip (cvttsd2si yields
+        // the 0x8000… sentinel, which converts back to -2^63 ≠ x) → bail.
+        ; movq xmm0, rax
+        ; cvttsd2si rax, xmm0                    // i64 trunc (NaN/±Inf → 0x8000…)
+        ; cvtsi2sd xmm1, rax
+        ; ucomisd xmm1, xmm0
+        ; jne => bail                            // fractional (or the NaN/Inf sentinel)
+        ; jp => bail                             // NaN (unordered)
+        ; jmp => done
+        ; => int_path
+        // eax already holds the i32 payload (low 32 of the boxed Value).
+        ; => done
+    );
 }
 
 /// Load `regs[reg]` as an f64 into `xmm{which}` (0 or 1). Int-tagged → cvtsi2sd;
@@ -5089,8 +5679,9 @@ fn single_char_const_bits(proto: &FuncProto, c: Value) -> Option<u64> {
 ///      `NaN!==NaN`, `0===-0` correct, and bails on a num-vs-non-num operand mix.
 ///   2. else EITHER operand is HEAP (high16 == 0x7FFD) with index ≥ 129 (a
 ///      multi-char string or a user object — NOT an interned single-char/empty
-///      string) → BAIL to the interpreter (those need full `strict_eq`; raw bits
-///      would wrongly distinguish equal-content strings).
+///      string) → the read-only `jit_strict_eq` helper (full `strict_eq`
+///      semantics: equal-content strings, BigInts, identity for objects) —
+///      `line === "##"` scans stay native instead of deopting.
 ///   3. else → 64-bit BITS equality. Exactly JS `===` for Int, Bool, Null,
 ///      Undefined, and interned single-char/empty strings (indices < 129). This
 ///      is the `s[i] === "7"` and `charCodeAt === 55` hot path (call-free).
@@ -5104,11 +5695,14 @@ fn region_poly_eq(
     a: u16,
     b: u16,
     ne: bool,
+    strict_eq_helper: usize,
 ) {
     let numeric = ops.new_dynamic_label();
     let a_not_heap = ops.new_dynamic_label();
     let do_bits = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    let after = ops.new_dynamic_label();
     // rax = a_bits, rcx = b_bits (kept live across the type checks).
     dynasm!(ops
         ; mov rax, [rbx + dreg(a)]
@@ -5135,7 +5729,7 @@ fn region_poly_eq(
         ; mov r9, QWORD PAYLOAD_MASK as i64
         ; and rdx, r9
         ; cmp rdx, USER_OBJ_START as i32
-        ; jae => bail                          // a is a non-interned heap value
+        ; jae => slow                          // a: non-interned heap → helper
         ; => a_not_heap
         ; mov rdx, rcx
         ; shr rdx, 48
@@ -5145,7 +5739,7 @@ fn region_poly_eq(
         ; mov r9, QWORD PAYLOAD_MASK as i64
         ; and rdx, r9
         ; cmp rdx, USER_OBJ_START as i32
-        ; jae => bail                          // b is a non-interned heap value
+        ; jae => slow                          // b: non-interned heap → helper
         ; jmp => do_bits
     );
     // ── numeric path (a or b is a double): f64 compare, identical to dcmp. ──
@@ -5176,6 +5770,23 @@ fn region_poly_eq(
         ; mov r8, QWORD BOOL_TAG as i64
         ; or rax, r8
         ; mov [rbx + dreg(dst)], rax
+        ; jmp => after
+        // ── slow path: full strict_eq via the read-only helper. ──
+        ; => slow
+        ; mov rcx, rdi                         // vm
+        ; mov rdx, [rbx + dreg(a)]
+        ; mov r8, [rbx + dreg(b)]
+        ; mov rax, QWORD strict_eq_helper as i64
+        ; call rax                             // rax = 0/1 (a === b)
+    );
+    if ne {
+        dynasm!(ops ; xor rax, 1);
+    }
+    dynasm!(ops
+        ; mov r8, QWORD BOOL_TAG as i64
+        ; or rax, r8
+        ; mov [rbx + dreg(dst)], rax
+        ; => after
     );
     emit_region_bail(ops, ip, bail, epilogue);
 }

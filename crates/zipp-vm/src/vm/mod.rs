@@ -1008,6 +1008,29 @@ pub struct Vm<'p> {
     /// Current native self-recursion depth (guards `jit_self_call`).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_recurse_depth: u32,
+    /// Current nesting of region call helpers (`jit_call_method_ic` /
+    /// `jit_call_ic`): each level nests `run_loop` on the Rust stack, so it is
+    /// capped at `JIT_REGION_CALL_MAX` (past it the call deopts to the
+    /// interpreter's flat frames). Unlike `jit_recurse_depth`, a non-zero value
+    /// does NOT close the JIT gates: nested execution may compile/enter
+    /// functions and regions (the calling region re-derives its movable pinned
+    /// pointers after every call helper).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_call_depth: u32,
+    /// One-shot flag a region call helper sets when its bail is NOT a
+    /// region-quality signal (depth-cap deopt, or a throw the call legitimately
+    /// produced): `try_run_osr` consumes it and skips the deopt-eviction count
+    /// for that exit, so legal recursion / caught throws don't evict hot regions.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    osr_deopt_exempt: bool,
+    /// Heap strings interned AT REGION-COMPILE TIME for the region's multi-char
+    /// string `LoadConst`s (their bits are embedded in the native code as
+    /// immediates). A GC ROOT: compiled code is not traced, so without this the
+    /// embedded strings could be swept and their slots reused while the region
+    /// still materializes them. Grows only at compile time; bounded by the
+    /// number of string constants across compiled regions.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_const_strings: Vec<Value>,
     /// Pinned register-file capacity: `self.regs` is reserved to this at startup
     /// and NEVER allowed to grow past it (every call/recursion site checks),
     /// so the Vec never reallocates while native JIT code holds a raw pointer

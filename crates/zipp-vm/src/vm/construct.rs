@@ -607,6 +607,9 @@ impl<'p> Vm<'p> {
         if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
             *slot = m;
         }
+        // The whole map (and its vals Vec) was replaced: invalidate any JIT
+        // inline cache that captured the old vals pointer.
+        self.heap.bump_version(idx);
         self.module_namespaces.insert(idx, slot_map);
     }
 

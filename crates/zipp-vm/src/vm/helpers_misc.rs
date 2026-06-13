@@ -81,6 +81,155 @@ pub(crate) extern "win64" fn jit_self_call_at(
     }
 }
 
+/// Depth cap for native-region → JS calls (`jit_call_method_ic` / `jit_call_ic`).
+/// Each level nests `try_run_osr → native region → helper → run_loop` on the
+/// Rust stack (unlike ordinary interpreter calls, which are flat frames), so
+/// recursion THROUGH region call sites must be bounded well below what the OS
+/// stack holds. Past the cap the helper deopts: the interpreter executes the
+/// call as a flat frame (correct, just not region-accelerated at that depth).
+/// 64 is comfortably safe (each level is a few KB) and deeper-than-64 recursion
+/// through a hot loop's call site is rare.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_REGION_CALL_MAX: u32 = 64;
+
+/// Win64 helper for a generic `obj.m(args…)` (`CallMethod`) inside a compiled
+/// OSR region. Consults the SAME per-site inline cache the interpreter uses
+/// (`ic_call_method`, keyed by `(func_id, ip)`), frame-calls the resolved plain
+/// user function to completion, and returns the result Value bits. Returns
+/// `SELF_CALL_DEOPT` when nothing has happened yet (IC miss / megamorphic /
+/// native callee / depth cap → the interpreter re-executes this op), or
+/// `CALL_THREW` when the call ran and threw (`pending_throw` is set; the OSR
+/// caller unwinds — the op must NOT re-execute). ABI: rcx=vm, rdx=caller window
+/// base (the region's rbx), r8=(func_id<<32)|ip, r9=(name<<32)|(obj<<16)|arg_base,
+/// 5th stack arg = argc.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `caller_base_ptr` is the running frame's window
+/// base within `vm.regs` (whose buffer is pinned — `reserve_jit_regs`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_call_method_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    argc: u32,
+) -> u64 {
+    // Catch Rust panics at the FFI boundary (UB to unwind across `extern`).
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_call_impl(caller_base_ptr, packed_fip, packed_args, argc as u16, true)
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Win64 helper for a generic `f(args…)` (`Call`) inside a compiled OSR region:
+/// the plain-call sibling of [`jit_call_method_ic`] (consults `ic_call`,
+/// `this = undefined`). r9 = (callee_reg<<16)|arg_base; same protocol otherwise.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_call_ic(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed_args: u64,
+    argc: u32,
+) -> u64 {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_region_call_impl(caller_base_ptr, packed_fip, packed_args, argc as u16, false)
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Win64 helper: full `===` for a region `Eq`/`Ne` whose operands are
+/// non-interned heap values (multi-char strings, objects, BigInts…). Read-only
+/// and side-effect-free — never deopts, never runs user code. Returns 0/1.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_strict_eq(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    crate::vm::collections::strict_eq(
+        &vm.heap,
+        Value::from_bits(a_bits),
+        Value::from_bits(b_bits),
+    ) as u64
+}
+
+/// Win64 helper: full JS truthiness for a region `Not` / `JumpIfFalse/True`
+/// whose operand isn't Int/Bool (doubles incl. NaN/±0, heap values incl. empty
+/// strings and [[IsHTMLDDA]], null/undefined). Read-only; returns 0/1.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_truthy(vm: *mut core::ffi::c_void, bits: u64) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    vm.truthy(Value::from_bits(bits)) as u64
+}
+
+/// Win64 helper: the `PROP_VIA_IC` continuation for a region `GetProp` whose
+/// miss helper found an accessor or a class-instance receiver. Consults the
+/// interpreter's per-site property IC (`ic_get_prop`) and frame-calls a plain
+/// getter to completion. Returns the value bits, `SELF_CALL_DEOPT` (no IC
+/// resolution — the interpreter re-executes the op), or `CALL_THREW`. The
+/// calling region re-derives r13/r14 afterwards (user code may have run).
+/// ABI: rcx=vm, rdx=caller window base, r8=(func_id<<32)|ip, r9=(name<<32)|obj_reg.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_get_prop_slow(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed2: u64,
+) -> u64 {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_prop_slow_impl(caller_base_ptr, packed_fip, packed2, false)
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// The `SetProp` sibling of [`jit_get_prop_slow`] (setter frame call; returns
+/// 0 when the store completed). r9=(name<<32)|(obj_reg<<16)|val_reg.
+///
+/// # Safety
+/// As [`jit_call_method_ic`].
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_set_prop_slow(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    packed_fip: u64,
+    packed2: u64,
+) -> u64 {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_prop_slow_impl(caller_base_ptr, packed_fip, packed2, true)
+    }));
+    match r {
+        Ok(bits) => bits,
+        Err(_) => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper: the INLINE-CACHE MISS path for a JIT'd `GetProp`. The native
 /// fast path (identity + version check, direct `vals[slot]` read) only calls this
 /// when its cache misses. Looks up `obj.<key>`, and on the fast-path-eligible case
@@ -346,13 +495,86 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
     let idx = obj.heap_index();
     let prog = vm.program; // &'p Program, independent of `vm`'s borrow
     let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
+    // Exotic receivers whose slots have live semantics layered over the ObjMap
+    // (the global object, %Array.prototype%, module namespaces, realm globals,
+    // deferred-namespace state) — same exclusions as the interpreter IC. A
+    // private ('#') name needs brand checks — interpreter only.
+    if key.as_bytes().first() == Some(&b'#')
+        || !vm.deferred_ns_state.is_empty()
+        || !vm.ic_obj_ok(idx)
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     let (val, vals_ptr, slot) = match vm.heap.get(idx) {
         HeapObj::Object(map) => match map.pos(key) {
+            // An accessor slot stores the GETTER, not a data value — route to
+            // the interpreter-IC slow helper, which frame-calls it.
+            Some(s) if map.attrs[s].accessor => return crate::codegen::PROP_VIA_IC,
             Some(s) => (map.vals[s], map.vals.as_ptr() as u64, s as u32),
-            // Missing own key: a class instance may resolve it as a method, so
-            // defer to the interpreter; a plain object yields undefined.
-            None if map.class.is_some() => return crate::codegen::SELF_CALL_DEOPT,
-            None => return Value::UNDEFINED.bits(),
+            // Missing own key: a CLASS instance resolves methods/getters on
+            // its class chain — the interpreter-IC slow helper serves those
+            // (polymorphic, guard-validated); a plain object walks the PROTO
+            // CHAIN (`Object.create({val})` — the chain may hold the property).
+            None if map.class.is_some() => return crate::codegen::PROP_VIA_IC,
+            None => {
+                const MAX: usize = crate::codegen::JIT_IC_MAX_HOPS;
+                let mut cur = idx;
+                let mut hops: [(u32, u32); MAX] = [(0, 0); MAX];
+                let mut n_hops = 0usize;
+                loop {
+                    let next = match vm.proto_of.get(&cur) {
+                        Some(p) if p.is_heap() => p.heap_index(),
+                        // Explicit null prototype: a true chain miss.
+                        Some(_) => return Value::UNDEFINED.bits(),
+                        None => {
+                            if vm.obj_proto == 0 || cur == vm.obj_proto {
+                                return Value::UNDEFINED.bits();
+                            }
+                            vm.obj_proto
+                        }
+                    };
+                    if n_hops >= 64 || !vm.ic_obj_ok(next) {
+                        return crate::codegen::SELF_CALL_DEOPT;
+                    }
+                    match vm.heap.get(next) {
+                        HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
+                            if let Some(i) = m2.pos(key) {
+                                if m2.attrs[i].accessor {
+                                    // Inherited getter: frame-called by the
+                                    // interpreter-IC slow helper.
+                                    return crate::codegen::PROP_VIA_IC;
+                                }
+                                let v = m2.vals[i];
+                                // A chain DATA hit within JIT_IC_MAX_HOPS fills
+                                // a hop-version-guarded way (receiver identity
+                                // + receiver version + every hop's version —
+                                // shadowing adds, hop key changes/deletes and
+                                // setPrototypeOf all bump one of them). Deeper
+                                // holders return UNCACHED (rare).
+                                if n_hops < MAX {
+                                    hops[n_hops] = (next, vm.heap.version_of(next));
+                                    if let Some(e) = crate::codegen::IcEntry::chain(
+                                        obj_bits,
+                                        m2.vals.as_ptr() as u64,
+                                        vm.heap.version_of(idx),
+                                        i as u32,
+                                        &hops[..=n_hops],
+                                    ) {
+                                        vm.jit.set_ic(site_idx, e);
+                                    }
+                                }
+                                return v.bits();
+                            }
+                        }
+                        _ => return crate::codegen::SELF_CALL_DEOPT, // exotic link
+                    }
+                    if n_hops < MAX {
+                        hops[n_hops] = (next, vm.heap.version_of(next));
+                    }
+                    n_hops += 1;
+                    cur = next;
+                }
+            }
         },
         // `arr.length` / `str.length` in a region: return the length WITHOUT
         // caching — it's derived from the container's element count, not a fixed
@@ -376,7 +598,9 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         _ => return crate::codegen::SELF_CALL_DEOPT, // other array/string props → interpreter
     };
     let version = vm.heap.version_of(idx);
-    vm.jit.set_ic(site_idx, obj_bits, vals_ptr, version, slot);
+    if let Some(e) = crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot) {
+        vm.jit.set_ic(site_idx, e);
+    }
     val.bits()
 }
 
@@ -407,23 +631,110 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     let idx = obj.heap_index();
     let prog = vm.program;
     let key = &prog.functions[func_id as usize].string_constants[name_idx as usize];
-    let (added, vals_ptr, slot) = match vm.heap.get_mut(idx) {
-        HeapObj::Object(map) => {
-            let added = map.set(key, Value::from_bits(val_bits));
-            // Position AFTER the set (existing key: unchanged; new key: appended).
-            let s = map.pos(key).unwrap() as u32;
-            (added, map.vals.as_ptr() as u64, s)
-        }
+    // Keys with exotic write interception (the inherited `__proto__` setter,
+    // restricted names, private names, canonical-index-ish keys) and exotic
+    // receivers — same exclusions as the interpreter's SetProp IC: defer.
+    if key == "__proto__"
+        || key == "caller"
+        || key == "arguments"
+        || key
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit() || *b == b'-' || *b == b'#')
+        || !vm.deferred_ns_state.is_empty()
+        || !vm.ic_obj_ok(idx)
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // Pre-checks against a shared borrow (the write below re-borrows mutably).
+    let own = match vm.heap.get(idx) {
+        HeapObj::Object(map) => match map.pos(key) {
+            // An accessor's SETTER must run (user code) — the interpreter-IC
+            // slow helper frame-calls it.
+            Some(s) if map.attrs[s].accessor => return crate::codegen::PROP_VIA_IC,
+            // A non-writable own data prop: sloppy no-op / strict throw —
+            // the interpreter applies the right one.
+            Some(s) if !map.attrs[s].writable => return crate::codegen::SELF_CALL_DEOPT,
+            Some(s) => Some(s),
+            None => {
+                // Own miss. A class-instance receiver may resolve a chain
+                // SETTER — the interpreter-IC slow helper serves it (or
+                // deopts). A non-extensible object must reject the add; an
+                // inherited accessor / non-writable data prop on the proto
+                // chain governs the write (OrdinarySet) — interpreter cases.
+                // Only a provably-clean chain lets us append the key.
+                if map.class.is_some() {
+                    return crate::codegen::PROP_VIA_IC;
+                }
+                if !map.extensible {
+                    return crate::codegen::SELF_CALL_DEOPT;
+                }
+                let mut cur = idx;
+                let mut hops = 0;
+                loop {
+                    let next = match vm.proto_of.get(&cur) {
+                        Some(p) if p.is_heap() => p.heap_index(),
+                        Some(_) => break, // explicit null proto: chain end
+                        None => {
+                            if vm.obj_proto == 0 || cur == vm.obj_proto {
+                                break;
+                            }
+                            vm.obj_proto
+                        }
+                    };
+                    hops += 1;
+                    if hops > 64 || !vm.ic_obj_ok(next) {
+                        return crate::codegen::SELF_CALL_DEOPT;
+                    }
+                    match vm.heap.get(next) {
+                        HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
+                            if let Some(i) = m2.pos(key) {
+                                if m2.attrs[i].accessor {
+                                    // Inherited setter governs the write —
+                                    // frame-called by the slow helper.
+                                    return crate::codegen::PROP_VIA_IC;
+                                }
+                                if !m2.attrs[i].writable {
+                                    return crate::codegen::SELF_CALL_DEOPT;
+                                }
+                                break; // writable chain data: the own add shadows it
+                            }
+                        }
+                        _ => return crate::codegen::SELF_CALL_DEOPT, // exotic link
+                    }
+                    cur = next;
+                }
+                None
+            }
+        },
         // `arr.length = n` truncates/grows — deopt so the interpreter's set_prop
         // applies it (no-op here would diverge from the interpreter).
         HeapObj::Array(_) if key == "length" => return crate::codegen::SELF_CALL_DEOPT,
         _ => return 0, // other heap non-Object props: silent no-op (matches interpreter)
     };
+    let (added, vals_ptr, slot) = match vm.heap.get_mut(idx) {
+        HeapObj::Object(map) => match own {
+            Some(s) => {
+                map.vals[s] = Value::from_bits(val_bits);
+                (false, map.vals.as_ptr() as u64, s as u32)
+            }
+            None => {
+                let added = map.set(key, Value::from_bits(val_bits));
+                let s = map.pos(key).unwrap() as u32;
+                (added, map.vals.as_ptr() as u64, s)
+            }
+        },
+        _ => return crate::codegen::SELF_CALL_DEOPT, // unreachable (checked above)
+    };
     if added {
         vm.heap.bump_version(idx);
     }
     let version = vm.heap.version_of(idx);
-    vm.jit.set_ic(site_idx, obj_bits, vals_ptr, version, slot);
+    // SetProp sites only ever hold OWN ways (the region's write fast path
+    // skips hop checks; chain setters/non-writables deopted above).
+    if let Some(e) = crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot) {
+        vm.jit.set_ic(site_idx, e);
+    }
     0
 }
 

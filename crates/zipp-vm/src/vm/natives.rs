@@ -2346,6 +2346,11 @@ impl<'p> Vm<'p> {
                                     _ => m.extensible = false,
                                 }
                             }
+                            // Attrs flipped IN PLACE: invalidate any JIT inline
+                            // cache holding a now-non-writable slot (the
+                            // interpreter IC re-reads attrs per hit; the native
+                            // IcEntry guards only on the version).
+                            self.heap.bump_version(idx);
                         }
                         // A TypedArray on a RESIZABLE buffer can never lose
                         // extensibility: [[PreventExtensions]] returns false
@@ -3002,6 +3007,9 @@ impl<'p> Vm<'p> {
                     if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                         m.extensible = false;
                     }
+                    // In-place attrs change: invalidate JIT inline caches (the
+                    // native IcEntry guards only on the heap version).
+                    self.heap.bump_version(idx);
                 } else {
                     self.arr_props.entry(idx).or_insert_with(ObjMap::new).extensible = false;
                 }

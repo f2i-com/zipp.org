@@ -2575,6 +2575,17 @@ impl<'p> Vm<'p> {
                             && t < ip
                         {
                             if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
+                                // A region exit with a pending exception (a
+                                // frame-called function threw — `CALL_THREW`):
+                                // UNWIND to this frame's handlers instead of
+                                // resuming (re-executing the call would double
+                                // its side effects). Mirrors the function-JIT
+                                // bail-(b) path above.
+                                if self.pending_throw.is_some() {
+                                    let top = self.frames.len() - 1;
+                                    self.frames[top].ip = resume;
+                                    return Err(Thrown(String::new()));
+                                }
                                 ip = resume;
                                 continue;
                             }
@@ -2609,6 +2620,91 @@ impl<'p> Vm<'p> {
                                     ip = t;
                                     continue;
                                 }
+                                // ── call-mix gate ── a Call/CallMethod site
+                                // whose interpreter IC stayed EMPTY through the
+                                // warmup (a native/megamorphic callee) will
+                                // fall back through the helper on EVERY
+                                // iteration (~10ns FFI overhead vs the
+                                // interpreter). Compile only when the region
+                                // has enough other ops for the native savings
+                                // to cover that (op count ≥ 20× such sites) —
+                                // e.g. a DataView-call loop with heavy bit math
+                                // wins, a bare `m.get(k)` loop would lose.
+                                let region_call_mix_ok = {
+                                    let proto = self.func(func_id as usize);
+                                    let s = t as usize;
+                                    let e = (ip as usize).min(proto.code.len() - 1);
+                                    let mut fallback = 0usize;
+                                    for (off, ins) in proto.code[s..=e].iter().enumerate() {
+                                        match ins {
+                                            Instr::CallMethod { name, argc, .. } => {
+                                                let key = proto
+                                                    .string_constants
+                                                    .get(*name as usize)
+                                                    .map(|x| x.as_str());
+                                                if *argc == 1
+                                                    && matches!(key, Some("push") | Some("charCodeAt"))
+                                                {
+                                                    continue; // dedicated helpers
+                                                }
+                                            }
+                                            Instr::Call { .. } => {}
+                                            _ => continue,
+                                        }
+                                        let site = (func_id as usize)
+                                            .checked_sub(0)
+                                            .and_then(|f| self.site_ics.get(f))
+                                            .and_then(|x| x.as_ref())
+                                            .and_then(|slots| slots.get(s + off))
+                                            .and_then(|x| x.as_deref());
+                                        if let Some(site) = site {
+                                            if site.n == 0 && site.misses >= 4 {
+                                                fallback += 1;
+                                            }
+                                        }
+                                    }
+                                    fallback == 0 || (e - s + 1) >= fallback * 20
+                                };
+                                if !region_call_mix_ok {
+                                    self.jit.blacklist_region(func_id, t as u32);
+                                    ip = t;
+                                    continue;
+                                }
+                                // Pre-intern the region's multi-char string
+                                // constants so the emitter can embed their bits
+                                // as immediates. Rooted for the VM's life in
+                                // `jit_const_strings` (compiled code isn't
+                                // traced by the GC).
+                                let pending: Vec<u32> = {
+                                    let proto = self.func(func_id as usize);
+                                    proto.code[t..=ip as usize]
+                                        .iter()
+                                        .filter_map(|ins| match *ins {
+                                            Instr::LoadConst { idx, .. } => {
+                                                let c = proto.constants[idx as usize];
+                                                if c.is_heap()
+                                                    && (c.heap_index() & STRING_CONST_BIT) != 0
+                                                {
+                                                    Some(idx)
+                                                } else {
+                                                    None
+                                                }
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect()
+                                };
+                                let mut const_strs: rustc_hash::FxHashMap<u32, u64> =
+                                    rustc_hash::FxHashMap::default();
+                                for idx in pending {
+                                    if const_strs.contains_key(&idx) {
+                                        continue;
+                                    }
+                                    let c = self.func(func_id as usize).constants[idx as usize];
+                                    let v = self.resolve_const(func_id, c);
+                                    self.jit_const_strings.push(v); // GC root
+                                    const_strs.insert(idx, v.bits());
+                                }
                                 let proto: *const crate::bytecode::FuncProto =
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
@@ -2630,11 +2726,23 @@ impl<'p> Vm<'p> {
                                         char_code_at: jit_char_code_at as usize,
                                         concat: jit_concat as usize,
                                         str_append: jit_str_append as usize,
+                                        call_method_ic: jit_call_method_ic as usize,
+                                        call_ic: jit_call_ic as usize,
+                                        get_prop_slow: jit_get_prop_slow as usize,
+                                        set_prop_slow: jit_set_prop_slow as usize,
+                                        strict_eq: jit_strict_eq as usize,
+                                        truthy: jit_truthy as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
+                                    &const_strs,
                                 );
                                 if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
+                                    if self.pending_throw.is_some() {
+                                        let top = self.frames.len() - 1;
+                                        self.frames[top].ip = resume;
+                                        return Err(Thrown(String::new()));
+                                    }
                                     ip = resume;
                                     continue;
                                 }
@@ -5659,10 +5767,15 @@ impl<'p> Vm<'p> {
     /// `self.regs`/`self.globals`, so the raw pointers stay valid for the call.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn try_run_osr(&mut self, func_id: u32, entry_ip: u32, base: usize) -> Option<usize> {
-        let region = self.jit.get_region(func_id, entry_ip)? as *const crate::codegen::Region;
-        // Object scalar-replacement (SROA): clone the sync plan so no region
-        // borrow is held while the sync mutates globals/heap below.
-        let field_plan = unsafe { (*region).field_plan().cloned() };
+        // Copy the native entry pointer and the SROA plan OUT of the region
+        // before running: a region's call helper can re-enter the interpreter,
+        // which may compile NEW regions (rehashing `jit.regions` — any &Region
+        // would dangle) or even evict THIS region (parked in `Jit::retired`,
+        // so the mmap'd code stays alive for the in-flight run).
+        let (entry, field_plan) = {
+            let region = self.jit.get_region(func_id, entry_ip)?;
+            (region.entry(), region.field_plan().cloned())
+        };
 
         // â”€â”€ pre-run sync â”€â”€ load the promoted object's fields into the scratch
         // pool globals the native code reads as ordinary globals.
@@ -5679,9 +5792,16 @@ impl<'p> Vm<'p> {
 
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
-        // SAFETY: `region` is stable for the call (we don't mutate self.jit until
-        // after); regs/globals do not move during a region run.
-        let resume = unsafe { (*region).run(regs_ptr, vm_ptr) };
+        // SAFETY: `entry` points into the region's mmap'd ExecutableBuffer
+        // (stable even if `jit.regions` rehashes; eviction parks, never drops,
+        // a possibly-running region); regs/globals never reallocate (pinned).
+        let resume = unsafe {
+            let f: extern "win64" fn(*mut u64, *mut u32, *mut core::ffi::c_void) -> u64 =
+                std::mem::transmute(entry);
+            let mut resume: u32 = crate::codegen::NO_BAIL;
+            let _ = f(regs_ptr, &mut resume as *mut u32, vm_ptr);
+            resume
+        };
 
         // â”€â”€ post-run sync â”€â”€ flush the pool globals back to the object's fields,
         // so the interpreter (which resumes on the ORIGINAL bytecode, reading the
@@ -5697,7 +5817,13 @@ impl<'p> Vm<'p> {
             }
         }
         // Bookkeeping: a resume INSIDE the region is a deopt; evict if chronic.
-        self.jit.note_region_resume(func_id, entry_ip, resume);
+        // A call helper may have flagged this exit as exempt (depth-cap deopt /
+        // a throw the call legitimately produced) — legal recursion and caught
+        // exceptions must not evict a hot region.
+        let exempt = std::mem::take(&mut self.osr_deopt_exempt);
+        if !exempt {
+            self.jit.note_region_resume(func_id, entry_ip, resume);
+        }
         Some(resume as usize)
     }
 

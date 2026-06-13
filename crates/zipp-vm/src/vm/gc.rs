@@ -116,6 +116,12 @@ impl Vm<'_> {
         for &v in &self.globals {
             root_val!(v);
         }
+        // Strings interned at region-compile time whose bits are embedded in
+        // native code (LoadConst immediates) — see `jit_const_strings`.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        for &v in &self.jit_const_strings {
+            root_val!(v);
+        }
         for v in self.class_values.iter().flatten() {
             root_val!(*v);
         }
