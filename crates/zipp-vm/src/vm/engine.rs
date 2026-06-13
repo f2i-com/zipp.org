@@ -1325,7 +1325,12 @@ impl<'p> Vm<'p> {
                     regs[dst as usize] = *consts.get(idx as usize)?;
                 }
                 I::Move { dst, src } => regs[dst as usize] = regs[src as usize],
-                I::GetProp { dst, obj: _, name } => {
+                // `obj: 0` ONLY (the `this` register): pass 1 admits a GetProp
+                // solely when `obj == 0`, and this arm reads `recv` (= reg 0).
+                // Matching `obj: 0` here ties the read to that guarantee — any
+                // future pass-1 change admitting `obj != 0` falls through to the
+                // `_ => return None` decline instead of silently reading `recv`.
+                I::GetProp { dst, obj: 0, name } => {
                     // `this.<field>` — own DATA slot only (a missing / accessor /
                     // inherited field needs full get_member semantics → decline).
                     if !recv.is_heap() || !self.ic_obj_ok(recv.heap_index()) {
