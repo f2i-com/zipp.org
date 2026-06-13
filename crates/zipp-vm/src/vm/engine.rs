@@ -457,6 +457,93 @@ impl<'p> Vm<'p> {
         plan
     }
 
+    /// Q4 v1: build the leaf-call inline plan for a memory-path region — the set
+    /// of `Call` sites in `[start, end]` whose monomorphic cached callee is a
+    /// PLAIN LEAF (`callee_leaf_ok`) the region emitter can inline straight-line.
+    /// Each entry carries the callee's identity bits (the runtime guard), the
+    /// scratch-window offset (the caller's `reg_count`), and the body to emit.
+    /// A site not in the map keeps the per-call `jit_call_ic` helper.
+    ///
+    /// Resolution uses the LIVE per-site IC (`ic_call_mono`, read-only): the
+    /// loop has executed `OSR_THRESHOLD` times by OSR-compile, so a hot
+    /// monomorphic call already has its `Callee` way filled. A polymorphic /
+    /// unfilled site simply isn't inlined.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_leaf_inline_plan(
+        &self,
+        func_id: u32,
+        start: u32,
+        end: u32,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::LeafInlinePlan> {
+        use crate::codegen::{callee_leaf_ok, LeafInlinePlan};
+        let mut plan = rustc_hash::FxHashMap::default();
+        let caller = self.func(func_id as usize);
+        let reg_window = caller.reg_count;
+        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        for ip in start as usize..=end as usize {
+            let Instr::Call { argc, .. } = caller.code[ip] else {
+                continue;
+            };
+            // Monomorphic plain-callee from the live IC.
+            let Some((callee_bits, fid, closure)) = self.ic_call_mono(func_id, ip) else {
+                if log {
+                    eprintln!("[leaf] fn{func_id}@{ip} NOT-MONO (no single Callee IC way)");
+                }
+                continue;
+            };
+            // v1: only callees with NO captured upvalues (the body has no
+            // Upval/Cell ops anyway, but a closure value with upvalues whose
+            // body somehow reads them would be unsound — exclude by construction).
+            let callee = self.func(fid as usize);
+            if closure != NO_CLOSURE && !callee.upvalues.is_empty() {
+                if log {
+                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (closure w/ upvalues)");
+                }
+                continue;
+            }
+            // The carved scratch window must hold the callee's whole register
+            // file; the headroom (vs MAX_FRAMES recursion) is checked at the
+            // region entry by `jit_regs_fits`.
+            let Some(body) = callee_leaf_ok(callee) else {
+                if log {
+                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (not leaf-eligible)");
+                }
+                continue;
+            };
+            // Pre-resolve the numeric constants the body's `LoadConst` ops read
+            // (callee_leaf_ok rejected any non-numeric constant).
+            let mut consts = rustc_hash::FxHashMap::default();
+            for instr in &body {
+                if let Instr::LoadConst { idx, .. } = *instr {
+                    if let Some(c) = callee.constants.get(idx as usize) {
+                        consts.insert(idx, c.bits());
+                    }
+                }
+            }
+            if log {
+                eprintln!(
+                    "[leaf] fn{func_id}@{ip} callee fn{fid} INLINE-ELIGIBLE \
+                     (argc={argc} callee_regs={} params={} body_ops={})",
+                    callee.reg_count,
+                    callee.param_count,
+                    body.len()
+                );
+            }
+            plan.insert(
+                ip,
+                LeafInlinePlan {
+                    callee_bits,
+                    reg_window,
+                    callee_reg_count: callee.reg_count,
+                    param_count: callee.param_count,
+                    body,
+                    consts,
+                },
+            );
+        }
+        plan
+    }
+
     /// Would growing `self.regs` to `needed` slots exceed the pinned capacity?
     /// (Interpreter-only builds: never — there is no pinned native pointer to
     /// protect, so the Vec may grow/reallocate freely.)
@@ -464,6 +551,15 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn regs_would_overflow(&self, needed: usize) -> bool {
         self.reg_capacity != 0 && needed > self.reg_capacity
+    }
+
+    /// The pinned register-file capacity (slots) for the Q4 leaf-inline headroom
+    /// check in `jit_regs_fits`. The reserved capacity never changes after
+    /// `reserve_jit_regs`, so a scratch window inside it can't trigger a realloc.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn reg_capacity_pub(&self) -> usize {
+        self.reg_capacity
     }
     #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
     #[inline]

@@ -1053,6 +1053,32 @@ pub(crate) extern "win64" fn jit_globals_base(vm: *mut core::ffi::c_void) -> *mu
     vm.globals.as_mut_ptr() as *mut u64
 }
 
+/// Win64 helper for Q4 leaf-call inlining: does the register file have headroom
+/// for a carved callee scratch window? `base_ptr` is the running region's window
+/// base (its `rbx`); `needed` is the highest scratch slot index used above that
+/// base (`reg_window + callee_reg_count`, summed to a max across the region's
+/// inlined callees). Returns 1 when `base + needed <= reg_capacity` — i.e. the
+/// scratch slots lie inside the pinned, reserved `vm.regs` buffer and writing
+/// them can never reallocate (which would dangle the region's `rbx`). Returns 0
+/// when it would overflow (only possible in near-MAX_FRAMES recursion), and the
+/// region then runs every inlined call through the per-call helper instead.
+/// Called ONCE per OSR entry (not per iteration), so its cost is amortised away.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`; `base_ptr` lies within `vm.regs`' pinned buffer.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_regs_fits(
+    vm: *mut core::ffi::c_void,
+    base_ptr: *const u64,
+    needed: u64,
+) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    let regs_base = vm.regs.as_ptr() as *const u64;
+    // SAFETY: base_ptr is within the same pinned allocation as regs_base.
+    let base = unsafe { base_ptr.offset_from(regs_base) } as usize;
+    (base + needed as usize <= vm.reg_capacity_pub()) as u64
+}
+
 /// Win64 helper: a UNARY `Math.<op>` over an already-numeric argument. `code` is
 /// `MathFn as u32` (`#[repr(u8)]`, fixed declaration order); `x_bits` is the
 /// operand's raw f64 bits (the region loaded it as a double after guarding it

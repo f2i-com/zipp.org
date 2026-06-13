@@ -118,6 +118,52 @@ pub struct TaPinPlan {
     pub access: FxHashMap<usize, u8>,
 }
 
+/// Q4 leaf-call inlining (v1). One inlinable monomorphic PLAIN-LEAF callee for a
+/// `Call` site in a memory-path region. Built in dispatch.rs from LIVE VM state
+/// (the resolved Callee IC entry) at OSR compile time; the emitted code guards
+/// the callee register's identity against `callee_bits` and, on a hit, runs the
+/// callee body INLINE (no frame push, no `setup_call`, no `run_loop`) over a
+/// scratch register window carved at offset `reg_window` above the caller frame.
+/// A guard MISS (callee reassigned / a different callee shape appears) falls
+/// through to the UNCHANGED `emit_region_call_ic` helper — a pure prefix that
+/// never deopts/evicts the region, so polymorphic / unknown callees degrade to
+/// today's per-call path.
+///
+/// SOUNDNESS: the body is verified `callee_leaf_ok` — a straight-line sequence of
+/// region-admissible value ops + global reads/writes, NO nested call / heap alloc
+/// / closure-cell / upvalue op, exactly one trailing `Return`/`ReturnUndefined`,
+/// and NO deopt-capable op after any effect (so an inlined-op bail — which
+/// resumes the interpreter AT THE CALL IP and re-runs the whole call — can never
+/// double-apply a `StoreGlobal`/`SetProp`). The body touches only the scratch
+/// window (its own regs, offset by `reg_window`) and globals (`r12`); a pure leaf
+/// runs no GC safepoint, so the carved window needs no zero-fill and the pinned
+/// pointers (r12/r13/r14) stay valid across it.
+pub struct LeafInlinePlan {
+    /// Guard: the caller's callee register must hold exactly these Value bits.
+    pub callee_bits: u64,
+    /// Offset (in registers) of the carved callee scratch window above the
+    /// caller frame's window: callee reg `r` lives at caller reg `reg_window+r`.
+    pub reg_window: u16,
+    /// Callee register-window size (validated to fit the reserved capacity).
+    pub callee_reg_count: u16,
+    /// Callee formal parameter count (args 0..min(argc,param_count) are copied
+    /// into scratch regs `reg_window+1 ..` ; reg `reg_window+0` is `this`).
+    pub param_count: u16,
+    /// The callee body ops to emit inline (with their OWN register numbers).
+    pub body: Vec<Instr>,
+    /// Resolved numeric-constant bits the body's `LoadConst` ops reference,
+    /// keyed by the constant index (the callee's own constant pool index).
+    pub consts: FxHashMap<u32, u64>,
+}
+
+impl LeafInlinePlan {
+    /// Boxed bits for a body `LoadConst` constant (numeric — `callee_leaf_ok`
+    /// rejected any non-numeric constant, and the planner pre-resolved them).
+    fn const_bits(&self, idx: u32) -> u64 {
+        self.consts.get(&idx).copied().unwrap_or(0)
+    }
+}
+
 /// Win64 addresses of the heap helpers (vm.rs), passed from the interpreter into
 /// `Jit::compile_region`. The inline-cache base site index is assigned inside
 /// `compile_region` (not here), then bundled into `HeapHelpers` for codegen.
@@ -195,6 +241,10 @@ pub struct HeapHelperAddrs {
     /// chain: read-only `Vm::has_property_jit`. Returns the BOOL Value bits, or
     /// `SELF_CALL_DEOPT` when the op needs user code / a throw (interpreter only).
     pub has_property: usize,
+    /// Helper for the Q4 leaf-inline ENTRY headroom check (`jit_regs_fits`):
+    /// returns 1 when a carved callee scratch window fits the pinned register
+    /// file. Called once per OSR entry when the region has any inlined call.
+    pub regs_fits: usize,
 }
 
 /// One compiled native function plus the buffer backing it.
@@ -568,6 +618,7 @@ impl Jit {
         field_pool_size: u32,
         const_strs: &FxHashMap<u32, u64>,
         ta_plan: &TaPinPlan,
+        leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     ) {
         let key = (func_id, start);
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
@@ -655,9 +706,10 @@ impl Jit {
             upval_get: heap_helpers.upval_get,
             forin_live: heap_helpers.forin_live,
             has_property: heap_helpers.has_property,
+            regs_fits: heap_helpers.regs_fits,
             ic_base_idx,
         };
-        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan) {
+        match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan) {
             Some(code) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] DOUBLE/MEM region fn{func_id} [{start},{end}] compiled");
@@ -2274,6 +2326,126 @@ fn region_can_compile(
     true
 }
 
+/// Q4 v1 leaf-call inlining eligibility: is `callee`'s body a PLAIN LEAF the
+/// region emitter can inline straight-line over a scratch window? Returns the
+/// body ops to inline, or `None` to decline (the Call keeps the per-call helper).
+///
+/// Requirements (all NON-NEGOTIABLE for soundness — see `LeafInlinePlan`):
+/// * Not a generator/async; reg_count ≤ 16; no rest/`arguments`; simple_params
+///   (so arg binding is a plain positional copy, no defaults/destructuring).
+/// * Body ops ⊂ a SAFE SUBSET of the region-admissible value/global ops, minus
+///   anything that calls (`Call`/`CallMethod`/`Super*`), allocates on the VM
+///   heap, reads a closure cell / upvalue (`Cell*`/`Upval*`), or touches the
+///   `arguments`/heap property machinery. The subset below is exactly what the
+///   inline emitter implements; any other op declines.
+/// * Exactly ONE trailing `Return`/`ReturnUndefined`, reached by fall-through —
+///   NO internal jump (straight-line; the inline emitter has no branch labels).
+/// * NO deopt-capable op may appear AFTER an effect (`StoreGlobal*`): if an
+///   inlined op bails, the interpreter re-runs the WHOLE call from the call ip,
+///   so an effect that already ran would double-apply. (For v1 the only effect
+///   admitted is `StoreGlobal*`; `SetProp`/`SetIndex` are NOT in the subset.)
+pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
+    if callee.is_generator || callee.is_async {
+        return None;
+    }
+    if callee.rest_reg.is_some() || callee.arguments_reg.is_some() {
+        return None;
+    }
+    if !callee.simple_params {
+        return None;
+    }
+    if callee.reg_count > 16 {
+        return None;
+    }
+    let full = &callee.code;
+    if full.is_empty() {
+        return None;
+    }
+    // The straight-line body ends at the FIRST `Return`/`ReturnUndefined` (the
+    // body must have no branch before it, so that return is the unique exit; any
+    // op after it is dead — the compiler routinely appends a `ReturnUndefined`
+    // after an explicit `Return`). Truncate the body there.
+    let term = full
+        .iter()
+        .position(|i| matches!(i, Instr::Return { .. } | Instr::ReturnUndefined))?;
+    let code: Vec<Instr> = full[..=term].to_vec();
+    // Every op except the terminator must be a non-control-flow value/global op.
+    // `seen_effect` enforces the side-effect-freedom-before-deopt ordering rule.
+    let mut seen_effect = false;
+    for (i, instr) in code.iter().enumerate() {
+        let is_last = i == code.len() - 1;
+        match *instr {
+            // The single trailing return — IS the last op (by construction above).
+            Instr::Return { .. } | Instr::ReturnUndefined => {
+                debug_assert!(is_last);
+            }
+            _ if is_last => return None, // unreachable: last op is the terminator
+            // ── deopt-capable value ops (may bail mid-body) ── forbidden AFTER
+            // an effect (a bail would re-run the call and re-apply the effect).
+            Instr::Add { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::AddInt { .. }
+            | Instr::Neg { .. }
+            | Instr::Bitwise { .. } => {
+                if seen_effect {
+                    return None;
+                }
+            }
+            // The inline emitter only implements the MathOp arities the region
+            // path does (1-arg, or a fixed 2-arg op set).
+            Instr::MathOp { op, argc, .. } => {
+                if seen_effect {
+                    return None;
+                }
+                let ok = match argc {
+                    1 => true,
+                    2 => matches!(
+                        op,
+                        MathFn::Pow
+                            | MathFn::Atan2
+                            | MathFn::Imul
+                            | MathFn::Min
+                            | MathFn::Max
+                            | MathFn::Hypot
+                    ),
+                    _ => false,
+                };
+                if !ok {
+                    return None;
+                }
+            }
+            // ── pure, never-bail value/load ops ── safe anywhere.
+            Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::LoadBool { .. }
+            | Instr::Move { .. }
+            | Instr::LoadGlobal { .. } => {}
+            // ── the one admitted effect ── a global write. Must be the only
+            // kind of effect; after it, no deopt-capable op may follow.
+            Instr::StoreGlobal { .. } | Instr::StoreGlobalStrict { .. } => {
+                seen_effect = true;
+            }
+            // Anything else (calls, heap props, branches, closures, throw, …)
+            // declines — the inline emitter doesn't implement it.
+            _ => return None,
+        }
+    }
+    // A `LoadConst` must be a NUMERIC constant (the inline emitter materialises
+    // it as raw bits; a string/heap constant needs interning we don't do here).
+    for instr in &code {
+        if let Instr::LoadConst { idx, .. } = *instr {
+            match callee.constants.get(idx as usize) {
+                Some(c) if c.is_number() => {}
+                _ => return None,
+            }
+        }
+    }
+    Some(code)
+}
+
 /// Detect a loop-invariant `g.length` to hoist out of a memory-path region: a
 /// `GetProp{obj, name:"length"}` whose object is loaded from a global `g` that the
 /// region never mutates (no `StoreGlobal(g)`, and no length-changing op anywhere —
@@ -2407,6 +2579,8 @@ struct HeapHelpers {
     forin_live: usize,
     /// `HasProp` (`in`) helper (key bits, obj bits → Bool Value bits / deopt).
     has_property: usize,
+    /// Q4 leaf-inline entry headroom check (`jit_regs_fits`).
+    regs_fits: usize,
     /// First global inline-cache site id for this region; the k-th heap op uses
     /// `ic_base_idx + k`.
     ic_base_idx: u32,
@@ -2418,6 +2592,7 @@ struct HeapHelpers {
 /// memory-based path if the region's shape is outside the register allocator's
 /// subset (e.g. it contains heap property ops). Returns `None` only if even the
 /// fallback can't handle it.
+#[allow(clippy::too_many_arguments)]
 fn compile_region(
     proto: &FuncProto,
     start: u32,
@@ -2426,11 +2601,15 @@ fn compile_region(
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
     ta_plan: &TaPinPlan,
+    leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
 ) -> Option<JitFn> {
+    // The register/SROA paths decline any region containing a Call, so leaf
+    // inlining (which only applies to Call sites) is reachable only via the
+    // memory path below.
     if let Some(f) = compile_region_regalloc(proto, start, end, globals_base_helper) {
         return Some(f);
     }
-    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan)
+    compile_region_mem(proto, start, end, globals_base_helper, heap, const_strs, ta_plan, leaf_plan)
 }
 
 /// Compile a (rewritten, purely-numeric) field-promoted region via the integer or
@@ -5112,11 +5291,328 @@ fn emit_region_call_ic(
     emit_region_bail(ops, ip, bail, epilogue);
 }
 
+/// Q4 leaf-call inlining (v1): emit a guarded INLINE expansion of a monomorphic
+/// plain-leaf callee for a region `Call` op, with a fallback to the unchanged
+/// per-call helper. Emitted INSTEAD of `emit_region_call_ic` when a `LeafInlinePlan`
+/// exists for this ip.
+///
+/// Shape:
+/// ```text
+///   ; guard: regs[callee] == callee_bits     ; miss → fallback
+///   ; headroom flag == 0                      ; tight → fallback
+///   ; regs[W+0] = undefined ; regs[W+1+i] = regs[arg_base+i]   (arg copy)
+///   ; <inlined body over scratch window W>    ; any bail → resume at CALL IP
+///   ; regs[dst] = <return value>
+///   ; jmp done
+/// fallback:
+///   ; <emit_region_call_ic — the existing helper, a pure prefix>
+/// done:
+/// ```
+/// SOUNDNESS: the guard miss and the headroom-tight case both fall to the helper
+/// (a PURE PREFIX — never deopts/evicts the region). The body is straight-line
+/// (`callee_leaf_ok`); any inlined-op bail records the CALL IP and exits to the
+/// epilogue, so the interpreter re-runs the WHOLE call (the side-effect-freedom-
+/// before-deopt rule guarantees no global write happened yet). The body touches
+/// only the scratch window (regs `W..W+callee_reg_count`, inside the pinned,
+/// headroom-checked register file) and globals (r12); it runs no GC safepoint,
+/// allocates nothing, and calls nothing — so r12/r13/r14 and the TA pins stay
+/// valid and need no re-fetch, and the scratch slots need no zero-fill (the body
+/// writes every reg it reads — see `callee_leaf_ok`: a leaf reads only its params
+/// (copied above), globals, and its own freshly-computed regs).
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_leaf_call(
+    ops: &mut dynasmrt::x64::Assembler,
+    call_ip: usize,
+    epilogue: dynasmrt::DynamicLabel,
+    leaf_flag_off: i32,
+    plan: &LeafInlinePlan,
+    callee: u16,
+    arg_base: u16,
+    argc: u16,
+    dst: u16,
+    math_unary: usize,
+    math_two: usize,
+    // Fallback emission (the unchanged per-call helper).
+    helper: usize,
+    packed_fip: u64,
+    packed_args: u64,
+    refetch: Option<(usize, usize)>,
+    ta_refetch: Option<(usize, &TaPinPlan)>,
+) {
+    let fallback = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let w = plan.reg_window;
+    // ── identity guard ── the callee register must hold EXACTLY the cached
+    // function value. A miss (callee reassigned, or a 2nd shape appears at this
+    // now-not-really-mono site) takes the helper — never evicts the region.
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(callee)]
+        ; mov r10, QWORD plan.callee_bits as i64
+        ; cmp rax, r10
+        ; jne => fallback
+        // ── headroom flag ── 0 ⇒ the scratch window might overflow the pinned
+        // register file (near-MAX_FRAMES recursion) → take the helper.
+        ; cmp QWORD [rsp + leaf_flag_off], 0
+        ; je => fallback
+        // ── arg binding ── reg 0 (callee `this`) = undefined; positional args
+        // into W+1.. (a leaf with simple_params binds args positionally). Args
+        // beyond `param_count`/`argc` are ignored by a leaf body (no
+        // `arguments`); params beyond `argc` stay undefined (the slot is zeroed
+        // here so a stale scratch value can't leak in).
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; mov [rbx + dreg(w)], rax
+    );
+    let n = argc.min(plan.param_count);
+    for i in 0..plan.param_count {
+        if i < n {
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(arg_base + i)]
+                ; mov [rbx + dreg(w + 1 + i)], rax
+            );
+        } else {
+            dynasm!(ops
+                ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                ; mov [rbx + dreg(w + 1 + i)], rax
+            );
+        }
+    }
+    // ── inline the body over the scratch window ── every register `r` maps to
+    // `w + r`. Each op that can bail uses a FRESH bail label whose block resumes
+    // the interpreter at the CALL IP (so the whole call re-runs cleanly).
+    let rg = |r: u16| w + r; // scratch-window register mapping
+    let mut ret_reg: Option<u16> = None;
+    for instr in &plan.body {
+        match *instr {
+            Instr::LoadInt { dst: d, val } => {
+                let boxed = INT_TAG | (val as u32 as u64);
+                dynasm!(ops
+                    ; mov rax, QWORD boxed as i64
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+            }
+            Instr::LoadConst { dst: d, idx } => {
+                // `callee_leaf_ok` already restricted these to numeric consts.
+                let bits = plan.const_bits(idx);
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+            }
+            Instr::LoadBool { dst: d, val } => {
+                let bits = BOOL_TAG | (val as u64);
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+            }
+            Instr::Move { dst: d, src } => {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(rg(src))]
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+            }
+            Instr::LoadGlobal { dst: d, idx } => {
+                dynasm!(ops
+                    ; mov rax, [r12 + (idx as i32) * 8]
+                    ; mov [rbx + dreg(rg(d))], rax
+                );
+            }
+            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(rg(src))]
+                    ; mov [r12 + (idx as i32) * 8], rax
+                );
+            }
+            Instr::Add { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Add, true)
+            }
+            Instr::Sub { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Sub, true)
+            }
+            Instr::Mul { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Mul, true)
+            }
+            Instr::Div { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                dbinop(ops, call_ip, bail, epilogue, rg(d), rg(a), rg(b), DOp::Div, false)
+            }
+            Instr::Mod { dst: d, a, b } => {
+                let bail = ops.new_dynamic_label();
+                let as_dbl = ops.new_dynamic_label();
+                let mod_done = ops.new_dynamic_label();
+                load_num_xmm(ops, rg(a), 0, bail);
+                load_num_xmm(ops, rg(b), 1, bail);
+                dynasm!(ops
+                    ; cvttsd2si rax, xmm0
+                    ; cvttsd2si rcx, xmm1
+                    ; test rcx, rcx
+                    ; jz => bail
+                    ; cvtsi2sd xmm2, rax
+                    ; ucomisd xmm2, xmm0
+                    ; jne => bail
+                    ; cvtsi2sd xmm2, rcx
+                    ; ucomisd xmm2, xmm1
+                    ; jne => bail
+                    ; cqo
+                    ; idiv rcx
+                    ; movsxd r8, edx
+                    ; cmp r8, rdx
+                    ; jne => as_dbl
+                    ; mov r8, QWORD INT_TAG as i64
+                    ; mov eax, edx
+                    ; or rax, r8
+                    ; mov [rbx + dreg(rg(d))], rax
+                    ; jmp => mod_done
+                    ; => as_dbl
+                    ; cvtsi2sd xmm0, rdx
+                    ; movq rax, xmm0
+                    ; mov [rbx + dreg(rg(d))], rax
+                    ; => mod_done
+                );
+                emit_region_bail(ops, call_ip, bail, epilogue);
+            }
+            Instr::AddInt { dst: d, a, imm, .. } => {
+                let bail = ops.new_dynamic_label();
+                let f64_path = ops.new_dynamic_label();
+                let done_ai = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(rg(a))]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, INT_TAG_HI as i32
+                    ; jne => f64_path
+                    ; add eax, imm
+                    ; jo => f64_path
+                );
+                box_eax(ops, rg(d));
+                dynasm!(ops ; jmp => done_ai ; => f64_path);
+                load_num_xmm(ops, rg(a), 0, bail);
+                dynasm!(ops
+                    ; mov eax, imm
+                    ; cvtsi2sd xmm1, eax
+                    ; addsd xmm0, xmm1
+                );
+                store_xmm(ops, rg(d));
+                dynasm!(ops ; => done_ai);
+                emit_region_bail(ops, call_ip, bail, epilogue);
+            }
+            Instr::Neg { dst: d, a } => {
+                let bail = ops.new_dynamic_label();
+                load_num_xmm(ops, rg(a), 1, bail);
+                dynasm!(ops
+                    ; xorps xmm0, xmm0
+                    ; subsd xmm0, xmm1
+                );
+                store_xmm(ops, rg(d));
+                emit_region_bail(ops, call_ip, bail, epilogue);
+            }
+            Instr::Bitwise { dst: d, a, b, op } => {
+                use crate::bytecode::BitwiseOp as B;
+                let bail = ops.new_dynamic_label();
+                load_toint32(ops, rg(a), bail);
+                dynasm!(ops ; mov r8d, eax);
+                load_toint32(ops, rg(b), bail);
+                dynasm!(ops ; mov ecx, eax ; mov eax, r8d);
+                match op {
+                    B::And => { dynasm!(ops ; and eax, ecx); box_eax(ops, rg(d)); }
+                    B::Or => { dynasm!(ops ; or eax, ecx); box_eax(ops, rg(d)); }
+                    B::Xor => { dynasm!(ops ; xor eax, ecx); box_eax(ops, rg(d)); }
+                    B::Shl => { dynasm!(ops ; shl eax, cl); box_eax(ops, rg(d)); }
+                    B::Shr => { dynasm!(ops ; sar eax, cl); box_eax(ops, rg(d)); }
+                    B::Ushr => {
+                        let as_dbl = ops.new_dynamic_label();
+                        let done_u = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; shr eax, cl
+                            ; test eax, eax
+                            ; js => as_dbl
+                        );
+                        box_eax(ops, rg(d));
+                        dynasm!(ops
+                            ; jmp => done_u
+                            ; => as_dbl
+                            ; mov eax, eax
+                            ; cvtsi2sd xmm0, rax
+                            ; movq rax, xmm0
+                            ; mov [rbx + dreg(rg(d))], rax
+                            ; => done_u
+                        );
+                    }
+                }
+                emit_region_bail(ops, call_ip, bail, epilogue);
+            }
+            Instr::MathOp { dst: d, op, arg_base: ab, argc: ac } => {
+                let bail = ops.new_dynamic_label();
+                if ac == 1 {
+                    load_num_xmm(ops, rg(ab), 0, bail);
+                    dynasm!(ops
+                        ; movq rdx, xmm0
+                        ; mov ecx, op as i32
+                        ; mov rax, QWORD math_unary as i64
+                        ; call rax
+                        ; movq xmm0, rax
+                    );
+                    emit_box_num(ops, rg(d));
+                } else {
+                    load_num_xmm(ops, rg(ab), 0, bail);
+                    load_num_xmm(ops, rg(ab + 1), 1, bail);
+                    dynasm!(ops
+                        ; movq rdx, xmm0
+                        ; movq r8, xmm1
+                        ; mov ecx, op as i32
+                        ; mov rax, QWORD math_two as i64
+                        ; call rax
+                        ; movq xmm0, rax
+                    );
+                    emit_box_num(ops, rg(d));
+                }
+                emit_region_bail(ops, call_ip, bail, epilogue);
+            }
+            Instr::Return { src } => {
+                ret_reg = Some(rg(src));
+            }
+            Instr::ReturnUndefined => {
+                ret_reg = None;
+            }
+            // `callee_leaf_ok` guarantees the body contains only the ops above.
+            ref other => unreachable!("inline leaf body op not admitted: {other:?}"),
+        }
+    }
+    // ── store the return value into the caller's `dst` ──
+    match ret_reg {
+        Some(r) => dynasm!(ops
+            ; mov rax, [rbx + dreg(r)]
+            ; mov [rbx + dreg(dst)], rax
+        ),
+        None => dynasm!(ops
+            ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+            ; mov [rbx + dreg(dst)], rax
+        ),
+    }
+    dynasm!(ops
+        ; jmp => done
+        ; => fallback
+    );
+    // ── fallback ── the UNCHANGED per-call helper (a pure prefix). On a clean
+    // return it writes `dst`; on its own deopt/throw sentinel it bails at this
+    // ip via the bail label `emit_region_call_ic` creates internally.
+    let helper_bail = ops.new_dynamic_label();
+    emit_region_call_ic(
+        ops, call_ip, helper_bail, epilogue, helper, packed_fip, packed_args, argc, dst, refetch,
+        ta_refetch,
+    );
+    dynasm!(ops ; => done);
+}
+
 /// Memory-based region codegen: every op loads operands from the register file
 /// (with a type guard) and stores results back, globals via the pinned base
 /// pointer. Correct and simple; ~4x faster than the interpreter but leaves
 /// per-iteration memory traffic on the table (the register-promoting path above
 /// removes it). Kept as the fallback for regions the allocator declines.
+#[allow(clippy::too_many_arguments)]
 fn compile_region_mem(
     proto: &FuncProto,
     start: u32,
@@ -5125,6 +5621,7 @@ fn compile_region_mem(
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
     ta_plan: &TaPinPlan,
+    leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end, Some(const_strs)) {
         return None;
@@ -5144,10 +5641,24 @@ fn compile_region_mem(
     let has_prop = proto.code[s..=e]
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
+    // ── Q4 leaf-call inlining ── the highest scratch slot any inlined callee
+    // uses above the caller window (`reg_window + callee_reg_count`). Checked
+    // ONCE at entry by `jit_regs_fits`; the result gates each inlined Call (a
+    // tight-headroom run falls back to the per-call helper for every site).
+    let do_leaf = !leaf_plan.is_empty();
+    let max_scratch_top: u64 = leaf_plan
+        .values()
+        .map(|p| p.reg_window as u64 + p.callee_reg_count as u64)
+        .max()
+        .unwrap_or(0);
     // Pinned-TypedArray snapshot slots: 32 bytes each, above the 32B shadow +
-    // 8B 5th-arg slot. 32*n keeps the frame's 16-alignment.
+    // 8B 5th-arg slot. 32*n keeps the frame's 16-alignment. The leaf-inline
+    // headroom flag adds one more 16B slot at the top of the frame.
     let n_ta = ta_plan.pins.len();
-    let frame = 40 + 32 * n_ta as i32;
+    let frame = 40 + 32 * n_ta as i32 + if do_leaf { 16 } else { 0 };
+    // Byte offset (from post-prologue rsp) of the headroom flag slot (1 = the
+    // scratch window fits → inline; 0 = fall back to the per-call helper).
+    let leaf_flag_off = frame - 8;
     // Re-derive the pins after any helper that can run user code.
     let ta_refetch = (n_ta > 0).then_some((heap.ta_snapshot, ta_plan));
     // Registers fed by a DOUBLE constant (`x * 1.5`, `i * 2654435761`): their
@@ -5202,6 +5713,21 @@ fn compile_region_mem(
     // Pin each TypedArray's `{obj_bits, base, len}` snapshot (entry derivation).
     if let Some((snap, plan)) = ta_refetch {
         emit_refetch_ta(&mut ops, snap, plan);
+    }
+    // ── Q4 leaf-inline headroom check (once per entry) ── `jit_regs_fits(vm,
+    // rbx, max_scratch_top)` → 1 if the carved scratch windows lie inside the
+    // pinned register file (the common case). Stash the 0/1 in the flag slot;
+    // each inlined Call site reads it and falls back to the helper on 0. rbx is
+    // callee-saved (survives the call); rcx/rdx/r8 are volatile scratch here.
+    if do_leaf {
+        dynasm!(ops
+            ; mov rcx, rdi                            // vm
+            ; mov rdx, rbx                            // caller window base
+            ; mov r8, QWORD max_scratch_top as i64    // highest scratch slot used
+            ; mov rax, QWORD heap.regs_fits as i64
+            ; call rax
+            ; mov [rsp + leaf_flag_off], rax          // 1 = inline ok, 0 = helper
+        );
     }
 
     // ── loop-invariant `g.length` hoist ── compute it ONCE here (reusing the
@@ -6280,19 +6806,43 @@ fn compile_region_mem(
                 // call helper. Packing: r9 = (callee<<16) | arg_base.
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let packed_args = ((callee as u64) << 16) | arg_base as u64;
-                emit_region_call_ic(
-                    &mut ops,
-                    ip,
-                    bail,
-                    epilogue,
-                    heap.call_ic,
-                    packed_fip,
-                    packed_args,
-                    argc,
-                    dst,
-                    has_prop.then_some((heap.versions_base, heap.ic_base)),
-                    ta_refetch,
-                );
+                // Q4 leaf-call inlining: a monomorphic plain-leaf callee at this
+                // site is inlined with an identity guard; a guard miss / tight
+                // headroom falls through to the SAME helper below (a pure prefix).
+                if let Some(lp) = leaf_plan.get(&ip) {
+                    emit_inline_leaf_call(
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        lp,
+                        callee,
+                        arg_base,
+                        argc,
+                        dst,
+                        heap.math_unary,
+                        heap.math_two,
+                        heap.call_ic,
+                        packed_fip,
+                        packed_args,
+                        has_prop.then_some((heap.versions_base, heap.ic_base)),
+                        ta_refetch,
+                    );
+                } else {
+                    emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        heap.call_ic,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        has_prop.then_some((heap.versions_base, heap.ic_base)),
+                        ta_refetch,
+                    );
+                }
             }
             Instr::StrConcat { dst, a, b } => {
                 // `dst = a + b` via the win64 `jit_concat` helper (rope concat or

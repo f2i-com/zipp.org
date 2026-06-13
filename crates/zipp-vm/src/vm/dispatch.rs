@@ -2720,6 +2720,11 @@ impl<'p> Vm<'p> {
                                 // hint is verified per access by an identity
                                 // guard, so a stale/wrong hint is always safe.
                                 let ta_plan = self.build_ta_pin_plan(func_id, t as u32, ip as u32, base);
+                                // Q4 leaf-call inline plan: monomorphic plain-leaf
+                                // callees at this region's Call sites (read-only —
+                                // built before the &proto borrow below).
+                                let leaf_plan =
+                                    self.build_leaf_inline_plan(func_id, t as u32, ip as u32);
                                 let proto: *const crate::bytecode::FuncProto =
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
@@ -2756,11 +2761,13 @@ impl<'p> Vm<'p> {
                                         upval_get: jit_upval_get as usize,
                                         forin_live: jit_forin_live as usize,
                                         has_property: jit_has_property as usize,
+                                        regs_fits: jit_regs_fits as usize,
                                     },
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
                                     &const_strs,
                                     &ta_plan,
+                                    &leaf_plan,
                                 );
                                 if let Some(resume) = self.try_run_osr(func_id, t as u32, base) {
                                     if self.pending_throw.is_some() {
