@@ -439,13 +439,14 @@ impl HeapHelperAddrs {
     }
 }
 
-/// Is the Tier C whole-function memory-path JIT enabled? Gated behind
-/// `ZIPP_FNJIT_MEM` until validated against the full test262 sweep (default-off
-/// keeps the engine byte-identical to the prior behavior). Read once per
-/// `Jit::compile` call (compiles are rare relative to execution).
+/// Is the Tier C whole-function memory-path JIT enabled? ON by default (validated
+/// against the full test262 sweep — JIT flag-on 48466/1 with zero new failures —
+/// and bench ALL_CORRECT); opt out with `ZIPP_NO_FNJIT_MEM` to fall back to the
+/// prior tiers only. (`ZIPP_NOJIT` disables the whole JIT upstream of here.) Read
+/// once per `Jit::compile` call (compiles are rare relative to execution).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn fnjit_mem_enabled() -> bool {
-    std::env::var_os("ZIPP_FNJIT_MEM").is_some()
+    std::env::var_os("ZIPP_NO_FNJIT_MEM").is_none()
 }
 
 /// One compiled native function plus the buffer backing it.
