@@ -214,6 +214,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--timeout", type=int, default=20)
     ap.add_argument("--show-fails", type=int, default=25)
+    ap.add_argument("--dump-fails", default="", help="write sorted FAIL relpaths to this file (exact regression diffs)")
     a = ap.parse_args()
     root = os.path.join(a.t262, a.sub)
     files = []
@@ -232,6 +233,7 @@ def main():
     fail_sigs = collections.Counter()
     n = len(files)
     print(f"running {n} tests with {a.jobs} workers …", flush=True)
+    fail_paths = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
         for i, (verdict, sig, path) in enumerate(
             ex.map(lambda p: run_one(a, get_harness, p), files)
@@ -242,8 +244,13 @@ def main():
             by_cat[cat][verdict] += 1
             if verdict == "FAIL":
                 fail_sigs[sig] += 1
+                fail_paths.append(rel.replace(os.sep, "/"))
             if (i + 1) % 2000 == 0:
                 print(f"  … {i+1}/{n}", flush=True)
+    if a.dump_fails:
+        with open(a.dump_fails, "w", newline="\n") as fh:
+            fh.write("\n".join(sorted(fail_paths)) + "\n")
+        print(f"wrote {len(fail_paths)} FAIL relpaths to {a.dump_fails}")
     p, f, s = totals["PASS"], totals["FAIL"], totals["SKIP"]
     ran = p + f
     print(f"\n==== test262 ({a.sub}) ====")

@@ -227,11 +227,14 @@ impl<'p> Vm<'p> {
                         .and_then(|s| self.globals.get(s as usize).copied())
                         .unwrap_or(Value::UNDEFINED)
                         .bits();
+                    let heap_helper_addrs = self.jit_heap_helper_addrs();
                     self.jit.compile(
                         func_id,
                         proto_ref,
                         jit_self_call_at as usize,
                         self_val,
+                        jit_globals_base as usize,
+                        heap_helper_addrs,
                     );
                 }
             }
@@ -2771,6 +2774,7 @@ impl<'p> Vm<'p> {
                                     self.func(func_id as usize);
                                 // SAFETY: program functions are immutable during run.
                                 let proto_ref = unsafe { &*proto };
+                                let heap_helper_addrs = self.jit_heap_helper_addrs();
                                 self.jit.compile_region(
                                     func_id,
                                     proto_ref,
@@ -2779,34 +2783,7 @@ impl<'p> Vm<'p> {
                                     &self.globals,
                                     &self.heap,
                                     jit_globals_base as usize,
-                                    crate::codegen::HeapHelperAddrs {
-                                        get_prop_miss: jit_get_prop_miss as usize,
-                                        set_prop_miss: jit_set_prop_miss as usize,
-                                        versions_base: jit_heap_versions_base as usize,
-                                        ic_base: jit_ic_base as usize,
-                                        get_index: jit_get_index as usize,
-                                        set_index: jit_set_index as usize,
-                                        array_push: jit_array_push as usize,
-                                        char_code_at: jit_char_code_at as usize,
-                                        concat: jit_concat as usize,
-                                        str_append: jit_str_append as usize,
-                                        call_method_ic: jit_call_method_ic as usize,
-                                        call_ic: jit_call_ic as usize,
-                                        get_prop_slow: jit_get_prop_slow as usize,
-                                        set_prop_slow: jit_set_prop_slow as usize,
-                                        strict_eq: jit_strict_eq as usize,
-                                        truthy: jit_truthy as usize,
-                                        ta_snapshot: jit_ta_snapshot as usize,
-                                        ta_clamp_store: jit_ta_clamp_store as usize,
-                                        dv_get: jit_dv_get as usize,
-                                        math_unary: jit_math_unary as usize,
-                                        math_two: jit_math_two as usize,
-                                        cell_get: jit_cell_get as usize,
-                                        upval_get: jit_upval_get as usize,
-                                        forin_live: jit_forin_live as usize,
-                                        has_property: jit_has_property as usize,
-                                        regs_fits: jit_regs_fits as usize,
-                                    },
+                                    heap_helper_addrs,
                                     self.program.global_count, // field-global pool base
                                     FIELD_POOL as u32,
                                     &const_strs,
@@ -5787,6 +5764,41 @@ impl<'p> Vm<'p> {
         fr.super_done = false;
         fr.args_obj = args_obj;
         Ok(true)
+    }
+
+    /// Bundle the win64 heap-helper addresses the JIT codegen needs (region path
+    /// and Tier C whole-function path). All entries are fixed `extern "win64" fn`
+    /// addresses — independent of `self` — so this is a pure constructor.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_heap_helper_addrs(&self) -> crate::codegen::HeapHelperAddrs {
+        crate::codegen::HeapHelperAddrs {
+            get_prop_miss: jit_get_prop_miss as usize,
+            set_prop_miss: jit_set_prop_miss as usize,
+            versions_base: jit_heap_versions_base as usize,
+            ic_base: jit_ic_base as usize,
+            get_index: jit_get_index as usize,
+            set_index: jit_set_index as usize,
+            array_push: jit_array_push as usize,
+            char_code_at: jit_char_code_at as usize,
+            concat: jit_concat as usize,
+            str_append: jit_str_append as usize,
+            call_method_ic: jit_call_method_ic as usize,
+            call_ic: jit_call_ic as usize,
+            get_prop_slow: jit_get_prop_slow as usize,
+            set_prop_slow: jit_set_prop_slow as usize,
+            strict_eq: jit_strict_eq as usize,
+            truthy: jit_truthy as usize,
+            ta_snapshot: jit_ta_snapshot as usize,
+            ta_clamp_store: jit_ta_clamp_store as usize,
+            dv_get: jit_dv_get as usize,
+            math_unary: jit_math_unary as usize,
+            math_two: jit_math_two as usize,
+            cell_get: jit_cell_get as usize,
+            upval_get: jit_upval_get as usize,
+            forin_live: jit_forin_live as usize,
+            has_property: jit_has_property as usize,
+            regs_fits: jit_regs_fits as usize,
+        }
     }
 
     pub(crate) fn try_run_jit(&mut self, func_id: u32, base: usize) -> Option<(Value, u32)> {

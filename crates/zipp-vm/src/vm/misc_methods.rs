@@ -264,7 +264,15 @@ impl<'p> Vm<'p> {
                 .and_then(|s| self.globals.get(s as usize).copied())
                 .unwrap_or(Value::UNDEFINED)
                 .bits();
-            self.jit.compile(fid, proto_ref, jit_self_call_at as usize, self_val);
+            let heap_helper_addrs = self.jit_heap_helper_addrs();
+            self.jit.compile(
+                fid,
+                proto_ref,
+                jit_self_call_at as usize,
+                self_val,
+                jit_globals_base as usize,
+                heap_helper_addrs,
+            );
         }
         let entry = self.jit.get(fid)?.entry();
         let proto = self.func(fid as usize);

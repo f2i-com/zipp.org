@@ -401,6 +401,53 @@ pub struct HeapHelperAddrs {
     pub regs_fits: usize,
 }
 
+impl HeapHelperAddrs {
+    /// Bundle these helper addresses with the COMPILING function's id and the
+    /// reserved inline-cache base into the codegen-internal `HeapHelpers`. Used
+    /// by both the OSR region path and Tier C (whole-function mem path).
+    fn to_heap_helpers(&self, func_id: u32, ic_base_idx: u32) -> HeapHelpers {
+        HeapHelpers {
+            func_id,
+            get_prop_miss: self.get_prop_miss,
+            set_prop_miss: self.set_prop_miss,
+            versions_base: self.versions_base,
+            ic_base: self.ic_base,
+            get_index: self.get_index,
+            set_index: self.set_index,
+            array_push: self.array_push,
+            char_code_at: self.char_code_at,
+            concat: self.concat,
+            str_append: self.str_append,
+            call_method_ic: self.call_method_ic,
+            call_ic: self.call_ic,
+            get_prop_slow: self.get_prop_slow,
+            set_prop_slow: self.set_prop_slow,
+            strict_eq: self.strict_eq,
+            truthy: self.truthy,
+            ta_snapshot: self.ta_snapshot,
+            ta_clamp_store: self.ta_clamp_store,
+            dv_get: self.dv_get,
+            math_unary: self.math_unary,
+            math_two: self.math_two,
+            cell_get: self.cell_get,
+            upval_get: self.upval_get,
+            forin_live: self.forin_live,
+            has_property: self.has_property,
+            regs_fits: self.regs_fits,
+            ic_base_idx,
+        }
+    }
+}
+
+/// Is the Tier C whole-function memory-path JIT enabled? Gated behind
+/// `ZIPP_FNJIT_MEM` until validated against the full test262 sweep (default-off
+/// keeps the engine byte-identical to the prior behavior). Read once per
+/// `Jit::compile` call (compiles are rare relative to execution).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn fnjit_mem_enabled() -> bool {
+    std::env::var_os("ZIPP_FNJIT_MEM").is_some()
+}
+
 /// One compiled native function plus the buffer backing it.
 pub struct JitFn {
     _buf: ExecutableBuffer,
@@ -665,6 +712,8 @@ impl Jit {
         proto: &FuncProto,
         self_call_helper: usize,
         self_val_bits: u64,
+        globals_base_helper: usize,
+        heap_helpers: HeapHelperAddrs,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -673,12 +722,31 @@ impl Jit {
             Some(f) => {
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
+                return;
             }
-            None => {
-                self.blacklist.insert(func_id);
-                self.set_fn_state(func_id, FN_DEAD);
+            None => {}
+        }
+        // ── Tier C (whole-function memory path) ── Tier A declined (not a
+        // fib-shaped int self-recursion). When enabled, try the call-heavy /
+        // recursive-descent path before blacklisting. Gated behind ZIPP_FNJIT_MEM
+        // until validated; default-off ⇒ byte-identical to the prior behavior.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if fnjit_mem_enabled() && mem_can_compile(proto) {
+            // v1 uses no GetProp/SetProp inline-cache sites; reserve 0 (returns
+            // the current base — never read by the emitted code).
+            let ic_base_idx = self.reserve_ic_sites(0);
+            let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
+            if let Some(f) = compile_proto_mem(proto, func_id, globals_base_helper, helpers) {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[jit] Tier C fn{func_id} compiled (whole-function mem path)");
+                }
+                self.compiled.insert(func_id, f);
+                self.set_fn_state(func_id, FN_COMPILED);
+                return;
             }
         }
+        self.blacklist.insert(func_id);
+        self.set_fn_state(func_id, FN_DEAD);
     }
 
     /// Native entry for the fused `map` kernel of callback `func_id`, compiling
@@ -850,36 +918,7 @@ impl Jit {
             .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
             .count();
         let ic_base_idx = self.reserve_ic_sites(n_sites);
-        let helpers = HeapHelpers {
-            func_id,
-            get_prop_miss: heap_helpers.get_prop_miss,
-            set_prop_miss: heap_helpers.set_prop_miss,
-            versions_base: heap_helpers.versions_base,
-            ic_base: heap_helpers.ic_base,
-            get_index: heap_helpers.get_index,
-            set_index: heap_helpers.set_index,
-            array_push: heap_helpers.array_push,
-            char_code_at: heap_helpers.char_code_at,
-            concat: heap_helpers.concat,
-            str_append: heap_helpers.str_append,
-            call_method_ic: heap_helpers.call_method_ic,
-            call_ic: heap_helpers.call_ic,
-            get_prop_slow: heap_helpers.get_prop_slow,
-            set_prop_slow: heap_helpers.set_prop_slow,
-            strict_eq: heap_helpers.strict_eq,
-            truthy: heap_helpers.truthy,
-            ta_snapshot: heap_helpers.ta_snapshot,
-            ta_clamp_store: heap_helpers.ta_clamp_store,
-            dv_get: heap_helpers.dv_get,
-            math_unary: heap_helpers.math_unary,
-            math_two: heap_helpers.math_two,
-            cell_get: heap_helpers.cell_get,
-            upval_get: heap_helpers.upval_get,
-            forin_live: heap_helpers.forin_live,
-            has_property: heap_helpers.has_property,
-            regs_fits: heap_helpers.regs_fits,
-            ic_base_idx,
-        };
+        let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
         match compile_region(proto, start, end, globals_base_helper, helpers, const_strs, ta_plan, leaf_plan, method_plan) {
             Some(code) => {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -8138,6 +8177,366 @@ fn compile_region_mem(
     }
 
     // ── epilogue ── restore and return; [rsi] already holds the resume ip.
+    dynasm!(ops
+        ; => epilogue
+        ; add rsp, frame
+        ; pop r14
+        ; pop r13
+        ; pop r12
+        ; pop rdi
+        ; pop rsi
+        ; pop rbx
+        ; ret
+    );
+
+    let buf = ops.finalize().ok()?;
+    let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
+    Some(JitFn { _buf: buf, entry: entry_ptr })
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tier C — whole-FUNCTION memory-path JIT (`compile_proto_mem`)
+//
+// The whole-function JIT (`compile_proto`, Tier A) admits only int-arithmetic +
+// SELF-recursive calls (fib-shaped). The OSR region JIT (Tier B,
+// `compile_region_mem`) admits the full call-heavy op set (globals via the r12
+// pin, GetIndex, charCodeAt, GENERAL calls via `emit_region_call_ic`) but ONLY
+// fires on a canonical while-loop back-edge. Recursive-descent functions
+// (`parse`'s tokIs/pFactor/pTerm/pExpr) have no hot LOOP and aren't self-only —
+// neither tier reaches them, so they run entirely in the interpreter.
+//
+// Tier C closes that gap: it LIFTS Tier B's proven op emitters into Tier A's
+// WHOLE-FUNCTION structure (a label per ip, a dedicated per-op bail recording
+// that ip, a whole-fn prologue/epilogue). Each function is compiled
+// independently; mutual recursion "just works" because a general call goes
+// `emit_region_call_ic` → `jit_call_ic` → `setup_call` + `run_loop` the callee,
+// which re-enters native at ITS own ip==0 gate. No direct Tier-C→Tier-C native
+// calls — every cross-function call routes through the depth-capped
+// (`JIT_REGION_CALL_MAX`) interpreter helper, so deep/mutual recursion deopts to
+// flat interpreter frames (→ catchable RangeError) instead of overflowing the
+// native stack.
+//
+// FRAME / ABI: identical to `compile_region_mem` — the win64 `JitFn` ABI
+// (rcx=regs base, rdx=bail_ip out-ptr, r8=vm), a 6-push prologue (rbx/rsi/rdi
+// pinned + r12=globals, r13/r14 saved-but-unused in v1), a 40-byte frame (32B
+// shadow + 8B 5th-arg slot, 16-aligned), and a SHARED epilogue every Return/bail
+// jumps to. This lets the region emitters (`dbinop`/`dcmp`/`region_poly_eq`/
+// `emit_region_call_ic`/`emit_region_bail`) be reused VERBATIM. The ONE
+// divergence from Tier B: `Return` produces a function RESULT (rax + NO_BAIL),
+// not a resume-ip, because Tier C is entered at function entry (try_run_jit at
+// ip==0) and its clean return pops the frame — not at a loop back-edge.
+//
+// v1 OP SET (exactly what the parse quartet needs): LoadInt/LoadBool/Move,
+// general LoadGlobal/StoreGlobal[Strict], GetIndex (generic helper), AddInt/Sub,
+// int/poly Eq/Ne + Lt/Le/Gt/Ge, Jump/JumpIf*, general Call, one charCodeAt
+// CallMethod, Return/ReturnUndefined. Anything else declines (the function stays
+// interpreted). Gated behind `ZIPP_FNJIT_MEM` until validated (see `Jit::compile`).
+
+/// Tier C eligibility: is every op of `proto` in the v1 whole-function mem-path
+/// subset? Stricter than `region_can_compile` (no GetProp/SetProp/StrConcat/
+/// MathOp/Bitwise/Cell/etc. yet — those are later increments). Rejects
+/// generators/async, rest/`arguments` (materialized by call setup, not emitted
+/// code), and any op the emitter below doesn't implement.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn mem_can_compile(proto: &FuncProto) -> bool {
+    if proto.code.is_empty() {
+        return false;
+    }
+    if proto.is_generator || proto.is_async {
+        return false;
+    }
+    // A rest parameter's array / the `arguments` object are built by the
+    // interpreter's call setup, not by emitted code — the native entry would skip
+    // them. Stay interpreted.
+    if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
+        return false;
+    }
+    for instr in &proto.code {
+        match *instr {
+            Instr::LoadInt { .. }
+            | Instr::LoadBool { .. }
+            | Instr::Move { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::GetIndex { .. }
+            | Instr::AddInt { .. }
+            | Instr::Sub { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. }
+            | Instr::Return { .. }
+            | Instr::ReturnUndefined => {}
+            // General plain call `f(args…)` — `this = undefined`.
+            Instr::Call { .. } => {}
+            // v1 method calls: ONLY the 1-arg `charCodeAt` (dedicated helper).
+            Instr::CallMethod { name, argc, .. } => {
+                let key = proto.string_constants.get(name as usize).map(|s| s.as_str());
+                if !(argc == 1 && key == Some("charCodeAt")) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Compile the WHOLE body of `proto` to native code via the memory-path op
+/// emitters (Tier C). `globals_base_helper` pins r12 = `vm.globals` base;
+/// `heap` carries the win64 helper addresses (get_index/char_code_at/call_ic/
+/// strict_eq/truthy). Returns a `JitFn` with the standard ABI, or `None` if the
+/// body is ineligible. v1 uses NO inline caches / TA pins / inline plans, so
+/// r13/r14 are saved-but-unused and no post-call re-fetch is emitted (the
+/// globals pin r12 stays valid across calls — `self.globals` never reallocates).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn compile_proto_mem(
+    proto: &FuncProto,
+    func_id: u32,
+    globals_base_helper: usize,
+    heap: HeapHelpers,
+) -> Option<JitFn> {
+    if !mem_can_compile(proto) {
+        return None;
+    }
+    let mut ops = dynasmrt::x64::Assembler::new().ok()?;
+    let n = proto.code.len();
+    // A label per ip; `labels[n]` is the fall-off-the-end (ReturnUndefined). All
+    // jump targets are in-function, so they resolve directly (no exit stubs).
+    let labels: Vec<_> = (0..=n).map(|_| ops.new_dynamic_label()).collect();
+    // Shared epilogue: every Return / bail records [rsi] then jumps here.
+    let epilogue = ops.new_dynamic_label();
+    // 32B shadow + 8B 5th-arg slot = 40 ⇒ rsp 16-aligned after the 6 pushes.
+    let frame: i32 = 40;
+
+    // ── prologue ── save callee-saved regs, stash inputs, pin r12 = globals base.
+    // Mirrors `compile_region_mem` (6 pushes + frame) so the region emitters and
+    // the shared epilogue work verbatim. r13/r14 are saved (win64 requires it)
+    // but left at the caller's values — v1 reads neither.
+    dynasm!(ops
+        ; push rbx
+        ; push rsi
+        ; push rdi
+        ; push r12
+        ; push r13
+        ; push r14
+        ; sub rsp, frame
+        ; mov rbx, rcx                    // regs base
+        ; mov rsi, rdx                    // bail_ip out-pointer
+        ; mov rdi, r8                     // vm
+        ; mov rcx, rdi                    // arg0 = vm
+        ; mov rax, QWORD globals_base_helper as i64
+        ; call rax
+        ; mov r12, rax                    // pinned globals base pointer
+    );
+
+    let int_hint = true; // v1 admits no double-constant feeds.
+    for ip in 0..n {
+        dynasm!(ops ; => labels[ip]);
+        // Each op gets its OWN dedicated bail label (records THIS ip); a guard
+        // miss resumes the interpreter exactly here, side-effect-free.
+        let bail = ops.new_dynamic_label();
+        match proto.code[ip] {
+            Instr::LoadInt { dst, val } => {
+                let boxed = INT_TAG | (val as u32 as u64);
+                dynasm!(ops
+                    ; mov rax, QWORD boxed as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::LoadBool { dst, val } => {
+                let bits = BOOL_TAG | (val as u64);
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::Move { dst, src } => {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::LoadGlobal { dst, idx } => {
+                dynasm!(ops
+                    ; mov rax, [r12 + (idx as i32) * 8]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
+            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src } => {
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov [r12 + (idx as i32) * 8], rax
+                );
+            }
+            Instr::AddInt { dst, a, imm, .. } => {
+                // Int fast path (the interpreter's `checked_add`), f64 fallback
+                // on a non-Int operand or overflow. (Copied from the mem path.)
+                let f64_path = ops.new_dynamic_label();
+                let done_ai = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(a)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, INT_TAG_HI as i32
+                    ; jne => f64_path
+                    ; add eax, imm
+                    ; jo => f64_path
+                );
+                box_eax(&mut ops, dst);
+                dynasm!(ops ; jmp => done_ai ; => f64_path);
+                load_num_xmm(&mut ops, a, 0, bail);
+                dynasm!(ops
+                    ; mov eax, imm
+                    ; cvtsi2sd xmm1, eax
+                    ; addsd xmm0, xmm1
+                );
+                store_xmm(&mut ops, dst);
+                dynasm!(ops ; => done_ai);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::Sub { dst, a, b } => {
+                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Sub, int_hint)
+            }
+            Instr::Lt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Lt),
+            Instr::Le { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Le),
+            Instr::Gt { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Gt),
+            Instr::Ge { dst, a, b } => dcmp(&mut ops, ip, bail, epilogue, dst, a, b, Cmp::Ge),
+            Instr::Eq { dst, a, b } => {
+                region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, false, heap.strict_eq)
+            }
+            Instr::Ne { dst, a, b } => {
+                region_poly_eq(&mut ops, ip, bail, epilogue, dst, a, b, true, heap.strict_eq)
+            }
+            Instr::Jump { target } => {
+                dynasm!(ops ; jmp => labels[target as usize]);
+            }
+            Instr::JumpIfFalse { cond, target } | Instr::JumpIfTrue { cond, target } => {
+                // Int/Bool condition tests its payload directly; anything else
+                // asks the read-only `jit_truthy` helper. (Copied from mem path.)
+                let if_false = matches!(proto.code[ip], Instr::JumpIfFalse { .. });
+                let t = labels[target as usize];
+                let testit = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(cond)]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, INT_TAG_HI as i32          // Int
+                    ; je => testit
+                    ; cmp r10d, (INT_TAG_HI + 1) as i32    // Bool
+                    ; je => testit
+                    ; mov rcx, rdi                         // vm
+                    ; mov rdx, rax                         // value bits
+                    ; mov rax, QWORD heap.truthy as i64
+                    ; call rax                             // rax = 0/1
+                    ; => testit
+                    ; test eax, eax
+                );
+                if if_false {
+                    dynasm!(ops ; jz => t);
+                } else {
+                    dynasm!(ops ; jnz => t);
+                }
+            }
+            Instr::JumpIfNotLt { a, b, target } => {
+                djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Lt, labels[target as usize]);
+            }
+            Instr::JumpIfNotLe { a, b, target } => {
+                djump_if_not_cmp(&mut ops, ip, bail, epilogue, a, b, Cmp::Le, labels[target as usize]);
+            }
+            Instr::GetIndex { dst, obj, key } => {
+                // Generic element read `a[i]` via the win64 helper (dense arrays,
+                // flat-ASCII strings, unpinned TypedArrays); `undefined` for
+                // out-of-range, deopt sentinel for receivers/keys needing
+                // interpreter semantics. No alloc / no user code → no re-fetch.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(obj)]          // array bits
+                    ; mov r8, [rbx + dreg(key)]           // index bits
+                    ; mov rax, QWORD heap.get_index as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::CallMethod { dst, obj, arg_base, .. } => {
+                // v1: only `s.charCodeAt(i)` (mem_can_compile gated). Dedicated
+                // win64 helper: receiver + arg0 bits in, result bits out, deopt
+                // sentinel → bail. No alloc / no user code → no re-fetch.
+                dynasm!(ops
+                    ; mov rcx, rdi                        // vm
+                    ; mov rdx, [rbx + dreg(obj)]          // receiver bits
+                    ; mov r8, [rbx + dreg(arg_base)]      // arg0 bits
+                    ; mov rax, QWORD heap.char_code_at as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::Call { dst, callee, arg_base, argc } => {
+                // General `f(args…)` (`this = undefined`) via the interpreter-IC
+                // call helper. Packing: r9 = (callee<<16) | arg_base; argc on the
+                // stack. v1 passes NO refetch / TA-refetch (r13/r14/TA unused).
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed_args = ((callee as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    heap.call_ic,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    None,
+                    None,
+                );
+            }
+            Instr::Return { src } => {
+                // Whole-function return: NO_BAIL + result Value (UNLIKE the region,
+                // which records the ip and lets the interpreter perform the return).
+                dynasm!(ops
+                    ; mov DWORD [rsi], NO_BAIL as i32
+                    ; mov rax, [rbx + dreg(src)]
+                    ; jmp => epilogue
+                );
+            }
+            Instr::ReturnUndefined => {
+                dynasm!(ops
+                    ; mov DWORD [rsi], NO_BAIL as i32
+                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                    ; jmp => epilogue
+                );
+            }
+            _ => return None, // mem_can_compile already filtered; defensive
+        }
+    }
+
+    // Falling off the end behaves like ReturnUndefined.
+    dynasm!(ops
+        ; => labels[n]
+        ; mov DWORD [rsi], NO_BAIL as i32
+        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+        ; jmp => epilogue
+    );
+
+    // ── epilogue ── restore and return; rax = result (or garbage on bail), [rsi]
+    // = NO_BAIL or the resume ip. Mirrors `compile_region_mem`'s 6-pop epilogue.
     dynasm!(ops
         ; => epilogue
         ; add rsp, frame
