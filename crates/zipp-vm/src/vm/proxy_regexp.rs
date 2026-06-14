@@ -1211,6 +1211,13 @@ impl<'p> Vm<'p> {
         };
         let callable = repl.is_heap() && self.heap.as_callable(repl.heap_index()).is_some();
         let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
+        // No match ⇒ the result is the subject unchanged (T0.4): return it as-is,
+        // after the observable `ToString(replaceValue)` above, skipping the full
+        // subject copy/rebuild. Strings are immutable, so the same heap value is
+        // observably identical to a fresh copy.
+        if matches.is_empty() {
+            return Ok(Value::heap(s_idx));
+        }
         let mut out: Vec<u8> = Vec::new();
         let mut last = 0usize;
         for m in &matches {
@@ -1324,6 +1331,13 @@ impl<'p> Vm<'p> {
         };
         let callable = repl.is_heap() && self.heap.as_callable(repl.heap_index()).is_some();
         let repl_str = if callable { String::new() } else { self.to_js_string(repl)? };
+        // No match ⇒ the result is the subject unchanged (T0.4): return it as-is,
+        // after the observable `ToString(replaceValue)`, skipping the subject
+        // memcpy + rebuild. (~46% of the regex bench's section-3 lines have no
+        // `//` and hit this.)
+        if matches.is_empty() {
+            return Ok(Value::heap(s_idx));
+        }
         // Own the subject (one memcpy) so the heap allocs below can't
         // invalidate the borrow; ASCII ⇒ valid UTF-8, sliceable as &str.
         let subject: String = match self.heap.get(s_idx) {
