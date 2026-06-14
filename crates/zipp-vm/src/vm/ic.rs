@@ -270,6 +270,25 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Q7: record a receiver INSTANCE seen at a Class method/getter/setter site
+    /// (called at IC-fill time — rare, so ~free). The JIT planner reads the ≤8
+    /// recorded receiver-bits to bake per-instance inline arms (the class-keyed
+    /// IC records no instances). Deduped + capped; stale entries are harmless
+    /// (rebuilt-from-live + runtime-guarded). See `mi_recv`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_record_recv(&mut self, func_id: u32, ip: usize, recv: Value) {
+        if !recv.is_heap() {
+            return;
+        }
+        let bits = recv.bits();
+        let set = self.mi_recv.entry(((func_id as u64) << 32) | ip as u64).or_default();
+        if set.len() < IC_WAYS && !set.contains(&bits) {
+            set.push(bits);
+        }
+    }
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    fn mi_record_recv(&mut self, _func_id: u32, _ip: usize, _recv: Value) {}
+
     // ── the fill walk ──
 
     /// Resolve `recv.key` with provenance, mirroring `get_member`'s fast path
@@ -538,6 +557,7 @@ impl<'p> Vm<'p> {
             }
             Walked::ClassGetter { class, getter } => {
                 let ver = self.heap.version_of(class);
+                self.mi_record_recv(func_id, ip, recv);
                 self.ic_install(func_id, ip, IcEntry::ClassGetter { class, ver, getter });
                 match self.ic_plain_fn(getter) {
                     Some((fid, closure)) => GetAct::Accessor { fid, closure, getter },
@@ -768,6 +788,7 @@ impl<'p> Vm<'p> {
                 match self.lookup_setter(Some(class), key) {
                     Some(setter) => {
                         let ver = self.heap.version_of(class);
+                        self.mi_record_recv(func_id, ip, recv);
                         self.ic_install(
                             func_id,
                             ip,
@@ -794,6 +815,7 @@ impl<'p> Vm<'p> {
                         if m.pos(key).is_none() {
                             if let Some(setter) = self.lookup_setter(Some(class), key) {
                                 let ver = self.heap.version_of(class);
+                                self.mi_record_recv(func_id, ip, recv);
                                 self.ic_install(
                                     func_id,
                                     ip,
@@ -991,6 +1013,7 @@ impl<'p> Vm<'p> {
             Walked::ClassMethod { class, callee } => match self.ic_plain_fn(callee) {
                 Some((fid, closure)) => {
                     let ver = self.heap.version_of(class);
+                    self.mi_record_recv(func_id, ip, recv);
                     self.ic_install(
                         func_id,
                         ip,

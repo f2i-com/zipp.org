@@ -85,6 +85,7 @@ impl<'p> Vm<'p> {
             builtin_globals: std::collections::HashMap::new(),
             class_values: vec![None; program.classes.len()],
             mi_class_epoch: 0,
+            mi_recv: rustc_hash::FxHashMap::default(),
             site_ics: Vec::new(),
             heap,
             globals,
@@ -659,9 +660,22 @@ impl<'p> Vm<'p> {
                 }
             };
             let mut cands: Vec<Value> = Vec::new();
+            // PRIMARY source: receiver instances RECORDED at this site's Class*
+            // IC fills during warmup — robust for `var o = arr[i]; o.m()` (where
+            // `o` is loaded indirectly, defeating the obj-reg/array trace below).
+            // Each is identity+version-guarded, so extras/stale are safe.
+            if let Some(rset) = self.mi_recv.get(&(((func_id as u64) << 32) | ip as u64)) {
+                for &b in rset {
+                    push_cand(Value::from_bits(b), &mut cands, &mut cand_bits);
+                }
+            }
+            // The live exemplar at the obj reg (always reliable — it's the op's
+            // receiver, live at the op).
             if let Some(&v) = self.regs.get(base + obj as usize) {
                 push_cand(v, &mut cands, &mut cand_bits);
             }
+            // Best-effort: the dense elements of the array a `arr[idx]` receiver
+            // came from (supplements recording; the temp may be reused).
             if let Some(arr_reg) = Self::mi_last_getindex_array(&caller.code, start as usize, ip, obj) {
                 if let Some(&av) = self.regs.get(base + arr_reg as usize) {
                     if av.is_heap() {

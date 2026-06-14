@@ -244,6 +244,15 @@ pub struct Vm<'p> {
     /// the discriminator that makes the inline match the interpreter's live
     /// `class_values[id]` resolution (a mismatch falls to the helper).
     mi_class_epoch: u32,
+    /// Q7 method/accessor-inline receiver recording: per `(func_id<<32)|ip`
+    /// CallMethod/GetProp/SetProp site that resolved a Class method/getter/setter,
+    /// the ≤8 distinct receiver Value-bits seen at IC-fill time (warmup). The JIT
+    /// planner reads this to bake a per-receiver-instance inline arm — the
+    /// class-keyed IC records no instances, and the obj-reg/array trace is
+    /// unreliable for `var o = arr[i]; o.x` (o is loaded indirectly). NOT a GC
+    /// root: a stale/reused-slot entry is rebuilt-from-live at compile time and
+    /// each arm is runtime identity+version-guarded, so a dead entry is harmless.
+    mi_recv: rustc_hash::FxHashMap<u64, Vec<u64>>,
     /// Interpreter inline caches: per MAIN-program function (outer index =
     /// func_id), per instruction (inner index = ip), a lazily-allocated
     /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the
