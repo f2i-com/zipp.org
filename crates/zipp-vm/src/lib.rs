@@ -519,6 +519,51 @@ mod tests {
     }
 
     #[test]
+    fn sroa_declines_class_accessor() {
+        // SROA must NOT scalar-replace a CLASS getter/setter on a stable global:
+        // the accessor lives on the prototype, so bypassing it (running the getter
+        // / setter only at region boundaries) drops side effects and reads stale
+        // values. Each iter runs set(7)→backing=70 and get→70, so s+=70 and
+        // calls+=2. (Regression for sroa-accessor-miscompile, the inherited case.)
+        assert_jit_matches(
+            "let backing=0,calls=0; class B{get v(){calls++;return backing;} set v(x){calls++;backing=x*10;}} \
+             let o=new B(); let s=0; for(let i=0;i<5000;i++){ o.v=7; s+=o.v; } console.log(s,calls,backing)",
+            &["350000 10000 70"],
+        );
+    }
+
+    #[test]
+    fn sroa_declines_own_defineproperty_accessor() {
+        // Same, for an OWN accessor installed by Object.defineProperty on a stable
+        // global plain object: it occupies a real own slot but is an accessor, so
+        // SROA must decline. (Regression for sroa-accessor-miscompile, own case.)
+        assert_jit_matches(
+            "let bk=0,c=0; let p={}; \
+             Object.defineProperty(p,'v',{get(){c++;return bk;},set(x){c++;bk=x*10;},configurable:true}); \
+             let s=0; for(let i=0;i<5000;i++){ p.v=7; s+=p.v; } console.log(s,c,bk)",
+            &["350000 10000 70"],
+        );
+    }
+
+    #[test]
+    fn sroa_bails_on_field_redefined_as_accessor() {
+        // Deeper guard: a plain DATA field is SROA-compiled in a hot loop, then
+        // redefined as an accessor (constant getter, no-op setter), then the SAME
+        // loop re-runs. The region's entry-time shape/version guard must detect the
+        // change and fall back to the interpreter, honouring the accessor: each
+        // iter reads 5, +1=6, set(6) is a no-op, reads 5 → s+=5, so s==25000.
+        // (Regression for sroa-accessor-miscompile, the shape-change-after-compile
+        // second bug.)
+        assert_jit_matches(
+            "let g={a:0}; let s=0; function hot(n){ for(let i=0;i<n;i++){ g.a=g.a+1; s+=g.a; } } \
+             hot(5000); \
+             Object.defineProperty(g,'a',{get(){return 5;},set(x){},configurable:true}); \
+             s=0; hot(5000); console.log(s)",
+            &["25000"],
+        );
+    }
+
+    #[test]
     fn regalloc_linear_scan_reuse_many_values() {
         // A loop with far more numeric values (~33) than the 14-home pool, forcing
         // linear-scan home REUSE. Hoisted constants (1..16) must keep permanent

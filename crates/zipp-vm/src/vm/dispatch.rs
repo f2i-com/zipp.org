@@ -2776,6 +2776,8 @@ impl<'p> Vm<'p> {
                                     proto_ref,
                                     t as u32,
                                     region_end as u32,
+                                    &self.globals,
+                                    &self.heap,
                                     jit_globals_base as usize,
                                     crate::codegen::HeapHelperAddrs {
                                         get_prop_miss: jit_get_prop_miss as usize,
@@ -5805,6 +5807,21 @@ impl<'p> Vm<'p> {
         // pool globals the native code reads as ordinary globals.
         if let Some(ref p) = field_plan {
             let obj = self.globals[p.obj_global as usize];
+            // â”€â”€ SROA shape guard â”€â”€ the native body reads/writes scratch pool slots,
+            // bypassing any getter/setter and the property's writability. If the
+            // global was reassigned, or its object's shape changed since compile
+            // (a key add/remove/redefine, freeze, or setPrototypeOf bumps the
+            // version, any of which could turn a promoted data field into an
+            // accessor / non-writable / inherited slot), the bypass would diverge.
+            // Fall back to the interpreter for this entry (the region stays; a
+            // later entry with the original shape can still use it). See
+            // memory: sroa-accessor-miscompile.
+            if !obj.is_heap()
+                || obj.heap_index() != p.obj_idx
+                || self.heap.version_of(p.obj_idx) != p.obj_version
+            {
+                return None;
+            }
             for &(name_idx, slot) in &p.fields {
                 let key = self.func(p.func_id as usize).string_constants
                     [name_idx as usize]

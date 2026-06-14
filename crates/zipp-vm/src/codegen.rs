@@ -460,6 +460,14 @@ pub struct FieldSyncPlan {
     pub fields: Vec<(u32, u32)>,
     /// The function id whose `string_constants` the name indices belong to.
     pub func_id: u32,
+    /// Compile-time heap identity of the promoted object: a region-entry guard
+    /// bails (→ interpreter) if the global was reassigned to a different object.
+    pub obj_idx: u32,
+    /// Compile-time heap shape version: a region-entry guard bails if it changed
+    /// (a key add/remove/redefine, freeze, or `setPrototypeOf` could have turned
+    /// a promoted data field into an accessor / non-writable — see
+    /// sroa-accessor-miscompile). Normal stores to existing slots don't bump it.
+    pub obj_version: u32,
 }
 
 /// Ways per JIT inline-cache site (matches the interpreter's `IC_WAYS`): a
@@ -766,6 +774,8 @@ impl Jit {
         proto: &FuncProto,
         start: u32,
         end: u32,
+        globals: &[Value],
+        heap: &crate::heap::Heap,
         globals_base_helper: usize,
         heap_helpers: HeapHelperAddrs,
         field_pool_base: u32,
@@ -785,7 +795,7 @@ impl Jit {
         // field-globals and compile the (now purely numeric) region — the loop
         // becomes register-only, like V8. Tried FIRST (beats the IC mem path).
         if !self.region_int_blacklist.contains(&key) {
-            if let Some(fp) = plan_field_promotion(proto, start, end) {
+            if let Some(fp) = plan_field_promotion(proto, start, end, globals, heap) {
                 if (fp.fields.len() as u32) <= field_pool_size {
                     let sync_fields: Vec<(u32, u32)> = fp
                         .fields
@@ -803,7 +813,13 @@ impl Jit {
                         );
                     }
                     if let Some((code, is_int)) = compiled {
-                        let plan = FieldSyncPlan { obj_global: fp.obj_global, fields: sync_fields, func_id };
+                        let plan = FieldSyncPlan {
+                            obj_global: fp.obj_global,
+                            fields: sync_fields,
+                            func_id,
+                            obj_idx: fp.obj_idx,
+                            obj_version: fp.obj_version,
+                        };
                         self.regions.insert(
                             key,
                             Region { code, start, end, deopts: 0, is_int, field_plan: Some(plan) },
@@ -4054,11 +4070,29 @@ struct FieldPromotePlan {
     /// Distinct accessed field name-constant indices, in first-seen order. Each
     /// maps to a synthetic "field global" the heap ops are rewritten to use.
     fields: Vec<u32>,
+    /// Heap index of the live promoted object at compile time (an identity guard
+    /// at region entry: the global could be reassigned to a different object).
+    obj_idx: u32,
+    /// The object's heap version at compile time. A key add/remove/redefine,
+    /// freeze, or `setPrototypeOf` bumps it, so a mismatch at region entry means
+    /// the validated all-own-data-slot shape may no longer hold (a field could
+    /// have become an accessor / non-writable / inherited) — bail to the
+    /// interpreter. See memory: sroa-accessor-miscompile.
+    obj_version: u32,
 }
 
 /// Detect whether `[start, end]` is field-promotable; see `FieldPromotePlan`.
+/// `globals`/`heap` give the live runtime shape so we can reject a receiver
+/// whose promoted fields aren't all OWN non-accessor data slots (an accessor /
+/// inherited / non-writable field would diverge — see sroa-accessor-miscompile).
 #[allow(dead_code)] // wired into codegen in a following step
-fn plan_field_promotion(proto: &FuncProto, start: u32, end: u32) -> Option<FieldPromotePlan> {
+fn plan_field_promotion(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    globals: &[Value],
+    heap: &crate::heap::Heap,
+) -> Option<FieldPromotePlan> {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
     if !code[s..=e]
@@ -4151,7 +4185,38 @@ fn plan_field_promotion(proto: &FuncProto, start: u32, end: u32) -> Option<Field
             }
         }
     }
-    Some(FieldPromotePlan { obj_global: g, fields })
+
+    // ── runtime shape check ── SROA scalar-replaces each field with a pool slot,
+    // bypassing any getter/setter AND the property's writability. It is sound
+    // ONLY when the live global is a plain object whose every promoted field is
+    // an OWN, non-accessor DATA slot (writable if the region stores to it). An
+    // inherited field, an accessor (a class get/set or a defineProperty accessor),
+    // or a non-writable store target would diverge from the interpreter — which
+    // runs the accessor / honours non-writability each iteration while the scalar
+    // pool would not. (Found by the accessor-inline audit 2026-06-14; class
+    // get/set live on the PROTOTYPE so `m.pos` returns None and we decline.)
+    let gv = *globals.get(g as usize)?;
+    if !gv.is_heap() {
+        return None;
+    }
+    let obj_idx = gv.heap_index();
+    let m = match heap.get(obj_idx) {
+        crate::heap::HeapObj::Object(m) => m,
+        _ => return None, // arrays / typed-arrays / fns aren't plain-field SROA targets
+    };
+    for &name_idx in &fields {
+        let fname = &proto.string_constants[name_idx as usize];
+        // Writability is required only if the region STORES to this field.
+        let need_writable = code[s..=e].iter().any(|instr| match *instr {
+            Instr::SetProp { name, .. } => proto.string_constants[name as usize] == *fname,
+            _ => false,
+        });
+        match m.pos(fname) {
+            Some(slot) if !m.attrs[slot].accessor && (!need_writable || m.attrs[slot].writable) => {}
+            _ => return None,
+        }
+    }
+    Some(FieldPromotePlan { obj_global: g, fields, obj_idx, obj_version: heap.version_of(obj_idx) })
 }
 
 /// Register-promoting region codegen: each region value lives in a fixed xmm
