@@ -5825,6 +5825,16 @@ fn emit_inline_leaf_call(
                         ; movq xmm0, rax
                     );
                     emit_box_num(ops, rg(d));
+                } else if matches!(op, MathFn::Imul) {
+                    // `Math.imul` INLINE (native 32-bit signed multiply, no FFI) —
+                    // see the mem-path MathOp arm for the soundness rationale. This
+                    // makes an inlined leaf's imul (e.g. the FNV/PRNG `mix` body)
+                    // native too.
+                    load_toint32(ops, rg(ab), bail);
+                    dynasm!(ops ; mov r8d, eax);
+                    load_toint32(ops, rg(ab + 1), bail);
+                    dynasm!(ops ; mov ecx, eax ; mov eax, r8d ; imul eax, ecx);
+                    box_eax(ops, rg(d));
                 } else {
                     load_num_xmm(ops, rg(ab), 0, bail);
                     load_num_xmm(ops, rg(ab + 1), 1, bail);
@@ -6829,6 +6839,20 @@ fn compile_region_mem(
                         ; movq xmm0, rax                  // result f64 bits
                     );
                     emit_box_num(&mut ops, dst);
+                } else if matches!(op, MathFn::Imul) {
+                    // `Math.imul(a,b)` INLINE — a 32-bit signed multiply, no FFI:
+                    // ToInt32 both operands (a non-int-coercible operand BAILS, so
+                    // the interpreter runs the full ToNumber incl. a user valueOf —
+                    // matching the helper), then `imul` (low 32 bits, signed) boxed
+                    // as Int. The low 32 bits of the product are identical whether
+                    // the inputs were ToInt32 or ToUint32, so this equals the
+                    // interpreter's `math_two(Imul)` exactly. (Twin of the Bitwise
+                    // ops above — the dominant op in every hash/PRNG hot loop.)
+                    load_toint32(&mut ops, arg_base, bail);
+                    dynasm!(ops ; mov r8d, eax);
+                    load_toint32(&mut ops, arg_base + 1, bail);
+                    dynasm!(ops ; mov ecx, eax ; mov eax, r8d ; imul eax, ecx);
+                    box_eax(&mut ops, dst);
                 } else {
                     // EXACTLY two args (region_can_compile gated the op set).
                     load_num_xmm(&mut ops, arg_base, 0, bail);

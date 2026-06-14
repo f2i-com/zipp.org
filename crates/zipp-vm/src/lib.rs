@@ -519,6 +519,19 @@ mod tests {
     }
 
     #[test]
+    fn region_math_imul_inline() {
+        // Math.imul emitted INLINE in a region (native 32-bit imul, no FFI) must
+        // be byte-identical to the helper path across overflow, negatives, double
+        // truncation, NaN, and a hot accumulating loop. Cross-checked vs node.
+        assert_jit_matches(
+            "let h=0x811c9dc5|0; for(let i=0;i<100000;i++){ h=Math.imul(h^i,16777619); } \
+             let a=0; for(let i=0;i<50000;i++){ a=(a+Math.imul(-1,-1)+Math.imul(0x7FFFFFFF,2)+Math.imul(2.9,5)+Math.imul(NaN,5)+Math.imul(i,-3))|0; } \
+             console.log((h>>>0)+' '+a)",
+            &["3686109669 545492296"],
+        );
+    }
+
+    #[test]
     fn fused_computed_index_concat_key() {
         // GetIndexConcat / SetIndexConcat / DeleteIndexConcat: the `obj["k" + i]`
         // map-key idiom must be byte-identical to the unfused path. Covers a plain
