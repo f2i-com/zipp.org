@@ -298,6 +298,35 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The enumerable own STRING keys of a PLAIN object, in canonical spec order
+    /// (integer indices ascending, then string keys in insertion order), as a
+    /// `Vec<String>` built DIRECTLY from the ObjMap — no heap-Array allocation, no
+    /// per-key `Value` boxing, no `display()` (the keys are already `String`s).
+    /// `None` ⇒ the object needs the full `object_enum_own` path: the global
+    /// object (slot-backed enumerable var/fn names), a module namespace / deferred
+    /// namespace (live-binding TDZ checks), or a non-`Object` heap value (Proxy /
+    /// TypedArray / Array / boxed-String exotics are separate variants). For every
+    /// other `HeapObj::Object` (plain literal, JSON-parsed node, class instance)
+    /// this reproduces `object_enum_own`'s plain-Object key set exactly.
+    fn json_object_keys_fast(&self, idx: u32) -> Option<Vec<String>> {
+        if idx == self.global_this
+            || self.module_namespaces.contains_key(&idx)
+            || self.deferred_ns_state.contains_key(&idx)
+        {
+            return None;
+        }
+        match self.heap.get(idx) {
+            HeapObj::Object(m) => Some(
+                spec_key_order(&m.keys)
+                    .into_iter()
+                    .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
+                    .map(|i| m.keys[i].clone())
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
     /// SerializeJSONProperty, appending straight into a single shared output
     /// buffer instead of building a per-node `String`/`Vec<String>` tree and
     /// joining at every level (the V8 approach). Returns `true` if a value was
@@ -529,9 +558,18 @@ impl<'p> Vm<'p> {
             out.push(']');
         } else {
             // EnumerableOwnPropertyNames(val) — or the PropertyList, when given.
-            let keys: Vec<String> = match allowlist {
-                Some(a) => a.to_vec(),
-                None => {
+            // FAST PATH (T0.5/T0.6): a plain object (not global / namespace) yields
+            // its enumerable own string keys as a `Vec<String>` straight from the
+            // ObjMap (no heap-Array, no `display()`), and below its DATA values are
+            // read directly from the map — eliding `object_enum_own`'s array alloc
+            // + per-key display + the per-key `json_get` dispatch. `use_fast` gates
+            // both the keys and the value reads together.
+            let fast_keys = if allowlist.is_none() { self.json_object_keys_fast(idx) } else { None };
+            let use_fast = fast_keys.is_some();
+            let keys: Vec<String> = match (allowlist, fast_keys) {
+                (Some(a), _) => a.to_vec(),
+                (None, Some(ks)) => ks,
+                (None, None) => {
                     let kv = match self.object_enum_own(v, crate::vm::EnumWhat::Keys) {
                         Ok(kv) => kv,
                         Err(e) => {
@@ -549,12 +587,31 @@ impl<'p> Vm<'p> {
             out.push('{');
             let mut any = false;
             for k in keys {
-                let val = match self.json_get(v, &k) {
-                    Ok(val) => val,
-                    Err(e) => {
-                        visited.pop();
-                        return Err(e);
+                // Value read at SERIALIZATION time (so a prior key's toJSON that
+                // mutated this one is observed). Fast path: a non-accessor own data
+                // slot reads `vals[slot]` directly; an accessor / a key deleted
+                // during recursion / anything else falls back to `json_get` (runs
+                // the getter, walks the prototype, deleted⇒undefined⇒omitted).
+                let direct = if use_fast {
+                    match self.heap.get(idx) {
+                        HeapObj::Object(m) => match m.pos(&k) {
+                            Some(i) if !m.attrs[i].accessor => Some(m.vals[i]),
+                            _ => None,
+                        },
+                        _ => None,
                     }
+                } else {
+                    None
+                };
+                let val = match direct {
+                    Some(val) => val,
+                    None => match self.json_get(v, &k) {
+                        Ok(val) => val,
+                        Err(e) => {
+                            visited.pop();
+                            return Err(e);
+                        }
+                    },
                 };
                 // Tentatively write `[,]\n pad "key"sep`, then the value; if the
                 // value is OMITTED, roll the buffer back to before this entry (so
